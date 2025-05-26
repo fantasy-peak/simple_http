@@ -649,6 +649,11 @@ class HttpResponseWriter
         m_http_status = std::to_string(http_status);
     }
 
+    void writeStatus(http::status http_status)
+    {
+        writeStatus(static_cast<int32_t>(http_status));
+    }
+
     template <typename Key, typename Value>
     void writeHeader(Key &&key, Value &&value)
     {
