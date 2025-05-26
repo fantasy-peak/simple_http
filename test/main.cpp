@@ -6,6 +6,8 @@
 
 #include <boost/beast/core/string_type.hpp>
 
+#include "boost/asio/as_tuple.hpp"
+#include "boost/asio/use_awaitable.hpp"
 #include "simple_http.h"
 
 namespace asio = boost::asio;
@@ -41,7 +43,7 @@ asio::awaitable<void> start()
             out << "body:" << str << std::endl;
             if (writer->version() == simple_http::Version::Http2)
             {
-#if 1
+#if 0
                 http::response<http::string_body> res;
                 res.result(http::status::ok);
                 res.set(http::field::content_type, "text/plain");
@@ -50,19 +52,17 @@ asio::awaitable<void> start()
                 writer->writeHttpResponse(
                     std::make_shared<http::response<http::string_body>>(res));
 #else
-                size_t total = str.size();
-                size_t part_size = total / 3;
-
-                std::string part1 = str.substr(0, part_size);
-                std::string part2 = str.substr(part_size, part_size);
-                std::string part3 = str.substr(part_size * 2);
-
                 writer->writeHeader("content-type", "text/plain");
                 writer->writeHeader(http::field::server, "test");
                 writer->writeHeaderEnd();
-                writer->writeBody(part1);
-                writer->writeBody(part2);
-                writer->writeBodyEnd(part3);
+                writer->writeBody("123");
+                asio::steady_timer timer(co_await asio::this_coro::executor);
+                timer.expires_after(std::chrono::seconds(4));
+                co_await timer.async_wait(asio::use_awaitable);
+                writer->writeBody("456");
+                timer.expires_after(std::chrono::seconds(4));
+                co_await timer.async_wait(asio::use_awaitable);
+                writer->writeBodyEnd("789");
 #endif
             }
             else
@@ -99,11 +99,61 @@ asio::awaitable<void> start()
     co_await hs.start();
 }
 
+// export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+asio::awaitable<void> client()
+{
+    static simple_http::IoCtxPool pool{2};
+    pool.start();
+    asio::steady_timer timer(*pool.getMainContext());
+    timer.expires_after(std::chrono::seconds(3));
+    co_await timer.async_wait();
+
+    std::cout << "client1:" << std::this_thread::get_id() << std::endl;
+    static simple_http::Http2Client client("learnrust.site",
+                                           6666,
+                                           pool.getIoContextPtr());
+    co_await client.connect();
+    co_await client.start();
+    std::cout << "client2:" << std::this_thread::get_id() << std::endl;
+
+    co_await asio::post(*pool.getMainContext(), asio::use_awaitable);
+    std::cout << "client3:" << std::this_thread::get_id() << std::endl;
+
+    auto ch = co_await client.send_post_request();
+    std::cout << "send_post_request3:" << std::this_thread::get_id()
+              << std::endl;
+
+    auto [ec, data] =
+        co_await ch->async_receive(asio::as_tuple(asio::use_awaitable));
+    std::cout << "收到 http 头\n";
+    auto res = std::get<http::response<http::empty_body>>(data);
+    std::cout << "send_post_request4:" << std::this_thread::get_id()
+              << std::endl;
+
+    for (const auto &field : res)
+    {
+        std::cout << field.name_string() << ": " << field.value() << "\n";
+    }
+    for (;;)
+    {
+        auto [ec, body] =
+            co_await ch->async_receive(asio::as_tuple(asio::use_awaitable));
+        if (ec)
+        {
+            std::cout << ec.message() << std::endl;
+            break;
+        }
+        auto body_str = std::get<std::string>(body);
+        std::cout << "recv body:" << body_str << std::endl;
+    }
+}
+
 int main()
 {
     simple_http::IoCtxPool pool{1};
     pool.start();
     asio::co_spawn(pool.getIoContext(), start(), asio::detached);
+    asio::co_spawn(pool.getIoContext(), client(), asio::detached);
     while (true)
         sleep(1000);
     return 0;
