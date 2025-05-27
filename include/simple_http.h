@@ -848,12 +848,12 @@ void shutdown(const auto &socket)
 
 inline asio::awaitable<void> watchdog(
     std::shared_ptr<std::chrono::steady_clock::time_point> deadline,
-    const std::chrono::seconds &interval)
+    std::chrono::seconds interval)
 {
     asio::steady_timer timer(co_await asio::this_coro::executor);
     while (true)
     {
-        timer.expires_at(*deadline);
+        timer.expires_at(std::chrono::steady_clock::now() + interval);
         co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
         auto now = std::chrono::steady_clock::now();
         if (now - *deadline >= interval)
