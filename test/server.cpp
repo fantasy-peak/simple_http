@@ -45,7 +45,7 @@ asio::awaitable<void> start()
             std::cout << "body:" << str << std::endl;
             if (writer->version() == simple_http::Version::Http2)
             {
-#if 1
+#if 0
                 auto res = simple_http::makeHttpResponse(http::status::ok);
                 res->body() = "hello h2";
                 writer->writeHttpResponse(res);
@@ -95,23 +95,18 @@ asio::awaitable<void> start()
             }
             co_return;
         });
-    hs.setHttpHandler(
-        "/world", [](auto /* req */, auto writer) -> asio::awaitable<void> {
-            if (writer->version() == simple_http::Version::Http2)
-            {
-                auto res = simple_http::makeHttpResponse(http::status::ok);
-                res->body() = "/world http2 body";
-                writer->writeHttpResponse(res);
-            }
-            else
-            {
-                auto res = simple_http::makeHttpResponse(http::status::ok);
-                res->body() = "/world http1.1 body";
-                res->prepare_payload();
-                writer->writeHttpResponse(res);
-            }
-            co_return;
-        });
+    hs.setHttpHandler("/world",
+                      [](auto /* req */, auto writer) -> asio::awaitable<void> {
+                          auto res =
+                              simple_http::makeHttpResponse(http::status::ok);
+                          res->body() =
+                              writer->version() == simple_http::Version::Http2
+                                  ? "/world http2 body"
+                                  : "/world http1.1 body";
+                          res->prepare_payload();
+                          writer->writeHttpResponse(res);
+                          co_return;
+                      });
     co_await hs.start();
 }
 

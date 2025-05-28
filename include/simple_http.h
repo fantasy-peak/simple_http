@@ -7,7 +7,6 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <exception>
 #include <functional>
 #include <future>
 #include <iostream>
@@ -275,16 +274,20 @@ inline bool isHttp2(const std::string &cache_data)
     }
 }
 
+struct Disconnect
+{
+};
+
 class HttpResponseWriter;
 
 using Http1Channel = asio::experimental::concurrent_channel<
     void(error_code,
          std::variant<std::shared_ptr<http::response<http::string_body>>,
-                      std::string>)>;
+                      std::string,
+                      Disconnect>)>;
 
-using Http2Channel =
-    asio::experimental::concurrent_channel<void(error_code,
-                                                std::shared_ptr<std::string>)>;
+using Http2Channel = asio::experimental::concurrent_channel<
+    void(error_code, std::variant<std::shared_ptr<std::string>, Disconnect>)>;
 
 inline bool callHandler(auto &map_proc,
                         auto &io_dispatch,
@@ -776,6 +779,26 @@ class HttpResponseWriter
         }
     }
 
+    void forceClose()
+    {
+        if (m_version == Version::Http2)
+        {
+            if (auto sp = m_http2_parse->m_h2_channel.lock())
+            {
+                asio::post(sp->get_executor(),
+                           [sp] { sp->try_send(error_code{}, Disconnect{}); });
+            }
+        }
+        else
+        {
+            if (auto sp = m_http2_parse->m_h1_channel.lock())
+            {
+                asio::post(sp->get_executor(),
+                           [sp] { sp->try_send(error_code{}, Disconnect{}); });
+            }
+        }
+    }
+
     bool writeHttpResponse(
         const std::shared_ptr<http::response<http::string_body>> &http_response)
     {
@@ -818,13 +841,19 @@ inline asio::awaitable<void> toSocket(
 {
     for (;;)
     {
-        auto [ec, info_ptr] =
+        auto [ec, data] =
             co_await ch->async_receive(asio::as_tuple(asio::use_awaitable));
         if (ec)
         {
             break;
         }
         *deadline = std::chrono::steady_clock::now();
+        if (std::holds_alternative<Disconnect>(data))
+        {
+            // forceClose
+            break;
+        }
+        auto &info_ptr = std::get<std::shared_ptr<std::string>>(data);
         if (auto [ec, nwritten] =
                 co_await async_write(*socket,
                                      asio::buffer(info_ptr->c_str(),
@@ -956,7 +985,7 @@ class HttpServer final
                unsigned int inlen,
                void * /* arg */) {
                 static const unsigned char alpn_proto_list[] = {
-                    2, 'h', '2'  // length-prefixed: "\x02h2"
+                    0x02, 'h', '2'  // length-prefixed: "\x02h2"
                 };
                 if (SSL_select_next_proto((unsigned char **)out,
                                           outlen,
@@ -1133,7 +1162,8 @@ class HttpServer final
                         break;
                     }
                 }
-                else
+                else if (std::holds_alternative<std::shared_ptr<
+                             http::response<http::string_body>>>(h1_rsp))
                 {
                     auto &body = std::get<
                         std::shared_ptr<http::response<http::string_body>>>(
@@ -1146,6 +1176,11 @@ class HttpServer final
                     {
                         break;
                     }
+                }
+                else
+                {
+                    // forceClose
+                    break;
                 }
                 if (version == Version::Http1)
                     break;
@@ -1358,10 +1393,6 @@ class HttpServer final
 };
 
 #ifdef _EXPERIMENT_HTTP_CLIENT_
-
-struct Disconnect
-{
-};
 
 struct HttpClient
 {
