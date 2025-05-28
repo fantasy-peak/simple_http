@@ -1,15 +1,13 @@
 #include <chrono>
 #include <cstdio>
-#include <exception>
-#include <memory>
 #include <ostream>
 #include <string>
 #include <syncstream>
 
 #include <boost/beast/core/string_type.hpp>
+#include <boost/asio/use_awaitable.hpp>
+#include <boost/url.hpp>
 
-#include "boost/asio/as_tuple.hpp"
-#include "boost/asio/use_awaitable.hpp"
 #include "simple_http.h"
 
 namespace asio = boost::asio;
@@ -31,6 +29,23 @@ asio::awaitable<void> start()
             out << to_string(level) << " " << file << ":" << line << " " << msg
                 << std::endl;
         };
+    hs.setBefore([](const auto &req,
+                    const auto &writer) -> asio::awaitable<bool> {
+        boost::urls::url_view urlv =
+            boost::urls::parse_origin_form(req.target()).value();
+        if (urlv.path() != "/hello")
+        {
+            auto res = simple_http::makeHttpResponse(http::status::bad_request);
+            res->prepare_payload();
+            writer->writeHttpResponse(res);
+            co_return false;
+        }
+        for (auto const &param : urlv.params())
+        {
+            std::cout << param.key << " = " << param.value << "\n";
+        }
+        co_return true;
+    });
     hs.setHttpHandler(
         "/hello", [](auto req, auto writer) -> asio::awaitable<void> {
             std::cout << "Headers:" << std::endl;
@@ -85,10 +100,10 @@ asio::awaitable<void> start()
                 writer->writeChunkHeader(res);
                 writer->writeChunkData("123");
                 asio::steady_timer timer(co_await asio::this_coro::executor);
-                timer.expires_after(std::chrono::seconds(4));
+                timer.expires_after(std::chrono::seconds(1));
                 co_await timer.async_wait(asio::use_awaitable);
                 writer->writeChunkData("456");
-                timer.expires_after(std::chrono::seconds(4));
+                timer.expires_after(std::chrono::seconds(1));
                 co_await timer.async_wait(asio::use_awaitable);
                 writer->writeChunkEnd();
 #endif

@@ -136,13 +136,9 @@ class IoCtxPool final
     {
         if (pool_size == 0)
             throw std::runtime_error("ContextPool size is 0");
-        for (std::size_t i = 0; i < pool_size + 1; ++i)
+        for (std::size_t i = 0; i < pool_size; ++i)
         {
-            auto io_context_ptr = std::make_shared<asio::io_context>();
-            m_io_contexts.emplace_back(io_context_ptr);
-            m_work.emplace_back(
-                asio::require(io_context_ptr->get_executor(),
-                              asio::execution::outstanding_work.tracked));
+            create();
         }
     }
 
@@ -182,7 +178,21 @@ class IoCtxPool final
         return m_io_contexts.back();
     }
 
+    void createMainContext()
+    {
+        create();
+    }
+
   private:
+    void create()
+    {
+        auto io_context_ptr = std::make_shared<asio::io_context>();
+        m_io_contexts.emplace_back(io_context_ptr);
+        m_work.emplace_back(
+            asio::require(io_context_ptr->get_executor(),
+                          asio::execution::outstanding_work.tracked));
+    }
+
     std::vector<std::shared_ptr<asio::io_context>> m_io_contexts;
     std::shared_ptr<asio::io_context> m_main_ioctx;
     std::list<asio::any_io_executor> m_work{};
@@ -289,30 +299,99 @@ using Http1Channel = asio::experimental::concurrent_channel<
 using Http2Channel = asio::experimental::concurrent_channel<
     void(error_code, std::variant<std::shared_ptr<std::string>, Disconnect>)>;
 
-inline bool callHandler(auto &map_proc,
+struct HandlerFunctions
+{
+    void setBefore(std::function<asio::awaitable<bool>(
+                       const http::request<http::string_body> &,
+                       const std::shared_ptr<HttpResponseWriter> &)> cb)
+    {
+        before = std::move(cb);
+    }
+
+    void setHttpHandler(const std::string &path,
+                        std::function<asio::awaitable<void>(
+                            http::request<http::string_body>,
+                            std::shared_ptr<HttpResponseWriter>)> cb)
+    {
+        map_proc[path] = std::move(cb);
+    }
+
+    void setUnhandled(std::function<asio::awaitable<void>(
+                          http::request<http::string_body>,
+                          std::shared_ptr<HttpResponseWriter>)> cb)
+    {
+        map_proc["*"] = std::move(cb);
+    }
+
+    std::function<
+        asio::awaitable<bool>(const http::request<http::string_body> &,
+                              const std::shared_ptr<HttpResponseWriter> &)>
+        before{[](const auto &, const auto &) -> asio::awaitable<bool> {
+            co_return true;
+        }};
+
+    std::unordered_map<std::string,
+                       std::function<asio::awaitable<void>(
+                           http::request<http::string_body>,
+                           std::shared_ptr<HttpResponseWriter>)>>
+        map_proc{
+            {"*", [](auto, auto writer) -> asio::awaitable<void> {
+                 if (writer->version() == simple_http::Version::Http2)
+                 {
+                     writer->writeStatus(404);
+                     writer->writeHeader("content-type", "text/plain");
+                     writer->writeHeader(http::field::server, "simple_http");
+                     writer->writeHeaderEnd();
+                     writer->writeBodyEnd("");
+                 }
+                 else
+                 {
+                     http::response<http::string_body> res{
+                         http::status::not_found, 11};
+                     res.set(http::field::content_type, "text/plain");
+                     res.set(http::field::server, "simple_http");
+                     res.body() = "";
+                     res.prepare_payload();
+                     writer->writeHttpResponse(
+                         std::make_shared<http::response<http::string_body>>(
+                             res));
+                 }
+                 co_return;
+             }}};
+};
+
+inline void callHandler(const std::weak_ptr<HandlerFunctions> &hf,
                         auto &io_dispatch,
                         auto req,
                         auto writer)
 {
-    std::string path = req.target();
-    if (auto pos = path.find('?'); pos != std::string::npos)
-    {
-        path = path.substr(0, pos);
-    }
-    if (map_proc.contains(path))
-    {
-        asio::co_spawn(io_dispatch,
-                       map_proc[path](std::move(req), std::move(writer)),
-                       asio::detached);
-        return true;
-    }
-    else
-    {
-        asio::co_spawn(io_dispatch,
-                       map_proc["*"](std::move(req), std::move(writer)),
-                       asio::detached);
-        return false;
-    }
+    asio::co_spawn(
+        io_dispatch,
+        [](auto hf, auto req, auto writer) -> asio::awaitable<void> {
+            auto sp = hf.lock();
+            if (!sp)
+                co_return;
+            if (!co_await sp->before(req, writer))
+            {
+                co_return;
+            }
+            std::string path = req.target();
+            if (auto pos = path.find('?'); pos != std::string::npos)
+            {
+                path = path.substr(0, pos);
+            }
+            if (sp->map_proc.contains(path))
+            {
+                co_await sp->map_proc[path](std::move(req), std::move(writer));
+            }
+            else
+            {
+                co_await sp->map_proc["*"](std::move(req), std::move(writer));
+            }
+            co_return;
+        }(hf, std::move(req), std::move(writer)),
+        asio::detached);
+    return;
 }
 
 class Http2Parse final : public std::enable_shared_from_this<Http2Parse>
@@ -331,11 +410,11 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse>
     Http2Parse(const std::shared_ptr<Http2Channel> &ch2,
                const std::shared_ptr<Http1Channel> &ch1,
                auto io_context,
-               auto &map_proc)
+               const std::shared_ptr<HandlerFunctions> &handler_functions)
         : m_h2_channel(ch2),
           m_h1_channel(ch1),
           m_io_dispatch(std::move(io_context)),
-          m_map_proc(map_proc)
+          m_handler_functions(handler_functions)
     {
     }
 
@@ -574,7 +653,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse>
                                                      Version::Http2);
             if (auto sp = h2p->m_h2_channel.lock())
             {
-                callHandler(h2p->m_map_proc,
+                callHandler(h2p->m_handler_functions,
                             *h2p->m_io_dispatch,
                             std::move(*req),
                             std::move(writer));
@@ -649,10 +728,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse>
     std::unordered_map<int32_t,
                        std::shared_ptr<http::request<http::string_body>>>
         m_streams;
-    std::unordered_map<std::string,
-                       std::function<asio::awaitable<void>(
-                           http::request<http::string_body>,
-                           std::shared_ptr<HttpResponseWriter>)>> &m_map_proc;
+    std::weak_ptr<HandlerFunctions> m_handler_functions;
 };
 
 class HttpResponseWriter
@@ -954,6 +1030,7 @@ class HttpServer final
           m_io_ctx_pool(cfg.worker_num),
           m_io_dispatch(std::make_shared<IoCtxPool>(cfg.worker_num))
     {
+        m_io_ctx_pool.createMainContext();
         m_io_ctx_pool.start();
         m_io_dispatch->start();
 
@@ -1035,8 +1112,10 @@ class HttpServer final
         auto ch =
             std::make_shared<Http2Channel>(co_await asio::this_coro::executor,
                                            CHANNEL_SIZE);
-        auto h2p =
-            std::make_shared<Http2Parse>(ch, nullptr, io_dispatch, m_map_proc);
+        auto h2p = std::make_shared<Http2Parse>(ch,
+                                                nullptr,
+                                                io_dispatch,
+                                                m_handler_functions);
         if (auto ret = h2p->init(Http2Parse::Config{
                 .is_h2c_upgrade = true,
                 .h2_setting = std::move(settings),
@@ -1053,7 +1132,7 @@ class HttpServer final
 
         if (req.method() != http::verb::options)
         {
-            callHandler(m_map_proc,
+            callHandler(m_handler_functions,
                         *io_dispatch,
                         std::move(req),
                         std::make_shared<HttpResponseWriter>(h2p,
@@ -1080,8 +1159,10 @@ class HttpServer final
         auto ch =
             std::make_shared<Http2Channel>(co_await asio::this_coro::executor,
                                            CHANNEL_SIZE);
-        auto h2p =
-            std::make_shared<Http2Parse>(ch, nullptr, io_dispatch, m_map_proc);
+        auto h2p = std::make_shared<Http2Parse>(ch,
+                                                nullptr,
+                                                io_dispatch,
+                                                m_handler_functions);
         if (auto ret = h2p->init(Http2Parse::Config{
                 .is_h2c_upgrade = false,
                 .h2_setting = "",
@@ -1129,7 +1210,7 @@ class HttpServer final
                 *deadline = std::chrono::steady_clock::now();
                 auto version =
                     (req.version() == 11 ? Version::Http11 : Version::Http1);
-                callHandler(m_map_proc,
+                callHandler(m_handler_functions,
                             m_io_dispatch->getIoContext(),
                             std::move(req),
                             std::make_shared<HttpResponseWriter>(h2p,
@@ -1202,7 +1283,7 @@ class HttpServer final
         auto h2p = std::make_shared<Http2Parse>(nullptr,
                                                 http1_ch,
                                                 nullptr,
-                                                m_map_proc);
+                                                m_handler_functions);
         beast::flat_buffer buffer;
         http::parser<true, http::string_body> parser;
         auto [ec, bytes] = co_await http::async_read_header(
@@ -1259,7 +1340,7 @@ class HttpServer final
         // this is http1 or 1.1
         auto version =
             (full_req.version() == 11 ? Version::Http11 : Version::Http1);
-        callHandler(m_map_proc,
+        callHandler(m_handler_functions,
                     m_io_dispatch->getIoContext(),
                     std::move(full_req),
                     std::make_shared<HttpResponseWriter>(h2p, 0, version));
@@ -1344,16 +1425,23 @@ class HttpServer final
     void setHttpHandler(const std::string &path,
                         std::function<asio::awaitable<void>(
                             http::request<http::string_body>,
-                            std::shared_ptr<HttpResponseWriter>)> _cb)
+                            std::shared_ptr<HttpResponseWriter>)> cb)
     {
-        m_map_proc[path] = std::move(_cb);
+        m_handler_functions->setHttpHandler(path, std::move(cb));
     }
 
     void setUnhandled(std::function<asio::awaitable<void>(
                           http::request<http::string_body>,
-                          std::shared_ptr<HttpResponseWriter>)> _cb)
+                          std::shared_ptr<HttpResponseWriter>)> cb)
     {
-        m_map_proc["*"] = std::move(_cb);
+        m_handler_functions->setUnhandled(std::move(cb));
+    }
+
+    void setBefore(std::function<asio::awaitable<bool>(
+                       const http::request<http::string_body> &,
+                       const std::shared_ptr<HttpResponseWriter> &)> cb)
+    {
+        m_handler_functions->setBefore(std::move(cb));
     }
 
     Config m_cfg;
@@ -1362,34 +1450,8 @@ class HttpServer final
     IoCtxPool m_io_ctx_pool;
     std::shared_ptr<IoCtxPool> m_io_dispatch;
     std::unique_ptr<asio::ip::tcp::acceptor> m_acceptor;
-    std::unordered_map<std::string,
-                       std::function<asio::awaitable<void>(
-                           http::request<http::string_body>,
-                           std::shared_ptr<HttpResponseWriter>)>>
-        m_map_proc{
-            {"*", [](auto, auto writer) -> asio::awaitable<void> {
-                 if (writer->version() == simple_http::Version::Http2)
-                 {
-                     writer->writeStatus(404);
-                     writer->writeHeader("content-type", "text/plain");
-                     writer->writeHeader(http::field::server, "simple_http");
-                     writer->writeHeaderEnd();
-                     writer->writeBodyEnd("");
-                 }
-                 else
-                 {
-                     http::response<http::string_body> res{
-                         http::status::not_found, 11};
-                     res.set(http::field::content_type, "text/plain");
-                     res.set(http::field::server, "simple_http");
-                     res.body() = "";
-                     res.prepare_payload();
-                     writer->writeHttpResponse(
-                         std::make_shared<http::response<http::string_body>>(
-                             res));
-                 }
-                 co_return;
-             }}};
+    std::shared_ptr<HandlerFunctions> m_handler_functions =
+        std::make_shared<HandlerFunctions>();
 };
 
 #ifdef _EXPERIMENT_HTTP_CLIENT_

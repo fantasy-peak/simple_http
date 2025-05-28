@@ -8,7 +8,7 @@ add_defines("_EXPERIMENT_HTTP_CLIENT_")
 add_requires("asio asio-1-34-2")
 add_requires("spdlog", {configs={std_format=true}})
 add_requires("nlohmann_json", "gzip-hpp", "openssl", "nghttp2")
-add_requires("boost", {configs={cmake=false}})
+add_requires("boost", {configs={cmake=false, url=true}})
 
 set_pcheader("include/simple_http.h")
 
