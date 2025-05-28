@@ -45,14 +45,10 @@ asio::awaitable<void> start()
             std::cout << "body:" << str << std::endl;
             if (writer->version() == simple_http::Version::Http2)
             {
-#if 0
-                http::response<http::string_body> res;
-                res.result(http::status::ok);
-                res.set(http::field::content_type, "text/plain");
-                res.body() = "hello h2";
-                res.prepare_payload();
-                writer->writeHttpResponse(
-                    std::make_shared<http::response<http::string_body>>(res));
+#if 1
+                auto res = simple_http::makeHttpResponse(http::status::ok);
+                res->body() = "hello h2";
+                writer->writeHttpResponse(res);
 #else
                 writer->writeHeader("content-type", "text/plain");
                 writer->writeHeader(http::field::server, "test");
@@ -79,7 +75,7 @@ asio::awaitable<void> start()
                 res.prepare_payload();
                 writer->writeHttpResponse(
                     std::make_shared<http::response<http::string_body>>(res));
-#endif
+#else
                 // curl --no-buffer  -v http://localhost:6666/hello -d "aaaa"
                 http::response<http::empty_body> res{http::status::ok, 11};
                 res.set(http::field::server, "simple_http_server");
@@ -95,6 +91,7 @@ asio::awaitable<void> start()
                 timer.expires_after(std::chrono::seconds(4));
                 co_await timer.async_wait(asio::use_awaitable);
                 writer->writeChunkEnd();
+#endif
             }
             co_return;
         });
@@ -102,25 +99,16 @@ asio::awaitable<void> start()
         "/world", [](auto /* req */, auto writer) -> asio::awaitable<void> {
             if (writer->version() == simple_http::Version::Http2)
             {
-                http::response<http::string_body> res;
-                res.result(http::status::ok);
-                res.set(http::field::content_type, "text/plain");
-                res.body() = "/world http2 body";
-                res.prepare_payload();
-                writer->writeHttpResponse(
-                    std::make_shared<http::response<http::string_body>>(res));
+                auto res = simple_http::makeHttpResponse(http::status::ok);
+                res->body() = "/world http2 body";
+                writer->writeHttpResponse(res);
             }
             else
             {
-                http::response<http::string_body> res;
-                res.version(11);
-                res.result(http::status::ok);
-                res.set(http::field::server, "simple_http_server");
-                res.set(http::field::content_type, "text/plain");
-                res.body() = "/world http1.1 body";
-                res.prepare_payload();
-                writer->writeHttpResponse(
-                    std::make_shared<http::response<http::string_body>>(res));
+                auto res = simple_http::makeHttpResponse(http::status::ok);
+                res->body() = "/world http1.1 body";
+                res->prepare_payload();
+                writer->writeHttpResponse(res);
             }
             co_return;
         });

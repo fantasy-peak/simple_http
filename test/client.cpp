@@ -38,9 +38,7 @@ asio::awaitable<void> client()
     asio::co_spawn(
         *ctx,
         [=]() -> asio::awaitable<void> {
-            auto req = std::make_shared<http::request<http::string_body>>(
-                http::verb::post, "/hello", 11);
-            req->set(http::field::user_agent, "my-client");
+            auto req = simple_http::makeHttpRequest("/hello");
             req->set("X-Custom-Header", "value");
             req->body() = "client";
             auto ch = co_await client->sendRequest(req);

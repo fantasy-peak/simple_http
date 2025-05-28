@@ -65,6 +65,36 @@ enum class LogLevel
     Error,
 };
 
+enum class Version : uint8_t
+{
+    Http1 = 0,
+    Http11 = 1,
+    Http2 = 2,
+};
+
+inline std::shared_ptr<http::response<http::string_body>> makeHttpResponse(
+    http::status status = http::status::ok,
+    std::string_view content_type = "text/plain")
+{
+    auto res = std::make_shared<http::response<http::string_body>>();
+    res->version(11);
+    res->result(status);
+    res->set(http::field::server, "simple_http_server");
+    res->set(http::field::content_type, content_type);
+    return res;
+}
+
+inline std::shared_ptr<http::request<http::string_body>> makeHttpRequest(
+    const std::string &path,
+    http::verb method = http::verb::post,
+    Version http_version = Version::Http11)
+{
+    auto req = std::make_shared<http::request<http::string_body>>(
+        method, path, http_version == Version::Http11 ? 11 : 10);
+    req->set(http::field::user_agent, "simpe_http_client");
+    return req;
+}
+
 constexpr int32_t CHANNEL_SIZE = 100000;
 
 inline constexpr std::string_view to_string(LogLevel level) noexcept
@@ -244,13 +274,6 @@ inline bool isHttp2(const std::string &cache_data)
         return false;
     }
 }
-
-enum class Version : uint8_t
-{
-    Http1 = 0,
-    Http11 = 1,
-    Http2 = 2,
-};
 
 class HttpResponseWriter;
 
@@ -676,6 +699,11 @@ class HttpResponseWriter
             m_headers.emplace(std::forward<Key>(key),
                               std::forward<Value>(value));
         }
+    }
+
+    void writeHeader(std::unordered_map<std::string, std::string> headers)
+    {
+        m_headers.merge(headers);
     }
 
     bool writeHeaderEnd()
