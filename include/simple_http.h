@@ -234,14 +234,38 @@ inline ssize_t dataReadCallback(nghttp2_session * /* session */,
     return to_copy;
 }
 
-const char base64_url_alphabet[] = {'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H',
-                                    'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P',
-                                    'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X',
-                                    'Y', 'Z', 'a', 'b', 'c', 'd', 'e', 'f',
-                                    'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n',
-                                    'o', 'p', 'q', 'r', 's', 't', 'u', 'v',
-                                    'w', 'x', 'y', 'z', '0', '1', '2', '3',
-                                    '4', '5', '6', '7', '8', '9', '-', '_'};
+constexpr char base64_url_alphabet[] = {'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H',
+                                        'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P',
+                                        'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X',
+                                        'Y', 'Z', 'a', 'b', 'c', 'd', 'e', 'f',
+                                        'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n',
+                                        'o', 'p', 'q', 'r', 's', 't', 'u', 'v',
+                                        'w', 'x', 'y', 'z', '0', '1', '2', '3',
+                                        '4', '5', '6', '7', '8', '9', '-', '_'};
+
+inline std::string base64_encode(const std::string &in)
+{
+    std::string out;
+    int val = 0, valb = -6;
+    size_t len = in.length();
+    unsigned int i = 0;
+    for (i = 0; i < len; i++)
+    {
+        unsigned char c = in[i];
+        val = (val << 8) + c;
+        valb += 8;
+        while (valb >= 0)
+        {
+            out.push_back(base64_url_alphabet[(val >> valb) & 0x3F]);
+            valb -= 6;
+        }
+    }
+    if (valb > -6)
+    {
+        out.push_back(base64_url_alphabet[((val << 8) >> (valb + 8)) & 0x3F]);
+    }
+    return out;
+}
 
 inline std::string base64_decode(const std::string &in)
 {
