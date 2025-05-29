@@ -60,6 +60,7 @@ namespace http = beast::http;
 
 enum class LogLevel
 {
+    Debug,
     Info,
     Error,
 };
@@ -100,6 +101,8 @@ inline constexpr std::string_view to_string(LogLevel level) noexcept
 {
     switch (level)
     {
+        case LogLevel::Debug:
+            return "Debug";
         case LogLevel::Info:
             return "Info";
         case LogLevel::Error:
@@ -112,8 +115,21 @@ inline constexpr std::string_view to_string(LogLevel level) noexcept
 inline std::function<void(LogLevel, std::string_view, int, std::string)>
     LOG_CB = [](auto, auto, auto, auto) {};
 
-#define INFO(...) log(LogLevel::Info, __FILE__, __LINE__, __VA_ARGS__)
-#define ERROR(...) log(LogLevel::Error, __FILE__, __LINE__, __VA_ARGS__)
+#define SIMPLE_HTTP_DEBUG_LOG(...)                 \
+    simple_http::log(simple_http::LogLevel::Debug, \
+                     __FILE__,                     \
+                     __LINE__,                     \
+                     __VA_ARGS__)
+#define SIMPLE_HTTP_INFO_LOG(...)                 \
+    simple_http::log(simple_http::LogLevel::Info, \
+                     __FILE__,                    \
+                     __LINE__,                    \
+                     __VA_ARGS__)
+#define SIMPLE_HTTP_ERROR_LOG(...)                 \
+    simple_http::log(simple_http::LogLevel::Error, \
+                     __FILE__,                     \
+                     __LINE__,                     \
+                     __VA_ARGS__)
 
 template <typename... Args>
 inline void log(LogLevel level,
@@ -475,8 +491,8 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse>
                 nullptr);
             if (ret)
             {
-                INFO("nghttp2_session_upgrade2 error: {}",
-                     nghttp2_strerror(ret));
+                SIMPLE_HTTP_ERROR_LOG("nghttp2_session_upgrade2 error: {}",
+                                      nghttp2_strerror(ret));
                 return ret;
             }
         }
@@ -594,7 +610,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse>
         {
             if (!sp->try_send(error_code{}, std::move(header)))
             {
-                ERROR("writeChunkData error");
+                SIMPLE_HTTP_ERROR_LOG("writeChunkData error");
                 return false;
             }
             return true;
@@ -609,9 +625,13 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse>
         if (auto sp = m_h1_channel.lock())
         {
             if (!sp->try_send(error_code{}, http_1_response))
+            {
+                SIMPLE_HTTP_ERROR_LOG("{}", "writeHttp1Response error");
                 return false;
+            }
             return true;
         }
+        SIMPLE_HTTP_DEBUG_LOG("{}", "writeHttp1Response client disconnect!!!");
         return false;
     }
 
@@ -636,11 +656,14 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse>
         {
             req->method(http::string_to_verb(value));
         }
-        if (name == ":path")
+        else if (name == ":path")
         {
             req->target(value);
         }
-        req->set(name, value);
+        else
+        {
+            req->set(name, value);
+        }
         return 0;
     }
 
@@ -653,11 +676,14 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse>
         auto h2p = static_cast<Http2Parse *>(userdata);
         auto sp = h2p->m_h2_channel.lock();
         if (sp == nullptr)
+        {
+            SIMPLE_HTTP_DEBUG_LOG("{}", "sendCallback client disconnect!!!");
             return length;
+        }
         if (!sp->try_send(error_code{},
                           std::make_shared<std::string>((char *)data, length)))
         {
-            ERROR("sendCallback send error!!!!");
+            SIMPLE_HTTP_ERROR_LOG("{}", "sendCallback send error!!!!");
         }
         return length;
     }
@@ -722,7 +748,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse>
             nghttp2_session_mem_recv(m_session, (const uint8_t *)data, len);
         if (ret != len)
         {
-            ERROR("nghttp2 error: {}", nghttp2_strerror(ret));
+            SIMPLE_HTTP_ERROR_LOG("nghttp2 error: {}", nghttp2_strerror(ret));
             return -1;
         }
         return (int)ret;
@@ -1024,7 +1050,7 @@ inline asio::awaitable<void> watchdog(
         auto now = std::chrono::steady_clock::now();
         if (now - *deadline >= interval)
         {
-            INFO("timeout");
+            SIMPLE_HTTP_INFO_LOG("timeout");
             break;
         }
     }
@@ -1084,7 +1110,7 @@ class HttpServer final
         m_acceptor->listen(asio::socket_base::max_listen_connections, ec);
         if (ec)
         {
-            ERROR("listen: {}", ec.message());
+            SIMPLE_HTTP_ERROR_LOG("listen: {}", ec.message());
             throw std::runtime_error(ec.message());
         }
         for (;;)
@@ -1104,7 +1130,7 @@ class HttpServer final
             {
                 std::stringstream ss;
                 ss << endpoint;
-                INFO("new connection from:[{}]", ss.str());
+                SIMPLE_HTTP_INFO_LOG("new connection from:[{}]", ss.str());
             }
             socket.set_option(asio::socket_base::keep_alive(true));
             socket.set_option(asio::ip::tcp::no_delay(true));
@@ -1259,7 +1285,7 @@ class HttpServer final
             });
             ret)
         {
-            ERROR("init error: {}", ret);
+            SIMPLE_HTTP_ERROR_LOG("init error: {}", ret);
             co_return;
         }
 
@@ -1306,7 +1332,7 @@ class HttpServer final
             });
             ret)
         {
-            ERROR("init error: {}", ret);
+            SIMPLE_HTTP_ERROR_LOG("init error: {}", ret);
             co_return;
         }
         auto ret = h2p->feedRecvData(buffer.c_str(), buffer.size());
@@ -1434,7 +1460,7 @@ class HttpServer final
             }
             else
             {
-                ERROR("not http2 request");
+                SIMPLE_HTTP_ERROR_LOG("not http2 request");
             }
             co_return;
         }
@@ -1455,7 +1481,7 @@ class HttpServer final
             *socket, buffer, parser, asio::as_tuple(asio::use_awaitable));
         if (ec)
         {
-            ERROR("body read error: {}", ec.message());
+            SIMPLE_HTTP_ERROR_LOG("body read error: {}", ec.message());
             co_return;
         }
 
@@ -1492,7 +1518,7 @@ class HttpServer final
                 asio::as_tuple(asio::use_awaitable));
             ec)
         {
-            ERROR("async_handshake: {}", ec.message());
+            SIMPLE_HTTP_DEBUG_LOG("async_handshake: {}", ec.message());
             co_return;
         }
         asio::co_spawn(*context,
@@ -1575,7 +1601,7 @@ class HttpsClient final : public HttpClient,
                                           asio::as_tuple(asio::use_awaitable));
         if (ec)
         {
-            ERROR("async_resolve: {}", ec.message());
+            SIMPLE_HTTP_ERROR_LOG("async_resolve: {}", ec.message());
             co_return false;
         }
 
@@ -1591,13 +1617,13 @@ class HttpsClient final : public HttpClient,
             auto [ec] = std::get<0>(result);
             if (ec)
             {
-                ERROR("async_connect: {}", ec.message());
+                SIMPLE_HTTP_ERROR_LOG("async_connect: {}", ec.message());
                 co_return false;
             }
         }
         else if (result.index() == 1)
         {
-            ERROR("async_connect timeout");
+            SIMPLE_HTTP_ERROR_LOG("async_connect timeout");
             co_return false;
         }
 
@@ -1609,7 +1635,7 @@ class HttpsClient final : public HttpClient,
         {
             ec = boost::system::error_code(static_cast<int>(::ERR_get_error()),
                                            asio::error::get_ssl_category());
-            ERROR("SSL_set_tlsext_host_name: {}", ec.message());
+            SIMPLE_HTTP_ERROR_LOG("SSL_set_tlsext_host_name: {}", ec.message());
             co_return false;
         }
 
@@ -1618,7 +1644,7 @@ class HttpsClient final : public HttpClient,
                 asio::as_tuple(asio::use_awaitable));
             ec)
         {
-            ERROR("async_handshake: {}", ec.message());
+            SIMPLE_HTTP_ERROR_LOG("async_handshake: {}", ec.message());
             co_return false;
         }
         const unsigned char *protocol = nullptr;
@@ -1628,7 +1654,7 @@ class HttpsClient final : public HttpClient,
 
         if (length == 2 && std::memcmp(protocol, "h2", 2) == 0)
         {
-            INFO("Negotiated ALPN: h2");
+            SIMPLE_HTTP_INFO_LOG("Negotiated ALPN: h2");
             m_h2 = true;
             initNghttp2();
             co_await startHttp2Cleint();
@@ -1636,7 +1662,7 @@ class HttpsClient final : public HttpClient,
         }
         else
         {
-            INFO("ALPN negotiation failed or not h2.");
+            SIMPLE_HTTP_INFO_LOG("ALPN negotiation failed or not h2.");
             m_h2 = false;
         }
 
@@ -1721,7 +1747,7 @@ class HttpsClient final : public HttpClient,
         }
         else
         {
-            ERROR("not found : {}", stream_id);
+            SIMPLE_HTTP_ERROR_LOG("not found : {}", stream_id);
         }
         return 0;
     }
@@ -1737,7 +1763,7 @@ class HttpsClient final : public HttpClient,
                 error_code{},
                 std::make_shared<std::string>((char *)data, length)))
         {
-            ERROR("sendCallback send error!!!!");
+            SIMPLE_HTTP_ERROR_LOG("sendCallback send error!!!!");
         }
         return length;
     }
@@ -1755,7 +1781,7 @@ class HttpsClient final : public HttpClient,
             }
             else
             {
-                ERROR("not found : {}", stream_id);
+                SIMPLE_HTTP_ERROR_LOG("not found : {}", stream_id);
             }
             h2_cli->m_streams.erase(stream_id);
         };
@@ -1800,7 +1826,7 @@ class HttpsClient final : public HttpClient,
         }
         else
         {
-            ERROR("not found : {}", stream_id);
+            SIMPLE_HTTP_ERROR_LOG("not found : {}", stream_id);
         }
         return 0;
     }
@@ -1828,7 +1854,7 @@ class HttpsClient final : public HttpClient,
             nghttp2_session_mem_recv2(m_session, (const uint8_t *)data, len);
         if (ret != len)
         {
-            ERROR("nghttp2 error: {}", nghttp2_strerror(ret));
+            SIMPLE_HTTP_ERROR_LOG("nghttp2 error: {}", nghttp2_strerror(ret));
             return -1;
         }
         return (int)ret;
@@ -1886,8 +1912,8 @@ class HttpsClient final : public HttpClient,
             nghttp2_session_send(m_session);
             if (stream_id < 0)
             {
-                ERROR("Failed to submit POST request: {}",
-                      nghttp2_strerror(stream_id));
+                SIMPLE_HTTP_ERROR_LOG("Failed to submit POST request: {}",
+                                      nghttp2_strerror(stream_id));
                 ch->close();
                 return -1;
             }
