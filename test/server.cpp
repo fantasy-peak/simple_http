@@ -70,10 +70,10 @@ asio::awaitable<void> start()
                 writer->writeHeaderEnd();
                 writer->writeBody("123");
                 asio::steady_timer timer(co_await asio::this_coro::executor);
-                timer.expires_after(std::chrono::seconds(4));
+                timer.expires_after(std::chrono::seconds(1));
                 co_await timer.async_wait(asio::use_awaitable);
                 writer->writeBody("456");
-                timer.expires_after(std::chrono::seconds(4));
+                timer.expires_after(std::chrono::seconds(1));
                 co_await timer.async_wait(asio::use_awaitable);
                 writer->writeBodyEnd("789");
 #endif

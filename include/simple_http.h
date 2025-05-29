@@ -1018,6 +1018,7 @@ struct Config
     std::chrono::seconds max_idle_time{120};
     std::string ssl_crt;
     std::string ssl_key;
+    bool disable_tls12{true};
 };
 
 class HttpServer final
@@ -1026,28 +1027,150 @@ class HttpServer final
     HttpServer(const Config &cfg)
         : m_cfg(cfg),
           m_ep(asio::ip::make_address(cfg.ip), cfg.port),
-          m_ssl_context(asio::ssl::context::tlsv13_server),
-          m_io_ctx_pool(cfg.worker_num),
-          m_io_dispatch(std::make_shared<IoCtxPool>(cfg.worker_num))
+          m_io_ctx_pool(std::make_shared<IoCtxPool>(cfg.worker_num)),
+          m_io_dispatch(std::make_shared<IoCtxPool>(cfg.worker_num)),
+          m_stop_ctx_pool(true)
     {
-        m_io_ctx_pool.createMainContext();
-        m_io_ctx_pool.start();
+        m_io_ctx_pool->createMainContext();
+        m_io_ctx_pool->start();
         m_io_dispatch->start();
+        initSsl();
+    }
 
-        if (cfg.ssl_crt.empty() || cfg.ssl_key.empty())
+    HttpServer(const Config &cfg,
+               std::shared_ptr<IoCtxPool> io_ctx_pool,
+               std::shared_ptr<IoCtxPool> io_dispatch)
+        : m_cfg(cfg),
+          m_ep(asio::ip::make_address(cfg.ip), cfg.port),
+          m_io_ctx_pool(std::move(io_ctx_pool)),
+          m_io_dispatch(std::move(io_dispatch)),
+          m_stop_ctx_pool(false)
+    {
+        initSsl();
+    }
+
+    asio::awaitable<void> start()
+    {
+        m_acceptor = std::make_unique<asio::ip::tcp::acceptor>(
+            *m_io_ctx_pool->getMainContext());
+        m_acceptor->open(m_ep.protocol());
+        error_code ec;
+        m_acceptor->set_option(asio::ip::tcp::acceptor::reuse_address(true));
+        m_acceptor->bind(m_ep);
+        m_acceptor->listen(asio::socket_base::max_listen_connections, ec);
+        if (ec)
+        {
+            ERROR("listen: {}", ec.message());
+            throw std::runtime_error(ec.message());
+        }
+        for (;;)
+        {
+            auto &context = m_io_ctx_pool->getIoContextPtr();
+            asio::ip::tcp::socket socket(*context);
+            auto [ec] = co_await m_acceptor->async_accept(
+                socket, asio::as_tuple(asio::use_awaitable));
+            if (ec)
+            {
+                if (ec == asio::error::operation_aborted)
+                    break;
+                continue;
+            }
+            auto endpoint = socket.remote_endpoint(ec);
+            if (!ec)
+            {
+                std::stringstream ss;
+                ss << endpoint;
+                INFO("new connection from:[{}]", ss.str());
+            }
+            socket.set_option(asio::socket_base::keep_alive(true));
+            socket.set_option(asio::ip::tcp::no_delay(true));
+            if (m_cfg.ssl_crt.empty())
+            {
+                asio::co_spawn(*context,
+                               session(std::make_shared<asio::ip::tcp::socket>(
+                                           std::move(socket)),
+                                       context),
+                               asio::detached);
+            }
+            else
+            {
+                auto stream =
+                    std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(
+                        std::move(socket), m_ssl_context);
+                asio::co_spawn(*context,
+                               startSslsession(std::move(stream), context),
+                               asio::detached);
+            }
+        }
+    }
+
+    void stop()
+    {
+        auto ctx = m_io_ctx_pool->getMainContext();
+        std::promise<void> done;
+        asio::post(*ctx, [&] {
+            if (m_acceptor)
+                m_acceptor->close();
+            done.set_value();
+        });
+        done.get_future().wait();
+        if (m_stop_ctx_pool)
+        {
+            m_io_ctx_pool->stop();
+            m_io_dispatch->stop();
+        }
+    }
+
+    void setHttpHandler(const std::string &path,
+                        std::function<asio::awaitable<void>(
+                            http::request<http::string_body>,
+                            std::shared_ptr<HttpResponseWriter>)> cb)
+    {
+        m_handler_functions->setHttpHandler(path, std::move(cb));
+    }
+
+    void setUnhandled(std::function<asio::awaitable<void>(
+                          http::request<http::string_body>,
+                          std::shared_ptr<HttpResponseWriter>)> cb)
+    {
+        m_handler_functions->setUnhandled(std::move(cb));
+    }
+
+    void setBefore(std::function<asio::awaitable<bool>(
+                       const http::request<http::string_body> &,
+                       const std::shared_ptr<HttpResponseWriter> &)> cb)
+    {
+        m_handler_functions->setBefore(std::move(cb));
+    }
+
+    auto ioDispatchPool()
+    {
+        return m_io_dispatch;
+    }
+
+  private:
+    void initSsl()
+    {
+        if (m_cfg.ssl_crt.empty() || m_cfg.ssl_key.empty())
             return;
-        m_ssl_context.set_options(asio::ssl::context::default_workarounds |
-                                  asio::ssl::context::no_tlsv1 |
-                                  asio::ssl::context::no_tlsv1_1 |
-                                  asio::ssl::context::no_tlsv1_2);
+
+        uint64_t opts = asio::ssl::context::default_workarounds |
+                        asio::ssl::context::no_tlsv1 |
+                        asio::ssl::context::no_tlsv1_1;
+        if (m_cfg.disable_tls12)
+        {
+            opts |= asio::ssl::context::no_tlsv1_2;
+        }
+        m_ssl_context.set_options(opts);
+
         error_code ec;
         [[maybe_unused]]
-        auto ret = m_ssl_context.use_certificate_chain_file(cfg.ssl_crt, ec);
+        auto ret = m_ssl_context.use_certificate_chain_file(m_cfg.ssl_crt, ec);
         if (ec)
             throw std::runtime_error(ec.message());
 
         [[maybe_unused]] auto _ =
-            m_ssl_context.use_private_key_file(cfg.ssl_key,
+            m_ssl_context.use_private_key_file(m_cfg.ssl_key,
                                                asio::ssl::context::pem,
                                                ec);
         if (ec)
@@ -1076,20 +1199,6 @@ class HttpServer final
                 return SSL_TLSEXT_ERR_OK;
             },
             nullptr);
-    }
-
-    void stop()
-    {
-        auto ctx = m_io_ctx_pool.getMainContext();
-        std::promise<void> done;
-        asio::post(*ctx, [&] {
-            if (m_acceptor)
-                m_acceptor->close();
-            done.set_value();
-        });
-        done.get_future().wait();
-        m_io_ctx_pool.stop();
-        m_io_dispatch->stop();
     }
 
     asio::awaitable<void> upgradeH2c(
@@ -1367,88 +1476,12 @@ class HttpServer final
                        asio::detached);
     }
 
-    asio::awaitable<void> start()
-    {
-        m_acceptor = std::make_unique<asio::ip::tcp::acceptor>(
-            *m_io_ctx_pool.getMainContext());
-        m_acceptor->open(m_ep.protocol());
-        error_code ec;
-        m_acceptor->set_option(asio::ip::tcp::acceptor::reuse_address(true));
-        m_acceptor->bind(m_ep);
-        m_acceptor->listen(asio::socket_base::max_listen_connections, ec);
-        if (ec)
-        {
-            ERROR("listen: {}", ec.message());
-            throw std::runtime_error(ec.message());
-        }
-        for (;;)
-        {
-            auto &context = m_io_ctx_pool.getIoContextPtr();
-            asio::ip::tcp::socket socket(*context);
-            auto [ec] = co_await m_acceptor->async_accept(
-                socket, asio::as_tuple(asio::use_awaitable));
-            if (ec)
-            {
-                if (ec == asio::error::operation_aborted)
-                    break;
-                continue;
-            }
-            auto endpoint = socket.remote_endpoint(ec);
-            if (!ec)
-            {
-                std::stringstream ss;
-                ss << endpoint;
-                INFO("new connection from:[{}]", ss.str());
-            }
-            socket.set_option(asio::socket_base::keep_alive(true));
-            socket.set_option(asio::ip::tcp::no_delay(true));
-            if (m_cfg.ssl_crt.empty())
-            {
-                asio::co_spawn(*context,
-                               session(std::make_shared<asio::ip::tcp::socket>(
-                                           std::move(socket)),
-                                       context),
-                               asio::detached);
-            }
-            else
-            {
-                auto stream =
-                    std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(
-                        std::move(socket), m_ssl_context);
-                asio::co_spawn(*context,
-                               startSslsession(std::move(stream), context),
-                               asio::detached);
-            }
-        }
-    }
-
-    void setHttpHandler(const std::string &path,
-                        std::function<asio::awaitable<void>(
-                            http::request<http::string_body>,
-                            std::shared_ptr<HttpResponseWriter>)> cb)
-    {
-        m_handler_functions->setHttpHandler(path, std::move(cb));
-    }
-
-    void setUnhandled(std::function<asio::awaitable<void>(
-                          http::request<http::string_body>,
-                          std::shared_ptr<HttpResponseWriter>)> cb)
-    {
-        m_handler_functions->setUnhandled(std::move(cb));
-    }
-
-    void setBefore(std::function<asio::awaitable<bool>(
-                       const http::request<http::string_body> &,
-                       const std::shared_ptr<HttpResponseWriter> &)> cb)
-    {
-        m_handler_functions->setBefore(std::move(cb));
-    }
-
     Config m_cfg;
     asio::ip::tcp::endpoint m_ep;
-    asio::ssl::context m_ssl_context;
-    IoCtxPool m_io_ctx_pool;
+    std::shared_ptr<IoCtxPool> m_io_ctx_pool;
     std::shared_ptr<IoCtxPool> m_io_dispatch;
+    bool m_stop_ctx_pool;
+    asio::ssl::context m_ssl_context{asio::ssl::context::tlsv13_server};
     std::unique_ptr<asio::ip::tcp::acceptor> m_acceptor;
     std::shared_ptr<HandlerFunctions> m_handler_functions =
         std::make_shared<HandlerFunctions>();
