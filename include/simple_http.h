@@ -936,7 +936,7 @@ class HttpResponseWriter
                 writeHeader(field.name_string(), field.value());
             }
             writeHeaderEnd();
-            writeBodyEnd(http_response->body());
+            writeBodyEnd(std::move(http_response->body()));
             return true;
         }
         else
@@ -965,30 +965,73 @@ inline asio::awaitable<void> toSocket(
     std::shared_ptr<Http2Channel> ch,
     std::shared_ptr<std::chrono::steady_clock::time_point> deadline)
 {
+    std::vector<std::shared_ptr<std::string>> vec;
+    bool force_close = false;
     for (;;)
     {
-        auto [ec, data] =
-            co_await ch->async_receive(asio::as_tuple(asio::use_awaitable));
-        if (ec)
+        while (true)
         {
-            break;
+            std::variant<std::shared_ptr<std::string>, Disconnect> data;
+            if (!ch->try_receive(
+                    [&](auto, auto recv_data) { data = std::move(recv_data); }))
+            {
+                break;
+            }
+            if (std::holds_alternative<Disconnect>(data))
+            {
+                force_close = true;
+                break;
+            }
+            else
+            {
+                auto &info_ptr = std::get<std::shared_ptr<std::string>>(data);
+                vec.emplace_back(std::move(info_ptr));
+            }
+            *deadline = std::chrono::steady_clock::now();
         }
-        *deadline = std::chrono::steady_clock::now();
-        if (std::holds_alternative<Disconnect>(data))
+
+        if (vec.empty() && !force_close)
         {
-            // forceClose
-            break;
+            std::variant<std::shared_ptr<std::string>, Disconnect> data;
+
+            error_code ec;
+            std::tie(ec, data) =
+                co_await ch->async_receive(asio::as_tuple(asio::use_awaitable));
+            if (ec)
+            {
+                break;
+            }
+            if (std::holds_alternative<Disconnect>(data))
+            {
+                force_close = true;
+            }
+            else
+            {
+                auto &info_ptr = std::get<std::shared_ptr<std::string>>(data);
+                vec.emplace_back(std::move(info_ptr));
+            }
+            *deadline = std::chrono::steady_clock::now();
         }
-        auto &info_ptr = std::get<std::shared_ptr<std::string>>(data);
-        if (auto [ec, nwritten] =
-                co_await async_write(*socket,
-                                     asio::buffer(info_ptr->c_str(),
-                                                  info_ptr->size()),
-                                     asio::as_tuple(asio::use_awaitable));
-            ec)
+
+        if (!vec.empty())
         {
-            break;
+            std::vector<asio::const_buffer> buffers;
+            buffers.reserve(vec.size());
+            for (const auto &s : vec)
+            {
+                buffers.push_back(asio::buffer(*s));
+            }
+            if (auto [ec, nwritten] = co_await async_write(
+                    *socket, buffers, asio::as_tuple(asio::use_awaitable));
+                ec)
+            {
+                break;
+            }
+            vec.clear();
         }
+
+        if (force_close)
+            break;
     }
     co_return;
 }
@@ -1133,7 +1176,8 @@ class HttpServer final
                 SIMPLE_HTTP_INFO_LOG("new connection from:[{}]", ss.str());
             }
             socket.set_option(asio::socket_base::keep_alive(true));
-            socket.set_option(asio::ip::tcp::no_delay(true));
+            // socket.set_option(asio::ip::tcp::no_delay(true));
+            // socket.set_option(asio::socket_base::send_buffer_size(5024 * 1024));
             if (m_cfg.ssl_crt.empty())
             {
                 asio::co_spawn(*context,
@@ -1851,7 +1895,7 @@ class HttpsClient final : public HttpClient,
     int feedRecvData(const char *data, size_t len)
     {
         size_t ret =
-            nghttp2_session_mem_recv2(m_session, (const uint8_t *)data, len);
+            nghttp2_session_mem_recv(m_session, (const uint8_t *)data, len);
         if (ret != len)
         {
             SIMPLE_HTTP_ERROR_LOG("nghttp2 error: {}", nghttp2_strerror(ret));
