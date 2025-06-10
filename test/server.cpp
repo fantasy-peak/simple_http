@@ -2,10 +2,7 @@
 #include <cstdio>
 #include <ostream>
 #include <string>
-#include <syncstream>
 
-#include <boost/beast/core/string_type.hpp>
-#include <boost/asio/use_awaitable.hpp>
 #include <boost/url.hpp>
 
 #include "simple_http.h"
@@ -18,16 +15,15 @@ asio::awaitable<void> start()
 {
     simple_http::Config cfg{.ip = "0.0.0.0",
                             .port = 6666,
-                            .worker_num = 4,
+                            .worker_num = 8,
                             .concurrent_streams = 200};
     cfg.ssl_crt = "./v.crt";
     cfg.ssl_key = "./v.key";
     simple_http::HttpServer hs(cfg);
     simple_http::LOG_CB =
         [](simple_http::LogLevel level, auto file, auto line, std::string msg) {
-            std::osyncstream out(std::cout);
-            out << to_string(level) << " " << file << ":" << line << " " << msg
-                << std::endl;
+            std::cout << to_string(level) << " " << file << ":" << line << " "
+                      << msg << std::endl;
         };
     hs.setBefore([](const auto &req,
                     const auto &writer) -> asio::awaitable<bool> {
@@ -81,15 +77,10 @@ asio::awaitable<void> start()
             else
             {
 #if 0
-                http::response<http::string_body> res;
-                res.version(11);
-                res.result(http::status::ok );
-                res.set(http::field::server, "simple_http_server");
-                res.set(http::field::content_type, "text/plain");
-                res.body() = "hello world";
-                res.prepare_payload();
-                writer->writeHttpResponse(
-                    std::make_shared<http::response<http::string_body>>(res));
+                auto res = simple_http::makeHttpResponse(http::status::ok);
+                res->body() = "hello world";
+                res->prepare_payload();
+                writer->writeHttpResponse(res);
 #else
                 // curl --no-buffer  -v http://localhost:6666/hello -d "aaaa"
                 http::response<http::empty_body> res{http::status::ok, 11};

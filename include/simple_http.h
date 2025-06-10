@@ -400,37 +400,55 @@ struct HandlerFunctions
              }}};
 };
 
+asio::awaitable<void> callCallback(std::weak_ptr<HandlerFunctions> hf,
+                                   auto req,
+                                   auto writer)
+{
+    auto sp = hf.lock();
+    if (!sp)
+        co_return;
+    if (!co_await sp->before(req, writer))
+    {
+        co_return;
+    }
+    std::string path = req.target();
+    if (auto pos = path.find('?'); pos != std::string::npos)
+    {
+        path = path.substr(0, pos);
+    }
+    if (sp->map_proc.contains(path))
+    {
+        co_await sp->map_proc[path](std::move(req), std::move(writer));
+    }
+    else
+    {
+        co_await sp->map_proc["*"](std::move(req), std::move(writer));
+    }
+    co_return;
+}
+
 inline void callHandler(const std::weak_ptr<HandlerFunctions> &hf,
                         auto &io_dispatch,
                         auto req,
                         auto writer)
 {
-    asio::co_spawn(
-        io_dispatch,
-        [](auto hf, auto req, auto writer) -> asio::awaitable<void> {
-            auto sp = hf.lock();
-            if (!sp)
-                co_return;
-            if (!co_await sp->before(req, writer))
-            {
-                co_return;
-            }
-            std::string path = req.target();
-            if (auto pos = path.find('?'); pos != std::string::npos)
-            {
-                path = path.substr(0, pos);
-            }
-            if (sp->map_proc.contains(path))
-            {
-                co_await sp->map_proc[path](std::move(req), std::move(writer));
-            }
-            else
-            {
-                co_await sp->map_proc["*"](std::move(req), std::move(writer));
-            }
-            co_return;
-        }(hf, std::move(req), std::move(writer)),
-        asio::detached);
+    asio::co_spawn(io_dispatch,
+                   callCallback(hf, std::move(req), std::move(writer)),
+                   [](const std::exception_ptr &ep) {
+                       try
+                       {
+                           if (ep)
+                               std::rethrow_exception(ep);
+                       }
+                       catch (const std::exception &e)
+                       {
+                           SIMPLE_HTTP_ERROR_LOG("{}", e.what());
+                       }
+                       catch (...)
+                       {
+                           SIMPLE_HTTP_ERROR_LOG("unknown exception");
+                       }
+                   });
     return;
 }
 
