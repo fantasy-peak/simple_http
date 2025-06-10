@@ -1,27 +1,22 @@
 # simple_http
 
-```
-curl -v --http2-prior-knowledge http://localhost:6666/hello\?key1\=value1\&key2\=value2
-curl -v --http2-prior-knowledge http://localhost:6666/hello -d "aaaa"
+## Require
+* C++20
+* nghttp2
+* boost
 
-curl -v --http2 http://localhost:6666/hello -d "aaaa" -k
-nghttp --upgrade -v http://127.0.0.1:6666/hello
-nghttp --upgrade -v http://nghttp2.org 
-h2load -n 60000 -c 1000 -m 200 -H 'Content-Type: application/json' --data=b.txt http://localhost:6666/hello
-```
-
+## Server Example
 ```
 asio::awaitable<void> start()
 {
     simple_http::Config cfg{.ip = "0.0.0.0",
                             .port = 6666,
-                            .worker_num = 4,
+                            .worker_num = 8,
                             .concurrent_streams = 200};
     simple_http::HttpServer hs(cfg);
     simple_http::LOG_CB =
         [](simple_http::LogLevel level, auto file, auto line, std::string msg) {
-            std::osyncstream out(std::cout);
-            out << to_string(level) << " " << file << ":" << line << " " << msg
+            std::out << to_string(level) << " " << file << ":" << line << " " << msg
                 << std::endl;
         };
     hs.setBefore([](const auto &req,
@@ -67,4 +62,15 @@ int main()
         sleep(1000);
     return 0;
 }
+```
+
+## Test Cmd
+```
+curl -v --http2-prior-knowledge http://localhost:6666/hello\?key1\=value1\&key2\=value2
+curl -v --http2-prior-knowledge http://localhost:6666/hello -d "abcd"
+curl -v --http2 http://localhost:6666/hello -d "abcd"
+
+nghttp --upgrade -v http://127.0.0.1:6666/hello
+nghttp --upgrade -v http://nghttp2.org
+h2load -n 60000 -c 1000 -m 200 -H 'Content-Type: application/json' --data=b.txt http://localhost:6666/hello
 ```
