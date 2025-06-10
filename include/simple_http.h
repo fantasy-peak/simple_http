@@ -28,7 +28,6 @@
 
 #include <nghttp2/nghttp2.h>
 
-#include <boost/asio.hpp>
 #include <boost/asio/as_tuple.hpp>
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/co_spawn.hpp>
@@ -50,6 +49,7 @@
 #include <boost/asio/post.hpp>
 #include <boost/asio/this_coro.hpp>
 #include <boost/asio/use_awaitable.hpp>
+#include <boost/asio.hpp>
 
 namespace simple_http
 {
@@ -58,7 +58,7 @@ namespace asio = boost::asio;
 namespace beast = boost::beast;
 namespace http = beast::http;
 
-enum class LogLevel
+enum class LogLevel : uint8_t
 {
     Debug,
     Info,
@@ -646,7 +646,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse>
     {
         int32_t stream_id = frame->hd.stream_id;
         auto h2p = static_cast<Http2Parse *>(userdata);
-        auto req = h2p->getStreamCtx(stream_id);
+        auto &req = h2p->getStreamCtx(stream_id);
         std::string name{(char *)_name, namelen};
         std::string_view value{(char *)_value, valuelen};
         std::ranges::transform(name, name.begin(), [](unsigned char c) {
@@ -695,7 +695,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse>
         auto call_handler = [&] {
             int32_t stream_id = frame->hd.stream_id;
             auto h2p = static_cast<Http2Parse *>(userdata);
-            auto req = h2p->getStreamCtx(stream_id);
+            auto &req = h2p->getStreamCtx(stream_id);
             req->prepare_payload();
             auto writer =
                 std::make_shared<HttpResponseWriter>(h2p->shared_from_this(),
@@ -737,7 +737,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse>
                                        void *userdata)
     {
         auto h2p = static_cast<Http2Parse *>(userdata);
-        auto req = h2p->getStreamCtx(stream_id);
+        auto &req = h2p->getStreamCtx(stream_id);
         req->body().append((char *)data, len);
         return 0;
     }
@@ -1177,7 +1177,8 @@ class HttpServer final
             }
             socket.set_option(asio::socket_base::keep_alive(true));
             // socket.set_option(asio::ip::tcp::no_delay(true));
-            // socket.set_option(asio::socket_base::send_buffer_size(5024 * 1024));
+            // socket.set_option(asio::socket_base::send_buffer_size(5024 *
+            // 1024));
             if (m_cfg.ssl_crt.empty())
             {
                 asio::co_spawn(*context,
