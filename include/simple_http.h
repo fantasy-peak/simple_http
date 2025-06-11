@@ -1210,8 +1210,13 @@ class HttpServer final
         m_acceptor->open(m_ep.protocol());
         error_code ec;
         m_acceptor->set_option(asio::ip::tcp::acceptor::reuse_address(true));
-        m_acceptor->bind(m_ep);
-        m_acceptor->listen(asio::socket_base::max_listen_connections, ec);
+        [[maybe_unused]] auto _ = m_acceptor->bind(m_ep, ec);
+        if (ec)
+        {
+            SIMPLE_HTTP_ERROR_LOG("bind: {}", ec.message());
+            throw std::runtime_error(ec.message());
+        }
+        _ = m_acceptor->listen(asio::socket_base::max_listen_connections, ec);
         if (ec)
         {
             SIMPLE_HTTP_ERROR_LOG("listen: {}", ec.message());
@@ -1232,9 +1237,9 @@ class HttpServer final
             auto endpoint = socket.remote_endpoint(ec);
             if (!ec)
             {
-                std::stringstream ss;
-                ss << endpoint;
-                SIMPLE_HTTP_INFO_LOG("new connection from:[{}]", ss.str());
+                SIMPLE_HTTP_INFO_LOG("new connection from [{}:{}]",
+                                     endpoint.address().to_string(),
+                                     endpoint.port());
             }
             socket.set_option(asio::socket_base::keep_alive(true));
             // socket.set_option(asio::ip::tcp::no_delay(true));
