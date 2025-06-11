@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <ostream>
 #include <string>
+#include <iostream>
 
 #include <boost/url.hpp>
 
@@ -25,8 +26,9 @@ asio::awaitable<void> start()
             std::cout << to_string(level) << " " << file << ":" << line << " "
                       << msg << std::endl;
         };
-    hs.setBefore([](const auto &req,
-                    const auto &writer) -> asio::awaitable<bool> {
+    hs.setBefore(
+        [](const auto &req, const auto &writer) -> asio::awaitable<bool> {
+#if 0
         boost::urls::url_view urlv =
             boost::urls::parse_origin_form(req.target()).value();
         if (urlv.path() != "/hello")
@@ -40,8 +42,9 @@ asio::awaitable<void> start()
         {
             std::cout << param.key << " = " << param.value << "\n";
         }
-        co_return true;
-    });
+#endif
+            co_return true;
+        });
     hs.setHttpHandler(
         "/hello", [](auto req, auto writer) -> asio::awaitable<void> {
             std::cout << "Headers:" << std::endl;
@@ -112,7 +115,15 @@ asio::awaitable<void> start()
                           res->prepare_payload();
                           writer->writeHttpResponse(res);
                           co_return;
-                      });
+                      })
+        .setHttpRegexHandler(
+            ".*", [](auto /* req */, auto writer) -> asio::awaitable<void> {
+                auto res = simple_http::makeHttpResponse(http::status::ok);
+                res->body() = "regex matched";
+                res->prepare_payload();
+                writer->writeHttpResponse(res);
+                co_return;
+            });
     co_await hs.start();
 }
 

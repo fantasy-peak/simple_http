@@ -9,10 +9,10 @@
 #include <cstdint>
 #include <functional>
 #include <future>
-#include <iostream>
 #include <list>
 #include <memory>
 #include <optional>
+#include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -356,6 +356,21 @@ struct HandlerFunctions
         map_proc[path] = std::move(cb);
     }
 
+    void setHttpRegexHandler(const std::string &regex,
+                             std::function<asio::awaitable<void>(
+                                 http::request<http::string_body>,
+                                 std::shared_ptr<HttpResponseWriter>)> cb)
+    {
+        try
+        {
+            regex_proc.emplace_back(std::regex{regex}, std::move(cb));
+        }
+        catch (const std::exception &e)
+        {
+            SIMPLE_HTTP_ERROR_LOG("regex:[{}], {}", regex, e.what());
+        }
+    }
+
     void setUnhandled(std::function<asio::awaitable<void>(
                           http::request<http::string_body>,
                           std::shared_ptr<HttpResponseWriter>)> cb)
@@ -398,6 +413,11 @@ struct HandlerFunctions
                  }
                  co_return;
              }}};
+    std::vector<std::pair<std::regex,
+                          std::function<asio::awaitable<void>(
+                              http::request<http::string_body>,
+                              std::shared_ptr<HttpResponseWriter>)>>>
+        regex_proc;
 };
 
 asio::awaitable<void> callCallback(std::weak_ptr<HandlerFunctions> hf,
@@ -422,6 +442,14 @@ asio::awaitable<void> callCallback(std::weak_ptr<HandlerFunctions> hf,
     }
     else
     {
+        for (const auto &[pattern, cb] : sp->regex_proc)
+        {
+            if (std::regex_match(path, pattern))
+            {
+                co_await cb(std::move(req), std::move(writer));
+                co_return;
+            }
+        }
         co_await sp->map_proc["*"](std::move(req), std::move(writer));
     }
     co_return;
@@ -1170,6 +1198,11 @@ class HttpServer final
         initSsl();
     }
 
+    HttpServer(const HttpServer &) = delete;
+    HttpServer &operator=(const HttpServer &) = delete;
+    HttpServer(HttpServer &&) = delete;
+    HttpServer &operator=(HttpServer &&) = delete;
+
     asio::awaitable<void> start()
     {
         m_acceptor = std::make_unique<asio::ip::tcp::acceptor>(
@@ -1244,26 +1277,38 @@ class HttpServer final
         }
     }
 
-    void setHttpHandler(const std::string &path,
-                        std::function<asio::awaitable<void>(
-                            http::request<http::string_body>,
-                            std::shared_ptr<HttpResponseWriter>)> cb)
+    auto &setHttpHandler(const std::string &path,
+                         std::function<asio::awaitable<void>(
+                             http::request<http::string_body>,
+                             std::shared_ptr<HttpResponseWriter>)> cb)
     {
         m_handler_functions->setHttpHandler(path, std::move(cb));
+        return *this;
     }
 
-    void setUnhandled(std::function<asio::awaitable<void>(
-                          http::request<http::string_body>,
-                          std::shared_ptr<HttpResponseWriter>)> cb)
+    auto &setHttpRegexHandler(const std::string &regex,
+                              std::function<asio::awaitable<void>(
+                                  http::request<http::string_body>,
+                                  std::shared_ptr<HttpResponseWriter>)> cb)
+    {
+        m_handler_functions->setHttpRegexHandler(regex, std::move(cb));
+        return *this;
+    }
+
+    auto &setUnhandled(std::function<asio::awaitable<void>(
+                           http::request<http::string_body>,
+                           std::shared_ptr<HttpResponseWriter>)> cb)
     {
         m_handler_functions->setUnhandled(std::move(cb));
+        return *this;
     }
 
-    void setBefore(std::function<asio::awaitable<bool>(
-                       const http::request<http::string_body> &,
-                       const std::shared_ptr<HttpResponseWriter> &)> cb)
+    auto &setBefore(std::function<asio::awaitable<bool>(
+                        const http::request<http::string_body> &,
+                        const std::shared_ptr<HttpResponseWriter> &)> cb)
     {
         m_handler_functions->setBefore(std::move(cb));
+        return *this;
     }
 
     auto ioDispatchPool()
