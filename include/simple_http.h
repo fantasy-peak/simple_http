@@ -622,11 +622,11 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse>
         return false;
     }
 
-    bool writeChunkData(std::string header)
+    bool writeChunkData(std::string data)
     {
         if (auto sp = m_h1_channel.lock())
         {
-            if (!sp->try_send(error_code{}, std::move(header)))
+            if (!sp->try_send(error_code{}, std::move(data)))
             {
                 SIMPLE_HTTP_ERROR_LOG("writeChunkData error");
                 return false;
@@ -860,7 +860,7 @@ class HttpResponseWriter
         static std::string server = http::to_string(http::field::server);
         if (!m_headers.contains(server))
         {
-            writeHeader(http::field::server, "simple_http_server");
+            m_headers.emplace(server, "simple_http_server");
         }
         m_write_h2_header_done = true;
         return m_http2_parse->writeHeaderEnd(std::move(m_headers),
@@ -897,12 +897,22 @@ class HttpResponseWriter
         return m_http2_parse->writeChunkData(ss.str());
     }
 
+    bool writeChunkData(const char *ptr, size_t size)
+    {
+        constexpr size_t max_chunk_header_len = 20;
+        char buffer[max_chunk_header_len];
+        int len = snprintf(buffer, max_chunk_header_len, "%zx\r\n", size);
+        std::string chunk;
+        chunk.reserve(len + size + 2 + 2);
+        chunk.append(buffer, len);
+        chunk.append(ptr, size);
+        chunk.append("\r\n", 2);
+        return m_http2_parse->writeChunkData(std::move(chunk));
+    }
+
     bool writeChunkData(const std::string &data)
     {
-        std::ostringstream oss;
-        oss << std::hex << data.length() << "\r\n";
-        oss << data << "\r\n";
-        return m_http2_parse->writeChunkData(oss.str());
+        return writeChunkData(data.c_str(), data.size());
     }
 
     bool writeChunkEnd()
