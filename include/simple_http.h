@@ -1,5 +1,5 @@
-#ifndef _SIMPLE_HTTP_H_
-#define _SIMPLE_HTTP_H_
+#ifndef _trojan_H_
+#define _trojan_H_
 
 #include <algorithm>
 #include <atomic>
@@ -7,12 +7,14 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <functional>
 #include <future>
 #include <list>
 #include <memory>
+#include <mutex>
 #include <optional>
-#include <regex>
+#include <ranges>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -25,8 +27,7 @@
 #include <utility>
 #include <variant>
 #include <vector>
-
-#include <nghttp2/nghttp2.h>
+#include <algorithm>
 
 #include <boost/asio/as_tuple.hpp>
 #include <boost/asio/awaitable.hpp>
@@ -50,8 +51,9 @@
 #include <boost/asio/this_coro.hpp>
 #include <boost/asio/use_awaitable.hpp>
 #include <boost/asio.hpp>
+#include <openssl/ssl.h>
 
-namespace simple_http
+namespace trojan
 {
 
 namespace asio = boost::asio;
@@ -64,38 +66,6 @@ enum class LogLevel : uint8_t
     Info,
     Error,
 };
-
-enum class Version : uint8_t
-{
-    Http1 = 0,
-    Http11 = 1,
-    Http2 = 2,
-};
-
-inline std::shared_ptr<http::response<http::string_body>> makeHttpResponse(
-    http::status status = http::status::ok,
-    std::string_view content_type = "text/plain")
-{
-    auto res = std::make_shared<http::response<http::string_body>>();
-    res->version(11);
-    res->result(status);
-    res->set(http::field::server, "simple_http_server");
-    res->set(http::field::content_type, content_type);
-    return res;
-}
-
-inline std::shared_ptr<http::request<http::string_body>> makeHttpRequest(
-    const std::string &path,
-    http::verb method = http::verb::post,
-    Version http_version = Version::Http11)
-{
-    auto req = std::make_shared<http::request<http::string_body>>(
-        method, path, http_version == Version::Http11 ? 11 : 10);
-    req->set(http::field::user_agent, "simpe_http_client");
-    return req;
-}
-
-constexpr int32_t CHANNEL_SIZE = 100000;
 
 inline constexpr std::string_view to_string(LogLevel level) noexcept
 {
@@ -112,24 +82,43 @@ inline constexpr std::string_view to_string(LogLevel level) noexcept
     }
 }
 
+class ScopeExit
+{
+  public:
+    ScopeExit(const ScopeExit &) = delete;
+    ScopeExit(ScopeExit &&) = delete;
+    ScopeExit &operator=(const ScopeExit &) = delete;
+    ScopeExit &operator=(ScopeExit &&) = delete;
+
+    template <typename Callable>
+    explicit ScopeExit(Callable &&call) : m_call(std::forward<Callable>(call))
+    {
+    }
+
+    ~ScopeExit()
+    {
+        if (m_call)
+            m_call();
+    }
+
+    void clear()
+    {
+        m_call = decltype(m_call)();
+    }
+
+  private:
+    std::function<void()> m_call;
+};
+
 inline std::function<void(LogLevel, std::string_view, int, std::string)>
     LOG_CB = [](auto, auto, auto, auto) {};
 
-#define SIMPLE_HTTP_DEBUG_LOG(...)                 \
-    simple_http::log(simple_http::LogLevel::Debug, \
-                     __FILE__,                     \
-                     __LINE__,                     \
-                     __VA_ARGS__)
-#define SIMPLE_HTTP_INFO_LOG(...)                 \
-    simple_http::log(simple_http::LogLevel::Info, \
-                     __FILE__,                    \
-                     __LINE__,                    \
-                     __VA_ARGS__)
-#define SIMPLE_HTTP_ERROR_LOG(...)                 \
-    simple_http::log(simple_http::LogLevel::Error, \
-                     __FILE__,                     \
-                     __LINE__,                     \
-                     __VA_ARGS__)
+#define TROJAN_DEBUG_LOG(...) \
+    trojan::log(trojan::LogLevel::Debug, __FILE__, __LINE__, __VA_ARGS__)
+#define TROJAN_INFO_LOG(...) \
+    trojan::log(trojan::LogLevel::Info, __FILE__, __LINE__, __VA_ARGS__)
+#define TROJAN_ERROR_LOG(...) \
+    trojan::log(trojan::LogLevel::Error, __FILE__, __LINE__, __VA_ARGS__)
 
 template <typename... Args>
 inline void log(LogLevel level,
@@ -217,902 +206,254 @@ class IoCtxPool final
     uint64_t m_pool_size;
 };
 
-struct DataContext
+asio::awaitable<void> forward(auto from_socket,
+                              auto to_socket,
+                              auto deadline,
+                              auto &cfg)
 {
-    const char *data;
-    size_t total_len;
-    size_t offset;
-    std::shared_ptr<void> input_data{nullptr};
-};
-
-inline ssize_t dataReadCallback(nghttp2_session * /* session */,
-                                int32_t /* stream_id */,
-                                uint8_t *buf,
-                                size_t length,
-                                uint32_t *data_flags,
-                                nghttp2_data_source *source,
-                                void * /* user_data */)
-{
-    auto *ctx = static_cast<DataContext *>(source->ptr);
-
-    size_t remaining = ctx->total_len - ctx->offset;
-    size_t to_copy = remaining < length ? remaining : length;
-
-    memcpy(buf, ctx->data + ctx->offset, to_copy);
-    ctx->offset += to_copy;
-
-    if (ctx->offset >= ctx->total_len)
-    {
-        *data_flags |= NGHTTP2_DATA_FLAG_EOF;
-        delete ctx;
-    }
-
-    return to_copy;
-}
-
-constexpr char base64_url_alphabet[] = {'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H',
-                                        'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P',
-                                        'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X',
-                                        'Y', 'Z', 'a', 'b', 'c', 'd', 'e', 'f',
-                                        'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n',
-                                        'o', 'p', 'q', 'r', 's', 't', 'u', 'v',
-                                        'w', 'x', 'y', 'z', '0', '1', '2', '3',
-                                        '4', '5', '6', '7', '8', '9', '-', '_'};
-
-inline std::string base64_encode(const std::string &in)
-{
-    std::string out;
-    int val = 0, valb = -6;
-    size_t len = in.length();
-    unsigned int i = 0;
-    for (i = 0; i < len; i++)
-    {
-        unsigned char c = in[i];
-        val = (val << 8) + c;
-        valb += 8;
-        while (valb >= 0)
-        {
-            out.push_back(base64_url_alphabet[(val >> valb) & 0x3F]);
-            valb -= 6;
-        }
-    }
-    if (valb > -6)
-    {
-        out.push_back(base64_url_alphabet[((val << 8) >> (valb + 8)) & 0x3F]);
-    }
-    return out;
-}
-
-inline std::string base64_decode(const std::string &in)
-{
-    std::string out;
-    std::vector<int> T(256, -1);
-    unsigned int i;
-    for (i = 0; i < 64; i++)
-        T[base64_url_alphabet[i]] = i;
-
-    int val = 0, valb = -8;
-    for (i = 0; i < in.length(); i++)
-    {
-        unsigned char c = in[i];
-        if (T[c] == -1)
-            break;
-        val = (val << 6) + T[c];
-        valb += 6;
-        if (valb >= 0)
-        {
-            out.push_back(char((val >> valb) & 0xFF));
-            valb -= 8;
-        }
-    }
-    return out;
-}
-
-inline bool isHttp2(const std::string &cache_data)
-{
-    if (cache_data.empty() || cache_data.size() < 6)
-        return false;
-    if (cache_data[0] == 0x50 && cache_data[1] == 0x52 &&
-        cache_data[2] == 0x49 && cache_data[3] == 0x20 &&
-        cache_data[4] == 0x2A && cache_data[5] == 0x20)
-    {
-        return true;
-    }
-    else
-    {
-        return false;
-    }
-}
-
-struct Disconnect
-{
-};
-
-class HttpResponseWriter;
-
-using Http1Channel = asio::experimental::concurrent_channel<
-    void(error_code,
-         std::variant<std::shared_ptr<http::response<http::string_body>>,
-                      std::string,
-                      Disconnect>)>;
-
-using Http2Channel = asio::experimental::concurrent_channel<
-    void(error_code, std::variant<std::shared_ptr<std::string>, Disconnect>)>;
-
-struct HandlerFunctions
-{
-    void setBefore(std::function<asio::awaitable<bool>(
-                       const http::request<http::string_body> &,
-                       const std::shared_ptr<HttpResponseWriter> &)> cb)
-    {
-        before = std::move(cb);
-    }
-
-    void setHttpHandler(const std::string &path,
-                        std::function<asio::awaitable<void>(
-                            http::request<http::string_body>,
-                            std::shared_ptr<HttpResponseWriter>)> cb)
-    {
-        map_proc[path] = std::move(cb);
-    }
-
-    void setHttpRegexHandler(const std::string &regex,
-                             std::function<asio::awaitable<void>(
-                                 http::request<http::string_body>,
-                                 std::shared_ptr<HttpResponseWriter>)> cb)
-    {
-        try
-        {
-            regex_proc.emplace_back(std::regex{regex}, std::move(cb));
-        }
-        catch (const std::exception &e)
-        {
-            SIMPLE_HTTP_ERROR_LOG("regex:[{}], {}", regex, e.what());
-        }
-    }
-
-    void setUnhandled(std::function<asio::awaitable<void>(
-                          http::request<http::string_body>,
-                          std::shared_ptr<HttpResponseWriter>)> cb)
-    {
-        map_proc["*"] = std::move(cb);
-    }
-
-    std::function<
-        asio::awaitable<bool>(const http::request<http::string_body> &,
-                              const std::shared_ptr<HttpResponseWriter> &)>
-        before{[](const auto &, const auto &) -> asio::awaitable<bool> {
-            co_return true;
-        }};
-
-    std::unordered_map<std::string,
-                       std::function<asio::awaitable<void>(
-                           http::request<http::string_body>,
-                           std::shared_ptr<HttpResponseWriter>)>>
-        map_proc{
-            {"*", [](auto, auto writer) -> asio::awaitable<void> {
-                 if (writer->version() == simple_http::Version::Http2)
-                 {
-                     writer->writeStatus(404);
-                     writer->writeHeader("content-type", "text/plain");
-                     writer->writeHeader(http::field::server, "simple_http");
-                     writer->writeHeaderEnd();
-                     writer->writeBodyEnd("");
-                 }
-                 else
-                 {
-                     http::response<http::string_body> res{
-                         http::status::not_found, 11};
-                     res.set(http::field::content_type, "text/plain");
-                     res.set(http::field::server, "simple_http");
-                     res.body() = "";
-                     res.prepare_payload();
-                     writer->writeHttpResponse(
-                         std::make_shared<http::response<http::string_body>>(
-                             res));
-                 }
-                 co_return;
-             }}};
-    std::vector<std::pair<std::regex,
-                          std::function<asio::awaitable<void>(
-                              http::request<http::string_body>,
-                              std::shared_ptr<HttpResponseWriter>)>>>
-        regex_proc;
-};
-
-asio::awaitable<void> callCallback(std::weak_ptr<HandlerFunctions> hf,
-                                   auto req,
-                                   auto writer)
-{
-    auto sp = hf.lock();
-    if (!sp)
-        co_return;
-    if (!co_await sp->before(req, writer))
-    {
-        co_return;
-    }
-    std::string path = req.target();
-    if (auto pos = path.find('?'); pos != std::string::npos)
-    {
-        path = path.substr(0, pos);
-    }
-    if (sp->map_proc.contains(path))
-    {
-        co_await sp->map_proc[path](std::move(req), std::move(writer));
-    }
-    else
-    {
-        for (const auto &[pattern, cb] : sp->regex_proc)
-        {
-            if (std::regex_match(path, pattern))
-            {
-                co_await cb(std::move(req), std::move(writer));
-                co_return;
-            }
-        }
-        co_await sp->map_proc["*"](std::move(req), std::move(writer));
-    }
-    co_return;
-}
-
-inline void callHandler(const std::weak_ptr<HandlerFunctions> &hf,
-                        auto &io_dispatch,
-                        auto req,
-                        auto writer)
-{
-    asio::co_spawn(io_dispatch,
-                   callCallback(hf, std::move(req), std::move(writer)),
-                   [](const std::exception_ptr &ep) {
-                       try
-                       {
-                           if (ep)
-                               std::rethrow_exception(ep);
-                       }
-                       catch (const std::exception &e)
-                       {
-                           SIMPLE_HTTP_ERROR_LOG("{}", e.what());
-                       }
-                       catch (...)
-                       {
-                           SIMPLE_HTTP_ERROR_LOG("unknown exception");
-                       }
-                   });
-    return;
-}
-
-class Http2Parse final : public std::enable_shared_from_this<Http2Parse>
-{
-  public:
-    struct Config
-    {
-        bool is_h2c_upgrade;
-        std::string h2_setting;
-        int32_t concurrent_streams{200};
-        std::optional<int32_t> window_size;
-        std::optional<int32_t> max_frame_size;
-        http::verb method;
-    };
-
-    Http2Parse(const std::shared_ptr<Http2Channel> &ch2,
-               const std::shared_ptr<Http1Channel> &ch1,
-               auto io_context,
-               const std::shared_ptr<HandlerFunctions> &handler_functions)
-        : m_h2_channel(ch2),
-          m_h1_channel(ch1),
-          m_io_dispatch(std::move(io_context)),
-          m_handler_functions(handler_functions)
-    {
-    }
-
-    ~Http2Parse()
-    {
-        if (m_session)
-        {
-            nghttp2_session_callbacks_del(m_cbs);
-            nghttp2_session_del(m_session);
-        }
-    }
-
-    int init(const Config &cfg)
-    {
-        nghttp2_session_callbacks_new(&m_cbs);
-        nghttp2_session_callbacks_set_on_header_callback(m_cbs,
-                                                         onHeaderCallback);
-        nghttp2_session_callbacks_set_send_callback(m_cbs, sendCallback);
-        nghttp2_session_callbacks_set_on_frame_recv_callback(
-            m_cbs, onFrameRecvCallback);
-        nghttp2_session_callbacks_set_on_data_chunk_recv_callback(
-            m_cbs, onDataChunkRecvCallback);
-
-        nghttp2_session_server_new(&m_session, m_cbs, this);
-
-        if (cfg.is_h2c_upgrade)
-        {
-            auto http2_settings_base64 = base64_decode(cfg.h2_setting);
-            auto ret = nghttp2_session_upgrade2(
-                m_session,
-                (uint8_t *)http2_settings_base64.data(),
-                http2_settings_base64.size(),
-                cfg.method == http::verb::head ? 1 : 0,
-                nullptr);
-            if (ret)
-            {
-                SIMPLE_HTTP_ERROR_LOG("nghttp2_session_upgrade2 error: {}",
-                                      nghttp2_strerror(ret));
-                return ret;
-            }
-        }
-
-        std::vector<nghttp2_settings_entry> iv;
-        iv.emplace_back(NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS,
-                        cfg.concurrent_streams);
-        if (cfg.window_size.has_value())
-        {
-            iv.emplace_back(NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE,
-                            cfg.window_size.value());
-        }
-        if (cfg.max_frame_size.has_value())
-        {
-            iv.emplace_back(NGHTTP2_SETTINGS_MAX_FRAME_SIZE,
-                            cfg.max_frame_size.value());
-        }
-        nghttp2_submit_settings(m_session,
-                                NGHTTP2_FLAG_NONE,
-                                iv.data(),
-                                iv.size());
-        nghttp2_session_send(m_session);
-
-        return 0;
-    }
-
-    bool writeHeaderEnd(std::unordered_map<std::string, std::string> headers,
-                        int32_t stream_id,
-                        std::string http_status)
-    {
-        if (auto sp = m_h2_channel.lock())
-        {
-            std::weak_ptr<Http2Parse> self = shared_from_this();
-            asio::post(sp->get_executor(),
-                       [this,
-                        self = std::move(self),
-                        headers = std::move(headers),
-                        stream_id,
-                        http_status = std::move(http_status)]() mutable {
-                           if (auto sp = self.lock())
-                           {
-                               std::vector<nghttp2_nv> hdrs;
-                               auto fill = [](const auto &name,
-                                              const auto &value,
-                                              auto &hdrs) {
-                                   nghttp2_nv nv;
-                                   nv.name = (uint8_t *)name.c_str();
-                                   nv.namelen = name.size();
-                                   nv.value = (uint8_t *)value.c_str();
-                                   nv.valuelen = value.size();
-                                   nv.flags = NGHTTP2_NV_FLAG_NONE;
-                                   hdrs.push_back(nv);
-                               };
-                               static std::string status{":status"};
-                               fill(status, http_status, hdrs);
-                               for (auto &[name, value] : headers)
-                               {
-                                   fill(name, value, hdrs);
-                               }
-                               nghttp2_submit_headers(m_session,
-                                                      NGHTTP2_FLAG_END_HEADERS,
-                                                      stream_id,
-                                                      nullptr,
-                                                      hdrs.data(),
-                                                      hdrs.size(),
-                                                      nullptr);
-                               nghttp2_session_send(m_session);
-                           }
-                       });
-            return true;
-        }
-        return false;
-    }
-
-    bool writeBody(std::string data,
-                   int32_t stream_id,
-                   nghttp2_flag flag = NGHTTP2_FLAG_NONE)
-    {
-        if (auto sp = m_h2_channel.lock())
-        {
-            std::weak_ptr<Http2Parse> self = shared_from_this();
-            asio::post(sp->get_executor(),
-                       [this,
-                        self = std::move(self),
-                        data = std::make_shared<std::string>(std::move(data)),
-                        flag,
-                        stream_id] {
-                           if (auto sp = self.lock())
-                           {
-                               nghttp2_data_provider data_prd;
-                               data_prd.read_callback = dataReadCallback;
-                               auto *ctx =
-                                   new DataContext{.data = data->c_str(),
-                                                   .total_len = data->size(),
-                                                   .offset = 0,
-                                                   .input_data = data};
-                               nghttp2_data_source source;
-                               source.ptr = ctx;
-                               data_prd.source = source;
-                               nghttp2_submit_data(m_session,
-                                                   flag,
-                                                   stream_id,
-                                                   &data_prd);
-                               nghttp2_session_send(m_session);
-                           }
-                       });
-            return true;
-        }
-        return false;
-    }
-
-    bool writeChunkData(std::string data)
-    {
-        if (auto sp = m_h1_channel.lock())
-        {
-            if (!sp->try_send(error_code{}, std::move(data)))
-            {
-                SIMPLE_HTTP_ERROR_LOG("writeChunkData error");
-                return false;
-            }
-            return true;
-        }
-        return false;
-    }
-
-    bool writeHttp1Response(
-        const std::shared_ptr<http::response<http::string_body>>
-            &http_1_response)
-    {
-        if (auto sp = m_h1_channel.lock())
-        {
-            if (!sp->try_send(error_code{}, http_1_response))
-            {
-                SIMPLE_HTTP_ERROR_LOG("{}", "writeHttp1Response error");
-                return false;
-            }
-            return true;
-        }
-        SIMPLE_HTTP_DEBUG_LOG("{}", "writeHttp1Response client disconnect!!!");
-        return false;
-    }
-
-    static int onHeaderCallback(nghttp2_session * /* session */,
-                                const nghttp2_frame *frame,
-                                const uint8_t *_name,
-                                size_t namelen,
-                                const uint8_t *_value,
-                                size_t valuelen,
-                                uint8_t /* flags */,
-                                void *userdata)
-    {
-        int32_t stream_id = frame->hd.stream_id;
-        auto h2p = static_cast<Http2Parse *>(userdata);
-        auto &req = h2p->getStreamCtx(stream_id);
-        std::string name{(char *)_name, namelen};
-        std::string_view value{(char *)_value, valuelen};
-        std::ranges::transform(name, name.begin(), [](unsigned char c) {
-            return std::tolower(c);
-        });
-        if (name == ":method")
-        {
-            req->method(http::string_to_verb(value));
-        }
-        else if (name == ":path")
-        {
-            req->target(value);
-        }
-        else
-        {
-            req->set(name, value);
-        }
-        return 0;
-    }
-
-    static ssize_t sendCallback(nghttp2_session * /* session */,
-                                const uint8_t *data,
-                                size_t length,
-                                int /* flags */,
-                                void *userdata)
-    {
-        auto h2p = static_cast<Http2Parse *>(userdata);
-        auto sp = h2p->m_h2_channel.lock();
-        if (sp == nullptr)
-        {
-            SIMPLE_HTTP_DEBUG_LOG("{}", "sendCallback client disconnect!!!");
-            return length;
-        }
-        if (!sp->try_send(error_code{},
-                          std::make_shared<std::string>((char *)data, length)))
-        {
-            SIMPLE_HTTP_ERROR_LOG("{}", "sendCallback send error!!!!");
-        }
-        return length;
-    }
-
-    static int onFrameRecvCallback(nghttp2_session * /* session */,
-                                   const nghttp2_frame *frame,
-                                   void *userdata)
-    {
-        auto call_handler = [&] {
-            int32_t stream_id = frame->hd.stream_id;
-            auto h2p = static_cast<Http2Parse *>(userdata);
-            auto &req = h2p->getStreamCtx(stream_id);
-            req->prepare_payload();
-            auto writer =
-                std::make_shared<HttpResponseWriter>(h2p->shared_from_this(),
-                                                     stream_id,
-                                                     Version::Http2);
-            if (auto sp = h2p->m_h2_channel.lock())
-            {
-                callHandler(h2p->m_handler_functions,
-                            *h2p->m_io_dispatch,
-                            std::move(*req),
-                            std::move(writer));
-            }
-            h2p->erase(stream_id);
-        };
-
-        if (frame->hd.type == NGHTTP2_HEADERS &&
-            frame->headers.cat == NGHTTP2_HCAT_REQUEST)
-        {
-            if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM)
-            {
-                call_handler();
-            }
-        }
-
-        if (frame->hd.type == NGHTTP2_DATA &&
-            (frame->hd.flags & NGHTTP2_FLAG_END_STREAM))
-        {
-            call_handler();
-        }
-
-        return 0;
-    }
-
-    static int onDataChunkRecvCallback(nghttp2_session * /* session */,
-                                       uint8_t /* flags */,
-                                       int32_t stream_id,
-                                       const uint8_t *data,
-                                       size_t len,
-                                       void *userdata)
-    {
-        auto h2p = static_cast<Http2Parse *>(userdata);
-        auto &req = h2p->getStreamCtx(stream_id);
-        req->body().append((char *)data, len);
-        return 0;
-    }
-
-    int feedRecvData(const char *data, size_t len)
-    {
-        size_t ret =
-            nghttp2_session_mem_recv(m_session, (const uint8_t *)data, len);
-        if (ret != len)
-        {
-            SIMPLE_HTTP_ERROR_LOG("nghttp2 error: {}", nghttp2_strerror(ret));
-            return -1;
-        }
-        return (int)ret;
-    }
-
-    std::shared_ptr<http::request<http::string_body>> &getStreamCtx(
-        int32_t stream_id)
-    {
-        if (!m_streams.contains(stream_id))
-        {
-            m_streams[stream_id] =
-                std::make_shared<http::request<http::string_body>>();
-        }
-        return m_streams[stream_id];
-    }
-
-    void erase(int32_t stream_id)
-    {
-        m_streams.erase(stream_id);
-    }
-
-    std::weak_ptr<Http2Channel> m_h2_channel;
-    std::weak_ptr<Http1Channel> m_h1_channel;
-    std::shared_ptr<asio::io_context> m_io_dispatch;
-    nghttp2_session_callbacks *m_cbs{};
-    nghttp2_session *m_session{};
-    std::unordered_map<int32_t,
-                       std::shared_ptr<http::request<http::string_body>>>
-        m_streams;
-    std::weak_ptr<HandlerFunctions> m_handler_functions;
-};
-
-class HttpResponseWriter
-{
-  public:
-    HttpResponseWriter(const std::shared_ptr<Http2Parse> &http2_helper,
-                       int32_t stream_id,
-                       Version version)
-        : m_http2_parse(http2_helper),
-          m_stream_id(stream_id),
-          m_version(version)
-    {
-    }
-
-    ~HttpResponseWriter()
-    {
-        if (m_version == Version::Http2 && !m_write_h2_header_done)
-        {
-            writeHeaderEnd();
-        }
-        if (m_version == Version::Http2 && !m_write_h2_body_done)
-        {
-            writeBodyEnd("");
-        }
-    }
-
-    void writeStatus(int32_t http_status)
-    {
-        m_http_status = std::to_string(http_status);
-    }
-
-    void writeStatus(http::status http_status)
-    {
-        writeStatus(static_cast<int32_t>(http_status));
-    }
-
-    template <typename Key, typename Value>
-    void writeHeader(Key &&key, Value &&value)
-    {
-        if constexpr (std::is_same_v<std::decay_t<Key>, http::field>)
-        {
-            m_headers.emplace(http::to_string(std::forward<Key>(key)),
-                              std::forward<Value>(value));
-        }
-        else
-        {
-            m_headers.emplace(std::forward<Key>(key),
-                              std::forward<Value>(value));
-        }
-    }
-
-    void writeHeader(std::unordered_map<std::string, std::string> headers)
-    {
-        m_headers.merge(headers);
-    }
-
-    bool writeHeaderEnd()
-    {
-        if (m_version != Version::Http2)
-            return false;
-        static std::string server = http::to_string(http::field::server);
-        if (!m_headers.contains(server))
-        {
-            m_headers.emplace(server, "simple_http_server");
-        }
-        m_write_h2_header_done = true;
-        return m_http2_parse->writeHeaderEnd(std::move(m_headers),
-                                             m_stream_id,
-                                             std::move(m_http_status));
-    }
-
-    template <typename T>
-    bool writeBody(T &&data, nghttp2_flag flag = NGHTTP2_FLAG_NONE)
-    {
-        if (m_version != Version::Http2)
-            return false;
-        static_assert(std::is_constructible_v<std::string, T &&>,
-                      "T must be convertible to std::string");
-        return m_http2_parse->writeBody(std::forward<T>(data),
-                                        m_stream_id,
-                                        flag);
-    }
-
-    template <typename T>
-    bool writeBodyEnd(T &&data)
-    {
-        if (m_version != Version::Http2)
-            return false;
-        m_write_h2_body_done = true;
-        return writeBody(std::forward<T>(data), NGHTTP2_FLAG_END_STREAM);
-    }
-
-    // for http1.1 chunk
-    bool writeChunkHeader(const http::response<http::empty_body> &res)
-    {
-        std::stringstream ss;
-        ss << res.base();
-        return m_http2_parse->writeChunkData(ss.str());
-    }
-
-    bool writeChunkData(const char *ptr, size_t size)
-    {
-        constexpr size_t max_chunk_header_len = 20;
-        char buffer[max_chunk_header_len];
-        int len = snprintf(buffer, max_chunk_header_len, "%zx\r\n", size);
-        std::string chunk;
-        chunk.reserve(len + size + 2 + 2);
-        chunk.append(buffer, len);
-        chunk.append(ptr, size);
-        chunk.append("\r\n", 2);
-        return m_http2_parse->writeChunkData(std::move(chunk));
-    }
-
-    bool writeChunkData(const std::string &data)
-    {
-        return writeChunkData(data.c_str(), data.size());
-    }
-
-    bool writeChunkEnd()
-    {
-        static std::string close_stream{"0\r\n\r\n"};
-        return m_http2_parse->writeChunkData(close_stream);
-    }
-
-    bool connected()
-    {
-        if (m_version == Version::Http2)
-        {
-            return m_http2_parse->m_h2_channel.lock() ? true : false;
-        }
-        else
-        {
-            return m_http2_parse->m_h1_channel.lock() ? true : false;
-        }
-    }
-
-    void forceClose()
-    {
-        if (m_version == Version::Http2)
-        {
-            if (auto sp = m_http2_parse->m_h2_channel.lock())
-            {
-                asio::post(sp->get_executor(),
-                           [sp] { sp->try_send(error_code{}, Disconnect{}); });
-            }
-        }
-        else
-        {
-            if (auto sp = m_http2_parse->m_h1_channel.lock())
-            {
-                asio::post(sp->get_executor(),
-                           [sp] { sp->try_send(error_code{}, Disconnect{}); });
-            }
-        }
-    }
-
-    bool writeHttpResponse(
-        const std::shared_ptr<http::response<http::string_body>> &http_response)
-    {
-        if (m_version == Version::Http2)
-        {
-            m_http_status = std::to_string(http_response->result_int());
-            for (const auto &field : http_response->base())
-            {
-                writeHeader(field.name_string(), field.value());
-            }
-            writeHeaderEnd();
-            writeBodyEnd(std::move(http_response->body()));
-            return true;
-        }
-        else
-        {
-            return m_http2_parse->writeHttp1Response(http_response);
-        }
-    }
-
-    auto version()
-    {
-        return m_version;
-    }
-
-  private:
-    std::shared_ptr<Http2Parse> m_http2_parse;
-    int32_t m_stream_id;
-    Version m_version;
-    std::string m_http_status{"200"};
-    std::unordered_map<std::string, std::string> m_headers;
-    bool m_write_h2_header_done{false};
-    bool m_write_h2_body_done{false};
-};
-
-inline asio::awaitable<void> toSocket(
-    auto socket,
-    std::shared_ptr<Http2Channel> ch,
-    std::shared_ptr<std::chrono::steady_clock::time_point> deadline)
-{
-    std::vector<std::shared_ptr<std::string>> vec;
-    bool force_close = false;
+    std::vector<char> buffer(32 * 1024);
     for (;;)
     {
-        while (true)
-        {
-            std::variant<std::shared_ptr<std::string>, Disconnect> data;
-            if (!ch->try_receive(
-                    [&](auto, auto recv_data) { data = std::move(recv_data); }))
-            {
-                break;
-            }
-            if (std::holds_alternative<Disconnect>(data))
-            {
-                force_close = true;
-                break;
-            }
-            else
-            {
-                auto &info_ptr = std::get<std::shared_ptr<std::string>>(data);
-                vec.emplace_back(std::move(info_ptr));
-            }
-            *deadline = std::chrono::steady_clock::now();
-        }
-
-        if (vec.empty() && !force_close)
-        {
-            std::variant<std::shared_ptr<std::string>, Disconnect> data;
-
-            error_code ec;
-            std::tie(ec, data) =
-                co_await ch->async_receive(asio::as_tuple(asio::use_awaitable));
-            if (ec)
-            {
-                break;
-            }
-            if (std::holds_alternative<Disconnect>(data))
-            {
-                force_close = true;
-            }
-            else
-            {
-                auto &info_ptr = std::get<std::shared_ptr<std::string>>(data);
-                vec.emplace_back(std::move(info_ptr));
-            }
-            *deadline = std::chrono::steady_clock::now();
-        }
-
-        if (!vec.empty())
-        {
-            std::vector<asio::const_buffer> buffers;
-            buffers.reserve(vec.size());
-            for (const auto &s : vec)
-            {
-                buffers.push_back(asio::buffer(*s));
-            }
-            if (auto [ec, nwritten] = co_await async_write(
-                    *socket, buffers, asio::as_tuple(asio::use_awaitable));
-                ec)
-            {
-                break;
-            }
-            vec.clear();
-        }
-
-        if (force_close)
-            break;
-    }
-    co_return;
-}
-
-inline asio::awaitable<void> toH2Parse(
-    auto socket,
-    auto h2p,
-    std::shared_ptr<std::chrono::steady_clock::time_point> deadline)
-{
-    char buffer[4096];
-    for (;;)
-    {
-        auto [ec, nread] = co_await socket->async_read_some(
-            asio::buffer(buffer, sizeof(buffer)),
-            asio::as_tuple(asio::use_awaitable));
+        *deadline = std::chrono::steady_clock::now() + cfg.read_write_max_idle;
+        auto [ec, length] = co_await from_socket->async_read_some(
+            asio::buffer(buffer), asio::as_tuple(asio::use_awaitable));
         if (ec)
         {
             break;
         }
-        *deadline = std::chrono::steady_clock::now();
-        auto ret = h2p->feedRecvData(buffer, nread);
-        if (ret == -1)
+        // TROJAN_INFO_LOG("forward {} bytes", length);
+        if (auto [ec, len] =
+                co_await asio::async_write(*to_socket,
+                                           asio::buffer(buffer, length),
+                                           asio::as_tuple(asio::use_awaitable));
+            ec)
         {
             break;
         }
+    }
+    co_return;
+}
+
+class Socks5Address
+{
+  public:
+    enum AddressType
+    {
+        IPv4 = 1,
+        DOMAINNAME = 3,
+        IPv6 = 4
+    } address_type;
+
+    std::string address;
+    uint16_t port;
+
+    bool parse(const std::string &data, size_t &address_len)
+    {
+        if (data.length() == 0 ||
+            (data[0] != IPv4 && data[0] != DOMAINNAME && data[0] != IPv6))
+        {
+            return false;
+        }
+        address_type = static_cast<AddressType>(data[0]);
+        switch (address_type)
+        {
+            case IPv4:
+            {
+                if (data.length() > 4 + 2)
+                {
+                    address = std::to_string(uint8_t(data[1])) + '.' +
+                              std::to_string(uint8_t(data[2])) + '.' +
+                              std::to_string(uint8_t(data[3])) + '.' +
+                              std::to_string(uint8_t(data[4]));
+                    port = (uint8_t(data[5]) << 8) | uint8_t(data[6]);
+                    address_len = 1 + 4 + 2;
+                    return true;
+                }
+                break;
+            }
+            case DOMAINNAME:
+            {
+                uint8_t domain_len = data[1];
+                if (domain_len == 0)
+                {
+                    // invalid domain len
+                    break;
+                }
+                if (data.length() > (unsigned int)(1 + domain_len + 2))
+                {
+                    address = data.substr(2, domain_len);
+                    port = (uint8_t(data[domain_len + 2]) << 8) |
+                           uint8_t(data[domain_len + 3]);
+                    address_len = 1 + 1 + domain_len + 2;
+                    return true;
+                }
+                break;
+            }
+            case IPv6:
+            {
+                if (data.length() > 16 + 2)
+                {
+                    char t[40];
+                    sprintf(
+                        t,
+                        "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:"
+                        "%02x%02x:%02x%02x",
+                        uint8_t(data[1]),
+                        uint8_t(data[2]),
+                        uint8_t(data[3]),
+                        uint8_t(data[4]),
+                        uint8_t(data[5]),
+                        uint8_t(data[6]),
+                        uint8_t(data[7]),
+                        uint8_t(data[8]),
+                        uint8_t(data[9]),
+                        uint8_t(data[10]),
+                        uint8_t(data[11]),
+                        uint8_t(data[12]),
+                        uint8_t(data[13]),
+                        uint8_t(data[14]),
+                        uint8_t(data[15]),
+                        uint8_t(data[16]));
+                    address = t;
+                    port = (uint8_t(data[17]) << 8) | uint8_t(data[18]);
+                    address_len = 1 + 16 + 2;
+                    return true;
+                }
+                break;
+            }
+        }
+        return false;
+    }
+
+    static std::string generate(const boost::asio::ip::udp::endpoint &endpoint)
+    {
+        if (endpoint.address().is_unspecified())
+        {
+            return std::string("\x01\x00\x00\x00\x00\x00\x00", 7);
+        }
+        std::string ret;
+        if (endpoint.address().is_v4())
+        {
+            ret += '\x01';
+            auto ip = endpoint.address().to_v4().to_bytes();
+            for (int i = 0; i < 4; ++i)
+            {
+                ret += char(ip[i]);
+            }
+        }
+        if (endpoint.address().is_v6())
+        {
+            ret += '\x04';
+            auto ip = endpoint.address().to_v6().to_bytes();
+            for (int i = 0; i < 16; ++i)
+            {
+                ret += char(ip[i]);
+            }
+        }
+        ret += char(uint8_t(endpoint.port() >> 8));
+        ret += char(uint8_t(endpoint.port() & 0xFF));
+        return ret;
+    }
+};
+
+class UdpPacket
+{
+  public:
+    Socks5Address address;
+    uint16_t length;
+    std::string payload;
+
+    bool parse(const std::string &data, size_t &udp_packet_len)
+    {
+        if (data.length() <= 0)
+        {
+            return false;
+        }
+        size_t address_len;
+        bool is_addr_valid = address.parse(data, address_len);
+        if (!is_addr_valid || data.length() < address_len + 2)
+        {
+            return false;
+        }
+        length =
+            (uint8_t(data[address_len]) << 8) | uint8_t(data[address_len + 1]);
+        if (data.length() < address_len + 4 + length ||
+            data.substr(address_len + 2, 2) != "\r\n")
+        {
+            return false;
+        }
+        payload = data.substr(address_len + 4, length);
+        udp_packet_len = address_len + 4 + length;
+        return true;
+    }
+
+    static std::string generate(const boost::asio::ip::udp::endpoint &endpoint,
+                                const std::string &payload)
+    {
+        std::string ret = Socks5Address::generate(endpoint);
+        ret += char(uint8_t(payload.length() >> 8));
+        ret += char(uint8_t(payload.length() & 0xFF));
+        ret += "\r\n";
+        ret += payload;
+        return ret;
+    }
+
+    static std::string generate(const std::string &domainname,
+                                uint16_t port,
+                                const std::string &payload)
+    {
+        std::string ret = "\x03";
+        ret += char(uint8_t(domainname.length()));
+        ret += domainname;
+        ret += char(uint8_t(port >> 8));
+        ret += char(uint8_t(port & 0xFF));
+        ret += char(uint8_t(payload.length() >> 8));
+        ret += char(uint8_t(payload.length() & 0xFF));
+        ret += "\r\n";
+        ret += payload;
+        return ret;
+    }
+};
+
+class TrojanRequest
+{
+  public:
+    std::string password;
+
+    enum Command : uint8_t
+    {
+        CONNECT = 1,
+        UDP_ASSOCIATE = 3
+    } command;
+
+    Socks5Address address;
+    std::string payload;
+
+    int parse(const std::string &data)
+    {
+        size_t first = data.find("\r\n");
+        if (first == std::string::npos)
+        {
+            return -1;
+        }
+        password = data.substr(0, first);
+        payload = data.substr(first + 2);
+        if (payload.length() == 0 || (payload[0] != Command::CONNECT &&
+                                      payload[0] != Command::UDP_ASSOCIATE))
+        {
+            return -1;
+        }
+        command = static_cast<Command>(payload[0]);
+        size_t address_len;
+        bool is_addr_valid = address.parse(payload.substr(1), address_len);
+        if (!is_addr_valid || payload.length() < address_len + 3 ||
+            payload.substr(address_len + 1, 2) != "\r\n")
+        {
+            return -1;
+        }
+        // address_len = ATYP + DST.ADDR + DST.PORT
+        payload = payload.substr(address_len + 3);
+        return data.length();
     }
 };
 
@@ -1138,22 +479,85 @@ void shutdown(const auto &socket)
 }
 
 inline asio::awaitable<void> watchdog(
-    std::shared_ptr<std::chrono::steady_clock::time_point> deadline,
-    std::chrono::seconds interval)
+    std::shared_ptr<std::chrono::steady_clock::time_point> deadline)
 {
     asio::steady_timer timer(co_await asio::this_coro::executor);
-    while (true)
+
+    auto now = std::chrono::steady_clock::now();
+    while (*deadline > now)
     {
-        timer.expires_at(std::chrono::steady_clock::now() + interval);
+        timer.expires_at(*deadline);
         co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
-        auto now = std::chrono::steady_clock::now();
-        if (now - *deadline >= interval)
-        {
-            SIMPLE_HTTP_INFO_LOG("timeout");
-            break;
-        }
+        now = std::chrono::steady_clock::now();
     }
     co_return;
+}
+
+inline asio::awaitable<void> timeout(
+    std::chrono::steady_clock::duration duration)
+{
+    asio::steady_timer timer(co_await asio::this_coro::executor);
+    timer.expires_after(duration);
+    co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+}
+
+inline std::string SHA224(const std::string &message)
+{
+    uint8_t digest[EVP_MAX_MD_SIZE];
+    char mdString[(EVP_MAX_MD_SIZE << 1) + 1];
+    unsigned int digest_len;
+    EVP_MD_CTX *ctx;
+    if ((ctx = EVP_MD_CTX_new()) == nullptr)
+    {
+        throw std::runtime_error("could not create hash context");
+    }
+    if (!EVP_DigestInit_ex(ctx, EVP_sha224(), nullptr))
+    {
+        EVP_MD_CTX_free(ctx);
+        throw std::runtime_error("could not initialize hash context");
+    }
+    if (!EVP_DigestUpdate(ctx, message.c_str(), message.length()))
+    {
+        EVP_MD_CTX_free(ctx);
+        throw std::runtime_error("could not update hash");
+    }
+    if (!EVP_DigestFinal_ex(ctx, digest, &digest_len))
+    {
+        EVP_MD_CTX_free(ctx);
+        throw std::runtime_error("could not output hash");
+    }
+
+    for (unsigned int i = 0; i < digest_len; ++i)
+    {
+        sprintf(mdString + (i << 1), "%02x", (unsigned int)digest[i]);
+    }
+    mdString[digest_len << 1] = '\0';
+    EVP_MD_CTX_free(ctx);
+    return mdString;
+}
+
+inline asio::awaitable<void> http301(
+    auto &socket,
+    const std::string &url = "https://www.baidu.com")
+{
+    namespace http = boost::beast::http;
+    http::response<http::empty_body> res{http::status::moved_permanently, 11};
+    res.set(http::field::location, url);
+    res.set(http::field::server, "nginx/1.20.1");
+    std::stringstream ss;
+    ss << res;
+    auto res_str = ss.str();
+    co_await asio::async_write(*socket,
+                               asio::buffer(res_str.c_str(), res_str.size()),
+                               asio::as_tuple(asio::use_awaitable));
+}
+
+inline long long getCurrentTimestampMs()
+{
+    auto now = std::chrono::system_clock::now();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               now.time_since_epoch())
+        .count();
 }
 
 struct Config
@@ -1161,47 +565,46 @@ struct Config
     std::string ip;
     uint16_t port;
     uint16_t worker_num{4};
-    int32_t concurrent_streams{200};
-    std::optional<int32_t> window_size;
-    std::optional<int32_t> max_frame_size;
-    std::chrono::seconds max_idle_time{120};
     std::string ssl_crt;
     std::string ssl_key;
-    bool disable_tls12{true};
+    std::string passwd;
+    std::string path;
+    std::chrono::seconds timeout{10};
+    std::chrono::seconds read_write_max_idle{60};
+    std::chrono::minutes dns_cache_time{30};
 };
 
-class HttpServer final
+class Server final
 {
   public:
-    HttpServer(const Config &cfg)
+    Server(const Config &cfg)
         : m_cfg(cfg),
           m_ep(asio::ip::make_address(cfg.ip), cfg.port),
           m_io_ctx_pool(std::make_shared<IoCtxPool>(cfg.worker_num)),
-          m_io_dispatch(std::make_shared<IoCtxPool>(cfg.worker_num)),
           m_stop_ctx_pool(true)
     {
         m_io_ctx_pool->createMainContext();
         m_io_ctx_pool->start();
-        m_io_dispatch->start();
+        m_cfg.passwd = SHA224(m_cfg.passwd);
+        asio::co_spawn(*m_io_ctx_pool->getMainContext(), dns(), asio::detached);
         initSsl();
     }
 
-    HttpServer(const Config &cfg,
-               std::shared_ptr<IoCtxPool> io_ctx_pool,
-               std::shared_ptr<IoCtxPool> io_dispatch)
+    Server(const Config &cfg, std::shared_ptr<IoCtxPool> io_ctx_pool)
         : m_cfg(cfg),
           m_ep(asio::ip::make_address(cfg.ip), cfg.port),
           m_io_ctx_pool(std::move(io_ctx_pool)),
-          m_io_dispatch(std::move(io_dispatch)),
           m_stop_ctx_pool(false)
     {
+        m_cfg.passwd = SHA224(m_cfg.passwd);
+        asio::co_spawn(*m_io_ctx_pool->getMainContext(), dns(), asio::detached);
         initSsl();
     }
 
-    HttpServer(const HttpServer &) = delete;
-    HttpServer &operator=(const HttpServer &) = delete;
-    HttpServer(HttpServer &&) = delete;
-    HttpServer &operator=(HttpServer &&) = delete;
+    Server(const Server &) = delete;
+    Server &operator=(const Server &) = delete;
+    Server(Server &&) = delete;
+    Server &operator=(Server &&) = delete;
 
     asio::awaitable<void> start()
     {
@@ -1213,13 +616,13 @@ class HttpServer final
         [[maybe_unused]] auto _ = m_acceptor->bind(m_ep, ec);
         if (ec)
         {
-            SIMPLE_HTTP_ERROR_LOG("bind: {}", ec.message());
+            TROJAN_ERROR_LOG("bind: {}", ec.message());
             throw std::runtime_error(ec.message());
         }
         _ = m_acceptor->listen(asio::socket_base::max_listen_connections, ec);
         if (ec)
         {
-            SIMPLE_HTTP_ERROR_LOG("listen: {}", ec.message());
+            TROJAN_ERROR_LOG("listen: {}", ec.message());
             throw std::runtime_error(ec.message());
         }
         for (;;)
@@ -1237,31 +640,19 @@ class HttpServer final
             auto endpoint = socket.remote_endpoint(ec);
             if (!ec)
             {
-                SIMPLE_HTTP_INFO_LOG("new connection from [{}:{}]",
-                                     endpoint.address().to_string(),
-                                     endpoint.port());
+                TROJAN_DEBUG_LOG("new connection from [{}:{}]",
+                                 endpoint.address().to_string(),
+                                 endpoint.port());
             }
             socket.set_option(asio::socket_base::keep_alive(true));
-            // socket.set_option(asio::ip::tcp::no_delay(true));
-            // socket.set_option(asio::socket_base::send_buffer_size(5024 *
-            // 1024));
-            if (m_cfg.ssl_crt.empty())
-            {
-                asio::co_spawn(*context,
-                               session(std::make_shared<asio::ip::tcp::socket>(
-                                           std::move(socket)),
-                                       context),
-                               asio::detached);
-            }
-            else
-            {
-                auto stream =
-                    std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(
-                        std::move(socket), m_ssl_context);
-                asio::co_spawn(*context,
-                               startSslsession(std::move(stream), context),
-                               asio::detached);
-            }
+
+            auto stream =
+                std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(
+                    std::move(socket), m_ssl_context);
+
+            asio::co_spawn(*context,
+                           startSslsession(std::move(stream), context),
+                           asio::detached);
         }
     }
 
@@ -1278,47 +669,7 @@ class HttpServer final
         if (m_stop_ctx_pool)
         {
             m_io_ctx_pool->stop();
-            m_io_dispatch->stop();
         }
-    }
-
-    auto &setHttpHandler(const std::string &path,
-                         std::function<asio::awaitable<void>(
-                             http::request<http::string_body>,
-                             std::shared_ptr<HttpResponseWriter>)> cb)
-    {
-        m_handler_functions->setHttpHandler(path, std::move(cb));
-        return *this;
-    }
-
-    auto &setHttpRegexHandler(const std::string &regex,
-                              std::function<asio::awaitable<void>(
-                                  http::request<http::string_body>,
-                                  std::shared_ptr<HttpResponseWriter>)> cb)
-    {
-        m_handler_functions->setHttpRegexHandler(regex, std::move(cb));
-        return *this;
-    }
-
-    auto &setUnhandled(std::function<asio::awaitable<void>(
-                           http::request<http::string_body>,
-                           std::shared_ptr<HttpResponseWriter>)> cb)
-    {
-        m_handler_functions->setUnhandled(std::move(cb));
-        return *this;
-    }
-
-    auto &setBefore(std::function<asio::awaitable<bool>(
-                        const http::request<http::string_body> &,
-                        const std::shared_ptr<HttpResponseWriter> &)> cb)
-    {
-        m_handler_functions->setBefore(std::move(cb));
-        return *this;
-    }
-
-    auto ioDispatchPool()
-    {
-        return m_io_dispatch;
     }
 
   private:
@@ -1329,11 +680,9 @@ class HttpServer final
 
         uint64_t opts = asio::ssl::context::default_workarounds |
                         asio::ssl::context::no_tlsv1 |
-                        asio::ssl::context::no_tlsv1_1;
-        if (m_cfg.disable_tls12)
-        {
-            opts |= asio::ssl::context::no_tlsv1_2;
-        }
+                        asio::ssl::context::no_tlsv1_1 |
+                        asio::ssl::context::no_tlsv1_2;
+
         m_ssl_context.set_options(opts);
 
         error_code ec;
@@ -1349,299 +698,517 @@ class HttpServer final
         if (ec)
             throw std::runtime_error(ec.message());
 
-        SSL_CTX_set_alpn_select_cb(
-            m_ssl_context.native_handle(),
-            [](SSL * /* ssl */,
-               const unsigned char **out,
-               unsigned char *outlen,
-               const unsigned char *in,
-               unsigned int inlen,
-               void * /* arg */) {
-                static const unsigned char alpn_proto_list[] = {
-                    0x02, 'h', '2'  // length-prefixed: "\x02h2"
-                };
-                if (SSL_select_next_proto((unsigned char **)out,
-                                          outlen,
-                                          alpn_proto_list,
-                                          sizeof(alpn_proto_list),
-                                          in,
-                                          inlen) != OPENSSL_NPN_NEGOTIATED)
-                {
-                    return SSL_TLSEXT_ERR_NOACK;
-                }
-                return SSL_TLSEXT_ERR_OK;
-            },
-            nullptr);
+        auto native = m_ssl_context.native_handle();
+        SSL_CTX_set_session_cache_mode(native, SSL_SESS_CACHE_SERVER);
     }
 
-    asio::awaitable<void> upgradeH2c(
-        auto socket,
-        const std::shared_ptr<asio::io_context> & /* ctx */,
-        http::request<http::string_body> req,
-        std::string settings)
+    enum class ParseError : int8_t
     {
-        // nghttp --upgrade  http://127.0.0.1:6666/hello --data ./a.txt
-        // curl -v --http2 http://localhost:6666/hello -d "aaaa" -k
-        http::response<http::empty_body> res{http::status::switching_protocols,
-                                             11};
-        res.set(http::field::connection, "Upgrade");
-        res.set(http::field::upgrade, "h2c");
-        co_await http::async_write(*socket,
-                                   res,
-                                   asio::as_tuple(asio::use_awaitable));
+        NetworkError,
+        PasswordError
+    };
 
-        auto &io_dispatch = m_io_dispatch->getIoContextPtr();
-        auto ch =
-            std::make_shared<Http2Channel>(co_await asio::this_coro::executor,
-                                           CHANNEL_SIZE);
-        auto h2p = std::make_shared<Http2Parse>(ch,
-                                                nullptr,
-                                                io_dispatch,
-                                                m_handler_functions);
-        if (auto ret = h2p->init(Http2Parse::Config{
-                .is_h2c_upgrade = true,
-                .h2_setting = std::move(settings),
-                .concurrent_streams = m_cfg.concurrent_streams,
-                .window_size = m_cfg.window_size,
-                .max_frame_size = m_cfg.max_frame_size,
-                .method = req.method(),
-            });
-            ret)
-        {
-            SIMPLE_HTTP_ERROR_LOG("init error: {}", ret);
-            co_return;
-        }
-
-        if (req.method() != http::verb::options)
-        {
-            callHandler(m_handler_functions,
-                        *io_dispatch,
-                        std::move(req),
-                        std::make_shared<HttpResponseWriter>(h2p,
-                                                             1,
-                                                             Version::Http2));
-        }
-        auto deadline = std::make_shared<std::chrono::steady_clock::time_point>(
-            std::chrono::steady_clock::now());
-        co_await (toH2Parse(socket, h2p, deadline) ||
-                  toSocket(socket, ch, deadline) ||
-                  watchdog(deadline, m_cfg.max_idle_time));
-        shutdown(socket);
-    }
-
-    asio::awaitable<void> switchH2c(
-        auto socket,
-        const std::shared_ptr<asio::io_context> & /* ctx */,
-        const std::string &buffer)
+    asio::awaitable<std::expected<TrojanRequest, ParseError>> recvRequest(
+        auto &socket,
+        auto &deadline,
+        auto &request,
+        auto &cfg)
     {
-        // curl -v --http2-prior-knowledge http://localhost:6666/hello
-        // curl -v --http2-prior-knowledge http://localhost:6666/hello -d "aaaa"
-        auto &io_dispatch = m_io_dispatch->getIoContextPtr();
-        // start proc http2
-        auto ch =
-            std::make_shared<Http2Channel>(co_await asio::this_coro::executor,
-                                           CHANNEL_SIZE);
-        auto h2p = std::make_shared<Http2Parse>(ch,
-                                                nullptr,
-                                                io_dispatch,
-                                                m_handler_functions);
-        if (auto ret = h2p->init(Http2Parse::Config{
-                .is_h2c_upgrade = false,
-                .h2_setting = "",
-                .concurrent_streams = m_cfg.concurrent_streams,
-                .window_size = m_cfg.window_size,
-                .max_frame_size = m_cfg.max_frame_size,
-                .method = http::verb::get,  // not use
-            });
-            ret)
+        constexpr size_t MAX_REQUEST_SIZE = 1024 * 4;
+        char buffer[MAX_REQUEST_SIZE];
+        TrojanRequest req;
+        for (;;)
         {
-            SIMPLE_HTTP_ERROR_LOG("init error: {}", ret);
-            co_return;
-        }
-        auto ret = h2p->feedRecvData(buffer.c_str(), buffer.size());
-        if (ret == -1)
-        {
-            co_return;
-        }
-        auto deadline = std::make_shared<std::chrono::steady_clock::time_point>(
-            std::chrono::steady_clock::now());
-        co_await (toH2Parse(socket, h2p, deadline) ||
-                  toSocket(socket, ch, deadline) ||
-                  watchdog(deadline, m_cfg.max_idle_time));
-        shutdown(socket);
-    }
-
-    asio::awaitable<void> switchHttp1(auto socket,
-                                      std::shared_ptr<Http1Channel> http1_ch,
-                                      std::shared_ptr<Http2Parse> h2p,
-                                      Version version)
-    {
-        auto recv_request = [this](auto socket,
-                                   auto h2p,
-                                   auto deadline) -> asio::awaitable<void> {
-            for (;;)
+            *deadline =
+                std::chrono::steady_clock::now() + cfg.read_write_max_idle;
+            auto [ec, length] = co_await socket->async_read_some(
+                asio::buffer(buffer, sizeof(buffer)),
+                asio::as_tuple(asio::use_awaitable));
+            if (ec)
             {
-                beast::flat_buffer buffer;
-                http::request<http::string_body> req;
-                auto [ec, count] = co_await http::async_read(
-                    *socket, buffer, req, asio::as_tuple(asio::use_awaitable));
-                if (ec)
-                {
-                    co_return;
-                }
-                *deadline = std::chrono::steady_clock::now();
-                auto version =
-                    (req.version() == 11 ? Version::Http11 : Version::Http1);
-                callHandler(m_handler_functions,
-                            m_io_dispatch->getIoContext(),
-                            std::move(req),
-                            std::make_shared<HttpResponseWriter>(h2p,
-                                                                 0,
-                                                                 version));
+                TROJAN_ERROR_LOG("async_read_some: {}", ec.message());
+                co_return std::unexpected(ParseError::NetworkError);
             }
-        };
-        auto send_response = [](auto socket,
-                                auto http1_ch,
-                                Version version,
-                                auto deadline) -> asio::awaitable<void> {
-            for (;;)
+            request.append(buffer, length);
+            if (request.size() >= 58 &&
+                !std::ranges::equal(request.begin(),
+                                    request.begin() + 56,
+                                    cfg.passwd.begin(),
+                                    cfg.passwd.end()))
             {
-                auto [ec, h1_rsp] = co_await http1_ch->async_receive(
-                    asio::as_tuple(asio::use_awaitable));
-                if (ec)
+                TROJAN_ERROR_LOG("invalid password: [{}]",
+                                 std::string{request.begin(),
+                                             request.begin() + 56});
+                co_await http301(socket);
+                co_return std::unexpected(ParseError::PasswordError);
+            }
+            if (req.parse(request) != -1)
+            {
+                break;
+            }
+            if (request.size() > MAX_REQUEST_SIZE)
+            {
+                TROJAN_ERROR_LOG("request size too large: {}", request.size());
+                co_await http301(socket);
+                co_return std::unexpected(ParseError::PasswordError);
+            }
+        }
+        co_return req;
+    }
+
+    asio::awaitable<std::optional<
+        std::vector<asio::ip::tcp::resolver::results_type::value_type>>>
+    resolve(const TrojanRequest &req)
+    {
+        std::vector<asio::ip::tcp::resolver::results_type::value_type> results;
+
+        auto async_resolve = [](auto &req)
+            -> asio::awaitable<std::optional<std::vector<
+                asio::ip::tcp::resolver::results_type::value_type>>> {
+            auto solver =
+                asio::ip::tcp::resolver(co_await asio::this_coro::executor);
+            auto [ec, results] =
+                co_await solver.async_resolve(req.address.address,
+                                              std::to_string(req.address.port),
+                                              asio::as_tuple(
+                                                  asio::use_awaitable));
+            if (ec)
+            {
+                TROJAN_ERROR_LOG("resolve [{}]: {}",
+                                 req.address.address,
+                                 ec.message());
+                co_return std::nullopt;
+            }
+
+            std::vector<asio::ip::tcp::resolver::results_type::value_type>
+                ipv4_entries;
+            std::vector<asio::ip::tcp::resolver::results_type::value_type>
+                ipv6_entries;
+
+            for (const auto &entry : results)
+            {
+                if (entry.endpoint().address().is_v4())
                 {
-                    break;
+                    ipv4_entries.push_back(entry);
                 }
-                *deadline = std::chrono::steady_clock::now();
-                if (std::holds_alternative<std::string>(h1_rsp))
+                else
                 {
-                    auto &body = std::get<std::string>(h1_rsp);
-                    if (auto [ec, count] = co_await asio::async_write(
-                            *socket,
-                            asio::buffer(body.data(), body.size()),
-                            asio::as_tuple(asio::use_awaitable));
-                        ec)
-                    {
-                        break;
-                    }
+                    ipv6_entries.push_back(entry);
                 }
-                else if (std::holds_alternative<std::shared_ptr<
-                             http::response<http::string_body>>>(h1_rsp))
+            }
+            if (ipv4_entries.empty())
+            {
+                TROJAN_INFO_LOG("ipv4_entries: {} ipv6_entries: {}",
+                                ipv4_entries.size(),
+                                ipv6_entries.size());
+            }
+
+            std::vector<asio::ip::tcp::resolver::results_type::value_type>
+                prioritized_entries;
+
+            prioritized_entries.insert(prioritized_entries.end(),
+                                       ipv4_entries.begin(),
+                                       ipv4_entries.end());
+            prioritized_entries.insert(prioritized_entries.end(),
+                                       ipv6_entries.begin(),
+                                       ipv6_entries.end());
+
+            co_return prioritized_entries;
+        };
+
+        std::unique_lock<std::mutex> lock(m_mtx);
+        if (m_results.contains(req.address.address))
+        {
+            results = m_results[req.address.address].results;
+            lock.unlock();
+        }
+        else
+        {
+            lock.unlock();
+            auto opt = co_await async_resolve(req);
+            if (!opt.has_value())
+            {
+                co_return std::nullopt;
+            }
+            std::unique_lock<std::mutex> lock(m_mtx);
+            results = opt.value();
+            m_results[req.address.address] = CachedResult{
+                .results = std::move(opt.value()),
+            };
+        }
+        co_return results;
+    }
+
+    asio::awaitable<void> session(
+        std::shared_ptr<asio::ssl::stream<asio::ip::tcp::socket>> socket,
+        const std::shared_ptr<asio::io_context> &ctx)
+    {
+        ScopeExit ssl_auto_exit([&socket] {
+            asio::co_spawn(
+                socket->get_executor(),
+                [](auto socket) -> asio::awaitable<void> {
+                    co_await socket->async_shutdown(
+                        asio::as_tuple(asio::use_awaitable));
+                }(socket),
+                asio::detached);
+        });
+
+        auto time_point =
+            std::make_shared<std::chrono::steady_clock::time_point>(
+                std::chrono::steady_clock::now());
+        TrojanRequest req;
+
+        {
+            beast::flat_buffer buffer;
+            http::parser<true, http::empty_body> parser;
+            auto result = co_await (
+                http::async_read_header(*socket,
+                                        buffer,
+                                        parser,
+                                        asio::as_tuple(asio::use_awaitable)) ||
+                timeout(m_cfg.timeout));
+            if (result.index() == 1)
+            {
+                TROJAN_ERROR_LOG("async_read_header timeout");
+                co_return;
+            }
+            auto [ec, bytes] = std::get<0>(result);
+            if (ec == http::error::end_of_stream)
+            {
+                co_return;
+            }
+            if (ec == http::error::bad_method)
+            {
+                // 原始协议
+                auto req_str = beast::buffers_to_string(buffer.data());
+                if (req.parse(req_str) != -1)
                 {
-                    auto &body = std::get<
-                        std::shared_ptr<http::response<http::string_body>>>(
-                        h1_rsp);
-                    if (auto [ec, count] = co_await http::async_write(
-                            *socket,
-                            *body,
-                            asio::as_tuple(asio::use_awaitable));
-                        ec)
+                    if (req.password != m_cfg.passwd)
                     {
-                        break;
+                        TROJAN_ERROR_LOG("password error: {}", req.password);
+                        co_await http301(socket);
+                        co_return;
                     }
                 }
                 else
                 {
-                    // forceClose
-                    break;
+                    auto result = co_await (
+                        recvRequest(socket, time_point, req_str, m_cfg) ||
+                        watchdog(time_point));
+                    if (result.index() == 1)
+                    {
+                        TROJAN_ERROR_LOG("recvRequest timeout");
+                        co_return;
+                    }
+                    auto exception_req = std::get<0>(result);
+                    if (!exception_req.has_value())
+                    {
+                        co_return;
+                    }
+                    req = std::move(exception_req.value());
                 }
-                if (version == Version::Http1)
-                    break;
             }
-        };
-        auto deadline = std::make_shared<std::chrono::steady_clock::time_point>(
-            std::chrono::steady_clock::now());
-        co_await (recv_request(socket, h2p, deadline) ||
-                  send_response(socket, http1_ch, version, deadline) ||
-                  watchdog(deadline, m_cfg.max_idle_time));
-        shutdown(socket);
-        co_return;
-    }
-
-    asio::awaitable<void> session(auto socket,
-                                  const std::shared_ptr<asio::io_context> &ctx)
-    {
-        auto http1_ch = std::make_shared<Http1Channel>(*ctx, CHANNEL_SIZE);
-        auto h2p = std::make_shared<Http2Parse>(nullptr,
-                                                http1_ch,
-                                                nullptr,
-                                                m_handler_functions);
-        beast::flat_buffer buffer;
-        http::parser<true, http::string_body> parser;
-        auto [ec, bytes] = co_await http::async_read_header(
-            *socket, buffer, parser, asio::as_tuple(asio::use_awaitable));
-        if (ec == http::error::end_of_stream)
-        {
-            co_return;
-        }
-        if (ec == http::error::bad_version)
-        {
-            auto req_str = beast::buffers_to_string(buffer.data());
-            if (isHttp2(req_str))
+            else if (ec)
             {
-                co_await switchH2c(std::move(socket), ctx, req_str);
+                TROJAN_ERROR_LOG("{}", ec.message());
+                co_await http301(socket);
+                co_return;
             }
             else
             {
-                SIMPLE_HTTP_ERROR_LOG("not http2 request");
+                auto &headers = parser.get();
+                if (m_cfg.path != headers.target())
+                {
+                    TROJAN_ERROR_LOG("not expected path: {}",
+                                     headers.target().data());
+                    co_await http301(socket);
+                    co_return;
+                }
+
+                http::response<http::empty_body> res{http::status::ok, 11};
+                res.set(http::field::server, "nginx/1.20.1");
+                res.keep_alive(true);
+                auto [ec, bytes] = co_await http::async_write(
+                    *socket, res, asio::as_tuple(asio::use_awaitable));
+                if (ec)
+                {
+                    TROJAN_ERROR_LOG("http write error: {}", ec.message());
+                    co_return;
+                }
+
+                std::string req_str;
+                auto result =
+                    co_await (recvRequest(socket, time_point, req_str, m_cfg) ||
+                              watchdog(time_point));
+                if (result.index() == 1)
+                {
+                    TROJAN_ERROR_LOG("recvRequest timeout");
+                    co_return;
+                }
+                auto exception_req = std::get<0>(result);
+                if (!exception_req.has_value())
+                {
+                    co_return;
+                }
+                req = std::move(exception_req.value());
             }
+        }
+
+        if (req.command == TrojanRequest::Command::CONNECT)
+        {
+            auto out_socket = std::make_shared<asio::ip::tcp::socket>(
+                co_await asio::this_coro::executor);
+
+            ScopeExit auto_exit([&out_socket] {
+                if (!out_socket->is_open())
+                {
+                    return;
+                }
+                boost::system::error_code ec;
+                out_socket->shutdown(
+                    boost::asio::ip::tcp::socket::shutdown_both, ec);
+                out_socket->close(ec);
+            });
+
+            auto results_opt = co_await resolve(req);
+            if (!results_opt.has_value())
+            {
+                co_return;
+            }
+            auto &results = results_opt.value();
+
+            auto start = getCurrentTimestampMs();
+            auto result = co_await (
+                asio::async_connect(*out_socket,
+                                    results,
+                                    asio::as_tuple(asio::use_awaitable)) ||
+                timeout(m_cfg.timeout));
+            if (result.index() == 0)
+            {
+                auto [ec, ret] = std::get<0>(result);
+                if (ec)
+                {
+                    TROJAN_ERROR_LOG("connect: {}", ec.message());
+                    {
+                        std::unique_lock<std::mutex> lock(m_mtx);
+                        m_results.erase(req.address.address);
+                    }
+                    co_return;
+                }
+            }
+            else if (result.index() == 1)
+            {
+                TROJAN_ERROR_LOG("connect timeout: {}", req.address.address);
+                {
+                    std::unique_lock<std::mutex> lock(m_mtx);
+                    m_results.erase(req.address.address);
+                }
+                co_return;
+            }
+            auto end = getCurrentTimestampMs();
+            if (end - start > 50)
+            {
+                TROJAN_INFO_LOG("req.address.address: {}:{} -> {}",
+                                req.address.address,
+                                req.address.port,
+                                end - start);
+            }
+
+            if (!req.payload.empty())
+            {
+                if (auto [ec, len] = co_await asio::async_write(
+                        *out_socket,
+                        asio::buffer(req.payload.data(), req.payload.size()),
+                        asio::as_tuple(asio::use_awaitable));
+                    ec)
+                {
+                    TROJAN_ERROR_LOG("async_write: {}", ec.message());
+                    co_return;
+                }
+            }
+
+            co_await (forward(socket, out_socket, time_point, m_cfg) ||
+                      forward(out_socket, socket, time_point, m_cfg) ||
+                      watchdog(time_point));
             co_return;
         }
-        if (ec)
+        else
         {
-            co_return;
+            auto recv_udp = [](auto self,
+                               auto payload,
+                               auto socket,
+                               auto deadline) -> asio::awaitable<void> {
+                std::unordered_map<
+                    std::string,
+                    std::pair<asio::ip::udp::endpoint,
+                              std::shared_ptr<asio::ip::udp::socket>>>
+                    udp_map;
+                ScopeExit udp_auto_exit([&udp_map] {
+                    for (auto &[addr, data] : udp_map)
+                    {
+                        auto &[endpoint, udp_socket] = data;
+                        if (udp_socket->is_open())
+                        {
+                            boost::system::error_code ec;
+                            udp_socket->cancel(ec);
+                            udp_socket->close(ec);
+                        }
+                    }
+                });
+                for (;;)
+                {
+                    *deadline = std::chrono::steady_clock::now() +
+                                self->m_cfg.read_write_max_idle;
+                    UdpPacket packet;
+                    size_t packet_len;
+                    bool is_packet_valid = packet.parse(payload, packet_len);
+                    if (!is_packet_valid)
+                    {
+                        char buff[4096];
+                        auto [ec, length] = co_await socket->async_read_some(
+                            asio::buffer(buff, sizeof(buff)),
+                            asio::as_tuple(asio::use_awaitable));
+                        if (ec)
+                        {
+                            break;
+                        }
+                        payload.append(buff, length);
+                        if (payload.length() > 1024 * 8)
+                        {
+                            co_await http301(socket);
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        payload = payload.substr(packet_len);
+                        TROJAN_DEBUG_LOG("query_addr: [{}]",
+                                         packet.address.address);
+                        if (!udp_map.contains(packet.address.address))
+                        {
+                            asio::ip::udp::resolver udp_resolver(
+                                co_await asio::this_coro::executor);
+                            auto [err, results] =
+                                co_await udp_resolver.async_resolve(
+                                    packet.address.address,
+                                    std::to_string(packet.address.port),
+                                    asio::as_tuple(asio::use_awaitable));
+                            if (err || results.empty())
+                            {
+                                TROJAN_ERROR_LOG("resolve error: {}",
+                                                 err.message());
+                                break;
+                            }
+                            for (const auto &entry : results)
+                            {
+                                auto udp_socket =
+                                    std::make_shared<asio::ip::udp::socket>(
+                                        co_await asio::this_coro::executor);
+                                auto protocol = entry.endpoint().protocol();
+                                boost::system::error_code ec;
+                                udp_socket->open(protocol, ec);
+                                if (ec)
+                                {
+                                    TROJAN_ERROR_LOG("open: {}", ec.message());
+                                    co_return;
+                                }
+                                udp_socket->bind(
+                                    asio::ip::udp::endpoint(protocol, 0), ec);
+                                if (ec)
+                                {
+                                    TROJAN_ERROR_LOG("bind: {}", ec.message());
+                                    co_return;
+                                }
+                                udp_map[packet.address.address] =
+                                    std::make_pair(entry.endpoint(),
+                                                   udp_socket);
+                                asio::co_spawn(
+                                    co_await asio::this_coro::executor,
+                                    self->udpToTcp(
+                                        socket,
+                                        udp_socket,
+                                        deadline,
+                                        self->m_cfg.read_write_max_idle),
+                                    asio::detached);
+                                break;
+                            }
+                        }
+                        auto &[endpoint, udp_socket] =
+                            udp_map[packet.address.address];
+                        auto [ec, len] = co_await udp_socket->async_send_to(
+                            boost::asio::buffer(packet.payload.c_str(),
+                                                packet.payload.size()),
+                            endpoint,
+                            asio::as_tuple(asio::use_awaitable));
+                        if (ec)
+                        {
+                            TROJAN_ERROR_LOG("async_send_to: {}", ec.message());
+                            break;
+                        }
+                    }
+                }
+            };
+            auto deadline =
+                std::make_shared<std::chrono::steady_clock::time_point>(
+                    std::chrono::steady_clock::now());
+            co_await (
+                recv_udp(this, std::move(req.payload), socket, deadline) ||
+                watchdog(deadline));
         }
-        auto &headers = parser.get();
-
-        std::string h2_setting;
-        if (headers.find(http::field::upgrade) != headers.end() &&
-            headers[http::field::upgrade] == "h2c")
-        {
-            h2_setting = headers[http::field::http2_settings];
-        }
-
-        std::tie(ec, bytes) = co_await http::async_read(
-            *socket, buffer, parser, asio::as_tuple(asio::use_awaitable));
-        if (ec)
-        {
-            SIMPLE_HTTP_ERROR_LOG("body read error: {}", ec.message());
-            co_return;
-        }
-
-        http::request<http::string_body> full_req = parser.get();
-
-        if (!h2_setting.empty())
-        {
-            co_await upgradeH2c(std::move(socket),
-                                ctx,
-                                std::move(full_req),
-                                std::move(h2_setting));
-            co_return;
-        }
-
-        // this is http1 or 1.1
-        auto version =
-            (full_req.version() == 11 ? Version::Http11 : Version::Http1);
-        callHandler(m_handler_functions,
-                    m_io_dispatch->getIoContext(),
-                    std::move(full_req),
-                    std::make_shared<HttpResponseWriter>(h2p, 0, version));
-        co_await switchHttp1(std::move(socket), http1_ch, h2p, version);
-
         co_return;
     }
 
-    // https server
+    asio::awaitable<void> udpToTcp(auto tcp_socket,
+                                   auto udp_socket,
+                                   auto deadline,
+                                   auto max_idle)
+    {
+        asio::ip::udp::endpoint udp_recv_endpoint;
+        char buff[4096];
+        for (;;)
+        {
+            *deadline = std::chrono::steady_clock::now() + max_idle;
+            auto [ec, len] = co_await udp_socket->async_receive_from(
+                asio::buffer(buff, sizeof(buff)),
+                udp_recv_endpoint,
+                asio::as_tuple(asio::use_awaitable));
+            if (ec)
+            {
+                // TROJAN_INFO_LOG("async_receive_from: {}", ec.message());
+                break;
+            }
+            auto data =
+                UdpPacket::generate(udp_recv_endpoint, std::string(buff, len));
+            if (auto [ec, len] =
+                    co_await asio::async_write(*tcp_socket,
+                                               asio::buffer(data),
+                                               asio::as_tuple(
+                                                   asio::use_awaitable));
+                ec)
+            {
+                TROJAN_ERROR_LOG("{}", ec.message());
+                break;
+            }
+        }
+    }
+
     asio::awaitable<void> startSslsession(
         std::shared_ptr<asio::ssl::stream<asio::ip::tcp::socket>> socket,
         auto context)
     {
-        if (auto [ec] = co_await socket->async_handshake(
-                boost::asio::ssl::stream_base::server,
-                asio::as_tuple(asio::use_awaitable));
-            ec)
+        auto result = co_await (
+            socket->async_handshake(boost::asio::ssl::stream_base::server,
+                                    asio::as_tuple(asio::use_awaitable)) ||
+            timeout(m_cfg.timeout));
+        if (result.index() == 1)
         {
-            SIMPLE_HTTP_DEBUG_LOG("async_handshake: {}", ec.message());
+            TROJAN_ERROR_LOG("async_handshake timeout");
+            co_return;
+        }
+        auto [ec] = std::get<0>(result);
+        if (ec)
+        {
+            TROJAN_ERROR_LOG("async_handshake: {}", ec.message());
             co_return;
         }
         asio::co_spawn(*context,
@@ -1649,488 +1216,49 @@ class HttpServer final
                        asio::detached);
     }
 
-    Config m_cfg;
-    asio::ip::tcp::endpoint m_ep;
-    std::shared_ptr<IoCtxPool> m_io_ctx_pool;
-    std::shared_ptr<IoCtxPool> m_io_dispatch;
-    bool m_stop_ctx_pool;
-    asio::ssl::context m_ssl_context{asio::ssl::context::tlsv13_server};
-    std::unique_ptr<asio::ip::tcp::acceptor> m_acceptor;
-    std::shared_ptr<HandlerFunctions> m_handler_functions =
-        std::make_shared<HandlerFunctions>();
-};
-
-#ifdef _EXPERIMENT_HTTP_CLIENT_
-
-struct HttpClient
-{
-    using Channel = asio::experimental::concurrent_channel<
-        void(error_code,
-             std::variant<http::response<http::empty_body>,
-                          std::string,
-                          Disconnect>)>;
-
-    using ReqChannel = asio::experimental::concurrent_channel<
-        void(error_code,
-             std::tuple<std::shared_ptr<http::request<http::string_body>>,
-                        std::shared_ptr<Channel>>)>;
-
-    HttpClient() = default;
-    virtual ~HttpClient() = default;
-
-    virtual asio::awaitable<bool> start() = 0;
-    virtual asio::awaitable<void> stop() = 0;
-    virtual asio::awaitable<std::shared_ptr<Channel>> sendRequest(
-        std::shared_ptr<http::request<http::string_body>> req) = 0;
-};
-
-class HttpsClient final : public HttpClient,
-                          public std::enable_shared_from_this<HttpsClient>
-{
-  public:
-    HttpsClient(std::string host,
-                uint16_t port,
-                std::shared_ptr<asio::io_context> ctx,
-                int32_t timeout = 60)
-        : m_host(std::move(host)),
-          m_port(port),
-          m_ctx(std::move(ctx)),
-          m_timeout(timeout),
-          m_ssl_context(asio::ssl::context::tlsv13_client)
+    asio::awaitable<void> dns()
     {
-        m_h2_channel = std::make_shared<Http2Channel>(*m_ctx, CHANNEL_SIZE);
-        m_req_channel = std::make_shared<ReqChannel>(*m_ctx, CHANNEL_SIZE);
-
-        m_ssl_context.set_verify_mode(SSL_VERIFY_PEER);
-        m_ssl_context.set_default_verify_paths();
-        const unsigned char alpn_protos[] = {0x02, 'h', '2'};
-        SSL_CTX_set_alpn_protos(m_ssl_context.native_handle(),
-                                alpn_protos,
-                                sizeof(alpn_protos));
-    }
-
-    asio::awaitable<bool> start() override
-    {
-        co_await asio::dispatch(
-            asio::bind_executor(m_ctx->get_executor(), asio::use_awaitable));
-
-        if (m_connected)
-            co_return true;
-
-        auto solver = asio::ip::tcp::resolver(*m_ctx);
-        auto [ec, results] =
-            co_await solver.async_resolve(m_host,
-                                          std::to_string(m_port),
-                                          asio::as_tuple(asio::use_awaitable));
-        if (ec)
-        {
-            SIMPLE_HTTP_ERROR_LOG("async_resolve: {}", ec.message());
-            co_return false;
-        }
-
-        asio::ip::tcp::socket socket(*m_ctx);
-        asio::steady_timer timer(*m_ctx);
-        timer.expires_after(std::chrono::seconds(10));
-        auto result = co_await (
-            socket.async_connect(*(results.begin()),
-                                 asio::as_tuple(asio::use_awaitable)) ||
-            timer.async_wait(asio::as_tuple(asio::use_awaitable)));
-        if (result.index() == 0)
-        {
-            auto [ec] = std::get<0>(result);
-            if (ec)
-            {
-                SIMPLE_HTTP_ERROR_LOG("async_connect: {}", ec.message());
-                co_return false;
-            }
-        }
-        else if (result.index() == 1)
-        {
-            SIMPLE_HTTP_ERROR_LOG("async_connect timeout");
-            co_return false;
-        }
-
-        m_socket = std::make_unique<asio::ssl::stream<asio::ip::tcp::socket>>(
-            std::move(socket), m_ssl_context);
-
-        if (!SSL_set_tlsext_host_name(m_socket->native_handle(),
-                                      m_host.c_str()))
-        {
-            ec = boost::system::error_code(static_cast<int>(::ERR_get_error()),
-                                           asio::error::get_ssl_category());
-            SIMPLE_HTTP_ERROR_LOG("SSL_set_tlsext_host_name: {}", ec.message());
-            co_return false;
-        }
-
-        if (auto [ec] = co_await m_socket->async_handshake(
-                asio::ssl::stream_base::client,
-                asio::as_tuple(asio::use_awaitable));
-            ec)
-        {
-            SIMPLE_HTTP_ERROR_LOG("async_handshake: {}", ec.message());
-            co_return false;
-        }
-        const unsigned char *protocol = nullptr;
-        unsigned int length = 0;
-
-        SSL_get0_alpn_selected(m_socket->native_handle(), &protocol, &length);
-
-        if (length == 2 && std::memcmp(protocol, "h2", 2) == 0)
-        {
-            SIMPLE_HTTP_INFO_LOG("Negotiated ALPN: h2");
-            m_h2 = true;
-            initNghttp2();
-            co_await startHttp2Cleint();
-            m_connected = true;
-        }
-        else
-        {
-            SIMPLE_HTTP_INFO_LOG("ALPN negotiation failed or not h2.");
-            m_h2 = false;
-        }
-
-        co_return true;
-    }
-
-    asio::awaitable<void> stop() override
-    {
-        co_await asio::dispatch(
-            asio::bind_executor(m_ctx->get_executor(), asio::use_awaitable));
-        if (m_socket)
-        {
-            shutdown(m_socket);
-        }
-        if (m_session)
-        {
-            nghttp2_session_callbacks_del(m_cbs);
-            nghttp2_session_del(m_session);
-            m_session = nullptr;
-        }
-        co_return;
-    }
-
-    int initNghttp2()
-    {
-        if (m_session)
-        {
-            nghttp2_session_callbacks_del(m_cbs);
-            nghttp2_session_del(m_session);
-            m_session = nullptr;
-        }
-        nghttp2_session_callbacks_new(&m_cbs);
-        nghttp2_session_callbacks_set_on_header_callback(m_cbs,
-                                                         onHeaderCallback);
-        nghttp2_session_callbacks_set_send_callback(m_cbs, sendCallback);
-        nghttp2_session_callbacks_set_on_frame_recv_callback(
-            m_cbs, onFrameRecvCallback);
-        nghttp2_session_callbacks_set_on_data_chunk_recv_callback(
-            m_cbs, onDataChunkRecvCallback);
-
-        nghttp2_session_client_new(&m_session, m_cbs, this);
-
-        std::vector<nghttp2_settings_entry> iv;
-        iv.emplace_back(NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 200);
-
-        nghttp2_submit_settings(m_session,
-                                NGHTTP2_FLAG_NONE,
-                                iv.data(),
-                                iv.size());
-        nghttp2_session_send(m_session);
-
-        return 0;
-    }
-
-    static int onHeaderCallback(nghttp2_session * /* session */,
-                                const nghttp2_frame *frame,
-                                const uint8_t *_name,
-                                size_t namelen,
-                                const uint8_t *_value,
-                                size_t valuelen,
-                                uint8_t /* flags */,
-                                void *userdata)
-    {
-        int32_t stream_id = frame->hd.stream_id;
-        auto cli = static_cast<HttpsClient *>(userdata);
-        if (cli->m_streams.contains(stream_id))
-        {
-            std::string name{(char *)_name, namelen};
-            std::string_view value{(char *)_value, valuelen};
-            std::ranges::transform(name, name.begin(), [](unsigned char c) {
-                return std::tolower(c);
-            });
-            if (name == ":status")
-            {
-                cli->m_streams[stream_id]->header.result(
-                    std::stoul(value.data()));
-            }
-            else
-            {
-                cli->m_streams[stream_id]->header.set(name, value);
-            }
-        }
-        else
-        {
-            SIMPLE_HTTP_ERROR_LOG("not found : {}", stream_id);
-        }
-        return 0;
-    }
-
-    static ssize_t sendCallback(nghttp2_session * /* session */,
-                                const uint8_t *data,
-                                size_t length,
-                                int /* flags */,
-                                void *userdata)
-    {
-        auto h2_cli = static_cast<HttpsClient *>(userdata);
-        if (!h2_cli->m_h2_channel->try_send(
-                error_code{},
-                std::make_shared<std::string>((char *)data, length)))
-        {
-            SIMPLE_HTTP_ERROR_LOG("sendCallback send error!!!!");
-        }
-        return length;
-    }
-
-    static int onFrameRecvCallback(nghttp2_session * /* session */,
-                                   const nghttp2_frame *frame,
-                                   void *userdata)
-    {
-        auto call_handler = [&] {
-            int32_t stream_id = frame->hd.stream_id;
-            auto h2_cli = static_cast<HttpsClient *>(userdata);
-            if (h2_cli->m_streams.contains(stream_id))
-            {
-                h2_cli->m_streams[stream_id]->close();
-            }
-            else
-            {
-                SIMPLE_HTTP_ERROR_LOG("not found : {}", stream_id);
-            }
-            h2_cli->m_streams.erase(stream_id);
-        };
-
-        if (frame->hd.type == NGHTTP2_HEADERS &&
-            frame->headers.cat == NGHTTP2_HCAT_RESPONSE)
-        {
-            int32_t stream_id = frame->hd.stream_id;
-            auto h2_cli = static_cast<HttpsClient *>(userdata);
-            if (h2_cli->m_streams.contains(stream_id))
-            {
-                h2_cli->m_streams[stream_id]->sendHttpHeader();
-            }
-
-            if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM)
-            {
-                call_handler();
-            }
-        }
-
-        if (frame->hd.type == NGHTTP2_DATA &&
-            (frame->hd.flags & NGHTTP2_FLAG_END_STREAM))
-        {
-            call_handler();
-        }
-
-        return 0;
-    }
-
-    static int onDataChunkRecvCallback(nghttp2_session * /* session */,
-                                       uint8_t /* flags */,
-                                       int32_t stream_id,
-                                       const uint8_t *data,
-                                       size_t len,
-                                       void *userdata)
-    {
-        auto h2_cli = static_cast<HttpsClient *>(userdata);
-        if (h2_cli->m_streams.contains(stream_id))
-        {
-            h2_cli->m_streams[stream_id]->sendHttpBody(
-                std::string{(char *)data, len});
-        }
-        else
-        {
-            SIMPLE_HTTP_ERROR_LOG("not found : {}", stream_id);
-        }
-        return 0;
-    }
-
-    asio::awaitable<std::shared_ptr<Channel>> sendRequest(
-        std::shared_ptr<http::request<http::string_body>> req) override
-    {
-        auto channel = std::make_shared<Channel>(*m_ctx, CHANNEL_SIZE);
-        auto tp = std::make_tuple(std::move(req), channel);
-        if (!m_req_channel->try_send(error_code{}, tp))
-        {
-            auto [ec] = co_await m_req_channel->async_send(
-                error_code{}, tp, asio::as_tuple(asio::use_awaitable));
-            if (ec)
-            {
-                co_return nullptr;
-            }
-        }
-        co_return channel;
-    }
-
-    int feedRecvData(const char *data, size_t len)
-    {
-        size_t ret =
-            nghttp2_session_mem_recv(m_session, (const uint8_t *)data, len);
-        if (ret != len)
-        {
-            SIMPLE_HTTP_ERROR_LOG("nghttp2 error: {}", nghttp2_strerror(ret));
-            return -1;
-        }
-        return (int)ret;
-    }
-
-    bool connected()
-    {
-        return m_connected.load(std::memory_order_relaxed);
-    }
-
-  private:
-    asio::awaitable<void> forwardRequest()
-    {
-        auto submit_request = [this](auto tp) mutable {
-            auto &[req, ch] = tp;
-            std::vector<nghttp2_nv> hdrs;
-            auto fill =
-                [](std::string_view name, std::string_view value, auto &hdrs) {
-                    nghttp2_nv nv;
-                    nv.name = (uint8_t *)name.data();
-                    nv.namelen = name.size();
-                    nv.value = (uint8_t *)value.data();
-                    nv.valuelen = value.size();
-                    nv.flags = NGHTTP2_NV_FLAG_NONE;
-                    hdrs.push_back(nv);
-                };
-
-            fill(":path", req->target(), hdrs);
-            fill(":scheme", "https", hdrs);
-            fill(":authority", m_host, hdrs);
-            std::string method_str = http::to_string(req->method());
-            fill(":method", method_str, hdrs);
-
-            for (const auto &field : *req)
-            {
-                fill(field.name_string(), field.value(), hdrs);
-            }
-
-            const auto &post_data = req->body();
-
-            nghttp2_data_provider data_prd;
-            auto *ctx = new DataContext{.data = post_data.data(),
-                                        .total_len = post_data.size(),
-                                        .offset = 0,
-                                        .input_data = req};
-            data_prd.source.ptr = ctx;
-            data_prd.read_callback = dataReadCallback;
-            int stream_id = nghttp2_submit_request(m_session,
-                                                   nullptr,
-                                                   hdrs.data(),
-                                                   hdrs.size(),
-                                                   &data_prd,
-                                                   nullptr);
-
-            nghttp2_session_send(m_session);
-            if (stream_id < 0)
-            {
-                SIMPLE_HTTP_ERROR_LOG("Failed to submit POST request: {}",
-                                      nghttp2_strerror(stream_id));
-                ch->close();
-                return -1;
-            }
-            m_streams.emplace(stream_id,
-                              std::make_shared<Response>(std::move(ch)));
-            return 0;
-        };
+        m_timer = std::make_unique<asio::steady_timer>(
+            *m_io_ctx_pool->getMainContext());
         for (;;)
         {
-            auto [ec, tp] = co_await m_req_channel->async_receive(
+            m_timer->expires_after(std::chrono::minutes(2));
+            auto [ec] = co_await m_timer->async_wait(
                 asio::as_tuple(asio::use_awaitable));
             if (ec)
             {
                 break;
             }
-            auto [req, ch] = tp;
-            submit_request(std::move(tp));
+            std::unique_lock<std::mutex> l(m_mtx);
+            std::erase_if(m_results, [&](auto &p) {
+                auto &[addr, cached_result] = p;
+                return std::chrono::steady_clock::now() -
+                           cached_result.expire_time >
+                       m_cfg.dns_cache_time;
+            });
+            l.unlock();
         }
     }
 
-    asio::awaitable<void> startHttp2Cleint()
+    Config m_cfg;
+    asio::ip::tcp::endpoint m_ep;
+    std::shared_ptr<IoCtxPool> m_io_ctx_pool;
+    bool m_stop_ctx_pool;
+    asio::ssl::context m_ssl_context{asio::ssl::context::tlsv13_server};
+    std::unique_ptr<asio::ip::tcp::acceptor> m_acceptor;
+    std::mutex m_mtx;
+    std::unique_ptr<asio::steady_timer> m_timer;
+
+    struct CachedResult
     {
-        auto func = [](auto socket,
-                       auto h2_channel,
-                       std::weak_ptr<HttpsClient> self,
-                       auto timeout) -> asio::awaitable<void> {
-            auto sp = self.lock();
-            auto deadline =
-                std::make_shared<std::chrono::steady_clock::time_point>(
-                    std::chrono::steady_clock::now());
-            co_await (toH2Parse(socket, sp, deadline) ||
-                      toSocket(socket, h2_channel, deadline) ||
-                      sp->forwardRequest() ||
-                      watchdog(deadline, std::chrono::seconds(timeout)));
-            sp->m_connected = false;
-            // disconnect
-            for (auto &[id, rsp] : sp->m_streams)
-            {
-                rsp->m_channel->try_send(error_code{}, Disconnect{});
-            }
-            sp->m_streams.clear();
-        };
-        asio::co_spawn(
-            *m_ctx,
-            func(m_socket, m_h2_channel, shared_from_this(), m_timeout),
-            asio::detached);
-        co_return;
-    }
-
-    std::string m_host;
-    uint16_t m_port;
-    std::shared_ptr<asio::io_context> m_ctx;
-    int32_t m_timeout;
-
-    asio::ssl::context m_ssl_context;
-    std::shared_ptr<asio::ssl::stream<asio::ip::tcp::socket>> m_socket;
-    bool m_h2;
-    nghttp2_session_callbacks *m_cbs{};
-    nghttp2_session *m_session{};
-    std::shared_ptr<Http2Channel> m_h2_channel;
-    std::shared_ptr<ReqChannel> m_req_channel;
-    std::atomic_bool m_connected{false};
-
-    struct Response
-    {
-        Response(std::shared_ptr<Channel> ch) : m_channel(std::move(ch))
-        {
-        }
-
-        bool sendHttpHeader()
-        {
-            return m_channel->try_send(error_code{}, std::move(header));
-        }
-
-        bool sendHttpBody(std::string body)
-        {
-            return m_channel->try_send(error_code{}, std::move(body));
-        }
-
-        void close()
-        {
-            if (m_channel)
-                m_channel->close();
-        }
-
-        http::response<http::empty_body> header;
-        std::shared_ptr<Channel> m_channel;
+        std::vector<asio::ip::tcp::resolver::results_type::value_type> results;
+        std::chrono::steady_clock::time_point expire_time{
+            std::chrono::steady_clock::now()};
     };
 
-    std::unordered_map<int32_t, std::shared_ptr<Response>> m_streams;
+    std::unordered_map<std::string, CachedResult> m_results;
 };
 
-#endif
+}  // namespace trojan
 
-}  // namespace simple_http
-
-#endif  // _SIMPLE_HTTP_H_
+#endif  // _trojan_H_

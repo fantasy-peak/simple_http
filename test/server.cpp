@@ -1,138 +1,189 @@
-#include <chrono>
 #include <cstdio>
 #include <ostream>
 #include <string>
 #include <iostream>
-
-#include <boost/url.hpp>
+#include <cstdlib>
+#include <iostream>
+#include <string>
 
 #include "simple_http.h"
+
+#include <spdlog/spdlog.h>
+#include <spdlog/sinks/basic_file_sink.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
+#include <spdlog/async.h>
+#include <spdlog/async_logger.h>
+#include <nlohmann/json.hpp>
 
 namespace asio = boost::asio;
 namespace beast = boost::beast;
 namespace http = beast::http;
 
+bool set_log_level(auto logger, const std::string &level)
+{
+    static const std::unordered_map<std::string, spdlog::level::level_enum>
+        level_map = {{"trace", spdlog::level::trace},
+                     {"debug", spdlog::level::debug},
+                     {"info", spdlog::level::info},
+                     {"warn", spdlog::level::warn},
+                     {"error", spdlog::level::err},
+                     {"critical", spdlog::level::critical},
+                     {"off", spdlog::level::off}};
+
+    auto it = level_map.find(level);
+    if (it != level_map.end())
+    {
+        logger->set_level(it->second);
+        return true;
+    }
+    return false;
+}
+
+trojan::Config load_config_from_env()
+{
+    trojan::Config cfg;
+
+    const char *ip = std::getenv("TROJAN_IP");
+    const char *passwd = std::getenv("TROJAN_PASSWD");
+    const char *path = std::getenv("TROJAN_PATH");
+    const char *ssl_crt = std::getenv("TROJAN_SSL_CRT");
+    const char *ssl_key = std::getenv("TROJAN_SSL_KEY");
+    const char *port_str = std::getenv("TROJAN_PORT");
+    const char *worker_str = std::getenv("TROJAN_WORKERS");
+
+    cfg.ip = ip ? ip : "0.0.0.0";
+    cfg.passwd = passwd ? passwd : "";
+    cfg.path = path ? path : "/";
+    cfg.ssl_crt = ssl_crt ? ssl_crt : "";
+    cfg.ssl_key = ssl_key ? ssl_key : "";
+
+    cfg.port = port_str ? std::stoi(port_str) : 5555;
+    cfg.worker_num = worker_str ? std::stoi(worker_str) : 4;
+
+    return cfg;
+}
+
+namespace trojan
+{
+std::ostream &operator<<(std::ostream &os, const Config &cfg)
+{
+    os << "Trojan Config:\n";
+    os << "  IP         : " << cfg.ip << "\n";
+    os << "  Port       : " << cfg.port << "\n";
+    os << "  Workers    : " << cfg.worker_num << "\n";
+    os << "  Password   : " << cfg.passwd << "\n";  // 注意：敏感信息
+    os << "  Path       : " << cfg.path << "\n";
+    os << "  SSL Cert   : " << cfg.ssl_crt << "\n";
+    os << "  SSL Key    : " << cfg.ssl_key << "\n";
+    return os;
+}
+}  // namespace trojan
+
 asio::awaitable<void> start()
 {
-    simple_http::Config cfg{.ip = "0.0.0.0",
-                            .port = 6666,
-                            .worker_num = 8,
-                            .concurrent_streams = 200};
-    cfg.ssl_crt = "./v.crt";
-    cfg.ssl_key = "./v.key";
-    simple_http::HttpServer hs(cfg);
-    simple_http::LOG_CB =
-        [](simple_http::LogLevel level, auto file, auto line, std::string msg) {
-            std::cout << to_string(level) << " " << file << ":" << line << " "
-                      << msg << std::endl;
+    trojan::Config cfg = load_config_from_env();
+    std::cout << cfg << std::endl;
+
+    trojan::Server hs(cfg);
+    trojan::LOG_CB =
+        [](trojan::LogLevel level, auto file, auto line, std::string msg) {
+            if (level == trojan::LogLevel::Error)
+                spdlog::error(" [{}:{}] {}", file, line, msg);
+            else if (level == trojan::LogLevel::Info)
+            {
+                spdlog::info(" [{}:{}] {}", file, line, msg);
+            }
+            else if (level == trojan::LogLevel::Debug)
+            {
+                spdlog::debug(" [{}:{}] {}", file, line, msg);
+            }
         };
-    hs.setBefore(
-        [](const auto &req, const auto &writer) -> asio::awaitable<bool> {
-#if 0
-        boost::urls::url_view urlv =
-            boost::urls::parse_origin_form(req.target()).value();
-        if (urlv.path() != "/hello")
-        {
-            auto res = simple_http::makeHttpResponse(http::status::bad_request);
-            res->prepare_payload();
-            writer->writeHttpResponse(res);
-            co_return false;
-        }
-        for (auto const &param : urlv.params())
-        {
-            std::cout << param.key << " = " << param.value << "\n";
-        }
-#endif
-            co_return true;
-        });
-    hs.setHttpHandler(
-        "/hello", [](auto req, auto writer) -> asio::awaitable<void> {
-            std::cout << "Headers:" << std::endl;
-            // std::println("meth: {}", std::string{req.method_string()});
-            for (auto const &field : req)
-            {
-                std::cout << field.name_string() << ": " << field.value()
-                          << "\n";
-            }
-            std::cout << req.target() << std::endl;
-            auto str = req.body();
-            std::cout << "body:" << str << std::endl;
-            if (writer->version() == simple_http::Version::Http2)
-            {
-#if 0
-                auto res = simple_http::makeHttpResponse(http::status::ok);
-                res->body() = "hello h2";
-                writer->writeHttpResponse(res);
-#else
-                writer->writeHeader("content-type", "text/plain");
-                writer->writeHeader(http::field::server, "test");
-                writer->writeHeaderEnd();
-                writer->writeBody("123");
-                asio::steady_timer timer(co_await asio::this_coro::executor);
-                timer.expires_after(std::chrono::seconds(1));
-                co_await timer.async_wait(asio::use_awaitable);
-                writer->writeBody("456");
-                timer.expires_after(std::chrono::seconds(1));
-                co_await timer.async_wait(asio::use_awaitable);
-                writer->writeBodyEnd("789");
-#endif
-            }
-            else
-            {
-#if 0
-                auto res = simple_http::makeHttpResponse(http::status::ok);
-                res->body() = "hello world";
-                res->prepare_payload();
-                writer->writeHttpResponse(res);
-#else
-                // curl --no-buffer  -v http://localhost:6666/hello -d "aaaa"
-                http::response<http::empty_body> res{http::status::ok, 11};
-                res.set(http::field::server, "simple_http_server");
-                res.set(http::field::content_type, "text/plain");
-                res.set(http::field::transfer_encoding, "chunked");  // 关键字段
-                res.keep_alive(true);
-                writer->writeChunkHeader(res);
-                writer->writeChunkData("123");
-                asio::steady_timer timer(co_await asio::this_coro::executor);
-                timer.expires_after(std::chrono::seconds(1));
-                co_await timer.async_wait(asio::use_awaitable);
-                writer->writeChunkData("456");
-                timer.expires_after(std::chrono::seconds(1));
-                co_await timer.async_wait(asio::use_awaitable);
-                writer->writeChunkEnd();
-#endif
-            }
-            co_return;
-        });
-    hs.setHttpHandler("/world",
-                      [](auto /* req */, auto writer) -> asio::awaitable<void> {
-                          auto res =
-                              simple_http::makeHttpResponse(http::status::ok);
-                          res->body() =
-                              writer->version() == simple_http::Version::Http2
-                                  ? "/world http2 body"
-                                  : "/world http1.1 body";
-                          res->prepare_payload();
-                          writer->writeHttpResponse(res);
-                          co_return;
-                      })
-        .setHttpRegexHandler(
-            ".*", [](auto /* req */, auto writer) -> asio::awaitable<void> {
-                auto res = simple_http::makeHttpResponse(http::status::ok);
-                res->body() = "regex matched";
-                res->prepare_payload();
-                writer->writeHttpResponse(res);
-                co_return;
-            });
+
     co_await hs.start();
 }
 
 int main()
 {
-    simple_http::IoCtxPool pool{1};
+    size_t queue_size = 8192;
+    size_t thread_count = 1;
+    spdlog::init_thread_pool(queue_size, thread_count);
+
+    auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
+    std::vector<spdlog::sink_ptr> sinks{console_sink};
+
+    auto logger_ = std::make_shared<spdlog::async_logger>(
+        "async_logger",
+        sinks.begin(),
+        sinks.end(),
+        spdlog::thread_pool(),
+        spdlog::async_overflow_policy::block);
+
+    spdlog::set_default_logger(logger_);
+    spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%t] [%^%l%$] %v");
+    spdlog::set_level(spdlog::level::info);
+
+    trojan::IoCtxPool pool{1};
     pool.start();
     asio::co_spawn(pool.getIoContext(), start(), asio::detached);
-    while (true)
-        sleep(1000);
+
+    // curl -X POST http://localhost:7777/loglevel -H "Content-Type:
+    // application/json" -d '{"level": "debug"}'
+    const char *port_str = std::getenv("TROJAN_LOG_PORT");
+    int port = port_str ? std::stoi(port_str) : 7777;
+    asio::ip::tcp::acceptor acceptor(
+        pool.getIoContext(),
+        asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port));
+
+    for (;;)
+    {
+        try
+        {
+            asio::ip::tcp::socket socket(pool.getIoContext());
+            acceptor.accept(socket);
+
+            beast::flat_buffer buffer;
+            http::request<http::string_body> req;
+            http::read(socket, buffer, req);
+
+            http::response<http::string_body> res;
+            if (req.method() == http::verb::post && req.target() == "/loglevel")
+            {
+                try
+                {
+                    auto j = nlohmann::json::parse(req.body());
+                    std::string level = j.at("level").get<std::string>();
+                    if (set_log_level(logger_, level))
+                    {
+                        res.result(http::status::ok);
+                        res.body() = "Log level set to: " + level;
+                    }
+                    else
+                    {
+                        res.result(http::status::bad_request);
+                        res.body() = "Invalid log level";
+                    }
+                }
+                catch (...)
+                {
+                    res.result(http::status::bad_request);
+                    res.body() = "Invalid JSON";
+                }
+            }
+            else
+            {
+                res.result(http::status::not_found);
+                res.body() = "Not found";
+            }
+
+            res.prepare_payload();
+
+            http::write(socket, res);
+        }
+        catch (std::exception const &e)
+        {
+            TROJAN_ERROR_LOG("Error: {}", e.what());
+        }
+    }
+
     return 0;
 }
