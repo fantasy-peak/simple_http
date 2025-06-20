@@ -1019,12 +1019,14 @@ class HttpResponseWriter
 inline asio::awaitable<void> toSocket(
     auto socket,
     std::shared_ptr<Http2Channel> ch,
-    std::shared_ptr<std::chrono::steady_clock::time_point> deadline)
+    std::shared_ptr<std::chrono::steady_clock::time_point> deadline,
+    std::chrono::seconds max_idle_time)
 {
     std::vector<std::shared_ptr<std::string>> vec;
     bool force_close = false;
     for (;;)
     {
+        *deadline = std::chrono::steady_clock::now() + max_idle_time;
         while (true)
         {
             std::variant<std::shared_ptr<std::string>, Disconnect> data;
@@ -1043,7 +1045,6 @@ inline asio::awaitable<void> toSocket(
                 auto &info_ptr = std::get<std::shared_ptr<std::string>>(data);
                 vec.emplace_back(std::move(info_ptr));
             }
-            *deadline = std::chrono::steady_clock::now();
         }
 
         if (vec.empty() && !force_close)
@@ -1095,11 +1096,13 @@ inline asio::awaitable<void> toSocket(
 inline asio::awaitable<void> toH2Parse(
     auto socket,
     auto h2p,
-    std::shared_ptr<std::chrono::steady_clock::time_point> deadline)
+    std::shared_ptr<std::chrono::steady_clock::time_point> deadline,
+    std::chrono::seconds max_idle_time)
 {
     char buffer[4096];
     for (;;)
     {
+        *deadline = std::chrono::steady_clock::now() + max_idle_time;
         auto [ec, nread] = co_await socket->async_read_some(
             asio::buffer(buffer, sizeof(buffer)),
             asio::as_tuple(asio::use_awaitable));
@@ -1107,7 +1110,6 @@ inline asio::awaitable<void> toH2Parse(
         {
             break;
         }
-        *deadline = std::chrono::steady_clock::now();
         auto ret = h2p->feedRecvData(buffer, nread);
         if (ret == -1)
         {
@@ -1138,20 +1140,16 @@ void shutdown(const auto &socket)
 }
 
 inline asio::awaitable<void> watchdog(
-    std::shared_ptr<std::chrono::steady_clock::time_point> deadline,
-    std::chrono::seconds interval)
+    std::shared_ptr<std::chrono::steady_clock::time_point> deadline)
 {
     asio::steady_timer timer(co_await asio::this_coro::executor);
-    while (true)
+
+    auto now = std::chrono::steady_clock::now();
+    while (*deadline > now)
     {
-        timer.expires_at(std::chrono::steady_clock::now() + interval);
+        timer.expires_at(*deadline);
         co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
-        auto now = std::chrono::steady_clock::now();
-        if (now - *deadline >= interval)
-        {
-            SIMPLE_HTTP_INFO_LOG("timeout");
-            break;
-        }
+        now = std::chrono::steady_clock::now();
     }
     co_return;
 }
@@ -1423,9 +1421,9 @@ class HttpServer final
         }
         auto deadline = std::make_shared<std::chrono::steady_clock::time_point>(
             std::chrono::steady_clock::now());
-        co_await (toH2Parse(socket, h2p, deadline) ||
-                  toSocket(socket, ch, deadline) ||
-                  watchdog(deadline, m_cfg.max_idle_time));
+        co_await (toH2Parse(socket, h2p, deadline, m_cfg.max_idle_time) ||
+                  toSocket(socket, ch, deadline, m_cfg.max_idle_time) ||
+                  watchdog(deadline));
         shutdown(socket);
     }
 
@@ -1465,9 +1463,9 @@ class HttpServer final
         }
         auto deadline = std::make_shared<std::chrono::steady_clock::time_point>(
             std::chrono::steady_clock::now());
-        co_await (toH2Parse(socket, h2p, deadline) ||
-                  toSocket(socket, ch, deadline) ||
-                  watchdog(deadline, m_cfg.max_idle_time));
+        co_await (toH2Parse(socket, h2p, deadline, m_cfg.max_idle_time) ||
+                  toSocket(socket, ch, deadline, m_cfg.max_idle_time) ||
+                  watchdog(deadline));
         shutdown(socket);
     }
 
@@ -1476,11 +1474,14 @@ class HttpServer final
                                       std::shared_ptr<Http2Parse> h2p,
                                       Version version)
     {
-        auto recv_request = [this](auto socket,
-                                   auto h2p,
-                                   auto deadline) -> asio::awaitable<void> {
+        auto recv_request =
+            [this](auto socket,
+                   auto h2p,
+                   auto deadline,
+                   auto max_idle_time) -> asio::awaitable<void> {
             for (;;)
             {
+                *deadline = std::chrono::steady_clock::now() + max_idle_time;
                 beast::flat_buffer buffer;
                 http::request<http::string_body> req;
                 auto [ec, count] = co_await http::async_read(
@@ -1489,7 +1490,6 @@ class HttpServer final
                 {
                     co_return;
                 }
-                *deadline = std::chrono::steady_clock::now();
                 auto version =
                     (req.version() == 11 ? Version::Http11 : Version::Http1);
                 callHandler(m_handler_functions,
@@ -1503,16 +1503,17 @@ class HttpServer final
         auto send_response = [](auto socket,
                                 auto http1_ch,
                                 Version version,
-                                auto deadline) -> asio::awaitable<void> {
+                                auto deadline,
+                                auto max_idle_time) -> asio::awaitable<void> {
             for (;;)
             {
+                *deadline = std::chrono::steady_clock::now() + max_idle_time;
                 auto [ec, h1_rsp] = co_await http1_ch->async_receive(
                     asio::as_tuple(asio::use_awaitable));
                 if (ec)
                 {
                     break;
                 }
-                *deadline = std::chrono::steady_clock::now();
                 if (std::holds_alternative<std::string>(h1_rsp))
                 {
                     auto &body = std::get<std::string>(h1_rsp);
@@ -1551,9 +1552,11 @@ class HttpServer final
         };
         auto deadline = std::make_shared<std::chrono::steady_clock::time_point>(
             std::chrono::steady_clock::now());
-        co_await (recv_request(socket, h2p, deadline) ||
-                  send_response(socket, http1_ch, version, deadline) ||
-                  watchdog(deadline, m_cfg.max_idle_time));
+        co_await (
+            recv_request(socket, h2p, deadline, m_cfg.max_idle_time) ||
+            send_response(
+                socket, http1_ch, version, deadline, m_cfg.max_idle_time) ||
+            watchdog(deadline));
         shutdown(socket);
         co_return;
     }
@@ -2067,10 +2070,15 @@ class HttpsClient final : public HttpClient,
             auto deadline =
                 std::make_shared<std::chrono::steady_clock::time_point>(
                     std::chrono::steady_clock::now());
-            co_await (toH2Parse(socket, sp, deadline) ||
-                      toSocket(socket, h2_channel, deadline) ||
-                      sp->forwardRequest() ||
-                      watchdog(deadline, std::chrono::seconds(timeout)));
+            co_await (toH2Parse(socket,
+                                sp,
+                                deadline,
+                                std::chrono::seconds(timeout)) ||
+                      toSocket(socket,
+                               h2_channel,
+                               deadline,
+                               std::chrono::seconds(timeout)) ||
+                      sp->forwardRequest() || watchdog(deadline));
             sp->m_connected = false;
             // disconnect
             for (auto &[id, rsp] : sp->m_streams)
