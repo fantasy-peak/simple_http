@@ -1562,7 +1562,7 @@ class HttpServer final
     }
 
     asio::awaitable<void> session(auto socket,
-                                  const std::shared_ptr<asio::io_context> &ctx)
+                                  std::shared_ptr<asio::io_context> ctx)
     {
         auto http1_ch = std::make_shared<Http1Channel>(*ctx, CHANNEL_SIZE);
         auto h2p = std::make_shared<Http2Parse>(nullptr,
