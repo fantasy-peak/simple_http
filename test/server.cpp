@@ -1,10 +1,11 @@
 #include <chrono>
 #include <cstdio>
+#include <iostream>
 #include <ostream>
 #include <string>
-#include <iostream>
 
 #include <boost/url.hpp>
+#include <thread>
 
 #include "simple_http.h"
 
@@ -15,19 +16,20 @@ namespace http = beast::http;
 asio::awaitable<void> start()
 {
     simple_http::Config cfg{.ip = "0.0.0.0",
-                            .port = 6666,
+                            .port = 7788,
                             .worker_num = 8,
                             .concurrent_streams = 200};
     cfg.ssl_crt = "./v.crt";
     cfg.ssl_key = "./v.key";
-    simple_http::HttpServer hs(cfg);
     simple_http::LOG_CB =
         [](simple_http::LogLevel level, auto file, auto line, std::string msg) {
             std::cout << to_string(level) << " " << file << ":" << line << " "
                       << msg << std::endl;
         };
-    hs.setBefore(
-        [](const auto &req, const auto &writer) -> asio::awaitable<bool> {
+    simple_http::HttpServer hs(cfg);
+    hs.setBefore([](const http::request<http::string_body> & /* req */,
+                    const std::shared_ptr<simple_http::HttpResponseWriter>
+                        & /* writer */) -> asio::awaitable<bool> {
 #if 0
         boost::urls::url_view urlv =
             boost::urls::parse_origin_form(req.target()).value();
@@ -43,10 +45,13 @@ asio::awaitable<void> start()
             std::cout << param.key << " = " << param.value << "\n";
         }
 #endif
-            co_return true;
-        });
+        co_return true;
+    });
     hs.setHttpHandler(
-        "/hello", [](auto req, auto writer) -> asio::awaitable<void> {
+        "/hello",
+        [](http::request<http::string_body> req,
+           std::shared_ptr<simple_http::HttpResponseWriter> writer)
+            -> asio::awaitable<void> {
             std::cout << "Headers:" << std::endl;
             // std::println("meth: {}", std::string{req.method_string()});
             for (auto const &field : req)
@@ -104,20 +109,24 @@ asio::awaitable<void> start()
             }
             co_return;
         });
-    hs.setHttpHandler("/world",
-                      [](auto /* req */, auto writer) -> asio::awaitable<void> {
-                          auto res =
-                              simple_http::makeHttpResponse(http::status::ok);
-                          res->body() =
-                              writer->version() == simple_http::Version::Http2
-                                  ? "/world http2 body"
-                                  : "/world http1.1 body";
-                          res->prepare_payload();
-                          writer->writeHttpResponse(res);
-                          co_return;
-                      })
+    hs.setHttpHandler(
+          "/world",
+          [](http::request<http::string_body> /* req */,
+             std::shared_ptr<simple_http::HttpResponseWriter> writer)
+              -> asio::awaitable<void> {
+              auto res = simple_http::makeHttpResponse(http::status::ok);
+              res->body() = writer->version() == simple_http::Version::Http2
+                                ? "/world http2 body"
+                                : "/world http1.1 body";
+              res->prepare_payload();
+              writer->writeHttpResponse(res);
+              co_return;
+          })
         .setHttpRegexHandler(
-            ".*", [](auto /* req */, auto writer) -> asio::awaitable<void> {
+            ".*",
+            [](http::request<http::string_body> /* req */,
+               std::shared_ptr<simple_http::HttpResponseWriter> writer)
+                -> asio::awaitable<void> {
                 auto res = simple_http::makeHttpResponse(http::status::ok);
                 res->body() = "regex matched";
                 res->prepare_payload();
@@ -131,8 +140,21 @@ int main()
 {
     simple_http::IoCtxPool pool{1};
     pool.start();
-    asio::co_spawn(pool.getIoContext(), start(), asio::detached);
+    asio::co_spawn(pool.getIoContext(),
+                   start(),
+                   [](const std::exception_ptr &eptr) {
+                       try
+                       {
+                           if (eptr)
+                               std::rethrow_exception(eptr);
+                       }
+                       catch (const std::exception &e)
+                       {
+                           std::cout << "Exception caught by co_spawn handler: "
+                                     << e.what() << std::endl;
+                       }
+                   });
     while (true)
-        sleep(1000);
+        std::this_thread::sleep_for(std::chrono::seconds(100));
     return 0;
 }

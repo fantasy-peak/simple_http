@@ -10,7 +10,7 @@
 asio::awaitable<void> start()
 {
     simple_http::Config cfg{.ip = "0.0.0.0",
-                            .port = 6666,
+                            .port = 7788,
                             .worker_num = 8,
                             .concurrent_streams = 200};
     simple_http::HttpServer hs(cfg);
@@ -66,11 +66,11 @@ int main()
 
 ## Test Cmd
 ```
-curl -v --http2-prior-knowledge http://localhost:6666/hello\?key1\=value1\&key2\=value2
-curl -v --http2-prior-knowledge http://localhost:6666/hello -d "abcd"
-curl -v --http2 http://localhost:6666/hello -d "abcd"
+curl -N -v --http2-prior-knowledge http://localhost:7788/hello\?key1\=value1\&key2\=value2
+curl -N -v --http2-prior-knowledge http://localhost:7788/hello -d "abcd"
+curl -N -v --http2 http://localhost:7788/hello -d "abcd"
 
-nghttp --upgrade -v http://127.0.0.1:6666/hello
+nghttp --upgrade -v http://127.0.0.1:7788/hello
 nghttp --upgrade -v http://nghttp2.org
-h2load -n 60000 -c 1000 -m 200 -H 'Content-Type: application/json' --data=b.txt http://localhost:6666/hello
+h2load -n 60000 -c 1000 -m 200 -H 'Content-Type: application/json' --data=b.txt http://localhost:7788/hello
 ```
