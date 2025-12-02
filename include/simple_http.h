@@ -7,6 +7,8 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <format>
 #include <functional>
 #include <future>
 #include <list>
@@ -28,16 +30,21 @@
 
 #include <nghttp2/nghttp2.h>
 
+#include <boost/asio.hpp>
 #include <boost/asio/as_tuple.hpp>
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
+#include <boost/asio/dispatch.hpp>
 #include <boost/asio/experimental/awaitable_operators.hpp>
 #include <boost/asio/experimental/concurrent_channel.hpp>
 #include <boost/asio/io_context.hpp>
+#include <boost/asio/post.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/asio/ssl/context.hpp>
 #include <boost/asio/ssl/stream.hpp>
+#include <boost/asio/this_coro.hpp>
+#include <boost/asio/use_awaitable.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/beast/http/empty_body.hpp>
@@ -45,11 +52,6 @@
 #include <boost/beast/http/message_fwd.hpp>
 #include <boost/beast/http/string_body_fwd.hpp>
 #include <boost/beast/http/verb.hpp>
-#include <boost/asio/dispatch.hpp>
-#include <boost/asio/post.hpp>
-#include <boost/asio/this_coro.hpp>
-#include <boost/asio/use_awaitable.hpp>
-#include <boost/asio.hpp>
 
 namespace simple_http
 {
@@ -1178,10 +1180,10 @@ class HttpServer final
           m_io_dispatch(std::make_shared<IoCtxPool>(cfg.worker_num)),
           m_stop_ctx_pool(true)
     {
+        initSsl();
         m_io_ctx_pool->createMainContext();
         m_io_ctx_pool->start();
         m_io_dispatch->start();
-        initSsl();
     }
 
     HttpServer(const Config &cfg,
@@ -1324,6 +1326,27 @@ class HttpServer final
     {
         if (m_cfg.ssl_crt.empty() || m_cfg.ssl_key.empty())
             return;
+
+        auto file_exists = [](const std::filesystem::path &path) {
+            std::error_code ec;
+            bool exists = std::filesystem::exists(path, ec) &&
+                          std::filesystem::is_regular_file(path, ec);
+
+            return !ec && exists;
+        };
+
+        if (!file_exists(m_cfg.ssl_crt))
+        {
+            SIMPLE_HTTP_ERROR_LOG("ssl_crt not exist {}", m_cfg.ssl_crt);
+            throw std::runtime_error(
+                std::format("{} not exist", m_cfg.ssl_crt));
+        }
+        if (!file_exists(m_cfg.ssl_key))
+        {
+            SIMPLE_HTTP_ERROR_LOG("ssl_key not exist {}", m_cfg.ssl_key);
+            throw std::runtime_error(
+                std::format("{} not exist", m_cfg.ssl_key));
+        }
 
         uint64_t opts = asio::ssl::context::default_workarounds |
                         asio::ssl::context::no_tlsv1 |
