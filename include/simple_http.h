@@ -1623,7 +1623,10 @@ class HttpServer final
         if (headers.find(http::field::upgrade) != headers.end() &&
             headers[http::field::upgrade] == "h2c")
         {
-            h2_setting = headers[http::field::http2_settings];
+            constexpr auto http2_header = "HTTP2-Settings";
+            if (headers.contains(http2_header)) {
+                h2_setting = headers.at(http2_header);
+            }
         }
 
         std::tie(ec, bytes) = co_await http::async_read(
