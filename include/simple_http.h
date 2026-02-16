@@ -322,6 +322,12 @@ using Http1Channel = asio::experimental::concurrent_channel<
 using Http2Channel = asio::experimental::concurrent_channel<
     void(error_code, std::variant<std::shared_ptr<std::string>, Disconnect>)>;
 
+using SimpleCallback = std::function<asio::awaitable<void>(
+                            http::request<http::string_body>,
+                            std::shared_ptr<HttpResponseWriter>)>;
+
+using RequestCallback = std::variant<SimpleCallback>;
+
 struct HandlerFunctions
 {
     void setBefore(std::function<asio::awaitable<bool>(
@@ -331,18 +337,12 @@ struct HandlerFunctions
         before = std::move(cb);
     }
 
-    void setHttpHandler(const std::string &path,
-                        std::function<asio::awaitable<void>(
-                            http::request<http::string_body>,
-                            std::shared_ptr<HttpResponseWriter>)> cb)
+    void setHttpHandler(const std::string &path, RequestCallback cb)
     {
         map_proc[path] = std::move(cb);
     }
 
-    void setHttpRegexHandler(const std::string &regex,
-                             std::function<asio::awaitable<void>(
-                                 http::request<http::string_body>,
-                                 std::shared_ptr<HttpResponseWriter>)> cb)
+    void setHttpRegexHandler(const std::string &regex, RequestCallback cb)
     {
         try
         {
@@ -368,11 +368,7 @@ struct HandlerFunctions
             co_return true;
         }};
 
-    std::unordered_map<std::string,
-                       std::function<asio::awaitable<void>(
-                           http::request<http::string_body>,
-                           std::shared_ptr<HttpResponseWriter>)>>
-        map_proc{
+    std::unordered_map<std::string, RequestCallback> map_proc{
             {"*", [](auto, auto writer) -> asio::awaitable<void> {
                  if (writer->version() == simple_http::Version::Http2)
                  {
@@ -396,12 +392,14 @@ struct HandlerFunctions
                  }
                  co_return;
              }}};
-    std::vector<std::pair<std::regex,
-                          std::function<asio::awaitable<void>(
-                              http::request<http::string_body>,
-                              std::shared_ptr<HttpResponseWriter>)>>>
-        regex_proc;
+    std::vector<std::pair<std::regex, RequestCallback>> regex_proc;
 };
+
+inline auto runCallBack(const RequestCallback* entry, auto req, auto writer) -> asio::awaitable<void> {
+    if (auto simple_cb = std::get_if<SimpleCallback>(entry)) {
+        co_await (*simple_cb)(std::move(req), std::move(writer));
+    }
+}
 
 asio::awaitable<void> callCallback(std::weak_ptr<HandlerFunctions> hf,
                                    auto req,
@@ -421,7 +419,7 @@ asio::awaitable<void> callCallback(std::weak_ptr<HandlerFunctions> hf,
     }
     if (sp->map_proc.contains(path))
     {
-        co_await sp->map_proc[path](std::move(req), std::move(writer));
+        co_await runCallBack(&sp->map_proc[path], std::move(req), std::move(writer));
     }
     else
     {
@@ -429,11 +427,11 @@ asio::awaitable<void> callCallback(std::weak_ptr<HandlerFunctions> hf,
         {
             if (std::regex_match(path, pattern))
             {
-                co_await cb(std::move(req), std::move(writer));
+                co_await runCallBack(&cb, std::move(req), std::move(writer));
                 co_return;
             }
         }
-        co_await sp->map_proc["*"](std::move(req), std::move(writer));
+        co_await runCallBack(&sp->map_proc["*"], std::move(req), std::move(writer));
     }
     co_return;
 }
@@ -1263,19 +1261,13 @@ class HttpServer final
         }
     }
 
-    auto &setHttpHandler(const std::string &path,
-                         std::function<asio::awaitable<void>(
-                             http::request<http::string_body>,
-                             std::shared_ptr<HttpResponseWriter>)> cb)
+    auto &setHttpHandler(const std::string &path, RequestCallback cb)
     {
         m_handler_functions->setHttpHandler(path, std::move(cb));
         return *this;
     }
 
-    auto &setHttpRegexHandler(const std::string &regex,
-                              std::function<asio::awaitable<void>(
-                                  http::request<http::string_body>,
-                                  std::shared_ptr<HttpResponseWriter>)> cb)
+    auto &setHttpRegexHandler(const std::string &regex, RequestCallback cb)
     {
         m_handler_functions->setHttpRegexHandler(regex, std::move(cb));
         return *this;
