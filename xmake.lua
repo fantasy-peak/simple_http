@@ -17,7 +17,7 @@ set_policy("package.librarydeps.strict_compatibility", true)
 -- PACKAGES --
 add_requires("boost", {configs = {asio=true}})
 add_requires("nghttp2")
-add_requires("openssl")
+add_requires("openssl3")
 
 target("simple_http")
     set_kind("static")
@@ -25,7 +25,7 @@ target("simple_http")
     add_packages(
         "boost",
         "nghttp2",
-        "openssl",
+        "openssl3",
         {public = true}
     )
 target_end()
