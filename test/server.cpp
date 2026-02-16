@@ -12,12 +12,14 @@ namespace http = beast::http;
 
 asio::awaitable<void> start()
 {
-    simple_http::Config cfg{.ip = "0.0.0.0",
-                            .port = 7788,
-                            .worker_num = 8,
-                            .concurrent_streams = 200};
-    // cfg.ssl_crt = "./v.crt";
-    // cfg.ssl_key = "./v.key";
+    simple_http::Config cfg{
+        .ip = "0.0.0.0",
+        .port = 7788,
+        .worker_num = 8,
+        .concurrent_streams = 200,
+        .ssl_crt = "./test/tls_certificates/cert.pem",
+        .ssl_key = "./test/tls_certificates/key.pem",
+    };
     simple_http::LOG_CB =
         [](simple_http::LogLevel level, auto file, auto line, std::string msg) {
             std::cout << to_string(level) << " " << file << ":" << line << " "
