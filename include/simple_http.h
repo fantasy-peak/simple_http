@@ -1226,7 +1226,7 @@ class HttpServer final
             // socket.set_option(asio::ip::tcp::no_delay(true));
             // socket.set_option(asio::socket_base::send_buffer_size(5024 *
             // 1024));
-            if (m_cfg.ssl_crt.empty())
+            if (!m_ssl_context)
             {
                 asio::co_spawn(*context,
                                session(std::make_shared<asio::ip::tcp::socket>(
@@ -1238,7 +1238,7 @@ class HttpServer final
             {
                 auto stream =
                     std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(
-                        std::move(socket), m_ssl_context);
+                        std::move(socket), *m_ssl_context);
                 asio::co_spawn(*context,
                                startSslsession(std::move(stream), context),
                                asio::detached);
@@ -1305,6 +1305,8 @@ class HttpServer final
   private:
     void initSsl()
     {
+        auto ssl_context = asio::ssl::context(asio::ssl::context::tlsv13_server);
+
         if (m_cfg.ssl_crt.empty() || m_cfg.ssl_key.empty())
             return;
 
@@ -1336,23 +1338,22 @@ class HttpServer final
         {
             opts |= asio::ssl::context::no_tlsv1_2;
         }
-        m_ssl_context.set_options(opts);
+        ssl_context.set_options(opts);
 
         error_code ec;
         [[maybe_unused]]
-        auto ret = m_ssl_context.use_certificate_chain_file(m_cfg.ssl_crt, ec);
-        if (ec)
-            throw std::runtime_error(ec.message());
+        auto ret = ssl_context.use_certificate_chain_file(m_cfg.ssl_crt, ec);
+        if (ec) {
+          throw std::runtime_error(ec.message());
+        }
 
-        [[maybe_unused]] auto _ =
-            m_ssl_context.use_private_key_file(m_cfg.ssl_key,
-                                               asio::ssl::context::pem,
-                                               ec);
-        if (ec)
-            throw std::runtime_error(ec.message());
+        [[maybe_unused]] auto _ = ssl_context.use_private_key_file(m_cfg.ssl_key, asio::ssl::context::pem, ec);
+        if (ec) {
+          throw std::runtime_error(ec.message());
+        }
 
         SSL_CTX_set_alpn_select_cb(
-            m_ssl_context.native_handle(),
+            ssl_context.native_handle(),
             [](SSL * /* ssl */,
                const unsigned char **out,
                unsigned char *outlen,
@@ -1374,6 +1375,8 @@ class HttpServer final
                 return SSL_TLSEXT_ERR_OK;
             },
             nullptr);
+
+      m_ssl_context = std::move(ssl_context);
     }
 
     asio::awaitable<void> upgradeH2c(
@@ -1664,11 +1667,11 @@ class HttpServer final
     }
 
     Config m_cfg;
+    std::optional<asio::ssl::context> m_ssl_context;
     asio::ip::tcp::endpoint m_ep;
     std::shared_ptr<IoCtxPool> m_io_ctx_pool;
     std::shared_ptr<IoCtxPool> m_io_dispatch;
     bool m_stop_ctx_pool;
-    asio::ssl::context m_ssl_context{asio::ssl::context::tlsv13_server};
     std::unique_ptr<asio::ip::tcp::acceptor> m_acceptor;
     std::shared_ptr<HandlerFunctions> m_handler_functions =
         std::make_shared<HandlerFunctions>();
