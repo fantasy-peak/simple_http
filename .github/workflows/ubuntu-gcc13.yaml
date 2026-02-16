@@ -18,13 +18,13 @@ jobs:
       - name: Installation
         run: |
           sudo apt-get update
-          sudo apt-get install -y valgrind libgl1-mesa-dev libglu1-mesa-dev p7zip gobjc wget sudo
+          sudo apt-get install -y p7zip wget
           sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
           sudo apt install -y gcc-13 g++-13
 
       - uses: xmake-io/github-action-setup-xmake@v1
         with:
-          xmake-version: v2.9.9
+          xmake-version: v3.0.7
 
       - name: checkout
         uses: actions/checkout@v3
@@ -34,6 +34,5 @@ jobs:
           g++-13 -v
           export CXX=g++-13
           export CC=gcc-13
-          cd test
           xmake build -y
           xmake install -o .
