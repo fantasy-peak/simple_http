@@ -47,3 +47,12 @@ Do this by editing `.vscode/c_cpp_properties.json`:
   ],
   ...
 }
+```
+
+## Nix Development Environment
+
+Users running Nix with flakes enables may enter a development shell with:
+
+```sh
+nix develop
+```

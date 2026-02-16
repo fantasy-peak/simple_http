@@ -11,7 +11,6 @@ add_rules("plugin.compile_commands.autoupdate", { outputdir = "build", lsp="clan
 
 -- REPRODUCIBILITY --
 set_policy("package.requires_lock", true)
-set_policy("package.install_only", true)
 set_policy("package.librarydeps.strict_compatibility", true)
 
 -- PACKAGES --
