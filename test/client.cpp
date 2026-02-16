@@ -1,17 +1,12 @@
 #include <chrono>
-#include <cstdio>
 #include <memory>
 #include <ostream>
 #include <string>
 #include <iostream>
 #include <variant>
 
-#include <boost/beast/core/string_type.hpp>
-#include "boost/asio/as_tuple.hpp"
-#include "boost/asio/awaitable.hpp"
-#include "boost/asio/co_spawn.hpp"
-#include "boost/asio/detached.hpp"
-#include "boost/asio/use_awaitable.hpp"
+#include <boost/beast.hpp>
+#include <boost/asio.hpp>
 
 #include "simple_http.h"
 
