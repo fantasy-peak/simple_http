@@ -4,11 +4,33 @@
 #include <string>
 #include <thread>
 
+#include <boost/asio.hpp>
+#include <openssl/ssl.h>
+#include <openssl/bio.h>
+#include <openssl/x509.h>
+
 #include "simple_http.h"
 
 namespace asio = boost::asio;
 namespace beast = boost::beast;
 namespace http = beast::http;
+
+
+// Taken from: https://gist.github.com/cseelye/adcd900768ff61f697e603fd41c67625
+auto certificate_subject_name(const X509* x509_cert) -> std::string {
+    auto constexpr max_len = 4096;
+    char buffer[max_len];
+    memset(buffer, 0, max_len);
+
+    const auto& x509_name = X509_get_subject_name(x509_cert);
+
+    auto output_bio = std::unique_ptr<BIO, decltype(&BIO_free)>(BIO_new(BIO_s_mem()), BIO_free);
+
+    X509_NAME_print_ex(output_bio.get(), x509_name, 0, 0);
+    BIO_read(output_bio.get(), buffer, max_len - 1);
+
+    return std::string(buffer);
+}
 
 asio::awaitable<void> start()
 {
@@ -99,6 +121,27 @@ asio::awaitable<void> start()
                 writer->writeHttpResponse(res);
                 co_return;
             });
+
+    hs.setHttpHandler("/tls", [](
+        http::request<http::string_body> /* req */,
+        std::shared_ptr<simple_http::HttpResponseWriter> writer,
+        std::optional<asio::ssl::stream<asio::ip::tcp::socket>::native_handle_type> ssl_ctx
+    ) -> asio::awaitable<void> {
+        auto response = simple_http::makeHttpResponse(simple_http::http::status::ok);
+
+        if (ssl_ctx) {
+            const auto& x509_ref = SSL_get_certificate(*ssl_ctx);
+            auto subject_name = certificate_subject_name(x509_ref);
+            response->body() = subject_name;
+        } else {
+            response->body() = "no TLS!";
+        }
+
+        writer->writeHttpResponse(response);
+
+        co_return;
+    });
+
     std::cout << "started http server\n";
     co_await hs.start();
 }
