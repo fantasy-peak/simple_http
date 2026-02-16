@@ -1,5 +1,4 @@
-#ifndef _SIMPLE_HTTP_H_
-#define _SIMPLE_HTTP_H_
+#pragma once
 
 #include <algorithm>
 #include <atomic>
@@ -29,29 +28,11 @@
 #include <vector>
 
 #include <nghttp2/nghttp2.h>
-
-#include <boost/asio.hpp>
-#include <boost/asio/as_tuple.hpp>
-#include <boost/asio/awaitable.hpp>
-#include <boost/asio/co_spawn.hpp>
-#include <boost/asio/detached.hpp>
-#include <boost/asio/dispatch.hpp>
 #include <boost/asio/experimental/awaitable_operators.hpp>
 #include <boost/asio/experimental/concurrent_channel.hpp>
-#include <boost/asio/io_context.hpp>
-#include <boost/asio/post.hpp>
+#include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
-#include <boost/asio/ssl/context.hpp>
-#include <boost/asio/ssl/stream.hpp>
-#include <boost/asio/this_coro.hpp>
-#include <boost/asio/use_awaitable.hpp>
-#include <boost/beast/core.hpp>
-#include <boost/beast/http.hpp>
-#include <boost/beast/http/empty_body.hpp>
-#include <boost/beast/http/message.hpp>
-#include <boost/beast/http/message_fwd.hpp>
-#include <boost/beast/http/string_body_fwd.hpp>
-#include <boost/beast/http/verb.hpp>
+#include <boost/beast.hpp>
 
 namespace simple_http
 {
@@ -1531,8 +1512,11 @@ class HttpServer final
             for (;;)
             {
                 *deadline = std::chrono::steady_clock::now() + max_idle_time;
+
+
                 auto [ec, h1_rsp] = co_await http1_ch->async_receive(
                     asio::as_tuple(asio::use_awaitable));
+
                 if (ec)
                 {
                     break;
@@ -1572,6 +1556,7 @@ class HttpServer final
                 if (version == Version::Http1)
                     break;
             }
+            co_return;
         };
         auto deadline = std::make_shared<std::chrono::steady_clock::time_point>(
             std::chrono::steady_clock::now());
@@ -2165,6 +2150,4 @@ class HttpsClient final : public HttpClient,
 
 #endif
 
-}  // namespace simple_http
-
-#endif  // _SIMPLE_HTTP_H_
+}
