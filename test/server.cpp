@@ -39,8 +39,10 @@ asio::awaitable<void> start()
         .port = 7788,
         .worker_num = 8,
         .concurrent_streams = 200,
-        .ssl_crt = "./test/tls_certificates/cert.pem",
-        .ssl_key = "./test/tls_certificates/key.pem",
+        .ssl_crt = "./test/tls_certificates/server_cert.pem",
+        .ssl_key = "./test/tls_certificates/server_key.pem",
+        .ssl_mutual = true,
+        .ssl_ca = "./test/tls_certificates/ca_cert.pem"
     };
     simple_http::LOG_CB =
         [](simple_http::LogLevel level, auto file, auto line, std::string msg) {
@@ -130,9 +132,13 @@ asio::awaitable<void> start()
         auto response = simple_http::makeHttpResponse(simple_http::http::status::ok);
 
         if (ssl_ctx) {
-            const auto& x509_ref = SSL_get_certificate(*ssl_ctx);
-            auto subject_name = certificate_subject_name(x509_ref);
-            response->body() = subject_name;
+            const auto& x509_server_ref = SSL_get_certificate(*ssl_ctx);
+            auto server_subject_name = certificate_subject_name(x509_server_ref);
+
+            const auto& x509_client_ref = SSL_get_peer_certificate(*ssl_ctx);
+            auto client_subject_name = certificate_subject_name(x509_client_ref);
+
+            response->body() = std::format("server subject: {}, client subject: {}", server_subject_name, client_subject_name);
         } else {
             response->body() = "no TLS!";
         }
