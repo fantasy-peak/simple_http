@@ -15,8 +15,7 @@ namespace beast = boost::beast;
 namespace http = beast::http;
 
 // export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
-asio::awaitable<void> client()
-{
+asio::awaitable<void> client() {
     static simple_http::IoCtxPool pool{2};
     pool.start();
 
@@ -25,9 +24,7 @@ asio::awaitable<void> client()
     co_await timer.async_wait();
 
     std::shared_ptr<simple_http::HttpClient> client =
-        std::make_shared<simple_http::HttpsClient>("learnrust.site",
-                                                   6666,
-                                                   pool.getIoContextPtr());
+        std::make_shared<simple_http::HttpsClient>("learnrust.site", 6666, pool.getIoContextPtr());
     assert(co_await client->start());
 
     auto ctx = pool.getMainContext();
@@ -39,32 +36,22 @@ asio::awaitable<void> client()
             req->body() = "client";
             auto ch = co_await client->sendRequest(req);
             std::cout << "recv http\n";
-            for (;;)
-            {
-                auto [ec, data] = co_await ch->async_receive(
-                    asio::as_tuple(asio::use_awaitable));
-                if (ec)
-                {
+            for (;;) {
+                auto [ec, data] = co_await ch->async_receive(asio::as_tuple(asio::use_awaitable));
+                if (ec) {
                     std::cout << ec.message() << std::endl;
                     break;
                 }
-                if (std::holds_alternative<simple_http::Disconnect>(data))
-                {
+                if (std::holds_alternative<simple_http::Disconnect>(data)) {
                     std::cout << "Disconnect" << std::endl;
                     break;
-                }
-                else if (std::holds_alternative<std::string>(data))
-                {
+                } else if (std::holds_alternative<std::string>(data)) {
                     auto body_str = std::get<std::string>(data);
                     std::cout << "recv body:" << body_str << std::endl;
-                }
-                else
-                {
+                } else {
                     auto res = std::get<http::response<http::empty_body>>(data);
-                    for (const auto &field : res)
-                    {
-                        std::cout << field.name_string() << ": "
-                                  << field.value() << "\n";
+                    for (const auto& field : res) {
+                        std::cout << field.name_string() << ": " << field.value() << "\n";
                     }
                 }
             }
@@ -79,13 +66,10 @@ asio::awaitable<void> client()
     co_return;
 }
 
-int main()
-{
-    simple_http::LOG_CB =
-        [](simple_http::LogLevel level, auto file, auto line, std::string msg) {
-            std::cout << to_string(level) << " " << file << ":" << line << " "
-                      << msg << std::endl;
-        };
+int main() {
+    simple_http::LOG_CB = [](simple_http::LogLevel level, auto file, auto line, std::string msg) {
+        std::cout << to_string(level) << " " << file << ":" << line << " " << msg << std::endl;
+    };
     simple_http::IoCtxPool pool{1};
     pool.start();
     asio::co_spawn(pool.getIoContext(), client(), asio::detached);
