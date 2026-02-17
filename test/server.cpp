@@ -1,11 +1,13 @@
 #include <chrono>
-#include <cstdio>
 #include <iostream>
 #include <ostream>
 #include <string>
-
-#include <boost/url.hpp>
 #include <thread>
+
+#include <boost/asio.hpp>
+#include <openssl/ssl.h>
+#include <openssl/bio.h>
+#include <openssl/x509.h>
 
 #include "simple_http.h"
 
@@ -13,40 +15,39 @@ namespace asio = boost::asio;
 namespace beast = boost::beast;
 namespace http = beast::http;
 
+
+// Taken from: https://gist.github.com/cseelye/adcd900768ff61f697e603fd41c67625
+auto certificate_subject_name(const X509* x509_cert) -> std::string {
+    auto constexpr max_len = 4096;
+    char buffer[max_len];
+    memset(buffer, 0, max_len);
+
+    const auto& x509_name = X509_get_subject_name(x509_cert);
+
+    auto output_bio = std::unique_ptr<BIO, decltype(&BIO_free)>(BIO_new(BIO_s_mem()), BIO_free);
+
+    X509_NAME_print_ex(output_bio.get(), x509_name, 0, 0);
+    BIO_read(output_bio.get(), buffer, max_len - 1);
+
+    return std::string(buffer);
+}
+
 asio::awaitable<void> start()
 {
-    simple_http::Config cfg{.ip = "0.0.0.0",
-                            .port = 7788,
-                            .worker_num = 8,
-                            .concurrent_streams = 200};
-    cfg.ssl_crt = "./v.crt";
-    cfg.ssl_key = "./v.key";
+    simple_http::Config cfg{
+        .ip = "0.0.0.0",
+        .port = 7788,
+        .worker_num = 8,
+        .concurrent_streams = 200,
+        .ssl_crt = "./test/tls_certificates/cert.pem",
+        .ssl_key = "./test/tls_certificates/key.pem",
+    };
     simple_http::LOG_CB =
         [](simple_http::LogLevel level, auto file, auto line, std::string msg) {
             std::cout << to_string(level) << " " << file << ":" << line << " "
                       << msg << std::endl;
         };
     simple_http::HttpServer hs(cfg);
-    hs.setBefore([](const http::request<http::string_body> & /* req */,
-                    const std::shared_ptr<simple_http::HttpResponseWriter>
-                        & /* writer */) -> asio::awaitable<bool> {
-#if 0
-        boost::urls::url_view urlv =
-            boost::urls::parse_origin_form(req.target()).value();
-        if (urlv.path() != "/hello")
-        {
-            auto res = simple_http::makeHttpResponse(http::status::bad_request);
-            res->prepare_payload();
-            writer->writeHttpResponse(res);
-            co_return false;
-        }
-        for (auto const &param : urlv.params())
-        {
-            std::cout << param.key << " = " << param.value << "\n";
-        }
-#endif
-        co_return true;
-    });
     hs.setHttpHandler(
         "/hello",
         [](http::request<http::string_body> req,
@@ -61,14 +62,9 @@ asio::awaitable<void> start()
             }
             std::cout << req.target() << std::endl;
             auto str = req.body();
-            std::cout << "body:" << str << std::endl;
+            std::cout << "request body:" << str << std::endl;
             if (writer->version() == simple_http::Version::Http2)
             {
-#if 0
-                auto res = simple_http::makeHttpResponse(http::status::ok);
-                res->body() = "hello h2";
-                writer->writeHttpResponse(res);
-#else
                 writer->writeHeader("content-type", "text/plain");
                 writer->writeHeader(http::field::server, "test");
                 writer->writeHeaderEnd();
@@ -80,16 +76,9 @@ asio::awaitable<void> start()
                 timer.expires_after(std::chrono::seconds(1));
                 co_await timer.async_wait(asio::use_awaitable);
                 writer->writeBodyEnd("789");
-#endif
             }
             else
             {
-#if 0
-                auto res = simple_http::makeHttpResponse(http::status::ok);
-                res->body() = "hello world";
-                res->prepare_payload();
-                writer->writeHttpResponse(res);
-#else
                 // curl --no-buffer  -v http://localhost:6666/hello -d "aaaa"
                 http::response<http::empty_body> res{http::status::ok, 11};
                 res.set(http::field::server, "simple_http_server");
@@ -105,7 +94,6 @@ asio::awaitable<void> start()
                 timer.expires_after(std::chrono::seconds(1));
                 co_await timer.async_wait(asio::use_awaitable);
                 writer->writeChunkEnd();
-#endif
             }
             co_return;
         });
@@ -133,6 +121,28 @@ asio::awaitable<void> start()
                 writer->writeHttpResponse(res);
                 co_return;
             });
+
+    hs.setHttpHandler("/tls", [](
+        http::request<http::string_body> /* req */,
+        std::shared_ptr<simple_http::HttpResponseWriter> writer,
+        std::optional<asio::ssl::stream<asio::ip::tcp::socket>::native_handle_type> ssl_ctx
+    ) -> asio::awaitable<void> {
+        auto response = simple_http::makeHttpResponse(simple_http::http::status::ok);
+
+        if (ssl_ctx) {
+            const auto& x509_ref = SSL_get_certificate(*ssl_ctx);
+            auto subject_name = certificate_subject_name(x509_ref);
+            response->body() = subject_name;
+        } else {
+            response->body() = "no TLS!";
+        }
+
+        writer->writeHttpResponse(response);
+
+        co_return;
+    });
+
+    std::cout << "started http server\n";
     co_await hs.start();
 }
 

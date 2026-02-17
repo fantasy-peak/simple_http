@@ -1,0 +1,22 @@
+{
+    __meta__ = {
+        version = "1.0"
+    },
+    ["linux|x86_64"] = {
+        ["boost#a409d47f"] = {
+            version = "1.90.0"
+        },
+        ["cmake#f56260b5"] = {
+            version = "4.1.2"
+        },
+        ["nghttp2#f56260b5"] = {
+            version = "1.68.0"
+        },
+        ["ninja#f56260b5"] = {
+            version = "1.13.2"
+        },
+        ["openssl3#f56260b5"] = {
+            version = "3.6.0"
+        }
+    }
+}
