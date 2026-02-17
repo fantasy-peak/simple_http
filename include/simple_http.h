@@ -1169,6 +1169,8 @@ struct Config
     std::string ssl_crt;
     std::string ssl_key;
     bool disable_tls12{true};
+    bool ssl_mutual;
+    std::optional<std::string> ssl_ca;
 };
 
 class HttpServer final
@@ -1347,6 +1349,16 @@ class HttpServer final
             opts |= asio::ssl::context::no_tlsv1_2;
         }
         ssl_context.set_options(opts);
+
+        if (m_cfg.ssl_mutual) {
+            ssl_context.set_verify_mode(asio::ssl::verify_peer | asio::ssl::verify_fail_if_no_peer_cert);
+
+            if (m_cfg.ssl_ca) {
+                ssl_context.load_verify_file(*m_cfg.ssl_ca);
+            } else {
+                ssl_context.set_default_verify_paths();
+            }
+        }
 
         error_code ec;
         [[maybe_unused]]
