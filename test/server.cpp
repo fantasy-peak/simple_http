@@ -41,6 +41,11 @@ asio::awaitable<void> start() {
         .ssl_key = "./test/tls_certificates/server_key.pem",
         .ssl_mutual = true,
         .ssl_ca = "./test/tls_certificates/ca_cert.pem",
+        .set_socket_option =
+            [](asio::ip::tcp::socket& socket) {
+                // Set socket properties
+                socket.set_option(asio::socket_base::keep_alive(true));
+            },
     };
     simple_http::LOG_CB = [](simple_http::LogLevel level, auto file, auto line, std::string msg) {
         std::cout << to_string(level) << " " << file << ":" << line << " " << msg << std::endl;

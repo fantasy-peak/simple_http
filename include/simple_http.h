@@ -306,13 +306,13 @@ struct HandlerFunctions {
              if (writer->version() == simple_http::Version::Http2) {
                  writer->writeStatus(404);
                  writer->writeHeader("content-type", "text/plain");
-                 writer->writeHeader(http::field::server, "simple_http");
+                 writer->writeHeader(http::field::server, "simple_http_server");
                  writer->writeHeaderEnd();
                  writer->writeBodyEnd("");
              } else {
                  http::response<http::string_body> res{http::status::not_found, 11};
                  res.set(http::field::content_type, "text/plain");
-                 res.set(http::field::server, "simple_http");
+                 res.set(http::field::server, "simple_http_server");
                  res.body() = "";
                  res.prepare_payload();
                  writer->writeHttpResponse(std::make_shared<http::response<http::string_body>>(res));
@@ -905,6 +905,7 @@ struct Config {
     bool disable_tls12{true};
     bool ssl_mutual;
     std::optional<std::string> ssl_ca;
+    std::function<void(asio::ip::tcp::socket&)> set_socket_option;
 };
 
 class HttpServer final {
@@ -963,14 +964,18 @@ class HttpServer final {
             if (!ec) {
                 SIMPLE_HTTP_INFO_LOG("new connection from [{}:{}]", endpoint.address().to_string(), endpoint.port());
             }
-            socket.set_option(asio::socket_base::keep_alive(true));
-            // socket.set_option(asio::ip::tcp::no_delay(true));
-            // socket.set_option(asio::socket_base::send_buffer_size(5024 *
-            // 1024));
+            if (m_cfg.set_socket_option) {
+                try {
+                    m_cfg.set_socket_option(socket);
+                } catch (const std::exception& e) {
+                    SIMPLE_HTTP_ERROR_LOG("set_socket_option error: {}", e.what());
+                }
+            }
             if (!m_ssl_context) {
-                auto session_context = __private::SessionContext{};
                 auto session_socket = std::make_shared<asio::ip::tcp::socket>(std::move(socket));
-                asio::co_spawn(*context, session(session_socket, context, std::move(session_context)), asio::detached);
+                asio::co_spawn(*context,
+                               session(std::move(session_socket), context, __private::SessionContext{}),
+                               asio::detached);
             } else {
                 auto session_socket =
                     std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(std::move(socket), *m_ssl_context);
@@ -1234,8 +1239,8 @@ class HttpServer final {
 
     asio::awaitable<void> session(auto socket,
                                   std::shared_ptr<asio::io_context> ctx,
-                                  __private::SessionContext&& session_context) {
-        auto session_ctx = std::make_shared<__private::SessionContext>(std::move(session_context));
+                                  __private::SessionContext session_context) {
+        auto session_ctx = std::make_shared<__private::SessionContext>(session_context);
         auto http1_ch = std::make_shared<Http1Channel>(*ctx, CHANNEL_SIZE);
         auto h2p = std::make_shared<Http2Parse>(nullptr, http1_ch, nullptr, m_handler_functions, session_ctx);
         beast::flat_buffer buffer;
