@@ -50,6 +50,9 @@ asio::awaitable<void> start() {
                 // Set socket properties
                 socket.set_option(asio::socket_base::keep_alive(true));
             },
+        .enable_ipv6 = true,
+        .ipv6_addr = "::1",
+        .ipv6_port = 7788,
     };
     simple_http::LOG_CB = [](simple_http::LogLevel level, auto file, auto line, std::string msg) {
         std::cout << to_string(level) << " " << file << ":" << line << " " << msg << std::endl;

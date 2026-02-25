@@ -1041,13 +1041,15 @@ struct Config {
     bool ssl_mutual;
     std::optional<std::string> ssl_ca;
     std::function<void(asio::ip::tcp::socket&)> set_socket_option;
+    bool enable_ipv6{false};
+    std::string ipv6_addr{"::1"};
+    uint16_t ipv6_port{443};
 };
 
 class HttpServer final {
   public:
     HttpServer(const Config& cfg)
         : m_cfg(cfg),
-          m_ep(asio::ip::make_address(cfg.ip), cfg.port),
           m_io_ctx_pool(std::make_shared<IoCtxPool>(cfg.worker_num)),
           m_io_dispatch(std::make_shared<IoCtxPool>(cfg.worker_num)),
           m_stop_ctx_pool(true) {
@@ -1059,7 +1061,6 @@ class HttpServer final {
 
     HttpServer(const Config& cfg, std::shared_ptr<IoCtxPool> io_ctx_pool, std::shared_ptr<IoCtxPool> io_dispatch)
         : m_cfg(cfg),
-          m_ep(asio::ip::make_address(cfg.ip), cfg.port),
           m_io_ctx_pool(std::move(io_ctx_pool)),
           m_io_dispatch(std::move(io_dispatch)),
           m_stop_ctx_pool(false) {
@@ -1072,59 +1073,24 @@ class HttpServer final {
     HttpServer& operator=(HttpServer&&) = delete;
 
     asio::awaitable<void> start() {
-        m_acceptor = std::make_unique<asio::ip::tcp::acceptor>(*m_io_ctx_pool->getMainContext());
-        m_acceptor->open(m_ep.protocol());
-        error_code ec;
-        m_acceptor->set_option(asio::ip::tcp::acceptor::reuse_address(true));
-        [[maybe_unused]] auto _ = m_acceptor->bind(m_ep, ec);
-        if (ec) {
-            SIMPLE_HTTP_ERROR_LOG("bind: {}", ec.message());
-            throw std::runtime_error(ec.message());
+        if (m_cfg.enable_ipv6) {
+            co_await (start_acceptor(m_cfg.ip, m_cfg.port, false) &&
+                      start_acceptor(m_cfg.ipv6_addr, m_cfg.ipv6_port, true));
+        } else {
+            co_await start_acceptor(m_cfg.ip, m_cfg.port, false);
         }
-        _ = m_acceptor->listen(asio::socket_base::max_listen_connections, ec);
-        if (ec) {
-            SIMPLE_HTTP_ERROR_LOG("listen: {}", ec.message());
-            throw std::runtime_error(ec.message());
-        }
-        for (;;) {
-            auto& context = m_io_ctx_pool->getIoContextPtr();
-            asio::ip::tcp::socket socket(*context);
-            auto [ec] = co_await m_acceptor->async_accept(socket, asio::as_tuple(asio::use_awaitable));
-            if (ec) {
-                if (ec == asio::error::operation_aborted)
-                    break;
-                continue;
-            }
-            auto endpoint = socket.remote_endpoint(ec);
-            if (!ec) {
-                SIMPLE_HTTP_INFO_LOG("new connection from [{}:{}]", endpoint.address().to_string(), endpoint.port());
-            }
-            if (m_cfg.set_socket_option) {
-                try {
-                    m_cfg.set_socket_option(socket);
-                } catch (const std::exception& e) {
-                    SIMPLE_HTTP_ERROR_LOG("set_socket_option error: {}", e.what());
-                }
-            }
-            if (!m_ssl_context) {
-                auto session_socket = std::make_shared<asio::ip::tcp::socket>(std::move(socket));
-                asio::co_spawn(*context,
-                               session(std::move(session_socket), context, __private::SessionContext{}),
-                               asio::detached);
-            } else {
-                auto session_socket =
-                    std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(std::move(socket), *m_ssl_context);
-                asio::co_spawn(*context, startSslsession(std::move(session_socket), context), asio::detached);
-            }
-        }
+        co_return;
     }
 
     void stop() {
         auto ctx = m_io_ctx_pool->getMainContext();
         std::promise<void> done;
         asio::post(*ctx, [&] {
-            if (m_acceptor)
-                m_acceptor->close();
+            for (const auto& acceptor : m_acceptors) {
+                if (acceptor) {
+                    acceptor->close();
+                }
+            }
             done.set_value();
         });
         done.get_future().wait();
@@ -1161,6 +1127,67 @@ class HttpServer final {
     }
 
   private:
+    asio::awaitable<void> start_acceptor(const std::string& ip, uint16_t port, bool is_v6 = false) {
+        SIMPLE_HTTP_INFO_LOG("listen {}:{}, is_v6: {}", ip, port, is_v6);
+        error_code ec;
+        auto addr = asio::ip::make_address(ip, ec);
+        if (ec) {
+            SIMPLE_HTTP_ERROR_LOG("make_address: {}", ec.message());
+            throw std::runtime_error(ec.message());
+            co_return;
+        }
+        asio::ip::tcp::endpoint endpoint(addr, port);
+
+        auto acceptor = std::make_shared<asio::ip::tcp::acceptor>(*m_io_ctx_pool->getMainContext());
+        m_acceptors.emplace_back(acceptor);
+        acceptor->open(endpoint.protocol());
+        if (is_v6) {
+            acceptor->set_option(boost::asio::ip::v6_only(true));
+        }
+        acceptor->set_option(asio::ip::tcp::acceptor::reuse_address(true));
+        [[maybe_unused]] auto _ = acceptor->bind(endpoint, ec);
+        if (ec) {
+            SIMPLE_HTTP_ERROR_LOG("bind: {}", ec.message());
+            throw std::runtime_error(ec.message());
+        }
+        _ = acceptor->listen(asio::socket_base::max_listen_connections, ec);
+        if (ec) {
+            SIMPLE_HTTP_ERROR_LOG("listen: {}", ec.message());
+            throw std::runtime_error(ec.message());
+        }
+        for (;;) {
+            auto& context = m_io_ctx_pool->getIoContextPtr();
+            asio::ip::tcp::socket socket(*context);
+            auto [ec] = co_await acceptor->async_accept(socket, asio::as_tuple(asio::use_awaitable));
+            if (ec) {
+                if (ec == asio::error::operation_aborted)
+                    break;
+                continue;
+            }
+            auto endpoint = socket.remote_endpoint(ec);
+            if (!ec) {
+                SIMPLE_HTTP_INFO_LOG("new connection from [{}:{}]", endpoint.address().to_string(), endpoint.port());
+            }
+            if (m_cfg.set_socket_option) {
+                try {
+                    m_cfg.set_socket_option(socket);
+                } catch (const std::exception& e) {
+                    SIMPLE_HTTP_ERROR_LOG("set_socket_option error: {}", e.what());
+                }
+            }
+            if (!m_ssl_context) {
+                auto session_socket = std::make_shared<asio::ip::tcp::socket>(std::move(socket));
+                asio::co_spawn(*context,
+                               session(std::move(session_socket), context, __private::SessionContext{}),
+                               asio::detached);
+            } else {
+                auto session_socket =
+                    std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(std::move(socket), *m_ssl_context);
+                asio::co_spawn(*context, startSslsession(std::move(session_socket), context), asio::detached);
+            }
+        }
+    }
+
     void initSsl() {
         auto ssl_context = asio::ssl::context(asio::ssl::context::tlsv13_server);
 
@@ -1455,11 +1482,10 @@ class HttpServer final {
 
     Config m_cfg;
     std::optional<asio::ssl::context> m_ssl_context;
-    asio::ip::tcp::endpoint m_ep;
     std::shared_ptr<IoCtxPool> m_io_ctx_pool;
     std::shared_ptr<IoCtxPool> m_io_dispatch;
     bool m_stop_ctx_pool;
-    std::unique_ptr<asio::ip::tcp::acceptor> m_acceptor;
+    std::vector<std::shared_ptr<asio::ip::tcp::acceptor>> m_acceptors;
     std::shared_ptr<HandlerFunctions> m_handler_functions = std::make_shared<HandlerFunctions>();
 };
 
