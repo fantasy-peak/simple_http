@@ -18,7 +18,6 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <sys/socket.h>
 #include <thread>
 #include <tuple>
 #include <type_traits>
@@ -81,6 +80,7 @@ inline std::shared_ptr<http::request<http::string_body>> makeHttpRequest(const s
 }
 
 inline int32_t CHANNEL_SIZE = 100000;
+constexpr int32_t READ_SOME_BUFF_LEN = 4096;
 
 inline constexpr std::string_view to_string(LogLevel level) noexcept {
     switch (level) {
@@ -243,7 +243,7 @@ inline std::string base64_decode(const std::string& in) {
     return out;
 }
 
-inline bool isHttp2(const std::string& cache_data) {
+inline bool isHttp2(std::string_view cache_data) {
     if (cache_data.empty() || cache_data.size() < 6)
         return false;
     if (cache_data[0] == 0x50 && cache_data[1] == 0x52 && cache_data[2] == 0x49 && cache_data[3] == 0x20 &&
@@ -331,6 +331,14 @@ class HttpRequestReader {
         return m_target;
     }
 
+    auto path() {
+        return m_path;
+    }
+
+    auto query() {
+        return m_path;
+    }
+
     auto& header() {
         return m_headers;
     }
@@ -350,30 +358,23 @@ class HttpRequestReader {
 
     void set_target(std::string target) {
         m_target = std::move(target);
+        splitPathAndQuery(m_target);
     }
 
     void set_header(std::string name, std::string value) {
         m_headers.emplace(std::move(name), std::move(value));
     }
 
-    bool try_send(std::string value) {
-        auto ret = m_reader_channel->try_send(error_code{}, std::move(value));
-        return ret;
-    }
-
-    bool try_send(Eof value) {
-        auto ret = m_reader_channel->try_send(error_code{}, value);
-        return ret;
-    }
-
-    bool try_send(Disconnect value) {
-        auto ret = m_reader_channel->try_send(error_code{}, value);
+    template <typename T>
+    bool try_send(T&& value) {
+        auto ret = m_reader_channel->try_send(error_code{}, std::forward<T>(value));
         return ret;
     }
 
     void set_http_request(const auto& req) {
         m_method = req.method();
         m_target = req.target();
+        splitPathAndQuery(m_target);
         m_headers.clear();
         for (auto const& field : req) {
             m_headers.emplace(field.name_string(), field.value());
@@ -390,14 +391,25 @@ class HttpRequestReader {
     }
 
   public:
+    void splitPathAndQuery(std::string_view input) {
+        size_t pos = input.find('?');
+        if (pos != std::string_view::npos) {
+            m_path = input.substr(0, pos);
+            m_query = input.substr(pos + 1);
+        } else {
+            m_path = input;
+        }
+    }
+
     Version m_version;
     std::shared_ptr<ReaderChannel> m_reader_channel;
-    http::request<http::string_body> m_req;
     http::verb m_method;
     std::string m_target;
     std::string m_body;
     std::unordered_multimap<std::string, std::string> m_headers;
     std::atomic_bool m_connected{true};
+    std::string_view m_path;
+    std::string_view m_query;
 };
 
 using SimpleCallback =
@@ -437,7 +449,15 @@ struct HandlerFunctions {
                                         const std::shared_ptr<HttpResponseWriter>&)>
         before{[](const auto&, const auto&) -> asio::awaitable<bool> { co_return true; }};
 
-    std::unordered_map<std::string, RequestCallback> map_proc{
+    struct string_hash {
+        using is_transparent = void;
+
+        std::size_t operator()(std::string_view str) const {
+            return std::hash<std::string_view>{}(str);
+        }
+    };
+
+    std::unordered_map<std::string, RequestCallback, string_hash, std::equal_to<>> map_proc{
         {"*", [](auto, auto writer) -> asio::awaitable<void> {
              if (writer->version() == simple_http::Version::Http2) {
                  writer->writeStatus(404);
@@ -479,15 +499,14 @@ asio::awaitable<void> callCallback(std::weak_ptr<HandlerFunctions> hf,
     if (!co_await sp->before(req, writer)) {
         co_return;
     }
-    std::string path = req->target();
-    if (auto pos = path.find('?'); pos != std::string::npos) {
-        path = path.substr(0, pos);
-    }
-    if (sp->map_proc.contains(path)) {
-        co_await runCallBack(&sp->map_proc[path], std::move(req), std::move(writer), session_ctx);
+    auto path = req->path();
+    auto it = sp->map_proc.find(path);
+    if (it != sp->map_proc.end()) {
+        co_await runCallBack(&it->second, std::move(req), std::move(writer), session_ctx);
     } else {
         for (const auto& [pattern, cb] : sp->regex_proc) {
-            if (std::regex_match(path, pattern)) {
+            std::string str{path};
+            if (std::regex_match(str, pattern)) {
                 co_await runCallBack(&cb, std::move(req), std::move(writer), session_ctx);
                 co_return;
             }
@@ -583,9 +602,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
         return 0;
     }
 
-    bool writeHeaderEnd(std::unordered_map<std::string, std::string> headers,
-                        int32_t stream_id,
-                        std::string http_status) {
+    bool writeHeaderEnd(auto headers, int32_t stream_id, std::string http_status) {
         if (auto sp = m_h2_channel.lock()) {
             std::weak_ptr<Http2Parse> self = shared_from_this();
             asio::post(sp->get_executor(),
@@ -686,7 +703,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
         auto& http_request_reader = h2p->getStreamCtx(stream_id);
         std::string name{(char*)_name, namelen};
         std::string value{(char*)_value, valuelen};
-        std::ranges::transform(name, name.begin(), [](unsigned char c) { return std::tolower(c); });
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::tolower(c); });
         if (name == ":method") {
             http_request_reader->set_method(http::string_to_verb(value));
         } else if (name == ":path") {
@@ -811,22 +828,26 @@ class HttpResponseWriter {
     template <typename Key, typename Value>
     void writeHeader(Key&& key, Value&& value) {
         if constexpr (std::is_same_v<std::decay_t<Key>, http::field>) {
-            m_headers.emplace(http::to_string(std::forward<Key>(key)), std::forward<Value>(value));
+            m_headers.emplace_back(http::to_string(std::forward<Key>(key)), std::forward<Value>(value));
         } else {
-            m_headers.emplace(std::forward<Key>(key), std::forward<Value>(value));
+            m_headers.emplace_back(std::forward<Key>(key), std::forward<Value>(value));
         }
     }
 
-    void writeHeader(std::unordered_map<std::string, std::string> headers) {
-        m_headers.merge(headers);
+    template <typename T>
+    void writeHeader(const T& headers) {
+        for (auto& [k, v] : headers) {
+            m_headers.emplace_back(k, v);
+        }
     }
 
     bool writeHeaderEnd() {
         if (m_version != Version::Http2)
             return false;
         static std::string server = http::to_string(http::field::server);
-        if (!m_headers.contains(server)) {
-            m_headers.emplace(server, "simple_http_server");
+        auto it = std::find_if(m_headers.begin(), m_headers.end(), [&](auto&& p) { return server == std::get<0>(p); });
+        if (it == m_headers.end()) {
+            m_headers.emplace_back(server, "simple_http_server");
         }
         m_write_h2_header_done = true;
         return m_http2_parse->writeHeaderEnd(std::move(m_headers), m_stream_id, std::move(m_http_status));
@@ -919,7 +940,7 @@ class HttpResponseWriter {
     int32_t m_stream_id;
     Version m_version;
     std::string m_http_status{"200"};
-    std::unordered_map<std::string, std::string> m_headers;
+    std::vector<std::tuple<std::string, std::string>> m_headers;
     bool m_write_h2_header_done{false};
     bool m_write_h2_body_done{false};
 };
@@ -985,7 +1006,7 @@ inline asio::awaitable<void> toH2Parse(auto socket,
                                        auto h2p,
                                        std::shared_ptr<std::chrono::steady_clock::time_point> deadline,
                                        std::chrono::seconds max_idle_time) {
-    char buffer[4096];
+    char buffer[READ_SOME_BUFF_LEN];
     for (;;) {
         *deadline = std::chrono::steady_clock::now() + max_idle_time;
         auto [ec, nread] =
@@ -1308,7 +1329,7 @@ class HttpServer final {
 
     asio::awaitable<void> switchH2c(auto socket,
                                     const std::shared_ptr<asio::io_context>& /* ctx */,
-                                    const std::string& buffer,
+                                    std::string_view buffer,
                                     std::shared_ptr<__private::SessionContext> session_ctx) {
         // curl -v --http2-prior-knowledge http://localhost:6666/hello
         // curl -v --http2-prior-knowledge http://localhost:6666/hello -d "aaaa"
@@ -1328,7 +1349,7 @@ class HttpServer final {
             SIMPLE_HTTP_ERROR_LOG("init error: {}", ret);
             co_return;
         }
-        auto ret = h2p->feedRecvData(buffer.c_str(), buffer.size());
+        auto ret = h2p->feedRecvData(buffer.data(), buffer.size());
         if (ret == -1) {
             co_return;
         }
@@ -1346,23 +1367,31 @@ class HttpServer final {
                                       std::shared_ptr<__private::SessionContext> session_ctx) {
         auto recv_request = [this](auto socket, auto h2p, auto deadline, auto max_idle_time, auto session_ctx)
             -> asio::awaitable<void> {
+            std::vector<std::weak_ptr<HttpRequestReader>> readers;
             for (;;) {
                 *deadline = std::chrono::steady_clock::now() + max_idle_time;
                 beast::flat_buffer buffer;
                 http::request<http::string_body> req;
                 auto [ec, count] = co_await http::async_read(*socket, buffer, req, asio::as_tuple(asio::use_awaitable));
                 if (ec) {
-                    co_return;
+                    break;
                 }
                 auto version = (req.version() == 11 ? Version::Http11 : Version::Http1);
                 auto http_request_reader = std::make_shared<HttpRequestReader>(version);
                 http_request_reader->set_http_request(req);
+                readers.emplace_back(http_request_reader);
                 callHandler(m_handler_functions,
                             m_io_dispatch->getIoContext(),
                             std::move(http_request_reader),
                             std::make_shared<HttpResponseWriter>(h2p, 0, version),
                             session_ctx);
             }
+            for (auto& reader : readers) {
+                if (auto sp = reader.lock()) {
+                    sp->disconnect();
+                }
+            }
+            co_return;
         };
         auto send_response = [](auto socket, auto http1_ch, Version version, auto deadline, auto max_idle_time)
             -> asio::awaitable<void> {
@@ -1419,9 +1448,10 @@ class HttpServer final {
             co_return;
         }
         if (ec == http::error::bad_version) {
-            auto req_str = beast::buffers_to_string(buffer.data());
-            if (isHttp2(req_str)) {
-                co_await switchH2c(std::move(socket), ctx, req_str, session_ctx);
+            auto const data = buffer.data();
+            std::string_view req_view{static_cast<char const*>(data.data()), data.size()};
+            if (isHttp2(req_view)) {
+                co_await switchH2c(std::move(socket), ctx, req_view, session_ctx);
             } else {
                 SIMPLE_HTTP_ERROR_LOG("not http2 request");
             }
@@ -1433,10 +1463,11 @@ class HttpServer final {
         auto& headers = parser.get();
 
         std::string h2_setting;
-        if (headers.find(http::field::upgrade) != headers.end() && headers[http::field::upgrade] == "h2c") {
-            constexpr auto http2_header = "HTTP2-Settings";
-            if (headers.contains(http2_header)) {
-                h2_setting = headers.at(http2_header);
+        auto const upgrade_it = headers.find(http::field::upgrade);
+        if (upgrade_it != headers.end() && upgrade_it->value() == "h2c") {
+            auto const settings_it = headers.find("HTTP2-Settings");
+            if (settings_it != headers.end()) {
+                h2_setting = settings_it->value();
             }
         }
 
