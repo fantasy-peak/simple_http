@@ -14,7 +14,6 @@
 #include <memory>
 #include <optional>
 #include <regex>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -335,7 +334,7 @@ class HttpRequestReader {
     }
 
     auto query() {
-        return m_path;
+        return m_query;
     }
 
     auto& header() {
@@ -348,6 +347,10 @@ class HttpRequestReader {
 
     auto& ref() {
         return m_body;
+    }
+
+    auto& channel() {
+        return m_reader_channel;
     }
 
     // Not for external use
@@ -370,7 +373,7 @@ class HttpRequestReader {
         return ret;
     }
 
-    void set_http_request(const auto& req) {
+    void set_http_request(http::request<http::string_body>& req) {
         m_method = req.method();
         m_target = req.target();
         splitPathAndQuery(m_target);
@@ -381,7 +384,7 @@ class HttpRequestReader {
         if (req.body().empty()) {
             return;
         }
-        m_body = req.body();
+        m_body = std::move(req.body());
         return;
     }
 
@@ -870,9 +873,15 @@ class HttpResponseWriter {
 
     // for http1.1 chunk
     bool writeChunkHeader(const http::response<http::empty_body>& res) {
-        std::stringstream ss;
-        ss << res.base();
-        return m_http2_parse->writeChunkData(ss.str());
+        http::response<http::empty_body>::header_type::writer fr{res.base(), res.version(), res.result_int()};
+        auto const& buffers = fr.get();
+        std::size_t total_size = asio::buffer_size(buffers);
+        std::string s;
+        s.reserve(total_size);
+        for (auto const& b : buffers) {
+            s.append(static_cast<char const*>(b.data()), b.size());
+        }
+        return m_http2_parse->writeChunkData(std::move(s));
     }
 
     bool writeChunkData(const char* ptr, size_t size) {
@@ -1028,7 +1037,16 @@ void shutdown(const auto& socket) {
             socket->shutdown(asio::ip::tcp::socket::shutdown_both, ec);
             socket->close(ec);
         }
-    } else {
+    }
+#ifdef SIMPLE_HTTP_BIND_UNIX_SOCKET
+    else if constexpr (std::is_same_v<std::shared_ptr<asio::local::stream_protocol::socket>,
+                                      std::decay_t<decltype(socket)>>) {
+        error_code ec;
+        socket->shutdown(asio::local::stream_protocol::socket::shutdown_both, ec);
+        socket->close(ec);
+    }
+#endif
+    else {
         error_code ec;
         socket->shutdown(ec);
         socket->next_layer().shutdown(asio::ip::tcp::socket::shutdown_both, ec);
@@ -1049,8 +1067,8 @@ inline asio::awaitable<void> watchdog(std::shared_ptr<std::chrono::steady_clock:
 }
 
 struct Config {
-    std::string ip;
-    uint16_t port;
+    std::string ip{"127.0.0.1"};
+    uint16_t port{443};
     uint16_t worker_num{4};
     int32_t concurrent_streams{200};
     std::optional<int32_t> window_size;
@@ -1065,6 +1083,7 @@ struct Config {
     bool enable_ipv6{false};
     std::string ipv6_addr{"::1"};
     uint16_t ipv6_port{443};
+    std::optional<std::string> unix_socket;
 };
 
 class HttpServer final {
@@ -1095,10 +1114,10 @@ class HttpServer final {
 
     asio::awaitable<void> start() {
         if (m_cfg.enable_ipv6) {
-            co_await (start_acceptor(m_cfg.ip, m_cfg.port, false) &&
-                      start_acceptor(m_cfg.ipv6_addr, m_cfg.ipv6_port, true));
+            co_await (startAcceptor(m_cfg.ip, m_cfg.port, false) &&
+                      startAcceptor(m_cfg.ipv6_addr, m_cfg.ipv6_port, true) && startUnixAcceptor(m_cfg.unix_socket));
         } else {
-            co_await start_acceptor(m_cfg.ip, m_cfg.port, false);
+            co_await (startAcceptor(m_cfg.ip, m_cfg.port, false) && startUnixAcceptor(m_cfg.unix_socket));
         }
         co_return;
     }
@@ -1107,6 +1126,11 @@ class HttpServer final {
         auto ctx = m_io_ctx_pool->getMainContext();
         std::promise<void> done;
         asio::post(*ctx, [&] {
+#ifdef SIMPLE_HTTP_BIND_UNIX_SOCKET
+            if (m_local_acceptor) {
+                m_local_acceptor->close();
+            }
+#endif
             for (const auto& acceptor : m_acceptors) {
                 if (acceptor) {
                     acceptor->close();
@@ -1148,7 +1172,10 @@ class HttpServer final {
     }
 
   private:
-    asio::awaitable<void> start_acceptor(const std::string& ip, uint16_t port, bool is_v6 = false) {
+    asio::awaitable<void> startAcceptor(const std::string& ip, uint16_t port, bool is_v6 = false) {
+        if (ip.empty()) {
+            co_return;
+        }
         SIMPLE_HTTP_INFO_LOG("listen {}:{}, is_v6: {}", ip, port, is_v6);
         error_code ec;
         auto addr = asio::ip::make_address(ip, ec);
@@ -1158,7 +1185,6 @@ class HttpServer final {
             co_return;
         }
         asio::ip::tcp::endpoint endpoint(addr, port);
-
         auto acceptor = std::make_shared<asio::ip::tcp::acceptor>(*m_io_ctx_pool->getMainContext());
         m_acceptors.emplace_back(acceptor);
         acceptor->open(endpoint.protocol());
@@ -1207,6 +1233,46 @@ class HttpServer final {
                 asio::co_spawn(*context, startSslsession(std::move(session_socket), context), asio::detached);
             }
         }
+    }
+
+    asio::awaitable<void> startUnixAcceptor(const std::optional<std::string>& socket_path) {
+#ifdef SIMPLE_HTTP_BIND_UNIX_SOCKET
+        if (!socket_path.has_value()) {
+            co_return;
+        }
+        {
+            std::filesystem::path sock_path{socket_path.value()};
+            std::error_code ec;
+            std::filesystem::remove(sock_path, ec);
+        }
+        SIMPLE_HTTP_INFO_LOG("listen {}", socket_path.value());
+        asio::local::stream_protocol::endpoint endpoint(socket_path.value());
+        auto acceptor =
+            std::make_shared<asio::local::stream_protocol::acceptor>(*m_io_ctx_pool->getMainContext(), endpoint);
+        m_local_acceptor = acceptor;
+        for (;;) {
+            auto& context = m_io_ctx_pool->getIoContextPtr();
+            asio::local::stream_protocol::socket socket(*context);
+            auto [ec] = co_await acceptor->async_accept(socket, asio::as_tuple(asio::use_awaitable));
+            if (ec) {
+                if (ec == asio::error::operation_aborted)
+                    break;
+                continue;
+            }
+            if (!m_ssl_context) {
+                auto session_socket = std::make_shared<asio::local::stream_protocol::socket>(std::move(socket));
+                asio::co_spawn(*context,
+                               session(std::move(session_socket), context, __private::SessionContext{}),
+                               asio::detached);
+            } else {
+                auto session_socket =
+                    std::make_shared<asio::ssl::stream<asio::local::stream_protocol::socket>>(std::move(socket),
+                                                                                              *m_ssl_context);
+                asio::co_spawn(*context, startSslsession(std::move(session_socket), context), asio::detached);
+            }
+        }
+#endif
+        co_return;
     }
 
     void initSsl() {
@@ -1499,8 +1565,7 @@ class HttpServer final {
     }
 
     // https server
-    asio::awaitable<void> startSslsession(std::shared_ptr<asio::ssl::stream<asio::ip::tcp::socket>> socket,
-                                          auto context) {
+    asio::awaitable<void> startSslsession(auto socket, auto context) {
         if (auto [ec] = co_await socket->async_handshake(boost::asio::ssl::stream_base::server,
                                                          asio::as_tuple(asio::use_awaitable));
             ec) {
@@ -1518,6 +1583,9 @@ class HttpServer final {
     bool m_stop_ctx_pool;
     std::vector<std::shared_ptr<asio::ip::tcp::acceptor>> m_acceptors;
     std::shared_ptr<HandlerFunctions> m_handler_functions = std::make_shared<HandlerFunctions>();
+#ifdef SIMPLE_HTTP_BIND_UNIX_SOCKET
+    std::shared_ptr<asio::local::stream_protocol::acceptor> m_local_acceptor;
+#endif
 };
 
 #ifdef _EXPERIMENT_HTTP_CLIENT_
