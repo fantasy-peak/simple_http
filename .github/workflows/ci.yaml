@@ -7,12 +7,40 @@ on:
     branches: ["main"]
 
 jobs:
-  install:
+  build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: 
+          - {name: "gcc13", pkg: "nixpkgs#gcc13"}
+          - {name: "default", pkg: "nixpkgs#gcc"} 
+
     env:
       XMAKE_ROOT: "y"
+
     steps:
-    - uses: actions/checkout@v5
-    - uses: cachix/install-nix-action@v31
-    - run: nix develop -c xmake build -y --all
-    - run: nix develop -c xmake install -o .
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+
+      - name: Magic Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build project
+        run: |
+          nix develop -c nix shell ${{ matrix.compiler.pkg }} --command bash -c "
+            echo '--- gcc version ---'
+            gcc --version
+            which gcc
+            xmake build -y --all
+          "
+
+      - name: Install
+        run: |
+          nix develop -c nix shell ${{ matrix.compiler.pkg }} --command bash -c "
+            xmake install -o ./output-${{ matrix.compiler.name }}
+            ls -R ./output-${{ matrix.compiler.name }}
+          "
