@@ -345,7 +345,7 @@ class HttpRequestReader {
         return m_version;
     }
 
-    auto& ref() {
+    auto& refBody() {
         return m_body;
     }
 
@@ -430,6 +430,11 @@ struct HandlerFunctions {
         before = std::move(cb);
     }
 
+    void setCORS(std::function<asio::awaitable<bool>(const std::shared_ptr<HttpRequestReader>&,
+                                                     const std::shared_ptr<HttpResponseWriter>&)> cb) {
+        cors = std::move(cb);
+    }
+
     void setHttpHandler(const std::string& path, RequestCallback cb) {
         map_proc[path] = std::move(cb);
     }
@@ -449,7 +454,11 @@ struct HandlerFunctions {
 
     std::function<asio::awaitable<bool>(const std::shared_ptr<HttpRequestReader>&,
                                         const std::shared_ptr<HttpResponseWriter>&)>
-        before{[](const auto&, const auto&) -> asio::awaitable<bool> { co_return true; }};
+        before;
+
+    std::function<asio::awaitable<bool>(const std::shared_ptr<HttpRequestReader>&,
+                                        const std::shared_ptr<HttpResponseWriter>&)>
+        cors;
 
     struct string_hash {
         using is_transparent = void;
@@ -498,9 +507,20 @@ asio::awaitable<void> callCallback(std::weak_ptr<HandlerFunctions> hf,
     auto sp = hf.lock();
     if (!sp)
         co_return;
-    if (!co_await sp->before(req, writer)) {
+
+    if (sp->cors) {
+        auto it = req->header().find("origin");
+        if (it != req->header().end()) {
+            if (!co_await sp->cors(req, writer)) {
+                co_return;
+            }
+        }
+    }
+
+    if (sp->before && !co_await sp->before(req, writer)) {
         co_return;
     }
+
     auto path = req->path();
     auto it = sp->map_proc.find(path);
     if (it != sp->map_proc.end()) {
@@ -682,6 +702,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
 
     bool writeHttp1Response(const std::shared_ptr<http::response<http::string_body>>& http_1_response) {
         if (auto sp = m_h1_channel.lock()) {
+            http_1_response->prepare_payload();
             if (!sp->try_send(error_code{}, http_1_response)) {
                 SIMPLE_HTTP_ERROR_LOG("{}", "writeHttp1Response error");
                 return false;
@@ -927,6 +948,7 @@ class HttpResponseWriter {
 
     bool writeHttpResponse(const std::shared_ptr<http::response<http::string_body>>& http_response) {
         if (m_version == Version::Http2) {
+            http_response->prepare_payload();
             m_http_status = std::to_string(http_response->result_int());
             for (const auto& field : http_response->base()) {
                 writeHeader(field.name_string(), field.value());
@@ -1167,6 +1189,12 @@ class HttpServer final {
         return *this;
     }
 
+    auto& setCORS(std::function<asio::awaitable<bool>(const std::shared_ptr<HttpRequestReader>&,
+                                                      const std::shared_ptr<HttpResponseWriter>&)> cb) {
+        m_handler_functions->setCORS(std::move(cb));
+        return *this;
+    }
+
     auto ioDispatchPool() {
         return m_io_dispatch;
     }
@@ -1213,7 +1241,7 @@ class HttpServer final {
             }
             auto endpoint = socket.remote_endpoint(ec);
             if (!ec) {
-                SIMPLE_HTTP_INFO_LOG("new connection from [{}:{}]", endpoint.address().to_string(), endpoint.port());
+                SIMPLE_HTTP_DEBUG_LOG("new connection from [{}:{}]", endpoint.address().to_string(), endpoint.port());
             }
             if (m_cfg.set_socket_option) {
                 try {

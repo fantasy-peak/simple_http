@@ -57,11 +57,10 @@ asio::awaitable<void> start() {
         };
     hs.setBefore([](const std::shared_ptr<simple_http::HttpRequestReader>& reader,
                     const std::shared_ptr<simple_http::HttpResponseWriter>& writer) -> asio::awaitable<bool> {
-        std::cout << "setBefore:" << req->target() << std::endl;
-        if (req->target() != "/hello")
+        std::cout << "setBefore:" << reader->target() << std::endl;
+        if (reader->target() != "/hello")
         {
             auto res = simple_http::makeHttpResponse(http::status::bad_request);
-            res->prepare_payload();
             writer->writeHttpResponse(res);
             co_return false;
         }

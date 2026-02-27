@@ -122,7 +122,6 @@ asio::awaitable<void> start() {
                           auto res = simple_http::makeHttpResponse(http::status::ok);
                           res->body() = writer->version() == simple_http::Version::Http2 ? "/world http2 body"
                                                                                          : "/world http1.1 body";
-                          res->prepare_payload();
                           writer->writeHttpResponse(res);
                           co_return;
                       })
@@ -131,7 +130,6 @@ asio::awaitable<void> start() {
                                 std::shared_ptr<simple_http::HttpResponseWriter> writer) -> asio::awaitable<void> {
                                  auto res = simple_http::makeHttpResponse(http::status::ok);
                                  res->body() = "regex matched";
-                                 res->prepare_payload();
                                  writer->writeHttpResponse(res);
                                  co_return;
                              });
