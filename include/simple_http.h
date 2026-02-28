@@ -165,34 +165,18 @@ class IoCtxPool final {
 };
 
 struct DataContext {
+    std::deque<std::shared_ptr<std::string>> queue;
+    size_t offset = 0;
+    size_t total_buffered = 0;
+    bool is_finished = false;
+};
+
+struct CliDataContext {
     const char* data;
     size_t total_len;
     size_t offset;
     std::shared_ptr<void> input_data{nullptr};
 };
-
-inline ssize_t dataReadCallback(nghttp2_session* /* session */,
-                                int32_t /* stream_id */,
-                                uint8_t* buf,
-                                size_t length,
-                                uint32_t* data_flags,
-                                nghttp2_data_source* source,
-                                void* /* user_data */) {
-    auto* ctx = static_cast<DataContext*>(source->ptr);
-
-    size_t remaining = ctx->total_len - ctx->offset;
-    size_t to_copy = remaining < length ? remaining : length;
-
-    memcpy(buf, ctx->data + ctx->offset, to_copy);
-    ctx->offset += to_copy;
-
-    if (ctx->offset >= ctx->total_len) {
-        *data_flags |= NGHTTP2_DATA_FLAG_EOF;
-        delete ctx;
-    }
-
-    return to_copy;
-}
 
 constexpr char base64_url_alphabet[] = {'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P',
                                         'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'a', 'b', 'c', 'd', 'e', 'f',
@@ -594,6 +578,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
         nghttp2_session_callbacks_set_send_callback(m_cbs, sendCallback);
         nghttp2_session_callbacks_set_on_frame_recv_callback(m_cbs, onFrameRecvCallback);
         nghttp2_session_callbacks_set_on_data_chunk_recv_callback(m_cbs, onDataChunkRecvCallback);
+        nghttp2_session_callbacks_set_on_stream_close_callback(m_cbs, onStreamCloseCallback);
 
         nghttp2_session_server_new(&m_session, m_cbs, this);
 
@@ -649,13 +634,18 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
                                for (auto& [name, value] : headers) {
                                    fill(name, value, hdrs);
                                }
-                               nghttp2_submit_headers(m_session,
-                                                      NGHTTP2_FLAG_END_HEADERS,
-                                                      stream_id,
-                                                      nullptr,
-                                                      hdrs.data(),
-                                                      hdrs.size(),
-                                                      nullptr);
+
+                               auto* ctx = new DataContext();
+                               nghttp2_session_set_stream_user_data(m_session, stream_id, ctx);
+
+                               nghttp2_data_provider prd;
+                               prd.source.ptr = ctx;
+                               prd.read_callback = dataReadCallback;
+
+                               int rv = nghttp2_submit_response(m_session, stream_id, hdrs.data(), hdrs.size(), &prd);
+                               if (rv != 0) {
+                                   SIMPLE_HTTP_ERROR_LOG("Fatal: submit_response failed: {}", nghttp2_strerror(rv));
+                               }
                                nghttp2_session_send(m_session);
                            }
                        });
@@ -664,26 +654,29 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
         return false;
     }
 
-    bool writeBody(std::string data, int32_t stream_id, nghttp2_flag flag = NGHTTP2_FLAG_NONE) {
+    bool writeBody(std::shared_ptr<std::string> data, int32_t stream_id, bool is_last) {
         if (auto sp = m_h2_channel.lock()) {
             std::weak_ptr<Http2Parse> self = shared_from_this();
-            asio::post(
-                sp->get_executor(),
-                [this, self = std::move(self), data = std::make_shared<std::string>(std::move(data)), flag, stream_id] {
-                    if (auto sp = self.lock()) {
-                        nghttp2_data_provider data_prd;
-                        data_prd.read_callback = dataReadCallback;
-                        auto* ctx = new DataContext{.data = data->c_str(),
-                                                    .total_len = data->size(),
-                                                    .offset = 0,
-                                                    .input_data = data};
-                        nghttp2_data_source source;
-                        source.ptr = ctx;
-                        data_prd.source = source;
-                        nghttp2_submit_data(m_session, flag, stream_id, &data_prd);
-                        nghttp2_session_send(m_session);
-                    }
-                });
+            asio::post(sp->get_executor(),
+                       [this, self = std::move(self), data = std::move(data), is_last, stream_id]() mutable {
+                           if (auto sp = self.lock()) {
+                               auto* ctx = static_cast<DataContext*>(
+                                   nghttp2_session_get_stream_user_data(m_session, stream_id));
+                               if (!ctx) {
+                                   SIMPLE_HTTP_ERROR_LOG("not found id: {} cache", stream_id);
+                                   return;
+                               }
+
+                               ctx->queue.push_back(std::move(data));
+
+                               if (is_last) {
+                                   ctx->is_finished = true;
+                               }
+
+                               nghttp2_session_resume_data(m_session, stream_id);
+                               nghttp2_session_send(m_session);
+                           }
+                       });
             return true;
         }
         return false;
@@ -711,6 +704,44 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
         }
         SIMPLE_HTTP_DEBUG_LOG("{}", "writeHttp1Response client disconnect!!!");
         return false;
+    }
+
+    static ssize_t dataReadCallback(nghttp2_session* /* session */,
+                                    int32_t /* stream_id */,
+                                    uint8_t* buf,
+                                    size_t length,
+                                    uint32_t* data_flags,
+                                    nghttp2_data_source* source,
+                                    void* /* user_data */) {
+        auto* ctx = static_cast<DataContext*>(source->ptr);
+        if (!ctx)
+            return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+
+        if (!ctx->queue.empty()) {
+            auto& chunk = *(ctx->queue.front());
+            size_t available = chunk.size() - ctx->offset;
+            size_t to_copy = std::min(length, available);
+
+            memcpy(buf, chunk.data() + ctx->offset, to_copy);
+            ctx->offset += to_copy;
+
+            if (ctx->offset >= chunk.size()) {
+                ctx->queue.pop_front();
+                ctx->offset = 0;
+            }
+
+            return static_cast<ssize_t>(to_copy);
+        }
+
+        if (ctx->is_finished) {
+            *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+            // // *data_flags &= ~NGHTTP2_DATA_FLAG_NO_END_STREAM;
+            // std::cout << "[HTTP2] 流 " << stream_id << " 数据推送完毕，发送 0 字节 END_STREAM" << std::endl;
+
+            return 0;
+        }
+
+        return NGHTTP2_ERR_DEFERRED;
     }
 
     static int onHeaderCallback(nghttp2_session* /* session */,
@@ -788,12 +819,25 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
         return 0;
     }
 
+    static int onStreamCloseCallback(nghttp2_session* session,
+                                     int32_t stream_id,
+                                     uint32_t /* error_code */,
+                                     void* /* user_data */) {
+        void* ptr = nghttp2_session_get_stream_user_data(session, stream_id);
+        if (ptr) {
+            delete static_cast<DataContext*>(ptr);
+            nghttp2_session_set_stream_user_data(session, stream_id, nullptr);
+        }
+        return 0;
+    }
+
     int feedRecvData(const char* data, size_t len) {
         size_t ret = nghttp2_session_mem_recv(m_session, (const uint8_t*)data, len);
         if (ret != len) {
             SIMPLE_HTTP_ERROR_LOG("nghttp2 error: {}", nghttp2_strerror(ret));
             return -1;
         }
+        nghttp2_session_send(m_session);
         return (int)ret;
     }
 
@@ -877,11 +921,16 @@ class HttpResponseWriter {
     }
 
     template <typename T>
-    bool writeBody(T&& data, nghttp2_flag flag = NGHTTP2_FLAG_NONE) {
+    bool writeBody(T&& data, bool is_last = false) {
         if (m_version != Version::Http2)
             return false;
-        static_assert(std::is_constructible_v<std::string, T&&>, "T must be convertible to std::string");
-        return m_http2_parse->writeBody(std::forward<T>(data), m_stream_id, flag);
+        using DecayedT = std::decay_t<T>;
+        if constexpr (std::is_same_v<DecayedT, std::shared_ptr<std::string>>) {
+            return m_http2_parse->writeBody(std::forward<T>(data), m_stream_id, is_last);
+        } else {
+            static_assert(std::is_constructible_v<std::string, T&&>, "T must be convertible to std::string");
+            return m_http2_parse->writeBody(std::make_shared<std::string>(std::forward<T>(data)), m_stream_id, is_last);
+        }
     }
 
     template <typename T>
@@ -889,7 +938,7 @@ class HttpResponseWriter {
         if (m_version != Version::Http2)
             return false;
         m_write_h2_body_done = true;
-        return writeBody(std::forward<T>(data), NGHTTP2_FLAG_END_STREAM);
+        return writeBody(std::forward<T>(data), true);
     }
 
     // for http1.1 chunk
@@ -1859,6 +1908,29 @@ class HttpsClient final : public HttpClient, public std::enable_shared_from_this
         return m_connected.load(std::memory_order_relaxed);
     }
 
+    static ssize_t cliDataReadCallback(nghttp2_session* /* session */,
+                                       int32_t /* stream_id */,
+                                       uint8_t* buf,
+                                       size_t length,
+                                       uint32_t* data_flags,
+                                       nghttp2_data_source* source,
+                                       void* /* user_data */) {
+        auto* ctx = static_cast<CliDataContext*>(source->ptr);
+
+        size_t remaining = ctx->total_len - ctx->offset;
+        size_t to_copy = remaining < length ? remaining : length;
+
+        memcpy(buf, ctx->data + ctx->offset, to_copy);
+        ctx->offset += to_copy;
+
+        if (ctx->offset >= ctx->total_len) {
+            *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+            delete ctx;
+        }
+
+        return to_copy;
+    }
+
   private:
     asio::awaitable<void> forwardRequest() {
         auto submit_request = [this](auto tp) mutable {
@@ -1887,12 +1959,12 @@ class HttpsClient final : public HttpClient, public std::enable_shared_from_this
             const auto& post_data = req->body();
 
             nghttp2_data_provider data_prd;
-            auto* ctx = new DataContext{.data = post_data.data(),
-                                        .total_len = post_data.size(),
-                                        .offset = 0,
-                                        .input_data = req};
+            auto* ctx = new CliDataContext{.data = post_data.data(),
+                                           .total_len = post_data.size(),
+                                           .offset = 0,
+                                           .input_data = req};
             data_prd.source.ptr = ctx;
-            data_prd.read_callback = dataReadCallback;
+            data_prd.read_callback = cliDataReadCallback;
             int stream_id = nghttp2_submit_request(m_session, nullptr, hdrs.data(), hdrs.size(), &data_prd, nullptr);
 
             nghttp2_session_send(m_session);

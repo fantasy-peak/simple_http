@@ -36,6 +36,7 @@ target("server")
     set_rundir(".")
 target_end()
 
+-- wait refactor client
 target("client")
     set_kind("binary")
     add_deps("simple_http")
