@@ -942,7 +942,11 @@ class HttpResponseWriter {
     }
 
     // for http1.1 chunk
-    bool writeChunkHeader(const http::response<http::empty_body>& res) {
+    bool writeChunkHeader(http::response<http::empty_body>& res) {
+        auto it = res.find(http::field::transfer_encoding);
+        if (it == res.end() || it->value() != "chunked") {
+            res.set(http::field::transfer_encoding, "chunked");
+        }
         http::response<http::empty_body>::header_type::writer fr{res.base(), res.version(), res.result_int()};
         auto const& buffers = fr.get();
         std::size_t total_size = asio::buffer_size(buffers);

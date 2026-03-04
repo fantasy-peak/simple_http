@@ -102,7 +102,6 @@ asio::awaitable<void> start() {
                               http::response<http::empty_body> res{http::status::ok, 11};
                               res.set(http::field::server, "simple_http_server");
                               res.set(http::field::content_type, "text/plain");
-                              res.set(http::field::transfer_encoding, "chunked");
                               res.keep_alive(true);
                               writer->writeChunkHeader(res);
                               writer->writeChunkData("123");
