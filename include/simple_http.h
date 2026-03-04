@@ -329,7 +329,7 @@ class HttpRequestReader {
         return m_version;
     }
 
-    auto& refBody() {
+    auto& getBody() {
         return m_body;
     }
 
@@ -338,26 +338,26 @@ class HttpRequestReader {
     }
 
     // Not for external use
-    void set_method(auto method) {
+    void setMethod(auto method) {
         m_method = method;
     }
 
-    void set_target(std::string target) {
+    void setTarget(std::string target) {
         m_target = std::move(target);
         splitPathAndQuery(m_target);
     }
 
-    void set_header(std::string name, std::string value) {
+    void setHeader(std::string name, std::string value) {
         m_headers.emplace(std::move(name), std::move(value));
     }
 
     template <typename T>
-    bool try_send(T&& value) {
+    bool trySend(T&& value) {
         auto ret = m_reader_channel->try_send(error_code{}, std::forward<T>(value));
         return ret;
     }
 
-    void set_http_request(http::request<http::string_body>& req) {
+    void setHttpRequest(http::request<http::string_body>& req) {
         m_method = req.method();
         m_target = req.target();
         splitPathAndQuery(m_target);
@@ -759,11 +759,11 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
         std::string value{(char*)_value, valuelen};
         std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::tolower(c); });
         if (name == ":method") {
-            http_request_reader->set_method(http::string_to_verb(value));
+            http_request_reader->setMethod(http::string_to_verb(value));
         } else if (name == ":path") {
-            http_request_reader->set_target(std::move(value));
+            http_request_reader->setTarget(std::move(value));
         } else {
-            http_request_reader->set_header(std::move(name), std::move(value));
+            http_request_reader->setHeader(std::move(name), std::move(value));
         }
         return 0;
     }
@@ -800,7 +800,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
             }
         }
         if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
-            http_request_reader->try_send(Eof{});
+            http_request_reader->trySend(Eof{});
             h2p->erase(stream_id);
         }
         return 0;
@@ -815,7 +815,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
         auto h2p = static_cast<Http2Parse*>(userdata);
         auto& req = h2p->getStreamCtx(stream_id);
         std::string recv_data{(char*)data, len};
-        req->try_send(std::move(recv_data));
+        req->trySend(std::move(recv_data));
         return 0;
     }
 
@@ -855,7 +855,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
 
     void disconnect() {
         for ([[maybe_unused]] auto& [id, http_request_reader] : m_streams) {
-            http_request_reader->try_send(Disconnect{});
+            http_request_reader->trySend(Disconnect{});
         }
     }
 
@@ -1455,8 +1455,8 @@ class HttpServer final {
         }
         if (req.method() != http::verb::options) {
             auto http_request_reader = h2p->getStreamCtx(1);
-            http_request_reader->set_http_request(req);
-            http_request_reader->try_send(Eof{});
+            http_request_reader->setHttpRequest(req);
+            http_request_reader->trySend(Eof{});
             callHandler(m_handler_functions,
                         *io_dispatch,
                         std::move(http_request_reader),
@@ -1521,7 +1521,7 @@ class HttpServer final {
                 }
                 auto version = (req.version() == 11 ? Version::Http11 : Version::Http1);
                 auto http_request_reader = std::make_shared<HttpRequestReader>(version);
-                http_request_reader->set_http_request(req);
+                http_request_reader->setHttpRequest(req);
                 readers.emplace_back(http_request_reader);
                 callHandler(m_handler_functions,
                             m_io_dispatch->getIoContext(),
@@ -1630,7 +1630,7 @@ class HttpServer final {
         // this is http1 or 1.1
         auto version = (full_req.version() == 11 ? Version::Http11 : Version::Http1);
         auto http_request_reader = std::make_shared<HttpRequestReader>(version);
-        http_request_reader->set_http_request(full_req);
+        http_request_reader->setHttpRequest(full_req);
         callHandler(m_handler_functions,
                     m_io_dispatch->getIoContext(),
                     http_request_reader,
