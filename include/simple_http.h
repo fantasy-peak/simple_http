@@ -1155,6 +1155,7 @@ struct Config {
     std::string ipv6_addr{"::1"};
     uint16_t ipv6_port{443};
     std::optional<std::string> unix_socket;
+    std::function<void(asio::ssl::context&)> set_ssl_context;
 };
 
 class HttpServer final {
@@ -1374,20 +1375,24 @@ class HttpServer final {
             throw std::runtime_error(std::format("{} not exist", m_cfg.ssl_key));
         }
 
-        uint64_t opts =
-            asio::ssl::context::default_workarounds | asio::ssl::context::no_tlsv1 | asio::ssl::context::no_tlsv1_1;
-        if (m_cfg.disable_tls12) {
-            opts |= asio::ssl::context::no_tlsv1_2;
-        }
-        ssl_context.set_options(opts);
+        if (m_cfg.set_ssl_context) {
+            m_cfg.set_ssl_context(ssl_context);
+        } else {
+            uint64_t opts =
+                asio::ssl::context::default_workarounds | asio::ssl::context::no_tlsv1 | asio::ssl::context::no_tlsv1_1;
+            if (m_cfg.disable_tls12) {
+                opts |= asio::ssl::context::no_tlsv1_2;
+            }
+            ssl_context.set_options(opts);
 
-        if (m_cfg.ssl_mutual) {
-            ssl_context.set_verify_mode(asio::ssl::verify_peer | asio::ssl::verify_fail_if_no_peer_cert);
+            if (m_cfg.ssl_mutual) {
+                ssl_context.set_verify_mode(asio::ssl::verify_peer | asio::ssl::verify_fail_if_no_peer_cert);
 
-            if (m_cfg.ssl_ca) {
-                ssl_context.load_verify_file(*m_cfg.ssl_ca);
-            } else {
-                ssl_context.set_default_verify_paths();
+                if (m_cfg.ssl_ca) {
+                    ssl_context.load_verify_file(*m_cfg.ssl_ca);
+                } else {
+                    ssl_context.set_default_verify_paths();
+                }
             }
         }
 
