@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <format>
 #include <functional>
@@ -31,6 +32,9 @@
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/beast.hpp>
+#ifdef SIMPLE_HTTP_EXPERIMENT_WEBSOCKET
+#include <boost/beast/websocket/ssl.hpp>
+#endif
 
 namespace __private {
 namespace asio = boost::asio;
@@ -45,6 +49,7 @@ namespace simple_http {
 namespace asio = boost::asio;
 namespace beast = boost::beast;
 namespace http = beast::http;
+namespace websocket = beast::websocket;
 
 enum class LogLevel : uint8_t {
     Debug,
@@ -408,6 +413,14 @@ using SslContextCallback =
 
 using RequestCallback = std::variant<SimpleCallback, SslContextCallback>;
 
+#ifdef SIMPLE_HTTP_EXPERIMENT_WEBSOCKET
+using WsSocketPtr = std::shared_ptr<websocket::stream<asio::ip::tcp::socket>>;
+using WssSocketPtr = std::shared_ptr<websocket::stream<asio::ssl::stream<asio::ip::tcp::socket>>>;
+using WsCallBack = std::function<asio::awaitable<bool>(const http::request<http::string_body>&, const WsSocketPtr&)>;
+using WssCallBack = std::function<asio::awaitable<bool>(const http::request<http::string_body>&, const WssSocketPtr&)>;
+using WebSocketCallback = std::variant<WsCallBack, WssCallBack>;
+#endif
+
 struct HandlerFunctions {
     void setBefore(std::function<asio::awaitable<bool>(const std::shared_ptr<HttpRequestReader>&,
                                                        const std::shared_ptr<HttpResponseWriter>&)> cb) {
@@ -422,6 +435,20 @@ struct HandlerFunctions {
     void setHttpHandler(const std::string& path, RequestCallback cb) {
         map_proc[path] = std::move(cb);
     }
+
+#ifdef SIMPLE_HTTP_EXPERIMENT_WEBSOCKET
+    void setWebsocketHandler(const std::string& path, WebSocketCallback cb) {
+        websocket_map_proc[path] = std::move(cb);
+    }
+
+    void setWebsocketRegexHandler(const std::string& regex, WebSocketCallback cb) {
+        try {
+            ws_regex_proc.emplace_back(std::regex{regex}, std::move(cb));
+        } catch (const std::exception& e) {
+            SIMPLE_HTTP_ERROR_LOG("regex:[{}], {}", regex, e.what());
+        }
+    }
+#endif
 
     void setHttpRegexHandler(const std::string& regex, RequestCallback cb) {
         try {
@@ -471,6 +498,10 @@ struct HandlerFunctions {
              co_return;
          }}};
     std::vector<std::pair<std::regex, RequestCallback>> regex_proc;
+#ifdef SIMPLE_HTTP_EXPERIMENT_WEBSOCKET
+    std::vector<std::pair<std::regex, WebSocketCallback>> ws_regex_proc;
+    std::unordered_map<std::string, WebSocketCallback, string_hash, std::equal_to<>> websocket_map_proc;
+#endif
 };
 
 inline auto runCallBack(const RequestCallback* entry,
@@ -1160,6 +1191,10 @@ struct Config {
     uint16_t ipv6_port{443};
     std::optional<std::string> unix_socket;
     std::function<void(asio::ssl::context&)> set_ssl_context;
+#ifdef SIMPLE_HTTP_EXPERIMENT_WEBSOCKET
+    std::function<void(std::variant<WssSocketPtr, WsSocketPtr>)> set_websocket;
+    bool auto_upgrade_websocket{true};
+#endif
 };
 
 class HttpServer final {
@@ -1225,6 +1260,18 @@ class HttpServer final {
         m_handler_functions->setHttpHandler(path, std::move(cb));
         return *this;
     }
+
+#ifdef SIMPLE_HTTP_EXPERIMENT_WEBSOCKET
+    auto& setWebsocketHandler(const std::string& path, WebSocketCallback cb) {
+        m_handler_functions->setWebsocketHandler(path, std::move(cb));
+        return *this;
+    }
+
+    auto& setWebsocketRegexHandler(const std::string& regex, WebSocketCallback cb) {
+        m_handler_functions->setWebsocketRegexHandler(regex, std::move(cb));
+        return *this;
+    }
+#endif
 
     auto& setHttpRegexHandler(const std::string& regex, RequestCallback cb) {
         m_handler_functions->setHttpRegexHandler(regex, std::move(cb));
@@ -1635,6 +1682,64 @@ class HttpServer final {
             co_await upgradeH2c(std::move(socket), ctx, std::move(full_req), std::move(h2_setting), session_ctx);
             co_return;
         }
+
+#ifdef SIMPLE_HTTP_EXPERIMENT_WEBSOCKET
+        if (beast::websocket::is_upgrade(full_req)) {
+            using SocketType = std::decay_t<decltype(*socket)>;
+            auto stream = std::make_shared<websocket::stream<SocketType>>(std::move(*socket));
+            if (m_cfg.auto_upgrade_websocket) {
+                if (m_cfg.set_websocket) {
+                    m_cfg.set_websocket(stream);
+                }
+                auto [ec] = co_await stream->async_accept(full_req, asio::as_tuple(asio::use_awaitable));
+                if (ec) {
+                    SIMPLE_HTTP_ERROR_LOG("websocket [{}] async_accept: {}", full_req.target(), ec.message());
+                    co_return;
+                }
+            }
+            auto callback = [](auto& full_req, auto& stream, auto& cb) -> asio::awaitable<void> {
+                try {
+                    if constexpr (std::is_same_v<SocketType, asio::ip::tcp::socket>) {
+                        auto ret = co_await std::get<WsCallBack>(cb)(full_req, stream);
+                        if (ret) {
+                            co_await stream->async_close(websocket::close_code::normal,
+                                                         asio::as_tuple(asio::use_awaitable));
+                        }
+                    } else {
+                        auto ret = co_await std::get<WssCallBack>(cb)(full_req, stream);
+                        if (ret) {
+                            co_await stream->async_close(websocket::close_code::normal,
+                                                         asio::as_tuple(asio::use_awaitable));
+                            co_await stream->next_layer().async_shutdown(asio::as_tuple(asio::use_awaitable));
+                        }
+                    }
+                } catch (const std::bad_variant_access& ex) {
+                    SIMPLE_HTTP_ERROR_LOG("{}", ex.what());
+                } catch (const std::exception& ex) {
+                    SIMPLE_HTTP_ERROR_LOG("{}", ex.what());
+                }
+            };
+            auto path = full_req.target();
+            auto it = m_handler_functions->websocket_map_proc.find(path);
+            if (it != m_handler_functions->websocket_map_proc.end()) {
+                co_await callback(full_req, stream, it->second);
+            } else {
+                for (const auto& [pattern, cb] : m_handler_functions->ws_regex_proc) {
+                    std::string str{path};
+                    if (std::regex_match(str, pattern)) {
+                        co_await callback(full_req, stream, cb);
+                        break;
+                    }
+                }
+            }
+            auto& tcp = beast::get_lowest_layer(*stream);
+            if (tcp.is_open()) {
+                tcp.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
+                tcp.close(ec);
+            }
+            co_return;
+        }
+#endif
 
         // this is http1 or 1.1
         auto version = (full_req.version() == 11 ? Version::Http11 : Version::Http1);

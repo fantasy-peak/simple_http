@@ -51,6 +51,7 @@ asio::awaitable<void> start() {
         .ipv6_addr = "::1",
         .ipv6_port = 7788,
         .unix_socket = std::nullopt,
+        .set_websocket = [](auto socket) { std::visit([](auto&& arg) { arg->compress(false); }, socket); },
     };
     simple_http::LOG_CB = [](simple_http::LogLevel level, auto file, auto line, std::string msg) {
         std::cout << to_string(level) << " " << file << ":" << line << " " << msg << std::endl;
@@ -158,6 +159,15 @@ asio::awaitable<void> start() {
 
                           co_return;
                       });
+
+    hs.setWebsocketHandler("/wss",
+                           [](const http::request<http::string_body>& req,
+                              const simple_http::WssSocketPtr& socket) -> asio::awaitable<bool> {
+                               socket->text(true);
+                               std::string data{"hello world"};
+                               co_await socket->async_write(asio::buffer(data), asio::use_awaitable);
+                               co_return true;
+                           });
     std::cout << "started http server\n";
     co_await hs.start();
 }
