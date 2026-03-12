@@ -258,11 +258,12 @@ using ReaderChannel =
 
 class HttpRequestReader {
   public:
-    HttpRequestReader(Version version, std::shared_ptr<ReaderChannel> ch)
-        : m_version(version), m_reader_channel(std::move(ch)) {
+    HttpRequestReader(Version version, std::shared_ptr<ReaderChannel> ch, asio::ip::tcp::endpoint endpoint)
+        : m_version(version), m_reader_channel(std::move(ch)), m_client_endpoint(std::move(endpoint)) {
     }
 
-    HttpRequestReader(Version version) : m_version(version) {
+    HttpRequestReader(Version version, asio::ip::tcp::endpoint endpoint)
+        : m_version(version), m_client_endpoint(std::move(endpoint)) {
     }
 
     ~HttpRequestReader() = default;
@@ -342,6 +343,10 @@ class HttpRequestReader {
         return m_reader_channel;
     }
 
+    std::string getPeerAddr() {
+        return m_client_endpoint.address().to_string();
+    }
+
     // Not for external use
     void setMethod(auto method) {
         m_method = method;
@@ -401,6 +406,7 @@ class HttpRequestReader {
     std::atomic_bool m_connected{true};
     std::string_view m_path;
     std::string_view m_query;
+    asio::ip::tcp::endpoint m_client_endpoint;
 };
 
 using SimpleCallback =
@@ -588,12 +594,14 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
                const std::shared_ptr<Http1Channel>& ch1,
                auto io_context,
                const std::shared_ptr<HandlerFunctions>& handler_functions,
-               const std::shared_ptr<__private::SessionContext> session_ctx)
+               const std::shared_ptr<__private::SessionContext> session_ctx,
+               asio::ip::tcp::endpoint endpoint)
         : m_h2_channel(ch2),
           m_h1_channel(ch1),
           m_io_dispatch(std::move(io_context)),
           m_handler_functions(handler_functions),
-          m_session_ctx(session_ctx) {
+          m_session_ctx(session_ctx),
+          m_endpoint(std::move(endpoint)) {
     }
 
     ~Http2Parse() {
@@ -875,7 +883,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
     std::shared_ptr<HttpRequestReader>& getStreamCtx(int32_t stream_id) {
         if (!m_streams.contains(stream_id)) {
             auto ch = std::make_shared<ReaderChannel>(m_io_dispatch->get_executor(), CHANNEL_SIZE);
-            m_streams[stream_id] = std::make_shared<HttpRequestReader>(Version::Http2, std::move(ch));
+            m_streams[stream_id] = std::make_shared<HttpRequestReader>(Version::Http2, std::move(ch), m_endpoint);
         }
         return m_streams[stream_id];
     }
@@ -898,6 +906,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
     std::unordered_map<int32_t, std::shared_ptr<HttpRequestReader>> m_streams;
     std::weak_ptr<HandlerFunctions> m_handler_functions;
     std::shared_ptr<__private::SessionContext> m_session_ctx;
+    asio::ip::tcp::endpoint m_endpoint;
 };
 
 class HttpResponseWriter {
@@ -1358,9 +1367,11 @@ class HttpServer final {
             }
             if (!m_ssl_context) {
                 auto session_socket = std::make_shared<asio::ip::tcp::socket>(std::move(socket));
-                asio::co_spawn(*context,
-                               session(std::move(session_socket), context, __private::SessionContext{}),
-                               asio::detached);
+                asio::ip::tcp::endpoint remote_ep = session_socket->remote_endpoint(ec);
+                asio::co_spawn(
+                    *context,
+                    session(std::move(session_socket), context, __private::SessionContext{}, std::move(remote_ep)),
+                    asio::detached);
             } else {
                 auto session_socket =
                     std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(std::move(socket), *m_ssl_context);
@@ -1491,7 +1502,8 @@ class HttpServer final {
                                      const std::shared_ptr<asio::io_context>& /* ctx */,
                                      http::request<http::string_body> req,
                                      std::string settings,
-                                     std::shared_ptr<__private::SessionContext> session_ctx) {
+                                     std::shared_ptr<__private::SessionContext> session_ctx,
+                                     asio::ip::tcp::endpoint endpoint) {
         // nghttp --upgrade  http://127.0.0.1:6666/hello --data ./a.txt
         // curl -v --http2 http://localhost:6666/hello -d "aaaa" -k
         http::response<http::empty_body> res{http::status::switching_protocols, 11};
@@ -1501,7 +1513,7 @@ class HttpServer final {
 
         auto& io_dispatch = m_io_dispatch->getIoContextPtr();
         auto ch = std::make_shared<Http2Channel>(co_await asio::this_coro::executor, CHANNEL_SIZE);
-        auto h2p = std::make_shared<Http2Parse>(ch, nullptr, io_dispatch, m_handler_functions, session_ctx);
+        auto h2p = std::make_shared<Http2Parse>(ch, nullptr, io_dispatch, m_handler_functions, session_ctx, endpoint);
         if (auto ret = h2p->init(Http2Parse::Config{
                 .is_h2c_upgrade = true,
                 .h2_setting = std::move(settings),
@@ -1534,13 +1546,14 @@ class HttpServer final {
     asio::awaitable<void> switchH2c(auto socket,
                                     const std::shared_ptr<asio::io_context>& /* ctx */,
                                     std::string_view buffer,
-                                    std::shared_ptr<__private::SessionContext> session_ctx) {
+                                    std::shared_ptr<__private::SessionContext> session_ctx,
+                                    asio::ip::tcp::endpoint endpoint) {
         // curl -v --http2-prior-knowledge http://localhost:6666/hello
         // curl -v --http2-prior-knowledge http://localhost:6666/hello -d "aaaa"
         auto& io_dispatch = m_io_dispatch->getIoContextPtr();
         // start proc http2
         auto ch = std::make_shared<Http2Channel>(co_await asio::this_coro::executor, CHANNEL_SIZE);
-        auto h2p = std::make_shared<Http2Parse>(ch, nullptr, io_dispatch, m_handler_functions, session_ctx);
+        auto h2p = std::make_shared<Http2Parse>(ch, nullptr, io_dispatch, m_handler_functions, session_ctx, endpoint);
         if (auto ret = h2p->init(Http2Parse::Config{
                 .is_h2c_upgrade = false,
                 .h2_setting = "",
@@ -1568,9 +1581,13 @@ class HttpServer final {
                                       std::shared_ptr<Http1Channel> http1_ch,
                                       std::shared_ptr<Http2Parse> h2p,
                                       Version version,
-                                      std::shared_ptr<__private::SessionContext> session_ctx) {
-        auto recv_request = [this](auto socket, auto h2p, auto deadline, auto max_idle_time, auto session_ctx)
-            -> asio::awaitable<void> {
+                                      std::shared_ptr<__private::SessionContext> session_ctx,
+                                      asio::ip::tcp::endpoint endpoint) {
+        auto recv_request = [this, &endpoint](auto socket,
+                                              auto h2p,
+                                              auto deadline,
+                                              auto max_idle_time,
+                                              auto session_ctx) -> asio::awaitable<void> {
             std::vector<std::weak_ptr<HttpRequestReader>> readers;
             for (;;) {
                 *deadline = std::chrono::steady_clock::now() + max_idle_time;
@@ -1581,7 +1598,7 @@ class HttpServer final {
                     break;
                 }
                 auto version = (req.version() == 11 ? Version::Http11 : Version::Http1);
-                auto http_request_reader = std::make_shared<HttpRequestReader>(version);
+                auto http_request_reader = std::make_shared<HttpRequestReader>(version, endpoint);
                 http_request_reader->setHttpRequest(req);
                 readers.emplace_back(http_request_reader);
                 callHandler(m_handler_functions,
@@ -1640,10 +1657,11 @@ class HttpServer final {
 
     asio::awaitable<void> session(auto socket,
                                   std::shared_ptr<asio::io_context> ctx,
-                                  __private::SessionContext session_context) {
+                                  __private::SessionContext session_context,
+                                  asio::ip::tcp::endpoint endpoint) {
         auto session_ctx = std::make_shared<__private::SessionContext>(session_context);
         auto http1_ch = std::make_shared<Http1Channel>(*ctx, CHANNEL_SIZE);
-        auto h2p = std::make_shared<Http2Parse>(nullptr, http1_ch, nullptr, m_handler_functions, session_ctx);
+        auto h2p = std::make_shared<Http2Parse>(nullptr, http1_ch, nullptr, m_handler_functions, session_ctx, endpoint);
         beast::flat_buffer buffer;
         http::parser<true, http::string_body> parser;
         auto [ec, bytes] =
@@ -1655,7 +1673,7 @@ class HttpServer final {
             auto const data = buffer.data();
             std::string_view req_view{static_cast<char const*>(data.data()), data.size()};
             if (isHttp2(req_view)) {
-                co_await switchH2c(std::move(socket), ctx, req_view, session_ctx);
+                co_await switchH2c(std::move(socket), ctx, req_view, session_ctx, endpoint);
             } else {
                 SIMPLE_HTTP_ERROR_LOG("not http2 request");
             }
@@ -1684,7 +1702,8 @@ class HttpServer final {
         http::request<http::string_body> full_req = parser.get();
 
         if (!h2_setting.empty()) {
-            co_await upgradeH2c(std::move(socket), ctx, std::move(full_req), std::move(h2_setting), session_ctx);
+            co_await upgradeH2c(
+                std::move(socket), ctx, std::move(full_req), std::move(h2_setting), session_ctx, endpoint);
             co_return;
         }
 
@@ -1748,29 +1767,32 @@ class HttpServer final {
 
         // this is http1 or 1.1
         auto version = (full_req.version() == 11 ? Version::Http11 : Version::Http1);
-        auto http_request_reader = std::make_shared<HttpRequestReader>(version);
+        auto http_request_reader = std::make_shared<HttpRequestReader>(version, endpoint);
         http_request_reader->setHttpRequest(full_req);
         callHandler(m_handler_functions,
                     m_io_dispatch->getIoContext(),
                     http_request_reader,
                     std::make_shared<HttpResponseWriter>(h2p, 0, version),
                     session_ctx);
-        co_await switchHttp1(std::move(socket), http1_ch, h2p, version, session_ctx);
+        co_await switchHttp1(std::move(socket), http1_ch, h2p, version, session_ctx, endpoint);
         http_request_reader->disconnect();
         co_return;
     }
 
     // https server
     asio::awaitable<void> startSslsession(auto socket, auto context) {
-        if (auto [ec] = co_await socket->async_handshake(boost::asio::ssl::stream_base::server,
-                                                         asio::as_tuple(asio::use_awaitable));
-            ec) {
-            auto remote_ep = socket->lowest_layer().remote_endpoint();
+        auto [ec] = co_await socket->async_handshake(boost::asio::ssl::stream_base::server,
+                                                     asio::as_tuple(asio::use_awaitable));
+        if (ec) {
+            asio::ip::tcp::endpoint remote_ep = socket->lowest_layer().remote_endpoint(ec);
             SIMPLE_HTTP_DEBUG_LOG("async_handshake: {}, {}", ec.message(), remote_ep.address().to_string());
             co_return;
         }
+        asio::ip::tcp::endpoint remote_ep = socket->lowest_layer().remote_endpoint(ec);
         auto session_context = __private::SessionContext{.ssl_context = {socket->native_handle()}};
-        asio::co_spawn(*context, session(std::move(socket), context, std::move(session_context)), asio::detached);
+        asio::co_spawn(*context,
+                       session(std::move(socket), context, std::move(session_context), std::move(remote_ep)),
+                       asio::detached);
     }
 
     Config m_cfg;
