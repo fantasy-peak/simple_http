@@ -952,7 +952,9 @@ class HttpResponseWriter {
     }
 
     template <typename T>
-    bool writeBody(T&& data, bool is_last = false) {
+    bool writeBody(T&& data, bool is_last = false)
+        requires std::same_as<decltype(is_last), bool>
+    {
         if (m_version != Version::Http2)
             return false;
         using DecayedT = std::decay_t<T>;
@@ -962,6 +964,10 @@ class HttpResponseWriter {
             static_assert(std::is_constructible_v<std::string, T&&>, "T must be convertible to std::string");
             return m_http2_parse->writeBody(std::make_shared<std::string>(std::forward<T>(data)), m_stream_id, is_last);
         }
+    }
+
+    bool writeBody(const char* data, std::size_t size, bool is_last = false) {
+        return writeBody(std::make_shared<std::string>(data, size), is_last);
     }
 
     template <typename T>
@@ -989,7 +995,7 @@ class HttpResponseWriter {
         return m_http2_parse->writeChunkData(std::move(s));
     }
 
-    bool writeChunkData(const char* ptr, size_t size) {
+    bool writeChunkData(const char* ptr, std::size_t size) {
         constexpr size_t max_chunk_header_len = 20;
         char buffer[max_chunk_header_len];
         int len = snprintf(buffer, max_chunk_header_len, "%zx\r\n", size);
@@ -1154,7 +1160,6 @@ void shutdown(const auto& socket) {
 #endif
     else {
         error_code ec;
-        socket->shutdown(ec);
         socket->next_layer().shutdown(asio::ip::tcp::socket::shutdown_both, ec);
         socket->next_layer().close(ec);
     }
@@ -1760,7 +1765,8 @@ class HttpServer final {
         if (auto [ec] = co_await socket->async_handshake(boost::asio::ssl::stream_base::server,
                                                          asio::as_tuple(asio::use_awaitable));
             ec) {
-            SIMPLE_HTTP_DEBUG_LOG("async_handshake: {}", ec.message());
+            auto remote_ep = socket->lowest_layer().remote_endpoint();
+            SIMPLE_HTTP_DEBUG_LOG("async_handshake: {}, {}", ec.message(), remote_ep.address().to_string());
             co_return;
         }
         auto session_context = __private::SessionContext{.ssl_context = {socket->native_handle()}};
