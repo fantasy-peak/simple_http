@@ -8,7 +8,7 @@
 ## ✨ Features
 
 - **Header-only**: Easy to integrate into any project by just including headers.
-- **Modern C++**: Leverages C++20/23 and coroutines for clean, asynchronous logic.
+- **Modern C++**: Leverages C++20/23/26 and coroutines for clean, asynchronous logic.
 - **Dual Protocol Support**: Supports both HTTP/1.1 and HTTP/2 with automatic negotiation.
 - **Server & Client**: Provides a consistent API for both server and client functionalities.
 - **Secure Communication**: Supports HTTPS and TLS mutual authentication (mTLS).
@@ -18,9 +18,9 @@
 
 ## 🚀 Requirements
 
-- **C++20/23** compatible compiler (e.g., GCC 13+, Clang 12+).
+- **C++20/23/26** compatible compiler (e.g., GCC 13+, Clang 12+).
 - **xmake**: Used for building examples and dependency management.
-- **Boost** (`asio`)
+- **Boost** (`beast`)
 - **nghttp2**
 - **OpenSSL**
 

@@ -1335,6 +1335,13 @@ class HttpServer final {
             acceptor->set_option(boost::asio::ip::v6_only(true));
         }
         acceptor->set_option(asio::ip::tcp::acceptor::reuse_address(true));
+#ifdef __linux__
+        using fast_open = asio::detail::socket_option::integer<IPPROTO_TCP, TCP_FASTOPEN>;
+        acceptor->set_option(fast_open(256), ec);
+        if (ec) {
+            SIMPLE_HTTP_ERROR_LOG("fast_open error: {}", ec.message());
+        }
+#endif
         [[maybe_unused]] auto _ = acceptor->bind(endpoint, ec);
         if (ec) {
             SIMPLE_HTTP_ERROR_LOG("bind: {}", ec.message());
