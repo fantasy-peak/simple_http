@@ -101,9 +101,19 @@ inline constexpr std::string_view to_string(LogLevel level) noexcept {
 
 inline std::function<void(LogLevel, std::string_view, int, std::string)> LOG_CB = [](auto, auto, auto, auto) {};
 
+#ifndef SIMPLE_HTTP_ENABLE_LOG
+#define SIMPLE_HTTP_ENABLE_LOG 1
+#endif
+
+#if SIMPLE_HTTP_ENABLE_LOG
 #define SIMPLE_HTTP_DEBUG_LOG(...) simple_http::log(simple_http::LogLevel::Debug, __FILE__, __LINE__, __VA_ARGS__)
 #define SIMPLE_HTTP_INFO_LOG(...) simple_http::log(simple_http::LogLevel::Info, __FILE__, __LINE__, __VA_ARGS__)
 #define SIMPLE_HTTP_ERROR_LOG(...) simple_http::log(simple_http::LogLevel::Error, __FILE__, __LINE__, __VA_ARGS__)
+#else
+#define SIMPLE_HTTP_DEBUG_LOG(...) ((void)0)
+#define SIMPLE_HTTP_INFO_LOG(...) ((void)0)
+#define SIMPLE_HTTP_ERROR_LOG(...) ((void)0)
+#endif
 
 template <typename... Args>
 inline void log(LogLevel level, std::string_view file, int line, std::format_string<Args...> fmt, Args&&... args) {
@@ -1361,9 +1371,9 @@ class HttpServer final {
                     break;
                 continue;
             }
-            auto endpoint = socket.remote_endpoint(ec);
+            auto remote_ep = socket.remote_endpoint(ec);
             if (!ec) {
-                SIMPLE_HTTP_DEBUG_LOG("new connection from [{}:{}]", endpoint.address().to_string(), endpoint.port());
+                SIMPLE_HTTP_DEBUG_LOG("new connection from [{}:{}]", remote_ep.address().to_string(), remote_ep.port());
             }
             if (m_cfg.socket_setup_cb) {
                 try {
@@ -1374,7 +1384,6 @@ class HttpServer final {
             }
             if (!m_ssl_context) {
                 auto session_socket = std::make_shared<asio::ip::tcp::socket>(std::move(socket));
-                asio::ip::tcp::endpoint remote_ep = session_socket->remote_endpoint(ec);
                 asio::co_spawn(
                     *context,
                     session(std::move(session_socket), context, __private::SessionContext{}, std::move(remote_ep)),
@@ -1382,7 +1391,9 @@ class HttpServer final {
             } else {
                 auto session_socket =
                     std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(std::move(socket), *m_ssl_context);
-                asio::co_spawn(*context, startSslsession(std::move(session_socket), context), asio::detached);
+                asio::co_spawn(*context,
+                               startSslsession(std::move(session_socket), context, std::move(remote_ep)),
+                               asio::detached);
             }
         }
     }
@@ -1784,15 +1795,15 @@ class HttpServer final {
     }
 
     // https server
-    asio::awaitable<void> startSslsession(auto socket, auto context) {
-        auto [ec] = co_await socket->async_handshake(boost::asio::ssl::stream_base::server,
-                                                     asio::as_tuple(asio::use_awaitable));
+    asio::awaitable<void> startSslsession(std::shared_ptr<asio::ssl::stream<asio::ip::tcp::socket>> socket,
+                                          std::shared_ptr<asio::io_context> context,
+                                          asio::ip::tcp::endpoint remote_ep) {
+        auto [ec] =
+            co_await socket->async_handshake(asio::ssl::stream_base::server, asio::as_tuple(asio::use_awaitable));
         if (ec) {
-            asio::ip::tcp::endpoint remote_ep = socket->lowest_layer().remote_endpoint(ec);
             SIMPLE_HTTP_DEBUG_LOG("async_handshake: {}, {}", ec.message(), remote_ep.address().to_string());
             co_return;
         }
-        asio::ip::tcp::endpoint remote_ep = socket->lowest_layer().remote_endpoint(ec);
         auto session_context = __private::SessionContext{.ssl_context = {socket->native_handle()}};
         asio::co_spawn(*context,
                        session(std::move(socket), context, std::move(session_context), std::move(remote_ep)),
