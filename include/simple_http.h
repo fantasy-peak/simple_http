@@ -251,6 +251,8 @@ inline bool isHttp2(std::string_view cache_data) {
     }
 }
 
+enum class WriteMode : int8_t { More, Last };
+
 struct Disconnect {};
 
 class HttpResponseWriter;
@@ -728,11 +730,11 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
         return false;
     }
 
-    bool writeBody(std::shared_ptr<std::string> data, int32_t stream_id, bool is_last) {
+    bool writeBody(std::shared_ptr<std::string> data, int32_t stream_id, WriteMode write_mode) {
         if (auto sp = m_h2_channel.lock()) {
             std::weak_ptr<Http2Parse> self = shared_from_this();
             asio::post(sp->get_executor(),
-                       [this, self = std::move(self), data = std::move(data), is_last, stream_id]() mutable {
+                       [this, self = std::move(self), data = std::move(data), write_mode, stream_id]() mutable {
                            if (auto sp = self.lock()) {
                                auto* ctx = static_cast<DataContext*>(
                                    nghttp2_session_get_stream_user_data(m_session, stream_id));
@@ -743,7 +745,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
 
                                ctx->queue.push_back(std::move(data));
 
-                               if (is_last) {
+                               if (write_mode == WriteMode::Last) {
                                    ctx->is_finished = true;
                                }
 
@@ -996,22 +998,22 @@ class HttpResponseWriter {
     }
 
     template <typename T>
-    bool writeBody(T&& data, bool is_last = false)
-        requires std::same_as<decltype(is_last), bool>
-    {
+    bool writeBody(T&& data, WriteMode write_mode = WriteMode::More) {
         if (m_version != Version::Http2)
             return false;
         using DecayedT = std::decay_t<T>;
         if constexpr (std::is_same_v<DecayedT, std::shared_ptr<std::string>>) {
-            return m_http2_parse->writeBody(std::forward<T>(data), m_stream_id, is_last);
+            return m_http2_parse->writeBody(std::forward<T>(data), m_stream_id, write_mode);
         } else {
             static_assert(std::is_constructible_v<std::string, T&&>, "T must be convertible to std::string");
-            return m_http2_parse->writeBody(std::make_shared<std::string>(std::forward<T>(data)), m_stream_id, is_last);
+            return m_http2_parse->writeBody(std::make_shared<std::string>(std::forward<T>(data)),
+                                            m_stream_id,
+                                            write_mode);
         }
     }
 
-    bool writeBody(const char* data, std::size_t size, bool is_last = false) {
-        return writeBody(std::make_shared<std::string>(data, size), is_last);
+    bool writeBody(const char* data, std::size_t size, WriteMode write_mode = WriteMode::More) {
+        return writeBody(std::make_shared<std::string>(data, size), write_mode);
     }
 
     template <typename T>
@@ -1019,7 +1021,7 @@ class HttpResponseWriter {
         if (m_version != Version::Http2)
             return false;
         m_write_h2_body_done = true;
-        return writeBody(std::forward<T>(data), true);
+        return writeBody(std::forward<T>(data), WriteMode::Last);
     }
 
     // for http1.1 chunk
