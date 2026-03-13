@@ -1131,6 +1131,10 @@ inline asio::awaitable<void> toSocket(auto socket,
                 auto& info_ptr = std::get<std::shared_ptr<std::string>>(data);
                 vec.emplace_back(std::move(info_ptr));
             }
+            // Let's yield the thread and allow other tasks to execute.
+            if (vec.size() > 100) {
+                break;
+            }
         }
 
         if (vec.empty() && !force_close) {
