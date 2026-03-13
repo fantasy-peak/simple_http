@@ -430,10 +430,35 @@ using SslContextCallback =
 using RequestCallback = std::variant<SimpleCallback, SslContextCallback>;
 
 #ifdef SIMPLE_HTTP_EXPERIMENT_WEBSOCKET
-using WsSocketPtr = std::shared_ptr<websocket::stream<asio::ip::tcp::socket>>;
 using WssSocketPtr = std::shared_ptr<websocket::stream<asio::ssl::stream<asio::ip::tcp::socket>>>;
-using WsCallBack = std::function<asio::awaitable<bool>(const http::request<http::string_body>&, const WsSocketPtr&)>;
-using WssCallBack = std::function<asio::awaitable<bool>(const http::request<http::string_body>&, const WssSocketPtr&)>;
+using WsSocketPtr = std::shared_ptr<websocket::stream<asio::ip::tcp::socket>>;
+
+template <typename SocketPtrType>
+class GenericStream {
+  public:
+    GenericStream(Version version, SocketPtrType stream) : m_version(version), m_stream(std::move(stream)) {
+    }
+
+    auto& stream() {
+        return m_stream;
+    }
+
+    auto version() {
+        return m_version;
+    }
+
+  private:
+    Version m_version;
+    SocketPtrType m_stream;
+};
+
+using WsStream = GenericStream<WsSocketPtr>;
+using WssStream = GenericStream<WssSocketPtr>;
+
+using WsStreamPtr = std::shared_ptr<WsStream>;
+using WssStreamPtr = std::shared_ptr<WssStream>;
+using WsCallBack = std::function<asio::awaitable<bool>(const http::request<http::string_body>&, const WsStreamPtr&)>;
+using WssCallBack = std::function<asio::awaitable<bool>(const http::request<http::string_body>&, const WssStreamPtr&)>;
 using WebSocketCallback = std::variant<WsCallBack, WssCallBack>;
 #endif
 
@@ -1739,13 +1764,15 @@ class HttpServer final {
             auto callback = [](auto& full_req, auto& stream, auto& cb) -> asio::awaitable<void> {
                 try {
                     if constexpr (std::is_same_v<SocketType, asio::ip::tcp::socket>) {
-                        auto ret = co_await std::get<WsCallBack>(cb)(full_req, stream);
+                        std::shared_ptr<WsStream> ptr = std::make_shared<WsStream>(Version::Http11, stream);
+                        auto ret = co_await std::get<WsCallBack>(cb)(full_req, ptr);
                         if (ret) {
                             co_await stream->async_close(websocket::close_code::normal,
                                                          asio::as_tuple(asio::use_awaitable));
                         }
                     } else {
-                        auto ret = co_await std::get<WssCallBack>(cb)(full_req, stream);
+                        auto ptr = std::make_shared<WssStream>(Version::Http11, stream);
+                        auto ret = co_await std::get<WssCallBack>(cb)(full_req, ptr);
                         if (ret) {
                             co_await stream->async_close(websocket::close_code::normal,
                                                          asio::as_tuple(asio::use_awaitable));

@@ -162,10 +162,11 @@ asio::awaitable<void> start() {
 
     hs.setWebsocketHandler("/wss",
                            [](const http::request<http::string_body>& req,
-                              const simple_http::WssSocketPtr& socket) -> asio::awaitable<bool> {
-                               socket->text(true);
+                              const simple_http::WssStreamPtr& wss_socket_ptr) -> asio::awaitable<bool> {
+                               auto& stream = wss_socket_ptr->stream();
+                               stream->text(true);
                                std::string data{"hello world"};
-                               co_await socket->async_write(asio::buffer(data), asio::use_awaitable);
+                               co_await stream->async_write(asio::buffer(data), asio::use_awaitable);
                                co_return true;
                            });
     std::cout << "started http server\n";
