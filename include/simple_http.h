@@ -1077,12 +1077,12 @@ class HttpResponseWriter {
 inline asio::awaitable<void> toSocket(auto socket,
                                       std::shared_ptr<Http2Channel> ch,
                                       std::shared_ptr<std::chrono::steady_clock::time_point> deadline,
-                                      std::chrono::seconds max_idle_time) {
+                                      std::chrono::seconds idle_timeout) {
     std::vector<std::shared_ptr<std::string>> vec;
     bool force_close = false;
     for (;;) {
         while (true) {
-            *deadline = std::chrono::steady_clock::now() + max_idle_time;
+            *deadline = std::chrono::steady_clock::now() + idle_timeout;
             std::variant<std::shared_ptr<std::string>, Disconnect> data;
             if (!ch->try_receive([&](auto, auto recv_data) { data = std::move(recv_data); })) {
                 break;
@@ -1134,10 +1134,10 @@ inline asio::awaitable<void> toSocket(auto socket,
 inline asio::awaitable<void> toH2Parse(auto socket,
                                        auto h2p,
                                        std::shared_ptr<std::chrono::steady_clock::time_point> deadline,
-                                       std::chrono::seconds max_idle_time) {
+                                       std::chrono::seconds idle_timeout) {
     char buffer[READ_SOME_BUFF_LEN];
     for (;;) {
-        *deadline = std::chrono::steady_clock::now() + max_idle_time;
+        *deadline = std::chrono::steady_clock::now() + idle_timeout;
         auto [ec, nread] =
             co_await socket->async_read_some(asio::buffer(buffer, sizeof(buffer)), asio::as_tuple(asio::use_awaitable));
         if (ec) {
@@ -1193,20 +1193,20 @@ struct Config {
     int32_t concurrent_streams{200};
     std::optional<int32_t> window_size;
     std::optional<int32_t> max_frame_size;
-    std::chrono::seconds max_idle_time{120};
+    std::chrono::seconds idle_timeout{120};
     std::string ssl_crt;
     std::string ssl_key;
     bool disable_tls12{true};
-    bool ssl_mutual;
+    bool ssl_mutual{false};
     std::optional<std::string> ssl_ca;
-    std::function<void(asio::ip::tcp::socket&)> set_socket_option;
+    std::function<void(asio::ip::tcp::socket&)> socket_setup_cb;
     bool enable_ipv6{false};
     std::string ipv6_addr{"::1"};
     uint16_t ipv6_port{443};
     std::optional<std::string> unix_socket;
-    std::function<void(asio::ssl::context&)> set_ssl_context;
+    std::function<void(asio::ssl::context&)> ssl_setup_cb;
 #ifdef SIMPLE_HTTP_EXPERIMENT_WEBSOCKET
-    std::function<void(std::variant<WssSocketPtr, WsSocketPtr>)> set_websocket;
+    std::function<void(std::variant<WssSocketPtr, WsSocketPtr>)> websocket_setup_cb;
     bool auto_upgrade_websocket{true};
 #endif
 };
@@ -1365,11 +1365,11 @@ class HttpServer final {
             if (!ec) {
                 SIMPLE_HTTP_DEBUG_LOG("new connection from [{}:{}]", endpoint.address().to_string(), endpoint.port());
             }
-            if (m_cfg.set_socket_option) {
+            if (m_cfg.socket_setup_cb) {
                 try {
-                    m_cfg.set_socket_option(socket);
+                    m_cfg.socket_setup_cb(socket);
                 } catch (const std::exception& e) {
-                    SIMPLE_HTTP_ERROR_LOG("set_socket_option error: {}", e.what());
+                    SIMPLE_HTTP_ERROR_LOG("socket_setup_cb error: {}", e.what());
                 }
             }
             if (!m_ssl_context) {
@@ -1449,8 +1449,8 @@ class HttpServer final {
             throw std::runtime_error(std::format("{} not exist", m_cfg.ssl_key));
         }
 
-        if (m_cfg.set_ssl_context) {
-            m_cfg.set_ssl_context(ssl_context);
+        if (m_cfg.ssl_setup_cb) {
+            m_cfg.ssl_setup_cb(ssl_context);
         } else {
             uint64_t opts =
                 asio::ssl::context::default_workarounds | asio::ssl::context::no_tlsv1 | asio::ssl::context::no_tlsv1_1;
@@ -1544,8 +1544,8 @@ class HttpServer final {
                         h2p->m_session_ctx);
         }
         auto deadline = std::make_shared<std::chrono::steady_clock::time_point>(std::chrono::steady_clock::now());
-        co_await (toH2Parse(socket, h2p, deadline, m_cfg.max_idle_time) ||
-                  toSocket(socket, ch, deadline, m_cfg.max_idle_time) || watchdog(deadline));
+        co_await (toH2Parse(socket, h2p, deadline, m_cfg.idle_timeout) ||
+                  toSocket(socket, ch, deadline, m_cfg.idle_timeout) || watchdog(deadline));
         h2p->disconnect();
         shutdown(socket);
     }
@@ -1578,8 +1578,8 @@ class HttpServer final {
             co_return;
         }
         auto deadline = std::make_shared<std::chrono::steady_clock::time_point>(std::chrono::steady_clock::now());
-        co_await (toH2Parse(socket, h2p, deadline, m_cfg.max_idle_time) ||
-                  toSocket(socket, ch, deadline, m_cfg.max_idle_time) || watchdog(deadline));
+        co_await (toH2Parse(socket, h2p, deadline, m_cfg.idle_timeout) ||
+                  toSocket(socket, ch, deadline, m_cfg.idle_timeout) || watchdog(deadline));
         h2p->disconnect();
         shutdown(socket);
     }
@@ -1590,14 +1590,11 @@ class HttpServer final {
                                       Version version,
                                       std::shared_ptr<__private::SessionContext> session_ctx,
                                       asio::ip::tcp::endpoint endpoint) {
-        auto recv_request = [this, &endpoint](auto socket,
-                                              auto h2p,
-                                              auto deadline,
-                                              auto max_idle_time,
-                                              auto session_ctx) -> asio::awaitable<void> {
+        auto recv_request = [this, &endpoint](auto socket, auto h2p, auto deadline, auto idle_timeout, auto session_ctx)
+            -> asio::awaitable<void> {
             std::vector<std::weak_ptr<HttpRequestReader>> readers;
             for (;;) {
-                *deadline = std::chrono::steady_clock::now() + max_idle_time;
+                *deadline = std::chrono::steady_clock::now() + idle_timeout;
                 beast::flat_buffer buffer;
                 http::request<http::string_body> req;
                 auto [ec, count] = co_await http::async_read(*socket, buffer, req, asio::as_tuple(asio::use_awaitable));
@@ -1621,10 +1618,10 @@ class HttpServer final {
             }
             co_return;
         };
-        auto send_response = [](auto socket, auto http1_ch, Version version, auto deadline, auto max_idle_time)
-            -> asio::awaitable<void> {
+        auto send_response =
+            [](auto socket, auto http1_ch, Version version, auto deadline, auto idle_timeout) -> asio::awaitable<void> {
             for (;;) {
-                *deadline = std::chrono::steady_clock::now() + max_idle_time;
+                *deadline = std::chrono::steady_clock::now() + idle_timeout;
 
                 auto [ec, h1_rsp] = co_await http1_ch->async_receive(asio::as_tuple(asio::use_awaitable));
 
@@ -1656,8 +1653,8 @@ class HttpServer final {
             co_return;
         };
         auto deadline = std::make_shared<std::chrono::steady_clock::time_point>(std::chrono::steady_clock::now());
-        co_await (recv_request(socket, h2p, deadline, m_cfg.max_idle_time, session_ctx) ||
-                  send_response(socket, http1_ch, version, deadline, m_cfg.max_idle_time) || watchdog(deadline));
+        co_await (recv_request(socket, h2p, deadline, m_cfg.idle_timeout, session_ctx) ||
+                  send_response(socket, http1_ch, version, deadline, m_cfg.idle_timeout) || watchdog(deadline));
         shutdown(socket);
         co_return;
     }
@@ -1719,8 +1716,8 @@ class HttpServer final {
             using SocketType = std::decay_t<decltype(*socket)>;
             auto stream = std::make_shared<websocket::stream<SocketType>>(std::move(*socket));
             if (m_cfg.auto_upgrade_websocket) {
-                if (m_cfg.set_websocket) {
-                    m_cfg.set_websocket(stream);
+                if (m_cfg.websocket_setup_cb) {
+                    m_cfg.websocket_setup_cb(stream);
                 }
                 auto [ec] = co_await stream->async_accept(full_req, asio::as_tuple(asio::use_awaitable));
                 if (ec) {

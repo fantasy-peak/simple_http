@@ -32,7 +32,7 @@ asio::awaitable<void> start() {
     simple_http::Config cfg{
         .ip = "0.0.0.0",
         .port = 7788,
-        .worker_num = 8,
+        .worker_num = 4,
         .concurrent_streams = 200,
         .window_size = std::nullopt,
         .max_frame_size = std::nullopt,
@@ -40,7 +40,7 @@ asio::awaitable<void> start() {
         .ssl_key = "./test/tls_certificates/server_key.pem",
         .ssl_mutual = true,
         .ssl_ca = "./test/tls_certificates/ca_cert.pem",
-        .set_socket_option =
+        .socket_setup_cb =
             [](asio::ip::tcp::socket& socket) {
                 // Set socket properties
                 socket.set_option(asio::socket_base::keep_alive(true));
