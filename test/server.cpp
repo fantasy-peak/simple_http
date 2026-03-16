@@ -128,9 +128,12 @@ asio::awaitable<void> start() {
         .setHttpRegexHandler(".*",
                              [](std::shared_ptr<simple_http::HttpRequestReader> reader,
                                 std::shared_ptr<simple_http::HttpResponseWriter> writer) -> asio::awaitable<void> {
-                                 auto res = simple_http::makeHttpResponse(http::status::ok);
-                                 res->body() = "regex matched";
-                                 writer->writeHttpResponse(res);
+                                 // This approach will unify HTTP1.1 and HTTP2 streaming responses.
+                                 writer->writeStatus(200);
+                                 writer->writeHeader("content-type", "text/plain");
+                                 writer->writeStreamHeaderEnd();
+                                 writer->writeStreamBody("regex matched");
+                                 writer->writeStreamEnd();
                                  co_return;
                              });
 

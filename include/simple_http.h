@@ -739,7 +739,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
                                auto* ctx = static_cast<DataContext*>(
                                    nghttp2_session_get_stream_user_data(m_session, stream_id));
                                if (!ctx) {
-                                   SIMPLE_HTTP_ERROR_LOG("not found id: {} cache", stream_id);
+                                   SIMPLE_HTTP_DEBUG_LOG("not found id: {} cache", stream_id);
                                    return;
                                }
 
@@ -918,11 +918,12 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
     }
 
     std::shared_ptr<HttpRequestReader>& getStreamCtx(int32_t stream_id) {
-        if (!m_streams.contains(stream_id)) {
+        auto [it, inserted] = m_streams.try_emplace(stream_id, nullptr);
+        if (inserted) {
             auto ch = std::make_shared<ReaderChannel>(m_io_dispatch->get_executor(), CHANNEL_SIZE);
-            m_streams[stream_id] = std::make_shared<HttpRequestReader>(Version::Http2, std::move(ch), m_endpoint);
+            it->second = std::make_shared<HttpRequestReader>(Version::Http2, std::move(ch), m_endpoint);
         }
-        return m_streams[stream_id];
+        return it->second;
     }
 
     void erase(int32_t stream_id) {
@@ -962,11 +963,13 @@ class HttpResponseWriter {
     }
 
     void writeStatus(int32_t http_status) {
+        m_http_status_code = http_status;
         m_http_status = std::to_string(http_status);
     }
 
     void writeStatus(http::status http_status) {
-        writeStatus(static_cast<int32_t>(http_status));
+        m_http_status_code = static_cast<int32_t>(http_status);
+        writeStatus(m_http_status_code);
     }
 
     template <typename Key, typename Value>
@@ -1097,6 +1100,38 @@ class HttpResponseWriter {
         }
     }
 
+    // for http1.1 and http2 stream
+    bool writeStreamHeaderEnd() {
+        if (m_version == Version::Http2) {
+            return writeHeaderEnd();
+        } else {
+            http::response<http::empty_body> res;
+            res.version(11);
+            res.result(m_http_status_code);
+            for (const auto& [k, v] : m_headers) {
+                res.set(k, v);
+            }
+            return writeChunkHeader(res);
+        }
+    }
+
+    template <typename T>
+    bool writeStreamBody(T&& data) {
+        if (m_version == Version::Http2) {
+            return writeBody(std::forward<T>(data), WriteMode::More);
+        } else {
+            return writeChunkData(std::forward<T>(data));
+        }
+    }
+
+    bool writeStreamEnd() {
+        if (m_version == Version::Http2) {
+            return writeBodyEnd("");
+        } else {
+            return writeChunkEnd();
+        }
+    }
+
     auto version() {
         return m_version;
     }
@@ -1106,6 +1141,7 @@ class HttpResponseWriter {
     int32_t m_stream_id;
     Version m_version;
     std::string m_http_status{"200"};
+    int32_t m_http_status_code{200};
     std::vector<std::tuple<std::string, std::string>> m_headers;
     bool m_write_h2_header_done{false};
     bool m_write_h2_body_done{false};
