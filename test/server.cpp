@@ -1,9 +1,8 @@
-#include <iostream>
 #include <optional>
+#include <print>
 #include <sstream>
 #include <string>
 
-#include <boost/asio.hpp>
 #include <openssl/ssl.h>
 #include <openssl/bio.h>
 #include <openssl/x509.h>
@@ -54,7 +53,7 @@ asio::awaitable<void> start() {
         .websocket_setup_cb = [](auto socket) { std::visit([](auto&& arg) { arg->compress(false); }, socket); },
     };
     simple_http::LOG_CB = [](simple_http::LogLevel level, auto file, auto line, std::string msg) {
-        std::cout << to_string(level) << " " << file << ":" << line << " " << msg << std::endl;
+        std::println("{} {} {} {}", to_string(level), file, line, msg);
     };
     simple_http::HttpServer hs(cfg);
     hs.setHttpHandler("/hello",
@@ -66,18 +65,18 @@ asio::awaitable<void> start() {
                               ss << "   " << name << ": " << value << "\n";
                           }
                           ss << reader->target() << "\n";
-                          std::cout << ss.str() << std::endl;
+                          std::println("{}", ss.str());
                           if (writer->version() == simple_http::Version::Http2) {
                               // for http2 stream recv
                               for (;;) {
                                   auto [ec, data] = co_await reader->asyncReadDataFrame();
                                   if (ec) {
-                                      std::cout << "ec:" << ec.message() << std::endl;
+                                      std::println("{}", ec.message());
                                       co_return;
                                   }
                                   if (std::holds_alternative<std::string>(data)) {
                                       auto& str = std::get<std::string>(data);
-                                      std::cout << "recv h2 data frame:" << str << std::endl;
+                                      std::println("recv h2 data frame:{}", str);
                                   } else if (std::holds_alternative<simple_http::Disconnect>(data)) {
                                       co_return;
                                   } else {
@@ -98,7 +97,7 @@ asio::awaitable<void> start() {
                               writer->writeBodyEnd("789");
                           } else {
                               auto [connected, body] = co_await reader->body();
-                              std::cout << "recv http1 data :" << body.get() << std::endl;
+                              std::println("recv http1 data :", body.get());
                               // curl --no-buffer  -v http://localhost:6666/hello -d "aaaa"
                               http::response<http::empty_body> res{http::status::ok, 11};
                               res.set(http::field::server, "simple_http_server");
@@ -172,7 +171,7 @@ asio::awaitable<void> start() {
                                co_await stream->async_write(asio::buffer(data), asio::use_awaitable);
                                co_return true;
                            });
-    std::cout << "started http server\n";
+    std::println("started http server");
     co_await hs.start();
 }
 
@@ -184,7 +183,7 @@ int main() {
             if (eptr)
                 std::rethrow_exception(eptr);
         } catch (const std::exception& e) {
-            std::cout << "Exception caught by co_spawn handler: " << e.what() << std::endl;
+            std::println("Exception caught by co_spawn handler: {}", e.what());
         }
     });
     while (true)
