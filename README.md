@@ -18,7 +18,7 @@
 
 ## 🚀 Requirements
 
-- **C++20/23/26** compatible compiler (e.g., GCC 13+, Clang 12+).
+- **C++20/23/26** compatible compiler (e.g., GCC 13+, Clang 17+).
 - **xmake**: Used for building examples and dependency management.
 - **Boost** (`beast`)
 - **nghttp2**
@@ -68,21 +68,11 @@ asio::awaitable<void> start() {
     });
     hs.setHttpHandler(
         "/hello", [](auto req, auto writer) -> asio::awaitable<void> {
-            if (writer->version() == simple_http::Version::Http2)
-            {
-#if 0
-                auto res = simple_http::makeHttpResponse(http::status::ok);
-                res->body() = "hello h2";
-                writer->writeHttpResponse(res);
-#else
-                writer->writeHeader("content-type", "text/plain");
-                writer->writeHeader(http::field::server, "test");
-                writer->writeHeaderEnd();
-                writer->writeBody("123");
-                writer->writeBody("456");
-                writer->writeBodyEnd("789");
-#endif
-            }
+            writer->writeStatus(200);
+            writer->writeHeader("content-type", "text/plain");
+            writer->writeStreamHeaderEnd();
+            writer->writeStreamBody("hello world");
+            writer->writeStreamEnd();
             co_return;
         });
     co_await hs.start();

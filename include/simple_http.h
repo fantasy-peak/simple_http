@@ -36,6 +36,27 @@
 #include <boost/beast/websocket/ssl.hpp>
 #endif
 
+#define SIMPLE_HTTP_VERSION_MAJOR 0
+#define SIMPLE_HTTP_VERSION_MINOR 6
+#define SIMPLE_HTTP_VERSION_PATCH 2
+
+#define SIMPLE_HTTP_STR_HELPER(x) #x
+#define SIMPLE_HTTP_STR(x) SIMPLE_HTTP_STR_HELPER(x)
+
+#define SIMPLE_HTTP_VERSION_STR                \
+    SIMPLE_HTTP_STR(SIMPLE_HTTP_VERSION_MAJOR) \
+    "." SIMPLE_HTTP_STR(SIMPLE_HTTP_VERSION_MINOR) "." SIMPLE_HTTP_STR(SIMPLE_HTTP_VERSION_PATCH)
+
+#define SIMPLE_HTTP_VERSION_CODE \
+    ((SIMPLE_HTTP_VERSION_MAJOR) * 10000 + (SIMPLE_HTTP_VERSION_MINOR) * 100 + (SIMPLE_HTTP_VERSION_PATCH))
+
+namespace simple_http {
+inline constexpr int version_major = SIMPLE_HTTP_VERSION_MAJOR;
+inline constexpr int version_minor = SIMPLE_HTTP_VERSION_MINOR;
+inline constexpr int version_patch = SIMPLE_HTTP_VERSION_PATCH;
+inline constexpr std::string_view server_version = "simple_http_server/" SIMPLE_HTTP_VERSION_STR;
+}  // namespace simple_http
+
 namespace __private {
 namespace asio = boost::asio;
 
@@ -69,7 +90,7 @@ inline std::shared_ptr<http::response<http::string_body>> makeHttpResponse(
     auto res = std::make_shared<http::response<http::string_body>>();
     res->version(11);
     res->result(status);
-    res->set(http::field::server, "simple_http_server");
+    res->set(http::field::server, server_version);
     res->set(http::field::content_type, content_type);
     return res;
 }
@@ -527,13 +548,13 @@ struct HandlerFunctions {
              if (writer->version() == simple_http::Version::Http2) {
                  writer->writeStatus(404);
                  writer->writeHeader("content-type", "text/plain");
-                 writer->writeHeader(http::field::server, "simple_http_server");
+                 writer->writeHeader(http::field::server, server_version);
                  writer->writeHeaderEnd();
                  writer->writeBodyEnd("");
              } else {
                  http::response<http::string_body> res{http::status::not_found, 11};
                  res.set(http::field::content_type, "text/plain");
-                 res.set(http::field::server, "simple_http_server");
+                 res.set(http::field::server, server_version);
                  res.body() = "";
                  res.prepare_payload();
                  writer->writeHttpResponse(std::make_shared<http::response<http::string_body>>(res));
@@ -994,7 +1015,7 @@ class HttpResponseWriter {
         static std::string server = http::to_string(http::field::server);
         auto it = std::find_if(m_headers.begin(), m_headers.end(), [&](auto&& p) { return server == std::get<0>(p); });
         if (it == m_headers.end()) {
-            m_headers.emplace_back(server, "simple_http_server");
+            m_headers.emplace_back(server, server_version);
         }
         m_write_h2_header_done = true;
         return m_http2_parse->writeHeaderEnd(std::move(m_headers), m_stream_id, std::move(m_http_status));
