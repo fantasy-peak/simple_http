@@ -3,7 +3,7 @@
 [![CI](https://github.com/fantasy-peak/simple_http/actions/workflows/ci.yaml/badge.svg)](https://github.com/fantasy-peak/simple_http/actions/workflows/ci.yaml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-`simple_http` is a lightweight, high-performance, asynchronous HTTP/1.1 & HTTP/2 server and client library for C++20, built upon Boost.Asio and nghttp2. It is designed as header-only for easy integration and use.
+`simple_http` is a lightweight, high-performance, asynchronous HTTP/1.1 & HTTP/2 server library for C++20, built upon Boost.Asio and nghttp2. It is designed as header-only for easy integration and use.
 
 ## ✨ Features
 

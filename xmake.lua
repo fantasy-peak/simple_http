@@ -37,11 +37,3 @@ target("server")
     set_rundir(".")
 target_end()
 
--- wait refactor client
-target("client")
-    set_kind("binary")
-    add_deps("simple_http")
-    add_defines("_EXPERIMENT_HTTP_CLIENT_")
-    add_files("test/client.cpp")
-    set_rundir(".")
-target_end()
