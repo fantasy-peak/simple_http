@@ -55,6 +55,7 @@ inline constexpr int version_major = SIMPLE_HTTP_VERSION_MAJOR;
 inline constexpr int version_minor = SIMPLE_HTTP_VERSION_MINOR;
 inline constexpr int version_patch = SIMPLE_HTTP_VERSION_PATCH;
 inline constexpr std::string_view server_version = "simple_http_server/" SIMPLE_HTTP_VERSION_STR;
+inline constexpr std::string_view client_version = "simple_http_client/" SIMPLE_HTTP_VERSION_STR;
 }  // namespace simple_http
 
 namespace __private {
@@ -106,6 +107,10 @@ inline std::shared_ptr<http::request<http::string_body>> makeHttpRequest(const s
 
 inline int32_t CHANNEL_SIZE = 100000;
 constexpr int32_t READ_SOME_BUFF_LEN = 4096;
+
+constexpr unsigned char alpn_proto_list[] =
+    "\x02h2"
+    "\x08http/1.1";
 
 inline constexpr std::string_view to_string(LogLevel level) noexcept {
     switch (level) {
@@ -270,6 +275,44 @@ inline bool isHttp2(std::string_view cache_data) {
     } else {
         return false;
     }
+}
+
+inline ssize_t dataReadCallback(nghttp2_session* /* session */,
+                                int32_t /* stream_id */,
+                                uint8_t* buf,
+                                size_t length,
+                                uint32_t* data_flags,
+                                nghttp2_data_source* source,
+                                void* /* user_data */) {
+    auto* ctx = static_cast<DataContext*>(source->ptr);
+    if (!ctx)
+        return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+
+    if (!ctx->queue.empty()) {
+        auto& chunk = *(ctx->queue.front());
+        size_t available = chunk.size() - ctx->offset;
+        size_t to_copy = std::min(length, available);
+
+        memcpy(buf, chunk.data() + ctx->offset, to_copy);
+        ctx->offset += to_copy;
+
+        if (ctx->offset >= chunk.size()) {
+            ctx->queue.pop_front();
+            ctx->offset = 0;
+        }
+
+        return static_cast<ssize_t>(to_copy);
+    }
+
+    if (ctx->is_finished) {
+        *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+        // // *data_flags &= ~NGHTTP2_DATA_FLAG_NO_END_STREAM;
+        // std::cout << "[HTTP2] 流 " << stream_id << " 数据推送完毕，发送 0 字节 END_STREAM" << std::endl;
+
+        return 0;
+    }
+
+    return NGHTTP2_ERR_DEFERRED;
 }
 
 enum class WriteMode : int8_t { More, Last };
@@ -801,44 +844,6 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
         }
         SIMPLE_HTTP_DEBUG_LOG("{}", "writeHttp1Response client disconnect!!!");
         return false;
-    }
-
-    static ssize_t dataReadCallback(nghttp2_session* /* session */,
-                                    int32_t /* stream_id */,
-                                    uint8_t* buf,
-                                    size_t length,
-                                    uint32_t* data_flags,
-                                    nghttp2_data_source* source,
-                                    void* /* user_data */) {
-        auto* ctx = static_cast<DataContext*>(source->ptr);
-        if (!ctx)
-            return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
-
-        if (!ctx->queue.empty()) {
-            auto& chunk = *(ctx->queue.front());
-            size_t available = chunk.size() - ctx->offset;
-            size_t to_copy = std::min(length, available);
-
-            memcpy(buf, chunk.data() + ctx->offset, to_copy);
-            ctx->offset += to_copy;
-
-            if (ctx->offset >= chunk.size()) {
-                ctx->queue.pop_front();
-                ctx->offset = 0;
-            }
-
-            return static_cast<ssize_t>(to_copy);
-        }
-
-        if (ctx->is_finished) {
-            *data_flags |= NGHTTP2_DATA_FLAG_EOF;
-            // // *data_flags &= ~NGHTTP2_DATA_FLAG_NO_END_STREAM;
-            // std::cout << "[HTTP2] 流 " << stream_id << " 数据推送完毕，发送 0 字节 END_STREAM" << std::endl;
-
-            return 0;
-        }
-
-        return NGHTTP2_ERR_DEFERRED;
     }
 
     static int onHeaderCallback(nghttp2_session* /* session */,
@@ -1589,9 +1594,6 @@ class HttpServer final {
                const unsigned char* in,
                unsigned int inlen,
                void* /* arg */) {
-                static const unsigned char alpn_proto_list[] =
-                    "\x02h2"
-                    "\x08http/1.1";
                 if (SSL_select_next_proto(
                         (unsigned char**)out, outlen, alpn_proto_list, sizeof(alpn_proto_list) - 1, in, inlen) !=
                     OPENSSL_NPN_NEGOTIATED) {
@@ -1911,5 +1913,524 @@ class HttpServer final {
     std::shared_ptr<asio::local::stream_protocol::acceptor> m_local_acceptor;
 #endif
 };
+
+#ifdef SIMPLE_HTTP_EXPERIMENT_HTTP2CLIENT
+
+struct HttpRequestWriter final {
+    bool writerBody(std::string data, WriteMode write_mode) {
+        return writerBody(std::make_shared<std::string>(std::move(data)), write_mode);
+    }
+
+    bool writerBody(std::shared_ptr<std::string> data, WriteMode write_mode) {
+        bool is_alive =
+            std::visit([](auto&& weak_ptr_ptr) -> bool { return !weak_ptr_ptr.expired(); }, m_variant_socket);
+        if (is_alive) {
+            m_writer_body(m_stream_id, std::move(data), write_mode);
+            return true;
+        }
+        // disconnect 情况
+        return false;
+    }
+
+    int m_stream_id;
+    Version m_version;
+    std::function<void(int, std::shared_ptr<std::string>, WriteMode)> m_writer_body;
+    std::variant<std::weak_ptr<asio::ssl::stream<asio::ip::tcp::socket>>, std::weak_ptr<asio::ip::tcp::socket>>
+        m_variant_socket;
+};
+
+struct ParseHeaderDone {};
+
+struct HttpResponseReader final {
+    using Channel = asio::experimental::concurrent_channel<
+        void(error_code, std::variant<ParseHeaderDone, Eof, std::shared_ptr<std::string>, Disconnect>)>;
+
+    HttpResponseReader(int stream_id, Version version, std::shared_ptr<Channel> channel)
+        : stream_id(stream_id), m_version(version), m_channel(std::move(channel)) {
+    }
+
+    asio::awaitable<
+        std::tuple<error_code, std::variant<ParseHeaderDone, Eof, std::shared_ptr<std::string>, Disconnect>>>
+    asyncReadDataFrame() {
+        if (!m_channel) {
+            co_return std::make_tuple(make_error_code(boost::asio::error::eof),
+                                      std::variant<ParseHeaderDone, Eof, std::shared_ptr<std::string>, Disconnect>{
+                                          Eof{}});
+        }
+
+        error_code ec;
+        std::variant<ParseHeaderDone, Eof, std::shared_ptr<std::string>, Disconnect> data;
+
+        bool success = m_channel->try_receive([&](auto cb_ec, auto recv_data) {
+            ec = cb_ec;
+            data = std::move(recv_data);
+        });
+        if (success) {
+            co_return std::make_tuple(ec, std::move(data));
+        }
+
+        std::tie(ec, data) = co_await m_channel->async_receive(asio::as_tuple(asio::use_awaitable));
+
+        co_return std::make_tuple(ec, std::move(data));
+    }
+
+    void setMethod(auto method) {
+        m_method = method;
+    }
+
+    void setHeader(std::string name, std::string value) {
+        m_headers.emplace(std::move(name), std::move(value));
+    }
+
+    bool try_send(auto data) {
+        auto ret = m_channel->try_send(boost::system::error_code{}, std::move(data));
+        return ret;
+    }
+
+    auto method() {
+        return m_method;
+    }
+
+    auto version() {
+        return m_version;
+    }
+
+    auto& header() {
+        return m_headers;
+    }
+
+    auto id() {
+        return stream_id;
+    }
+
+  private:
+    int stream_id;
+    Version m_version;
+    std::shared_ptr<Channel> m_channel;
+    http::verb m_method;
+    std::unordered_multimap<std::string, std::string> m_headers;
+    std::string m_body;
+};
+
+struct StreamSpec {
+    http::verb method = http::verb::get;
+    std::string path = "/";
+    std::vector<std::pair<std::string, std::string>> headers;
+};
+
+struct HttpClientConfig {
+    std::string host{"127.0.0.1"};
+    uint16_t port{443};
+
+    int32_t concurrent_streams{200};
+
+    bool use_tls{true};
+    bool verify_peer{true};
+    std::string ssl_ca;
+    std::string ssl_crt;
+    std::string ssl_key;
+
+    std::shared_ptr<asio::ssl::context> ssl_context;
+    std::string tlsext_host_name;
+    std::chrono::seconds idle_timeout{120};
+};
+
+class Http2Client final : public std::enable_shared_from_this<Http2Client> {
+  public:
+    Http2Client(HttpClientConfig cfg, std::shared_ptr<asio::io_context> io_context)
+        : m_cfg(std::move(cfg)), m_io_context(std::move(io_context)) {
+        if (!m_cfg.use_tls) {
+            return;
+        }
+        if (m_cfg.ssl_context) {
+            // Already initialized externally
+            return;
+        }
+        m_cfg.ssl_context = std::make_shared<asio::ssl::context>(asio::ssl::context::tlsv13_client);
+        auto& ssl_context = *m_cfg.ssl_context;
+        ssl_context.set_verify_mode(m_cfg.verify_peer ? asio::ssl::verify_peer : asio::ssl::verify_none);
+        if (!m_cfg.ssl_ca.empty()) {
+            ssl_context.load_verify_file(m_cfg.ssl_ca);
+        } else {
+            ssl_context.set_default_verify_paths();
+        }
+        if (!m_cfg.ssl_crt.empty() && !m_cfg.ssl_key.empty()) {
+            ssl_context.use_certificate_chain_file(m_cfg.ssl_crt);
+            ssl_context.use_private_key_file(m_cfg.ssl_key, asio::ssl::context::pem);
+        }
+        SSL_CTX_set_alpn_protos(ssl_context.native_handle(), alpn_proto_list, sizeof(alpn_proto_list) - 1);
+    }
+
+    ~Http2Client() {
+        std::promise<void> done;
+        asio::dispatch(*m_io_context, [&] {
+            disconnect();
+            if (m_session) {
+                nghttp2_session_callbacks_del(m_cbs);
+                nghttp2_session_del(m_session);
+                m_session = nullptr;
+            }
+            done.set_value();
+        });
+        done.get_future().wait();
+    }
+
+    void disconnect() {
+        asio::dispatch(*m_io_context, [this] {
+            std::visit(
+                [](auto&& weak_ptr_ptr) {
+                    if (auto sp = weak_ptr_ptr.lock()) {
+                        boost::system::error_code ec;
+                        auto& lowest_layer = [&]() -> asio::ip::tcp::socket& {
+                            if constexpr (std::is_same_v<std::decay_t<decltype(*sp)>,
+                                                         asio::ssl::stream<asio::ip::tcp::socket>>) {
+                                return sp->next_layer();
+                            } else {
+                                return *sp;
+                            }
+                        }();
+                        lowest_layer.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
+                        lowest_layer.close(ec);
+                    }
+                },
+                m_variant_socket);
+        });
+    }
+
+    template <asio::completion_token_for<void(std::tuple<bool, std::string>)> CompletionToken>
+    auto asyncStart(std::chrono::seconds timeout, CompletionToken&& token) {
+        return asio::async_initiate<CompletionToken, void(std::tuple<bool, std::string>)>(
+            [this]<typename Handler>(Handler&& handler, auto timeout) mutable {
+                using HandlerType = std::decay_t<Handler>;
+                auto h = std::make_shared<HandlerType>(std::forward<Handler>(handler));
+                asio::co_spawn(
+                    *m_io_context,
+                    [this, h = std::move(h), timeout] -> asio::awaitable<void> {
+                        if (m_session) {
+                            nghttp2_session_callbacks_del(m_cbs);
+                            nghttp2_session_del(m_session);
+                            m_session = nullptr;
+                        }
+                        auto ex = asio::get_associated_executor(*h);
+                        auto solver = asio::ip::tcp::resolver(*m_io_context);
+                        auto [ec, results] = co_await solver.async_resolve(m_cfg.host,
+                                                                           std::to_string(m_cfg.port),
+                                                                           asio::as_tuple(asio::use_awaitable));
+                        if (ec) {
+                            asio::dispatch(ex, [=] { std::move (*h)(std::make_tuple(false, ec.message())); });
+                            co_return;
+                        }
+                        asio::ip::tcp::socket socket(*m_io_context);
+                        asio::steady_timer timer(*m_io_context);
+                        timer.expires_after(timeout);
+                        auto result =
+                            co_await (socket.async_connect(*(results.begin()), asio::as_tuple(asio::use_awaitable)) ||
+                                      timer.async_wait(asio::as_tuple(asio::use_awaitable)));
+                        if (result.index() == 0) {
+                            auto [ec] = std::get<0>(result);
+                            if (ec) {
+                                asio::dispatch(ex, [=] { std::move (*h)(std::make_tuple(false, ec.message())); });
+                                co_return;
+                            }
+                        } else if (result.index() == 1) {
+                            asio::dispatch(ex, [=] {
+                                std::move (*h)(std::make_tuple(false, std::string("async_connect timeout")));
+                            });
+                            co_return;
+                        }
+                        m_send_h2_channel = std::make_shared<Http2Channel>(*m_io_context, CHANNEL_SIZE);
+                        if (m_cfg.use_tls) {
+                            auto socket_ptr =
+                                std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(std::move(socket),
+                                                                                           *m_cfg.ssl_context);
+                            m_variant_socket = socket_ptr;
+                            if (!SSL_set_tlsext_host_name(socket_ptr->native_handle(),
+                                                          m_cfg.tlsext_host_name.empty()
+                                                              ? (void*)m_cfg.host.c_str()
+                                                              : (void*)m_cfg.tlsext_host_name.c_str())) {
+                                ec = boost::system::error_code(static_cast<int>(::ERR_get_error()),
+                                                               asio::error::get_ssl_category());
+                                asio::dispatch(ex, [=] { std::move (*h)(std::make_tuple(false, ec.message())); });
+                                co_return;
+                            }
+
+                            if (auto [ec] = co_await socket_ptr->async_handshake(asio::ssl::stream_base::client,
+                                                                                 asio::as_tuple(asio::use_awaitable));
+                                ec) {
+                                asio::dispatch(ex, [=] { std::move (*h)(std::make_tuple(false, ec.message())); });
+                                co_return;
+                            }
+                            const unsigned char* protocol = nullptr;
+                            unsigned int length = 0;
+
+                            SSL_get0_alpn_selected(socket_ptr->native_handle(), &protocol, &length);
+                            if (length == 2 && std::memcmp(protocol, "h2", 2) == 0) {
+                                initNghttp2AndStart(socket_ptr);
+                                asio::dispatch(ex,
+                                               [=] { std::move (*h)(std::make_tuple(true, std::string{"success"})); });
+                            } else {
+                                asio::dispatch(ex, [=] {
+                                    std::move (*h)(std::make_tuple(false, std::string{"ALPN negotiation failed"}));
+                                });
+                            }
+                        } else {
+                            // for H2C
+                            auto socket_ptr = std::make_shared<asio::ip::tcp::socket>(std::move(socket));
+                            m_variant_socket = socket_ptr;
+                            initNghttp2AndStart(socket_ptr);
+                            asio::dispatch(ex, [=] { std::move (*h)(std::make_tuple(true, std::string{"success"})); });
+                        }
+                    },
+                    asio::detached);
+            },
+            token,
+            timeout);
+    }
+
+    template <asio::completion_token_for<
+        void(std::optional<std::tuple<std::shared_ptr<HttpRequestWriter>, std::shared_ptr<HttpResponseReader>>>)>
+                  CompletionToken>
+    auto openStream(const std::shared_ptr<StreamSpec>& stream_spec, CompletionToken&& token) {
+        std::weak_ptr<Http2Client> self_ptr = shared_from_this();
+        return asio::async_initiate<
+            CompletionToken,
+            void(std::optional<std::tuple<std::shared_ptr<HttpRequestWriter>, std::shared_ptr<HttpResponseReader>>>)>(
+            [this, self_ptr]<typename Handler>(Handler&& handler, auto stream_spec) mutable {
+                using HandlerType = std::decay_t<Handler>;
+                auto h = std::make_shared<HandlerType>(std::forward<Handler>(handler));
+                asio::dispatch(
+                    *m_io_context, [this, self_ptr, stream_spec = std::move(stream_spec), h = std::move(h)]() mutable {
+                        if (auto sp = self_ptr.lock()) {
+                            std::vector<nghttp2_nv> hdrs;
+                            auto fill = [](std::string_view name, std::string_view value, auto& hdrs) {
+                                nghttp2_nv nv;
+                                nv.name = (uint8_t*)name.data();
+                                nv.namelen = name.size();
+                                nv.value = (uint8_t*)value.data();
+                                nv.valuelen = value.size();
+                                nv.flags = NGHTTP2_NV_FLAG_NONE;
+                                hdrs.push_back(nv);
+                            };
+
+                            fill(":path", stream_spec->path, hdrs);
+                            fill(":scheme", m_cfg.use_tls ? "https" : "http", hdrs);
+                            fill(":authority", m_cfg.host, hdrs);
+                            std::string method_str = http::to_string(stream_spec->method);
+                            fill(":method", method_str, hdrs);
+                            fill("user-agent", client_version, hdrs);
+
+                            for (const auto& [k, v] : stream_spec->headers) {
+                                fill(k, v, hdrs);
+                            }
+
+                            auto ex = asio::get_associated_executor(*h);
+
+                            auto* ctx = new DataContext();
+                            nghttp2_data_provider prd;
+                            prd.source.ptr = ctx;
+                            prd.read_callback = dataReadCallback;
+                            int stream_id =
+                                nghttp2_submit_request(m_session, nullptr, hdrs.data(), hdrs.size(), &prd, nullptr);
+                            if (stream_id < 0) {
+                                asio::dispatch(ex, [h = std::move(h)] { std::move (*h)(std::nullopt); });
+                                SIMPLE_HTTP_ERROR_LOG("Failed to submit request: {}", nghttp2_strerror(stream_id));
+                                return;
+                            }
+
+                            nghttp2_session_set_stream_user_data(m_session, stream_id, ctx);
+                            nghttp2_session_send(m_session);
+
+                            auto http_request_writer = std::make_shared<HttpRequestWriter>(
+                                stream_id,
+                                Version::Http2,
+                                [self_ptr](int stream_id, std::shared_ptr<std::string> data, WriteMode write_mode) {
+                                    if (auto sp = self_ptr.lock()) {
+                                        asio::dispatch(*sp->m_io_context,
+                                                       [sp, stream_id, data = std::move(data), write_mode]() mutable {
+                                                           sp->writerBody(stream_id, std::move(data), write_mode);
+                                                       });
+                                    }
+                                },
+                                m_variant_socket);
+                            auto http_response_reader = std::make_shared<HttpResponseReader>(
+                                stream_id,
+                                Version::Http2,
+                                std::make_shared<HttpResponseReader::Channel>(*m_io_context, CHANNEL_SIZE));
+                            m_streams.emplace(stream_id, http_response_reader);
+                            asio::dispatch(ex, [h = std::move(h), http_request_writer, http_response_reader] {
+                                std::move (*h)(std::make_tuple(http_request_writer, http_response_reader));
+                            });
+                        }
+                        return;
+                    });
+            },
+            token,
+            stream_spec);
+    }
+
+    static int onStreamCloseCallback(nghttp2_session* session,
+                                     int32_t stream_id,
+                                     uint32_t /* error_code */,
+                                     void* /* user_data */) {
+        void* ptr = nghttp2_session_get_stream_user_data(session, stream_id);
+        if (ptr) {
+            delete static_cast<DataContext*>(ptr);
+            nghttp2_session_set_stream_user_data(session, stream_id, nullptr);
+        }
+        return 0;
+    }
+
+    static int onHeaderCallback(nghttp2_session* /* session */,
+                                const nghttp2_frame* frame,
+                                const uint8_t* _name,
+                                size_t namelen,
+                                const uint8_t* _value,
+                                size_t valuelen,
+                                uint8_t /* flags */,
+                                void* userdata) {
+        int32_t stream_id = frame->hd.stream_id;
+        auto http2_client = static_cast<Http2Client*>(userdata);
+        auto& http_rsp = http2_client->getStreamCtx(stream_id);
+        std::string name{(char*)_name, namelen};
+        std::string value{(char*)_value, valuelen};
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::tolower(c); });
+        if (name == ":method") {
+            http_rsp->setMethod(http::string_to_verb(value));
+        } else {
+            http_rsp->setHeader(std::move(name), std::move(value));
+        }
+        return 0;
+    }
+
+    static ssize_t sendCallback(nghttp2_session* /* session */,
+                                const uint8_t* data,
+                                size_t length,
+                                int /* flags */,
+                                void* userdata) {
+        auto http2_client = static_cast<Http2Client*>(userdata);
+        if (!http2_client->m_send_h2_channel->try_send(error_code{},
+                                                       std::make_shared<std::string>((char*)data, length))) {
+            SIMPLE_HTTP_ERROR_LOG("{}", "sendCallback send error!!!!");
+        }
+        return length;
+    }
+
+    static int onFrameRecvCallback(nghttp2_session* /* session */, const nghttp2_frame* frame, void* userdata) {
+        int32_t stream_id = frame->hd.stream_id;
+        if (stream_id == 0) {
+            return 0;
+        }
+        auto http2_client = static_cast<Http2Client*>(userdata);
+        const auto& http_rsp_reader = http2_client->getStreamCtx(stream_id);
+        if (frame->hd.type == NGHTTP2_HEADERS && (frame->hd.flags & NGHTTP2_FLAG_END_HEADERS)) {
+            http_rsp_reader->try_send(ParseHeaderDone{});
+        }
+        if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
+            http_rsp_reader->try_send(Eof{});
+            http2_client->erase(stream_id);
+        }
+        return 0;
+    }
+
+    static int onDataChunkRecvCallback(nghttp2_session* /* session */,
+                                       uint8_t /* flags */,
+                                       int32_t stream_id,
+                                       const uint8_t* data,
+                                       size_t len,
+                                       void* userdata) {
+        auto h2_cli = static_cast<Http2Client*>(userdata);
+        auto& http_rsp_reader = h2_cli->getStreamCtx(stream_id);
+        http_rsp_reader->try_send(std::make_shared<std::string>((char*)data, len));
+        return 0;
+    }
+
+    int feedRecvData(const char* data, size_t len) {
+        size_t ret = nghttp2_session_mem_recv(m_session, (const uint8_t*)data, len);
+        if (ret != len) {
+            SIMPLE_HTTP_ERROR_LOG("feedRecvData error: {}", nghttp2_strerror(ret));
+            return -1;
+        }
+        nghttp2_session_send(m_session);
+        return (int)ret;
+    }
+
+  private:
+    void writerBody(int stream_id, std::shared_ptr<std::string> data, WriteMode write_mode) {
+        auto* ctx = static_cast<DataContext*>(nghttp2_session_get_stream_user_data(m_session, stream_id));
+        if (!ctx) {
+            SIMPLE_HTTP_DEBUG_LOG("not found id: {} cache", stream_id);
+            return;
+        }
+        ctx->queue.push_back(std::move(data));
+        if (write_mode == WriteMode::Last) {
+            ctx->is_finished = true;
+        }
+        nghttp2_session_resume_data(m_session, stream_id);
+        nghttp2_session_send(m_session);
+    }
+
+    std::shared_ptr<HttpResponseReader>& getStreamCtx(int32_t stream_id) {
+        auto it = m_streams.find(stream_id);
+        if (it != m_streams.end()) {
+            return it->second;
+        }
+        SIMPLE_HTTP_ERROR_LOG("not found Stream ID: {}", stream_id);
+        std::terminate();
+    }
+
+    void erase(int32_t stream_id) {
+        m_streams.erase(stream_id);
+    }
+
+    void initNghttp2AndStart(auto socket_ptr) {
+        if (m_session) {
+            nghttp2_session_callbacks_del(m_cbs);
+            nghttp2_session_del(m_session);
+            m_session = nullptr;
+        }
+        nghttp2_session_callbacks_new(&m_cbs);
+        nghttp2_session_callbacks_set_on_header_callback(m_cbs, onHeaderCallback);
+        nghttp2_session_callbacks_set_send_callback(m_cbs, sendCallback);
+        nghttp2_session_callbacks_set_on_frame_recv_callback(m_cbs, onFrameRecvCallback);
+        nghttp2_session_callbacks_set_on_data_chunk_recv_callback(m_cbs, onDataChunkRecvCallback);
+        nghttp2_session_callbacks_set_on_stream_close_callback(m_cbs, onStreamCloseCallback);
+
+        nghttp2_session_client_new(&m_session, m_cbs, this);
+
+        std::vector<nghttp2_settings_entry> iv;
+        iv.emplace_back(NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, m_cfg.concurrent_streams);
+
+        nghttp2_submit_settings(m_session, NGHTTP2_FLAG_NONE, iv.data(), iv.size());
+
+        auto func =
+            [](auto socket, auto h2_channel, std::weak_ptr<Http2Client> self, auto timeout) -> asio::awaitable<void> {
+            auto sp = self.lock();
+            auto deadline = std::make_shared<std::chrono::steady_clock::time_point>(std::chrono::steady_clock::now());
+            co_await (toH2Parse(socket, sp, deadline, std::chrono::seconds(timeout)) ||
+                      toSocket(socket, h2_channel, deadline, std::chrono::seconds(timeout)) || watchdog(deadline));
+            // disconnect
+            for (auto& [id, rsp] : sp->m_streams) {
+                rsp->try_send(Disconnect{});
+            }
+            sp->m_streams.clear();
+        };
+        asio::co_spawn(*m_io_context,
+                       func(socket_ptr, m_send_h2_channel, shared_from_this(), m_cfg.idle_timeout),
+                       asio::detached);
+
+        nghttp2_session_send(m_session);
+    }
+
+    HttpClientConfig m_cfg;
+    std::shared_ptr<asio::io_context> m_io_context;
+    std::variant<std::weak_ptr<asio::ssl::stream<asio::ip::tcp::socket>>, std::weak_ptr<asio::ip::tcp::socket>>
+        m_variant_socket;
+    nghttp2_session_callbacks* m_cbs{};
+    nghttp2_session* m_session{};
+    std::unordered_map<int, std::shared_ptr<HttpResponseReader>> m_streams;
+    std::shared_ptr<Http2Channel> m_send_h2_channel;
+};
+
+#endif
 
 }  // namespace simple_http
