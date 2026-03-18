@@ -38,7 +38,7 @@
 
 #define SIMPLE_HTTP_VERSION_MAJOR 0
 #define SIMPLE_HTTP_VERSION_MINOR 6
-#define SIMPLE_HTTP_VERSION_PATCH 2
+#define SIMPLE_HTTP_VERSION_PATCH 3
 
 #define SIMPLE_HTTP_STR_HELPER(x) #x
 #define SIMPLE_HTTP_STR(x) SIMPLE_HTTP_STR_HELPER(x)
@@ -2012,7 +2012,17 @@ struct HttpResponseReader final {
     std::string m_body;
 };
 
-struct StreamSpec {
+class StreamSpec {
+  public:
+    template <typename Key, typename Value>
+    void writeHeader(Key&& key, Value&& value) {
+        if constexpr (std::is_same_v<std::decay_t<Key>, http::field>) {
+            headers.emplace_back(http::to_string(std::forward<Key>(key)), std::forward<Value>(value));
+        } else {
+            headers.emplace_back(std::forward<Key>(key), std::forward<Value>(value));
+        }
+    }
+
     http::verb method = http::verb::get;
     std::string path = "/";
     std::vector<std::pair<std::string, std::string>> headers;

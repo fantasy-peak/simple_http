@@ -5,6 +5,8 @@
 #include "simple_http.h"
 
 namespace asio = boost::asio;
+namespace beast = boost::beast;
+namespace http = beast::http;
 
 // export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 asio::awaitable<void> client(simple_http::IoCtxPool& pool) {
@@ -27,8 +29,8 @@ asio::awaitable<void> client(simple_http::IoCtxPool& pool) {
         std::println("{}", err);
         co_return;
     }
-    std::vector<std::pair<std::string, std::string>> headers{{"test", "hello"}};
-    auto stream_spec = std::make_shared<simple_http::StreamSpec>(simple_http::http::verb::post, "/hello", headers);
+    auto stream_spec = std::make_shared<simple_http::StreamSpec>(http::verb::post, "/hello");
+    stream_spec->writeHeader(http::field::content_type, "text/plain");
     auto opt = co_await client->openStream(stream_spec, asio::use_awaitable);
     if (!opt) {
         co_return;
