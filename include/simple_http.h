@@ -2014,18 +2014,48 @@ struct HttpResponseReader final {
 
 class StreamSpec {
   public:
+    StreamSpec(http::verb method, std::string path) : m_method(method), m_path(std::move(path)) {
+    }
+
     template <typename Key, typename Value>
     void writeHeader(Key&& key, Value&& value) {
         if constexpr (std::is_same_v<std::decay_t<Key>, http::field>) {
-            headers.emplace_back(http::to_string(std::forward<Key>(key)), std::forward<Value>(value));
+            m_headers.emplace_back(http::to_string(std::forward<Key>(key)), std::forward<Value>(value));
         } else {
-            headers.emplace_back(std::forward<Key>(key), std::forward<Value>(value));
+            m_headers.emplace_back(std::forward<Key>(key), std::forward<Value>(value));
         }
     }
 
-    http::verb method = http::verb::get;
-    std::string path = "/";
-    std::vector<std::pair<std::string, std::string>> headers;
+    auto& header() {
+        return m_headers;
+    }
+
+    auto& path() {
+        return m_path;
+    }
+
+    auto& body() {
+        return m_body;
+    }
+
+    auto method() {
+        return m_method;
+    }
+
+    void setEndStreamFlag() {
+        m_end_stream = true;
+    }
+
+    auto getEndStreamFlag() {
+        return m_end_stream;
+    }
+
+  private:
+    http::verb m_method;
+    std::string m_path;
+    std::vector<std::pair<std::string, std::string>> m_headers;
+    std::string m_body;
+    bool m_end_stream{false};
 };
 
 struct HttpClientConfig {
@@ -2222,14 +2252,14 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
                                 hdrs.push_back(nv);
                             };
 
-                            fill(":path", stream_spec->path, hdrs);
+                            fill(":path", stream_spec->path(), hdrs);
                             fill(":scheme", m_cfg.use_tls ? "https" : "http", hdrs);
                             fill(":authority", m_cfg.host, hdrs);
-                            std::string method_str = http::to_string(stream_spec->method);
+                            std::string method_str = http::to_string(stream_spec->method());
                             fill(":method", method_str, hdrs);
                             fill("user-agent", client_version, hdrs);
 
-                            for (const auto& [k, v] : stream_spec->headers) {
+                            for (const auto& [k, v] : stream_spec->header()) {
                                 fill(k, v, hdrs);
                             }
 
@@ -2250,10 +2280,22 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
                             nghttp2_session_set_stream_user_data(m_session, stream_id, ctx);
                             nghttp2_session_send(m_session);
 
+                            auto end_stream = stream_spec->getEndStreamFlag();
+                            const std::string& body_ref = stream_spec->body();
+                            if (end_stream || !body_ref.empty()) {
+                                writerBody(stream_id,
+                                           std::make_shared<std::string>(std::move(stream_spec->body())),
+                                           end_stream ? WriteMode::Last : WriteMode::More);
+                            }
+
                             auto http_request_writer = std::make_shared<HttpRequestWriter>(
                                 stream_id,
                                 Version::Http2,
-                                [self_ptr](int stream_id, std::shared_ptr<std::string> data, WriteMode write_mode) {
+                                [self_ptr,
+                                 end_stream](int stream_id, std::shared_ptr<std::string> data, WriteMode write_mode) {
+                                    if (end_stream) {
+                                        return;
+                                    }
                                     if (auto sp = self_ptr.lock()) {
                                         asio::dispatch(*sp->m_io_context,
                                                        [sp, stream_id, data = std::move(data), write_mode]() mutable {
