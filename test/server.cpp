@@ -29,6 +29,96 @@ auto certificate_subject_name(const X509* x509_cert) -> std::string {
     return std::string(buffer);
 }
 
+asio::awaitable<void> hello(std::shared_ptr<simple_http::HttpRequestReader> reader,
+                            std::shared_ptr<simple_http::HttpResponseWriter> writer) {
+    std::stringstream ss;
+    ss << "Headers:\n";
+    for (auto const& [name, value] : reader->header()) {
+        ss << "   " << name << ": " << value << "\n";
+    }
+    ss << reader->target() << "\n";
+    std::println("{}", ss.str());
+    if (writer->version() == simple_http::Version::Http2) {
+        // for http2 stream recv
+        for (;;) {
+            auto [ec, data] = co_await reader->asyncReadDataFrame();
+            if (ec) {
+                std::println("{}", ec.message());
+                co_return;
+            }
+            if (std::holds_alternative<std::string>(data)) {
+                auto& str = std::get<std::string>(data);
+                std::println("recv h2 data frame:{}", str);
+            } else if (std::holds_alternative<simple_http::Disconnect>(data)) {
+                co_return;
+            } else {
+                break;
+            }
+        }
+
+        writer->writeHeader("content-type", "text/plain");
+        writer->writeHeader(http::field::server, "test");
+        writer->writeHeaderEnd();
+        writer->writeBody("123");
+        asio::steady_timer timer(co_await asio::this_coro::executor);
+        timer.expires_after(std::chrono::seconds(1));
+        co_await timer.async_wait(asio::use_awaitable);
+        writer->writeBody("456");
+        timer.expires_after(std::chrono::seconds(1));
+        co_await timer.async_wait(asio::use_awaitable);
+        writer->writeBodyEnd("789");
+    } else {
+        auto [connected, body] = co_await reader->body();
+        std::println("recv http1 data :", body.get());
+        // curl --no-buffer  -v http://localhost:6666/hello -d "aaaa"
+        http::response<http::empty_body> res{http::status::ok, 11};
+        res.set(http::field::server, "simple_http_server");
+        res.set(http::field::content_type, "text/plain");
+        res.keep_alive(true);
+        writer->writeChunkHeader(res);
+        writer->writeChunkData("123");
+        asio::steady_timer timer(co_await asio::this_coro::executor);
+        timer.expires_after(std::chrono::seconds(1));
+        co_await timer.async_wait(asio::use_awaitable);
+        writer->writeChunkData("456");
+        timer.expires_after(std::chrono::seconds(1));
+        co_await timer.async_wait(asio::use_awaitable);
+        writer->writeChunkEnd();
+    }
+    co_return;
+}
+
+asio::awaitable<void> world(std::shared_ptr<simple_http::HttpRequestReader> reader,
+                            std::shared_ptr<simple_http::HttpResponseWriter> writer) {
+    auto res = simple_http::makeHttpResponse(http::status::ok);
+    res->body() = writer->version() == simple_http::Version::Http2 ? "/world http2 body" : "/world http1.1 body";
+    writer->writeHttpResponse(res);
+    co_return;
+}
+
+asio::awaitable<void> tls(std::shared_ptr<simple_http::HttpRequestReader> reader,
+                          std::shared_ptr<simple_http::HttpResponseWriter> writer,
+                          std::optional<asio::ssl::stream<asio::ip::tcp::socket>::native_handle_type> ssl_ctx) {
+    auto response = simple_http::makeHttpResponse(simple_http::http::status::ok);
+
+    if (ssl_ctx) {
+        const auto& x509_server_ref = SSL_get_certificate(*ssl_ctx);
+        auto server_subject_name = certificate_subject_name(x509_server_ref);
+
+        const auto& x509_client_ref = SSL_get_peer_certificate(*ssl_ctx);
+        auto client_subject_name = certificate_subject_name(x509_client_ref);
+
+        response->body() =
+            std::format("server subject: {}, client subject: {}", server_subject_name, client_subject_name);
+    } else {
+        response->body() = "no TLS!";
+    }
+
+    writer->writeHttpResponse(response);
+
+    co_return;
+}
+
 asio::awaitable<void> start() {
     simple_http::Config cfg{
         .ip = "0.0.0.0",
@@ -56,112 +146,19 @@ asio::awaitable<void> start() {
         std::println("{} {} {} {}", to_string(level), file, line, msg);
     };
     simple_http::HttpServer hs(cfg);
-    hs.setHttpHandler("/hello",
-                      [](std::shared_ptr<simple_http::HttpRequestReader> reader,
-                         std::shared_ptr<simple_http::HttpResponseWriter> writer) -> asio::awaitable<void> {
-                          std::stringstream ss;
-                          ss << "Headers:\n";
-                          for (auto const& [name, value] : reader->header()) {
-                              ss << "   " << name << ": " << value << "\n";
-                          }
-                          ss << reader->target() << "\n";
-                          std::println("{}", ss.str());
-                          if (writer->version() == simple_http::Version::Http2) {
-                              // for http2 stream recv
-                              for (;;) {
-                                  auto [ec, data] = co_await reader->asyncReadDataFrame();
-                                  if (ec) {
-                                      std::println("{}", ec.message());
-                                      co_return;
-                                  }
-                                  if (std::holds_alternative<std::string>(data)) {
-                                      auto& str = std::get<std::string>(data);
-                                      std::println("recv h2 data frame:{}", str);
-                                  } else if (std::holds_alternative<simple_http::Disconnect>(data)) {
-                                      co_return;
-                                  } else {
-                                      break;
-                                  }
-                              }
-
-                              writer->writeHeader("content-type", "text/plain");
-                              writer->writeHeader(http::field::server, "test");
-                              writer->writeHeaderEnd();
-                              writer->writeBody("123");
-                              asio::steady_timer timer(co_await asio::this_coro::executor);
-                              timer.expires_after(std::chrono::seconds(1));
-                              co_await timer.async_wait(asio::use_awaitable);
-                              writer->writeBody("456");
-                              timer.expires_after(std::chrono::seconds(1));
-                              co_await timer.async_wait(asio::use_awaitable);
-                              writer->writeBodyEnd("789");
-                          } else {
-                              auto [connected, body] = co_await reader->body();
-                              std::println("recv http1 data :", body.get());
-                              // curl --no-buffer  -v http://localhost:6666/hello -d "aaaa"
-                              http::response<http::empty_body> res{http::status::ok, 11};
-                              res.set(http::field::server, "simple_http_server");
-                              res.set(http::field::content_type, "text/plain");
-                              res.keep_alive(true);
-                              writer->writeChunkHeader(res);
-                              writer->writeChunkData("123");
-                              asio::steady_timer timer(co_await asio::this_coro::executor);
-                              timer.expires_after(std::chrono::seconds(1));
-                              co_await timer.async_wait(asio::use_awaitable);
-                              writer->writeChunkData("456");
-                              timer.expires_after(std::chrono::seconds(1));
-                              co_await timer.async_wait(asio::use_awaitable);
-                              writer->writeChunkEnd();
-                          }
-                          co_return;
-                      });
-    hs.setHttpHandler("/world",
-                      [](std::shared_ptr<simple_http::HttpRequestReader> reader,
-                         std::shared_ptr<simple_http::HttpResponseWriter> writer) -> asio::awaitable<void> {
-                          auto res = simple_http::makeHttpResponse(http::status::ok);
-                          res->body() = writer->version() == simple_http::Version::Http2 ? "/world http2 body"
-                                                                                         : "/world http1.1 body";
-                          writer->writeHttpResponse(res);
-                          co_return;
-                      })
-        .setHttpRegexHandler(".*",
-                             [](std::shared_ptr<simple_http::HttpRequestReader> reader,
-                                std::shared_ptr<simple_http::HttpResponseWriter> writer) -> asio::awaitable<void> {
-                                 // This approach will unify HTTP1.1 and HTTP2 streaming responses.
-                                 writer->writeStatus(200);
-                                 writer->writeHeader("content-type", "text/plain");
-                                 writer->writeStreamHeaderEnd();
-                                 writer->writeStreamBody("regex matched");
-                                 writer->writeStreamEnd();
-                                 co_return;
-                             });
-
-    hs.setHttpHandler("/tls",
-                      [](std::shared_ptr<simple_http::HttpRequestReader> reader,
-                         std::shared_ptr<simple_http::HttpResponseWriter> writer,
-                         std::optional<asio::ssl::stream<asio::ip::tcp::socket>::native_handle_type> ssl_ctx)
-                          -> asio::awaitable<void> {
-                          auto response = simple_http::makeHttpResponse(simple_http::http::status::ok);
-
-                          if (ssl_ctx) {
-                              const auto& x509_server_ref = SSL_get_certificate(*ssl_ctx);
-                              auto server_subject_name = certificate_subject_name(x509_server_ref);
-
-                              const auto& x509_client_ref = SSL_get_peer_certificate(*ssl_ctx);
-                              auto client_subject_name = certificate_subject_name(x509_client_ref);
-
-                              response->body() = std::format("server subject: {}, client subject: {}",
-                                                             server_subject_name,
-                                                             client_subject_name);
-                          } else {
-                              response->body() = "no TLS!";
-                          }
-
-                          writer->writeHttpResponse(response);
-
-                          co_return;
-                      });
-
+    hs.setHttpHandler("/hello", hello);
+    hs.setHttpHandler("/world", world).setHttpHandler("/tls", tls);
+    hs.setHttpRegexHandler(".*",
+                           [](std::shared_ptr<simple_http::HttpRequestReader> reader,
+                              std::shared_ptr<simple_http::HttpResponseWriter> writer) -> asio::awaitable<void> {
+                               // This approach will unify HTTP1.1 and HTTP2 streaming responses.
+                               writer->writeStatus(200);
+                               writer->writeHeader(http::field::content_type, "text/plain");
+                               writer->writeStreamHeaderEnd();
+                               writer->writeStreamBody("regex matched");
+                               writer->writeStreamEnd();
+                               co_return;
+                           });
     hs.setWebsocketHandler("/wss",
                            [](const http::request<http::string_body>& req,
                               const simple_http::WssStreamPtr& wss_socket_ptr) -> asio::awaitable<bool> {

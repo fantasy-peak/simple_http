@@ -1312,6 +1312,7 @@ struct Config {
     std::function<void(std::variant<WssSocketPtr, WsSocketPtr>)> websocket_setup_cb;
     bool auto_upgrade_websocket{true};
 #endif
+    bool reuse_port{false};
 };
 
 class HttpServer final {
@@ -1427,7 +1428,6 @@ class HttpServer final {
         auto addr = asio::ip::make_address(ip, ec);
         if (ec) {
             SIMPLE_HTTP_ERROR_LOG("make_address: {}", ec.message());
-            throw std::runtime_error(ec.message());
             co_return;
         }
         asio::ip::tcp::endpoint endpoint(addr, port);
@@ -1438,7 +1438,14 @@ class HttpServer final {
             acceptor->set_option(boost::asio::ip::v6_only(true));
         }
         acceptor->set_option(asio::ip::tcp::acceptor::reuse_address(true));
-#ifdef __linux__
+#ifdef SO_REUSEPORT
+        if (m_cfg.reuse_port) {
+            SIMPLE_HTTP_DEBUG_LOG("enable reuse port");
+            acceptor->set_option(asio::detail::socket_option::boolean<SOL_SOCKET, SO_REUSEPORT>(true), ec);
+        }
+#endif
+#ifdef TCP_FASTOPEN
+        SIMPLE_HTTP_DEBUG_LOG("enable fastopen");
         using fast_open = asio::detail::socket_option::integer<IPPROTO_TCP, TCP_FASTOPEN>;
         acceptor->set_option(fast_open(256), ec);
         if (ec) {
@@ -1448,12 +1455,12 @@ class HttpServer final {
         [[maybe_unused]] auto _ = acceptor->bind(endpoint, ec);
         if (ec) {
             SIMPLE_HTTP_ERROR_LOG("bind: {}", ec.message());
-            throw std::runtime_error(ec.message());
+            co_return;
         }
         _ = acceptor->listen(asio::socket_base::max_listen_connections, ec);
         if (ec) {
             SIMPLE_HTTP_ERROR_LOG("listen: {}", ec.message());
-            throw std::runtime_error(ec.message());
+            co_return;
         }
         for (;;) {
             auto& context = m_io_ctx_pool->getIoContextPtr();
@@ -2161,6 +2168,17 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
                             co_return;
                         }
                         asio::ip::tcp::socket socket(*m_io_context);
+                        socket.open(asio::ip::tcp::v4(), ec);
+                        if (ec) {
+                            asio::dispatch(ex, [=] { std::move (*h)(std::make_tuple(false, ec.message())); });
+                            co_return;
+                        }
+#ifdef TCP_FASTOPEN_CONNECT
+                        int value = 1;
+                        socket.set_option(asio::detail::socket_option::integer<IPPROTO_TCP, TCP_FASTOPEN_CONNECT>(
+                                              value),
+                                          ec);
+#endif
                         asio::steady_timer timer(*m_io_context);
                         timer.expires_after(timeout);
                         auto result =

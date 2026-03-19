@@ -68,6 +68,6 @@ int main() {
     pool.start();
     asio::co_spawn(pool.getIoContext(), client(pool), asio::detached);
     while (true)
-        sleep(1000);
+        std::this_thread::sleep_for(std::chrono::seconds(100));
     return 0;
 }
