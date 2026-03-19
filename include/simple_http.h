@@ -627,8 +627,9 @@ asio::awaitable<void> callCallback(std::weak_ptr<HandlerFunctions> hf,
                                    auto writer,
                                    std::shared_ptr<__private::SessionContext> session_ctx) {
     auto sp = hf.lock();
-    if (!sp)
+    if (!sp) [[unlikely]] {
         co_return;
+    }
 
     if (sp->cors) {
         auto it = req->header().find("origin");
@@ -750,100 +751,109 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
     }
 
     bool writeHeaderEnd(auto headers, int32_t stream_id, std::string http_status) {
-        if (auto sp = m_h2_channel.lock()) {
-            std::weak_ptr<Http2Parse> self = shared_from_this();
-            asio::post(sp->get_executor(),
-                       [this,
-                        self = std::move(self),
-                        headers = std::move(headers),
-                        stream_id,
-                        http_status = std::move(http_status)]() mutable {
-                           if (auto sp = self.lock()) {
-                               std::vector<nghttp2_nv> hdrs;
-                               auto fill = [](const auto& name, const auto& value, auto& hdrs) {
-                                   nghttp2_nv nv;
-                                   nv.name = (uint8_t*)name.c_str();
-                                   nv.namelen = name.size();
-                                   nv.value = (uint8_t*)value.c_str();
-                                   nv.valuelen = value.size();
-                                   nv.flags = NGHTTP2_NV_FLAG_NONE;
-                                   hdrs.push_back(nv);
-                               };
-                               static std::string status{":status"};
-                               fill(status, http_status, hdrs);
-                               for (auto& [name, value] : headers) {
-                                   fill(name, value, hdrs);
-                               }
-
-                               auto* ctx = new DataContext();
-                               nghttp2_session_set_stream_user_data(m_session, stream_id, ctx);
-
-                               nghttp2_data_provider prd;
-                               prd.source.ptr = ctx;
-                               prd.read_callback = dataReadCallback;
-
-                               int rv = nghttp2_submit_response(m_session, stream_id, hdrs.data(), hdrs.size(), &prd);
-                               if (rv != 0) {
-                                   SIMPLE_HTTP_ERROR_LOG("Fatal: submit_response failed: {}", nghttp2_strerror(rv));
-                               }
-                               nghttp2_session_send(m_session);
-                           }
-                       });
-            return true;
+        auto sp = m_h2_channel.lock();
+        if (!sp) {
+            return false;
         }
-        return false;
+        std::weak_ptr<Http2Parse> self = shared_from_this();
+        asio::post(sp->get_executor(),
+                   [this,
+                    self = std::move(self),
+                    headers = std::move(headers),
+                    stream_id,
+                    http_status = std::move(http_status)]() mutable {
+                       auto sp = self.lock();
+                       if (!sp) {
+                           return;
+                       }
+                       std::vector<nghttp2_nv> hdrs;
+                       auto fill = [](const auto& name, const auto& value, auto& hdrs) {
+                           nghttp2_nv nv;
+                           nv.name = (uint8_t*)name.c_str();
+                           nv.namelen = name.size();
+                           nv.value = (uint8_t*)value.c_str();
+                           nv.valuelen = value.size();
+                           nv.flags = NGHTTP2_NV_FLAG_NONE;
+                           hdrs.push_back(nv);
+                       };
+                       static std::string status{":status"};
+                       fill(status, http_status, hdrs);
+                       for (auto& [name, value] : headers) {
+                           fill(name, value, hdrs);
+                       }
+
+                       auto* ctx = new DataContext();
+                       nghttp2_session_set_stream_user_data(m_session, stream_id, ctx);
+
+                       nghttp2_data_provider prd;
+                       prd.source.ptr = ctx;
+                       prd.read_callback = dataReadCallback;
+
+                       int rv = nghttp2_submit_response(m_session, stream_id, hdrs.data(), hdrs.size(), &prd);
+                       if (rv != 0) {
+                           SIMPLE_HTTP_ERROR_LOG("Fatal: submit_response failed: {}", nghttp2_strerror(rv));
+                       }
+                       nghttp2_session_send(m_session);
+                   });
+        return true;
     }
 
     bool writeBody(std::shared_ptr<std::string> data, int32_t stream_id, WriteMode write_mode) {
-        if (auto sp = m_h2_channel.lock()) {
-            std::weak_ptr<Http2Parse> self = shared_from_this();
-            asio::post(sp->get_executor(),
-                       [this, self = std::move(self), data = std::move(data), write_mode, stream_id]() mutable {
-                           if (auto sp = self.lock()) {
-                               auto* ctx = static_cast<DataContext*>(
-                                   nghttp2_session_get_stream_user_data(m_session, stream_id));
-                               if (!ctx) {
-                                   SIMPLE_HTTP_DEBUG_LOG("not found id: {} cache", stream_id);
-                                   return;
-                               }
-
-                               ctx->queue.push_back(std::move(data));
-
-                               if (write_mode == WriteMode::Last) {
-                                   ctx->is_finished = true;
-                               }
-
-                               nghttp2_session_resume_data(m_session, stream_id);
-                               nghttp2_session_send(m_session);
-                           }
-                       });
-            return true;
+        auto sp = m_h2_channel.lock();
+        if (!sp) {
+            return false;
         }
-        return false;
+        std::weak_ptr<Http2Parse> self = shared_from_this();
+        asio::post(sp->get_executor(),
+                   [this, self = std::move(self), data = std::move(data), write_mode, stream_id]() mutable {
+                       auto sp = self.lock();
+                       if (!sp) {
+                           return;
+                       }
+
+                       auto* ctx =
+                           static_cast<DataContext*>(nghttp2_session_get_stream_user_data(m_session, stream_id));
+                       if (!ctx) {
+                           SIMPLE_HTTP_DEBUG_LOG("not found id: {} cache", stream_id);
+                           return;
+                       }
+
+                       ctx->queue.push_back(std::move(data));
+
+                       if (write_mode == WriteMode::Last) {
+                           ctx->is_finished = true;
+                       }
+
+                       nghttp2_session_resume_data(m_session, stream_id);
+                       nghttp2_session_send(m_session);
+                   });
+        return true;
     }
 
     bool writeChunkData(std::string data) {
-        if (auto sp = m_h1_channel.lock()) {
-            if (!sp->try_send(error_code{}, std::move(data))) {
-                SIMPLE_HTTP_ERROR_LOG("writeChunkData error");
-                return false;
-            }
-            return true;
+        auto sp = m_h1_channel.lock();
+        if (!sp) {
+            return false;
         }
-        return false;
+        if (!sp->try_send(error_code{}, std::move(data))) {
+            SIMPLE_HTTP_ERROR_LOG("writeChunkData error");
+            return false;
+        }
+        return true;
     }
 
     bool writeHttp1Response(const std::shared_ptr<http::response<http::string_body>>& http_1_response) {
-        if (auto sp = m_h1_channel.lock()) {
-            http_1_response->prepare_payload();
-            if (!sp->try_send(error_code{}, http_1_response)) {
-                SIMPLE_HTTP_ERROR_LOG("{}", "writeHttp1Response error");
-                return false;
-            }
-            return true;
+        auto sp = m_h1_channel.lock();
+        if (!sp) {
+            SIMPLE_HTTP_DEBUG_LOG("{}", "writeHttp1Response client disconnect!!!");
+            return false;
         }
-        SIMPLE_HTTP_DEBUG_LOG("{}", "writeHttp1Response client disconnect!!!");
-        return false;
+        http_1_response->prepare_payload();
+        if (!sp->try_send(error_code{}, http_1_response)) {
+            SIMPLE_HTTP_ERROR_LOG("{}", "writeHttp1Response error");
+            return false;
+        }
+        return true;
     }
 
     static int onHeaderCallback(nghttp2_session* /* session */,
@@ -1092,11 +1102,8 @@ class HttpResponseWriter {
     }
 
     bool connected() {
-        if (m_version == Version::Http2) {
-            return m_http2_parse->m_h2_channel.lock() ? true : false;
-        } else {
-            return m_http2_parse->m_h1_channel.lock() ? true : false;
-        }
+        return (m_version == Version::Http2) ? !m_http2_parse->m_h2_channel.expired()
+                                             : !m_http2_parse->m_h1_channel.expired();
     }
 
     void forceClose() {
