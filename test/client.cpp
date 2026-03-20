@@ -67,7 +67,7 @@ asio::awaitable<void> client(simple_http::IoCtxPool& pool) {
         }
     }
 
-    stream_spec.reset();
+    client.reset();
     std::println("done");
     co_return;
 }

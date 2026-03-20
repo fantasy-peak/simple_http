@@ -1115,8 +1115,7 @@ class HttpResponseWriter {
     }
 
     bool writeChunkEnd() {
-        static std::string close_stream{"0\r\n\r\n"};
-        return m_http2_parse->writeChunkData(close_stream);
+        return m_http2_parse->writeChunkData("0\r\n\r\n");
     }
 
     bool connected() {
@@ -1202,7 +1201,7 @@ inline asio::awaitable<void> toSocket(auto socket,
                                       std::shared_ptr<Http2Channel> ch,
                                       std::shared_ptr<std::chrono::steady_clock::time_point> deadline,
                                       std::chrono::seconds idle_timeout) {
-    std::vector<std::shared_ptr<std::string>> vec;
+    std::vector<std::unique_ptr<std::string>> vec;
     bool force_close = false;
     for (;;) {
         while (true) {
@@ -2292,9 +2291,18 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
                             fillH2Header(":authority", m_cfg.host, hdrs);
                             std::string method_str = http::to_string(stream_spec->method());
                             fillH2Header(":method", method_str, hdrs);
-                            fillH2Header("user-agent", client_version, hdrs);
-                            for (const auto& [k, v] : stream_spec->header()) {
+                            bool has_user_agent = false;
+                            for (auto& [k, v] : stream_spec->header()) {
+                                std::transform(k.begin(), k.end(), k.begin(), [](unsigned char c) {
+                                    return tolower(c);
+                                });
+                                if (k == "user-agent") {
+                                    has_user_agent = true;
+                                }
                                 fillH2Header(k, v, hdrs);
+                            }
+                            if (!has_user_agent) {
+                                fillH2Header("user-agent", client_version, hdrs);
                             }
 
                             auto ex = asio::get_associated_executor(*h);
@@ -2303,7 +2311,7 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
                             nghttp2_data_provider prd;
                             prd.source.ptr = ctx;
                             prd.read_callback = dataReadCallback;
-                            int stream_id =
+                            int32_t stream_id =
                                 nghttp2_submit_request(m_session, nullptr, hdrs.data(), hdrs.size(), &prd, nullptr);
                             if (stream_id < 0) {
                                 asio::dispatch(ex, [h = std::move(h)] { std::move (*h)(std::nullopt); });

@@ -62,7 +62,7 @@ asio::awaitable<void> hello(std::shared_ptr<simple_http::HttpRequestReader> read
         }
 
         writer->writeHeader("content-type", "text/plain");
-        writer->writeHeader(http::field::server, "test");
+        writer->writeHeader(http::field::server, simple_http::server_version);
         writer->writeHeaderEnd();
         writer->writeBody("123");
         asio::steady_timer timer(co_await asio::this_coro::executor);
@@ -77,7 +77,7 @@ asio::awaitable<void> hello(std::shared_ptr<simple_http::HttpRequestReader> read
         std::println("recv http1 data :", body.get());
         // curl --no-buffer  -v http://localhost:6666/hello -d "aaaa"
         http::response<http::empty_body> res{http::status::ok, 11};
-        res.set(http::field::server, "simple_http_server");
+        res.set(http::field::server, simple_http::server_version);
         res.set(http::field::content_type, "text/plain");
         res.keep_alive(true);
         writer->writeChunkHeader(res);
