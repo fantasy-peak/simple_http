@@ -2180,8 +2180,10 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
                             asio::dispatch(ex, [=] { std::move (*h)(std::make_tuple(false, ec.message())); });
                             co_return;
                         }
+                        auto target_endpoint = results.begin()->endpoint();
+                        auto protocol = target_endpoint.protocol();
                         asio::ip::tcp::socket socket(*m_io_context);
-                        socket.open(asio::ip::tcp::v4(), ec);
+                        socket.open(protocol, ec);
                         if (ec) {
                             asio::dispatch(ex, [=] { std::move (*h)(std::make_tuple(false, ec.message())); });
                             co_return;
@@ -2195,7 +2197,7 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
                         asio::steady_timer timer(*m_io_context);
                         timer.expires_after(timeout);
                         auto result =
-                            co_await (socket.async_connect(*(results.begin()), asio::as_tuple(asio::use_awaitable)) ||
+                            co_await (socket.async_connect(target_endpoint, asio::as_tuple(asio::use_awaitable)) ||
                                       timer.async_wait(asio::as_tuple(asio::use_awaitable)));
                         if (result.index() == 0) {
                             auto [ec] = std::get<0>(result);
