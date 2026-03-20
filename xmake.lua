@@ -14,7 +14,7 @@ set_policy("package.requires_lock", true)
 set_policy("package.librarydeps.strict_compatibility", true)
 
 -- PACKAGES --
-add_requires("boost", {configs = {asio=true}})
+add_requires("boost", {configs = {asio=true, regex=true}})
 add_requires("nghttp2")
 add_requires("openssl3")
 
@@ -32,7 +32,7 @@ target_end()
 target("server")
     set_kind("binary")
     add_deps("simple_http")
-    add_defines("SIMPLE_HTTP_EXPERIMENT_WEBSOCKET")
+    add_defines("SIMPLE_HTTP_EXPERIMENT_WEBSOCKET", "SIMPLE_HTTP_USE_BOOST_REGEX")
     add_files("test/server.cpp")
     set_rundir(".")
 target_end()

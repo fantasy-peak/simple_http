@@ -14,7 +14,11 @@
 #include <list>
 #include <memory>
 #include <optional>
+#ifdef SIMPLE_HTTP_USE_BOOST_REGEX
+#include <boost/regex.hpp>
+#else
 #include <regex>
+#endif
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -72,6 +76,12 @@ namespace asio = boost::asio;
 namespace beast = boost::beast;
 namespace http = beast::http;
 namespace websocket = beast::websocket;
+
+#ifdef SIMPLE_HTTP_USE_BOOST_REGEX
+namespace regex_adapter = boost;
+#else
+namespace regex_adapter = std;
+#endif
 
 enum class LogLevel : uint8_t {
     Debug,
@@ -568,7 +578,7 @@ struct HandlerFunctions {
 
     void setWebsocketRegexHandler(const std::string& regex, WebSocketCallback cb) {
         try {
-            ws_regex_proc.emplace_back(std::regex{regex}, std::move(cb));
+            ws_regex_proc.emplace_back(regex_adapter::regex{regex}, std::move(cb));
         } catch (const std::exception& e) {
             SIMPLE_HTTP_ERROR_LOG("regex:[{}], {}", regex, e.what());
         }
@@ -577,7 +587,7 @@ struct HandlerFunctions {
 
     void setHttpRegexHandler(const std::string& regex, RequestCallback cb) {
         try {
-            regex_proc.emplace_back(std::regex{regex}, std::move(cb));
+            regex_proc.emplace_back(regex_adapter::regex{regex}, std::move(cb));
         } catch (const std::exception& e) {
             SIMPLE_HTTP_ERROR_LOG("regex:[{}], {}", regex, e.what());
         }
@@ -622,9 +632,9 @@ struct HandlerFunctions {
              }
              co_return;
          }}};
-    std::vector<std::pair<std::regex, RequestCallback>> regex_proc;
+    std::vector<std::pair<regex_adapter::regex, RequestCallback>> regex_proc;
 #ifdef SIMPLE_HTTP_EXPERIMENT_WEBSOCKET
-    std::vector<std::pair<std::regex, WebSocketCallback>> ws_regex_proc;
+    std::vector<std::pair<regex_adapter::regex, WebSocketCallback>> ws_regex_proc;
     std::unordered_map<std::string, WebSocketCallback, string_hash, std::equal_to<>> websocket_map_proc;
 #endif
 };
@@ -669,7 +679,7 @@ asio::awaitable<void> callCallback(std::weak_ptr<HandlerFunctions> hf,
     } else {
         for (const auto& [pattern, cb] : sp->regex_proc) {
             std::string str{path};
-            if (std::regex_match(str, pattern)) {
+            if (regex_adapter::regex_match(str, pattern)) {
                 co_await runCallBack(&cb, std::move(req), std::move(writer), session_ctx);
                 co_return;
             }
@@ -1879,7 +1889,7 @@ class HttpServer final {
             } else {
                 for (const auto& [pattern, cb] : m_handler_functions->ws_regex_proc) {
                     std::string str{path};
-                    if (std::regex_match(str, pattern)) {
+                    if (regex_adapter::regex_match(str, pattern)) {
                         co_await callback(full_req, stream, cb);
                         break;
                     }
