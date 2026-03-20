@@ -77,6 +77,9 @@ namespace beast = boost::beast;
 namespace http = beast::http;
 namespace websocket = beast::websocket;
 
+using error_code = boost::system::error_code;
+using namespace boost::asio::experimental::awaitable_operators;
+
 #ifdef SIMPLE_HTTP_USE_BOOST_REGEX
 namespace regex_adapter = boost;
 #else
@@ -161,9 +164,6 @@ inline void log(LogLevel level, std::string_view file, int line, std::format_str
     LOG_CB(level, file, line, std::format(fmt, std::forward<Args>(args)...));
 }
 
-using error_code = boost::system::error_code;
-using namespace boost::asio::experimental::awaitable_operators;
-
 class IoCtxPool final {
   public:
     IoCtxPool(std::size_t pool_size) : m_next_io_context(0), m_pool_size(pool_size) {
@@ -218,20 +218,6 @@ class IoCtxPool final {
     std::atomic_uint64_t m_next_io_context;
     std::vector<std::thread> m_threads;
     uint64_t m_pool_size;
-};
-
-struct DataContext {
-    std::deque<std::shared_ptr<std::string>> queue;
-    size_t offset = 0;
-    size_t total_buffered = 0;
-    bool is_finished = false;
-};
-
-struct CliDataContext {
-    const char* data;
-    size_t total_len;
-    size_t offset;
-    std::shared_ptr<void> input_data{nullptr};
 };
 
 constexpr char base64_url_alphabet[] = {'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P',
@@ -303,6 +289,20 @@ inline void fillH2Header(std::string_view name, std::string_view value, std::vec
     return;
 }
 
+struct DataContext {
+    std::deque<std::shared_ptr<std::string>> queue;
+    size_t offset = 0;
+    size_t total_buffered = 0;
+    bool is_finished = false;
+};
+
+struct CliDataContext {
+    const char* data;
+    size_t total_len;
+    size_t offset;
+    std::shared_ptr<void> input_data{nullptr};
+};
+
 inline ssize_t dataReadCallback(nghttp2_session* /* session */,
                                 int32_t /* stream_id */,
                                 uint8_t* buf,
@@ -343,9 +343,12 @@ inline ssize_t dataReadCallback(nghttp2_session* /* session */,
 
 enum class WriteMode : int8_t { More, Last };
 
+struct Eof {};
+
 struct Disconnect {};
 
 class HttpResponseWriter;
+class HttpRequestReader;
 
 using Http1Channel = asio::experimental::concurrent_channel<
     void(error_code, std::variant<std::shared_ptr<http::response<http::string_body>>, std::string, Disconnect>)>;
@@ -353,11 +356,52 @@ using Http1Channel = asio::experimental::concurrent_channel<
 using Http2Channel =
     asio::experimental::concurrent_channel<void(error_code, std::variant<std::unique_ptr<std::string>, Disconnect>)>;
 
-struct Eof {};
-
 using ReaderChannel =
     asio::experimental::concurrent_channel<void(error_code,
                                                 std::variant<std::unique_ptr<std::string>, Eof, Disconnect>)>;
+
+using SimpleCallback =
+    std::function<asio::awaitable<void>(std::shared_ptr<HttpRequestReader>, std::shared_ptr<HttpResponseWriter>)>;
+
+using SslContextCallback =
+    std::function<asio::awaitable<void>(std::shared_ptr<HttpRequestReader>,
+                                        std::shared_ptr<HttpResponseWriter>,
+                                        std::optional<asio::ssl::stream<asio::ip::tcp::socket>::native_handle_type>)>;
+
+using RequestCallback = std::variant<SimpleCallback, SslContextCallback>;
+
+#ifdef SIMPLE_HTTP_EXPERIMENT_WEBSOCKET
+using WssSocketPtr = std::shared_ptr<websocket::stream<asio::ssl::stream<asio::ip::tcp::socket>>>;
+using WsSocketPtr = std::shared_ptr<websocket::stream<asio::ip::tcp::socket>>;
+
+template <typename SocketPtrType>
+class GenericStream {
+  public:
+    GenericStream(Version version, SocketPtrType stream) : m_version(version), m_stream(std::move(stream)) {
+    }
+
+    auto& stream() {
+        return m_stream;
+    }
+
+    auto version() {
+        return m_version;
+    }
+
+  private:
+    Version m_version;
+    SocketPtrType m_stream;
+};
+
+using WsStream = GenericStream<WsSocketPtr>;
+using WssStream = GenericStream<WssSocketPtr>;
+
+using WsStreamPtr = std::shared_ptr<WsStream>;
+using WssStreamPtr = std::shared_ptr<WssStream>;
+using WsCallBack = std::function<asio::awaitable<bool>(const http::request<http::string_body>&, const WsStreamPtr&)>;
+using WssCallBack = std::function<asio::awaitable<bool>(const http::request<http::string_body>&, const WssStreamPtr&)>;
+using WebSocketCallback = std::variant<WsCallBack, WssCallBack>;
+#endif
 
 class HttpRequestReader {
   public:
@@ -513,49 +557,6 @@ class HttpRequestReader {
     asio::ip::tcp::endpoint m_client_endpoint;
 };
 
-using SimpleCallback =
-    std::function<asio::awaitable<void>(std::shared_ptr<HttpRequestReader>, std::shared_ptr<HttpResponseWriter>)>;
-
-using SslContextCallback =
-    std::function<asio::awaitable<void>(std::shared_ptr<HttpRequestReader>,
-                                        std::shared_ptr<HttpResponseWriter>,
-                                        std::optional<asio::ssl::stream<asio::ip::tcp::socket>::native_handle_type>)>;
-
-using RequestCallback = std::variant<SimpleCallback, SslContextCallback>;
-
-#ifdef SIMPLE_HTTP_EXPERIMENT_WEBSOCKET
-using WssSocketPtr = std::shared_ptr<websocket::stream<asio::ssl::stream<asio::ip::tcp::socket>>>;
-using WsSocketPtr = std::shared_ptr<websocket::stream<asio::ip::tcp::socket>>;
-
-template <typename SocketPtrType>
-class GenericStream {
-  public:
-    GenericStream(Version version, SocketPtrType stream) : m_version(version), m_stream(std::move(stream)) {
-    }
-
-    auto& stream() {
-        return m_stream;
-    }
-
-    auto version() {
-        return m_version;
-    }
-
-  private:
-    Version m_version;
-    SocketPtrType m_stream;
-};
-
-using WsStream = GenericStream<WsSocketPtr>;
-using WssStream = GenericStream<WssSocketPtr>;
-
-using WsStreamPtr = std::shared_ptr<WsStream>;
-using WssStreamPtr = std::shared_ptr<WssStream>;
-using WsCallBack = std::function<asio::awaitable<bool>(const http::request<http::string_body>&, const WsStreamPtr&)>;
-using WssCallBack = std::function<asio::awaitable<bool>(const http::request<http::string_body>&, const WssStreamPtr&)>;
-using WebSocketCallback = std::variant<WsCallBack, WssCallBack>;
-#endif
-
 struct HandlerFunctions {
     void setBefore(std::function<asio::awaitable<bool>(const std::shared_ptr<HttpRequestReader>&,
                                                        const std::shared_ptr<HttpResponseWriter>&)> cb) {
@@ -627,7 +628,6 @@ struct HandlerFunctions {
                  res.set(http::field::content_type, "text/plain");
                  res.set(http::field::server, server_version);
                  res.body() = "";
-                 res.prepare_payload();
                  writer->writeHttpResponse(std::make_shared<http::response<http::string_body>>(res));
              }
              co_return;
@@ -639,21 +639,22 @@ struct HandlerFunctions {
 #endif
 };
 
-inline auto runCallBack(const RequestCallback* entry,
-                        auto req,
-                        auto writer,
-                        std::shared_ptr<__private::SessionContext> session_context) -> asio::awaitable<void> {
+inline asio::awaitable<void> runCallBack(const RequestCallback* entry,
+                                         std::shared_ptr<HttpRequestReader> req,
+                                         std::shared_ptr<HttpResponseWriter> writer,
+                                         std::shared_ptr<__private::SessionContext> session_context) {
     if (auto simple_cb = std::get_if<SimpleCallback>(entry)) {
         co_await (*simple_cb)(std::move(req), std::move(writer));
     } else if (auto ssl_ctx_cb = std::get_if<SslContextCallback>(entry)) {
         co_await (*ssl_ctx_cb)(std::move(req), std::move(writer), session_context->ssl_context);
     }
+    co_return;
 }
 
-asio::awaitable<void> callCallback(std::weak_ptr<HandlerFunctions> hf,
-                                   std::shared_ptr<HttpRequestReader> req,
-                                   auto writer,
-                                   std::shared_ptr<__private::SessionContext> session_ctx) {
+inline asio::awaitable<void> callCallback(std::weak_ptr<HandlerFunctions> hf,
+                                          std::shared_ptr<HttpRequestReader> req,
+                                          std::shared_ptr<HttpResponseWriter> writer,
+                                          std::shared_ptr<__private::SessionContext> session_ctx) {
     auto sp = hf.lock();
     if (!sp) [[unlikely]] {
         co_return;
@@ -690,9 +691,9 @@ asio::awaitable<void> callCallback(std::weak_ptr<HandlerFunctions> hf,
 }
 
 inline void callHandler(const std::weak_ptr<HandlerFunctions>& hf,
-                        auto& io_dispatch,
+                        asio::io_context& io_dispatch,
                         std::shared_ptr<HttpRequestReader> req,
-                        auto writer,
+                        std::shared_ptr<HttpResponseWriter> writer,
                         std::shared_ptr<__private::SessionContext> session_context) {
     asio::co_spawn(io_dispatch,
                    callCallback(hf, std::move(req), std::move(writer), std::move(session_context)),
@@ -1197,7 +1198,8 @@ class HttpResponseWriter {
     bool m_write_h2_body_done{false};
 };
 
-inline asio::awaitable<void> toSocket(auto socket,
+template <typename AsyncStream>
+inline asio::awaitable<void> toSocket(AsyncStream socket,
                                       std::shared_ptr<Http2Channel> ch,
                                       std::shared_ptr<std::chrono::steady_clock::time_point> deadline,
                                       std::chrono::seconds idle_timeout) {
@@ -1258,8 +1260,9 @@ inline asio::awaitable<void> toSocket(auto socket,
     co_return;
 }
 
-inline asio::awaitable<void> toH2Parse(auto socket,
-                                       auto h2p,
+template <typename AsyncStream, typename H2Parser>
+inline asio::awaitable<void> toH2Parse(AsyncStream socket,
+                                       H2Parser h2p,
                                        std::shared_ptr<std::chrono::steady_clock::time_point> deadline,
                                        std::chrono::seconds idle_timeout) {
     char buffer[READ_SOME_BUFF_LEN];
@@ -1443,495 +1446,40 @@ class HttpServer final {
     }
 
   private:
-    asio::awaitable<void> startAcceptor(const std::string& ip, uint16_t port, bool is_v6 = false) {
-        if (ip.empty()) {
-            co_return;
-        }
-        SIMPLE_HTTP_INFO_LOG("listen {}:{}, is_v6: {}", ip, port, is_v6);
-        error_code ec;
-        auto addr = asio::ip::make_address(ip, ec);
-        if (ec) {
-            SIMPLE_HTTP_ERROR_LOG("make_address: {}", ec.message());
-            co_return;
-        }
-        asio::ip::tcp::endpoint endpoint(addr, port);
-        auto acceptor = std::make_shared<asio::ip::tcp::acceptor>(*m_io_ctx_pool->getMainContext());
-        m_acceptors.emplace_back(acceptor);
-        acceptor->open(endpoint.protocol());
-        if (is_v6) {
-            acceptor->set_option(boost::asio::ip::v6_only(true));
-        }
-        acceptor->set_option(asio::ip::tcp::acceptor::reuse_address(true));
-#ifdef SO_REUSEPORT
-        if (m_cfg.reuse_port) {
-            SIMPLE_HTTP_DEBUG_LOG("enable reuse port");
-            acceptor->set_option(asio::detail::socket_option::boolean<SOL_SOCKET, SO_REUSEPORT>(true), ec);
-        }
-#endif
-#ifdef TCP_FASTOPEN
-        SIMPLE_HTTP_DEBUG_LOG("enable fastopen");
-        using fast_open = asio::detail::socket_option::integer<IPPROTO_TCP, TCP_FASTOPEN>;
-        acceptor->set_option(fast_open(256), ec);
-        if (ec) {
-            SIMPLE_HTTP_ERROR_LOG("fast_open error: {}", ec.message());
-        }
-#endif
-        [[maybe_unused]] auto _ = acceptor->bind(endpoint, ec);
-        if (ec) {
-            SIMPLE_HTTP_ERROR_LOG("bind: {}", ec.message());
-            co_return;
-        }
-        _ = acceptor->listen(asio::socket_base::max_listen_connections, ec);
-        if (ec) {
-            SIMPLE_HTTP_ERROR_LOG("listen: {}", ec.message());
-            co_return;
-        }
-        for (;;) {
-            auto& context = m_io_ctx_pool->getIoContextPtr();
-            asio::ip::tcp::socket socket(*context);
-            auto [ec] = co_await acceptor->async_accept(socket, asio::as_tuple(asio::use_awaitable));
-            if (ec) {
-                if (ec == asio::error::operation_aborted)
-                    break;
-                continue;
-            }
-            auto remote_ep = socket.remote_endpoint(ec);
-            if (!ec) {
-                SIMPLE_HTTP_DEBUG_LOG("new connection from [{}:{}]", remote_ep.address().to_string(), remote_ep.port());
-            }
-            if (m_cfg.socket_setup_cb) {
-                try {
-                    m_cfg.socket_setup_cb(socket);
-                } catch (const std::exception& e) {
-                    SIMPLE_HTTP_ERROR_LOG("socket_setup_cb error: {}", e.what());
-                }
-            }
-            if (!m_ssl_context) {
-                auto session_socket = std::make_shared<asio::ip::tcp::socket>(std::move(socket));
-                asio::co_spawn(
-                    *context,
-                    session(std::move(session_socket), context, __private::SessionContext{}, std::move(remote_ep)),
-                    asio::detached);
-            } else {
-                auto session_socket =
-                    std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(std::move(socket), *m_ssl_context);
-                asio::co_spawn(*context,
-                               startSslsession(std::move(session_socket), context, std::move(remote_ep)),
-                               asio::detached);
-            }
-        }
-    }
+    asio::awaitable<void> startAcceptor(const std::string& ip, uint16_t port, bool is_v6 = false);
+    asio::awaitable<void> startUnixAcceptor(const std::optional<std::string>& socket_path);
 
-    asio::awaitable<void> startUnixAcceptor(const std::optional<std::string>& socket_path) {
-#ifdef SIMPLE_HTTP_BIND_UNIX_SOCKET
-        if (!socket_path.has_value()) {
-            co_return;
-        }
-        {
-            std::filesystem::path sock_path{socket_path.value()};
-            std::error_code ec;
-            std::filesystem::remove(sock_path, ec);
-        }
-        SIMPLE_HTTP_INFO_LOG("listen {}", socket_path.value());
-        asio::local::stream_protocol::endpoint endpoint(socket_path.value());
-        auto acceptor =
-            std::make_shared<asio::local::stream_protocol::acceptor>(*m_io_ctx_pool->getMainContext(), endpoint);
-        m_local_acceptor = acceptor;
-        for (;;) {
-            auto& context = m_io_ctx_pool->getIoContextPtr();
-            asio::local::stream_protocol::socket socket(*context);
-            auto [ec] = co_await acceptor->async_accept(socket, asio::as_tuple(asio::use_awaitable));
-            if (ec) {
-                if (ec == asio::error::operation_aborted)
-                    break;
-                continue;
-            }
-            if (!m_ssl_context) {
-                auto session_socket = std::make_shared<asio::local::stream_protocol::socket>(std::move(socket));
-                asio::co_spawn(*context,
-                               session(std::move(session_socket), context, __private::SessionContext{}),
-                               asio::detached);
-            } else {
-                auto session_socket =
-                    std::make_shared<asio::ssl::stream<asio::local::stream_protocol::socket>>(std::move(socket),
-                                                                                              *m_ssl_context);
-                asio::co_spawn(*context, startSslsession(std::move(session_socket), context), asio::detached);
-            }
-        }
-#endif
-        co_return;
-    }
+    void initSsl();
 
-    void initSsl() {
-        auto ssl_context = asio::ssl::context(asio::ssl::context::tlsv13_server);
-
-        if (m_cfg.ssl_crt.empty() || m_cfg.ssl_key.empty())
-            return;
-
-        auto file_exists = [](const std::filesystem::path& path) {
-            std::error_code ec;
-            bool exists = std::filesystem::exists(path, ec) && std::filesystem::is_regular_file(path, ec);
-
-            return !ec && exists;
-        };
-
-        if (!file_exists(m_cfg.ssl_crt)) {
-            SIMPLE_HTTP_ERROR_LOG("ssl_crt not exist {}", m_cfg.ssl_crt);
-            throw std::runtime_error(std::format("{} not exist", m_cfg.ssl_crt));
-        }
-        if (!file_exists(m_cfg.ssl_key)) {
-            SIMPLE_HTTP_ERROR_LOG("ssl_key not exist {}", m_cfg.ssl_key);
-            throw std::runtime_error(std::format("{} not exist", m_cfg.ssl_key));
-        }
-
-        if (m_cfg.ssl_setup_cb) {
-            m_cfg.ssl_setup_cb(ssl_context);
-        } else {
-            uint64_t opts =
-                asio::ssl::context::default_workarounds | asio::ssl::context::no_tlsv1 | asio::ssl::context::no_tlsv1_1;
-            if (m_cfg.disable_tls12) {
-                opts |= asio::ssl::context::no_tlsv1_2;
-            }
-            ssl_context.set_options(opts);
-
-            if (m_cfg.ssl_mutual) {
-                ssl_context.set_verify_mode(asio::ssl::verify_peer | asio::ssl::verify_fail_if_no_peer_cert);
-
-                if (m_cfg.ssl_ca) {
-                    ssl_context.load_verify_file(*m_cfg.ssl_ca);
-                } else {
-                    ssl_context.set_default_verify_paths();
-                }
-            }
-        }
-
-        error_code ec;
-        [[maybe_unused]]
-        auto ret = ssl_context.use_certificate_chain_file(m_cfg.ssl_crt, ec);
-        if (ec) {
-            throw std::runtime_error(ec.message());
-        }
-
-        [[maybe_unused]] auto _ = ssl_context.use_private_key_file(m_cfg.ssl_key, asio::ssl::context::pem, ec);
-        if (ec) {
-            throw std::runtime_error(ec.message());
-        }
-
-        SSL_CTX_set_alpn_select_cb(
-            ssl_context.native_handle(),
-            [](SSL* /* ssl */,
-               const unsigned char** out,
-               unsigned char* outlen,
-               const unsigned char* in,
-               unsigned int inlen,
-               void* /* arg */) {
-                if (SSL_select_next_proto(
-                        (unsigned char**)out, outlen, alpn_proto_list, sizeof(alpn_proto_list) - 1, in, inlen) !=
-                    OPENSSL_NPN_NEGOTIATED) {
-                    return SSL_TLSEXT_ERR_NOACK;
-                }
-                return SSL_TLSEXT_ERR_OK;
-            },
-            nullptr);
-
-        m_ssl_context = std::move(ssl_context);
-    }
-
-    asio::awaitable<void> upgradeH2c(auto socket,
+    template <typename AsyncStream>
+    asio::awaitable<void> upgradeH2c(AsyncStream socket,
                                      const std::shared_ptr<asio::io_context>& /* ctx */,
                                      http::request<http::string_body> req,
                                      std::string settings,
                                      std::shared_ptr<__private::SessionContext> session_ctx,
-                                     asio::ip::tcp::endpoint endpoint) {
-        // nghttp --upgrade  http://127.0.0.1:6666/hello --data ./a.txt
-        // curl -v --http2 http://localhost:6666/hello -d "aaaa" -k
-        http::response<http::empty_body> res{http::status::switching_protocols, 11};
-        res.set(http::field::connection, "Upgrade");
-        res.set(http::field::upgrade, "h2c");
-        co_await http::async_write(*socket, res, asio::as_tuple(asio::use_awaitable));
-
-        auto& io_dispatch = m_io_dispatch->getIoContextPtr();
-        auto ch = std::make_shared<Http2Channel>(co_await asio::this_coro::executor, CHANNEL_SIZE);
-        auto h2p = std::make_shared<Http2Parse>(ch, nullptr, io_dispatch, m_handler_functions, session_ctx, endpoint);
-        if (auto ret = h2p->init(Http2Parse::Config{
-                .is_h2c_upgrade = true,
-                .h2_setting = std::move(settings),
-                .concurrent_streams = m_cfg.concurrent_streams,
-                .window_size = m_cfg.window_size,
-                .max_frame_size = m_cfg.max_frame_size,
-                .method = req.method(),
-            });
-            ret) {
-            SIMPLE_HTTP_ERROR_LOG("init error: {}", ret);
-            co_return;
-        }
-        if (req.method() != http::verb::options) {
-            auto http_request_reader = h2p->getStreamCtx(1);
-            http_request_reader->setHttpRequest(req);
-            http_request_reader->trySend(Eof{});
-            callHandler(m_handler_functions,
-                        *io_dispatch,
-                        std::move(http_request_reader),
-                        std::make_shared<HttpResponseWriter>(h2p, 1, Version::Http2),
-                        h2p->m_session_ctx);
-        }
-        auto deadline = std::make_shared<std::chrono::steady_clock::time_point>(std::chrono::steady_clock::now());
-        co_await (toH2Parse(socket, h2p, deadline, m_cfg.idle_timeout) ||
-                  toSocket(socket, ch, deadline, m_cfg.idle_timeout) || watchdog(deadline));
-        h2p->disconnect();
-        shutdown(socket);
-    }
-
-    asio::awaitable<void> switchH2c(auto socket,
+                                     asio::ip::tcp::endpoint endpoint);
+    template <typename AsyncStream>
+    asio::awaitable<void> switchH2c(AsyncStream socket,
                                     const std::shared_ptr<asio::io_context>& /* ctx */,
                                     std::string_view buffer,
                                     std::shared_ptr<__private::SessionContext> session_ctx,
-                                    asio::ip::tcp::endpoint endpoint) {
-        // curl -v --http2-prior-knowledge http://localhost:6666/hello
-        // curl -v --http2-prior-knowledge http://localhost:6666/hello -d "aaaa"
-        auto& io_dispatch = m_io_dispatch->getIoContextPtr();
-        // start proc http2
-        auto ch = std::make_shared<Http2Channel>(co_await asio::this_coro::executor, CHANNEL_SIZE);
-        auto h2p = std::make_shared<Http2Parse>(ch, nullptr, io_dispatch, m_handler_functions, session_ctx, endpoint);
-        if (auto ret = h2p->init(Http2Parse::Config{
-                .is_h2c_upgrade = false,
-                .h2_setting = "",
-                .concurrent_streams = m_cfg.concurrent_streams,
-                .window_size = m_cfg.window_size,
-                .max_frame_size = m_cfg.max_frame_size,
-                .method = http::verb::get,  // not use
-            });
-            ret) {
-            SIMPLE_HTTP_ERROR_LOG("init error: {}", ret);
-            co_return;
-        }
-        auto ret = h2p->feedRecvData(buffer.data(), buffer.size());
-        if (ret == -1) {
-            co_return;
-        }
-        auto deadline = std::make_shared<std::chrono::steady_clock::time_point>(std::chrono::steady_clock::now());
-        co_await (toH2Parse(socket, h2p, deadline, m_cfg.idle_timeout) ||
-                  toSocket(socket, ch, deadline, m_cfg.idle_timeout) || watchdog(deadline));
-        h2p->disconnect();
-        shutdown(socket);
-    }
-
-    asio::awaitable<void> switchHttp1(auto socket,
+                                    asio::ip::tcp::endpoint endpoint);
+    template <typename AsyncStream>
+    asio::awaitable<void> switchHttp1(AsyncStream socket,
                                       std::shared_ptr<Http1Channel> http1_ch,
                                       std::shared_ptr<Http2Parse> h2p,
                                       Version version,
                                       std::shared_ptr<__private::SessionContext> session_ctx,
-                                      asio::ip::tcp::endpoint endpoint) {
-        auto recv_request = [this, &endpoint](auto socket, auto h2p, auto deadline, auto idle_timeout, auto session_ctx)
-            -> asio::awaitable<void> {
-            std::vector<std::weak_ptr<HttpRequestReader>> readers;
-            for (;;) {
-                *deadline = std::chrono::steady_clock::now() + idle_timeout;
-                beast::flat_buffer buffer;
-                http::request<http::string_body> req;
-                auto [ec, count] = co_await http::async_read(*socket, buffer, req, asio::as_tuple(asio::use_awaitable));
-                if (ec) {
-                    break;
-                }
-                auto version = (req.version() == 11 ? Version::Http11 : Version::Http1);
-                auto http_request_reader = std::make_shared<HttpRequestReader>(version, endpoint);
-                http_request_reader->setHttpRequest(req);
-                readers.emplace_back(http_request_reader);
-                callHandler(m_handler_functions,
-                            m_io_dispatch->getIoContext(),
-                            std::move(http_request_reader),
-                            std::make_shared<HttpResponseWriter>(h2p, 0, version),
-                            session_ctx);
-            }
-            for (auto& reader : readers) {
-                if (auto sp = reader.lock()) {
-                    sp->disconnect();
-                }
-            }
-            co_return;
-        };
-        auto send_response =
-            [](auto socket, auto http1_ch, Version version, auto deadline, auto idle_timeout) -> asio::awaitable<void> {
-            for (;;) {
-                *deadline = std::chrono::steady_clock::now() + idle_timeout;
-
-                auto [ec, h1_rsp] = co_await http1_ch->async_receive(asio::as_tuple(asio::use_awaitable));
-
-                if (ec) {
-                    break;
-                }
-                if (std::holds_alternative<std::string>(h1_rsp)) {
-                    auto& body = std::get<std::string>(h1_rsp);
-                    if (auto [ec, count] = co_await asio::async_write(*socket,
-                                                                      asio::buffer(body.data(), body.size()),
-                                                                      asio::as_tuple(asio::use_awaitable));
-                        ec) {
-                        break;
-                    }
-                } else if (std::holds_alternative<std::shared_ptr<http::response<http::string_body>>>(h1_rsp)) {
-                    auto& body = std::get<std::shared_ptr<http::response<http::string_body>>>(h1_rsp);
-                    if (auto [ec, count] =
-                            co_await http::async_write(*socket, *body, asio::as_tuple(asio::use_awaitable));
-                        ec) {
-                        break;
-                    }
-                } else {
-                    // forceClose
-                    break;
-                }
-                if (version == Version::Http1)
-                    break;
-            }
-            co_return;
-        };
-        auto deadline = std::make_shared<std::chrono::steady_clock::time_point>(std::chrono::steady_clock::now());
-        co_await (recv_request(socket, h2p, deadline, m_cfg.idle_timeout, session_ctx) ||
-                  send_response(socket, http1_ch, version, deadline, m_cfg.idle_timeout) || watchdog(deadline));
-        shutdown(socket);
-        co_return;
-    }
-
-    asio::awaitable<void> session(auto socket,
+                                      asio::ip::tcp::endpoint endpoint);
+    template <typename AsyncStream>
+    asio::awaitable<void> session(AsyncStream socket,
                                   std::shared_ptr<asio::io_context> ctx,
                                   __private::SessionContext session_context,
-                                  asio::ip::tcp::endpoint endpoint) {
-        auto session_ctx = std::make_shared<__private::SessionContext>(session_context);
-        auto http1_ch = std::make_shared<Http1Channel>(*ctx, CHANNEL_SIZE);
-        auto h2p = std::make_shared<Http2Parse>(nullptr, http1_ch, nullptr, m_handler_functions, session_ctx, endpoint);
-        beast::flat_buffer buffer;
-        http::parser<true, http::string_body> parser;
-        auto [ec, bytes] =
-            co_await http::async_read_header(*socket, buffer, parser, asio::as_tuple(asio::use_awaitable));
-        if (ec == http::error::end_of_stream) {
-            co_return;
-        }
-        if (ec == http::error::bad_version) {
-            auto const data = buffer.data();
-            std::string_view req_view{static_cast<char const*>(data.data()), data.size()};
-            if (isHttp2(req_view)) {
-                co_await switchH2c(std::move(socket), ctx, req_view, session_ctx, endpoint);
-            } else {
-                SIMPLE_HTTP_ERROR_LOG("not http2 request");
-            }
-            co_return;
-        }
-        if (ec) {
-            co_return;
-        }
-        auto& headers = parser.get();
-
-        std::string h2_setting;
-        auto const upgrade_it = headers.find(http::field::upgrade);
-        if (upgrade_it != headers.end() && upgrade_it->value() == "h2c") {
-            auto const settings_it = headers.find("HTTP2-Settings");
-            if (settings_it != headers.end()) {
-                h2_setting = settings_it->value();
-            }
-        }
-
-        std::tie(ec, bytes) = co_await http::async_read(*socket, buffer, parser, asio::as_tuple(asio::use_awaitable));
-        if (ec) {
-            SIMPLE_HTTP_ERROR_LOG("body read error: {}", ec.message());
-            co_return;
-        }
-
-        http::request<http::string_body> full_req = parser.get();
-
-        if (!h2_setting.empty()) {
-            co_await upgradeH2c(
-                std::move(socket), ctx, std::move(full_req), std::move(h2_setting), session_ctx, endpoint);
-            co_return;
-        }
-
-#ifdef SIMPLE_HTTP_EXPERIMENT_WEBSOCKET
-        if (beast::websocket::is_upgrade(full_req)) {
-            using SocketType = std::decay_t<decltype(*socket)>;
-            auto stream = std::make_shared<websocket::stream<SocketType>>(std::move(*socket));
-            if (m_cfg.auto_upgrade_websocket) {
-                if (m_cfg.websocket_setup_cb) {
-                    m_cfg.websocket_setup_cb(stream);
-                }
-                auto [ec] = co_await stream->async_accept(full_req, asio::as_tuple(asio::use_awaitable));
-                if (ec) {
-                    SIMPLE_HTTP_ERROR_LOG("websocket [{}] async_accept: {}", full_req.target(), ec.message());
-                    co_return;
-                }
-            }
-            auto callback = [](auto& full_req, auto& stream, auto& cb) -> asio::awaitable<void> {
-                try {
-                    if constexpr (std::is_same_v<SocketType, asio::ip::tcp::socket>) {
-                        std::shared_ptr<WsStream> ptr = std::make_shared<WsStream>(Version::Http11, stream);
-                        auto ret = co_await std::get<WsCallBack>(cb)(full_req, ptr);
-                        if (ret) {
-                            co_await stream->async_close(websocket::close_code::normal,
-                                                         asio::as_tuple(asio::use_awaitable));
-                        }
-                    } else {
-                        auto ptr = std::make_shared<WssStream>(Version::Http11, stream);
-                        auto ret = co_await std::get<WssCallBack>(cb)(full_req, ptr);
-                        if (ret) {
-                            co_await stream->async_close(websocket::close_code::normal,
-                                                         asio::as_tuple(asio::use_awaitable));
-                            co_await stream->next_layer().async_shutdown(asio::as_tuple(asio::use_awaitable));
-                        }
-                    }
-                } catch (const std::bad_variant_access& ex) {
-                    SIMPLE_HTTP_ERROR_LOG("{}", ex.what());
-                } catch (const std::exception& ex) {
-                    SIMPLE_HTTP_ERROR_LOG("{}", ex.what());
-                }
-            };
-            auto path = full_req.target();
-            auto it = m_handler_functions->websocket_map_proc.find(path);
-            if (it != m_handler_functions->websocket_map_proc.end()) {
-                co_await callback(full_req, stream, it->second);
-            } else {
-                for (const auto& [pattern, cb] : m_handler_functions->ws_regex_proc) {
-                    std::string str{path};
-                    if (regex_adapter::regex_match(str, pattern)) {
-                        co_await callback(full_req, stream, cb);
-                        break;
-                    }
-                }
-            }
-            auto& tcp = beast::get_lowest_layer(*stream);
-            if (tcp.is_open()) {
-                tcp.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
-                tcp.close(ec);
-            }
-            co_return;
-        }
-#endif
-
-        // this is http1 or 1.1
-        auto version = (full_req.version() == 11 ? Version::Http11 : Version::Http1);
-        auto http_request_reader = std::make_shared<HttpRequestReader>(version, endpoint);
-        http_request_reader->setHttpRequest(full_req);
-        callHandler(m_handler_functions,
-                    m_io_dispatch->getIoContext(),
-                    http_request_reader,
-                    std::make_shared<HttpResponseWriter>(h2p, 0, version),
-                    session_ctx);
-        co_await switchHttp1(std::move(socket), http1_ch, h2p, version, session_ctx, endpoint);
-        http_request_reader->disconnect();
-        co_return;
-    }
-
+                                  asio::ip::tcp::endpoint endpoint);
     // https server
     asio::awaitable<void> startSslsession(std::shared_ptr<asio::ssl::stream<asio::ip::tcp::socket>> socket,
                                           std::shared_ptr<asio::io_context> context,
-                                          asio::ip::tcp::endpoint remote_ep) {
-        auto [ec] =
-            co_await socket->async_handshake(asio::ssl::stream_base::server, asio::as_tuple(asio::use_awaitable));
-        if (ec) {
-            SIMPLE_HTTP_DEBUG_LOG("async_handshake: {}, {}", ec.message(), remote_ep.address().to_string());
-            co_return;
-        }
-        auto session_context = __private::SessionContext{.ssl_context = {socket->native_handle()}};
-        asio::co_spawn(*context,
-                       session(std::move(socket), context, std::move(session_context), std::move(remote_ep)),
-                       asio::detached);
-    }
+                                          asio::ip::tcp::endpoint remote_ep);
 
     Config m_cfg;
     std::optional<asio::ssl::context> m_ssl_context;
@@ -1944,6 +1492,496 @@ class HttpServer final {
     std::shared_ptr<asio::local::stream_protocol::acceptor> m_local_acceptor;
 #endif
 };
+
+inline asio::awaitable<void> HttpServer::startAcceptor(const std::string& ip, uint16_t port, bool is_v6) {
+    if (ip.empty()) {
+        co_return;
+    }
+    SIMPLE_HTTP_INFO_LOG("listen {}:{}, is_v6: {}", ip, port, is_v6);
+    error_code ec;
+    auto addr = asio::ip::make_address(ip, ec);
+    if (ec) {
+        SIMPLE_HTTP_ERROR_LOG("make_address: {}", ec.message());
+        co_return;
+    }
+    asio::ip::tcp::endpoint endpoint(addr, port);
+    auto acceptor = std::make_shared<asio::ip::tcp::acceptor>(*m_io_ctx_pool->getMainContext());
+    m_acceptors.emplace_back(acceptor);
+    acceptor->open(endpoint.protocol());
+    if (is_v6) {
+        acceptor->set_option(boost::asio::ip::v6_only(true));
+    }
+    acceptor->set_option(asio::ip::tcp::acceptor::reuse_address(true));
+#ifdef SO_REUSEPORT
+    if (m_cfg.reuse_port) {
+        SIMPLE_HTTP_DEBUG_LOG("enable reuse port");
+        acceptor->set_option(asio::detail::socket_option::boolean<SOL_SOCKET, SO_REUSEPORT>(true), ec);
+    }
+#endif
+#ifdef TCP_FASTOPEN
+    SIMPLE_HTTP_DEBUG_LOG("enable fastopen");
+    using fast_open = asio::detail::socket_option::integer<IPPROTO_TCP, TCP_FASTOPEN>;
+    acceptor->set_option(fast_open(256), ec);
+    if (ec) {
+        SIMPLE_HTTP_ERROR_LOG("fast_open error: {}", ec.message());
+    }
+#endif
+    [[maybe_unused]] auto _ = acceptor->bind(endpoint, ec);
+    if (ec) {
+        SIMPLE_HTTP_ERROR_LOG("bind: {}", ec.message());
+        co_return;
+    }
+    _ = acceptor->listen(asio::socket_base::max_listen_connections, ec);
+    if (ec) {
+        SIMPLE_HTTP_ERROR_LOG("listen: {}", ec.message());
+        co_return;
+    }
+    for (;;) {
+        auto& context = m_io_ctx_pool->getIoContextPtr();
+        asio::ip::tcp::socket socket(*context);
+        auto [ec] = co_await acceptor->async_accept(socket, asio::as_tuple(asio::use_awaitable));
+        if (ec) {
+            if (ec == asio::error::operation_aborted)
+                break;
+            continue;
+        }
+        auto remote_ep = socket.remote_endpoint(ec);
+        if (!ec) {
+            SIMPLE_HTTP_DEBUG_LOG("new connection from [{}:{}]", remote_ep.address().to_string(), remote_ep.port());
+        }
+        if (m_cfg.socket_setup_cb) {
+            try {
+                m_cfg.socket_setup_cb(socket);
+            } catch (const std::exception& e) {
+                SIMPLE_HTTP_ERROR_LOG("socket_setup_cb error: {}", e.what());
+            }
+        }
+        if (!m_ssl_context) {
+            auto session_socket = std::make_shared<asio::ip::tcp::socket>(std::move(socket));
+            asio::co_spawn(
+                *context,
+                session(std::move(session_socket), context, __private::SessionContext{}, std::move(remote_ep)),
+                asio::detached);
+        } else {
+            auto session_socket =
+                std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(std::move(socket), *m_ssl_context);
+            asio::co_spawn(*context,
+                           startSslsession(std::move(session_socket), context, std::move(remote_ep)),
+                           asio::detached);
+        }
+    }
+}
+
+inline asio::awaitable<void> HttpServer::startUnixAcceptor(const std::optional<std::string>& socket_path) {
+#ifdef SIMPLE_HTTP_BIND_UNIX_SOCKET
+    if (!socket_path.has_value()) {
+        co_return;
+    }
+    {
+        std::filesystem::path sock_path{socket_path.value()};
+        std::error_code ec;
+        std::filesystem::remove(sock_path, ec);
+    }
+    SIMPLE_HTTP_INFO_LOG("listen {}", socket_path.value());
+    asio::local::stream_protocol::endpoint endpoint(socket_path.value());
+    auto acceptor =
+        std::make_shared<asio::local::stream_protocol::acceptor>(*m_io_ctx_pool->getMainContext(), endpoint);
+    m_local_acceptor = acceptor;
+    for (;;) {
+        auto& context = m_io_ctx_pool->getIoContextPtr();
+        asio::local::stream_protocol::socket socket(*context);
+        auto [ec] = co_await acceptor->async_accept(socket, asio::as_tuple(asio::use_awaitable));
+        if (ec) {
+            if (ec == asio::error::operation_aborted)
+                break;
+            continue;
+        }
+        if (!m_ssl_context) {
+            auto session_socket = std::make_shared<asio::local::stream_protocol::socket>(std::move(socket));
+            asio::co_spawn(*context,
+                           session(std::move(session_socket), context, __private::SessionContext{}),
+                           asio::detached);
+        } else {
+            auto session_socket =
+                std::make_shared<asio::ssl::stream<asio::local::stream_protocol::socket>>(std::move(socket),
+                                                                                          *m_ssl_context);
+            asio::co_spawn(*context, startSslsession(std::move(session_socket), context), asio::detached);
+        }
+    }
+#endif
+    co_return;
+}
+
+inline void HttpServer::initSsl() {
+    auto ssl_context = asio::ssl::context(asio::ssl::context::tlsv13_server);
+
+    if (m_cfg.ssl_crt.empty() || m_cfg.ssl_key.empty())
+        return;
+
+    auto file_exists = [](const std::filesystem::path& path) {
+        std::error_code ec;
+        bool exists = std::filesystem::exists(path, ec) && std::filesystem::is_regular_file(path, ec);
+
+        return !ec && exists;
+    };
+
+    if (!file_exists(m_cfg.ssl_crt)) {
+        SIMPLE_HTTP_ERROR_LOG("ssl_crt not exist {}", m_cfg.ssl_crt);
+        throw std::runtime_error(std::format("{} not exist", m_cfg.ssl_crt));
+    }
+    if (!file_exists(m_cfg.ssl_key)) {
+        SIMPLE_HTTP_ERROR_LOG("ssl_key not exist {}", m_cfg.ssl_key);
+        throw std::runtime_error(std::format("{} not exist", m_cfg.ssl_key));
+    }
+
+    if (m_cfg.ssl_setup_cb) {
+        m_cfg.ssl_setup_cb(ssl_context);
+    } else {
+        uint64_t opts =
+            asio::ssl::context::default_workarounds | asio::ssl::context::no_tlsv1 | asio::ssl::context::no_tlsv1_1;
+        if (m_cfg.disable_tls12) {
+            opts |= asio::ssl::context::no_tlsv1_2;
+        }
+        ssl_context.set_options(opts);
+
+        if (m_cfg.ssl_mutual) {
+            ssl_context.set_verify_mode(asio::ssl::verify_peer | asio::ssl::verify_fail_if_no_peer_cert);
+
+            if (m_cfg.ssl_ca) {
+                ssl_context.load_verify_file(*m_cfg.ssl_ca);
+            } else {
+                ssl_context.set_default_verify_paths();
+            }
+        }
+    }
+
+    error_code ec;
+    [[maybe_unused]]
+    auto ret = ssl_context.use_certificate_chain_file(m_cfg.ssl_crt, ec);
+    if (ec) {
+        throw std::runtime_error(ec.message());
+    }
+
+    [[maybe_unused]] auto _ = ssl_context.use_private_key_file(m_cfg.ssl_key, asio::ssl::context::pem, ec);
+    if (ec) {
+        throw std::runtime_error(ec.message());
+    }
+
+    SSL_CTX_set_alpn_select_cb(
+        ssl_context.native_handle(),
+        [](SSL* /* ssl */,
+           const unsigned char** out,
+           unsigned char* outlen,
+           const unsigned char* in,
+           unsigned int inlen,
+           void* /* arg */) {
+            if (SSL_select_next_proto(
+                    (unsigned char**)out, outlen, alpn_proto_list, sizeof(alpn_proto_list) - 1, in, inlen) !=
+                OPENSSL_NPN_NEGOTIATED) {
+                return SSL_TLSEXT_ERR_NOACK;
+            }
+            return SSL_TLSEXT_ERR_OK;
+        },
+        nullptr);
+
+    m_ssl_context = std::move(ssl_context);
+}
+
+template <typename AsyncStream>
+inline asio::awaitable<void> HttpServer::upgradeH2c(AsyncStream socket,
+                                                    const std::shared_ptr<asio::io_context>& /* ctx */,
+                                                    http::request<http::string_body> req,
+                                                    std::string settings,
+                                                    std::shared_ptr<__private::SessionContext> session_ctx,
+                                                    asio::ip::tcp::endpoint endpoint) {
+    // nghttp --upgrade  http://127.0.0.1:6666/hello --data ./a.txt
+    // curl -v --http2 http://localhost:6666/hello -d "aaaa" -k
+    http::response<http::empty_body> res{http::status::switching_protocols, 11};
+    res.set(http::field::connection, "Upgrade");
+    res.set(http::field::upgrade, "h2c");
+    co_await http::async_write(*socket, res, asio::as_tuple(asio::use_awaitable));
+
+    auto& io_dispatch = m_io_dispatch->getIoContextPtr();
+    auto ch = std::make_shared<Http2Channel>(co_await asio::this_coro::executor, CHANNEL_SIZE);
+    auto h2p = std::make_shared<Http2Parse>(ch, nullptr, io_dispatch, m_handler_functions, session_ctx, endpoint);
+    if (auto ret = h2p->init(Http2Parse::Config{
+            .is_h2c_upgrade = true,
+            .h2_setting = std::move(settings),
+            .concurrent_streams = m_cfg.concurrent_streams,
+            .window_size = m_cfg.window_size,
+            .max_frame_size = m_cfg.max_frame_size,
+            .method = req.method(),
+        });
+        ret) {
+        SIMPLE_HTTP_ERROR_LOG("init error: {}", ret);
+        co_return;
+    }
+    if (req.method() != http::verb::options) {
+        auto http_request_reader = h2p->getStreamCtx(1);
+        http_request_reader->setHttpRequest(req);
+        http_request_reader->trySend(Eof{});
+        callHandler(m_handler_functions,
+                    *io_dispatch,
+                    std::move(http_request_reader),
+                    std::make_shared<HttpResponseWriter>(h2p, 1, Version::Http2),
+                    h2p->m_session_ctx);
+    }
+    auto deadline = std::make_shared<std::chrono::steady_clock::time_point>(std::chrono::steady_clock::now());
+    co_await (toH2Parse(socket, h2p, deadline, m_cfg.idle_timeout) ||
+              toSocket(socket, ch, deadline, m_cfg.idle_timeout) || watchdog(deadline));
+    h2p->disconnect();
+    shutdown(socket);
+}
+
+template <typename AsyncStream>
+inline asio::awaitable<void> HttpServer::switchH2c(AsyncStream socket,
+                                                   const std::shared_ptr<asio::io_context>& /* ctx */,
+                                                   std::string_view buffer,
+                                                   std::shared_ptr<__private::SessionContext> session_ctx,
+                                                   asio::ip::tcp::endpoint endpoint) {
+    // curl -v --http2-prior-knowledge http://localhost:6666/hello
+    // curl -v --http2-prior-knowledge http://localhost:6666/hello -d "aaaa"
+    auto& io_dispatch = m_io_dispatch->getIoContextPtr();
+    // start proc http2
+    auto ch = std::make_shared<Http2Channel>(co_await asio::this_coro::executor, CHANNEL_SIZE);
+    auto h2p = std::make_shared<Http2Parse>(ch, nullptr, io_dispatch, m_handler_functions, session_ctx, endpoint);
+    if (auto ret = h2p->init(Http2Parse::Config{
+            .is_h2c_upgrade = false,
+            .h2_setting = "",
+            .concurrent_streams = m_cfg.concurrent_streams,
+            .window_size = m_cfg.window_size,
+            .max_frame_size = m_cfg.max_frame_size,
+            .method = http::verb::get,  // not use
+        });
+        ret) {
+        SIMPLE_HTTP_ERROR_LOG("init error: {}", ret);
+        co_return;
+    }
+    auto ret = h2p->feedRecvData(buffer.data(), buffer.size());
+    if (ret == -1) {
+        co_return;
+    }
+    auto deadline = std::make_shared<std::chrono::steady_clock::time_point>(std::chrono::steady_clock::now());
+    co_await (toH2Parse(socket, h2p, deadline, m_cfg.idle_timeout) ||
+              toSocket(socket, ch, deadline, m_cfg.idle_timeout) || watchdog(deadline));
+    h2p->disconnect();
+    shutdown(socket);
+}
+
+template <typename AsyncStream>
+inline asio::awaitable<void> HttpServer::switchHttp1(AsyncStream socket,
+                                                     std::shared_ptr<Http1Channel> http1_ch,
+                                                     std::shared_ptr<Http2Parse> h2p,
+                                                     Version version,
+                                                     std::shared_ptr<__private::SessionContext> session_ctx,
+                                                     asio::ip::tcp::endpoint endpoint) {
+    auto recv_request = [this, &endpoint](auto socket, auto h2p, auto deadline, auto idle_timeout, auto session_ctx)
+        -> asio::awaitable<void> {
+        std::vector<std::weak_ptr<HttpRequestReader>> readers;
+        for (;;) {
+            *deadline = std::chrono::steady_clock::now() + idle_timeout;
+            beast::flat_buffer buffer;
+            http::request<http::string_body> req;
+            auto [ec, count] = co_await http::async_read(*socket, buffer, req, asio::as_tuple(asio::use_awaitable));
+            if (ec) {
+                break;
+            }
+            auto version = (req.version() == 11 ? Version::Http11 : Version::Http1);
+            auto http_request_reader = std::make_shared<HttpRequestReader>(version, endpoint);
+            http_request_reader->setHttpRequest(req);
+            readers.emplace_back(http_request_reader);
+            callHandler(m_handler_functions,
+                        m_io_dispatch->getIoContext(),
+                        std::move(http_request_reader),
+                        std::make_shared<HttpResponseWriter>(h2p, 0, version),
+                        session_ctx);
+        }
+        for (auto& reader : readers) {
+            if (auto sp = reader.lock()) {
+                sp->disconnect();
+            }
+        }
+        co_return;
+    };
+    auto send_response =
+        [](auto socket, auto http1_ch, Version version, auto deadline, auto idle_timeout) -> asio::awaitable<void> {
+        for (;;) {
+            *deadline = std::chrono::steady_clock::now() + idle_timeout;
+
+            auto [ec, h1_rsp] = co_await http1_ch->async_receive(asio::as_tuple(asio::use_awaitable));
+
+            if (ec) {
+                break;
+            }
+            if (std::holds_alternative<std::string>(h1_rsp)) {
+                auto& body = std::get<std::string>(h1_rsp);
+                if (auto [ec, count] = co_await asio::async_write(*socket,
+                                                                  asio::buffer(body.data(), body.size()),
+                                                                  asio::as_tuple(asio::use_awaitable));
+                    ec) {
+                    break;
+                }
+            } else if (std::holds_alternative<std::shared_ptr<http::response<http::string_body>>>(h1_rsp)) {
+                auto& body = std::get<std::shared_ptr<http::response<http::string_body>>>(h1_rsp);
+                if (auto [ec, count] = co_await http::async_write(*socket, *body, asio::as_tuple(asio::use_awaitable));
+                    ec) {
+                    break;
+                }
+            } else {
+                // forceClose
+                break;
+            }
+            if (version == Version::Http1)
+                break;
+        }
+        co_return;
+    };
+    auto deadline = std::make_shared<std::chrono::steady_clock::time_point>(std::chrono::steady_clock::now());
+    co_await (recv_request(socket, h2p, deadline, m_cfg.idle_timeout, session_ctx) ||
+              send_response(socket, http1_ch, version, deadline, m_cfg.idle_timeout) || watchdog(deadline));
+    shutdown(socket);
+    co_return;
+}
+
+template <typename AsyncStream>
+inline asio::awaitable<void> HttpServer::session(AsyncStream socket,
+                                                 std::shared_ptr<asio::io_context> ctx,
+                                                 __private::SessionContext session_context,
+                                                 asio::ip::tcp::endpoint endpoint) {
+    auto session_ctx = std::make_shared<__private::SessionContext>(session_context);
+    auto http1_ch = std::make_shared<Http1Channel>(*ctx, CHANNEL_SIZE);
+    auto h2p = std::make_shared<Http2Parse>(nullptr, http1_ch, nullptr, m_handler_functions, session_ctx, endpoint);
+    beast::flat_buffer buffer;
+    http::parser<true, http::string_body> parser;
+    auto [ec, bytes] = co_await http::async_read_header(*socket, buffer, parser, asio::as_tuple(asio::use_awaitable));
+    if (ec == http::error::end_of_stream) {
+        co_return;
+    }
+    if (ec == http::error::bad_version) {
+        auto const data = buffer.data();
+        std::string_view req_view{static_cast<char const*>(data.data()), data.size()};
+        if (isHttp2(req_view)) {
+            co_await switchH2c(std::move(socket), ctx, req_view, session_ctx, endpoint);
+        } else {
+            SIMPLE_HTTP_ERROR_LOG("not http2 request");
+        }
+        co_return;
+    }
+    if (ec) {
+        co_return;
+    }
+    auto& headers = parser.get();
+
+    std::string h2_setting;
+    auto const upgrade_it = headers.find(http::field::upgrade);
+    if (upgrade_it != headers.end() && upgrade_it->value() == "h2c") {
+        auto const settings_it = headers.find("HTTP2-Settings");
+        if (settings_it != headers.end()) {
+            h2_setting = settings_it->value();
+        }
+    }
+
+    std::tie(ec, bytes) = co_await http::async_read(*socket, buffer, parser, asio::as_tuple(asio::use_awaitable));
+    if (ec) {
+        SIMPLE_HTTP_ERROR_LOG("body read error: {}", ec.message());
+        co_return;
+    }
+
+    http::request<http::string_body> full_req = parser.get();
+
+    if (!h2_setting.empty()) {
+        co_await upgradeH2c(std::move(socket), ctx, std::move(full_req), std::move(h2_setting), session_ctx, endpoint);
+        co_return;
+    }
+
+#ifdef SIMPLE_HTTP_EXPERIMENT_WEBSOCKET
+    if (beast::websocket::is_upgrade(full_req)) {
+        using SocketType = std::decay_t<decltype(*socket)>;
+        auto stream = std::make_shared<websocket::stream<SocketType>>(std::move(*socket));
+        if (m_cfg.auto_upgrade_websocket) {
+            if (m_cfg.websocket_setup_cb) {
+                m_cfg.websocket_setup_cb(stream);
+            }
+            auto [ec] = co_await stream->async_accept(full_req, asio::as_tuple(asio::use_awaitable));
+            if (ec) {
+                SIMPLE_HTTP_ERROR_LOG("websocket [{}] async_accept: {}", full_req.target(), ec.message());
+                co_return;
+            }
+        }
+        auto callback = [](auto& full_req, auto& stream, auto& cb) -> asio::awaitable<void> {
+            try {
+                if constexpr (std::is_same_v<SocketType, asio::ip::tcp::socket>) {
+                    std::shared_ptr<WsStream> ptr = std::make_shared<WsStream>(Version::Http11, stream);
+                    auto ret = co_await std::get<WsCallBack>(cb)(full_req, ptr);
+                    if (ret) {
+                        co_await stream->async_close(websocket::close_code::normal,
+                                                     asio::as_tuple(asio::use_awaitable));
+                    }
+                } else {
+                    auto ptr = std::make_shared<WssStream>(Version::Http11, stream);
+                    auto ret = co_await std::get<WssCallBack>(cb)(full_req, ptr);
+                    if (ret) {
+                        co_await stream->async_close(websocket::close_code::normal,
+                                                     asio::as_tuple(asio::use_awaitable));
+                        co_await stream->next_layer().async_shutdown(asio::as_tuple(asio::use_awaitable));
+                    }
+                }
+            } catch (const std::bad_variant_access& ex) {
+                SIMPLE_HTTP_ERROR_LOG("{}", ex.what());
+            } catch (const std::exception& ex) {
+                SIMPLE_HTTP_ERROR_LOG("{}", ex.what());
+            }
+        };
+        auto path = full_req.target();
+        auto it = m_handler_functions->websocket_map_proc.find(path);
+        if (it != m_handler_functions->websocket_map_proc.end()) {
+            co_await callback(full_req, stream, it->second);
+        } else {
+            for (const auto& [pattern, cb] : m_handler_functions->ws_regex_proc) {
+                std::string str{path};
+                if (regex_adapter::regex_match(str, pattern)) {
+                    co_await callback(full_req, stream, cb);
+                    break;
+                }
+            }
+        }
+        auto& tcp = beast::get_lowest_layer(*stream);
+        if (tcp.is_open()) {
+            tcp.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
+            tcp.close(ec);
+        }
+        co_return;
+    }
+#endif
+
+    // this is http1 or 1.1
+    auto version = (full_req.version() == 11 ? Version::Http11 : Version::Http1);
+    auto http_request_reader = std::make_shared<HttpRequestReader>(version, endpoint);
+    http_request_reader->setHttpRequest(full_req);
+    callHandler(m_handler_functions,
+                m_io_dispatch->getIoContext(),
+                http_request_reader,
+                std::make_shared<HttpResponseWriter>(h2p, 0, version),
+                session_ctx);
+    co_await switchHttp1(std::move(socket), http1_ch, h2p, version, session_ctx, endpoint);
+    http_request_reader->disconnect();
+    co_return;
+}
+
+inline asio::awaitable<void> HttpServer::startSslsession(
+    std::shared_ptr<asio::ssl::stream<asio::ip::tcp::socket>> socket,
+    std::shared_ptr<asio::io_context> context,
+    asio::ip::tcp::endpoint remote_ep) {
+    auto [ec] = co_await socket->async_handshake(asio::ssl::stream_base::server, asio::as_tuple(asio::use_awaitable));
+    if (ec) {
+        SIMPLE_HTTP_DEBUG_LOG("async_handshake: {}, {}", ec.message(), remote_ep.address().to_string());
+        co_return;
+    }
+    auto session_context = __private::SessionContext{.ssl_context = {socket->native_handle()}};
+    asio::co_spawn(*context,
+                   session(std::move(socket), context, std::move(session_context), std::move(remote_ep)),
+                   asio::detached);
+}
 
 #ifdef SIMPLE_HTTP_EXPERIMENT_HTTP2CLIENT
 
