@@ -85,6 +85,11 @@ enum class Version : uint8_t {
     Http2 = 2,
 };
 
+template <class... Ts>
+struct overloaded : Ts... {
+    using Ts::operator()...;
+};
+
 inline std::shared_ptr<http::response<http::string_body>> makeHttpResponse(
     http::status status = http::status::ok,
     std::string_view content_type = "text/plain") {
@@ -325,12 +330,13 @@ using Http1Channel = asio::experimental::concurrent_channel<
     void(error_code, std::variant<std::shared_ptr<http::response<http::string_body>>, std::string, Disconnect>)>;
 
 using Http2Channel =
-    asio::experimental::concurrent_channel<void(error_code, std::variant<std::shared_ptr<std::string>, Disconnect>)>;
+    asio::experimental::concurrent_channel<void(error_code, std::variant<std::unique_ptr<std::string>, Disconnect>)>;
 
 struct Eof {};
 
 using ReaderChannel =
-    asio::experimental::concurrent_channel<void(error_code, std::variant<std::string, Eof, Disconnect>)>;
+    asio::experimental::concurrent_channel<void(error_code,
+                                                std::variant<std::unique_ptr<std::string>, Eof, Disconnect>)>;
 
 class HttpRequestReader {
   public:
@@ -345,14 +351,15 @@ class HttpRequestReader {
     ~HttpRequestReader() = default;
 
     // Http2 streaming reads http body
-    asio::awaitable<std::tuple<error_code, std::variant<std::string, Eof, Disconnect>>> asyncReadDataFrame() {
+    asio::awaitable<std::tuple<error_code, std::variant<std::unique_ptr<std::string>, Eof, Disconnect>>>
+    asyncReadDataFrame() {
         if (!m_reader_channel) {
             co_return std::make_tuple(make_error_code(boost::asio::error::eof),
-                                      std::variant<std::string, Eof, Disconnect>{Eof{}});
+                                      std::variant<std::unique_ptr<std::string>, Eof, Disconnect>{Eof{}});
         }
 
         error_code ec;
-        std::variant<std::string, Eof, Disconnect> data;
+        std::variant<std::unique_ptr<std::string>, Eof, Disconnect> data;
 
         bool success = m_reader_channel->try_receive([&](auto cb_ec, auto recv_data) {
             ec = cb_ec;
@@ -373,9 +380,9 @@ class HttpRequestReader {
                 auto [ec, data] = co_await asyncReadDataFrame();
                 if (ec)
                     break;
-                if (std::holds_alternative<std::string>(data)) {
-                    auto& str = std::get<std::string>(data);
-                    m_body.append(str);
+                if (std::holds_alternative<std::unique_ptr<std::string>>(data)) {
+                    auto& str = std::get<std::unique_ptr<std::string>>(data);
+                    m_body.append(*str);
                 } else if (std::holds_alternative<simple_http::Disconnect>(data)) {
                     m_connected = false;
                     break;
@@ -891,7 +898,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
             SIMPLE_HTTP_DEBUG_LOG("{}", "sendCallback client disconnect!!!");
             return length;
         }
-        if (!sp->try_send(error_code{}, std::make_shared<std::string>((char*)data, length))) {
+        if (!sp->try_send(error_code{}, std::make_unique<std::string>((char*)data, length))) {
             SIMPLE_HTTP_ERROR_LOG("{}", "sendCallback send error!!!!");
         }
         return length;
@@ -926,8 +933,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
                                        void* userdata) {
         auto h2p = static_cast<Http2Parse*>(userdata);
         auto& req = h2p->getStreamCtx(stream_id);
-        std::string recv_data{(char*)data, len};
-        req->trySend(std::move(recv_data));
+        req->trySend(std::make_unique<std::string>((char*)data, len));
         return 0;
     }
 
@@ -1189,7 +1195,7 @@ inline asio::awaitable<void> toSocket(auto socket,
     for (;;) {
         while (true) {
             *deadline = std::chrono::steady_clock::now() + idle_timeout;
-            std::variant<std::shared_ptr<std::string>, Disconnect> data;
+            std::variant<std::unique_ptr<std::string>, Disconnect> data;
             if (!ch->try_receive([&](auto, auto recv_data) { data = std::move(recv_data); })) {
                 break;
             }
@@ -1197,7 +1203,7 @@ inline asio::awaitable<void> toSocket(auto socket,
                 force_close = true;
                 break;
             } else {
-                auto& info_ptr = std::get<std::shared_ptr<std::string>>(data);
+                auto& info_ptr = std::get<std::unique_ptr<std::string>>(data);
                 vec.emplace_back(std::move(info_ptr));
             }
             // Let's yield the thread and allow other tasks to execute.
@@ -1207,7 +1213,7 @@ inline asio::awaitable<void> toSocket(auto socket,
         }
 
         if (vec.empty() && !force_close) {
-            std::variant<std::shared_ptr<std::string>, Disconnect> data;
+            std::variant<std::unique_ptr<std::string>, Disconnect> data;
 
             error_code ec;
             std::tie(ec, data) = co_await ch->async_receive(asio::as_tuple(asio::use_awaitable));
@@ -1217,7 +1223,7 @@ inline asio::awaitable<void> toSocket(auto socket,
             if (std::holds_alternative<Disconnect>(data)) {
                 force_close = true;
             } else {
-                auto& info_ptr = std::get<std::shared_ptr<std::string>>(data);
+                auto& info_ptr = std::get<std::unique_ptr<std::string>>(data);
                 vec.emplace_back(std::move(info_ptr));
             }
         }
@@ -1957,23 +1963,23 @@ struct ParseHeaderDone {};
 
 struct HttpResponseReader final {
     using Channel = asio::experimental::concurrent_channel<
-        void(error_code, std::variant<ParseHeaderDone, Eof, std::shared_ptr<std::string>, Disconnect>)>;
+        void(error_code, std::variant<ParseHeaderDone, Eof, std::unique_ptr<std::string>, Disconnect>)>;
 
     HttpResponseReader(int stream_id, Version version, std::shared_ptr<Channel> channel)
         : stream_id(stream_id), m_version(version), m_channel(std::move(channel)) {
     }
 
     asio::awaitable<
-        std::tuple<error_code, std::variant<ParseHeaderDone, Eof, std::shared_ptr<std::string>, Disconnect>>>
+        std::tuple<error_code, std::variant<ParseHeaderDone, Eof, std::unique_ptr<std::string>, Disconnect>>>
     asyncReadDataFrame() {
         if (!m_channel) {
             co_return std::make_tuple(make_error_code(boost::asio::error::eof),
-                                      std::variant<ParseHeaderDone, Eof, std::shared_ptr<std::string>, Disconnect>{
+                                      std::variant<ParseHeaderDone, Eof, std::unique_ptr<std::string>, Disconnect>{
                                           Eof{}});
         }
 
         error_code ec;
-        std::variant<ParseHeaderDone, Eof, std::shared_ptr<std::string>, Disconnect> data;
+        std::variant<ParseHeaderDone, Eof, std::unique_ptr<std::string>, Disconnect> data;
 
         bool success = m_channel->try_receive([&](auto cb_ec, auto recv_data) {
             ec = cb_ec;
@@ -2386,7 +2392,7 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
                                 void* userdata) {
         auto http2_client = static_cast<Http2Client*>(userdata);
         if (!http2_client->m_send_h2_channel->try_send(error_code{},
-                                                       std::make_shared<std::string>((char*)data, length))) {
+                                                       std::make_unique<std::string>((char*)data, length))) {
             SIMPLE_HTTP_ERROR_LOG("{}", "sendCallback send error!!!!");
         }
         return length;
@@ -2417,7 +2423,7 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
                                        void* userdata) {
         auto h2_cli = static_cast<Http2Client*>(userdata);
         auto& http_rsp_reader = h2_cli->getStreamCtx(stream_id);
-        http_rsp_reader->try_send(std::make_shared<std::string>((char*)data, len));
+        http_rsp_reader->try_send(std::make_unique<std::string>((char*)data, len));
         return 0;
     }
 

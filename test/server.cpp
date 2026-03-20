@@ -42,16 +42,21 @@ asio::awaitable<void> hello(std::shared_ptr<simple_http::HttpRequestReader> read
         // for http2 stream recv
         for (;;) {
             auto [ec, data] = co_await reader->asyncReadDataFrame();
+
             if (ec) {
-                std::println("{}", ec.message());
+                std::println("Error: {}", ec.message());
                 co_return;
             }
-            if (std::holds_alternative<std::string>(data)) {
-                auto& str = std::get<std::string>(data);
-                std::println("recv h2 data frame:{}", str);
-            } else if (std::holds_alternative<simple_http::Disconnect>(data)) {
-                co_return;
-            } else {
+
+            bool should_continue = std::visit(simple_http::overloaded{[](std::unique_ptr<std::string> str) {
+                                                                          std::println("recv h2 data frame: {}", *str);
+                                                                          return true;
+                                                                      },
+                                                                      [](simple_http::Disconnect) { return false; },
+                                                                      [](simple_http::Eof) { return false; }},
+                                              std::move(data));
+
+            if (!should_continue) {
                 break;
             }
         }

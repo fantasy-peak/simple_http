@@ -47,14 +47,26 @@ asio::awaitable<void> client(simple_http::IoCtxPool& pool) {
 
     for (;;) {
         auto [ec, d] = co_await r->asyncReadDataFrame();
-        if (std::holds_alternative<std::shared_ptr<std::string>>(d)) {
-            std::println("recv data: {}", *std::get<std::shared_ptr<std::string>>(d));
+
+        if (ec) {
+            std::println("read error: {}", ec.message());
+            break;
         }
-        if (std::holds_alternative<simple_http::Eof>(d)) {
-            std::println("receive Eof");
+
+        bool should_continue = std::visit(simple_http::overloaded{[](std::unique_ptr<std::string> str_ptr) {
+                                                                      std::println("recv data: {}", *str_ptr);
+                                                                      return true;
+                                                                  },
+                                                                  [](simple_http::Eof) { return false; },
+                                                                  [](simple_http::Disconnect) { return false; },
+                                                                  [](simple_http::ParseHeaderDone) { return false; }},
+                                          std::move(d));
+
+        if (!should_continue) {
             break;
         }
     }
+
     stream_spec.reset();
     std::println("done");
     co_return;
