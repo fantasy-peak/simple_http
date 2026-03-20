@@ -282,6 +282,17 @@ inline bool isHttp2(std::string_view cache_data) {
     }
 }
 
+inline void fillH2Header(std::string_view name, std::string_view value, std::vector<nghttp2_nv>& hdrs) {
+    nghttp2_nv nv;
+    nv.name = (uint8_t*)name.data();
+    nv.namelen = name.size();
+    nv.value = (uint8_t*)value.data();
+    nv.valuelen = value.size();
+    nv.flags = NGHTTP2_NV_FLAG_NONE;
+    hdrs.push_back(nv);
+    return;
+}
+
 inline ssize_t dataReadCallback(nghttp2_session* /* session */,
                                 int32_t /* stream_id */,
                                 uint8_t* buf,
@@ -774,19 +785,10 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
                            return;
                        }
                        std::vector<nghttp2_nv> hdrs;
-                       auto fill = [](const auto& name, const auto& value, auto& hdrs) {
-                           nghttp2_nv nv;
-                           nv.name = (uint8_t*)name.c_str();
-                           nv.namelen = name.size();
-                           nv.value = (uint8_t*)value.c_str();
-                           nv.valuelen = value.size();
-                           nv.flags = NGHTTP2_NV_FLAG_NONE;
-                           hdrs.push_back(nv);
-                       };
                        static std::string status{":status"};
-                       fill(status, http_status, hdrs);
+                       fillH2Header(status, http_status, hdrs);
                        for (auto& [name, value] : headers) {
-                           fill(name, value, hdrs);
+                           fillH2Header(name, value, hdrs);
                        }
 
                        auto* ctx = new DataContext();
@@ -2275,25 +2277,14 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
                     *m_io_context, [this, self_ptr, stream_spec = std::move(stream_spec), h = std::move(h)]() mutable {
                         if (auto sp = self_ptr.lock()) {
                             std::vector<nghttp2_nv> hdrs;
-                            auto fill = [](std::string_view name, std::string_view value, auto& hdrs) {
-                                nghttp2_nv nv;
-                                nv.name = (uint8_t*)name.data();
-                                nv.namelen = name.size();
-                                nv.value = (uint8_t*)value.data();
-                                nv.valuelen = value.size();
-                                nv.flags = NGHTTP2_NV_FLAG_NONE;
-                                hdrs.push_back(nv);
-                            };
-
-                            fill(":path", stream_spec->path(), hdrs);
-                            fill(":scheme", m_cfg.use_tls ? "https" : "http", hdrs);
-                            fill(":authority", m_cfg.host, hdrs);
+                            fillH2Header(":path", stream_spec->path(), hdrs);
+                            fillH2Header(":scheme", m_cfg.use_tls ? "https" : "http", hdrs);
+                            fillH2Header(":authority", m_cfg.host, hdrs);
                             std::string method_str = http::to_string(stream_spec->method());
-                            fill(":method", method_str, hdrs);
-                            fill("user-agent", client_version, hdrs);
-
+                            fillH2Header(":method", method_str, hdrs);
+                            fillH2Header("user-agent", client_version, hdrs);
                             for (const auto& [k, v] : stream_spec->header()) {
-                                fill(k, v, hdrs);
+                                fillH2Header(k, v, hdrs);
                             }
 
                             auto ex = asio::get_associated_executor(*h);
@@ -2487,9 +2478,13 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
 
         nghttp2_submit_settings(m_session, NGHTTP2_FLAG_NONE, iv.data(), iv.size());
 
-        auto func =
-            [](auto socket, auto h2_channel, std::weak_ptr<Http2Client> self, auto timeout) -> asio::awaitable<void> {
+        auto start_forward = [](auto socket, std::weak_ptr<Http2Client> self) -> asio::awaitable<void> {
             auto sp = self.lock();
+            if (!sp) {
+                co_return;
+            }
+            auto& h2_channel = sp->m_send_h2_channel;
+            auto& timeout = sp->m_cfg.idle_timeout;
             auto deadline = std::make_shared<std::chrono::steady_clock::time_point>(std::chrono::steady_clock::now());
             co_await (toH2Parse(socket, sp, deadline, std::chrono::seconds(timeout)) ||
                       toSocket(socket, h2_channel, deadline, std::chrono::seconds(timeout)) || watchdog(deadline));
@@ -2498,10 +2493,9 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
                 rsp->try_send(Disconnect{});
             }
             sp->m_streams.clear();
+            co_return;
         };
-        asio::co_spawn(*m_io_context,
-                       func(socket_ptr, m_send_h2_channel, shared_from_this(), m_cfg.idle_timeout),
-                       asio::detached);
+        asio::co_spawn(*m_io_context, start_forward(socket_ptr, shared_from_this()), asio::detached);
 
         nghttp2_session_send(m_session);
     }
