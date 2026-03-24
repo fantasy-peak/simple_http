@@ -1719,6 +1719,9 @@ inline asio::awaitable<void> HttpServer::upgradeH2c(AsyncStream socket,
     if (req.method() != http::verb::options) {
         auto http_request_reader = h2p->getStreamCtx(1);
         http_request_reader->setHttpRequest(req);
+        auto& body_ref = http_request_reader->getBody();
+        http_request_reader->trySend(std::make_unique<std::string>(std::move(body_ref)));
+        body_ref.clear();
         http_request_reader->trySend(Eof{});
         callHandler(m_handler_functions,
                     *io_dispatch,
