@@ -30,7 +30,7 @@ asio::awaitable<void> client(simple_http::IoCtxPool& pool) {
         co_return;
     }
     auto stream_spec = std::make_shared<simple_http::StreamSpec>(http::verb::post, "/hello");
-    stream_spec->writeHeader(http::field::content_type, "text/plain");
+    stream_spec->writeHeader(http::field::content_type, simple_http::mime::text_plain);
     stream_spec->body() = "hi, im simple http client";
     auto opt = co_await client->openStream(stream_spec, asio::use_awaitable);
     if (!opt) {

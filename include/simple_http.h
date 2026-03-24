@@ -103,24 +103,26 @@ struct overloaded : Ts... {
     using Ts::operator()...;
 };
 
+namespace mime {
+constexpr std::string_view text_plain = "text/plain";
+constexpr std::string_view text_html = "text/html";
+constexpr std::string_view app_json = "application/json";
+constexpr std::string_view app_xml = "application/xml";
+constexpr std::string_view app_octet_stream = "application/octet-stream";
+constexpr std::string_view text_css = "text/css";
+constexpr std::string_view text_javascript = "text/javascript";
+constexpr std::string_view image_gif = "image/gif";
+}  // namespace mime
+
 inline std::shared_ptr<http::response<http::string_body>> makeHttpResponse(
     http::status status = http::status::ok,
-    std::string_view content_type = "text/plain") {
+    std::string_view content_type = mime::text_plain) {
     auto res = std::make_shared<http::response<http::string_body>>();
     res->version(11);
     res->result(status);
     res->set(http::field::server, server_version);
     res->set(http::field::content_type, content_type);
     return res;
-}
-
-inline std::shared_ptr<http::request<http::string_body>> makeHttpRequest(const std::string& path,
-                                                                         http::verb method = http::verb::post,
-                                                                         Version http_version = Version::Http11) {
-    auto req =
-        std::make_shared<http::request<http::string_body>>(method, path, http_version == Version::Http11 ? 11 : 10);
-    req->set(http::field::user_agent, "simpe_http_client");
-    return req;
 }
 
 inline int32_t CHANNEL_SIZE = 100000;
@@ -619,13 +621,13 @@ struct HandlerFunctions {
         {"*", [](auto, auto writer) -> asio::awaitable<void> {
              if (writer->version() == simple_http::Version::Http2) {
                  writer->writeStatus(404);
-                 writer->writeHeader("content-type", "text/plain");
+                 writer->writeHeader("content-type", mime::text_plain);
                  writer->writeHeader(http::field::server, server_version);
                  writer->writeHeaderEnd();
                  writer->writeBodyEnd("");
              } else {
                  http::response<http::string_body> res{http::status::not_found, 11};
-                 res.set(http::field::content_type, "text/plain");
+                 res.set(http::field::content_type, mime::text_plain);
                  res.set(http::field::server, server_version);
                  res.body() = "";
                  writer->writeHttpResponse(std::make_shared<http::response<http::string_body>>(res));

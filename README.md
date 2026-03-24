@@ -32,7 +32,7 @@ asio::awaitable<void> start() {
     simple_http::Config cfg{
         .ip = "0.0.0.0",
         .port = 7788,
-        .worker_num = 4,
+        .worker_num = 8,
         .concurrent_streams = 200,
         .window_size = std::nullopt,
         .max_frame_size = std::nullopt,
@@ -48,28 +48,25 @@ asio::awaitable<void> start() {
         .enable_ipv6 = true,
         .ipv6_addr = "::1",
         .ipv6_port = 7788,
+        .unix_socket = std::nullopt,
+        .websocket_setup_cb = [](auto socket) { std::visit([](auto&& arg) { arg->compress(false); }, socket); },
     };
     simple_http::HttpServer hs(cfg);
-    simple_http::LOG_CB =
-        [](simple_http::LogLevel level, auto file, auto line, std::string msg) {
-            std::out << to_string(level) << " " << file << ":" << line << " " << msg
-                << std::endl;
-        };
-    hs.setBefore([](const std::shared_ptr<simple_http::HttpRequestReader>& reader,
-                    const std::shared_ptr<simple_http::HttpResponseWriter>& writer) -> asio::awaitable<bool> {
-        std::cout << "setBefore:" << reader->target() << std::endl;
-        if (reader->target() != "/hello")
-        {
+    simple_http::LOG_CB = [](simple_http::LogLevel level, auto file, auto line, std::string msg) {
+        std::println("{} {} {} {}", to_string(level), file, line, msg);
+    };
+    hs.setBefore([](const auto& reader, const auto& writer) -> asio::awaitable<bool> {
+        if (reader->target() != "/hello") {
             auto res = simple_http::makeHttpResponse(http::status::bad_request);
             writer->writeHttpResponse(res);
             co_return false;
         }
         co_return true;
     });
-    hs.setHttpHandler(
-        "/hello", [](auto req, auto writer) -> asio::awaitable<void> {
+    hs.setHttpHandler("/hello",
+        [](auto req, auto writer) -> asio::awaitable<void> {
             writer->writeStatus(200);
-            writer->writeHeader("content-type", "text/plain");
+            writer->writeHeader(http::field::content_type, simple_http::mime::text_plain);
             writer->writeStreamHeaderEnd();
             writer->writeStreamBody("hello world");
             writer->writeStreamEnd();

@@ -61,7 +61,7 @@ asio::awaitable<void> hello(std::shared_ptr<simple_http::HttpRequestReader> read
             }
         }
 
-        writer->writeHeader("content-type", "text/plain");
+        writer->writeHeader(http::field::content_type, simple_http::mime::text_plain);
         writer->writeHeader(http::field::server, simple_http::server_version);
         writer->writeHeaderEnd();
         writer->writeBody("123");
@@ -78,7 +78,7 @@ asio::awaitable<void> hello(std::shared_ptr<simple_http::HttpRequestReader> read
         // curl --no-buffer  -v http://localhost:6666/hello -d "aaaa"
         http::response<http::empty_body> res{http::status::ok, 11};
         res.set(http::field::server, simple_http::server_version);
-        res.set(http::field::content_type, "text/plain");
+        res.set(http::field::content_type, simple_http::mime::text_plain);
         res.keep_alive(true);
         writer->writeChunkHeader(res);
         writer->writeChunkData("123");
@@ -158,7 +158,7 @@ asio::awaitable<void> start() {
                               std::shared_ptr<simple_http::HttpResponseWriter> writer) -> asio::awaitable<void> {
                                // This approach will unify HTTP1.1 and HTTP2 streaming responses.
                                writer->writeStatus(200);
-                               writer->writeHeader(http::field::content_type, "text/plain");
+                               writer->writeHeader(http::field::content_type, simple_http::mime::text_plain);
                                writer->writeStreamHeaderEnd();
                                writer->writeStreamBody("regex matched");
                                writer->writeStreamEnd();
