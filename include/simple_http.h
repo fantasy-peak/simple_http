@@ -781,7 +781,9 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
         return 0;
     }
 
-    bool writeHeaderEnd(auto headers, int32_t stream_id, std::string http_status) {
+    bool writeHeaderEnd(std::unique_ptr<std::vector<std::tuple<std::string, std::string>>> headers,
+                        int32_t stream_id,
+                        std::string http_status) {
         auto sp = m_h2_channel.lock();
         if (!sp) {
             return false;
@@ -800,7 +802,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
                        std::vector<nghttp2_nv> hdrs;
                        static std::string status{":status"};
                        fillH2Header(status, http_status, hdrs);
-                       for (auto& [name, value] : headers) {
+                       for (auto& [name, value] : *headers) {
                            fillH2Header(name, value, hdrs);
                        }
 
@@ -1032,16 +1034,16 @@ class HttpResponseWriter {
     template <typename Key, typename Value>
     void writeHeader(Key&& key, Value&& value) {
         if constexpr (std::is_same_v<std::decay_t<Key>, http::field>) {
-            m_headers.emplace_back(http::to_string(std::forward<Key>(key)), std::forward<Value>(value));
+            m_headers->emplace_back(http::to_string(std::forward<Key>(key)), std::forward<Value>(value));
         } else {
-            m_headers.emplace_back(std::forward<Key>(key), std::forward<Value>(value));
+            m_headers->emplace_back(std::forward<Key>(key), std::forward<Value>(value));
         }
     }
 
     template <typename T>
     void writeHeader(const T& headers) {
         for (auto& [k, v] : headers) {
-            m_headers.emplace_back(k, v);
+            m_headers->emplace_back(k, v);
         }
     }
 
@@ -1049,12 +1051,15 @@ class HttpResponseWriter {
         if (m_version != Version::Http2)
             return false;
         static std::string server = http::to_string(http::field::server);
-        auto it = std::find_if(m_headers.begin(), m_headers.end(), [&](auto&& p) { return server == std::get<0>(p); });
-        if (it == m_headers.end()) {
-            m_headers.emplace_back(server, server_version);
+        auto it =
+            std::find_if(m_headers->begin(), m_headers->end(), [&](auto&& p) { return server == std::get<0>(p); });
+        if (it == m_headers->end()) {
+            m_headers->emplace_back(server, server_version);
         }
         m_write_h2_header_done = true;
-        return m_http2_parse->writeHeaderEnd(std::move(m_headers), m_stream_id, std::move(m_http_status));
+        // Attention m_headers already move !!!
+        auto ret = m_http2_parse->writeHeaderEnd(std::move(m_headers), m_stream_id, std::move(m_http_status));
+        return ret;
     }
 
     template <typename T>
@@ -1161,7 +1166,7 @@ class HttpResponseWriter {
             http::response<http::empty_body> res;
             res.version(11);
             res.result(m_http_status_code);
-            for (const auto& [k, v] : m_headers) {
+            for (const auto& [k, v] : *m_headers) {
                 res.set(k, v);
             }
             return writeChunkHeader(res);
@@ -1195,7 +1200,8 @@ class HttpResponseWriter {
     Version m_version;
     std::string m_http_status{"200"};
     int32_t m_http_status_code{200};
-    std::vector<std::tuple<std::string, std::string>> m_headers;
+    std::unique_ptr<std::vector<std::tuple<std::string, std::string>>> m_headers{
+        std::make_unique<std::vector<std::tuple<std::string, std::string>>>()};
     bool m_write_h2_header_done{false};
     bool m_write_h2_body_done{false};
 };
@@ -1369,6 +1375,10 @@ class HttpServer final {
     HttpServer& operator=(const HttpServer&) = delete;
     HttpServer(HttpServer&&) = delete;
     HttpServer& operator=(HttpServer&&) = delete;
+
+    static auto create(const Config& cfg) {
+        return std::make_unique<HttpServer>(cfg);
+    }
 
     asio::awaitable<void> start() {
         if (m_cfg.enable_ipv6) {
