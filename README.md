@@ -94,8 +94,8 @@ asio::awaitable<void> client(simple_http::IoCtxPool& pool) {
         .use_tls = true,
         .verify_peer = true,
         .ssl_ca = "./test/tls_certificates/ca_cert.pem",
-        .ssl_crt = "./test/tls_certificates/server_cert.pem",
-        .ssl_key = "./test/tls_certificates/server_key.pem",
+        .ssl_crt = "./test/tls_certificates/client_cert.pem",
+        .ssl_key = "./test/tls_certificates/client_key.pem",
         .ssl_context = nullptr,
         .tlsext_host_name = "SimpleHttpServer",
     };
@@ -147,7 +147,16 @@ int main() {
     };
     simple_http::IoCtxPool pool{1};
     pool.start();
-    asio::co_spawn(pool.getIoContext(), client(pool), asio::detached);
+    asio::co_spawn(pool.getIoContext(), client(pool), [](const std::exception_ptr& ep) {
+        try {
+            if (ep)
+                std::rethrow_exception(ep);
+        } catch (const std::exception& e) {
+            SIMPLE_HTTP_ERROR_LOG("{}", e.what());
+        } catch (...) {
+            SIMPLE_HTTP_ERROR_LOG("unknown exception");
+        }
+    });
     while (true)
         sleep(1000);
     return 0;
