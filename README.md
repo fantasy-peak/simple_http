@@ -15,6 +15,7 @@
 - **Highly Configurable**: Easily configure server worker threads, concurrent stream limits, window sizes, and more.
 - **Middleware Support**: Offers a `setBefore` interface for middleware-style request pre-processing.
 - **IPv4 & IPv6**: Full dual-stack support.
+- **UNIX Domain Sockets**: High-performance local IPC with zero network overhead.
 
 ## 🚀 Requirements
 
@@ -25,6 +26,15 @@
 - **OpenSSL**
 
 > **Note**: When building with `xmake`, it automatically downloads and links all necessary dependencies, so you don't need to install them manually.
+
+## 🛠 Configuration Macros
+
+The following macros can be defined to enable or customize specific features:
+
+- `SIMPLE_HTTP_EXPERIMENT_WEBSOCKET`: Enables experimental WebSocket support.
+- `SIMPLE_HTTP_EXPERIMENT_HTTP2CLIENT`: Enables experimental HTTP/2 client support.
+- `SIMPLE_HTTP_USE_BOOST_REGEX`: Uses `boost::regex` instead of `std::regex` for header parsing and routing. This can provide better performance and compatibility in certain environments.
+- `SIMPLE_HTTP_BIND_UNIX_SOCKET`: Enables support for binding the server to UNIX Domain Sockets (UDS) for high-performance local IPC.
 
 ## Server Example
 ```

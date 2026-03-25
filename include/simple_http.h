@@ -375,6 +375,8 @@ using RequestCallback = std::variant<SimpleCallback, SslContextCallback>;
 #ifdef SIMPLE_HTTP_EXPERIMENT_WEBSOCKET
 using WssSocketPtr = std::shared_ptr<websocket::stream<asio::ssl::stream<asio::ip::tcp::socket>>>;
 using WsSocketPtr = std::shared_ptr<websocket::stream<asio::ip::tcp::socket>>;
+using WssUnixSocketPtr = std::shared_ptr<websocket::stream<asio::ssl::stream<asio::local::stream_protocol::socket>>>;
+using WsUnixSocketPtr = std::shared_ptr<websocket::stream<asio::local::stream_protocol::socket>>;
 
 template <typename SocketPtrType>
 class GenericStream {
@@ -397,12 +399,21 @@ class GenericStream {
 
 using WsStream = GenericStream<WsSocketPtr>;
 using WssStream = GenericStream<WssSocketPtr>;
+using WsUnixStream = GenericStream<WsUnixSocketPtr>;
+using WssUnixStream = GenericStream<WssUnixSocketPtr>;
 
 using WsStreamPtr = std::shared_ptr<WsStream>;
 using WssStreamPtr = std::shared_ptr<WssStream>;
+using WsUnixStreamPtr = std::shared_ptr<WsUnixStream>;
+using WssUnixStreamPtr = std::shared_ptr<WssUnixStream>;
+
 using WsCallBack = std::function<asio::awaitable<bool>(const http::request<http::string_body>&, const WsStreamPtr&)>;
 using WssCallBack = std::function<asio::awaitable<bool>(const http::request<http::string_body>&, const WssStreamPtr&)>;
-using WebSocketCallback = std::variant<WsCallBack, WssCallBack>;
+using WsUnixCallBack =
+    std::function<asio::awaitable<bool>(const http::request<http::string_body>&, const WsUnixStreamPtr&)>;
+using WssUnixCallBack =
+    std::function<asio::awaitable<bool>(const http::request<http::string_body>&, const WssUnixStreamPtr&)>;
+using WebSocketCallback = std::variant<WsCallBack, WssCallBack, WsUnixCallBack, WssUnixCallBack>;
 #endif
 
 class HttpRequestReader {
@@ -1344,7 +1355,7 @@ struct Config {
     std::optional<std::string> unix_socket;
     std::function<void(asio::ssl::context&)> ssl_setup_cb;
 #ifdef SIMPLE_HTTP_EXPERIMENT_WEBSOCKET
-    std::function<void(std::variant<WssSocketPtr, WsSocketPtr>)> websocket_setup_cb;
+    std::function<void(std::variant<WssSocketPtr, WsSocketPtr, WssUnixSocketPtr, WsUnixSocketPtr>)> websocket_setup_cb;
     bool auto_upgrade_websocket{true};
 #endif
     bool reuse_port{false};
@@ -1489,7 +1500,8 @@ class HttpServer final {
                                   __private::SessionContext session_context,
                                   asio::ip::tcp::endpoint endpoint);
     // https server
-    asio::awaitable<void> startSslsession(std::shared_ptr<asio::ssl::stream<asio::ip::tcp::socket>> socket,
+    template <typename AsyncStream>
+    asio::awaitable<void> startSslsession(AsyncStream socket,
                                           std::shared_ptr<asio::io_context> context,
                                           asio::ip::tcp::endpoint remote_ep);
 
@@ -1608,16 +1620,17 @@ inline asio::awaitable<void> HttpServer::startUnixAcceptor(const std::optional<s
                 break;
             continue;
         }
+        asio::ip::tcp::endpoint remote_ep;
         if (!m_ssl_context) {
             auto session_socket = std::make_shared<asio::local::stream_protocol::socket>(std::move(socket));
             asio::co_spawn(*context,
-                           session(std::move(session_socket), context, __private::SessionContext{}),
+                           session(std::move(session_socket), context, __private::SessionContext{}, remote_ep),
                            asio::detached);
         } else {
             auto session_socket =
                 std::make_shared<asio::ssl::stream<asio::local::stream_protocol::socket>>(std::move(socket),
                                                                                           *m_ssl_context);
-            asio::co_spawn(*context, startSslsession(std::move(session_socket), context), asio::detached);
+            asio::co_spawn(*context, startSslsession(std::move(session_socket), context, remote_ep), asio::detached);
         }
     }
 #endif
@@ -1923,7 +1936,7 @@ inline asio::awaitable<void> HttpServer::session(AsyncStream socket,
                 co_return;
             }
         }
-        auto callback = [](auto& full_req, auto& stream, auto& cb) -> asio::awaitable<void> {
+        auto callback = [](auto& full_req, auto& stream, WebSocketCallback& cb) -> asio::awaitable<void> {
             try {
                 if constexpr (std::is_same_v<SocketType, asio::ip::tcp::socket>) {
                     std::shared_ptr<WsStream> ptr = std::make_shared<WsStream>(Version::Http11, stream);
@@ -1932,9 +1945,25 @@ inline asio::awaitable<void> HttpServer::session(AsyncStream socket,
                         co_await stream->async_close(websocket::close_code::normal,
                                                      asio::as_tuple(asio::use_awaitable));
                     }
-                } else {
+                } else if constexpr (std::is_same_v<SocketType, asio::ssl::stream<asio::ip::tcp::socket>>) {
                     auto ptr = std::make_shared<WssStream>(Version::Http11, stream);
                     auto ret = co_await std::get<WssCallBack>(cb)(full_req, ptr);
+                    if (ret) {
+                        co_await stream->async_close(websocket::close_code::normal,
+                                                     asio::as_tuple(asio::use_awaitable));
+                        co_await stream->next_layer().async_shutdown(asio::as_tuple(asio::use_awaitable));
+                    }
+                } else if constexpr (std::is_same_v<SocketType, asio::local::stream_protocol::socket>) {
+                    auto ptr = std::make_shared<WsUnixStream>(Version::Http11, stream);
+                    auto ret = co_await std::get<WsUnixCallBack>(cb)(full_req, ptr);
+                    if (ret) {
+                        co_await stream->async_close(websocket::close_code::normal,
+                                                     asio::as_tuple(asio::use_awaitable));
+                    }
+                } else if constexpr (std::is_same_v<SocketType,
+                                                    asio::ssl::stream<asio::local::stream_protocol::socket>>) {
+                    auto ptr = std::make_shared<WssUnixStream>(Version::Http11, stream);
+                    auto ret = co_await std::get<WssUnixCallBack>(cb)(full_req, ptr);
                     if (ret) {
                         co_await stream->async_close(websocket::close_code::normal,
                                                      asio::as_tuple(asio::use_awaitable));
@@ -1952,7 +1981,8 @@ inline asio::awaitable<void> HttpServer::session(AsyncStream socket,
         if (it != m_handler_functions->websocket_map_proc.end()) {
             co_await callback(full_req, stream, it->second);
         } else {
-            for (const auto& [pattern, cb] : m_handler_functions->ws_regex_proc) {
+            for (auto& p : m_handler_functions->ws_regex_proc) {
+                auto& [pattern, cb] = p;
                 std::string str{path};
                 if (regex_adapter::regex_match(str, pattern)) {
                     co_await callback(full_req, stream, cb);
@@ -1983,10 +2013,10 @@ inline asio::awaitable<void> HttpServer::session(AsyncStream socket,
     co_return;
 }
 
-inline asio::awaitable<void> HttpServer::startSslsession(
-    std::shared_ptr<asio::ssl::stream<asio::ip::tcp::socket>> socket,
-    std::shared_ptr<asio::io_context> context,
-    asio::ip::tcp::endpoint remote_ep) {
+template <typename AsyncStream>
+inline asio::awaitable<void> HttpServer::startSslsession(AsyncStream socket,
+                                                         std::shared_ptr<asio::io_context> context,
+                                                         asio::ip::tcp::endpoint remote_ep) {
     auto [ec] = co_await socket->async_handshake(asio::ssl::stream_base::server, asio::as_tuple(asio::use_awaitable));
     if (ec) {
         SIMPLE_HTTP_DEBUG_LOG("async_handshake: {}, {}", ec.message(), remote_ep.address().to_string());
@@ -2019,7 +2049,10 @@ struct HttpRequestWriter final {
     int m_stream_id;
     Version m_version;
     std::function<void(int, std::shared_ptr<std::string>, WriteMode)> m_writer_body;
-    std::variant<std::weak_ptr<asio::ssl::stream<asio::ip::tcp::socket>>, std::weak_ptr<asio::ip::tcp::socket>>
+    std::variant<std::weak_ptr<asio::ssl::stream<asio::ip::tcp::socket>>,
+                 std::weak_ptr<asio::ip::tcp::socket>,
+                 std::weak_ptr<asio::local::stream_protocol::socket>,
+                 std::weak_ptr<asio::ssl::stream<asio::local::stream_protocol::socket>>>
         m_variant_socket;
 };
 
@@ -2157,6 +2190,7 @@ struct HttpClientConfig {
     std::shared_ptr<asio::ssl::context> ssl_context;
     std::string tlsext_host_name;
     std::chrono::seconds idle_timeout{120};
+    std::optional<std::string> unix_socket;
 };
 
 class Http2Client final : public std::enable_shared_from_this<Http2Client> {
@@ -2202,19 +2236,16 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
     void disconnect() {
         asio::dispatch(*m_io_context, [this] {
             std::visit(
-                [](auto&& weak_ptr_ptr) {
-                    if (auto sp = weak_ptr_ptr.lock()) {
+                [&](auto&& weak_handle) {
+                    auto s = weak_handle.lock();
+                    if (!s) {
+                        return;
+                    }
+                    auto& lowest = s->lowest_layer();
+                    if (lowest.is_open()) {
                         boost::system::error_code ec;
-                        auto& lowest_layer = [&]() -> asio::ip::tcp::socket& {
-                            if constexpr (std::is_same_v<std::decay_t<decltype(*sp)>,
-                                                         asio::ssl::stream<asio::ip::tcp::socket>>) {
-                                return sp->next_layer();
-                            } else {
-                                return *sp;
-                            }
-                        }();
-                        lowest_layer.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
-                        lowest_layer.close(ec);
+                        lowest.shutdown(asio::socket_base::shutdown_both, ec);
+                        lowest.close(ec);
                     }
                 },
                 m_variant_socket);
@@ -2236,57 +2267,15 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
                             m_session = nullptr;
                         }
                         auto ex = asio::get_associated_executor(*h);
-                        auto solver = asio::ip::tcp::resolver(*m_io_context);
-                        auto [ec, results] = co_await solver.async_resolve(m_cfg.host,
-                                                                           std::to_string(m_cfg.port),
-                                                                           asio::as_tuple(asio::use_awaitable));
-                        if (ec) {
-                            asio::dispatch(ex, [=] { std::move (*h)(std::make_tuple(false, ec.message())); });
-                            co_return;
-                        }
-                        auto target_endpoint = results.begin()->endpoint();
-                        auto protocol = target_endpoint.protocol();
-                        asio::ip::tcp::socket socket(*m_io_context);
-                        socket.open(protocol, ec);
-                        if (ec) {
-                            asio::dispatch(ex, [=] { std::move (*h)(std::make_tuple(false, ec.message())); });
-                            co_return;
-                        }
-#ifdef TCP_FASTOPEN_CONNECT
-                        int value = 1;
-                        socket.set_option(asio::detail::socket_option::integer<IPPROTO_TCP, TCP_FASTOPEN_CONNECT>(
-                                              value),
-                                          ec);
-#endif
-                        asio::steady_timer timer(*m_io_context);
-                        timer.expires_after(timeout);
-                        auto result =
-                            co_await (socket.async_connect(target_endpoint, asio::as_tuple(asio::use_awaitable)) ||
-                                      timer.async_wait(asio::as_tuple(asio::use_awaitable)));
-                        if (result.index() == 0) {
-                            auto [ec] = std::get<0>(result);
-                            if (ec) {
-                                asio::dispatch(ex, [=] { std::move (*h)(std::make_tuple(false, ec.message())); });
-                                co_return;
-                            }
-                        } else if (result.index() == 1) {
-                            asio::dispatch(ex, [=] {
-                                std::move (*h)(std::make_tuple(false, std::string("async_connect timeout")));
-                            });
-                            co_return;
-                        }
                         m_send_h2_channel = std::make_shared<Http2Channel>(*m_io_context, CHANNEL_SIZE);
-                        if (m_cfg.use_tls) {
-                            auto socket_ptr =
-                                std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(std::move(socket),
-                                                                                           *m_cfg.ssl_context);
-                            m_variant_socket = socket_ptr;
+                        auto do_ssl =
+                            [](auto self, auto socket_ptr, auto& ex, auto& cfg, auto& h) -> asio::awaitable<void> {
                             if (!SSL_set_tlsext_host_name(socket_ptr->native_handle(),
-                                                          m_cfg.tlsext_host_name.empty()
-                                                              ? (void*)m_cfg.host.c_str()
-                                                              : (void*)m_cfg.tlsext_host_name.c_str())) {
-                                ec = boost::system::error_code(static_cast<int>(::ERR_get_error()),
-                                                               asio::error::get_ssl_category());
+                                                          cfg.tlsext_host_name.empty()
+                                                              ? (void*)cfg.host.c_str()
+                                                              : (void*)cfg.tlsext_host_name.c_str())) {
+                                auto ec = boost::system::error_code(static_cast<int>(::ERR_get_error()),
+                                                                    asio::error::get_ssl_category());
                                 asio::dispatch(ex, [=] { std::move (*h)(std::make_tuple(false, ec.message())); });
                                 co_return;
                             }
@@ -2302,7 +2291,7 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
 
                             SSL_get0_alpn_selected(socket_ptr->native_handle(), &protocol, &length);
                             if (length == 2 && std::memcmp(protocol, "h2", 2) == 0) {
-                                initNghttp2AndStart(socket_ptr);
+                                self->initNghttp2AndStart(socket_ptr);
                                 asio::dispatch(ex,
                                                [=] { std::move (*h)(std::make_tuple(true, std::string{"success"})); });
                             } else {
@@ -2310,12 +2299,85 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
                                     std::move (*h)(std::make_tuple(false, std::string{"ALPN negotiation failed"}));
                                 });
                             }
+                            co_return;
+                        };
+                        if (m_cfg.unix_socket.has_value()) {
+                            asio::local::stream_protocol::socket socket(*m_io_context);
+                            asio::local::stream_protocol::endpoint ep(m_cfg.unix_socket.value());
+                            auto [ec] = co_await socket.async_connect(ep, asio::as_tuple(asio::use_awaitable));
+                            if (ec) {
+                                asio::dispatch(ex, [=] { std::move (*h)(std::make_tuple(false, ec.message())); });
+                                co_return;
+                            }
+                            if (m_cfg.use_tls) {
+                                auto socket_ptr =
+                                    std::make_shared<asio::ssl::stream<asio::local::stream_protocol::socket>>(
+                                        std::move(socket), *m_cfg.ssl_context);
+                                m_variant_socket = socket_ptr;
+                                co_await do_ssl(this, socket_ptr, ex, m_cfg, h);
+                            } else {
+                                auto socket_ptr =
+                                    std::make_shared<asio::local::stream_protocol::socket>(std::move(socket));
+                                m_variant_socket = socket_ptr;
+                                initNghttp2AndStart(socket_ptr);
+                                asio::dispatch(ex,
+                                               [=] { std::move (*h)(std::make_tuple(true, std::string{"success"})); });
+                            }
                         } else {
-                            // for H2C
-                            auto socket_ptr = std::make_shared<asio::ip::tcp::socket>(std::move(socket));
-                            m_variant_socket = socket_ptr;
-                            initNghttp2AndStart(socket_ptr);
-                            asio::dispatch(ex, [=] { std::move (*h)(std::make_tuple(true, std::string{"success"})); });
+                            auto solver = asio::ip::tcp::resolver(*m_io_context);
+                            auto [ec, results] = co_await solver.async_resolve(m_cfg.host,
+                                                                               std::to_string(m_cfg.port),
+                                                                               asio::as_tuple(asio::use_awaitable));
+                            if (ec) {
+                                asio::dispatch(ex, [=] { std::move (*h)(std::make_tuple(false, ec.message())); });
+                                co_return;
+                            }
+                            auto target_endpoint = results.begin()->endpoint();
+                            auto protocol = target_endpoint.protocol();
+                            asio::ip::tcp::socket socket(*m_io_context);
+                            socket.open(protocol, ec);
+                            if (ec) {
+                                asio::dispatch(ex, [=] { std::move (*h)(std::make_tuple(false, ec.message())); });
+                                co_return;
+                            }
+#ifdef TCP_FASTOPEN_CONNECT
+                            int value = 1;
+                            socket.set_option(asio::detail::socket_option::integer<IPPROTO_TCP, TCP_FASTOPEN_CONNECT>(
+                                                  value),
+                                              ec);
+#endif
+                            asio::steady_timer timer(*m_io_context);
+                            timer.expires_after(timeout);
+                            auto result =
+                                co_await (socket.async_connect(target_endpoint, asio::as_tuple(asio::use_awaitable)) ||
+                                          timer.async_wait(asio::as_tuple(asio::use_awaitable)));
+                            if (result.index() == 0) {
+                                auto [ec] = std::get<0>(result);
+                                if (ec) {
+                                    asio::dispatch(ex, [=] { std::move (*h)(std::make_tuple(false, ec.message())); });
+                                    co_return;
+                                }
+                            } else if (result.index() == 1) {
+                                asio::dispatch(ex, [=] {
+                                    std::move (*h)(std::make_tuple(false, std::string("async_connect timeout")));
+                                });
+                                co_return;
+                            }
+
+                            if (m_cfg.use_tls) {
+                                auto socket_ptr =
+                                    std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(std::move(socket),
+                                                                                               *m_cfg.ssl_context);
+                                m_variant_socket = socket_ptr;
+                                co_await do_ssl(this, socket_ptr, ex, m_cfg, h);
+                            } else {
+                                // for H2C
+                                auto socket_ptr = std::make_shared<asio::ip::tcp::socket>(std::move(socket));
+                                m_variant_socket = socket_ptr;
+                                initNghttp2AndStart(socket_ptr);
+                                asio::dispatch(ex,
+                                               [=] { std::move (*h)(std::make_tuple(true, std::string{"success"})); });
+                            }
                         }
                     },
                     asio::detached);
@@ -2573,7 +2635,10 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
 
     HttpClientConfig m_cfg;
     std::shared_ptr<asio::io_context> m_io_context;
-    std::variant<std::weak_ptr<asio::ssl::stream<asio::ip::tcp::socket>>, std::weak_ptr<asio::ip::tcp::socket>>
+    std::variant<std::weak_ptr<asio::ssl::stream<asio::ip::tcp::socket>>,
+                 std::weak_ptr<asio::ip::tcp::socket>,
+                 std::weak_ptr<asio::local::stream_protocol::socket>,
+                 std::weak_ptr<asio::ssl::stream<asio::local::stream_protocol::socket>>>
         m_variant_socket;
     nghttp2_session_callbacks* m_cbs{};
     nghttp2_session* m_session{};

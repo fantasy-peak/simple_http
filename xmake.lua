@@ -1,10 +1,7 @@
 add_rules("mode.debug", "mode.release")
 
 set_languages("c++23")
-set_toolchains("gcc")
 
--- TEMP: false positives?
-add_cxxflags("-Wno-maybe-uninitialized")
 set_warnings("all", "error")
 
 add_rules("plugin.compile_commands.autoupdate", { outputdir = "build", lsp="clangd" })
@@ -31,6 +28,11 @@ target_end()
 
 target("server")
     set_kind("binary")
+    on_load(function (target)
+        if target:toolchain("gcc") then
+            target:add("cxxflags", "-Wno-maybe-uninitialized")
+        end
+    end)
     add_deps("simple_http")
     add_defines("SIMPLE_HTTP_EXPERIMENT_WEBSOCKET", "SIMPLE_HTTP_USE_BOOST_REGEX")
     add_files("test/server.cpp")
@@ -39,8 +41,13 @@ target_end()
 
 target("client")
     set_kind("binary")
+    on_load(function (target)
+        if target:toolchain("gcc") then
+            target:add("cxxflags", "-Wno-maybe-uninitialized")
+        end
+    end)
     add_deps("simple_http")
-    add_defines("SIMPLE_HTTP_EXPERIMENT_HTTP2CLIENT")
+    add_defines("SIMPLE_HTTP_EXPERIMENT_HTTP2CLIENT", "SIMPLE_HTTP_EXPERIMENT_WEBSOCKET")
     add_files("test/client.cpp")
     set_rundir(".")
 target_end()

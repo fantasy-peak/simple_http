@@ -1,4 +1,4 @@
-name: CI
+name: gcc
 
 on:
   push:
@@ -14,5 +14,5 @@ jobs:
     steps:
     - uses: actions/checkout@v5
     - uses: cachix/install-nix-action@v31
-    - run: nix develop -c xmake build -y --all
-    - run: nix develop -c xmake install -o .
+    - run: nix develop -c sh -c "xmake f -p linux --toolchain=gcc -y && xmake build -y --all && xmake install -o ."
+
