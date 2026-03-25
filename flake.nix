@@ -17,6 +17,7 @@
 
             packages = with pkgs; [
               gcc
+              clang
               xmake
               unzip
               gnum4

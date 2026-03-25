@@ -1,0 +1,18 @@
+name: clang
+
+on:
+  push:
+    branches: ["main", "dev"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  install:
+    runs-on: ubuntu-latest
+    env:
+      XMAKE_ROOT: "y"
+    steps:
+    - uses: actions/checkout@v5
+    - uses: cachix/install-nix-action@v31
+    - run: nix develop -c sh -c "xmake f -p linux --toolchain=clang -y && xmake build -y --all && xmake install -o ."
+

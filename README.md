@@ -15,6 +15,7 @@
 - **Highly Configurable**: Easily configure server worker threads, concurrent stream limits, window sizes, and more.
 - **Middleware Support**: Offers a `setBefore` interface for middleware-style request pre-processing.
 - **IPv4 & IPv6**: Full dual-stack support.
+- **UNIX Domain Sockets**: High-performance local IPC with zero network overhead.
 
 ## 🚀 Requirements
 
