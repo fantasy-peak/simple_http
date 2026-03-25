@@ -47,7 +47,7 @@ target("client")
         end
     end)
     add_deps("simple_http")
-    add_defines("SIMPLE_HTTP_EXPERIMENT_HTTP2CLIENT")
+    add_defines("SIMPLE_HTTP_EXPERIMENT_HTTP2CLIENT", "SIMPLE_HTTP_EXPERIMENT_WEBSOCKET")
     add_files("test/client.cpp")
     set_rundir(".")
 target_end()
