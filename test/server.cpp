@@ -1,13 +1,15 @@
-#include <optional>
-#include <print>
-#include <sstream>
-#include <string>
-
 #include <openssl/ssl.h>
 #include <openssl/bio.h>
 #include <openssl/x509.h>
 
-#include "simple_http.h"
+#include <boost/asio/experimental/awaitable_operators.hpp>
+#include <boost/asio/experimental/concurrent_channel.hpp>
+#include <boost/asio.hpp>
+#include <boost/asio/ssl.hpp>
+#include <boost/beast.hpp>
+
+import std;
+import simple_http;
 
 namespace asio = boost::asio;
 namespace beast = boost::beast;
@@ -31,13 +33,6 @@ auto certificate_subject_name(const X509* x509_cert) -> std::string {
 
 asio::awaitable<void> hello(std::shared_ptr<simple_http::HttpRequestReader> reader,
                             std::shared_ptr<simple_http::HttpResponseWriter> writer) {
-    std::stringstream ss;
-    ss << "Headers:\n";
-    for (auto const& [name, value] : reader->header()) {
-        ss << "   " << name << ": " << value << "\n";
-    }
-    ss << reader->target() << "\n";
-    std::println("{}", ss.str());
     if (writer->version() == simple_http::Version::Http2) {
         // for http2 stream recv
         for (;;) {
@@ -49,7 +44,7 @@ asio::awaitable<void> hello(std::shared_ptr<simple_http::HttpRequestReader> read
             }
 
             bool should_continue = std::visit(simple_http::overloaded{[](std::unique_ptr<std::string> str) {
-                                                                          std::println("recv h2 data frame: {}", *str);
+                                                                          std::println("recv data: {}", *str);
                                                                           return true;
                                                                       },
                                                                       [](simple_http::Disconnect) { return false; },
@@ -64,13 +59,6 @@ asio::awaitable<void> hello(std::shared_ptr<simple_http::HttpRequestReader> read
         writer->writeHeader(http::field::content_type, simple_http::mime::text_plain);
         writer->writeHeader(http::field::server, simple_http::server_version);
         writer->writeHeaderEnd();
-        writer->writeBody("123");
-        asio::steady_timer timer(co_await asio::this_coro::executor);
-        timer.expires_after(std::chrono::seconds(1));
-        co_await timer.async_wait(asio::use_awaitable);
-        writer->writeBody("456");
-        timer.expires_after(std::chrono::seconds(1));
-        co_await timer.async_wait(asio::use_awaitable);
         writer->writeBodyEnd("789");
     } else {
         auto [connected, body] = co_await reader->body();
