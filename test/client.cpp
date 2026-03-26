@@ -74,7 +74,7 @@ asio::awaitable<void> client(simple_http::IoCtxPool& pool) {
 
 int main() {
     simple_http::LOG_CB = [](simple_http::LogLevel level, auto file, auto line, std::string msg) {
-        std::println("{} {} {} {}", to_string(level), file, line, msg);
+        std::println("{} {} {} {}", toString(level), file, line, msg);
     };
     simple_http::IoCtxPool pool{1};
     pool.start();
@@ -83,9 +83,9 @@ int main() {
             if (ep)
                 std::rethrow_exception(ep);
         } catch (const std::exception& e) {
-            SIMPLE_HTTP_ERROR_LOG("{}", e.what());
+            std::println("{}", e.what());
         } catch (...) {
-            SIMPLE_HTTP_ERROR_LOG("unknown exception");
+            std::println("unknown exception");
         }
     });
     while (true)

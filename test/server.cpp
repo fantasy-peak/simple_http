@@ -148,7 +148,7 @@ asio::awaitable<void> start() {
         .websocket_setup_cb = [](auto socket) { std::visit([](auto&& arg) { arg->compress(false); }, socket); },
     };
     simple_http::LOG_CB = [](simple_http::LogLevel level, auto file, auto line, std::string msg) {
-        std::println("{} {} {} {}", to_string(level), file, line, msg);
+        std::println("{} {} {} {}", toString(level), file, line, msg);
     };
     simple_http::HttpServer hs(cfg);
     hs.setHttpHandler("/hello", hello);
