@@ -286,7 +286,7 @@ inline void fillH2Header(std::string_view name, std::string_view value, std::vec
     nv.namelen = name.size();
     nv.value = (uint8_t*)value.data();
     nv.valuelen = value.size();
-    nv.flags = NGHTTP2_NV_FLAG_NONE;
+    nv.flags = NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE;
     hdrs.push_back(nv);
     return;
 }
@@ -296,13 +296,6 @@ struct DataContext {
     size_t offset = 0;
     size_t total_buffered = 0;
     bool is_finished = false;
-};
-
-struct CliDataContext {
-    const char* data;
-    size_t total_len;
-    size_t offset;
-    std::shared_ptr<void> input_data{nullptr};
 };
 
 inline ssize_t dataReadCallback(nghttp2_session* /* session */,
@@ -762,6 +755,8 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
         nghttp2_session_callbacks_set_on_frame_recv_callback(m_cbs, onFrameRecvCallback);
         nghttp2_session_callbacks_set_on_data_chunk_recv_callback(m_cbs, onDataChunkRecvCallback);
         nghttp2_session_callbacks_set_on_stream_close_callback(m_cbs, onStreamCloseCallback);
+        nghttp2_session_callbacks_set_on_frame_send_callback(m_cbs, onFrameSendCallback);
+        nghttp2_session_callbacks_set_on_frame_not_send_callback(m_cbs, onFrameNotSendCallback);
 
         nghttp2_session_server_new(&m_session, m_cbs, this);
 
@@ -814,9 +809,12 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
                        static std::string status{":status"};
                        fillH2Header(status, http_status, hdrs);
                        for (auto& [name, value] : *headers) {
+                           std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
+                               return std::tolower(c);
+                           });
                            fillH2Header(name, value, hdrs);
                        }
-
+                       m_header_cache.emplace(stream_id, std::move(headers));
                        auto* ctx = new DataContext();
                        nghttp2_session_set_stream_user_data(m_session, stream_id, ctx);
 
@@ -889,6 +887,25 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
             return false;
         }
         return true;
+    }
+
+    static int onFrameSendCallback(nghttp2_session* /* session */, const nghttp2_frame* frame, void* user_data) {
+        if (frame->hd.type == NGHTTP2_HEADERS) {
+            auto h2p = static_cast<Http2Parse*>(user_data);
+            h2p->m_header_cache.erase(frame->hd.stream_id);
+        }
+        return 0;
+    }
+
+    static int onFrameNotSendCallback(nghttp2_session* /* session */,
+                                      const nghttp2_frame* frame,
+                                      int /* lib_error_code */,
+                                      void* user_data) {
+        if (frame->hd.type == NGHTTP2_HEADERS) {
+            auto h2p = static_cast<Http2Parse*>(user_data);
+            h2p->m_header_cache.erase(frame->hd.stream_id);
+        }
+        return 0;
     }
 
     static int onHeaderCallback(nghttp2_session* /* session */,
@@ -1012,6 +1029,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
     nghttp2_session_callbacks* m_cbs{};
     nghttp2_session* m_session{};
     std::unordered_map<int32_t, std::shared_ptr<HttpRequestReader>> m_streams;
+    std::unordered_map<int32_t, std::unique_ptr<std::vector<std::tuple<std::string, std::string>>>> m_header_cache;
     std::weak_ptr<HandlerFunctions> m_handler_functions;
     std::shared_ptr<__private::SessionContext> m_session_ctx;
     asio::ip::tcp::endpoint m_endpoint;
@@ -2132,6 +2150,7 @@ struct HttpResponseReader final {
 class StreamSpec {
   public:
     StreamSpec(http::verb method, std::string path) : m_method(method), m_path(std::move(path)) {
+        m_method_str = http::to_string(method);
     }
 
     template <typename Key, typename Value>
@@ -2155,8 +2174,8 @@ class StreamSpec {
         return m_body;
     }
 
-    auto method() {
-        return m_method;
+    auto& methodString() {
+        return m_method_str;
     }
 
     void setEndStreamFlag() {
@@ -2167,12 +2186,17 @@ class StreamSpec {
         return m_end_stream;
     }
 
+    auto method() {
+        return m_method;
+    }
+
   private:
     http::verb m_method;
     std::string m_path;
     std::vector<std::pair<std::string, std::string>> m_headers;
     std::string m_body;
     bool m_end_stream{false};
+    std::string m_method_str;
 };
 
 struct HttpClientConfig {
@@ -2404,8 +2428,7 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
                             fillH2Header(":path", stream_spec->path(), hdrs);
                             fillH2Header(":scheme", m_cfg.use_tls ? "https" : "http", hdrs);
                             fillH2Header(":authority", m_cfg.host, hdrs);
-                            std::string method_str = http::to_string(stream_spec->method());
-                            fillH2Header(":method", method_str, hdrs);
+                            fillH2Header(":method", stream_spec->methodString(), hdrs);
                             bool has_user_agent = false;
                             for (auto& [k, v] : stream_spec->header()) {
                                 std::transform(k.begin(), k.end(), k.begin(), [](unsigned char c) {
@@ -2434,6 +2457,7 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
                                 return;
                             }
 
+                            m_header_cache.emplace(stream_id, stream_spec);
                             nghttp2_session_set_stream_user_data(m_session, stream_id, ctx);
                             nghttp2_session_send(m_session);
 
@@ -2553,6 +2577,25 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
         return 0;
     }
 
+    static int onFrameSendCallback(nghttp2_session* /* session */, const nghttp2_frame* frame, void* user_data) {
+        if (frame->hd.type == NGHTTP2_HEADERS) {
+            auto h2p = static_cast<Http2Client*>(user_data);
+            h2p->m_header_cache.erase(frame->hd.stream_id);
+        }
+        return 0;
+    }
+
+    static int onFrameNotSendCallback(nghttp2_session* /* session */,
+                                      const nghttp2_frame* frame,
+                                      int /* lib_error_code */,
+                                      void* user_data) {
+        if (frame->hd.type == NGHTTP2_HEADERS) {
+            auto h2p = static_cast<Http2Client*>(user_data);
+            h2p->m_header_cache.erase(frame->hd.stream_id);
+        }
+        return 0;
+    }
+
     int feedRecvData(const char* data, size_t len) {
         size_t ret = nghttp2_session_mem_recv(m_session, (const uint8_t*)data, len);
         if (ret != len) {
@@ -2603,6 +2646,8 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
         nghttp2_session_callbacks_set_on_frame_recv_callback(m_cbs, onFrameRecvCallback);
         nghttp2_session_callbacks_set_on_data_chunk_recv_callback(m_cbs, onDataChunkRecvCallback);
         nghttp2_session_callbacks_set_on_stream_close_callback(m_cbs, onStreamCloseCallback);
+        nghttp2_session_callbacks_set_on_frame_send_callback(m_cbs, onFrameSendCallback);
+        nghttp2_session_callbacks_set_on_frame_not_send_callback(m_cbs, onFrameNotSendCallback);
 
         nghttp2_session_client_new(&m_session, m_cbs, this);
 
@@ -2642,8 +2687,9 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
         m_variant_socket;
     nghttp2_session_callbacks* m_cbs{};
     nghttp2_session* m_session{};
-    std::unordered_map<int, std::shared_ptr<HttpResponseReader>> m_streams;
+    std::unordered_map<int32_t, std::shared_ptr<HttpResponseReader>> m_streams;
     std::shared_ptr<Http2Channel> m_send_h2_channel;
+    std::unordered_map<int32_t, std::shared_ptr<StreamSpec>> m_header_cache;
 };
 
 #endif

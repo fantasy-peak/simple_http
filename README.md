@@ -186,20 +186,20 @@ The following benchmark was performed using `h2load`.
 **Test Configuration:**
 - **Request Size**: 1KB (via `b.txt`)
 - **Response Size**: 10KB
-- **Command**: `h2load -t 4 -n 1000000 -c 1000 -m 100 -H 'Content-Type: application/json' --data=b.txt http://localhost:7788/hello`
+- **Command**: `h2load -t 4 -n 1000000 -c 1000 -m 40 -H 'Content-Type: application/json' --data=b.txt http://localhost:7788/hello`
 
 **Results:**
 
 ```text
-finished in 10.52s, 95040.47 req/s, 931.69MB/s
+finished in 10.55s, 94824.57 req/s, 929.86MB/s
 requests: 1000000 total, 1000000 started, 1000000 done, 1000000 succeeded, 0 failed, 0 errored, 0 timeout
 status codes: 1000000 2xx, 0 3xx, 0 4xx, 0 5xx
-traffic: 9.57GB (10279231000) total, 2.87MB (3012000) headers (space savings 92.83%), 9.54GB (10240000000) data
+traffic: 9.58GB (10282451999) total, 2.89MB (3026000) headers (space savings 95.12%), 9.54GB (10243000000) data
                      min         max         mean         sd        +/- sd
-time for request:    24.80ms       2.25s    960.37ms    196.92ms    77.87%
-time for connect:    18.73ms    177.97ms     89.05ms     39.54ms    59.10%
-time to 1st byte:   110.19ms    641.54ms    363.77ms     88.02ms    75.00%
-req/s           :      95.16      103.24       98.84        2.23    62.30%
+time for request:    13.36ms       1.35s    377.40ms     96.52ms    70.89%
+time for connect:     4.77ms    169.45ms     71.33ms     46.08ms    67.10%
+time to 1st byte:    72.58ms    542.68ms    288.73ms     88.46ms    65.00%
+req/s           :      95.24      108.06       98.59        3.17    86.90%
 ```
 
 ## Test Cmd
