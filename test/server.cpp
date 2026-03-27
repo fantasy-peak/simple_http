@@ -1,3 +1,15 @@
+#ifdef SIMPLE_HTTP_USE_MODULES
+#include <nghttp2/nghttp2.h>
+#include <boost/asio/experimental/awaitable_operators.hpp>
+#include <boost/asio/experimental/concurrent_channel.hpp>
+#include <boost/asio.hpp>
+#include <boost/asio/ssl.hpp>
+#include <boost/beast.hpp>
+#include <boost/beast/websocket/ssl.hpp>
+
+import std;
+import simple_http;
+#else
 #include <optional>
 #include <print>
 #include <sstream>
@@ -8,6 +20,7 @@
 #include <openssl/x509.h>
 
 #include "simple_http.h"
+#endif
 
 namespace asio = boost::asio;
 namespace beast = boost::beast;
@@ -104,7 +117,7 @@ asio::awaitable<void> world(std::shared_ptr<simple_http::HttpRequestReader> read
 asio::awaitable<void> tls(std::shared_ptr<simple_http::HttpRequestReader> reader,
                           std::shared_ptr<simple_http::HttpResponseWriter> writer,
                           std::optional<asio::ssl::stream<asio::ip::tcp::socket>::native_handle_type> ssl_ctx) {
-    auto response = simple_http::makeHttpResponse(simple_http::http::status::ok);
+    auto response = simple_http::makeHttpResponse(http::status::ok);
 
     if (ssl_ctx) {
         const auto& x509_server_ref = SSL_get_certificate(*ssl_ctx);

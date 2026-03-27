@@ -28,6 +28,51 @@
 
 > **Note**: When building with `xmake`, it automatically downloads and links all necessary dependencies, so you don't need to install them manually.
 
+## 📦 C++20 Modules Support (Experimental)
+
+`simple_http` provides experimental support for C++20 Modules via `include/simple_http.cppm`. This allows for faster compilation and better code isolation compared to traditional header inclusions.
+
+> **Note**: Currently, C++20 Modules support is verified on **Clang 17+**. Support for GCC and MSVC is planned.
+
+### Usage in C++
+To use the module, simply replace your `#include` with an `import` statement:
+
+```cpp
+import simple_http;
+
+simple_http::HttpServer hs(cfg);
+```
+
+### Integration with xmake
+The following example shows how to integrate `simple_http` as a C++20 module in your `xmake.lua` project:
+
+```lua
+add_requires("simple_http")
+
+set_policy("build.c++.modules", true)
+set_policy("build.c++.modules.std", true)
+
+target("server")
+    set_kind("binary")
+
+    add_cxflags("-fuse-ld=mold")
+    add_cxxflags("-stdlib=libc++")
+
+    on_load(function (target)
+        local pkg = target:pkg("simple_http")
+        if pkg then
+            local installdir = pkg:installdir()
+            local module_file = path.join(installdir, "include", "simple_http.cppm")
+            target:add("files", module_file)
+            print("Successfully linked C++20 module from: " .. module_file)
+        end
+    end)
+
+    add_files("src/main.cpp")
+    add_packages("simple_http")
+```
+
+
 ## 🛠 Configuration Macros
 
 The following macros can be defined to enable or customize specific features:
