@@ -20,7 +20,7 @@
 
 ## 🚀 Requirements
 
-- **C++20/23/26** compatible compiler (e.g., GCC 13+, Clang 17+).
+- **C++20/23/26** compatible compiler (e.g., GCC 13+, Clang 20+).
 - **xmake**: Used for building examples and dependency management.
 - **Boost** (`beast`)
 - **nghttp2**
@@ -32,7 +32,7 @@
 
 `simple_http` provides experimental support for C++20 Modules via `include/simple_http.cppm`. This allows for faster compilation and better code isolation compared to traditional header inclusions.
 
-> **Note**: Currently, C++20 Modules support is verified on **Clang 17+**. Support for GCC and MSVC is planned.
+> **Note**: Currently, C++20 Modules support is verified on **Clang 20+**. Support for GCC and MSVC is planned.
 
 ### Usage in C++
 To use the module, simply replace your `#include` with an `import` statement:
@@ -84,6 +84,9 @@ The following macros can be defined to enable or customize specific features:
 
 ## Server Example
 ```
+import std;
+import simple_http;
+
 asio::awaitable<void> start() {
     simple_http::Config cfg{
         .ip = "0.0.0.0",
@@ -142,6 +145,9 @@ int main() {
 ```
 ## Client Example
 ```
+import std;
+import simple_http;
+
 asio::awaitable<void> client(simple_http::IoCtxPool& pool) {
     simple_http::HttpClientConfig cfg{
         .host = "127.0.0.1",
