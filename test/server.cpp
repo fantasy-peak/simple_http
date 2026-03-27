@@ -61,8 +61,8 @@ asio::awaitable<void> hello(std::shared_ptr<simple_http::HttpRequestReader> read
                 co_return;
             }
 
-            bool should_continue = std::visit(simple_http::overloaded{[](std::unique_ptr<std::string> str) {
-                                                                          std::println("recv h2 data frame: {}", *str);
+            bool should_continue = std::visit(simple_http::overloaded{[](std::string str) {
+                                                                          std::println("recv h2 data frame: {}", str);
                                                                           return true;
                                                                       },
                                                                       [](simple_http::Disconnect) { return false; },

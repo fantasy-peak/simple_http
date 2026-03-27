@@ -188,8 +188,8 @@ asio::awaitable<void> client(simple_http::IoCtxPool& pool) {
             break;
         }
         bool should_continue = std::visit(simple_http::overloaded{
-            [](std::unique_ptr<std::string> str_ptr) {
-                std::println("recv data: {}", *str_ptr);
+            [](std::string str) {
+                std::println("recv data: {}", str);
                 return true;
             },
             [](simple_http::Eof) { return false; },
