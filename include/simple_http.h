@@ -290,7 +290,7 @@ inline void fillH2Header(std::string_view name, std::string_view value, std::vec
 }
 
 struct DataContext {
-    std::deque<std::shared_ptr<std::string>> queue;
+    std::deque<std::string> queue;
     size_t offset = 0;
     size_t total_buffered = 0;
     bool is_finished = false;
@@ -308,7 +308,7 @@ inline ssize_t dataReadCallback(nghttp2_session* /* session */,
         return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
 
     if (!ctx->queue.empty()) {
-        auto& chunk = *(ctx->queue.front());
+        auto& chunk = ctx->queue.front();
         size_t available = chunk.size() - ctx->offset;
         size_t to_copy = std::min(length, available);
 
@@ -933,7 +933,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
         return true;
     }
 
-    bool writeBody(std::shared_ptr<std::string> data, int32_t stream_id, WriteMode write_mode) {
+    bool writeBody(std::string data, int32_t stream_id, WriteMode write_mode) {
         auto sp = m_h2_channel.lock();
         if (!sp) {
             return false;
@@ -1199,17 +1199,15 @@ class HttpResponseWriter {
             return false;
         using DecayedT = std::decay_t<T>;
         if constexpr (std::is_same_v<DecayedT, std::shared_ptr<std::string>>) {
-            return m_http2_parse->writeBody(std::forward<T>(data), m_stream_id, write_mode);
+            return m_http2_parse->writeBody(std::move(*data), m_stream_id, write_mode);
         } else {
             static_assert(std::is_constructible_v<std::string, T&&>, "T must be convertible to std::string");
-            return m_http2_parse->writeBody(std::make_shared<std::string>(std::forward<T>(data)),
-                                            m_stream_id,
-                                            write_mode);
+            return m_http2_parse->writeBody(std::forward<T>(data), m_stream_id, write_mode);
         }
     }
 
     bool writeBody(const char* data, std::size_t size, WriteMode write_mode = WriteMode::More) {
-        return writeBody(std::make_shared<std::string>(data, size), write_mode);
+        return writeBody(std::string(data, size), write_mode);
     }
 
     template <typename T>
@@ -1394,6 +1392,7 @@ class HttpServer final {
     }
 
     asio::awaitable<void> start() {
+        co_await asio::dispatch(asio::bind_executor(*(m_io_dispatch->getMainContext()), asio::use_awaitable));
         if (m_cfg.enable_ipv6) {
             co_await (startAcceptor(m_cfg.ip, m_cfg.port, false) &&
                       startAcceptor(m_cfg.ipv6_addr, m_cfg.ipv6_port, true) && startUnixAcceptor(m_cfg.unix_socket));
@@ -2037,10 +2036,6 @@ inline asio::awaitable<void> HttpServer::startSslsession(AsyncStream socket,
 
 struct HttpRequestWriter final {
     bool writerBody(std::string data, WriteMode write_mode) {
-        return writerBody(std::make_shared<std::string>(std::move(data)), write_mode);
-    }
-
-    bool writerBody(std::shared_ptr<std::string> data, WriteMode write_mode) {
         bool is_alive =
             std::visit([](auto&& weak_ptr_ptr) -> bool { return !weak_ptr_ptr.expired(); }, m_variant_socket);
         if (is_alive) {
@@ -2053,7 +2048,7 @@ struct HttpRequestWriter final {
 
     int m_stream_id;
     Version m_version;
-    std::function<void(int, std::shared_ptr<std::string>, WriteMode)> m_writer_body;
+    std::function<void(int, std::string, WriteMode)> m_writer_body;
     std::variant<std::weak_ptr<asio::ssl::stream<asio::ip::tcp::socket>>,
                  std::weak_ptr<asio::ip::tcp::socket>,
                  std::weak_ptr<asio::local::stream_protocol::socket>,
@@ -2447,15 +2442,14 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
                             const std::string& body_ref = stream_spec->body();
                             if (end_stream || !body_ref.empty()) {
                                 writerBody(stream_id,
-                                           std::make_shared<std::string>(std::move(stream_spec->body())),
+                                           std::move(stream_spec->body()),
                                            end_stream ? WriteMode::Last : WriteMode::More);
                             }
 
                             auto http_request_writer = std::make_shared<HttpRequestWriter>(
                                 stream_id,
                                 Version::Http2,
-                                [self_ptr,
-                                 end_stream](int stream_id, std::shared_ptr<std::string> data, WriteMode write_mode) {
+                                [self_ptr, end_stream](int stream_id, std::string data, WriteMode write_mode) {
                                     if (end_stream) {
                                         return;
                                     }
@@ -2588,7 +2582,7 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
     }
 
   private:
-    void writerBody(int stream_id, std::shared_ptr<std::string> data, WriteMode write_mode) {
+    void writerBody(int stream_id, std::string data, WriteMode write_mode) {
         auto* ctx = static_cast<DataContext*>(nghttp2_session_get_stream_user_data(m_session, stream_id));
         if (!ctx) {
             SIMPLE_HTTP_DEBUG_LOG("not found id: {} cache", stream_id);

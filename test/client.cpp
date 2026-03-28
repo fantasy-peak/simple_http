@@ -37,8 +37,8 @@ asio::awaitable<void> client(simple_http::IoCtxPool& pool) {
         co_return;
     }
     auto& [w, r] = opt.value();
-    w->writerBody(std::make_shared<std::string>("hello"), simple_http::WriteMode::More);
-    w->writerBody(std::make_shared<std::string>("client"), simple_http::WriteMode::Last);
+    w->writerBody("hello", simple_http::WriteMode::More);
+    w->writerBody("client", simple_http::WriteMode::Last);
 
     auto [ec, d] = co_await r->asyncReadDataFrame();
     if (std::holds_alternative<simple_http::ParseHeaderDone>(d)) {
