@@ -1391,15 +1391,30 @@ class HttpServer final {
         return std::make_unique<HttpServer>(cfg);
     }
 
-    asio::awaitable<void> start() {
-        co_await asio::dispatch(asio::bind_executor(*(m_io_dispatch->getMainContext()), asio::use_awaitable));
-        if (m_cfg.enable_ipv6) {
-            co_await (startAcceptor(m_cfg.ip, m_cfg.port, false) &&
-                      startAcceptor(m_cfg.ipv6_addr, m_cfg.ipv6_port, true) && startUnixAcceptor(m_cfg.unix_socket));
-        } else {
-            co_await (startAcceptor(m_cfg.ip, m_cfg.port, false) && startUnixAcceptor(m_cfg.unix_socket));
-        }
-        co_return;
+    template <asio::completion_token_for<void(bool)> CompletionToken = asio::use_awaitable_t<>>
+    auto start(CompletionToken&& token = CompletionToken{}) {
+        return asio::async_initiate<CompletionToken, void(bool)>(
+            [this]<typename Handler>(Handler&& handler) mutable {
+                using HandlerType = std::decay_t<Handler>;
+                auto h = std::make_shared<HandlerType>(std::forward<Handler>(handler));
+                asio::co_spawn(
+                    *(m_io_dispatch->getMainContext()),
+                    [this, h = std::move(h)] -> asio::awaitable<void> {
+                        auto ex = asio::get_associated_executor(*h);
+                        if (m_cfg.enable_ipv6) {
+                            auto [r1, r2, r3] = co_await (listenIpv4() && listenIpv6() && listenUnix());
+                            bool all_success = r1 && r2 && r3;
+                            asio::dispatch(ex, [=] { std::move (*h)(all_success); });
+                        } else {
+                            auto [r1, r2] = co_await (listenIpv4() && listenUnix());
+                            bool all_success = r1 && r2;
+                            asio::dispatch(ex, [=] { std::move (*h)(all_success); });
+                        }
+                        co_return;
+                    },
+                    asio::detached);
+            },
+            token);
     }
 
     void stop() {
@@ -1423,6 +1438,18 @@ class HttpServer final {
             m_io_ctx_pool->stop();
             m_io_dispatch->stop();
         }
+    }
+
+    asio::awaitable<bool> listenIpv4() {
+        co_return co_await startAcceptor(m_cfg.ip, m_cfg.port, false);
+    }
+
+    asio::awaitable<bool> listenIpv6() {
+        co_return co_await startAcceptor(m_cfg.ipv6_addr, m_cfg.ipv6_port, true);
+    }
+
+    asio::awaitable<bool> listenUnix() {
+        co_return co_await startUnixAcceptor(m_cfg.unix_socket);
     }
 
     auto& setHttpHandler(const std::string& path, RequestCallback cb) {
@@ -1470,8 +1497,8 @@ class HttpServer final {
     }
 
   private:
-    asio::awaitable<void> startAcceptor(const std::string& ip, uint16_t port, bool is_v6 = false);
-    asio::awaitable<void> startUnixAcceptor(const std::optional<std::string>& socket_path);
+    asio::awaitable<bool> startAcceptor(const std::string& ip, uint16_t port, bool is_v6 = false);
+    asio::awaitable<bool> startUnixAcceptor(const std::optional<std::string>& socket_path);
 
     void initSsl();
 
@@ -1518,16 +1545,16 @@ class HttpServer final {
 #endif
 };
 
-inline asio::awaitable<void> HttpServer::startAcceptor(const std::string& ip, uint16_t port, bool is_v6) {
+inline asio::awaitable<bool> HttpServer::startAcceptor(const std::string& ip, uint16_t port, bool is_v6) {
     if (ip.empty()) {
-        co_return;
+        co_return false;
     }
     SIMPLE_HTTP_INFO_LOG("listen {}:{}, is_v6: {}", ip, port, is_v6);
     error_code ec;
     auto addr = asio::ip::make_address(ip, ec);
     if (ec) {
         SIMPLE_HTTP_ERROR_LOG("make_address: {}", ec.message());
-        co_return;
+        co_return false;
     }
     asio::ip::tcp::endpoint endpoint(addr, port);
     auto acceptor = std::make_shared<asio::ip::tcp::acceptor>(*m_io_ctx_pool->getMainContext());
@@ -1554,12 +1581,12 @@ inline asio::awaitable<void> HttpServer::startAcceptor(const std::string& ip, ui
     [[maybe_unused]] auto _ = acceptor->bind(endpoint, ec);
     if (ec) {
         SIMPLE_HTTP_ERROR_LOG("bind: {}", ec.message());
-        co_return;
+        co_return false;
     }
     _ = acceptor->listen(asio::socket_base::max_listen_connections, ec);
     if (ec) {
         SIMPLE_HTTP_ERROR_LOG("listen: {}", ec.message());
-        co_return;
+        co_return false;
     }
     for (;;) {
         auto& context = m_io_ctx_pool->getIoContextPtr();
@@ -1595,12 +1622,13 @@ inline asio::awaitable<void> HttpServer::startAcceptor(const std::string& ip, ui
                            asio::detached);
         }
     }
+    co_return true;
 }
 
-inline asio::awaitable<void> HttpServer::startUnixAcceptor(const std::optional<std::string>& socket_path) {
+inline asio::awaitable<bool> HttpServer::startUnixAcceptor(const std::optional<std::string>& socket_path) {
 #ifdef SIMPLE_HTTP_BIND_UNIX_SOCKET
     if (!socket_path.has_value()) {
-        co_return;
+        co_return true;
     }
     {
         std::filesystem::path sock_path{socket_path.value()};
@@ -1635,7 +1663,7 @@ inline asio::awaitable<void> HttpServer::startUnixAcceptor(const std::optional<s
         }
     }
 #endif
-    co_return;
+    co_return true;
 }
 
 inline void HttpServer::initSsl() {
