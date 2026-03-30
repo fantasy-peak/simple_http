@@ -44,6 +44,8 @@ using ::simple_http::WssUnixStreamPtr;
 using ::simple_http::WsUnixStreamPtr;
 
 // function
+using ::simple_http::base64UrlDecode;
+using ::simple_http::base64UrlEncode;
 using ::simple_http::makeHttpResponse;
 using ::simple_http::toLower;
 using ::simple_http::toString;

@@ -242,15 +242,15 @@ The following benchmark was performed using `h2load`.
 **Results:**
 
 ```text
-finished in 10.55s, 94824.57 req/s, 929.86MB/s
+finished in 10.04s, 99558.82 req/s, 976.28MB/s
 requests: 1000000 total, 1000000 started, 1000000 done, 1000000 succeeded, 0 failed, 0 errored, 0 timeout
 status codes: 1000000 2xx, 0 3xx, 0 4xx, 0 5xx
-traffic: 9.58GB (10282451999) total, 2.89MB (3026000) headers (space savings 95.12%), 9.54GB (10243000000) data
+traffic: 9.58GB (10282450426) total, 2.89MB (3026000) headers (space savings 95.12%), 9.54GB (10243000000) data
                      min         max         mean         sd        +/- sd
-time for request:    13.36ms       1.35s    377.40ms     96.52ms    70.89%
-time for connect:     4.77ms    169.45ms     71.33ms     46.08ms    67.10%
-time to 1st byte:    72.58ms    542.68ms    288.73ms     88.46ms    65.00%
-req/s           :      95.24      108.06       98.59        3.17    86.90%
+time for request:     5.99ms       1.43s    342.76ms    137.20ms    77.08%
+time for connect:     5.65ms    151.01ms     62.93ms     37.19ms    67.60%
+time to 1st byte:    79.20ms       1.02s    537.90ms    308.48ms    51.80%
+req/s           :     100.72      124.03      105.92        4.56    71.10%
 ```
 
 ## Test Cmd

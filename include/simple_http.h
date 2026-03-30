@@ -225,7 +225,7 @@ constexpr char base64_url_alphabet[] = {'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 
                                         'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v',
                                         'w', 'x', 'y', 'z', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '-', '_'};
 
-inline std::string base64_encode(const std::string& in) {
+inline std::string base64UrlEncode(const std::string& in) {
     std::string out;
     int val = 0, valb = -6;
     size_t len = in.length();
@@ -245,7 +245,7 @@ inline std::string base64_encode(const std::string& in) {
     return out;
 }
 
-inline std::string base64_decode(const std::string& in) {
+inline std::string base64UrlDecode(const std::string& in) {
     std::string out;
     std::vector<int> T(256, -1);
     unsigned int i;
@@ -865,7 +865,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
         nghttp2_session_server_new(&m_session, m_cbs, this);
 
         if (cfg.is_h2c_upgrade) {
-            auto http2_settings_base64 = base64_decode(cfg.h2_setting);
+            auto http2_settings_base64 = base64UrlDecode(cfg.h2_setting);
             auto ret = nghttp2_session_upgrade2(m_session,
                                                 (uint8_t*)http2_settings_base64.data(),
                                                 http2_settings_base64.size(),
