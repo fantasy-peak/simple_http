@@ -66,6 +66,7 @@ asio::awaitable<void> hello(std::shared_ptr<simple_http::HttpRequestReader> read
                                                                           return true;
                                                                       },
                                                                       [](simple_http::Disconnect) { return false; },
+                                                                      [](simple_http::Rst) { return false; },
                                                                       [](simple_http::Eof) { return false; }},
                                               std::move(data));
 

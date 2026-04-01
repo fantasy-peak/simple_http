@@ -58,6 +58,7 @@ asio::awaitable<void> client(simple_http::IoCtxPool& pool) {
                                                                       return true;
                                                                   },
                                                                   [](simple_http::Eof) { return false; },
+                                                                  [](simple_http::Rst) { return false; },
                                                                   [](simple_http::Disconnect) { return false; },
                                                                   [](simple_http::ParseHeaderDone) { return false; }},
                                           std::move(d));

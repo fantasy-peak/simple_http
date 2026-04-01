@@ -151,6 +151,8 @@ enum class WriteMode : int8_t { More, Last };
 
 struct Eof {};
 
+struct Rst {};
+
 struct Disconnect {};
 
 class HttpResponseWriter;
@@ -165,7 +167,7 @@ using Http1Channel = asio::experimental::concurrent_channel<
 using Http2Channel = asio::experimental::concurrent_channel<void(error_code, std::variant<std::string, Disconnect>)>;
 
 using ReaderChannel =
-    asio::experimental::concurrent_channel<void(error_code, std::variant<std::string, Eof, Disconnect>)>;
+    asio::experimental::concurrent_channel<void(error_code, std::variant<std::string, Eof, Rst, Disconnect>)>;
 
 using SimpleCallback =
     std::function<asio::awaitable<void>(std::shared_ptr<HttpRequestReader>, std::shared_ptr<HttpResponseWriter>)>;
@@ -422,14 +424,14 @@ class HttpRequestReader {
     ~HttpRequestReader() = default;
 
     // Http2 streaming reads http body
-    asio::awaitable<std::tuple<error_code, std::variant<std::string, Eof, Disconnect>>> asyncReadDataFrame() {
+    asio::awaitable<std::tuple<error_code, std::variant<std::string, Eof, Rst, Disconnect>>> asyncReadDataFrame() {
         if (!m_reader_channel) {
             co_return std::make_tuple(make_error_code(asio::error::eof),
-                                      std::variant<std::string, Eof, Disconnect>{Eof{}});
+                                      std::variant<std::string, Eof, Rst, Disconnect>{Eof{}});
         }
 
         error_code ec;
-        std::variant<std::string, Eof, Disconnect> data;
+        std::variant<std::string, Eof, Rst, Disconnect> data;
 
         bool success = m_reader_channel->try_receive([&](auto cb_ec, auto recv_data) {
             ec = cb_ec;
@@ -1056,7 +1058,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
         auto h2p = static_cast<Http2Parse*>(userdata);
         auto http_request_reader = h2p->getStreamCtx(stream_id);
         if (frame->hd.type == NGHTTP2_RST_STREAM) {
-            http_request_reader->trySend(Eof{});
+            http_request_reader->trySend(Rst{});
             return 0;
         }
         if (frame->hd.type == NGHTTP2_HEADERS && (frame->hd.flags & NGHTTP2_FLAG_END_HEADERS)) {
@@ -2094,21 +2096,21 @@ struct ParseHeaderDone {};
 struct HttpResponseReader final {
     using Channel =
         asio::experimental::concurrent_channel<void(error_code,
-                                                    std::variant<ParseHeaderDone, Eof, std::string, Disconnect>)>;
+                                                    std::variant<ParseHeaderDone, Eof, Rst, std::string, Disconnect>)>;
 
     HttpResponseReader(int stream_id, Version version, std::shared_ptr<Channel> channel)
         : stream_id(stream_id), m_version(version), m_channel(std::move(channel)) {
     }
 
-    asio::awaitable<std::tuple<error_code, std::variant<ParseHeaderDone, Eof, std::string, Disconnect>>>
+    asio::awaitable<std::tuple<error_code, std::variant<ParseHeaderDone, Eof, Rst, std::string, Disconnect>>>
     asyncReadDataFrame() {
         if (!m_channel) {
             co_return std::make_tuple(make_error_code(asio::error::eof),
-                                      std::variant<ParseHeaderDone, Eof, std::string, Disconnect>{Eof{}});
+                                      std::variant<ParseHeaderDone, Eof, Rst, std::string, Disconnect>{Eof{}});
         }
 
         error_code ec;
-        std::variant<ParseHeaderDone, Eof, std::string, Disconnect> data;
+        std::variant<ParseHeaderDone, Eof, Rst, std::string, Disconnect> data;
 
         bool success = m_channel->try_receive([&](auto cb_ec, auto recv_data) {
             ec = cb_ec;
@@ -2618,12 +2620,13 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
         if (stream_id == 0) {
             return 0;
         }
-        if (frame->hd.type == NGHTTP2_RST_STREAM) {
-            return 0;
-        }
         auto http2_client = static_cast<Http2Client*>(userdata);
         const auto& http_rsp_reader = http2_client->getStreamCtx(stream_id);
         if (http_rsp_reader == nullptr) {
+            return 0;
+        }
+        if (frame->hd.type == NGHTTP2_RST_STREAM) {
+            http_rsp_reader->try_send(Rst{});
             return 0;
         }
         if (frame->hd.type == NGHTTP2_HEADERS && (frame->hd.flags & NGHTTP2_FLAG_END_HEADERS)) {
