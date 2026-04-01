@@ -1055,6 +1055,10 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
         int32_t stream_id = frame->hd.stream_id;
         auto h2p = static_cast<Http2Parse*>(userdata);
         auto http_request_reader = h2p->getStreamCtx(stream_id);
+        if (frame->hd.type == NGHTTP2_RST_STREAM) {
+            http_request_reader->trySend(Eof{});
+            return 0;
+        }
         if (frame->hd.type == NGHTTP2_HEADERS && (frame->hd.flags & NGHTTP2_FLAG_END_HEADERS)) {
             auto writer = std::make_shared<HttpResponseWriter>(h2p->shared_from_this(), stream_id, Version::Http2);
             if (auto sp = h2p->m_h2_channel.lock()) {
@@ -1067,7 +1071,6 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
         }
         if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
             http_request_reader->trySend(Eof{});
-            h2p->erase(stream_id);
         }
         return 0;
     }
@@ -1087,7 +1090,9 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
     static int onStreamCloseCallback(nghttp2_session* session,
                                      int32_t stream_id,
                                      uint32_t /* error_code */,
-                                     void* /* user_data */) {
+                                     void* userdata) {
+        auto h2p = static_cast<Http2Parse*>(userdata);
+        h2p->erase(stream_id);
         void* ptr = nghttp2_session_get_stream_user_data(session, stream_id);
         if (ptr) {
             delete static_cast<DataContext*>(ptr);
@@ -2283,6 +2288,15 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
         });
     }
 
+    bool setHttpProxy(const std::string& proxy_url) {
+        ProxyInfo proxy_info;
+        auto ret = ProxyInfo::parseProxyUrl(proxy_url, proxy_info);
+        if (ret) {
+            m_proxy_info = proxy_info;
+        }
+        return ret;
+    }
+
     template <asio::completion_token_for<void(std::tuple<bool, std::string>)> CompletionToken>
     auto asyncStart(std::chrono::seconds timeout, CompletionToken&& token) {
         return asio::async_initiate<CompletionToken, void(std::tuple<bool, std::string>)>(
@@ -2356,9 +2370,16 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
                             }
                         } else {
                             auto solver = asio::ip::tcp::resolver(*m_io_context);
-                            auto [ec, results] = co_await solver.async_resolve(m_cfg.host,
-                                                                               std::to_string(m_cfg.port),
-                                                                               asio::as_tuple(asio::use_awaitable));
+                            std::string host, port;
+                            if (m_proxy_info.has_value()) {
+                                host = m_proxy_info->host;
+                                port = std::to_string(m_proxy_info->port);
+                            } else {
+                                host = m_cfg.host;
+                                port = std::to_string(m_cfg.port);
+                            }
+                            auto [ec, results] =
+                                co_await solver.async_resolve(host, port, asio::as_tuple(asio::use_awaitable));
                             if (ec) {
                                 asio::dispatch(ex, [=] { std::move (*h)(std::make_tuple(false, ec.message())); });
                                 co_return;
@@ -2394,7 +2415,16 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
                                 });
                                 co_return;
                             }
-
+                            if (m_proxy_info.has_value()) {
+                                auto ret = co_await connectHttpProxy(m_cfg.host, m_cfg.port, socket);
+                                if (!ret) {
+                                    asio::dispatch(ex, [=] {
+                                        std::move (*h)(
+                                            std::make_tuple(false, std::string("async_connect http proxy fail")));
+                                    });
+                                    co_return;
+                                }
+                            }
                             if (m_cfg.use_tls) {
                                 auto socket_ptr =
                                     std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(std::move(socket),
@@ -2415,6 +2445,36 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
             },
             token,
             timeout);
+    }
+
+    asio::awaitable<bool> connectHttpProxy(auto& target_ip, auto& target_port, auto& socket) {
+        constexpr int http_version = 11;
+        auto target = std::format("{}:{}", target_ip, target_port);
+        http::request<http::empty_body> connect_req{http::verb::connect, target, http_version};
+        connect_req.set(http::field::host, target);
+        connect_req.set(http::field::user_agent,
+                        R"(Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0)
+            Gecko/20100101 Firefox/133.0)");
+        connect_req.set(http::field::proxy_connection, "keep-alive");
+        connect_req.set(http::field::connection, "keep-alive");
+
+        auto [ec, count] = co_await http::async_write(socket, connect_req, asio::as_tuple(asio::use_awaitable));
+        if (ec) {
+            SIMPLE_HTTP_DEBUG_LOG("{}", ec.message());
+            co_return false;
+        }
+        http::response<http::empty_body> res;
+        http::parser<false, http::empty_body> http_parser(res);
+        http_parser.skip(true);
+
+        boost::beast::flat_buffer buffer;
+        std::tie(ec, count) =
+            co_await http::async_read(socket, buffer, http_parser, asio::as_tuple(asio::use_awaitable));
+        if (http::status::ok != res.result()) {
+            SIMPLE_HTTP_DEBUG_LOG("Proxy response failed: {}", res.result_int());
+            co_return false;
+        }
+        co_return true;
     }
 
     template <asio::completion_token_for<
@@ -2508,7 +2568,9 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
     static int onStreamCloseCallback(nghttp2_session* session,
                                      int32_t stream_id,
                                      uint32_t /* error_code */,
-                                     void* /* user_data */) {
+                                     void* userdata) {
+        auto http2_client = static_cast<Http2Client*>(userdata);
+        http2_client->erase(stream_id);
         void* ptr = nghttp2_session_get_stream_user_data(session, stream_id);
         if (ptr) {
             delete static_cast<DataContext*>(ptr);
@@ -2556,14 +2618,19 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
         if (stream_id == 0) {
             return 0;
         }
+        if (frame->hd.type == NGHTTP2_RST_STREAM) {
+            return 0;
+        }
         auto http2_client = static_cast<Http2Client*>(userdata);
         const auto& http_rsp_reader = http2_client->getStreamCtx(stream_id);
+        if (http_rsp_reader == nullptr) {
+            return 0;
+        }
         if (frame->hd.type == NGHTTP2_HEADERS && (frame->hd.flags & NGHTTP2_FLAG_END_HEADERS)) {
             http_rsp_reader->try_send(ParseHeaderDone{});
         }
         if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
             http_rsp_reader->try_send(Eof{});
-            http2_client->erase(stream_id);
         }
         return 0;
     }
@@ -2625,12 +2692,13 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
     }
 
     std::shared_ptr<HttpResponseReader>& getStreamCtx(int32_t stream_id) {
+        static std::shared_ptr<HttpResponseReader> defaul_ptr{nullptr};
         auto it = m_streams.find(stream_id);
         if (it != m_streams.end()) {
             return it->second;
         }
         SIMPLE_HTTP_ERROR_LOG("not found Stream ID: {}", stream_id);
-        std::terminate();
+        return defaul_ptr;
     }
 
     void erase(int32_t stream_id) {
@@ -2693,6 +2761,35 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
     std::unordered_map<int32_t, std::shared_ptr<HttpResponseReader>> m_streams;
     std::shared_ptr<Http2Channel> m_send_h2_channel;
     std::unordered_map<int32_t, std::shared_ptr<StreamSpec>> m_header_cache;
+
+    struct ProxyInfo {
+        std::string protocol;
+        std::string user;
+        std::string password;
+        std::string host;
+        uint16_t port;
+
+        static bool parseProxyUrl(const std::string& url, ProxyInfo& info) {
+            regex_adapter::regex url_regex(R"(^([^:]+)://(?:([^:@]+):([^:@]+)@)?([^/:]+)(?::([0-9]+))?)");
+            regex_adapter::smatch matches;
+
+            if (regex_adapter::regex_search(url, matches, url_regex)) {
+                info.protocol = matches[1].str();
+                info.user = matches[2].str();
+                info.password = matches[3].str();
+                info.host = matches[4].str();
+                if (matches[5].matched) {
+                    info.port = std::stoi(matches[5].str());
+                } else {
+                    info.port = (info.protocol == "https") ? 443 : 80;
+                }
+                return true;
+            }
+            return false;
+        }
+    };
+
+    std::optional<ProxyInfo> m_proxy_info;
 };
 
 #endif
