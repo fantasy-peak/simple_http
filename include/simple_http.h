@@ -148,6 +148,7 @@ inline std::function<void(LogLevel, std::string_view, int, std::string)> LOG_CB 
 #endif
 
 enum class WriteMode : int8_t { More, Last };
+enum class StreamStatus : int8_t { Ok, Eof, Rst, Disconnect };
 
 struct Eof {};
 
@@ -444,7 +445,14 @@ class HttpRequestReader {
         co_return co_await m_reader_channel->async_receive(asio::as_tuple(asio::use_awaitable));
     }
 
+    [[deprecated("Use asyncReadBody() directly or the new stream-based API instead.")]]
     asio::awaitable<std::tuple<bool, std::reference_wrapper<std::string>>> body() {
+        auto [stream_status, ref_body] = co_await asyncReadBody();
+        co_return std::make_tuple(stream_status == StreamStatus::Disconnect ? true : false, std::ref(m_body));
+    }
+
+    asio::awaitable<std::tuple<StreamStatus, std::reference_wrapper<std::string>>> asyncReadBody() {
+        StreamStatus stream_status = StreamStatus::Ok;
         if (m_version == Version::Http2) {
             for (;;) {
                 auto [ec, data] = co_await asyncReadDataFrame();
@@ -454,14 +462,22 @@ class HttpRequestReader {
                     auto& str = std::get<std::string>(data);
                     m_body.append(str);
                 } else if (std::holds_alternative<Disconnect>(data)) {
-                    m_connected = false;
+                    stream_status = StreamStatus::Disconnect;
                     break;
+                } else if (std::holds_alternative<Eof>(data)) {
+                    stream_status = StreamStatus::Eof;
                 } else {
+                    stream_status = StreamStatus::Rst;
                     break;
                 }
             }
+        } else {
+            auto connected = m_connected.load(std::memory_order_acquire);
+            if (!connected) {
+                stream_status = StreamStatus::Disconnect;
+            }
         }
-        co_return std::make_tuple(m_connected.load(), std::ref(m_body));
+        co_return std::make_tuple(stream_status, std::ref(m_body));
     }
 
     auto method() {
@@ -511,7 +527,19 @@ class HttpRequestReader {
     }
 
     void setHeader(std::string name, std::string value) {
-        m_headers.emplace(std::move(name), std::move(value));
+        m_headers.emplace_back(std::move(name), std::move(value));
+    }
+
+    const std::string& getHeaderBy(const std::string& lower_field) {
+        static std::string default_val;
+        auto it =
+            std::find_if(m_headers.begin(), m_headers.end(), [&](auto& p) { return std::get<0>(p) == lower_field; });
+        return it != m_headers.end() ? std::get<1>(*it) : default_val;
+    }
+
+    const std::string& getHeader(std::string field) {
+        toLower(field);
+        return getHeaderBy(field);
     }
 
     template <typename T>
@@ -526,7 +554,9 @@ class HttpRequestReader {
         splitPathAndQuery(m_target);
         m_headers.clear();
         for (auto const& field : req) {
-            m_headers.emplace(field.name_string(), field.value());
+            std::string str = field.name_string();
+            toLower(str);
+            m_headers.emplace_back(std::move(str), field.value());
         }
         if (req.body().empty()) {
             return;
@@ -536,7 +566,7 @@ class HttpRequestReader {
     }
 
     void disconnect() {
-        m_connected = false;
+        m_connected.store(false, std::memory_order_release);
     }
 
   public:
@@ -555,7 +585,7 @@ class HttpRequestReader {
     http::verb m_method;
     std::string m_target;
     std::string m_body;
-    std::unordered_multimap<std::string, std::string> m_headers;
+    std::vector<std::tuple<std::string, std::string>> m_headers;
     std::atomic_bool m_connected{true};
     std::string_view m_path;
     std::string_view m_query;
@@ -658,8 +688,8 @@ inline asio::awaitable<void> callCallback(std::weak_ptr<HandlerFunctions> hf,
     }
 
     if (sp->cors) {
-        auto it = req->header().find("origin");
-        if (it != req->header().end()) {
+        auto& value = req->getHeader("origin");
+        if (!value.empty()) {
             if (!co_await sp->cors(req, writer)) {
                 co_return;
             }
@@ -674,16 +704,16 @@ inline asio::awaitable<void> callCallback(std::weak_ptr<HandlerFunctions> hf,
     auto it = sp->map_proc.find(path);
     if (it != sp->map_proc.end()) {
         co_await runCallBack(&it->second, std::move(req), std::move(writer), session_ctx);
-    } else {
-        for (const auto& [pattern, cb] : sp->regex_proc) {
-            std::string str{path};
-            if (regex_adapter::regex_match(str, pattern)) {
-                co_await runCallBack(&cb, std::move(req), std::move(writer), session_ctx);
-                co_return;
-            }
-        }
-        co_await runCallBack(&sp->map_proc["*"], std::move(req), std::move(writer), session_ctx);
+        co_return;
     }
+    for (const auto& [pattern, cb] : sp->regex_proc) {
+        std::string str{path};
+        if (regex_adapter::regex_match(str, pattern)) {
+            co_await runCallBack(&cb, std::move(req), std::move(writer), session_ctx);
+            co_return;
+        }
+    }
+    co_await runCallBack(&sp->map_proc["*"], std::move(req), std::move(writer), session_ctx);
     co_return;
 }
 
@@ -1284,7 +1314,9 @@ class HttpResponseWriter {
             http_response->prepare_payload();
             m_http_status = std::to_string(http_response->result_int());
             for (const auto& field : http_response->base()) {
-                writeHeader(field.name_string(), field.value());
+                std::string str = field.name_string();
+                toLower(str);
+                writeHeader(std::move(str), field.value());
             }
             writeHeaderEnd();
             writeBodyEnd(std::move(http_response->body()));

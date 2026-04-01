@@ -87,7 +87,11 @@ asio::awaitable<void> hello(std::shared_ptr<simple_http::HttpRequestReader> read
         co_await timer.async_wait(asio::use_awaitable);
         writer->writeBodyEnd("789");
     } else {
-        auto [connected, body] = co_await reader->body();
+        auto [stream_status, body] = co_await reader->asyncReadBody();
+        if (stream_status == simple_http::StreamStatus::Disconnect) {
+            std::println("client disconnect");
+            co_return;
+        }
         std::println("recv http1 data :", body.get());
         // curl --no-buffer  -v http://localhost:6666/hello -d "aaaa"
         http::response<http::empty_body> res{http::status::ok, 11};
