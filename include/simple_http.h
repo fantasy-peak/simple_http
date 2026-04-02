@@ -1404,10 +1404,11 @@ struct Config {
 
 class HttpServer final {
   public:
-    HttpServer(const Config& cfg)
+    HttpServer(const Config& cfg, int32_t io_dispatch_worker_num = -1)
         : m_cfg(cfg),
           m_io_ctx_pool(std::make_shared<IoCtxPool>(cfg.worker_num)),
-          m_io_dispatch(std::make_shared<IoCtxPool>(cfg.worker_num)),
+          m_io_dispatch(
+              std::make_shared<IoCtxPool>(io_dispatch_worker_num <= 0 ? cfg.worker_num : io_dispatch_worker_num)),
           m_stop_ctx_pool(true) {
         initSsl();
         m_io_ctx_pool->createMainContext();
