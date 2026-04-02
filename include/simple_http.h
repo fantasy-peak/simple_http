@@ -42,7 +42,7 @@
 
 #define SIMPLE_HTTP_VERSION_MAJOR 0
 #define SIMPLE_HTTP_VERSION_MINOR 6
-#define SIMPLE_HTTP_VERSION_PATCH 4
+#define SIMPLE_HTTP_VERSION_PATCH 5
 
 #define SIMPLE_HTTP_STR_HELPER(x) #x
 #define SIMPLE_HTTP_STR(x) SIMPLE_HTTP_STR_HELPER(x)
@@ -1202,9 +1202,13 @@ class HttpResponseWriter {
     template <typename Key, typename Value>
     void writeHeader(Key&& key, Value&& value) {
         if constexpr (std::is_same_v<std::decay_t<Key>, http::field>) {
-            m_headers->emplace_back(http::to_string(std::forward<Key>(key)), std::forward<Value>(value));
+            std::string key_str = http::to_string(std::forward<Key>(key));
+            toLower(key_str);
+            m_headers->emplace_back(std::move(key_str), std::forward<Value>(value));
         } else {
-            m_headers->emplace_back(std::forward<Key>(key), std::forward<Value>(value));
+            std::string key_str{std::forward<Key>(key)};
+            toLower(key_str);
+            m_headers->emplace_back(std::move(key_str), std::forward<Value>(value));
         }
     }
 
@@ -1218,7 +1222,7 @@ class HttpResponseWriter {
     bool writeHeaderEnd() {
         if (m_version != Version::Http2)
             return false;
-        static std::string server = http::to_string(http::field::server);
+        static std::string server = "server";
         auto it =
             std::find_if(m_headers->begin(), m_headers->end(), [&](auto&& p) { return server == std::get<0>(p); });
         if (it == m_headers->end()) {
@@ -1314,9 +1318,7 @@ class HttpResponseWriter {
             http_response->prepare_payload();
             m_http_status = std::to_string(http_response->result_int());
             for (const auto& field : http_response->base()) {
-                std::string str = field.name_string();
-                toLower(str);
-                writeHeader(std::move(str), field.value());
+                writeHeader(field.name_string(), field.value());
             }
             writeHeaderEnd();
             writeBodyEnd(std::move(http_response->body()));
