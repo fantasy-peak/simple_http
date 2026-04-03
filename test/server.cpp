@@ -51,6 +51,7 @@ asio::awaitable<void> hello(std::shared_ptr<simple_http::HttpRequestReader> read
     }
     ss << reader->target() << "\n";
     std::println("{}", ss.str());
+    bool first = true;
     if (writer->version() == simple_http::Version::Http2) {
         // for http2 stream recv
         for (;;) {
@@ -61,14 +62,23 @@ asio::awaitable<void> hello(std::shared_ptr<simple_http::HttpRequestReader> read
                 co_return;
             }
 
-            bool should_continue = std::visit(simple_http::overloaded{[](std::string str) {
-                                                                          std::println("recv h2 data frame: {}", str);
-                                                                          return true;
-                                                                      },
-                                                                      [](simple_http::Disconnect) { return false; },
-                                                                      [](simple_http::Rst) { return false; },
-                                                                      [](simple_http::Eof) { return false; }},
-                                              std::move(data));
+            bool should_continue =
+                std::visit(simple_http::overloaded{[&first](std::string str) mutable {
+                                                       if (first) {
+                                                           first = false;
+                                                           std::println("recv h2 data frame: {}", str);
+                                                       } else {
+                                                           int32_t network_val;
+                                                           memcpy(&network_val, str.data(), sizeof(network_val));
+                                                           int32_t aa = ntohl(network_val);
+                                                           std::println("recv h2 data frame(int32_t): {}", aa);
+                                                       }
+                                                       return true;
+                                                   },
+                                                   [](simple_http::Disconnect) { return false; },
+                                                   [](simple_http::Rst) { return false; },
+                                                   [](simple_http::Eof) { return false; }},
+                           std::move(data));
 
             if (!should_continue) {
                 break;

@@ -1,6 +1,7 @@
 #include <chrono>
 #include <memory>
 #include <print>
+#include <string>
 
 #include "simple_http.h"
 
@@ -37,8 +38,10 @@ asio::awaitable<void> client(simple_http::IoCtxPool& pool) {
         co_return;
     }
     auto& [w, r] = opt.value();
-    w->writerBody("hello", simple_http::WriteMode::More);
-    w->writerBody("client", simple_http::WriteMode::Last);
+
+    int32_t a = 8888;
+    int32_t net_a = htonl(a);
+    w->writerBody(std::string(reinterpret_cast<const char*>(&net_a), sizeof(net_a)), simple_http::WriteMode::Last);
 
     auto [ec, d] = co_await r->asyncReadDataFrame();
     if (std::holds_alternative<simple_http::ParseHeaderDone>(d)) {
