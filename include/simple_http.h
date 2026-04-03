@@ -11,7 +11,6 @@
 #include <format>
 #include <functional>
 #include <future>
-#include <list>
 #include <memory>
 #include <optional>
 #ifdef SIMPLE_HTTP_USE_BOOST_REGEX
@@ -42,7 +41,7 @@
 
 #define SIMPLE_HTTP_VERSION_MAJOR 0
 #define SIMPLE_HTTP_VERSION_MINOR 6
-#define SIMPLE_HTTP_VERSION_PATCH 5
+#define SIMPLE_HTTP_VERSION_PATCH 6
 
 #define SIMPLE_HTTP_STR_HELPER(x) #x
 #define SIMPLE_HTTP_STR(x) SIMPLE_HTTP_STR_HELPER(x)
@@ -353,6 +352,7 @@ class IoCtxPool final {
     }
 
     void stop() {
+        m_work.clear();
         for (auto& context_ptr : m_io_contexts)
             context_ptr->stop();
         for (auto& thread : m_threads) {
@@ -383,11 +383,11 @@ class IoCtxPool final {
     void create() {
         auto io_context_ptr = std::make_shared<asio::io_context>(1);
         m_io_contexts.emplace_back(io_context_ptr);
-        m_work.emplace_back(asio::require(io_context_ptr->get_executor(), asio::execution::outstanding_work.tracked));
+        m_work.emplace_back(asio::make_work_guard(io_context_ptr->get_executor()));
     }
 
     std::vector<std::shared_ptr<asio::io_context>> m_io_contexts;
-    std::list<asio::any_io_executor> m_work{};
+    std::vector<asio::executor_work_guard<asio::io_context::executor_type>> m_work;
     std::atomic_uint64_t m_next_io_context;
     std::vector<std::thread> m_threads;
     uint64_t m_pool_size;
@@ -945,7 +945,6 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
                        static std::string status{":status"};
                        fillH2Header(status, http_status, hdrs);
                        for (auto& [name, value] : *headers) {
-                           toLower(name);
                            fillH2Header(name, value, hdrs);
                        }
                        m_header_cache.emplace(stream_id, std::move(headers));
@@ -1086,7 +1085,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
     static int onFrameRecvCallback(nghttp2_session* /* session */, const nghttp2_frame* frame, void* userdata) {
         int32_t stream_id = frame->hd.stream_id;
         auto h2p = static_cast<Http2Parse*>(userdata);
-        auto http_request_reader = h2p->getStreamCtx(stream_id);
+        auto& http_request_reader = h2p->getStreamCtx(stream_id);
         if (frame->hd.type == NGHTTP2_RST_STREAM) {
             http_request_reader->trySend(Rst{});
             return 0;
@@ -1191,31 +1190,32 @@ class HttpResponseWriter {
 
     void writeStatus(int32_t http_status) {
         m_http_status_code = http_status;
-        m_http_status = std::to_string(http_status);
     }
 
     void writeStatus(http::status http_status) {
-        m_http_status_code = static_cast<int32_t>(http_status);
-        writeStatus(m_http_status_code);
+        writeStatus(static_cast<int32_t>(http_status));
     }
 
     template <typename Key, typename Value>
-    void writeHeader(Key&& key, Value&& value) {
+    void writeHeader(Key&& key, Value&& value, bool to_lower = true) {
         if constexpr (std::is_same_v<std::decay_t<Key>, http::field>) {
             std::string key_str = http::to_string(std::forward<Key>(key));
             toLower(key_str);
             m_headers->emplace_back(std::move(key_str), std::forward<Value>(value));
         } else {
             std::string key_str{std::forward<Key>(key)};
-            toLower(key_str);
+            if (to_lower) {
+                toLower(key_str);
+            }
             m_headers->emplace_back(std::move(key_str), std::forward<Value>(value));
         }
     }
 
     template <typename T>
     void writeHeader(const T& headers) {
-        for (auto& [k, v] : headers) {
-            m_headers->emplace_back(k, v);
+        for (auto [k, v] : headers) {
+            toLower(k);
+            m_headers->emplace_back(std::move(k), std::move(v));
         }
     }
 
@@ -1230,7 +1230,7 @@ class HttpResponseWriter {
         }
         m_write_h2_header_done = true;
         // Attention m_headers already move !!!
-        auto ret = m_http2_parse->writeHeaderEnd(std::move(m_headers), m_stream_id, std::move(m_http_status));
+        auto ret = m_http2_parse->writeHeaderEnd(std::move(m_headers), m_stream_id, std::to_string(m_http_status_code));
         return ret;
     }
 
@@ -1261,9 +1261,8 @@ class HttpResponseWriter {
 
     // for http1.1 chunk
     bool writeChunkHeader(http::response<http::empty_body>& res) {
-        auto it = res.find(http::field::transfer_encoding);
-        if (it == res.end() || it->value() != "chunked") {
-            res.set(http::field::transfer_encoding, "chunked");
+        if (!res.chunked()) {
+            res.chunked(true);
         }
         http::response<http::empty_body>::header_type::writer fr{res.base(), res.version(), res.result_int()};
         auto const& buffers = fr.get();
@@ -1316,7 +1315,7 @@ class HttpResponseWriter {
     bool writeHttpResponse(const std::shared_ptr<http::response<http::string_body>>& http_response) {
         if (m_version == Version::Http2) {
             http_response->prepare_payload();
-            m_http_status = std::to_string(http_response->result_int());
+            m_http_status_code = http_response->result_int();
             for (const auto& field : http_response->base()) {
                 writeHeader(field.name_string(), field.value());
             }
@@ -1368,7 +1367,6 @@ class HttpResponseWriter {
     std::shared_ptr<Http2Parse> m_http2_parse;
     int32_t m_stream_id;
     Version m_version;
-    std::string m_http_status{"200"};
     int32_t m_http_status_code{200};
     std::unique_ptr<std::vector<std::tuple<std::string, std::string>>> m_headers{
         std::make_unique<std::vector<std::tuple<std::string, std::string>>>()};
@@ -1440,7 +1438,7 @@ class HttpServer final {
                 using HandlerType = std::decay_t<Handler>;
                 auto h = std::make_shared<HandlerType>(std::forward<Handler>(handler));
                 asio::co_spawn(
-                    *(m_io_dispatch->getMainContext()),
+                    *(m_io_ctx_pool->getMainContext()),
                     [this, h = std::move(h)] -> asio::awaitable<void> {
                         auto ex = asio::get_associated_executor(*h);
                         if (m_cfg.enable_ipv6) {

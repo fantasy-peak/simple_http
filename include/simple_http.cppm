@@ -27,6 +27,8 @@ using ::simple_http::StreamSpec;
 using ::simple_http::Disconnect;
 using ::simple_http::Eof;
 using ::simple_http::ParseHeaderDone;
+using ::simple_http::Rst;
+using ::simple_http::StreamStatus;
 
 using ::simple_http::IoCtxPool;
 using ::simple_http::LogLevel;
