@@ -14,6 +14,7 @@ set_policy("package.librarydeps.strict_compatibility", true)
 add_requires("boost", {configs = {asio=true, regex=true}})
 add_requires("nghttp2")
 add_requires("openssl3")
+add_requires("catch2 v3.13.0", {configs = {with_main = true}})
 
 add_defines("SIMPLE_HTTP_EXPERIMENT_WEBSOCKET", "SIMPLE_HTTP_USE_BOOST_REGEX", "SIMPLE_HTTP_EXPERIMENT_HTTP2CLIENT")
 
@@ -26,6 +27,14 @@ target("simple_http")
         "openssl3",
         {public = true}
     )
+target_end()
+
+target("unit_tests")
+    set_kind("binary")
+    add_deps("simple_http")
+    add_packages("catch2")
+    add_files("test/unit_tests.cpp")
+    set_rundir(".")
 target_end()
 
 target("server")
