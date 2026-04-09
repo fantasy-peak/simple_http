@@ -86,7 +86,7 @@ namespace regex_adapter = std;
 #endif
 
 inline int32_t channel_capacity = 100000;
-constexpr int32_t tcp_read_buffer_size = 4096;
+constexpr int32_t tcp_read_buffer_size = 8 * 1024;
 inline std::vector<uint8_t> alpn_proto_list{0x02, 'h', '2', 0x08, 'h', 't', 't', 'p', '/', '1', '.', '1'};
 
 template <class... Ts>
@@ -327,9 +327,6 @@ inline ssize_t dataReadCallback(nghttp2_session* /* session */,
 
     if (ctx->is_finished) {
         *data_flags |= NGHTTP2_DATA_FLAG_EOF;
-        // // *data_flags &= ~NGHTTP2_DATA_FLAG_NO_END_STREAM;
-        // std::cout << "[HTTP2] 流 " << stream_id << " 数据推送完毕，发送 0 字节 END_STREAM" << std::endl;
-
         return 0;
     }
 
@@ -783,7 +780,8 @@ inline asio::awaitable<void> flushToSocket(AsyncStream socket,
             for (const auto& s : vec) {
                 buffers.push_back(asio::buffer(s));
             }
-            if (auto [ec, nwritten] = co_await async_write(*socket, buffers, asio::as_tuple(asio::use_awaitable)); ec) {
+            if (auto [ec, nwritten] = co_await asio::async_write(*socket, buffers, asio::as_tuple(asio::use_awaitable));
+                ec) {
                 break;
             }
             vec.clear();
@@ -1795,7 +1793,10 @@ inline asio::awaitable<void> HttpServer::upgradeH2c(AsyncStream socket,
     http::response<http::empty_body> res{http::status::switching_protocols, 11};
     res.set(http::field::connection, "Upgrade");
     res.set(http::field::upgrade, "h2c");
-    co_await http::async_write(*socket, res, asio::as_tuple(asio::use_awaitable));
+    if (auto [ec, count] = co_await http::async_write(*socket, res, asio::as_tuple(asio::use_awaitable)); ec) {
+        SIMPLE_HTTP_DEBUG_LOG("write error: {}", ec.message());
+        co_return;
+    }
 
     auto& io_dispatch = m_io_dispatch->getIoContextPtr();
     auto ch = std::make_shared<Http2Channel>(co_await asio::this_coro::executor, channel_capacity);
