@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <bit>
 #include <exception>
 #include <filesystem>
 #include <format>
@@ -282,9 +283,9 @@ inline bool isHttp2(std::string_view cache_data) {
 
 inline void fillH2Header(std::string_view name, std::string_view value, std::vector<nghttp2_nv>& hdrs) {
     nghttp2_nv nv;
-    nv.name = (uint8_t*)name.data();
+    nv.name = std::bit_cast<uint8_t*>(name.data());
     nv.namelen = name.size();
-    nv.value = (uint8_t*)value.data();
+    nv.value = std::bit_cast<uint8_t*>(value.data());
     nv.valuelen = value.size();
     nv.flags = NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE;
     hdrs.push_back(nv);
@@ -742,7 +743,7 @@ inline asio::awaitable<void> flushToSocket(AsyncStream socket,
     std::vector<std::string> vec;
     bool force_close = false;
     for (;;) {
-        while (true) {
+        for (;;) {
             *deadline = std::chrono::steady_clock::now() + idle_timeout;
             std::variant<std::string, Disconnect> data;
             if (!ch->try_receive([&](auto, auto recv_data) { data = std::move(recv_data); })) {
@@ -752,8 +753,8 @@ inline asio::awaitable<void> flushToSocket(AsyncStream socket,
                 force_close = true;
                 break;
             } else {
-                auto& info_ptr = std::get<std::string>(data);
-                vec.emplace_back(std::move(info_ptr));
+                auto& send_data = std::get<std::string>(data);
+                vec.emplace_back(std::move(send_data));
             }
             // Let's yield the thread and allow other tasks to execute.
             if (vec.size() > 100) {
@@ -772,6 +773,7 @@ inline asio::awaitable<void> flushToSocket(AsyncStream socket,
                 auto& info = std::get<std::string>(data);
                 vec.emplace_back(std::move(info));
             }
+            *deadline = std::chrono::steady_clock::now() + idle_timeout;
         }
 
         if (!vec.empty()) {
@@ -799,15 +801,14 @@ inline asio::awaitable<void> processH2Stream(AsyncStream socket,
                                              H2Parser h2p,
                                              std::shared_ptr<std::chrono::steady_clock::time_point> deadline,
                                              std::chrono::seconds idle_timeout) {
-    char buffer[tcp_read_buffer_size];
+    std::array<uint8_t, tcp_read_buffer_size> buffer;
     for (;;) {
         *deadline = std::chrono::steady_clock::now() + idle_timeout;
-        auto [ec, nread] =
-            co_await socket->async_read_some(asio::buffer(buffer, sizeof(buffer)), asio::as_tuple(asio::use_awaitable));
+        auto [ec, nread] = co_await socket->async_read_some(asio::buffer(buffer), asio::as_tuple(asio::use_awaitable));
         if (ec) {
             break;
         }
-        auto ret = h2p->feedRecvData(buffer, nread);
+        auto ret = h2p->feedRecvData(buffer.data(), nread);
         if (ret == -1) {
             break;
         }
@@ -897,7 +898,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
         if (cfg.is_h2c_upgrade) {
             auto http2_settings_base64 = base64UrlDecode(cfg.h2_setting);
             auto ret = nghttp2_session_upgrade2(m_session,
-                                                (uint8_t*)http2_settings_base64.data(),
+                                                std::bit_cast<uint8_t*>(http2_settings_base64.data()),
                                                 http2_settings_base64.size(),
                                                 cfg.method == http::verb::head ? 1 : 0,
                                                 nullptr);
@@ -1050,8 +1051,8 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
         int32_t stream_id = frame->hd.stream_id;
         auto h2p = static_cast<Http2Parse*>(userdata);
         auto& http_request_reader = h2p->getStreamCtx(stream_id);
-        std::string name{(char*)_name, namelen};
-        std::string value{(char*)_value, valuelen};
+        std::string name{std::bit_cast<const char*>(_name), namelen};
+        std::string value{std::bit_cast<const char*>(_value), valuelen};
         toLower(name);
         if (name == ":method") {
             http_request_reader->setMethod(http::string_to_verb(value));
@@ -1074,7 +1075,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
             SIMPLE_HTTP_DEBUG_LOG("{}", "sendCallback client disconnect!!!");
             return length;
         }
-        if (!sp->try_send(error_code{}, std::string((char*)data, length))) {
+        if (!sp->try_send(error_code{}, std::string(std::bit_cast<const char*>(data), length))) {
             SIMPLE_HTTP_ERROR_LOG("{}", "sendCallback send error!!!!");
         }
         return length;
@@ -1112,7 +1113,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
                                        void* userdata) {
         auto h2p = static_cast<Http2Parse*>(userdata);
         auto& req = h2p->getStreamCtx(stream_id);
-        req->trySend(std::string((char*)data, len));
+        req->trySend(std::string(std::bit_cast<const char*>(data), len));
         return 0;
     }
 
@@ -1130,8 +1131,8 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
         return 0;
     }
 
-    int feedRecvData(const char* data, size_t len) {
-        size_t ret = nghttp2_session_mem_recv(m_session, (const uint8_t*)data, len);
+    int feedRecvData(const uint8_t* data, size_t len) {
+        size_t ret = nghttp2_session_mem_recv(m_session, data, len);
         if (ret != len) {
             SIMPLE_HTTP_ERROR_LOG("nghttp2 error: {}", nghttp2_strerror(ret));
             return -1;
@@ -1858,7 +1859,7 @@ inline asio::awaitable<void> HttpServer::switchH2c(AsyncStream socket,
         SIMPLE_HTTP_ERROR_LOG("init error: {}", ret);
         co_return;
     }
-    auto ret = h2p->feedRecvData(buffer.data(), buffer.size());
+    auto ret = h2p->feedRecvData(std::bit_cast<const uint8_t*>(buffer.data()), buffer.size());
     if (ret == -1) {
         co_return;
     }
@@ -1948,6 +1949,7 @@ inline asio::awaitable<void> HttpServer::switchHttp1(AsyncStream socket,
 template <typename AsyncStream>
 inline asio::awaitable<void> HttpServer::upgradeWebsocket(AsyncStream socket,
                                                           const http::request<http::string_body>& full_req) {
+#ifdef SIMPLE_HTTP_EXPERIMENT_WEBSOCKET
     using SocketType = std::decay_t<decltype(*socket)>;
     auto stream = std::make_shared<websocket::stream<SocketType>>(std::move(*socket));
     if (m_cfg.auto_upgrade_websocket) {
@@ -2015,6 +2017,7 @@ inline asio::awaitable<void> HttpServer::upgradeWebsocket(AsyncStream socket,
         tcp.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
         tcp.close(ec);
     }
+#endif
     co_return;
 }
 
@@ -2631,8 +2634,8 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
         int32_t stream_id = frame->hd.stream_id;
         auto http2_client = static_cast<Http2Client*>(userdata);
         auto& http_rsp = http2_client->getStreamCtx(stream_id);
-        std::string name{(char*)_name, namelen};
-        std::string value{(char*)_value, valuelen};
+        std::string name{std::bit_cast<const char*>(_name), namelen};
+        std::string value{std::bit_cast<const char*>(_value), valuelen};
         toLower(name);
         if (name == ":method") {
             http_rsp->setMethod(http::string_to_verb(value));
@@ -2648,7 +2651,8 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
                                 int /* flags */,
                                 void* userdata) {
         auto http2_client = static_cast<Http2Client*>(userdata);
-        if (!http2_client->m_send_h2_channel->try_send(error_code{}, std::string((char*)data, length))) {
+        if (!http2_client->m_send_h2_channel->try_send(error_code{},
+                                                       std::string(std::bit_cast<const char*>(data), length))) {
             SIMPLE_HTTP_ERROR_LOG("{}", "sendCallback send error!!!!");
         }
         return length;
@@ -2685,7 +2689,7 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
                                        void* userdata) {
         auto h2_cli = static_cast<Http2Client*>(userdata);
         auto& http_rsp_reader = h2_cli->getStreamCtx(stream_id);
-        http_rsp_reader->try_send(std::string((char*)data, len));
+        http_rsp_reader->try_send(std::string(std::bit_cast<const char*>(data), len));
         return 0;
     }
 
@@ -2708,8 +2712,8 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
         return 0;
     }
 
-    int feedRecvData(const char* data, size_t len) {
-        size_t ret = nghttp2_session_mem_recv(m_session, (const uint8_t*)data, len);
+    int feedRecvData(const uint8_t* data, size_t len) {
+        size_t ret = nghttp2_session_mem_recv(m_session, data, len);
         if (ret != len) {
             SIMPLE_HTTP_ERROR_LOG("feedRecvData error: {}", nghttp2_strerror(ret));
             return -1;
