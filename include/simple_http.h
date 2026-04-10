@@ -14,6 +14,7 @@
 #include <future>
 #include <memory>
 #include <optional>
+#include <charconv>
 #ifdef SIMPLE_HTTP_USE_BOOST_REGEX
 #include <boost/regex.hpp>
 #else
@@ -421,6 +422,11 @@ class HttpRequestReader {
     }
 
     ~HttpRequestReader() = default;
+
+    HttpRequestReader(const HttpRequestReader&) = delete;
+    HttpRequestReader& operator=(const HttpRequestReader&) = delete;
+    HttpRequestReader(HttpRequestReader&&) = delete;
+    HttpRequestReader& operator=(HttpRequestReader&&) = delete;
 
     // Http2 streaming reads http body
     asio::awaitable<std::tuple<error_code, std::variant<std::string, Eof, Rst, Disconnect>>> asyncReadDataFrame() {
@@ -883,6 +889,11 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
         }
     }
 
+    Http2Parse(const Http2Parse&) = delete;
+    Http2Parse& operator=(const Http2Parse&) = delete;
+    Http2Parse(Http2Parse&&) = delete;
+    Http2Parse& operator=(Http2Parse&&) = delete;
+
     int init(const Config& cfg) {
         nghttp2_session_callbacks_new(&m_cbs);
         nghttp2_session_callbacks_set_on_header_callback(m_cbs, onHeaderCallback);
@@ -1187,6 +1198,11 @@ class HttpResponseWriter {
         }
     }
 
+    HttpResponseWriter(const HttpResponseWriter&) = delete;
+    HttpResponseWriter& operator=(const HttpResponseWriter&) = delete;
+    HttpResponseWriter(HttpResponseWriter&&) = delete;
+    HttpResponseWriter& operator=(HttpResponseWriter&&) = delete;
+
     void writeStatus(int32_t http_status) {
         m_http_status_code = http_status;
     }
@@ -1366,7 +1382,7 @@ class HttpResponseWriter {
     std::shared_ptr<Http2Parse> m_http2_parse;
     int32_t m_stream_id;
     Version m_version;
-    int32_t m_http_status_code{200};
+    uint32_t m_http_status_code{200};
     std::unique_ptr<std::vector<std::tuple<std::string, std::string>>> m_headers{
         std::make_unique<std::vector<std::tuple<std::string, std::string>>>()};
     bool m_write_h2_header_done{false};
@@ -1420,6 +1436,8 @@ class HttpServer final {
           m_stop_ctx_pool(false) {
         initSsl();
     }
+
+    ~HttpServer() = default;
 
     HttpServer(const HttpServer&) = delete;
     HttpServer& operator=(const HttpServer&) = delete;
@@ -2165,21 +2183,24 @@ struct HttpResponseReader final {
         co_return co_await m_channel->async_receive(asio::as_tuple(asio::use_awaitable));
     }
 
-    void setMethod(auto method) {
-        m_method = method;
-    }
-
     void setHeader(std::string name, std::string value) {
         m_headers.emplace(std::move(name), std::move(value));
     }
 
-    bool try_send(auto data) {
-        auto ret = m_channel->try_send(error_code{}, std::move(data));
-        return ret;
+    void setStatusCode(const char* str, std::size_t len) {
+        if (len == 0) {
+            return;
+        }
+        [[maybe_unused]] auto [ptr, ec] = std::from_chars(str, str + len, m_http_status_code);
+        if (ec != std::errc()) {
+            m_http_status_code = 500;
+        }
+        return;
     }
 
-    auto method() {
-        return m_method;
+    bool trySend(auto data) {
+        auto ret = m_channel->try_send(error_code{}, std::move(data));
+        return ret;
     }
 
     auto version() {
@@ -2194,13 +2215,17 @@ struct HttpResponseReader final {
         return stream_id;
     }
 
+    auto getStatusCode() {
+        return m_http_status_code;
+    }
+
   private:
     int stream_id;
     Version m_version;
     std::shared_ptr<Channel> m_channel;
-    http::verb m_method;
     std::unordered_multimap<std::string, std::string> m_headers;
     std::string m_body;
+    int32_t m_http_status_code{500};
 };
 
 class StreamSpec {
@@ -2312,6 +2337,11 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
         });
         done.get_future().wait();
     }
+
+    Http2Client(const Http2Client&) = delete;
+    Http2Client& operator=(const Http2Client&) = delete;
+    Http2Client(Http2Client&&) = delete;
+    Http2Client& operator=(Http2Client&&) = delete;
 
     void disconnect() {
         asio::dispatch(*m_io_context, [this] {
@@ -2635,11 +2665,11 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
         auto http2_client = static_cast<Http2Client*>(userdata);
         auto& http_rsp = http2_client->getStreamCtx(stream_id);
         std::string name{std::bit_cast<const char*>(_name), namelen};
-        std::string value{std::bit_cast<const char*>(_value), valuelen};
         toLower(name);
-        if (name == ":method") {
-            http_rsp->setMethod(http::string_to_verb(value));
+        if (name == ":status") {
+            http_rsp->setStatusCode(std::bit_cast<const char*>(_value), valuelen);
         } else {
+            std::string value{std::bit_cast<const char*>(_value), valuelen};
             http_rsp->setHeader(std::move(name), std::move(value));
         }
         return 0;
@@ -2669,14 +2699,14 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
             return 0;
         }
         if (frame->hd.type == NGHTTP2_RST_STREAM) {
-            http_rsp_reader->try_send(Rst{});
+            http_rsp_reader->trySend(Rst{});
             return 0;
         }
         if (frame->hd.type == NGHTTP2_HEADERS && (frame->hd.flags & NGHTTP2_FLAG_END_HEADERS)) {
-            http_rsp_reader->try_send(ParseHeaderDone{});
+            http_rsp_reader->trySend(ParseHeaderDone{});
         }
         if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
-            http_rsp_reader->try_send(Eof{});
+            http_rsp_reader->trySend(Eof{});
         }
         return 0;
     }
@@ -2689,7 +2719,7 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
                                        void* userdata) {
         auto h2_cli = static_cast<Http2Client*>(userdata);
         auto& http_rsp_reader = h2_cli->getStreamCtx(stream_id);
-        http_rsp_reader->try_send(std::string(std::bit_cast<const char*>(data), len));
+        http_rsp_reader->trySend(std::string(std::bit_cast<const char*>(data), len));
         return 0;
     }
 
@@ -2785,7 +2815,7 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
                       flushToSocket(socket, h2_channel, deadline, std::chrono::seconds(timeout)) || watchdog(deadline));
             // disconnect
             for (auto& [id, rsp] : sp->m_streams) {
-                rsp->try_send(Disconnect{});
+                rsp->trySend(Disconnect{});
             }
             sp->m_streams.clear();
             co_return;
