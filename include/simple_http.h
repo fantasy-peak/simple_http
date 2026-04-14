@@ -940,7 +940,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
         if (!sp) {
             return false;
         }
-        std::weak_ptr<Http2Parse> self = shared_from_this();
+        std::weak_ptr<Http2Parse> self = weak_from_this();
         asio::post(sp->get_executor(),
                    [this,
                     self = std::move(self),
@@ -979,7 +979,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
         if (!sp) {
             return false;
         }
-        std::weak_ptr<Http2Parse> self = shared_from_this();
+        std::weak_ptr<Http2Parse> self = weak_from_this();
         asio::post(sp->get_executor(),
                    [this, self = std::move(self), data = std::move(data), write_mode, stream_id]() mutable {
                        auto sp = self.lock();
@@ -2555,7 +2555,7 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
         void(std::optional<std::tuple<std::shared_ptr<HttpRequestWriter>, std::shared_ptr<HttpResponseReader>>>)>
                   CompletionToken>
     auto openStream(const std::shared_ptr<StreamSpec>& stream_spec, CompletionToken&& token) {
-        std::weak_ptr<Http2Client> self_ptr = shared_from_this();
+        std::weak_ptr<Http2Client> self_ptr = weak_from_this();
         return asio::async_initiate<
             CompletionToken,
             void(std::optional<std::tuple<std::shared_ptr<HttpRequestWriter>, std::shared_ptr<HttpResponseReader>>>)>(
@@ -2820,7 +2820,7 @@ class Http2Client final : public std::enable_shared_from_this<Http2Client> {
             sp->m_streams.clear();
             co_return;
         };
-        asio::co_spawn(*m_io_context, start_forward(socket_ptr, shared_from_this()), asio::detached);
+        asio::co_spawn(*m_io_context, start_forward(socket_ptr, weak_from_this()), asio::detached);
 
         nghttp2_session_send(m_session);
     }
