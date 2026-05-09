@@ -865,7 +865,7 @@ inline asio::awaitable<void> watchdog(std::shared_ptr<std::chrono::steady_clock:
     co_return;
 }
 
-class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
+class HttpParse final : public std::enable_shared_from_this<HttpParse> {
   public:
     struct Config {
         bool is_h2c_upgrade;
@@ -876,12 +876,12 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
         http::verb method;
     };
 
-    Http2Parse(const std::shared_ptr<Http2Channel>& ch2,
-               const std::shared_ptr<Http1Channel>& ch1,
-               auto io_context,
-               const std::shared_ptr<HandlerFunctions>& handler_functions,
-               const std::shared_ptr<__private::SessionContext> session_ctx,
-               asio::ip::tcp::endpoint endpoint)
+    HttpParse(const std::shared_ptr<Http2Channel>& ch2,
+              const std::shared_ptr<Http1Channel>& ch1,
+              auto io_context,
+              const std::shared_ptr<HandlerFunctions>& handler_functions,
+              const std::shared_ptr<__private::SessionContext> session_ctx,
+              asio::ip::tcp::endpoint endpoint)
         : m_h2_channel(ch2),
           m_h1_channel(ch1),
           m_io_dispatch(std::move(io_context)),
@@ -890,17 +890,17 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
           m_endpoint(std::move(endpoint)) {
     }
 
-    ~Http2Parse() {
+    ~HttpParse() {
         if (m_session) {
             nghttp2_session_callbacks_del(m_cbs);
             nghttp2_session_del(m_session);
         }
     }
 
-    Http2Parse(const Http2Parse&) = delete;
-    Http2Parse& operator=(const Http2Parse&) = delete;
-    Http2Parse(Http2Parse&&) = delete;
-    Http2Parse& operator=(Http2Parse&&) = delete;
+    HttpParse(const HttpParse&) = delete;
+    HttpParse& operator=(const HttpParse&) = delete;
+    HttpParse(HttpParse&&) = delete;
+    HttpParse& operator=(HttpParse&&) = delete;
 
     int init(const Config& cfg) {
         nghttp2_session_callbacks_new(&m_cbs);
@@ -948,7 +948,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
         if (!sp) {
             return false;
         }
-        std::weak_ptr<Http2Parse> self = weak_from_this();
+        std::weak_ptr<HttpParse> self = weak_from_this();
         asio::post(sp->get_executor(),
                    [this,
                     self = std::move(self),
@@ -987,7 +987,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
         if (!sp) {
             return false;
         }
-        std::weak_ptr<Http2Parse> self = weak_from_this();
+        std::weak_ptr<HttpParse> self = weak_from_this();
         asio::post(sp->get_executor(),
                    [this, self = std::move(self), data = std::move(data), write_mode, stream_id]() mutable {
                        auto sp = self.lock();
@@ -1042,7 +1042,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
 
     static int onFrameSendCallback(nghttp2_session* /* session */, const nghttp2_frame* frame, void* user_data) {
         if (frame->hd.type == NGHTTP2_HEADERS) {
-            auto h2p = static_cast<Http2Parse*>(user_data);
+            auto h2p = static_cast<HttpParse*>(user_data);
             h2p->m_header_cache.erase(frame->hd.stream_id);
         }
         return 0;
@@ -1053,7 +1053,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
                                       int /* lib_error_code */,
                                       void* user_data) {
         if (frame->hd.type == NGHTTP2_HEADERS) {
-            auto h2p = static_cast<Http2Parse*>(user_data);
+            auto h2p = static_cast<HttpParse*>(user_data);
             h2p->m_header_cache.erase(frame->hd.stream_id);
         }
         return 0;
@@ -1068,7 +1068,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
                                 uint8_t /* flags */,
                                 void* userdata) {
         int32_t stream_id = frame->hd.stream_id;
-        auto h2p = static_cast<Http2Parse*>(userdata);
+        auto h2p = static_cast<HttpParse*>(userdata);
         auto& http_request_reader = h2p->getStreamCtx(stream_id);
         std::string name{std::bit_cast<const char*>(_name), namelen};
         std::string value{std::bit_cast<const char*>(_value), valuelen};
@@ -1088,7 +1088,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
                                 size_t length,
                                 int /* flags */,
                                 void* userdata) {
-        auto h2p = static_cast<Http2Parse*>(userdata);
+        auto h2p = static_cast<HttpParse*>(userdata);
         auto sp = h2p->m_h2_channel.lock();
         if (sp == nullptr) {
             SIMPLE_HTTP_DEBUG_LOG("{}", "sendCallback client disconnect!!!");
@@ -1102,7 +1102,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
 
     static int onFrameRecvCallback(nghttp2_session* /* session */, const nghttp2_frame* frame, void* userdata) {
         int32_t stream_id = frame->hd.stream_id;
-        auto h2p = static_cast<Http2Parse*>(userdata);
+        auto h2p = static_cast<HttpParse*>(userdata);
         auto& http_request_reader = h2p->getStreamCtx(stream_id);
         if (frame->hd.type == NGHTTP2_RST_STREAM) {
             http_request_reader->trySend(Rst{});
@@ -1130,7 +1130,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
                                        const uint8_t* data,
                                        size_t len,
                                        void* userdata) {
-        auto h2p = static_cast<Http2Parse*>(userdata);
+        auto h2p = static_cast<HttpParse*>(userdata);
         auto& req = h2p->getStreamCtx(stream_id);
         req->trySend(std::string(std::bit_cast<const char*>(data), len));
         return 0;
@@ -1140,7 +1140,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
                                      int32_t stream_id,
                                      uint32_t /* error_code */,
                                      void* userdata) {
-        auto h2p = static_cast<Http2Parse*>(userdata);
+        auto h2p = static_cast<HttpParse*>(userdata);
         h2p->erase(stream_id);
         void* ptr = nghttp2_session_get_stream_user_data(session, stream_id);
         if (ptr) {
@@ -1193,7 +1193,7 @@ class Http2Parse final : public std::enable_shared_from_this<Http2Parse> {
 
 class HttpResponseWriter {
   public:
-    HttpResponseWriter(const std::shared_ptr<Http2Parse>& http2_helper, int32_t stream_id, Version version)
+    HttpResponseWriter(const std::shared_ptr<HttpParse>& http2_helper, int32_t stream_id, Version version)
         : m_http2_parse(http2_helper), m_stream_id(stream_id), m_version(version) {
     }
 
@@ -1387,7 +1387,7 @@ class HttpResponseWriter {
     }
 
   private:
-    std::shared_ptr<Http2Parse> m_http2_parse;
+    std::shared_ptr<HttpParse> m_http2_parse;
     int32_t m_stream_id;
     Version m_version;
     uint32_t m_http_status_code{200};
@@ -1583,7 +1583,7 @@ class HttpServer final {
     template <typename AsyncStream>
     asio::awaitable<void> switchHttp1(AsyncStream socket,
                                       std::shared_ptr<Http1Channel> http1_ch,
-                                      std::shared_ptr<Http2Parse> h2p,
+                                      std::shared_ptr<HttpParse> h2p,
                                       Version version,
                                       std::shared_ptr<__private::SessionContext> session_ctx,
                                       asio::ip::tcp::endpoint endpoint);
@@ -1827,8 +1827,8 @@ inline asio::awaitable<void> HttpServer::upgradeH2c(AsyncStream socket,
 
     auto& io_dispatch = m_io_dispatch->getIoContextPtr();
     auto ch = std::make_shared<Http2Channel>(co_await asio::this_coro::executor, channel_capacity);
-    auto h2p = std::make_shared<Http2Parse>(ch, nullptr, io_dispatch, m_handler_functions, session_ctx, endpoint);
-    if (auto ret = h2p->init(Http2Parse::Config{
+    auto h2p = std::make_shared<HttpParse>(ch, nullptr, io_dispatch, m_handler_functions, session_ctx, endpoint);
+    if (auto ret = h2p->init(HttpParse::Config{
             .is_h2c_upgrade = true,
             .h2_setting = std::move(settings),
             .concurrent_streams = m_cfg.concurrent_streams,
@@ -1872,8 +1872,8 @@ inline asio::awaitable<void> HttpServer::switchH2c(AsyncStream socket,
     auto& io_dispatch = m_io_dispatch->getIoContextPtr();
     // start proc http2
     auto ch = std::make_shared<Http2Channel>(co_await asio::this_coro::executor, channel_capacity);
-    auto h2p = std::make_shared<Http2Parse>(ch, nullptr, io_dispatch, m_handler_functions, session_ctx, endpoint);
-    if (auto ret = h2p->init(Http2Parse::Config{
+    auto h2p = std::make_shared<HttpParse>(ch, nullptr, io_dispatch, m_handler_functions, session_ctx, endpoint);
+    if (auto ret = h2p->init(HttpParse::Config{
             .is_h2c_upgrade = false,
             .h2_setting = "",
             .concurrent_streams = m_cfg.concurrent_streams,
@@ -1900,7 +1900,7 @@ inline asio::awaitable<void> HttpServer::switchH2c(AsyncStream socket,
 template <typename AsyncStream>
 inline asio::awaitable<void> HttpServer::switchHttp1(AsyncStream socket,
                                                      std::shared_ptr<Http1Channel> http1_ch,
-                                                     std::shared_ptr<Http2Parse> h2p,
+                                                     std::shared_ptr<HttpParse> h2p,
                                                      Version version,
                                                      std::shared_ptr<__private::SessionContext> session_ctx,
                                                      asio::ip::tcp::endpoint endpoint) {
@@ -2054,7 +2054,7 @@ inline asio::awaitable<void> HttpServer::session(AsyncStream socket,
                                                  asio::ip::tcp::endpoint endpoint) {
     auto session_ctx = std::make_shared<__private::SessionContext>(session_context);
     auto http1_ch = std::make_shared<Http1Channel>(*ctx, channel_capacity);
-    auto h2p = std::make_shared<Http2Parse>(nullptr, http1_ch, nullptr, m_handler_functions, session_ctx, endpoint);
+    auto h2p = std::make_shared<HttpParse>(nullptr, http1_ch, nullptr, m_handler_functions, session_ctx, endpoint);
     beast::flat_buffer buffer;
     http::parser<true, http::string_body> parser;
     auto [ec, bytes] = co_await http::async_read_header(*socket, buffer, parser, asio::as_tuple(asio::use_awaitable));
