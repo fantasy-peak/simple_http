@@ -108,10 +108,16 @@ inline constexpr std::string_view image_gif = "image/gif";
 }  // namespace mime
 
 enum class LogLevel : uint8_t {
-    Debug,
-    Info,
-    Error,
+    Debug = 0,
+    Info = 1,
+    Error = 2,
 };
+
+inline std::atomic<LogLevel> log_level = LogLevel::Info;
+
+inline void setLogLevel(LogLevel level) {
+    log_level.store(level, std::memory_order_relaxed);
+}
 
 enum class Version : uint8_t {
     Http1 = 0,
@@ -208,7 +214,9 @@ using WebSocketCallback = std::variant<WsCallBack, WssCallBack, WsUnixCallBack, 
 
 template <typename... Args>
 inline void log(LogLevel level, std::string_view file, int line, std::format_string<Args...> fmt, Args&&... args) {
-    LOG_CB(level, file, line, std::format(fmt, std::forward<Args>(args)...));
+    if (level >= log_level.load(std::memory_order_relaxed)) {
+        LOG_CB(level, file, line, std::format(fmt, std::forward<Args>(args)...));
+    }
 }
 
 inline std::shared_ptr<http::response<http::string_body>> makeHttpResponse(
@@ -1477,7 +1485,7 @@ class HttpServer final {
     void stop() {
         auto ctx = m_io_ctx_pool->getMainContext();
         std::promise<void> done;
-        asio::post(*ctx, [&] {
+        asio::dispatch(*ctx, [&] {
 #ifdef SIMPLE_HTTP_BIND_UNIX_SOCKET
             if (m_local_acceptor) {
                 m_local_acceptor->close();

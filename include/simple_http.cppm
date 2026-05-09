@@ -49,6 +49,7 @@ using ::simple_http::WsUnixStreamPtr;
 using ::simple_http::base64UrlDecode;
 using ::simple_http::base64UrlEncode;
 using ::simple_http::makeHttpResponse;
+using ::simple_http::setLogLevel;
 using ::simple_http::toLower;
 using ::simple_http::toString;
 
