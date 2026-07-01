@@ -478,6 +478,7 @@ class HttpRequestReader {
                     break;
                 } else if (std::holds_alternative<Eof>(data)) {
                     stream_status = StreamStatus::Eof;
+                    break;
                 } else {
                     stream_status = StreamStatus::Rst;
                     break;
