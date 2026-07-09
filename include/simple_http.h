@@ -13,6 +13,7 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <charconv>
 #ifdef SIMPLE_HTTP_USE_BOOST_REGEX
@@ -1626,7 +1627,11 @@ inline asio::awaitable<bool> HttpServer::startAcceptor(const std::string& ip, ui
     }
     asio::ip::tcp::endpoint endpoint(addr, port);
     auto acceptor = std::make_shared<asio::ip::tcp::acceptor>(*m_io_ctx_pool->getMainContext());
-    m_acceptors.emplace_back(acceptor);
+    static std::mutex mtx;
+    {
+        std::lock_guard lk(mtx);
+        m_acceptors.emplace_back(acceptor);
+    }
     acceptor->open(endpoint.protocol());
     if (is_v6) {
         acceptor->set_option(asio::ip::v6_only(true));
