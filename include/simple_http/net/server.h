@@ -104,6 +104,39 @@ class Server {
         return *this;
     }
 
+    // --- WebSocket proxy-route registration (byte-level pass-through) ---
+    // An Upgrade: websocket request on `path` is spliced verbatim to the backend
+    // TCP endpoint host:port. Frames, fragmentation, masking and control frames
+    // all pass through untouched.
+    Server& ws_proxy(std::string path, std::string host, std::uint16_t port, std::string rewrite_path = {}) {
+        m_router->ws_proxy(std::move(path),
+                           WsProxyTarget{std::move(host), port, std::move(rewrite_path)});
+        return *this;
+    }
+    Server& ws_proxy_regex(const std::string& pattern, std::string host, std::uint16_t port,
+                           std::string rewrite_path = {}) {
+        m_router->ws_proxy_regex(pattern, WsProxyTarget{std::move(host), port, std::move(rewrite_path)});
+        return *this;
+    }
+
+    // --- HTTP reverse-proxy route registration (request-level) ---
+    // A matching request on `path` is forwarded to the backend host:port with the
+    // standard X-Forwarded-* headers added and hop-by-hop headers stripped, and
+    // the backend's response streamed back. Works for HTTP/1.x, h2c and HTTP/2
+    // clients (the backend connection is always HTTP/1.1). rewrite_path rewrites
+    // the request target; for the regex form it is a substitution template
+    // ($1..$9 capture groups).
+    Server& http_proxy(std::string path, std::string host, std::uint16_t port, std::string rewrite_path = {}) {
+        m_router->http_proxy(std::move(path),
+                             HttpProxyTarget{std::move(host), port, std::move(rewrite_path)});
+        return *this;
+    }
+    Server& http_proxy_regex(const std::string& pattern, std::string host, std::uint16_t port,
+                             std::string rewrite_path = {}) {
+        m_router->http_proxy_regex(pattern, HttpProxyTarget{std::move(host), port, std::move(rewrite_path)});
+        return *this;
+    }
+
     // Start all listeners. Resolves true if every listener bound successfully.
     asio::awaitable<bool> run() {
         bool all_ok = true;
@@ -167,6 +200,13 @@ class Server {
         };
     }
 
+    WsProxyLookup make_ws_proxy_lookup() {
+        auto router = m_router;
+        return [router](std::string_view path) -> std::optional<WsProxyTarget> {
+            return router->find_ws_proxy(path);  // already expands capture groups
+        };
+    }
+
     std::shared_ptr<asio::ip::tcp::acceptor> make_acceptor(const Listen& l) {
         error_code ec;
         auto addr = asio::ip::make_address(l.host, ec);
@@ -203,6 +243,7 @@ class Server {
     asio::awaitable<void> accept_loop(std::shared_ptr<asio::ip::tcp::acceptor> acceptor, Listen /*l*/) {
         auto dispatch = make_dispatcher();
         auto ws_lookup = make_ws_lookup();
+        auto ws_proxy_lookup = make_ws_proxy_lookup();
         for (;;) {
             auto& ctx = m_pool->next_ptr();  // pin the connection to one worker
             asio::ip::tcp::socket socket{*ctx};
@@ -225,12 +266,15 @@ class Server {
                 auto stream = std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(std::move(socket),
                                                                                         m_tls->context());
                 auto transport = std::make_shared<TlsStreamTransport>(std::move(stream), peer);
-                asio::co_spawn(*ctx, serve_tls(transport, dispatch, ws_lookup, m_config.limits), asio::detached);
+                asio::co_spawn(*ctx,
+                               serve_tls(transport, dispatch, ws_lookup, m_config.limits, ws_proxy_lookup),
+                               asio::detached);
             } else {
                 auto sock_ptr = std::make_shared<asio::ip::tcp::socket>(std::move(socket));
                 auto transport = std::make_shared<TcpStreamTransport>(std::move(sock_ptr), peer);
-                asio::co_spawn(*ctx, serve_plaintext(transport, dispatch, ws_lookup, m_config.limits),
-                               asio::detached);
+                asio::co_spawn(
+                    *ctx, serve_plaintext(transport, dispatch, ws_lookup, m_config.limits, ws_proxy_lookup),
+                    asio::detached);
             }
         }
         co_return;

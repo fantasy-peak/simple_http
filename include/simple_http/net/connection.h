@@ -37,7 +37,8 @@ inline constexpr std::string_view h2_preface_prefix = "PRI * HTTP/2.0";
 // Serve a plaintext transport: detect prior-knowledge h2, else HTTP/1.x.
 template <typename Transport>
 inline asio::awaitable<void> serve_plaintext(std::shared_ptr<Transport> transport, Dispatcher dispatch,
-                                             WsLookup ws_lookup = {}, EngineLimits limits = {}) {
+                                             WsLookup ws_lookup = {}, EngineLimits limits = {},
+                                             WsProxyLookup ws_proxy_lookup = {}) {
     std::array<std::byte, 4096> buf{};
     auto [ec, n] = co_await transport->async_read_some(std::span<std::byte>{buf});
     if (ec) {
@@ -58,14 +59,15 @@ inline asio::awaitable<void> serve_plaintext(std::shared_ptr<Transport> transpor
     // A registered WebSocket route (ws_lookup) enables the Upgrade: websocket
     // handshake inside the h1 engine.
     Http1Engine<Transport> engine{transport, limits};
-    co_await engine.run(dispatch, std::string{head}, std::move(ws_lookup));
+    co_await engine.run(dispatch, std::string{head}, std::move(ws_lookup), std::move(ws_proxy_lookup));
     co_return;
 }
 
 // Serve a TLS transport: handshake, then ALPN selects the engine.
 template <typename TlsTransportT>
 inline asio::awaitable<void> serve_tls(std::shared_ptr<TlsTransportT> transport, Dispatcher dispatch,
-                                       WsLookup ws_lookup = {}, EngineLimits limits = {}) {
+                                       WsLookup ws_lookup = {}, EngineLimits limits = {},
+                                       WsProxyLookup ws_proxy_lookup = {}) {
     if (auto ec = co_await transport->handshake(); ec) {
         transport->close();
         co_return;
@@ -75,7 +77,7 @@ inline asio::awaitable<void> serve_tls(std::shared_ptr<TlsTransportT> transport,
         co_await engine->run(std::move(dispatch));
     } else {
         Http1Engine<TlsTransportT> engine{transport, limits};
-        co_await engine.run(dispatch, {}, std::move(ws_lookup));
+        co_await engine.run(dispatch, {}, std::move(ws_lookup), std::move(ws_proxy_lookup));
     }
     co_return;
 }

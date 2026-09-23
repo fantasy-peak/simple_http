@@ -46,6 +46,7 @@
 #include "../dispatcher.h"
 #include "../h2/h2_engine.h"
 #include "h1_parser.h"
+#include "ws_proxy.h"
 
 namespace simple_http {
 
@@ -188,9 +189,11 @@ class Http1Engine {
     // keep-alive. `dispatch` runs the handler for each request. `initial` may
     // contain bytes already read from the transport during protocol detection
     // (e.g. by a preceding peek); they are consumed before reading more.
-    asio::awaitable<void> run(const Dispatcher& dispatch, std::string initial = {}, WsLookup ws_lookup = {}) {
+    asio::awaitable<void> run(const Dispatcher& dispatch, std::string initial = {}, WsLookup ws_lookup = {},
+                              WsProxyLookup ws_proxy_lookup = {}) {
         using namespace asio::experimental::awaitable_operators;
         m_ws_lookup = std::move(ws_lookup);
+        m_ws_proxy_lookup = std::move(ws_proxy_lookup);
         m_deadline = std::chrono::steady_clock::now() + m_limits.idle_timeout;
         co_await (serve_loop(dispatch, std::move(initial)) || watchdog());
         if (!m_upgraded) {
@@ -260,16 +263,34 @@ class Http1Engine {
             bool keep_alive = connection_keep_alive(head, version);
 
             // WebSocket upgrade: an Upgrade: websocket request with a
-            // Sec-WebSocket-Key, matched by a registered ws route. On success the
-            // connection is handed to the WebSocket layer and serve_loop returns
-            // (the transport is now owned by the WebSocket).
-            if (m_ws_lookup && is_websocket_upgrade(head)) {
-                m_buf.assign(parser.remainder());
-                if (co_await try_websocket_upgrade(head)) {
-                    co_return;  // connection upgraded; run() must not close it
+            // Sec-WebSocket-Key. A path registered as a proxy route is spliced
+            // byte-for-byte to its backend (transparent reverse proxy); otherwise
+            // a matched local ws route hands the connection to the WebSocket
+            // layer. On success serve_loop returns (the transport is no longer
+            // owned by this engine).
+            if (is_websocket_upgrade(head)) {
+                std::string ws_path = request_path(head.target);
+
+                // 1) Byte-level proxy pass-through takes precedence.
+                if (m_ws_proxy_lookup) {
+                    if (auto target = m_ws_proxy_lookup(ws_path)) {
+                        m_upgraded = true;  // stop the watchdog from closing the transport
+                        co_await run_ws_proxy(m_transport, head, std::string{parser.remainder()},
+                                              std::move(*target));
+                        co_return;  // tunnel finished; run() must not touch the transport
+                    }
                 }
-                // Upgrade requested but no route matched (or handshake failed):
-                // reply 404 and close.
+
+                // 2) Local WebSocket handler.
+                if (m_ws_lookup) {
+                    m_buf.assign(parser.remainder());
+                    if (co_await try_websocket_upgrade(head)) {
+                        co_return;  // connection upgraded; run() must not close it
+                    }
+                }
+
+                // Upgrade requested but no proxy/route matched (or handshake
+                // failed): reply 404 and close.
                 co_await send_error_response(404);
                 co_return;
             }
@@ -578,11 +599,18 @@ class Http1Engine {
     // response, builds a WebSocket over this transport, then runs the ws handler
     // and its write pump concurrently. Returns true if the connection was
     // upgraded (the caller must not close it), false if no route matched.
-    asio::awaitable<bool> try_websocket_upgrade(const ParsedHead& head) {
-        std::string path{head.target};
+    // Strips the query string from a request target, yielding the path used for
+    // route/proxy lookup.
+    static std::string request_path(std::string_view target) {
+        std::string path{target};
         if (auto q = path.find('?'); q != std::string::npos) {
             path.resize(q);
         }
+        return path;
+    }
+
+    asio::awaitable<bool> try_websocket_upgrade(const ParsedHead& head) {
+        std::string path = request_path(head.target);
         auto handler = m_ws_lookup(path);
         if (!handler) {
             co_return false;
@@ -707,7 +735,8 @@ class Http1Engine {
     std::chrono::steady_clock::time_point m_deadline{};
     std::string m_buf;  // bytes read past the most recently parsed head
     WsLookup m_ws_lookup;  // WebSocket route lookup (empty if ws disabled)
-    bool m_upgraded{false};  // connection handed off to the WebSocket layer
+    WsProxyLookup m_ws_proxy_lookup;  // WebSocket proxy-route lookup (empty if none)
+    bool m_upgraded{false};  // connection handed off to the WebSocket / proxy layer
 };
 
 }  // namespace simple_http

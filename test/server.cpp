@@ -54,11 +54,7 @@ template <typename ServerT>
 void register_routes(ServerT& server) {
     // One-shot response.
     server.route("/world", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
-        auto frame = co_await req->body().read_all();
-        // if (frame->size() != 1024) {
-        //     exit(1);
-        // }
-        std::string body = std::string{"hello from "} + std::string{to_string(res->version())} + std::string(1024, 'a');
+        std::string body = std::string{"hello from "} + std::string{to_string(res->version())};
         co_await res->status(200).send(body);
     });
 
@@ -101,6 +97,16 @@ void register_routes(ServerT& server) {
     // A simple one-shot handler.
     server.route("/sync", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
         co_await res->status(200).content_type("text/plain").send("simple one-shot reply");
+    });
+
+    // Echoes all received request headers. Handy to inspect what a reverse-proxy
+    // forwards (X-Forwarded-For / X-Forwarded-Proto / X-Forwarded-Host / Host).
+    server.route("/headers", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
+        std::string out;
+        for (const auto& [name, value] : req->headers()) {
+            out += name + ": " + value + "\n";
+        }
+        co_await res->status(200).content_type("text/plain").send(out);
     });
 
     // TLS-aware handler: inspects the peer (client) certificate.
@@ -266,6 +272,28 @@ void register_routes(ServerT& server) {
         co_return;
     });
 
+    // Byte-level WebSocket reverse proxy: an Upgrade: websocket on /wsproxy is
+    // spliced verbatim to the backend below. Frames, fragmentation, masking and
+    // control frames all pass through untouched (no re-framing, no size cap).
+    // Here the backend is this same plaintext server's /chat endpoint (the
+    // request target is rewritten to /chat so the backend routes to a real ws
+    // handler instead of looping back through the proxy), so /wsproxy behaves
+    // exactly like connecting to /chat directly.
+    server.ws_proxy("/wsproxy", "127.0.0.1", 7788, "/chat");
+
+    // Regex proxy with capture-group rewrite: /proxy/<name> is spliced to the
+    // backend with its target rewritten to /<name>. $1 is the first capture
+    // group. e.g. /proxy/chat -> backend /chat. Every /proxy/* path routes to a
+    // single rule, and the backend still sees the meaningful sub-path.
+    server.ws_proxy_regex("/proxy/(.*)", "127.0.0.1", 7788, "/$1");
+
+    // HTTP reverse proxy (request-level). /rproxy/<rest> is forwarded to this
+    // same plaintext server with the target rewritten to /<rest>, so e.g.
+    // /rproxy/world -> backend /world, /rproxy/echo -> backend /echo. Standard
+    // X-Forwarded-* headers are added and the response is streamed back. Works
+    // for HTTP/1.1, h2c and HTTP/2 clients (backend hop is HTTP/1.1).
+    server.http_proxy_regex("/rproxy/(.*)", "127.0.0.1", 7788, "/$1");
+
     server.fallback([](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
         co_await res->status(404).send("not found");
     });
@@ -280,14 +308,14 @@ int main() {
     // Plaintext server: HTTP/1.1, h2c upgrade, HTTP/2 prior-knowledge.
     ServerConfig plain_cfg;
     plain_cfg.listen = {{"0.0.0.0", 7788, false}};
-    plain_cfg.worker_threads = 8;
+    plain_cfg.worker_threads = 4;
     Server plain{plain_cfg};
     register_routes(plain);
 
     // TLS server: HTTP/1.1 and HTTP/2 selected by ALPN, with mutual TLS.
     ServerConfig tls_cfg;
     tls_cfg.listen = {{"0.0.0.0", 7789, false}};
-    tls_cfg.worker_threads = 8;
+    tls_cfg.worker_threads = 4;
     tls_cfg.tls = TlsConfig{
         .cert_chain_file = "./test/tls_certificates/server_cert.pem",
         .private_key_file = "./test/tls_certificates/server_key.pem",
