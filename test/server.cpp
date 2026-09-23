@@ -1,222 +1,307 @@
-#ifdef SIMPLE_HTTP_USE_MODULES
-#include <nghttp2/nghttp2.h>
-#include <boost/asio/experimental/awaitable_operators.hpp>
-#include <boost/asio/experimental/concurrent_channel.hpp>
-#include <boost/asio.hpp>
-#include <boost/asio/ssl.hpp>
-#include <boost/beast.hpp>
-#include <boost/beast/websocket/ssl.hpp>
+// Example server demonstrating the simple_http v2 API (coroutine-only handlers).
+//
+// It starts a plaintext server (HTTP/1.1, h2c upgrade, HTTP/2 prior-knowledge)
+// and a TLS server (HTTP/1.1 and HTTP/2 via ALPN, mutual TLS), sharing the same
+// routes. All handlers are coroutines; responses can be one-shot or streamed
+// (chunked over HTTP/1.1, DATA frames over HTTP/2).
 
-import std;
-import simple_http;
-#else
-#include <optional>
+#include <charconv>
+#include <format>
 #include <print>
-#include <sstream>
 #include <string>
+#include <thread>
 
 #include <openssl/ssl.h>
-#include <openssl/bio.h>
 #include <openssl/x509.h>
 
 #include "simple_http.h"
-#endif
 
 namespace asio = boost::asio;
-namespace beast = boost::beast;
-namespace http = beast::http;
+namespace http = boost::beast::http;
+using namespace simple_http;
 
-// Taken from: https://gist.github.com/cseelye/adcd900768ff61f697e603fd41c67625
-auto certificate_subject_name(const X509* x509_cert) -> std::string {
-    auto constexpr max_len = 4096;
-    char buffer[max_len];
-    memset(buffer, 0, max_len);
-
-    const auto& x509_name = X509_get_subject_name(x509_cert);
-
-    auto output_bio = std::unique_ptr<BIO, decltype(&BIO_free)>(BIO_new(BIO_s_mem()), BIO_free);
-
-    X509_NAME_print_ex(output_bio.get(), x509_name, 0, 0);
-    BIO_read(output_bio.get(), buffer, max_len - 1);
-
-    return std::string(buffer);
+// Returns the subject name of an X509 certificate, or "-" if none.
+static std::string subject_name(X509* cert) {
+    if (!cert) return "-";
+    char buf[512] = {0};
+    X509_NAME_oneline(X509_get_subject_name(cert), buf, sizeof(buf) - 1);
+    return std::string{buf};
 }
 
-asio::awaitable<void> hello(std::shared_ptr<simple_http::HttpRequestReader> reader,
-                            std::shared_ptr<simple_http::HttpResponseWriter> writer) {
-    std::stringstream ss;
-    ss << "Headers:\n";
-    for (auto const& [name, value] : reader->header()) {
-        ss << "   " << name << ": " << value << "\n";
+// Parses an unsigned integer query parameter "key=..." from a raw query string,
+// returning `fallback` if absent or unparseable.
+static std::size_t query_uint(std::string_view query, std::string_view key, std::size_t fallback) {
+    std::string needle{key};
+    needle += '=';
+    for (std::size_t pos = 0; pos < query.size();) {
+        auto amp = query.find('&', pos);
+        auto pair = query.substr(pos, amp == std::string_view::npos ? std::string_view::npos : amp - pos);
+        if (pair.starts_with(needle)) {
+            auto val = pair.substr(needle.size());
+            std::size_t out = 0;
+            auto [ptr, ec] = std::from_chars(val.data(), val.data() + val.size(), out);
+            if (ec == std::errc{}) return out;
+            return fallback;
+        }
+        if (amp == std::string_view::npos) break;
+        pos = amp + 1;
     }
-    ss << reader->target() << "\n";
-    std::println("{}", ss.str());
-    bool first = true;
-    if (writer->version() == simple_http::Version::Http2) {
-        // for http2 stream recv
+    return fallback;
+}
+
+// Registers the shared route table on a server.
+template <typename ServerT>
+void register_routes(ServerT& server) {
+    // One-shot response.
+    server.route("/world", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
+        auto frame = co_await req->body().read_all();
+        // if (frame->size() != 1024) {
+        //     exit(1);
+        // }
+        std::string body = std::string{"hello from "} + std::string{to_string(res->version())} + std::string(1024, 'a');
+        co_await res->status(200).send(body);
+    });
+
+    // Bidirectional streaming: read each request-body frame, log it, and echo a
+    // response frame back per received frame. Chunked over HTTP/1.1, DATA frames
+    // over HTTP/2 — every frame is flushed as it is produced.
+    server.route("/hello", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
+        co_await res->status(200).content_type("text/plain").begin();
+        int i = 0;
         for (;;) {
-            auto [ec, data] = co_await reader->asyncReadDataFrame();
-
-            if (ec) {
-                std::println("Error: {}", ec.message());
-                co_return;
+            auto frame = co_await req->body().read();
+            if (!frame) {
+                std::println("[SERVER] body read error: {}", frame.error().message());
+                break;
             }
+            if (frame->eof) {
+                std::println("[SERVER] <-- request body EOF");
+                break;
+            }
+            std::println("[SERVER] <-- recv frame #{} ({} bytes): {}", i, frame->data.size(), frame->data);
+            std::string out = std::format("echo #{}: {}", i, frame->data);
+            co_await res->write(out);
+            std::println("[SERVER] --> sent frame #{} ({} bytes)", i, out.size());
+            ++i;
+        }
+        co_await res->finish(std::format("done, {} frames\n", i));
+        std::println("[SERVER] --> sent final frame (total {} frames)", i);
+    });
 
-            bool should_continue =
-                std::visit(simple_http::overloaded{[&first](std::string str) mutable {
-                                                       if (first) {
-                                                           first = false;
-                                                           std::println("recv h2 data frame: {}", str);
-                                                       } else {
-                                                           int32_t network_val;
-                                                           memcpy(&network_val, str.data(), sizeof(network_val));
-                                                           int32_t aa = ntohl(network_val);
-                                                           std::println("recv h2 data frame(int32_t): {}", aa);
-                                                       }
-                                                       return true;
-                                                   },
-                                                   [](simple_http::Disconnect) { return false; },
-                                                   [](simple_http::Rst) { return false; },
-                                                   [](simple_http::Eof) { return false; }},
-                           std::move(data));
+    // Reads the whole request body and echoes it back (one-shot).
+    server.route("/echo", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
+        auto body = co_await req->body().read_all();
+        if (!body) {
+            co_await res->status(400).send("read error");
+            co_return;
+        }
+        co_await res->status(200).send(*body);
+    });
 
-            if (!should_continue) {
+    // A simple one-shot handler.
+    server.route("/sync", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
+        co_await res->status(200).content_type("text/plain").send("simple one-shot reply");
+    });
+
+    // TLS-aware handler: inspects the peer (client) certificate.
+    server.route("/whoami",
+                 [](std::shared_ptr<Request> req, std::shared_ptr<Response> res, SslHandle ssl) -> asio::awaitable<void> {
+        std::string who = "no TLS";
+        if (ssl && *ssl) {
+            X509* peer = SSL_get_peer_certificate(*ssl);
+            who = std::string{"client="} + subject_name(peer);
+            if (peer) X509_free(peer);
+        }
+        co_await res->status(200).send(who);
+    });
+
+    // Large one-shot response body (default 1 MiB) — exercises flow control /
+    // multiple DATA frames (h2) or a large chunked body (h1). Size via ?n=BYTES.
+    server.route("/big", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
+        std::size_t n = query_uint(req->query(), "n", 1024 * 1024);
+        co_await res->status(200).send(std::string(n, 'x'));
+    });
+
+    // Reads the entire request body and replies with its length — exercises
+    // large body upload + flow control.
+    server.route("/drain", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
+        auto body = co_await req->body().read_all();
+        if (!body) {
+            co_await res->status(400).send("read error");
+            co_return;
+        }
+        co_await res->status(200).send(std::format("received {} bytes", body->size()));
+    });
+
+    // Delays before responding (default 500 ms) — verifies the idle watchdog
+    // does not kill an active-but-slow handler. Delay via ?ms=MILLIS.
+    server.route("/delay", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
+        int ms = static_cast<int>(query_uint(req->query(), "ms", 500));
+        asio::steady_timer timer{co_await asio::this_coro::executor};
+        timer.expires_after(std::chrono::milliseconds(ms));
+        co_await timer.async_wait(asio::use_awaitable);
+        co_await res->status(200).send(std::format("waited {} ms", ms));
+    });
+
+    // Handler that throws — the engine must not crash; the connection stays sane.
+    server.route("/throw", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
+        throw std::runtime_error("handler failure (intentional)");
+        co_return;
+    });
+
+    // Empty response (204 No Content, no body).
+    server.route("/empty", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
+        co_await res->status(204).send("");
+    });
+
+    // Response carrying connection-specific headers that are illegal in HTTP/2;
+    // the engine must strip them so the response stays valid.
+    server.route("/badhdr", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
+        co_await res->status(200)
+            .header("connection", "keep-alive")
+            .header("transfer-encoding", "chunked")
+            .header("x-ok", "kept")
+            .send("body-with-illegal-headers-stripped");
+    });
+
+    // Full-duplex, HTTP/2 only. Demonstrates a reader coroutine and a writer
+    // coroutine running INDEPENDENTLY and CONCURRENTLY on the same stream, both
+    // spawned AFTER the handler returns (they capture shared_ptr<Request>/<Response>
+    // so both outlive the handler body):
+    //   * reader: drains the request body frame by frame (upstream), on its own
+    //   * writer: pushes a server frame every 200ms on its own schedule, then ends
+    // Neither waits on the other — true bidirectional flow, which only HTTP/2
+    // supports. HTTP/1.1 is half-duplex, so it falls back to read-then-reply.
+    server.route("/duplex", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
+        auto exec = co_await asio::this_coro::executor;
+
+        if (req->version() != Version::Http2) {
+            // HTTP/1.x: half-duplex. Read the whole body, then reply once.
+            auto body = co_await req->body().read_all();
+            std::size_t n = body ? body->size() : 0;
+            co_await res->status(200).send(std::format("half-duplex (HTTP/1.x): drained {} bytes\n", n));
+            co_return;
+        }
+
+        // Reader coroutine: independently consume the uplink body to completion.
+        asio::co_spawn(
+            exec,
+            [req]() -> asio::awaitable<void> {
+                int i = 0;
+                for (;;) {
+                    auto frame = co_await req->body().read();
+                    if (!frame || frame->eof) break;
+                    std::println("[SERVER] duplex <-- recv frame #{} ({} bytes): {}", i, frame->data.size(),
+                                 frame->data);
+                    ++i;
+                }
+                std::println("[SERVER] duplex reader done ({} frames)", i);
+            },
+            asio::detached);
+
+        // Writer coroutine: independently push frames on a timer, not tied to reads.
+        asio::co_spawn(
+            exec,
+            [res, exec]() -> asio::awaitable<void> {
+                if (auto ec = co_await res->status(200).content_type("text/plain").begin(); ec) co_return;
+                asio::steady_timer timer{exec};
+                for (int i = 0; i < 5; ++i) {
+                    timer.expires_after(std::chrono::milliseconds(200));
+                    co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+                    if (auto ec = co_await res->write(std::format("push #{}\n", i)); ec) co_return;
+                    std::println("[SERVER] duplex --> push #{}", i);
+                }
+                co_await res->finish("done\n");
+                std::println("[SERVER] duplex writer done");
+            },
+            asio::detached);
+
+        co_return;  // handler returns immediately; the two coroutines keep going
+    });
+
+    // Regex catch-all.
+    server.route_regex("/api/.*",
+                       [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
+        co_await res->status(200).send(std::string{"api path: "} + std::string{req->path()});
+    });
+
+
+
+    // Full-duplex WebSocket endpoint (ws over plaintext, wss over TLS):
+    //   * a spawned writer coroutine pushes a server message every second
+    //   * the read loop echoes each client message, preserving its text/binary type
+    // Both write concurrently; the WebSocket serializes writes internally.
+    server.ws_route("/chat", [](std::shared_ptr<Request> req, std::shared_ptr<WebSocket> ws) -> asio::awaitable<void> {
+        std::println("[SERVER] websocket connected: {}", req->path());
+        auto exec = co_await asio::this_coro::executor;
+
+        // Concurrent writer: periodic server-initiated pushes.
+        asio::co_spawn(
+            exec,
+            [ws]() -> asio::awaitable<void> {
+                asio::steady_timer timer{co_await asio::this_coro::executor};
+                for (int i = 0; ws->is_open(); ++i) {
+                    timer.expires_after(std::chrono::seconds(1));
+                    co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+                    if (!ws->is_open()) break;
+                    if (co_await ws->write_text(std::format("server-push #{}", i))) break;
+                }
+                co_return;
+            },
+            asio::detached);
+
+        // Read loop: echo each message back with the same type (text/binary).
+        for (;;) {
+            auto msg = co_await ws->read();
+            if (!msg) {
+                std::println("[SERVER] websocket closed: {}", msg.error().message());
+                break;
+            }
+            std::println("[SERVER] ws recv ({} bytes, {}): {}", msg->data.size(), msg->text ? "text" : "binary",
+                         msg->text ? msg->data : std::string{"<binary>"});
+            if (auto ec = co_await ws->write("echo: " + msg->data, msg->text); ec) {
                 break;
             }
         }
+        co_return;
+    });
 
-        writer->writeHeader(http::field::content_type, simple_http::mime::text_plain);
-        writer->writeHeader(http::field::server, simple_http::server_version);
-        writer->writeHeaderEnd();
-        writer->writeBody("123");
-        asio::steady_timer timer(co_await asio::this_coro::executor);
-        timer.expires_after(std::chrono::seconds(1));
-        co_await timer.async_wait(asio::use_awaitable);
-        writer->writeBody("456");
-        timer.expires_after(std::chrono::seconds(1));
-        co_await timer.async_wait(asio::use_awaitable);
-        writer->writeBodyEnd("789");
-    } else {
-        auto [stream_status, body] = co_await reader->asyncReadBody();
-        if (stream_status == simple_http::StreamStatus::Disconnect) {
-            std::println("client disconnect");
-            co_return;
-        }
-        std::println("recv http1 data :", body.get());
-        // curl --no-buffer  -v http://localhost:6666/hello -d "aaaa"
-        http::response<http::empty_body> res{http::status::ok, 11};
-        res.set(http::field::server, simple_http::server_version);
-        res.set(http::field::content_type, simple_http::mime::text_plain);
-        res.keep_alive(true);
-        writer->writeChunkHeader(res);
-        writer->writeChunkData("123");
-        asio::steady_timer timer(co_await asio::this_coro::executor);
-        timer.expires_after(std::chrono::seconds(1));
-        co_await timer.async_wait(asio::use_awaitable);
-        writer->writeChunkData("456");
-        timer.expires_after(std::chrono::seconds(1));
-        co_await timer.async_wait(asio::use_awaitable);
-        writer->writeChunkEnd();
-    }
-    co_return;
-}
-
-asio::awaitable<void> world(std::shared_ptr<simple_http::HttpRequestReader> reader,
-                            std::shared_ptr<simple_http::HttpResponseWriter> writer) {
-    auto res = simple_http::makeHttpResponse(http::status::ok);
-    res->body() = writer->version() == simple_http::Version::Http2 ? "/world http2 body" : "/world http1.1 body";
-    writer->writeHttpResponse(res);
-    co_return;
-}
-
-asio::awaitable<void> tls(std::shared_ptr<simple_http::HttpRequestReader> reader,
-                          std::shared_ptr<simple_http::HttpResponseWriter> writer,
-                          std::optional<asio::ssl::stream<asio::ip::tcp::socket>::native_handle_type> ssl_ctx) {
-    auto response = simple_http::makeHttpResponse(http::status::ok);
-
-    if (ssl_ctx) {
-        const auto& x509_server_ref = SSL_get_certificate(*ssl_ctx);
-        auto server_subject_name = certificate_subject_name(x509_server_ref);
-
-        const auto& x509_client_ref = SSL_get_peer_certificate(*ssl_ctx);
-        auto client_subject_name = certificate_subject_name(x509_client_ref);
-
-        response->body() =
-            std::format("server subject: {}, client subject: {}", server_subject_name, client_subject_name);
-    } else {
-        response->body() = "no TLS!";
-    }
-
-    writer->writeHttpResponse(response);
-
-    co_return;
-}
-
-asio::awaitable<void> start() {
-    simple_http::Config cfg{
-        .ip = "0.0.0.0",
-        .port = 7788,
-        .worker_num = 8,
-        .concurrent_streams = 200,
-        .window_size = std::nullopt,
-        .max_frame_size = std::nullopt,
-        .ssl_crt = "./test/tls_certificates/server_cert.pem",
-        .ssl_key = "./test/tls_certificates/server_key.pem",
-        .ssl_mutual = true,
-        .ssl_ca = "./test/tls_certificates/ca_cert.pem",
-        .socket_setup_cb =
-            [](asio::ip::tcp::socket& socket) {
-                // Set socket properties
-                socket.set_option(asio::socket_base::keep_alive(true));
-            },
-        .enable_ipv6 = true,
-        .ipv6_addr = "::1",
-        .ipv6_port = 7788,
-        .unix_socket = std::nullopt,
-        .websocket_setup_cb = [](auto socket) { std::visit([](auto&& arg) { arg->compress(false); }, socket); },
-    };
-    simple_http::LOG_CB = [](simple_http::LogLevel level, auto file, auto line, std::string msg) {
-        std::println("{} {} {} {}", toString(level), file, line, msg);
-    };
-    simple_http::HttpServer hs(cfg);
-    hs.setHttpHandler("/hello", hello);
-    hs.setHttpHandler("/world", world).setHttpHandler("/tls", tls);
-    hs.setHttpRegexHandler(".*",
-                           [](std::shared_ptr<simple_http::HttpRequestReader> reader,
-                              std::shared_ptr<simple_http::HttpResponseWriter> writer) -> asio::awaitable<void> {
-                               // This approach will unify HTTP1.1 and HTTP2 streaming responses.
-                               writer->writeStatus(200);
-                               writer->writeHeader(http::field::content_type, simple_http::mime::text_plain);
-                               writer->writeStreamHeaderEnd();
-                               writer->writeStreamBody("regex matched");
-                               writer->writeStreamEnd();
-                               co_return;
-                           });
-    hs.setWebsocketHandler("/wss",
-                           [](const http::request<http::string_body>& req,
-                              const simple_http::WssStreamPtr& wss_socket_ptr) -> asio::awaitable<bool> {
-                               auto& stream = wss_socket_ptr->stream();
-                               stream->text(true);
-                               std::string data{"hello world"};
-                               co_await stream->async_write(asio::buffer(data), asio::use_awaitable);
-                               co_return true;
-                           });
-    std::println("started http server");
-    co_await hs.start();
+    server.fallback([](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
+        co_await res->status(404).send("not found");
+    });
 }
 
 int main() {
-    simple_http::IoCtxPool pool{1};
-    pool.start();
-    asio::co_spawn(pool.getIoContext(), start(), [](const std::exception_ptr& eptr) {
-        try {
-            if (eptr)
-                std::rethrow_exception(eptr);
-        } catch (const std::exception& e) {
-            std::println("Exception caught by co_spawn handler: {}", e.what());
-        }
-    });
-    while (true)
-        std::this_thread::sleep_for(std::chrono::seconds(100));
+    LOG_CB = [](LogLevel level, std::string_view file, int line, std::string msg) {
+        std::println("[{}] {}", to_string(level), msg);
+    };
+    set_log_level(LogLevel::Info);
+
+    // Plaintext server: HTTP/1.1, h2c upgrade, HTTP/2 prior-knowledge.
+    ServerConfig plain_cfg;
+    plain_cfg.listen = {{"0.0.0.0", 7788, false}};
+    plain_cfg.worker_threads = 8;
+    Server plain{plain_cfg};
+    register_routes(plain);
+
+    // TLS server: HTTP/1.1 and HTTP/2 selected by ALPN, with mutual TLS.
+    ServerConfig tls_cfg;
+    tls_cfg.listen = {{"0.0.0.0", 7789, false}};
+    tls_cfg.worker_threads = 8;
+    tls_cfg.tls = TlsConfig{
+        .cert_chain_file = "./test/tls_certificates/server_cert.pem",
+        .private_key_file = "./test/tls_certificates/server_key.pem",
+        .mutual = true,
+        .ca_file = "./test/tls_certificates/ca_cert.pem",
+    };
+    Server tls{tls_cfg};
+    register_routes(tls);
+
+    bool ok = plain.start() && tls.start();
+    std::println("servers started: plaintext :7788, tls :7789 (ok={})", ok);
+
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(60));
+    }
     return 0;
 }

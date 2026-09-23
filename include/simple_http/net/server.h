@@ -8,6 +8,7 @@
 // detected in the net/connection layer. The Router's dispatch is used as the
 // engine Dispatcher, so one route table serves HTTP/1.x, HTTP/2 and h2c.
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -44,6 +45,10 @@ struct ServerConfig {
     bool reuse_port{false};
     // All protocol-engine tunables (timeouts, size caps, HTTP/2 windows/streams).
     EngineLimits limits{};
+    // Optional per-accepted-socket hook (TCP_NODELAY / keepalive / buffer sizes …).
+    // Invoked right after accept, before the transport or TLS handshake touches the
+    // socket. Use the error_code overloads of set_option to avoid throwing.
+    std::function<void(asio::ip::tcp::socket&)> socket_setup;
 };
 
 class Server {
@@ -205,6 +210,13 @@ class Server {
             if (ec) {
                 if (ec == asio::error::operation_aborted) break;
                 continue;
+            }
+            if (m_config.socket_setup) {
+                try {
+                    m_config.socket_setup(socket);
+                } catch (const std::exception& e) {
+                    SIMPLE_HTTP_ERROR_LOG("socket_setup threw: {}", e.what());
+                }
             }
             error_code pe;
             auto peer = socket.remote_endpoint(pe);
