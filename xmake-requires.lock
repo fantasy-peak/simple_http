@@ -3,19 +3,36 @@
         version = "1.0"
     },
     ["linux|x86_64"] = {
-        ["boost#a409d47f"] = {
+        ["boost#791fa972"] = {
+            repo = {
+                branch = "master",
+                commit = "8d8ece25f427532c0b1462536b81b7785afe9338",
+                url = "https://gitcode.com/xmake-io/xmake-repo.git"
+            },
             version = "1.90.0"
         },
         ["cmake#f56260b5"] = {
+            repo = {
+                branch = "master",
+                commit = "8d8ece25f427532c0b1462536b81b7785afe9338",
+                url = "https://gitcode.com/xmake-io/xmake-repo.git"
+            },
             version = "4.1.2"
         },
-        ["nghttp2#f56260b5"] = {
-            version = "1.68.0"
-        },
         ["ninja#f56260b5"] = {
+            repo = {
+                branch = "master",
+                commit = "8d8ece25f427532c0b1462536b81b7785afe9338",
+                url = "https://gitcode.com/xmake-io/xmake-repo.git"
+            },
             version = "1.13.2"
         },
         ["openssl3#f56260b5"] = {
+            repo = {
+                branch = "master",
+                commit = "8d8ece25f427532c0b1462536b81b7785afe9338",
+                url = "https://gitcode.com/xmake-io/xmake-repo.git"
+            },
             version = "3.6.0"
         }
     }

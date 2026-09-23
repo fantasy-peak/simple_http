@@ -12,7 +12,6 @@ set_policy("package.librarydeps.strict_compatibility", true)
 
 -- PACKAGES --
 add_requires("boost", {configs = {asio=true, regex=true}})
-add_requires("nghttp2")
 add_requires("openssl3")
 
 add_defines("SIMPLE_HTTP_EXPERIMENT_WEBSOCKET", "SIMPLE_HTTP_USE_BOOST_REGEX", "SIMPLE_HTTP_EXPERIMENT_HTTP2CLIENT")
@@ -22,7 +21,6 @@ target("simple_http")
     add_includedirs("include", { public = true })
     add_packages(
         "boost",
-        "nghttp2",
         "openssl3",
         {public = true}
     )
@@ -49,14 +47,3 @@ target("server")
     set_rundir(".")
 target_end()
 
-target("client")
-    set_kind("binary")
-    on_load(function (target)
-        if target:toolchain("gcc") then
-            target:add("cxxflags", "-Wno-maybe-uninitialized")
-        end
-    end)
-    add_deps("simple_http")
-    add_files("test/client.cpp")
-    set_rundir(".")
-target_end()
