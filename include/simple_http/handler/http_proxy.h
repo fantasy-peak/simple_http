@@ -230,14 +230,11 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
     }
 
     auto write_all = [&backend](const std::string& out) -> asio::awaitable<error_code> {
-        std::size_t sent = 0;
-        while (sent < out.size()) {
-            auto [ec, n] = co_await asio::async_write(*backend, asio::buffer(out.data() + sent, out.size() - sent),
-                                                      asio::as_tuple(asio::use_awaitable));
-            if (ec) co_return ec;
-            sent += n;
-        }
-        co_return error_code{};
+        // Composed async_write: writes the whole buffer or returns an error.
+        auto [ec, n] =
+            co_await asio::async_write(*backend, asio::buffer(out.data(), out.size()), asio::as_tuple(asio::use_awaitable));
+        (void)n;
+        co_return ec;
     };
 
     // --- build the forwarded request head ---

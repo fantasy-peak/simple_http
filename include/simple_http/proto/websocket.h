@@ -101,6 +101,7 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
           m_parser(max_payload),
           m_max_payload(max_payload),
           m_idle_timeout(idle_timeout),
+          m_watchdog_timer(std::make_shared<asio::steady_timer>(m_executor)),
           m_write_q(m_executor, 1024) {
         m_deadline = std::chrono::steady_clock::now() + m_idle_timeout;
     }
@@ -236,22 +237,24 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
     // freed transport.
     asio::awaitable<void> run_writer() override {
         auto self = this->shared_from_this();
-        // Start the idle watchdog alongside the pump. It self-references through
-        // `self`, so it stays alive as long as it is scheduled, independent of the
-        // WebSocket handle's lifetime.
-        asio::co_spawn(m_executor, run_watchdog(self), asio::detached);
+        // Start the idle watchdog alongside the pump. It holds only a weak_ptr to
+        // the backend (see run_watchdog): it must NOT keep the backend alive, so
+        // that a finished connection is freed immediately rather than lingering
+        // for the idle timeout.
+        asio::co_spawn(m_executor, run_watchdog(std::weak_ptr<WsBackendImpl>(self)), asio::detached);
         return pump(self);
     }
 
     // Non-blocking teardown for ~WebSocket: mark the connection closed and close
     // the queue. The pump then leaves the loop (its receive fails) and, as the
-    // last owner, releases the backend once any in-flight write has finished. The
-    // watchdog timer is cancelled so its coroutine wakes immediately, sees the
-    // closed state and drops its own reference to the backend.
+    // last real owner, releases the backend once any in-flight write has finished.
+    // Cancelling the watchdog timer wakes its coroutine immediately; it then sees
+    // the closed state (or a failed weak_ptr lock) and exits without waiting out
+    // the idle timeout.
     void abort() override {
         m_open = false;
         m_write_q.close();
-        if (m_watchdog_timer) m_watchdog_timer->cancel();
+        m_watchdog_timer->cancel();
     }
 
     bool is_open() const override { return m_open; }
@@ -299,33 +302,56 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
 
     // Writes all of `frame` to the transport, looping over partial writes.
     asio::awaitable<error_code> write_all(const std::string& frame) {
-        std::size_t sent = 0;
-        auto bytes = std::as_bytes(std::span<const char>{frame.data(), frame.size()});
-        while (sent < frame.size()) {
-            touch_deadline();  // outbound bytes: connection is active
-            auto [ec, n] = co_await m_transport->async_write(bytes.subspan(sent));
-            if (ec) co_return ec;
-            sent += n;
-        }
-        co_return error_code{};
+        touch_deadline();  // outbound bytes: connection is active
+        // Composed async_write: whole buffer or error, no partial-write loop.
+        auto [ec, n] = co_await m_transport->async_write(
+            std::as_bytes(std::span<const char>{frame.data(), frame.size()}));
+        (void)n;
+        co_return ec;
     }
 
     // Push the idle deadline forward; called from both the read and write paths.
     void touch_deadline() { m_deadline = std::chrono::steady_clock::now() + m_idle_timeout; }
 
     // Idle watchdog: closes the transport once neither a read nor a write has
-    // happened within the idle timeout, mirroring the h1/h2 engines. Runs as its
-    // own coroutine and, like the pump, holds a shared_ptr to the backend so it
-    // never touches a freed transport. Closing the transport unblocks the read
-    // loop, which ends the connection.
-    static asio::awaitable<void> run_watchdog(std::shared_ptr<WsBackendImpl> self) {
-        auto timer = std::make_shared<asio::steady_timer>(self->m_executor);
-        self->m_watchdog_timer = timer;  // let abort()/close() cancel the wait
+    // happened within the idle timeout, mirroring the h1/h2 engines.
+    //
+    // Unlike the pump, the watchdog holds only a WEAK reference to the backend.
+    // The pump must keep the backend alive so an in-flight write can finish
+    // through a valid transport; the watchdog has no such duty — once every real
+    // owner (the pump and the WebSocket handle) is gone the connection is done
+    // and the watchdog should just stop. A weak_ptr means the backend (and the
+    // transport, TLS stream and parse buffer it owns) is freed the instant those
+    // owners drop it, instead of lingering until the idle timeout fires. That is
+    // what prevents backend backlog — and the apparent unbounded memory growth —
+    // under high connection churn, where run_writer() may spawn this coroutine
+    // only after the connection has already closed.
+    //
+    // The steady_timer lives in the backend (m_watchdog_timer). The coroutine
+    // never holds the backend across a suspension: it locks the weak_ptr, arms
+    // the timer, then releases the strong ref before awaiting. If the backend is
+    // destroyed while suspended, its m_watchdog_timer is destroyed too, which
+    // completes the wait with operation_aborted and the coroutine exits.
+    static asio::awaitable<void> run_watchdog(std::weak_ptr<WsBackendImpl> weak) {
         for (;;) {
-            timer->expires_at(self->m_deadline);
-            co_await timer->async_wait(asio::as_tuple(asio::use_awaitable));
-            if (!self->m_open) {
-                break;  // connection already closing; stop watching
+            asio::steady_timer* timer = nullptr;
+            {
+                auto self = weak.lock();
+                if (!self || !self->m_open) {
+                    co_return;  // connection gone or already closing: stop watching
+                }
+                timer = self->m_watchdog_timer.get();
+                timer->expires_at(self->m_deadline);
+                // `self` is released at the end of this scope, before the await
+                // below, so the suspended wait does not keep the backend alive.
+            }
+            auto [ec] = co_await timer->async_wait(asio::as_tuple(asio::use_awaitable));
+            if (ec == asio::error::operation_aborted) {
+                co_return;  // timer cancelled or backend destroyed: stop watching
+            }
+            auto self = weak.lock();
+            if (!self || !self->m_open) {
+                co_return;
             }
             if (std::chrono::steady_clock::now() >= self->m_deadline) {
                 // Idle: tear down. Marking closed + closing the transport makes the
@@ -333,11 +359,10 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
                 self->m_open = false;
                 self->m_write_q.close();
                 self->m_transport->close();
-                break;
+                co_return;
             }
-            // Deadline was pushed forward by a read/write: re-arm on the new value.
+            // Deadline was pushed forward by a read/write: loop and re-arm.
         }
-        co_return;
     }
 
     std::shared_ptr<Transport> m_transport;

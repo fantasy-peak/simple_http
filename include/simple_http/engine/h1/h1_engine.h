@@ -167,17 +167,16 @@ class Http1ResponseWriter : public ResponseWriter {
     }
 
     asio::awaitable<error_code> write_raw(const std::string& out) {
-        std::size_t sent = 0;
-        auto bytes = std::as_bytes(std::span<const char>{out.data(), out.size()});
-        while (sent < out.size()) {
-            // Writing is connection activity: refresh the shared idle deadline so
-            // the watchdog does not reap a connection busy streaming a response.
-            if (m_deadline) *m_deadline = std::chrono::steady_clock::now() + m_idle_timeout;
-            auto [ec, n] = co_await m_transport->async_write(bytes.subspan(sent));
-            if (ec) co_return ec;
-            sent += n;
-        }
-        co_return error_code{};
+        // Writing is connection activity: refresh the shared idle deadline so the
+        // watchdog does not reap a connection busy streaming a response.
+        if (m_deadline) *m_deadline = std::chrono::steady_clock::now() + m_idle_timeout;
+        // Transport::async_write is a composed operation (asio::async_write): it
+        // writes the whole buffer or returns an error, so no partial-write loop
+        // is needed here.
+        auto [ec, n] = co_await m_transport->async_write(
+            std::as_bytes(std::span<const char>{out.data(), out.size()}));
+        (void)n;
+        co_return ec;
     }
 
     asio::awaitable<void> hop() {
@@ -744,14 +743,11 @@ class Http1Engine {
 
     // Writes all of `out` to the transport (partial-write loop).
     asio::awaitable<error_code> write_all(const std::string& out) {
-        std::size_t sent = 0;
-        auto bytes = std::as_bytes(std::span<const char>{out.data(), out.size()});
-        while (sent < out.size()) {
-            auto [ec, n] = co_await m_transport->async_write(bytes.subspan(sent));
-            if (ec) co_return ec;
-            sent += n;
-        }
-        co_return error_code{};
+        // Composed async_write: whole buffer or error, no partial-write loop.
+        auto [ec, n] = co_await m_transport->async_write(
+            std::as_bytes(std::span<const char>{out.data(), out.size()}));
+        (void)n;
+        co_return ec;
     }
 
     // --- pull-mode request-body state (one request at a time; h1 is serial) ---

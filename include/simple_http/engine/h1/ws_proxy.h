@@ -101,19 +101,16 @@ inline asio::awaitable<bool> run_ws_proxy(std::shared_ptr<Transport> client, con
     std::string preamble = rebuild_request_head(head, target.rewrite_path);
     preamble.append(initial);
     {
-        std::size_t sent = 0;
-        while (sent < preamble.size()) {
-            auto [ec, n] = co_await asio::async_write(
-                *backend, asio::buffer(preamble.data() + sent, preamble.size() - sent),
-                asio::as_tuple(asio::use_awaitable));
-            if (ec) {
-                SIMPLE_HTTP_ERROR_LOG("ws-proxy write preamble failed: {}", ec.message());
-                error_code sec;
-                backend->shutdown(asio::ip::tcp::socket::shutdown_both, sec);
-                backend->close(sec);
-                co_return false;
-            }
-            sent += n;
+        // Composed async_write: writes the whole preamble or returns an error.
+        auto [ec, n] = co_await asio::async_write(
+            *backend, asio::buffer(preamble.data(), preamble.size()), asio::as_tuple(asio::use_awaitable));
+        (void)n;
+        if (ec) {
+            SIMPLE_HTTP_ERROR_LOG("ws-proxy write preamble failed: {}", ec.message());
+            error_code sec;
+            backend->shutdown(asio::ip::tcp::socket::shutdown_both, sec);
+            backend->close(sec);
+            co_return false;
         }
     }
 
@@ -131,18 +128,11 @@ inline asio::awaitable<bool> run_ws_proxy(std::shared_ptr<Transport> client, con
         for (;;) {
             auto [rec2, n] = co_await client->async_read_some(std::span<std::byte>{buf});
             if (rec2 || n == 0) break;
-            std::size_t sent = 0;
-            bool err = false;
-            while (sent < n) {
-                auto [wec, w] = co_await asio::async_write(
-                    *backend, asio::buffer(buf.data() + sent, n - sent), asio::as_tuple(asio::use_awaitable));
-                if (wec) {
-                    err = true;
-                    break;
-                }
-                sent += w;
-            }
-            if (err) break;
+            // Composed async_write: writes all n bytes or errors, no inner loop.
+            auto [wec, w] =
+                co_await asio::async_write(*backend, asio::buffer(buf.data(), n), asio::as_tuple(asio::use_awaitable));
+            (void)w;
+            if (wec) break;
         }
         co_return;
     };
@@ -154,18 +144,10 @@ inline asio::awaitable<bool> run_ws_proxy(std::shared_ptr<Transport> client, con
             auto [rec2, n] = co_await backend->async_read_some(
                 asio::buffer(buf.data(), buf.size()), asio::as_tuple(asio::use_awaitable));
             if (rec2 || n == 0) break;
-            auto bytes = std::span<const std::byte>{buf.data(), n};
-            std::size_t sent = 0;
-            bool err = false;
-            while (sent < n) {
-                auto [wec, w] = co_await client->async_write(bytes.subspan(sent));
-                if (wec) {
-                    err = true;
-                    break;
-                }
-                sent += w;
-            }
-            if (err) break;
+            // Transport::async_write is composed: writes all n bytes or errors.
+            auto [wec, w] = co_await client->async_write(std::span<const std::byte>{buf.data(), n});
+            (void)w;
+            if (wec) break;
         }
         co_return;
     };
