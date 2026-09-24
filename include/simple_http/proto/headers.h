@@ -30,12 +30,12 @@ class Headers {
         m_fields.emplace_back(std::move(lower_name), std::move(value));
     }
 
-    // Case-insensitive lookup of the first matching field.
+    // Case-insensitive lookup of the first matching field. Field names are
+    // stored lowercased, so this compares `name` case-insensitively without
+    // allocating a temporary lowercased copy (called on the request hot path).
     std::optional<std::string_view> get(std::string_view name) const {
-        std::string lowered{name};
-        to_lower(lowered);
         auto it = std::find_if(m_fields.begin(), m_fields.end(),
-                               [&](const value_type& f) { return f.first == lowered; });
+                               [&](const value_type& f) { return iequals_ascii(f.first, name); });
         if (it == m_fields.end()) {
             return std::nullopt;
         }
@@ -53,9 +53,28 @@ class Headers {
 
     const std::vector<value_type>& fields() const { return m_fields; }
 
+    // Allocation-free ASCII case-insensitive equality. `lhs` is a stored,
+    // already-lowercased field name; `rhs` is the caller-provided name.
+    static bool iequals_ascii(std::string_view lhs, std::string_view rhs) {
+        if (lhs.size() != rhs.size()) {
+            return false;
+        }
+        for (std::size_t i = 0; i < lhs.size(); ++i) {
+            if (lhs[i] != to_lower_ascii(rhs[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
   private:
+    static char to_lower_ascii(char c) {
+        return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+    }
+
     static void to_lower(std::string& s) {
-        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
+        std::transform(s.begin(), s.end(), s.begin(),
+                       [](unsigned char c) { return static_cast<char>(to_lower_ascii(static_cast<char>(c))); });
     }
 
     std::vector<value_type> m_fields;

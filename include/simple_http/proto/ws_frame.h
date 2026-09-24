@@ -20,6 +20,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -62,6 +63,35 @@ struct WsFrame {
     WsOpcode opcode = WsOpcode::Text;
     std::string payload;
 };
+
+// Unmask a WebSocket payload in place (RFC 6455 §5.3: data[i] ^= key[i % 4]).
+//
+// Processes eight bytes per iteration instead of one. Because the payload
+// starts at masking offset 0, the per-byte key pattern over any 8-byte block is
+// the 4-byte key repeated twice (0 1 2 3 0 1 2 3) — a fixed phase — so a single
+// 64-bit key can be XORed against each word. The trailing 0..7 bytes fall back
+// to the byte-wise form. memcpy is used for the word loads/stores so no
+// alignment or strict-aliasing assumptions are made.
+inline void ws_unmask(char* data, std::size_t len, const unsigned char (&key)[4]) {
+    // Build the 8-byte key: key repeated twice, matching offsets 0..7.
+    unsigned char key8[8] = {key[0], key[1], key[2], key[3], key[0], key[1], key[2], key[3]};
+    std::uint64_t mask64;
+    std::memcpy(&mask64, key8, sizeof(mask64));
+
+    std::size_t i = 0;
+    for (; i + 8 <= len; i += 8) {
+        std::uint64_t word;
+        std::memcpy(&word, data + i, sizeof(word));
+        word ^= mask64;
+        std::memcpy(data + i, &word, sizeof(word));
+    }
+    // Tail (< 8 bytes): the masking offset here is `i`, and i is a multiple of
+    // 8, so i % 4 == 0 — the key index for the remaining bytes is simply their
+    // position within the tail modulo 4.
+    for (std::size_t j = 0; i < len; ++i, ++j) {
+        data[i] = static_cast<char>(static_cast<unsigned char>(data[i]) ^ key[j % 4]);
+    }
+}
 
 // Incremental frame parser. Feed received bytes with append(); repeatedly call
 // next() to pop complete frames. The parser handles the variable-length header
@@ -157,9 +187,7 @@ class WsFrameParser {
         out.opcode = static_cast<WsOpcode>(opcode);
         out.payload.assign(reinterpret_cast<const char*>(data + pos), static_cast<std::size_t>(payload_len));
         if (mask) {
-            for (std::size_t j = 0; j < out.payload.size(); ++j) {
-                out.payload[j] = static_cast<char>(static_cast<unsigned char>(out.payload[j]) ^ mask_key[j % 4]);
-            }
+            ws_unmask(out.payload.data(), out.payload.size(), mask_key);
         }
 
         m_buf.erase(0, pos + static_cast<std::size_t>(payload_len));

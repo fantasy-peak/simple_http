@@ -33,6 +33,7 @@
 // read reports end-of-stream.
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -93,12 +94,16 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
     using WriteQueue = asio::experimental::concurrent_channel<void(error_code, WriteReq)>;
 
   public:
-    explicit WsBackendImpl(std::shared_ptr<Transport> transport, std::uint64_t max_payload = 16u * 1024 * 1024)
+    explicit WsBackendImpl(std::shared_ptr<Transport> transport, std::uint64_t max_payload = 16u * 1024 * 1024,
+                           std::chrono::steady_clock::duration idle_timeout = std::chrono::seconds(120))
         : m_transport(std::move(transport)),
           m_executor(m_transport->get_executor()),
           m_parser(max_payload),
           m_max_payload(max_payload),
-          m_write_q(m_executor, 1024) {}
+          m_idle_timeout(idle_timeout),
+          m_write_q(m_executor, 1024) {
+        m_deadline = std::chrono::steady_clock::now() + m_idle_timeout;
+    }
 
     // Reads one complete message, reassembling fragments and transparently
     // answering Ping with Pong / Close with Close. Returns std::unexpected(ec)
@@ -125,6 +130,7 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
                     m_open = false;
                     co_return std::unexpected(ec);
                 }
+                touch_deadline();  // inbound bytes: connection is active
                 m_parser.append(tmp.data(), n);
                 continue;
             }
@@ -216,6 +222,7 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
             }
         }
         m_write_q.close();  // stop the write pump if it is still running
+        if (m_watchdog_timer) m_watchdog_timer->cancel();  // stop the idle watchdog
         m_transport->close();
         co_return error_code{};
     }
@@ -227,14 +234,24 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
     // outlives the WebSocket handle (the engine destroys it as soon as the
     // handler returns), so holding only `this` would leave it writing through a
     // freed transport.
-    asio::awaitable<void> run_writer() override { return pump(this->shared_from_this()); }
+    asio::awaitable<void> run_writer() override {
+        auto self = this->shared_from_this();
+        // Start the idle watchdog alongside the pump. It self-references through
+        // `self`, so it stays alive as long as it is scheduled, independent of the
+        // WebSocket handle's lifetime.
+        asio::co_spawn(m_executor, run_watchdog(self), asio::detached);
+        return pump(self);
+    }
 
     // Non-blocking teardown for ~WebSocket: mark the connection closed and close
     // the queue. The pump then leaves the loop (its receive fails) and, as the
-    // last owner, releases the backend once any in-flight write has finished.
+    // last owner, releases the backend once any in-flight write has finished. The
+    // watchdog timer is cancelled so its coroutine wakes immediately, sees the
+    // closed state and drops its own reference to the backend.
     void abort() override {
         m_open = false;
         m_write_q.close();
+        if (m_watchdog_timer) m_watchdog_timer->cancel();
     }
 
     bool is_open() const override { return m_open; }
@@ -285,6 +302,7 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
         std::size_t sent = 0;
         auto bytes = std::as_bytes(std::span<const char>{frame.data(), frame.size()});
         while (sent < frame.size()) {
+            touch_deadline();  // outbound bytes: connection is active
             auto [ec, n] = co_await m_transport->async_write(bytes.subspan(sent));
             if (ec) co_return ec;
             sent += n;
@@ -292,10 +310,43 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
         co_return error_code{};
     }
 
+    // Push the idle deadline forward; called from both the read and write paths.
+    void touch_deadline() { m_deadline = std::chrono::steady_clock::now() + m_idle_timeout; }
+
+    // Idle watchdog: closes the transport once neither a read nor a write has
+    // happened within the idle timeout, mirroring the h1/h2 engines. Runs as its
+    // own coroutine and, like the pump, holds a shared_ptr to the backend so it
+    // never touches a freed transport. Closing the transport unblocks the read
+    // loop, which ends the connection.
+    static asio::awaitable<void> run_watchdog(std::shared_ptr<WsBackendImpl> self) {
+        auto timer = std::make_shared<asio::steady_timer>(self->m_executor);
+        self->m_watchdog_timer = timer;  // let abort()/close() cancel the wait
+        for (;;) {
+            timer->expires_at(self->m_deadline);
+            co_await timer->async_wait(asio::as_tuple(asio::use_awaitable));
+            if (!self->m_open) {
+                break;  // connection already closing; stop watching
+            }
+            if (std::chrono::steady_clock::now() >= self->m_deadline) {
+                // Idle: tear down. Marking closed + closing the transport makes the
+                // pending read/write fail, ending both loops.
+                self->m_open = false;
+                self->m_write_q.close();
+                self->m_transport->close();
+                break;
+            }
+            // Deadline was pushed forward by a read/write: re-arm on the new value.
+        }
+        co_return;
+    }
+
     std::shared_ptr<Transport> m_transport;
     Executor m_executor;
     WsFrameParser m_parser;
     std::uint64_t m_max_payload;
+    std::chrono::steady_clock::duration m_idle_timeout;
+    std::chrono::steady_clock::time_point m_deadline{};
+    std::shared_ptr<asio::steady_timer> m_watchdog_timer;  // cancelled on teardown
     WriteQueue m_write_q;
     bool m_open{true};
 };

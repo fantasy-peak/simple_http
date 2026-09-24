@@ -389,6 +389,10 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
                 std::size_t sent = 0;
                 auto bytes = std::as_bytes(std::span<const char>{chunk.data(), chunk.size()});
                 while (sent < chunk.size()) {
+                    // Writing is connection activity: refresh the idle deadline so
+                    // the watchdog does not reap a connection that is busy sending
+                    // (e.g. streaming a large response to a slow client).
+                    m_deadline = std::chrono::steady_clock::now() + m_limits.idle_timeout;
                     auto [ec, n] = co_await m_transport->async_write(bytes.subspan(sent));
                     if (ec) co_return;
                     sent += n;

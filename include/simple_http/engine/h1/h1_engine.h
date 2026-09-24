@@ -52,12 +52,24 @@ namespace simple_http {
 
 namespace asio = boost::asio;
 
+// A connection-level idle deadline shared between the engine and the response
+// writer(s) it creates, so that both reads and writes can refresh it and the
+// watchdog reaps a connection only when it is genuinely idle in both directions.
+using SharedDeadline = std::shared_ptr<std::chrono::steady_clock::time_point>;
+
 // ResponseWriter for HTTP/1.x. Hand-serializes directly onto the transport.
 template <TransportLike Transport>
 class Http1ResponseWriter : public ResponseWriter {
   public:
-    explicit Http1ResponseWriter(std::shared_ptr<Transport> transport, Version version)
-        : m_transport(std::move(transport)), m_executor(m_transport->get_executor()), m_version(version) {}
+    // `deadline` and `idle_timeout` let a write refresh the connection's idle
+    // deadline (shared with the engine's read path and watchdog).
+    Http1ResponseWriter(std::shared_ptr<Transport> transport, Version version, SharedDeadline deadline,
+                        std::chrono::steady_clock::duration idle_timeout)
+        : m_transport(std::move(transport)),
+          m_executor(m_transport->get_executor()),
+          m_version(version),
+          m_deadline(std::move(deadline)),
+          m_idle_timeout(idle_timeout) {}
 
     asio::awaitable<error_code> send(int status, Headers headers, std::string body) override {
         co_await hop();
@@ -121,13 +133,10 @@ class Http1ResponseWriter : public ResponseWriter {
 
   private:
     std::string status_line(int status) const {
-        std::string out;
-        out.append(m_version == Version::Http1 ? "HTTP/1.0 " : "HTTP/1.1 ");
-        out.append(std::to_string(status));
-        out.push_back(' ');
-        out.append(reason_phrase(status));
-        out.append("\r\n");
-        return out;
+        return std::format("{} {} {}\r\n",
+                            m_version == Version::Http1 ? "HTTP/1.0" : "HTTP/1.1", 
+                            status,
+                            reason_phrase(status));
     }
 
     void append_headers(std::string& out, const Headers& headers) const {
@@ -161,6 +170,9 @@ class Http1ResponseWriter : public ResponseWriter {
         std::size_t sent = 0;
         auto bytes = std::as_bytes(std::span<const char>{out.data(), out.size()});
         while (sent < out.size()) {
+            // Writing is connection activity: refresh the shared idle deadline so
+            // the watchdog does not reap a connection busy streaming a response.
+            if (m_deadline) *m_deadline = std::chrono::steady_clock::now() + m_idle_timeout;
             auto [ec, n] = co_await m_transport->async_write(bytes.subspan(sent));
             if (ec) co_return ec;
             sent += n;
@@ -177,6 +189,8 @@ class Http1ResponseWriter : public ResponseWriter {
     Version m_version;
     bool m_open{true};
     bool m_keep_alive_out{true};
+    SharedDeadline m_deadline;  // shared with the engine (read path + watchdog)
+    std::chrono::steady_clock::duration m_idle_timeout{};
 };
 
 template <TransportLike Transport>
@@ -194,7 +208,7 @@ class Http1Engine {
         using namespace asio::experimental::awaitable_operators;
         m_ws_lookup = std::move(ws_lookup);
         m_ws_proxy_lookup = std::move(ws_proxy_lookup);
-        m_deadline = std::chrono::steady_clock::now() + m_limits.idle_timeout;
+        *m_deadline = std::chrono::steady_clock::now() + m_limits.idle_timeout;
         co_await (serve_loop(dispatch, std::move(initial)) || watchdog());
         if (!m_upgraded) {
             m_transport->close();
@@ -209,7 +223,7 @@ class Http1Engine {
     asio::awaitable<void> watchdog() {
         asio::steady_timer timer{m_executor};
         for (;;) {
-            timer.expires_at(m_deadline);
+            timer.expires_at(*m_deadline);
             co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
             if (m_upgraded) {
                 // The connection was handed to the WebSocket layer, which manages
@@ -219,16 +233,17 @@ class Http1Engine {
                     co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
                 }
             }
-            if (std::chrono::steady_clock::now() >= m_deadline) break;  // idle timeout elapsed
+            if (std::chrono::steady_clock::now() >= *m_deadline) break;  // idle timeout elapsed
         }
         co_return;
     }
 
     // A read that refreshes the idle deadline on every attempt; all transport
     // reads in the engine go through this so the watchdog covers header reads,
-    // body reads and pipelined-request reads alike.
+    // body reads and pipelined-request reads alike. Writes refresh the same
+    // shared deadline from Http1ResponseWriter::write_raw.
     asio::awaitable<std::pair<error_code, std::size_t>> read_some(std::span<std::byte> buf) {
-        m_deadline = std::chrono::steady_clock::now() + m_limits.idle_timeout;
+        *m_deadline = std::chrono::steady_clock::now() + m_limits.idle_timeout;
         co_return co_await m_transport->async_read_some(buf);
     }
 
@@ -344,7 +359,8 @@ class Http1Engine {
                     co_return co_await pull_body_chunk();
                 });
 
-            auto writer = std::make_shared<Http1ResponseWriter<Transport>>(m_transport, version);
+            auto writer = std::make_shared<Http1ResponseWriter<Transport>>(m_transport, version, m_deadline,
+                                                                           m_limits.idle_timeout);
             writer->set_keep_alive(keep_alive);
             auto response = std::make_shared<Response>(writer);
 
@@ -522,13 +538,24 @@ class Http1Engine {
         return version != Version::Http1;  // HTTP/1.1 defaults to keep-alive, 1.0 to close
     }
 
+    // Allocation-free ASCII case-insensitive substring test. Called per request
+    // for keep-alive detection and body framing, so it avoids the temporary
+    // lowercased copies the previous implementation made.
     static bool icontains(std::string_view haystack, std::string_view needle) {
-        auto lower = [](std::string_view s) {
-            std::string out{s};
-            for (auto& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            return out;
+        if (needle.empty()) return true;
+        if (needle.size() > haystack.size()) return false;
+        auto lower = [](char c) {
+            return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
         };
-        return lower(haystack).find(lower(needle)) != std::string::npos;
+        const std::size_t last = haystack.size() - needle.size();
+        for (std::size_t i = 0; i <= last; ++i) {
+            std::size_t j = 0;
+            for (; j < needle.size(); ++j) {
+                if (lower(haystack[i + j]) != lower(needle[j])) break;
+            }
+            if (j == needle.size()) return true;
+        }
+        return false;
     }
 
     // Reads one CRLF- or LF-terminated line from m_buf (topping up from the
@@ -578,7 +605,8 @@ class Http1Engine {
     }
 
     asio::awaitable<void> send_error_response(int status) {
-        auto writer = std::make_shared<Http1ResponseWriter<Transport>>(m_transport, Version::Http11);
+        auto writer = std::make_shared<Http1ResponseWriter<Transport>>(m_transport, Version::Http11, m_deadline,
+                                                                        m_limits.idle_timeout);
         writer->set_keep_alive(false);
         Headers headers;
         std::string body{reason_phrase(status)};
@@ -641,7 +669,8 @@ class Http1Engine {
         // The backend is shared-owned: the detached write pump keeps a reference
         // to it (and hence to the transport) while a write is in flight, even
         // after this WebSocket handle is gone.
-        auto backend = std::make_shared<WsBackendImpl<Transport>>(m_transport, m_limits.max_body_bytes);
+        auto backend = std::make_shared<WsBackendImpl<Transport>>(m_transport, m_limits.max_body_bytes,
+                                                                  m_limits.idle_timeout);
         auto ws = std::make_shared<WebSocket>(std::move(backend));
 
         // Start the write pump as an independent coroutine on this executor so it
@@ -735,7 +764,8 @@ class Http1Engine {
     std::shared_ptr<Transport> m_transport;
     decltype(std::declval<Transport&>().get_executor()) m_executor;
     EngineLimits m_limits;
-    std::chrono::steady_clock::time_point m_deadline{};
+    // Shared so response writers can refresh it on writes too (see SharedDeadline).
+    SharedDeadline m_deadline{std::make_shared<std::chrono::steady_clock::time_point>()};
     std::string m_buf;  // bytes read past the most recently parsed head
     WsLookup m_ws_lookup;  // WebSocket route lookup (empty if ws disabled)
     WsProxyLookup m_ws_proxy_lookup;  // WebSocket proxy-route lookup (empty if none)

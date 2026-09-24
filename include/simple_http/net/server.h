@@ -43,6 +43,12 @@ struct ServerConfig {
     std::optional<TlsConfig> tls;
     unsigned worker_threads{4};
     bool reuse_port{false};
+    // Disable Nagle's algorithm on every accepted connection (TCP_NODELAY).
+    // On by default, matching nginx's `tcp_nodelay on`: without it small
+    // responses can sit in the kernel for up to ~40ms waiting to coalesce,
+    // which hurts both latency and throughput on request/response workloads.
+    // Set to false to keep Nagle enabled.
+    bool tcp_nodelay{true};
     // All protocol-engine tunables (timeouts, size caps, HTTP/2 windows/streams).
     EngineLimits limits{};
     // Optional per-accepted-socket hook (TCP_NODELAY / keepalive / buffer sizes …).
@@ -251,6 +257,10 @@ class Server {
             if (ec) {
                 if (ec == asio::error::operation_aborted) break;
                 continue;
+            }
+            if (m_config.tcp_nodelay) {
+                error_code ne;
+                socket.set_option(asio::ip::tcp::no_delay(true), ne);  // best-effort
             }
             if (m_config.socket_setup) {
                 try {
