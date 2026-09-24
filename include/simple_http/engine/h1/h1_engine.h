@@ -619,13 +619,13 @@ class Http1Engine {
         // Build and send the 101 Switching Protocols handshake response.
         auto key = head.headers.get("sec-websocket-key");
         std::string accept = ws_accept_key(*key);
-        std::string resp;
-        resp.append("HTTP/1.1 101 Switching Protocols\r\n");
-        resp.append("Upgrade: websocket\r\n");
-        resp.append("Connection: Upgrade\r\n");
-        resp.append("Sec-WebSocket-Accept: ");
-        resp.append(accept);
-        resp.append("\r\n\r\n");
+        std::string resp = std::format(
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Accept: {}\r\n\r\n",
+            accept
+        );
         if (auto ec = co_await write_all(resp); ec) {
             co_return false;  // could not send handshake; connection is unusable
         }
@@ -638,7 +638,10 @@ class Http1Engine {
         request->set_target(head.target);
         request->mutable_headers() = head.headers;
 
-        auto backend = std::make_unique<WsBackendImpl<Transport>>(m_transport, m_limits.max_body_bytes);
+        // The backend is shared-owned: the detached write pump keeps a reference
+        // to it (and hence to the transport) while a write is in flight, even
+        // after this WebSocket handle is gone.
+        auto backend = std::make_shared<WsBackendImpl<Transport>>(m_transport, m_limits.max_body_bytes);
         auto ws = std::make_shared<WebSocket>(std::move(backend));
 
         // Start the write pump as an independent coroutine on this executor so it

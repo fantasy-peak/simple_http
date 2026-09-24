@@ -23,6 +23,9 @@
 // all writes are serialized through an internal write pump: write_* enqueue a
 // frame and await their own completion while a single pump coroutine
 // (run_writer, started by the engine) performs the async_writes one at a time.
+// The pump holds a reference to the backend for its entire run, so it may
+// outlive the handle: whenever a write is still in flight the transport (and
+// the TLS stream under it) stays alive until that write has completed.
 //
 // Fragmentation and control frames are handled inside read(): continuation
 // frames are reassembled into one message (bounded by max_payload), Ping is
@@ -56,7 +59,10 @@ struct WsMessage {
 };
 
 // Type-erased backend over a concrete Transport. The WebSocket handle forwards
-// to it, so handlers never see the transport type.
+// to it, so handlers never see the transport type. Owned through a shared_ptr
+// (never a unique_ptr): the write pump coroutine holds a reference to itself so
+// that it - and the transport it writes through - cannot be destroyed while a
+// write is still in flight.
 class WsBackend {
   public:
     virtual ~WsBackend() = default;
@@ -65,12 +71,16 @@ class WsBackend {
     virtual asio::awaitable<error_code> close() = 0;
     virtual asio::awaitable<void> run_writer() = 0;  // the serializing write pump
     virtual bool is_open() const = 0;
+    // Non-blocking teardown used by ~WebSocket: stops the write pump so that a
+    // detached pump coroutine can finish and drop its self-reference. Safe to
+    // call after close() (closing an already closed queue is a no-op).
+    virtual void abort() = 0;
 };
 
 // Concrete backend over a simple_http Transport (TCP plain or TLS). Reads whole
 // messages via WsFrameParser and serializes all writes through a write pump.
 template <typename Transport>
-class WsBackendImpl final : public WsBackend {
+class WsBackendImpl final : public WsBackend, public std::enable_shared_from_this<WsBackendImpl<Transport>> {
     using Executor = decltype(std::declval<Transport&>().get_executor());
 
     // One queued outbound frame + a channel to deliver its write result.
@@ -210,17 +220,36 @@ class WsBackendImpl final : public WsBackend {
         co_return error_code{};
     }
 
-    // Single write pump: serializes all async_writes for this connection. Runs
-    // on the connection executor (started by the engine).
-    asio::awaitable<void> run_writer() override {
+    // Runs the write pump on the connection executor (started by the engine).
+    // The pump body is a static coroutine taking a shared_ptr to the backend so
+    // that its frame keeps the backend - and through it the transport and the
+    // TLS stream - alive until the last write has completed. A detached pump
+    // outlives the WebSocket handle (the engine destroys it as soon as the
+    // handler returns), so holding only `this` would leave it writing through a
+    // freed transport.
+    asio::awaitable<void> run_writer() override { return pump(this->shared_from_this()); }
+
+    // Non-blocking teardown for ~WebSocket: mark the connection closed and close
+    // the queue. The pump then leaves the loop (its receive fails) and, as the
+    // last owner, releases the backend once any in-flight write has finished.
+    void abort() override {
+        m_open = false;
+        m_write_q.close();
+    }
+
+    bool is_open() const override { return m_open; }
+
+  private:
+    // Single write pump: serializes all async_writes for this connection.
+    static asio::awaitable<void> pump(std::shared_ptr<WsBackendImpl> self) {
         for (;;) {
-            auto [qec, req] = co_await m_write_q.async_receive(asio::as_tuple(asio::use_awaitable));
+            auto [qec, req] = co_await self->m_write_q.async_receive(asio::as_tuple(asio::use_awaitable));
             if (qec) {
                 break;  // queue closed -> connection is going away
             }
-            auto wec = co_await write_all(req.frame);
+            auto wec = co_await self->write_all(req.frame);
             if (wec) {
-                m_open = false;
+                self->m_open = false;
             }
             if (req.done) {
                 (void)req.done->try_send(wec);  // deliver result to the waiter
@@ -232,9 +261,6 @@ class WsBackendImpl final : public WsBackend {
         co_return;
     }
 
-    bool is_open() const override { return m_open; }
-
-  private:
     // Re-enter the connection's executor regardless of the caller's context, so
     // touching m_open / m_parser / m_transport is always single-threaded.
     asio::awaitable<void> hop() {
@@ -277,7 +303,11 @@ class WsBackendImpl final : public WsBackend {
 // User-facing WebSocket handle. Forwards to the type-erased backend.
 class WebSocket {
   public:
-    explicit WebSocket(std::unique_ptr<WsBackend> backend) : m_backend(std::move(backend)) {}
+    explicit WebSocket(std::shared_ptr<WsBackend> backend) : m_backend(std::move(backend)) {}
+
+    // Dropping the handle without awaiting close() must still stop the detached
+    // write pump, otherwise it would keep the backend alive forever.
+    ~WebSocket() { m_backend->abort(); }
 
     // Reads one complete message (with its text/binary type). std::unexpected(ec)
     // on close/error.
@@ -297,11 +327,12 @@ class WebSocket {
     bool is_open() const { return m_backend->is_open(); }
 
     // Runs the serializing write pump (started by the engine on the connection
-    // executor; keep the WebSocket alive for its duration).
+    // executor). The pump holds its own reference to the backend, so it is safe
+    // to spawn detached and to drop this handle while it is still draining.
     asio::awaitable<void> run_writer() { return m_backend->run_writer(); }
 
   private:
-    std::unique_ptr<WsBackend> m_backend;
+    std::shared_ptr<WsBackend> m_backend;
 };
 
 }  // namespace simple_http
