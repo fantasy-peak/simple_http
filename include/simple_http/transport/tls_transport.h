@@ -56,6 +56,15 @@ class TlsTransport {
         co_return IoResult{ec, n};
     }
 
+    // Reads exactly `buffer.size()` bytes. Composed operation: it completes when
+    // the buffer is full, or with an error (EOF included) after a partial read -
+    // the result still reports the bytes read.
+    asio::awaitable<IoResult> async_read(ByteSpan buffer) {
+        auto [ec, n] = co_await asio::async_read(*m_stream, asio::buffer(buffer.data(), buffer.size()),
+                                                asio::as_tuple(asio::use_awaitable));
+        co_return IoResult{ec, n};
+    }
+
     asio::awaitable<IoResult> async_write(ConstByteSpan buffer) {
         auto [ec, n] = co_await asio::async_write(*m_stream, asio::buffer(buffer.data(), buffer.size()),
                                                   asio::as_tuple(asio::use_awaitable));

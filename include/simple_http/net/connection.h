@@ -35,23 +35,54 @@ namespace beast = boost::beast;
 inline constexpr std::string_view h2_preface_prefix = "PRI * HTTP/2.0";
 
 // Serve a plaintext transport: detect prior-knowledge h2, else HTTP/1.x.
+//
+// HTTP/2 prior knowledge is recognised by the start of the client preface, so we
+// read exactly that many bytes and compare. Reading exactly (rather than once)
+// matters: a single async_read_some may return fewer bytes - a TCP segment can
+// split the preface - and a partial match must not be read as "not h2". A
+// well-formed HTTP/1.x request line is longer than the prefix, so this never
+// delays HTTP/1.x handling. The read is bounded by the idle timeout, otherwise a
+// client that sends a few bytes and stalls would hold the connection open (the
+// engines' own watchdogs only start once a protocol has been chosen).
 template <typename Transport>
 inline asio::awaitable<void> serve_plaintext(std::shared_ptr<Transport> transport, Dispatcher dispatch,
                                              WsLookup ws_lookup = {}, EngineLimits limits = {},
                                              WsProxyLookup ws_proxy_lookup = {}) {
-    std::array<std::byte, 4096> buf{};
-    auto [ec, n] = co_await transport->async_read_some(std::span<std::byte>{buf});
-    if (ec) {
+    using namespace asio::experimental::awaitable_operators;
+
+    std::array<std::byte, h2_preface_prefix.size()> head{};
+    std::size_t n = 0;
+
+    auto read_head = [&]() -> asio::awaitable<void> {
+        auto [ec, got] = co_await transport->async_read(std::span<std::byte>{head});
+        n = got;
+        if (ec && got == 0) {
+            co_return;  // EOF/error before a single byte: nothing to classify
+        }
+        co_return;
+    };
+    auto detection_deadline = [&]() -> asio::awaitable<void> {
+        if (limits.idle_timeout.count() <= 0) {
+            co_return;  // idle timeout disabled
+        }
+        asio::steady_timer timer{co_await asio::this_coro::executor};
+        timer.expires_after(limits.idle_timeout);
+        co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+    };
+
+    co_await (read_head() || detection_deadline());
+    if (n == 0) {
         transport->close();
         co_return;
     }
-    std::string_view head{reinterpret_cast<const char*>(buf.data()), n};
 
-    if (head.starts_with(h2_preface_prefix)) {
-        // HTTP/2 prior-knowledge: replay the bytes we consumed into the engine.
-        // The engine is shared so in-flight handlers keep it alive.
+    std::string_view header{reinterpret_cast<const char*>(head.data()), n};
+    if (n == h2_preface_prefix.size() && header == h2_preface_prefix) {
+        // HTTP/2 prior-knowledge: replay the consumed prefix into the engine, which
+        // reads the rest of the 24-octet preface itself (RFC 7540 §3.5). The
+        // engine is shared so in-flight handlers keep it alive.
         auto engine = std::make_shared<Http2Engine<Transport>>(transport, limits);
-        co_await engine->run(std::move(dispatch), std::string{head});
+        co_await engine->run(std::move(dispatch), std::string{header});
         co_return;
     }
 
@@ -59,7 +90,7 @@ inline asio::awaitable<void> serve_plaintext(std::shared_ptr<Transport> transpor
     // A registered WebSocket route (ws_lookup) enables the Upgrade: websocket
     // handshake inside the h1 engine.
     Http1Engine<Transport> engine{transport, limits};
-    co_await engine.run(dispatch, std::string{head}, std::move(ws_lookup), std::move(ws_proxy_lookup));
+    co_await engine.run(dispatch, std::string{header}, std::move(ws_lookup), std::move(ws_proxy_lookup));
     co_return;
 }
 
