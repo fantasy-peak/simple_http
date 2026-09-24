@@ -57,6 +57,13 @@ class Response {
         return m_writer->send(m_status, std::move(m_headers), std::move(body));
     }
 
+    // Status + headers with no body and no body framing at all (204/304 and every
+    // response to HEAD): the client sees the response end at the header block.
+    [[nodiscard]] asio::awaitable<error_code> send_bodyless() {
+        apply_defaults();
+        return m_writer->send_bodyless(m_status, std::move(m_headers));
+    }
+
     // --- streaming ---
     [[nodiscard]] asio::awaitable<error_code> begin() {
         apply_defaults();

@@ -14,6 +14,18 @@ namespace simple_http {
 
 using error_code = boost::system::error_code;
 
+// Whether a string carries a byte that must never appear in an HTTP field name,
+// value or request target (CR, LF, NUL). HTTP/2 does not delimit fields itself,
+// so a peer can put any byte there; anything that later synthesizes an HTTP/1.1
+// message (a handler, or the reverse proxy) would splice it into a request line
+// or a header and split the message in two.
+inline bool contains_ctl(std::string_view s) noexcept {
+    for (char c : s) {
+        if (c == '\r' || c == '\n' || c == '\0') return true;
+    }
+    return false;
+}
+
 // The wire protocol a request/response is being served over.
 enum class Version : std::uint8_t {
     Http1 = 0,   // HTTP/1.0

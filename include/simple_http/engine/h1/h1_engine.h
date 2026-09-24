@@ -71,17 +71,51 @@ class Http1ResponseWriter : public ResponseWriter {
           m_deadline(std::move(deadline)),
           m_idle_timeout(idle_timeout) {}
 
+    // Set by the engine when the request method was HEAD: the response keeps its
+    // headers (so the client learns the entity length) but carries no body
+    // (RFC 9110 §9.3.2).
+    void set_head_request(bool head) { m_head_request = head; }
+
     asio::awaitable<error_code> send(int status, Headers headers, std::string body) override {
         co_await hop();
         if (!m_open) co_return make_error_code(asio::error::not_connected);
+
+        if (status == 204 || status == 304) {
+            // Neither a body nor a Content-Length (RFC 9110 §15.3.5/§15.4.5).
+            co_return co_await send_bodyless(status, std::move(headers));
+        }
 
         headers.add_lower("content-length", std::to_string(body.size()));
         std::string out = status_line(status);
         append_headers(out, headers);
         out.append("\r\n");
+        if (m_head_request) {  // headers only
+            auto ec = co_await write_raw(out);
+            if (ec) m_open = false;
+            co_return ec;
+        }
         out.append(body);
 
         auto ec = co_await write_raw(out);
+        if (ec) m_open = false;
+        co_return ec;
+    }
+
+    asio::awaitable<error_code> send_bodyless(int status, Headers headers) override {
+        co_await hop();
+        if (!m_open) co_return make_error_code(asio::error::not_connected);
+        std::string out = status_line(status);
+        append_headers(out, headers);
+        out.append("\r\n");
+        auto ec = co_await write_raw(out);
+        if (ec) m_open = false;
+        co_return ec;
+    }
+
+    asio::awaitable<error_code> send_continue() override {
+        co_await hop();
+        if (!m_open) co_return make_error_code(asio::error::not_connected);
+        auto ec = co_await write_raw("HTTP/1.1 100 Continue\r\n\r\n");
         if (ec) m_open = false;
         co_return ec;
     }
@@ -90,7 +124,15 @@ class Http1ResponseWriter : public ResponseWriter {
         co_await hop();
         if (!m_open) co_return make_error_code(asio::error::not_connected);
 
-        headers.add_lower("transfer-encoding", "chunked");
+        // HTTP/1.0 has no chunked framing: such a response is delimited by the
+        // connection close, so refuse keep-alive here (append_headers then writes
+        // `connection: close` and the engine closes, since keep_alive_out() is false).
+        // A response to HEAD is delimited by its headers alone.
+        if (m_version == Version::Http1 || m_head_request) {
+            m_keep_alive_out = false;
+        } else {
+            headers.add_lower("transfer-encoding", "chunked");
+        }
         std::string out = status_line(status);
         append_headers(out, headers);
         out.append("\r\n");
@@ -101,6 +143,7 @@ class Http1ResponseWriter : public ResponseWriter {
     }
 
     asio::awaitable<error_code> send_chunk(std::string data) override {
+        if (m_head_request) co_return error_code{};  // HEAD: headers only
         co_await hop();
         if (!m_open) co_return make_error_code(asio::error::not_connected);
         auto ec = co_await write_raw(encode_chunk(data));
@@ -109,6 +152,7 @@ class Http1ResponseWriter : public ResponseWriter {
     }
 
     asio::awaitable<error_code> send_last(std::string data) override {
+        if (m_head_request) co_return error_code{};  // HEAD: headers only
         co_await hop();
         if (!m_open) co_return make_error_code(asio::error::not_connected);
         std::string out;
@@ -188,6 +232,7 @@ class Http1ResponseWriter : public ResponseWriter {
     Version m_version;
     bool m_open{true};
     bool m_keep_alive_out{true};
+    bool m_head_request{false};  // response to HEAD: no body (RFC 9110 §9.3.2)
     SharedDeadline m_deadline;  // shared with the engine (read path + watchdog)
     std::chrono::steady_clock::duration m_idle_timeout{};
 };
@@ -290,7 +335,7 @@ class Http1Engine {
                     if (auto target = m_ws_proxy_lookup(ws_path)) {
                         m_upgraded = true;  // stop the watchdog from closing the transport
                         co_await run_ws_proxy(m_transport, head, std::string{parser.remainder()},
-                                              std::move(*target));
+                                              std::move(*target), m_limits.idle_timeout);
                         co_return;  // tunnel finished; run() must not touch the transport
                     }
                 }
@@ -361,6 +406,7 @@ class Http1Engine {
             auto writer = std::make_shared<Http1ResponseWriter<Transport>>(m_transport, version, m_deadline,
                                                                            m_limits.idle_timeout);
             writer->set_keep_alive(keep_alive);
+            writer->set_head_request(head.method == Method::Head);
             auto response = std::make_shared<Response>(writer);
 
             // Run the handler to completion (h1 is half-duplex: the reader and the
@@ -467,6 +513,13 @@ class Http1Engine {
             // Last chunk: consume trailers up to the blank line, then EOF.
             std::string trailer;
             while (co_await read_line(trailer) && !trailer.empty()) {
+                // Trailers are part of the body volume: count them so a peer cannot
+                // stream trailers forever (each line is itself bounded by read_line).
+                m_body_total += trailer.size() + 2;
+                if (m_body_total > m_limits.max_body_bytes) {
+                    m_body_done = true;
+                    co_return std::unexpected(make_error_code(asio::error::message_size));
+                }
             }
             m_body_done = true;
             co_return ReadResult::end();
@@ -567,6 +620,14 @@ class Http1Engine {
                 out.assign(m_buf, 0, end);
                 m_buf.erase(0, nl + 1);
                 co_return true;
+            }
+            // No line ending yet, so everything buffered belongs to this line (a
+            // chunk-size line or a trailer line). Bound it: read_some refreshes the
+            // idle deadline on every call, so an endless line (never a newline)
+            // would otherwise grow m_buf until the process runs out of memory.
+            if (m_buf.size() >= m_limits.max_header_bytes) {
+                SIMPLE_HTTP_ERROR_LOG("h1 line longer than {} bytes; closing", m_limits.max_header_bytes);
+                co_return false;
             }
             std::array<std::byte, 8192> tmp{};
             auto [ec, n] = co_await read_some(std::span<std::byte>{tmp});
@@ -670,6 +731,14 @@ class Http1Engine {
         // after this WebSocket handle is gone.
         auto backend = std::make_shared<WsBackendImpl<Transport>>(m_transport, m_limits.max_body_bytes,
                                                                   m_limits.idle_timeout);
+
+        // Bytes the parser read past the request head (m_buf) are the start of the
+        // WebSocket stream - typically the client's first frame, which many clients
+        // pipeline behind the upgrade request. Hand them to the frame parser instead
+        // of dropping them.
+        backend->feed(m_buf);
+        m_buf.clear();
+
         auto ws = std::make_shared<WebSocket>(std::move(backend));
 
         // Start the write pump as an independent coroutine on this executor so it

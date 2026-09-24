@@ -82,8 +82,20 @@ class Http2ResponseWriter : public ResponseWriter {
         co_await hop();
         auto eng = m_engine.lock();
         if (!eng || !eng->alive()) co_return make_error_code(asio::error::not_connected);
-        eng->submit_headers(m_stream_id, status, headers, /*end_stream=*/false);
-        eng->enqueue_body(m_stream_id, std::move(body), /*last=*/true);
+        // A response to HEAD has no body: END_STREAM on the HEADERS frame, and the
+        // headers still carry the Content-Length a GET would have produced.
+        const bool head = eng->method_is_head(m_stream_id);
+        eng->submit_headers(m_stream_id, status, headers, /*end_stream=*/head);
+        if (!head) eng->enqueue_body(m_stream_id, std::move(body), /*last=*/true);
+        co_return error_code{};
+    }
+
+    asio::awaitable<error_code> send_bodyless(int status, Headers headers) override {
+        co_await hop();
+        auto eng = m_engine.lock();
+        if (!eng || !eng->alive()) co_return make_error_code(asio::error::not_connected);
+        // Nothing follows the HEADERS frame: END_STREAM ends the stream (RFC 9113 §8.1).
+        eng->submit_headers(m_stream_id, status, headers, /*end_stream=*/true);
         co_return error_code{};
     }
 
@@ -91,7 +103,7 @@ class Http2ResponseWriter : public ResponseWriter {
         co_await hop();
         auto eng = m_engine.lock();
         if (!eng || !eng->alive()) co_return make_error_code(asio::error::not_connected);
-        eng->submit_headers(m_stream_id, status, headers, /*end_stream=*/false);
+        eng->submit_headers(m_stream_id, status, headers, /*end_stream=*/eng->method_is_head(m_stream_id));
         eng->flush();
         co_return error_code{};
     }
@@ -100,6 +112,7 @@ class Http2ResponseWriter : public ResponseWriter {
         co_await hop();
         auto eng = m_engine.lock();
         if (!eng || !eng->alive()) co_return make_error_code(asio::error::not_connected);
+        if (eng->method_is_head(m_stream_id)) co_return error_code{};  // HEAD: no body
         eng->enqueue_body(m_stream_id, std::move(data), /*last=*/false);
         co_return error_code{};
     }
@@ -108,6 +121,7 @@ class Http2ResponseWriter : public ResponseWriter {
         co_await hop();
         auto eng = m_engine.lock();
         if (!eng || !eng->alive()) co_return make_error_code(asio::error::not_connected);
+        if (eng->method_is_head(m_stream_id)) co_return error_code{};  // HEAD: no body
         eng->enqueue_body(m_stream_id, std::move(data), /*last=*/true);
         co_return error_code{};
     }
@@ -168,6 +182,7 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
         // Apply the client's SETTINGS payload (raw settings frame body).
         std::string settings = base64_url_decode(settings_b64);
         apply_settings_payload(settings);
+        if (m_goaway_sent) co_return;  // the h2c HTTP2-Settings were rejected
         queue_settings();
 
         // Seed stream 1 from the initial request and dispatch it.
@@ -205,9 +220,27 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
             }
             codec::hpack_append_literal(block, name, value);
         }
-        std::uint8_t flags = codec::H2_FLAG_END_HEADERS;
-        if (end_stream) flags |= codec::H2_FLAG_END_STREAM;
-        append_frame(codec::H2FrameType::Headers, flags, stream_id, block);
+        // A header block larger than the peer's advertised frame size must be split
+        // over HEADERS + CONTINUATION frames (RFC 9113 §6.2/§6.10): a compliant peer
+        // answers a larger frame with FRAME_SIZE_ERROR and closes the connection.
+        const std::size_t limit =
+            std::max<std::size_t>(1, std::min<std::size_t>(m_peer_max_frame_size, m_limits.h2_max_frame_size));
+        std::size_t off = 0;
+        bool first = true;
+        do {
+            const std::size_t take = std::min(limit, block.size() - off);
+            const bool last = (off + take == block.size());
+            std::uint8_t flags = last ? codec::H2_FLAG_END_HEADERS : 0;
+            if (first) {
+                if (end_stream) flags |= codec::H2_FLAG_END_STREAM;
+                append_frame(codec::H2FrameType::Headers, flags, stream_id, std::string_view{block}.substr(off, take));
+            } else {
+                append_frame(codec::H2FrameType::Continuation, flags, stream_id,
+                             std::string_view{block}.substr(off, take));
+            }
+            first = false;
+            off += take;
+        } while (off < block.size());
     }
 
     // Enqueue a response body chunk for `stream_id`. `last` marks end-of-body so
@@ -304,9 +337,31 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
                 m_peer_initial_window = static_cast<std::int32_t>(value);
                 for (auto& [sid, st] : m_streams) st.send_window += delta;
             } else if (id == codec::H2_SETTINGS_MAX_FRAME_SIZE) {
+                // RFC 7540 §6.5.2: the value must lie in [2^14, 2^24-1]; anything
+                // else is a connection error. Accepting 0 here (reachable from a
+                // 6-byte SETTINGS frame, or through the h2c HTTP2-Settings header)
+                // would leave fill_data_frames() with a zero frame budget: it could
+                // not advance, would re-loop forever and grow m_out without bound.
+                if (value < 16384u || value > 16777215u) {
+                    go_away(codec::H2_PROTOCOL_ERROR);
+                    return;
+                }
                 m_peer_max_frame_size = value;
             }
         }
+    }
+
+    // Whether adding `extra` bytes to a header block of `current` bytes would exceed
+    // the bound we accept. Without it, HEADERS without END_HEADERS plus endless
+    // CONTINUATION accumulate without limit (RFC 9113 §10.5.1).
+    bool header_block_too_big(std::size_t current, std::size_t extra) const {
+        return current + extra > m_limits.max_header_bytes;
+    }
+
+    // Whether the request on `stream_id` was a HEAD (its response carries no body).
+    bool method_is_head(std::uint32_t stream_id) const {
+        auto it = m_streams.find(stream_id);
+        return it != m_streams.end() && it->second.request->method() == Method::Head;
     }
 
     // --- stream table ---
@@ -361,7 +416,42 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
         flush();  // push our initial SETTINGS
         co_await (read_loop() || write_loop() || watchdog());
         m_alive = false;
+        // Whichever loop finished first cancels the others, and a cancelled
+        // async_write drops its buffer - so the GOAWAY the write loop had just taken
+        // may never reach the wire, leaving the peer with a bare TCP close and no
+        // explanation. Re-serialize it here and write it directly (RFC 9113 §6.8
+        // allows an endpoint to send GOAWAY more than once, so re-sending is safe).
+        if (m_goaway_sent) {
+            m_out.clear();  // queued DATA is moot on a connection error
+            std::string payload;
+            append_u32(payload, m_next_peer_stream_id);
+            append_u32(payload, m_goaway_error);
+            append_frame(codec::H2FrameType::Goaway, 0, 0, payload);
+        }
+        // Flush with a deadline: a peer that stopped reading must not keep the
+        // connection (and this coroutine) alive.
+        co_await (flush_pending_output() || flush_deadline());
         m_transport->close();
+        co_return;
+    }
+
+    // Best-effort flush of the serialized output left behind by the write loop.
+    asio::awaitable<void> flush_pending_output() {
+        if (m_out.empty()) co_return;
+        auto bytes = std::as_bytes(std::span<const char>{m_out.data(), m_out.size()});
+        auto [ec, n] = co_await m_transport->async_write(bytes);
+        (void)n;
+        m_out.clear();
+        if (ec) co_return;
+        co_return;
+    }
+
+    // Deadline for the teardown flush above: never let a non-reading peer keep the
+    // connection (and its coroutine frame) alive.
+    asio::awaitable<void> flush_deadline() {
+        asio::steady_timer timer{m_executor};
+        timer.expires_after(std::chrono::seconds(2));
+        co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
         co_return;
     }
 
@@ -432,9 +522,10 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
         while (m_recv_buf.size() - pos >= codec::kH2FrameHeaderSize) {
             codec::H2FrameHeader hdr;
             codec::parse_frame_header(std::string_view{m_recv_buf}.substr(pos), hdr);
-            if (hdr.length > m_limits.h2_max_frame_size &&
-                hdr.type != static_cast<std::uint8_t>(codec::H2FrameType::Headers) &&
-                hdr.type != static_cast<std::uint8_t>(codec::H2FrameType::Continuation)) {
+            // RFC 9113 §4.2: a frame larger than our advertised SETTINGS_MAX_FRAME_SIZE
+            // is a connection error, for every frame type (a compliant peer never sends
+            // one). Bounding it here also bounds how much a single frame can buffer.
+            if (hdr.length > m_limits.h2_max_frame_size) {
                 go_away(codec::H2_FRAME_SIZE_ERROR);
                 return false;
             }
@@ -504,6 +595,24 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
                                                hdr.has_flag(codec::H2_FLAG_PRIORITY), ok);
         if (!ok) { go_away(codec::H2_PROTOCOL_ERROR); return false; }
 
+        // Refuse streams beyond the concurrency limit we advertise (RFC 9113 §5.1.2):
+        // each accepted stream allocates a Request (with its Body channel), a
+        // ResponseWriter and a handler coroutine, so an unbounded stream count is an
+        // unbounded resource commitment.
+        if (m_streams.find(hdr.stream_id) == m_streams.end() &&
+            m_streams.size() >= m_limits.h2_max_concurrent_streams) {
+            SIMPLE_HTTP_ERROR_LOG("h2: refusing stream {} ({} open, limit {})", hdr.stream_id, m_streams.size(),
+                                  m_limits.h2_max_concurrent_streams);
+            reset_stream(hdr.stream_id, codec::H2_REFUSED_STREAM);
+            return true;
+        }
+        if (header_block_too_big(m_streams.contains(hdr.stream_id) ? m_streams.at(hdr.stream_id).header_block.size() : 0,
+                                 block.size())) {
+            SIMPLE_HTTP_ERROR_LOG("h2: header block exceeds {} bytes (stream={})", m_limits.max_header_bytes,
+                                  hdr.stream_id);
+            go_away(codec::H2_ENHANCE_YOUR_CALM);
+            return false;
+        }
         Stream& st = ensure_stream(hdr.stream_id);
         st.header_block.append(block);
         if (hdr.stream_id > m_next_peer_stream_id) m_next_peer_stream_id = hdr.stream_id;
@@ -513,9 +622,13 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
 
         if (hdr.has_flag(codec::H2_FLAG_END_HEADERS)) {
             if (!finish_header_block(hdr.stream_id, st)) return false;
+            // finish_header_block may have reset (and erased) a malformed stream, so
+            // `st` must not be used again: re-look it up before dispatching.
+            auto it = m_streams.find(hdr.stream_id);
+            if (it == m_streams.end()) return true;
             if (end_stream) {
-                st.half_closed_remote = true;
-                (void)st.request->body().finish();
+                it->second.half_closed_remote = true;
+                (void)it->second.request->body().finish();
             }
             // Dispatch as soon as the request head is complete. The handler runs
             // concurrently with any DATA frames still arriving, reading the body
@@ -536,12 +649,20 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
         }
         auto it = m_streams.find(hdr.stream_id);
         if (it == m_streams.end()) { go_away(codec::H2_PROTOCOL_ERROR); return false; }
+        if (header_block_too_big(it->second.header_block.size(), payload.size())) {
+            SIMPLE_HTTP_ERROR_LOG("h2: CONTINUATION header block exceeds {} bytes (stream={})",
+                                  m_limits.max_header_bytes, hdr.stream_id);
+            go_away(codec::H2_ENHANCE_YOUR_CALM);  // RFC 9113 §10.5.1 (CONTINUATION flood)
+            return false;
+        }
         it->second.header_block.append(payload);
         if (hdr.has_flag(codec::H2_FLAG_END_HEADERS)) {
             m_continuation_stream = 0;
             if (!finish_header_block(hdr.stream_id, it->second)) return false;
-            if (it->second.half_closed_remote) {
-                (void)it->second.request->body().finish();
+            auto it2 = m_streams.find(hdr.stream_id);  // may have been reset+erased
+            if (it2 == m_streams.end()) return true;
+            if (it2->second.half_closed_remote) {
+                (void)it2->second.request->body().finish();
             }
             dispatch_stream(hdr.stream_id);
         }
@@ -559,6 +680,16 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
         }
         st.header_block.clear();
         for (auto& f : fields) {
+            // RFC 9113 §8.2.1: a field name or value must not contain CR, LF or NUL.
+            // HTTP/2 has no line folding, so these bytes survive decoding verbatim and
+            // would let a peer inject request lines/headers into whatever HTTP/1.1
+            // message is built downstream (handlers, reverse proxy). A request is
+            // malformed -> stream error (§8.1.1); the connection stays usable.
+            if (contains_ctl(f.name) || contains_ctl(f.value)) {
+                SIMPLE_HTTP_ERROR_LOG("h2 field with CR/LF/NUL (stream={}); resetting stream", stream_id);
+                reset_stream(stream_id, codec::H2_PROTOCOL_ERROR);
+                return true;  // stream is gone: the caller must not dispatch it
+            }
             if (f.name == ":method") {
                 st.request->set_method_token(f.value);
             } else if (f.name == ":path") {
@@ -631,6 +762,7 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
         if (hdr.has_flag(codec::H2_FLAG_ACK)) return true;  // our SETTINGS was acked
         if (payload.size() % 6 != 0) { go_away(codec::H2_FRAME_SIZE_ERROR); return false; }
         apply_settings_payload(payload);
+        if (m_goaway_sent) return false;  // a rejected setting sent us away: no ACK
         append_frame(codec::H2FrameType::Settings, codec::H2_FLAG_ACK, 0, {});  // ACK
         return true;
     }
@@ -744,6 +876,9 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
 
     void go_away(std::uint32_t error_code_value) {
         if (m_goaway_sent) return;
+        // Remember the code so the teardown path can re-serialize the GOAWAY if the
+        // write loop was cancelled before it reached the wire.
+        m_goaway_error = error_code_value;
         std::string payload;
         append_u32(payload, m_next_peer_stream_id);  // last stream id we processed
         append_u32(payload, error_code_value);
@@ -784,6 +919,11 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
                     window,
                     static_cast<std::int64_t>(std::min<std::uint32_t>(m_peer_max_frame_size, m_limits.h2_max_frame_size))));
                 std::size_t take = std::min(available, budget);
+                if (take == 0) {
+                    // No progress possible (frame-size limit configured to 0):
+                    // stop rather than spin and grow m_out without bound.
+                    break;
+                }
 
                 // Frame [out_offset, out_offset+take) of the front chunk directly,
                 // with no intermediate copy.
@@ -856,6 +996,7 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
     std::string m_recv_buf;  // received bytes awaiting frame parsing
     std::string m_out;       // serialized frames awaiting transport write
 
+    std::uint32_t m_goaway_error{0};  // code for the GOAWAY re-emitted on teardown
     std::int64_t m_conn_send_window = kH2InitialWindow;  // peer's connection-level window for us (send side)
     std::int64_t m_conn_recv_window = kH2InitialWindow;  // our connection-level window to the peer (recv side)
     std::int64_t m_conn_recv_pending = 0;                // consumed bytes awaiting a batched connection WINDOW_UPDATE

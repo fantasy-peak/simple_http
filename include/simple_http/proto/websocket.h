@@ -78,6 +78,10 @@ class WsBackend {
     // detached pump coroutine can finish and drop its self-reference. Safe to
     // call after close() (closing an already closed queue is a no-op).
     virtual void abort() = 0;
+    // Hands bytes already read past the upgrade request (the start of the
+    // client's first frame) to the frame parser. Must be called on the connection
+    // executor before the first read().
+    virtual void feed(std::string_view bytes) = 0;
 };
 
 // Concrete backend over a simple_http Transport (TCP plain or TLS). Reads whole
@@ -130,6 +134,14 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
           m_watchdog_timer(std::make_shared<asio::steady_timer>(m_executor)),
           m_notify(m_executor, 1) {
         m_deadline = std::chrono::steady_clock::now() + m_idle_timeout;
+    }
+
+    // Hands bytes already read past the upgrade request to the parser, so a
+    // client that pipelines its first frame behind the handshake does not lose it.
+    void feed(std::string_view bytes) override {
+        if (!bytes.empty()) {
+            m_parser.append(reinterpret_cast<const std::byte*>(bytes.data()), bytes.size());
+        }
     }
 
     // Reads one complete message, reassembling fragments and transparently

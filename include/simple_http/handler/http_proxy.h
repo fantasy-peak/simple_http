@@ -254,6 +254,15 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
         }
     }
 
+    // Defence in depth: never splice a control byte into the request line or a
+    // header we synthesize. The engines reject such bytes at parse time (h1 cannot
+    // produce them, h2 validates them), but a proxy must not rely on its caller.
+    if (contains_ctl(req->method_token()) || contains_ctl(forwarded_target)) {
+        SIMPLE_HTTP_ERROR_LOG("http-proxy: refusing request line with CR/LF/NUL");
+        co_await fail_502();
+        co_return;
+    }
+
     std::string head;
     head.append(req->method_token());
     head.push_back(' ');
@@ -268,6 +277,14 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
     // (or a data chunk before EOF) the request has a body. The peeked frame is
     // forwarded first once the head is written. This is protocol-agnostic and
     // correct for h1, h2 and h2c alike.
+    // A client that sent `Expect: 100-continue` waits for a go-ahead before sending
+    // its body. Answer it ourselves (RFC 9110 §10.1.1 allows an intermediary to) -
+    // otherwise this read would block until the client gives up waiting and sends the
+    // body anyway, and a client that never gives up would deadlock the request.
+    if (auto exp = req->header("expect"); exp && detail::to_lower(*exp).find("100-continue") != std::string::npos) {
+        (void)co_await res->writer().send_continue();
+    }
+
     std::string first_chunk;
     bool req_has_body = false;
     {
@@ -287,11 +304,17 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
     for (const auto& [name, value] : req->headers()) {
         if (detail::is_hop_by_hop(name) || detail::contains_token(req_conn_tokens, name)) continue;
         if (name == "host") continue;              // replaced below
+        if (name == "expect") continue;            // answered locally above
         if (name == "content-length") continue;    // re-framed as chunked below
         if (name == "x-forwarded-for") {
             saw_xff = true;
             xff = value;  // will append the client address below
             continue;
+        }
+        if (contains_ctl(name) || contains_ctl(value)) {
+            SIMPLE_HTTP_ERROR_LOG("http-proxy: refusing header with CR/LF/NUL: {}", name);
+            co_await fail_502();
+            co_return;
         }
         head.append(name);
         head.append(": ");
@@ -384,6 +407,9 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
     {
         std::array<std::byte, 8192> tmp{};
         auto state = detail::BackendResponseParser::State::NeedMore;
+        // Loop so informational responses (100 Continue, 103 Early Hints) are
+        // swallowed instead of being mistaken for the final response.
+        for (;;) {
         while (state == detail::BackendResponseParser::State::NeedMore) {
             auto [ec, n] = co_await backend->async_read_some(asio::buffer(tmp.data(), tmp.size()),
                                                              asio::as_tuple(asio::use_awaitable));
@@ -400,6 +426,14 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
             SIMPLE_HTTP_ERROR_LOG("http-proxy malformed response head from {}:{}", target.host, target.port);
             co_await fail_502();
             co_return;
+        }
+        if (parser.head().status >= 200) break;  // final response
+        // Informational: discard it and parse the next head from what we have.
+        leftover.assign(parser.remainder());
+        parser = detail::BackendResponseParser{};
+        parser.feed(reinterpret_cast<const std::byte*>(leftover.data()), leftover.size());
+        leftover.clear();
+        state = parser.parse();
         }
         leftover.assign(parser.remainder());
     }
@@ -433,17 +467,21 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
     auto resp_conn_tokens = detail::connection_tokens(bhead.headers);
     for (const auto& [name, value] : bhead.headers) {
         if (detail::is_hop_by_hop(name) || detail::contains_token(resp_conn_tokens, name)) continue;
-        if (name == "content-length") continue;  // we stream; framing chosen by the writer
+        // We stream the body, so the upstream Content-Length is replaced by our own
+        // framing - except for HEAD, whose response carries the headers a GET would
+        // have produced (Content-Length included) and no body at all.
+        if (name == "content-length" && req->method() != Method::Head) continue;
         res->header(name, value);
     }
-    if (auto ec = co_await res->begin(); ec) {
-        // Client went away; nothing more to do.
+    if (bodyless) {
+        // Nothing follows the headers: no framing, no terminating chunk, no body.
+        (void)co_await res->send_bodyless();
         backend->close();
         co_return;
     }
 
-    if (bodyless) {
-        (void)co_await res->finish();
+    if (auto ec = co_await res->begin(); ec) {
+        // Client went away; nothing more to do.
         backend->close();
         co_return;
     }
@@ -459,6 +497,19 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
         co_return true;
     };
 
+    // An upstream that stops mid-body must not be reported to the client as a
+    // complete response: finishing cleanly hands the client a truncated body with a
+    // valid terminator and no error. Abort instead - HTTP/1.x closes the connection
+    // (so the response has no terminating chunk), HTTP/2 resets the stream - and the
+    // client sees the failure.
+    auto abort_truncated = [&res, &backend](const char* why) -> asio::awaitable<void> {
+        SIMPLE_HTTP_ERROR_LOG("http-proxy: {}; aborting the client response", why);
+        res->close();
+        backend->close();
+        co_return;
+    };
+    bool body_complete = false;
+
     // --- stream the response body back to the client ---
     if (resp_chunked) {
         // Decode chunked from the backend and re-emit as opaque chunks to the client.
@@ -466,7 +517,10 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
             // read a size line
             std::size_t nl;
             while ((nl = leftover.find('\n')) == std::string::npos) {
-                if (!co_await pump_more()) { (void)co_await res->finish(); backend->close(); co_return; }
+                if (!co_await pump_more()) {
+                    co_await abort_truncated("upstream ended inside a chunk header");
+                    co_return;
+                }
             }
             std::string size_line = leftover.substr(0, nl);
             leftover.erase(0, nl + 1);
@@ -482,7 +536,10 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
                 else { ok = false; break; }
                 chunk_len = chunk_len * 16 + d;
             }
-            if (!ok) break;
+            if (!ok) {
+                co_await abort_truncated("malformed chunk size line from upstream");
+                co_return;
+            }
             if (chunk_len == 0) {
                 // consume trailer up to blank line
                 for (;;) {
@@ -494,7 +551,10 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
                     std::string tline = leftover.substr(0, tnl);
                     leftover.erase(0, tnl + 1);
                     if (!tline.empty() && tline.back() == '\r') tline.pop_back();
-                    if (tline.empty()) break;
+                    if (tline.empty()) {
+                        body_complete = true;  // trailers terminated: the body is whole
+                        break;
+                    }
                 }
                 break;
             }
@@ -509,7 +569,6 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
             if (leftover.size() >= 2 && leftover[0] == '\r' && leftover[1] == '\n') leftover.erase(0, 2);
             if (auto ec = co_await res->write(std::move(data)); ec) { backend->close(); co_return; }
         }
-        (void)co_await res->finish();
     } else if (resp_has_length) {
         std::uint64_t remaining = resp_length;
         // emit whatever is already buffered
@@ -524,7 +583,7 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
             remaining -= take;
             if (auto ec = co_await res->write(std::move(data)); ec) { backend->close(); co_return; }
         }
-        (void)co_await res->finish();
+        body_complete = (remaining == 0);  // a short read means the upstream was cut off
     } else {
         // No length, no chunked: body runs until the backend closes (we sent
         // Connection: close so the backend does too).
@@ -536,9 +595,14 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
             }
             if (!co_await pump_more()) break;
         }
-        (void)co_await res->finish();
+        body_complete = true;  // no length was announced: the close *is* the terminator
     }
 
+    if (body_complete) {
+        (void)co_await res->finish();
+    } else {
+        co_await abort_truncated("upstream body truncated");
+    }
     backend->close();
     co_return;
 }

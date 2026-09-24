@@ -38,6 +38,17 @@ class ResponseWriter {
     // The final body chunk; ends the response.
     [[nodiscard]] virtual asio::awaitable<error_code> send_last(std::string data) = 0;
 
+    // Status + headers for a response with no body and no body framing at all:
+    // 204/304 and every response to HEAD. Nothing follows the header block, so the
+    // client sees the response end where the headers end (RFC 9110 §6.3). Emitting a
+    // chunked terminator or a Content-Length here desynchronizes a keep-alive
+    // client, which then reads the remainder as the next response.
+    [[nodiscard]] virtual asio::awaitable<error_code> send_bodyless(int status, Headers headers) = 0;
+
+    // Informational response (e.g. 100 Continue), when the client asked for one with
+    // `Expect: 100-continue`. Protocols without the concept ignore it.
+    [[nodiscard]] virtual asio::awaitable<error_code> send_continue() { co_return error_code{}; }
+
     virtual bool connected() const = 0;
     virtual void close() = 0;
     virtual Version version() const = 0;

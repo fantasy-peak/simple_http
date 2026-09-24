@@ -75,7 +75,9 @@ inline std::string rebuild_request_head(const ParsedHead& head, std::string_view
 // right after the replayed request head.
 template <typename Transport>
 inline asio::awaitable<bool> run_ws_proxy(std::shared_ptr<Transport> client, const ParsedHead& head,
-                                          std::string initial, WsProxyTarget target) {
+                                          std::string initial, WsProxyTarget target,
+                                          std::chrono::steady_clock::duration idle_timeout =
+                                              std::chrono::seconds(120)) {
     using namespace asio::experimental::awaitable_operators;
 
     auto executor = client->get_executor();
@@ -114,6 +116,14 @@ inline asio::awaitable<bool> run_ws_proxy(std::shared_ptr<Transport> client, con
         }
     }
 
+    // Idle deadline, refreshed by every successful read or write in either
+    // direction. The tunnel has no framing of its own, so without this a peer that
+    // vanishes without a FIN/RST (NAT timeout, power loss, pulled cable) leaves both
+    // directions blocked forever - holding two sockets, the 16 KiB buffers and this
+    // coroutine. A long one-way transfer keeps refreshing it, so only a genuinely
+    // idle tunnel is reaped.
+    auto deadline = std::chrono::steady_clock::now() + idle_timeout;
+
     // Shut both sockets down so a finished direction unblocks the other.
     auto teardown = [client, backend]() {
         client->close();
@@ -128,11 +138,13 @@ inline asio::awaitable<bool> run_ws_proxy(std::shared_ptr<Transport> client, con
         for (;;) {
             auto [rec2, n] = co_await client->async_read_some(std::span<std::byte>{buf});
             if (rec2 || n == 0) break;
+            deadline = std::chrono::steady_clock::now() + idle_timeout;
             // Composed async_write: writes all n bytes or errors, no inner loop.
             auto [wec, w] =
                 co_await asio::async_write(*backend, asio::buffer(buf.data(), n), asio::as_tuple(asio::use_awaitable));
             (void)w;
             if (wec) break;
+            deadline = std::chrono::steady_clock::now() + idle_timeout;
         }
         co_return;
     };
@@ -144,18 +156,38 @@ inline asio::awaitable<bool> run_ws_proxy(std::shared_ptr<Transport> client, con
             auto [rec2, n] = co_await backend->async_read_some(
                 asio::buffer(buf.data(), buf.size()), asio::as_tuple(asio::use_awaitable));
             if (rec2 || n == 0) break;
+            deadline = std::chrono::steady_clock::now() + idle_timeout;
             // Transport::async_write is composed: writes all n bytes or errors.
             auto [wec, w] = co_await client->async_write(std::span<const std::byte>{buf.data(), n});
             (void)w;
             if (wec) break;
+            deadline = std::chrono::steady_clock::now() + idle_timeout;
         }
         co_return;
     };
 
-    // Run both directions concurrently; the first to finish (EOF/error) tears
-    // both sockets down, which unblocks the pending read in the other direction
-    // so it also completes.
-    co_await (client_to_backend() || backend_to_client());
+    // Reaps a tunnel that has seen no traffic in either direction for idle_timeout.
+    auto idle_check = [&]() -> asio::awaitable<void> {
+        if (idle_timeout.count() <= 0) {
+            co_return;  // disabled: do not take part in the race
+        }
+        for (;;) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                SIMPLE_HTTP_ERROR_LOG("ws-proxy tunnel idle for {}s; closing",
+                                      std::chrono::duration_cast<std::chrono::seconds>(idle_timeout).count());
+                co_return;
+            }
+            asio::steady_timer timer{executor};
+            timer.expires_at(deadline);
+            auto [ec] = co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+            if (ec) co_return;  // cancelled: the tunnel already finished
+        }
+    };
+
+    // Run both directions plus the idle check concurrently; the first to finish
+    // (EOF/error/idle) tears both sockets down, which unblocks the pending read in
+    // the other direction so it also completes.
+    co_await (client_to_backend() || backend_to_client() || idle_check());
     teardown();
     co_return true;
 }
