@@ -201,21 +201,32 @@ class WsFrameParser {
 
 // Serializes a server->client frame header (server frames are never masked).
 // Ported from paozhu makeWSHeader, generalized over the payload length.
-inline void ws_append_header(std::string& out, WsOpcode opcode, std::uint64_t len) {
-    out.push_back(static_cast<char>(0x80 | static_cast<std::uint8_t>(opcode)));  // FIN=1 + opcode
+// Serializes a server->client frame header (never masked) into a caller-provided
+// buffer, which must hold at least 10 bytes; returns the header length. Writing
+// the header into a stack buffer lets a frame go out as "header + payload" in one
+// scatter-gather write, with no per-frame buffer to concatenate into.
+inline std::size_t ws_encode_header(char* out, WsOpcode opcode, std::uint64_t len) {
+    std::size_t n = 0;
+    out[n++] = static_cast<char>(0x80 | static_cast<std::uint8_t>(opcode));  // FIN=1 + opcode
 
     if (len <= 125) {
-        out.push_back(static_cast<char>(len));
+        out[n++] = static_cast<char>(len);
     } else if (len <= 0xFFFF) {
-        out.push_back(static_cast<char>(126));
-        out.push_back(static_cast<char>((len >> 8) & 0xFF));
-        out.push_back(static_cast<char>(len & 0xFF));
+        out[n++] = static_cast<char>(126);
+        out[n++] = static_cast<char>((len >> 8) & 0xFF);
+        out[n++] = static_cast<char>(len & 0xFF);
     } else {
-        out.push_back(static_cast<char>(127));
+        out[n++] = static_cast<char>(127);
         for (int i = 7; i >= 0; --i) {
-            out.push_back(static_cast<char>((len >> (8 * i)) & 0xFF));
+            out[n++] = static_cast<char>((len >> (8 * i)) & 0xFF);
         }
     }
+    return n;
+}
+
+inline void ws_append_header(std::string& out, WsOpcode opcode, std::uint64_t len) {
+    char buf[10];
+    out.append(buf, ws_encode_header(buf, opcode, len));
 }
 
 // Builds a complete server->client data frame (header + payload).
@@ -231,6 +242,14 @@ inline std::string ws_encode_text(std::string_view payload) { return ws_encode_f
 inline std::string ws_encode_binary(std::string_view payload) { return ws_encode_frame(WsOpcode::Binary, payload); }
 inline std::string ws_encode_pong(std::string_view payload) { return ws_encode_frame(WsOpcode::Pong, payload); }
 inline std::string ws_encode_ping(std::string_view payload) { return ws_encode_frame(WsOpcode::Ping, payload); }
+
+// The payload of a Close frame: an optional status code as a 2-byte prefix.
+inline std::string ws_close_payload(std::uint16_t code = 1000) {
+    std::string payload;
+    payload.push_back(static_cast<char>((code >> 8) & 0xFF));
+    payload.push_back(static_cast<char>(code & 0xFF));
+    return payload;
+}
 
 // Builds a Close frame; an optional status code is encoded as a 2-byte prefix.
 inline std::string ws_encode_close(std::uint16_t code = 1000) {

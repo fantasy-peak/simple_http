@@ -36,6 +36,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <expected>
 #include <memory>
 #include <span>
@@ -46,6 +47,7 @@
 #include <boost/asio/experimental/concurrent_channel.hpp>
 
 #include "../core/types.h"
+#include "../transport/transport.h"  // ConstByteSpan / kMaxWriteSegments
 #include "ws_frame.h"
 
 namespace simple_http {
@@ -87,11 +89,35 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
     // One queued outbound frame + a channel to deliver its write result.
     using ResultChannel = asio::experimental::concurrent_channel<void(error_code)>;
     struct WriteReq {
-        std::string frame;                     // already-serialized WebSocket frame bytes
+        std::string payload;                   // frame payload: the caller's buffer, moved in
+        char header[10]{};                     // serialized frame header (at most 10 bytes)
+        std::size_t header_len{0};
         std::shared_ptr<ResultChannel> done;   // null for fire-and-forget (auto Pong)
         bool close_after = false;              // stop the pump once this frame is written
     };
-    using WriteQueue = asio::experimental::concurrent_channel<void(error_code, WriteReq)>;
+    // Queued frames live in our own deque: it is destroyed by ~WsBackendImpl and
+    // explicitly cleared on teardown. They are deliberately NOT handed to asio as
+    // a channel payload - asio's channel keeps a payload inside its operation
+    // objects, and when such an operation is abandoned (the channel is closed
+    // while a send is pending, which is exactly what a peer aborting mid-stream
+    // does) that payload is released without running its destructor, so every
+    // heap member it owns (here the frame payload) leaks. The channel below
+    // therefore carries only an error_code, purely as a pump wake-up signal.
+    using WriteQueue = std::deque<WriteReq>;
+    using Notify = asio::experimental::concurrent_channel<void(error_code)>;
+
+    // Builds a queued frame without any concatenation buffer: the header is
+    // serialized into the request itself (10 bytes inline) and the payload's
+    // buffer is moved in. The pump sends the two segments as one write.
+    static WriteReq make_req(WsOpcode opcode, std::string payload, std::shared_ptr<ResultChannel> done,
+                             bool close_after = false) {
+        WriteReq req;
+        req.header_len = ws_encode_header(req.header, opcode, payload.size());
+        req.payload = std::move(payload);
+        req.done = std::move(done);
+        req.close_after = close_after;
+        return req;
+    }
 
   public:
     explicit WsBackendImpl(std::shared_ptr<Transport> transport, std::uint64_t max_payload = 16u * 1024 * 1024,
@@ -102,7 +128,7 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
           m_max_payload(max_payload),
           m_idle_timeout(idle_timeout),
           m_watchdog_timer(std::make_shared<asio::steady_timer>(m_executor)),
-          m_write_q(m_executor, 1024) {
+          m_notify(m_executor, 1) {
         m_deadline = std::chrono::steady_clock::now() + m_idle_timeout;
     }
 
@@ -141,11 +167,11 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
                 case WsOpcode::Close:
                     // Answer with a Close (echoing status if present) and stop.
                     m_open = false;
-                    co_await enqueue_control(ws_encode_close(), /*close_after=*/true);
+                    co_await enqueue_control(WsOpcode::Close, ws_close_payload(), /*close_after=*/true);
                     co_return std::unexpected(make_error_code(asio::error::eof));
 
                 case WsOpcode::Ping:
-                    co_await enqueue_control(ws_encode_pong(frame.payload));
+                    co_await enqueue_control(WsOpcode::Pong, std::move(frame.payload));
                     continue;
 
                 case WsOpcode::Pong:
@@ -193,15 +219,9 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
         if (!m_open) {
             co_return make_error_code(asio::error::not_connected);
         }
-        std::string frame = ws_encode_frame(text ? WsOpcode::Text : WsOpcode::Binary, data);
         auto done = std::make_shared<ResultChannel>(m_executor, 1);
-        WriteReq req{std::move(frame), done, false};
-        auto [send_ec] =
-            co_await m_write_q.async_send(error_code{}, std::move(req), asio::as_tuple(asio::use_awaitable));
-        if (send_ec) {
-            m_open = false;
-            co_return make_error_code(asio::error::not_connected);
-        }
+        m_pending.push_back(make_req(text ? WsOpcode::Text : WsOpcode::Binary, std::move(data), done, false));
+        (void)m_notify.try_send(error_code{});  // wake the pump; coalescing is fine
         auto [ec] = co_await done->async_receive(asio::as_tuple(asio::use_awaitable));
         co_return ec;
     }
@@ -214,15 +234,13 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
         if (m_open) {
             m_open = false;
             auto done = std::make_shared<ResultChannel>(m_executor, 1);
-            WriteReq req{ws_encode_close(), done, /*close_after=*/true};
-            auto [send_ec] =
-                co_await m_write_q.async_send(error_code{}, std::move(req), asio::as_tuple(asio::use_awaitable));
-            if (!send_ec) {
-                // Wait for the pump to actually write the Close frame.
-                co_await done->async_receive(asio::as_tuple(asio::use_awaitable));
-            }
+            m_pending.push_back(make_req(WsOpcode::Close, ws_close_payload(), done, /*close_after=*/true));
+            (void)m_notify.try_send(error_code{});
+            // Wait for the pump to actually write the Close frame.
+            co_await done->async_receive(asio::as_tuple(asio::use_awaitable));
         }
-        m_write_q.close();  // stop the write pump if it is still running
+        m_notify.close();  // stop the write pump if it is still running
+        fail_pending_writes();
         if (m_watchdog_timer) m_watchdog_timer->cancel();  // stop the idle watchdog
         m_transport->close();
         co_return error_code{};
@@ -253,8 +271,22 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
     // the idle timeout.
     void abort() override {
         m_open = false;
-        m_write_q.close();
+        m_notify.close();
+        fail_pending_writes();
         m_watchdog_timer->cancel();
+    }
+
+    // Drops every queued frame and fails its waiter. Runs on the connection
+    // executor; the deque is ours, so this is ordinary destruction - no asio
+    // operation is involved, which is exactly the point.
+    void fail_pending_writes() {
+        while (!m_pending.empty()) {
+            WriteReq req = std::move(m_pending.front());
+            m_pending.pop_front();
+            if (req.done) {
+                (void)req.done->try_send(make_error_code(asio::error::operation_aborted));
+            }
+        }
     }
 
     bool is_open() const override { return m_open; }
@@ -263,11 +295,16 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
     // Single write pump: serializes all async_writes for this connection.
     static asio::awaitable<void> pump(std::shared_ptr<WsBackendImpl> self) {
         for (;;) {
-            auto [qec, req] = co_await self->m_write_q.async_receive(asio::as_tuple(asio::use_awaitable));
-            if (qec) {
-                break;  // queue closed -> connection is going away
+            if (self->m_pending.empty()) {
+                auto [qec] = co_await self->m_notify.async_receive(asio::as_tuple(asio::use_awaitable));
+                if (qec) {
+                    break;  // closed -> connection is going away
+                }
+                continue;  // drain whatever got queued
             }
-            auto wec = co_await self->write_all(req.frame);
+            WriteReq req = std::move(self->m_pending.front());
+            self->m_pending.pop_front();
+            auto wec = co_await self->write_all(req);
             if (wec) {
                 self->m_open = false;
             }
@@ -290,22 +327,23 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
     // Enqueue a control frame (Pong/Close). Fire-and-forget for Pong; the caller
     // is already on the connection executor (read() hopped). If the queue is
     // closed/full the connection is going away, so mark it not-open.
-    asio::awaitable<void> enqueue_control(std::string frame, bool close_after = false) {
-        WriteReq req{std::move(frame), nullptr, close_after};
-        auto [ec] =
-            co_await m_write_q.async_send(error_code{}, std::move(req), asio::as_tuple(asio::use_awaitable));
-        if (ec) {
-            m_open = false;
-        }
+    asio::awaitable<void> enqueue_control(WsOpcode opcode, std::string payload, bool close_after = false) {
+        m_pending.push_back(make_req(opcode, std::move(payload), nullptr, close_after));
+        (void)m_notify.try_send(error_code{});
         co_return;
     }
 
     // Writes all of `frame` to the transport, looping over partial writes.
-    asio::awaitable<error_code> write_all(const std::string& frame) {
+    // Sends one queued frame: the header (serialized into the request) and the
+    // payload (the caller's buffer) as a single scatter-gather write, so no
+    // per-frame concatenation buffer is ever allocated.
+    asio::awaitable<error_code> write_all(const WriteReq& req) {
         touch_deadline();  // outbound bytes: connection is active
-        // Composed async_write: whole buffer or error, no partial-write loop.
-        auto [ec, n] = co_await m_transport->async_write(
-            std::as_bytes(std::span<const char>{frame.data(), frame.size()}));
+        const std::array<ConstByteSpan, 2> bufs{
+            std::as_bytes(std::span<const char>{req.header, req.header_len}),
+            std::as_bytes(std::span<const char>{req.payload.data(), req.payload.size()}),
+        };
+        auto [ec, n] = co_await m_transport->async_write_seq(bufs);
         (void)n;
         co_return ec;
     }
@@ -357,7 +395,8 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
                 // Idle: tear down. Marking closed + closing the transport makes the
                 // pending read/write fail, ending both loops.
                 self->m_open = false;
-                self->m_write_q.close();
+                self->m_notify.close();
+                self->fail_pending_writes();
                 self->m_transport->close();
                 co_return;
             }
@@ -372,7 +411,8 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
     std::chrono::steady_clock::duration m_idle_timeout;
     std::chrono::steady_clock::time_point m_deadline{};
     std::shared_ptr<asio::steady_timer> m_watchdog_timer;  // cancelled on teardown
-    WriteQueue m_write_q;
+    WriteQueue m_pending;  // queued frames: owned by us, cleared on teardown
+    Notify m_notify;       // pump wake-up signal (carries only a trivial error_code)
     bool m_open{true};
 };
 

@@ -5,6 +5,8 @@
 // Templated on the underlying Asio socket so plain TCP and Unix-domain sockets
 // share one implementation. Satisfies the TransportLike concept.
 
+#include <algorithm>
+#include <array>
 #include <cstddef>
 #include <memory>
 #include <span>
@@ -56,6 +58,20 @@ class TcpTransport {
                                                   asio::as_tuple(asio::use_awaitable));
         co_return IoResult{ec, n};
     }
+    // Writes several buffers as one operation (one writev), so a frame header and
+    // its payload need not be concatenated first. Like async_write this is a
+    // composed operation: it completes only once every byte has been written.
+    asio::awaitable<IoResult> async_write_seq(std::span<const ConstByteSpan> buffers) {
+        const std::size_t count = std::min<std::size_t>(buffers.size(), 8);
+        std::array<asio::const_buffer, 8> bufs{};
+        for (std::size_t i = 0; i < count; ++i) {
+            bufs[i] = asio::buffer(buffers[i].data(), buffers[i].size());
+        }
+        auto [ec, n] = co_await asio::async_write(
+            *m_socket, std::span<const asio::const_buffer>{bufs.data(), count}, asio::as_tuple(asio::use_awaitable));
+        co_return IoResult{ec, n};
+    }
+
 
     auto get_executor() { return m_socket->get_executor(); }
 
