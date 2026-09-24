@@ -68,6 +68,21 @@ inline constexpr std::int32_t kH2InitialWindow = 65535;
 // until it announces its own SETTINGS_MAX_FRAME_SIZE.
 inline constexpr std::size_t kH2MaxFrameSize = 16384;
 
+// Outbound backpressure watermarks for one stream's response queue. A producer
+// (the reverse proxy streaming an upstream body, say) is parked once it has this
+// many bytes queued but not yet framed, and released when the write loop has
+// drained the queue back to the low mark.
+//
+// Without this a response body was simply accumulated: the handler ran ahead of
+// the peer's flow-control window at full speed, so a client that stopped reading
+// (window exhausted - congestion, a busy browser main thread, a mid-way RST)
+// left the *entire* response sitting in memory, per stream. Measured with the
+// 19 MiB code-server workbench.js: RSS went 12 MiB -> 30 MiB and stayed there
+// while the client read nothing. The marks bound per-stream memory to roughly
+// the high watermark regardless of response size.
+inline constexpr std::size_t kOutHighWatermark = 1u << 20;   // 1 MiB: park the producer
+inline constexpr std::size_t kOutLowWatermark = 256u << 10;  // 256 KiB: wake it again
+
 // ResponseWriter for a single HTTP/2 stream. Holds a weak_ptr to the engine so
 // it can be used safely from any thread and after the connection has closed.
 template <TransportLike Transport>
@@ -81,7 +96,9 @@ class Http2ResponseWriter : public ResponseWriter {
     asio::awaitable<error_code> send(int status, Headers headers, std::string body) override {
         co_await hop();
         auto eng = m_engine.lock();
-        if (!eng || !eng->alive()) co_return make_error_code(asio::error::not_connected);
+        if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
+            co_return make_error_code(asio::error::not_connected);
+        }
         // A response to HEAD has no body: END_STREAM on the HEADERS frame, and the
         // headers still carry the Content-Length a GET would have produced.
         const bool head = eng->method_is_head(m_stream_id);
@@ -93,7 +110,9 @@ class Http2ResponseWriter : public ResponseWriter {
     asio::awaitable<error_code> send_bodyless(int status, Headers headers) override {
         co_await hop();
         auto eng = m_engine.lock();
-        if (!eng || !eng->alive()) co_return make_error_code(asio::error::not_connected);
+        if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
+            co_return make_error_code(asio::error::not_connected);
+        }
         // Nothing follows the HEADERS frame: END_STREAM ends the stream (RFC 9113 §8.1).
         eng->submit_headers(m_stream_id, status, headers, /*end_stream=*/true);
         co_return error_code{};
@@ -102,7 +121,9 @@ class Http2ResponseWriter : public ResponseWriter {
     asio::awaitable<error_code> send_headers(int status, Headers headers) override {
         co_await hop();
         auto eng = m_engine.lock();
-        if (!eng || !eng->alive()) co_return make_error_code(asio::error::not_connected);
+        if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
+            co_return make_error_code(asio::error::not_connected);
+        }
         eng->submit_headers(m_stream_id, status, headers, /*end_stream=*/eng->method_is_head(m_stream_id));
         eng->flush();
         co_return error_code{};
@@ -111,8 +132,13 @@ class Http2ResponseWriter : public ResponseWriter {
     asio::awaitable<error_code> send_chunk(std::string data) override {
         co_await hop();
         auto eng = m_engine.lock();
-        if (!eng || !eng->alive()) co_return make_error_code(asio::error::not_connected);
+        if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
+            co_return make_error_code(asio::error::not_connected);
+        }
         if (eng->method_is_head(m_stream_id)) co_return error_code{};  // HEAD: no body
+        // Backpressure: block while this stream's queue is over the high mark, so
+        // a fast producer (reverse proxy) is paced by the peer's window.
+        if (auto ec = co_await eng->await_out_space(m_stream_id); ec) co_return ec;
         eng->enqueue_body(m_stream_id, std::move(data), /*last=*/false);
         co_return error_code{};
     }
@@ -120,15 +146,21 @@ class Http2ResponseWriter : public ResponseWriter {
     asio::awaitable<error_code> send_last(std::string data) override {
         co_await hop();
         auto eng = m_engine.lock();
-        if (!eng || !eng->alive()) co_return make_error_code(asio::error::not_connected);
+        if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
+            co_return make_error_code(asio::error::not_connected);
+        }
         if (eng->method_is_head(m_stream_id)) co_return error_code{};  // HEAD: no body
+        if (auto ec = co_await eng->await_out_space(m_stream_id); ec) co_return ec;
         eng->enqueue_body(m_stream_id, std::move(data), /*last=*/true);
         co_return error_code{};
     }
 
     bool connected() const override {
         auto eng = m_engine.lock();
-        return eng && eng->alive();
+        // A reset/finished stream cannot take a response either: report the
+        // response as unwritable so callers (e.g. a proxy's 502 path) stop
+        // rather than trying to write onto a dead stream.
+        return eng && eng->alive() && eng->stream_writable(m_stream_id);
     }
     void close() override {
         if (auto eng = m_engine.lock()) eng->reset_stream(m_stream_id, codec::H2_CANCEL);
@@ -211,6 +243,12 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
     // Serialize a response HEADERS block for `stream_id` into the control-frame
     // output queue. Connection-specific headers illegal in HTTP/2 are dropped.
     void submit_headers(std::uint32_t stream_id, int status, const Headers& headers, bool end_stream) {
+        // Never emit a header block on a stream that is gone (reset by the peer)
+        // or already ended: RFC 9113 §5.1 makes a frame on a closed stream a
+        // connection-level protocol error, so the peer answers with GOAWAY and
+        // every other stream on the connection dies with it. DEFENCE IN DEPTH:
+        // writers check first, this guards any other caller.
+        if (!stream_writable(stream_id)) return;
         std::string block;
         codec::hpack_append_status(block, status);
         for (const auto& [name, value] : headers) {
@@ -241,6 +279,21 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
             first = false;
             off += take;
         } while (off < block.size());
+
+        if (end_stream) {
+            // The HEADERS block itself ends the stream (a response to HEAD, or a
+            // 204/304 via send_bodyless). Record that here: the framing loop only
+            // sets the flag when it emits a terminating DATA frame, so without
+            // this the entry never satisfied maybe_complete_stream() and leaked
+            // for the life of the connection - and the stream kept reporting
+            // itself writable, so a later write would emit frames after
+            // END_STREAM (the same RFC 9113 §5.1 violation as above).
+            auto it = m_streams.find(stream_id);
+            if (it != m_streams.end()) {
+                it->second.end_stream_sent = true;
+                maybe_complete_stream(stream_id);
+            }
+        }
     }
 
     // Enqueue a response body chunk for `stream_id`. `last` marks end-of-body so
@@ -249,11 +302,52 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
     // nudged; actual framing/flow-control happens there.
     void enqueue_body(std::uint32_t stream_id, std::string data, bool last) {
         auto it = m_streams.find(stream_id);
-        if (it == m_streams.end()) return;  // stream already gone (reset/closed)
+        // Stream gone (reset/closed) or already ended: queueing would only be
+        // dropped by the framing loop, so refuse it here as well.
+        if (it == m_streams.end() || it->second.end_stream_sent) return;
         Stream& st = it->second;
-        if (!data.empty()) st.out_queue.push_back(std::move(data));
+        if (!data.empty()) {
+            st.out_queued += data.size();
+            st.out_queue.push_back(std::move(data));
+        }
         if (last) st.out_finished = true;
         flush();
+    }
+
+    // Whether this stream still accepts response frames. False once the peer has
+    // reset it (RST_STREAM -> erased from the table) or we have already emitted
+    // END_STREAM. Writing after either is a connection-level protocol error that
+    // costs the peer's whole connection (RFC 9113 §5.1), and browsers reset
+    // streams constantly while a page loads - cancelled preloads, navigation,
+    // superseded fetches - so this must be checked, not assumed.
+    bool stream_writable(std::uint32_t stream_id) const {
+        auto it = m_streams.find(stream_id);
+        return it != m_streams.end() && !it->second.end_stream_sent;
+    }
+
+    // Parks the calling producer until this stream's outbound queue has drained
+    // below the low watermark, so a handler that outruns the peer's flow-control
+    // window cannot queue an unbounded response body. Returns an error once the
+    // stream is gone (reset, completed, connection closed): the caller stops
+    // rather than waiting forever.
+    //
+    // Callers hop onto the connection executor first, so the check-then-wait
+    // sequence below cannot race the write loop (single-threaded model A).
+    asio::awaitable<error_code> await_out_space(std::uint32_t stream_id) {
+        for (;;) {
+            auto it = m_streams.find(stream_id);
+            if (it == m_streams.end()) co_return make_error_code(asio::error::operation_aborted);
+            if (it->second.out_queued <= kOutHighWatermark) co_return error_code{};
+            if (!it->second.out_space) {
+                it->second.out_space =
+                    std::make_shared<asio::experimental::concurrent_channel<void(error_code)>>(m_executor, 1);
+            }
+            // Keep the channel alive across the wait: the stream entry itself may
+            // be erased (and the channel closed, waking us) while we are parked.
+            auto space = it->second.out_space;
+            auto [ec] = co_await space->async_receive(asio::as_tuple(asio::use_awaitable));
+            if (ec) co_return make_error_code(asio::error::operation_aborted);
+        }
     }
 
     // Abort a stream with the given error code (RST_STREAM).
@@ -277,6 +371,14 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
         std::deque<std::string> out_queue;
         std::size_t out_offset = 0;
         bool out_finished = false;  // handler signalled end-of-body (send/send_last)
+
+        // Bytes queued but not yet framed into DATA frames. Drives the producer
+        // backpressure in await_out_space() (kOutHighWatermark/kOutLowWatermark).
+        std::size_t out_queued = 0;
+        // Wakes a producer parked on backpressure. Created lazily on the first
+        // wait, closed on teardown (stream erased, connection ending) so a parked
+        // producer is always released rather than stranded.
+        std::shared_ptr<asio::experimental::concurrent_channel<void(error_code)>> out_space;
 
         std::uint32_t id = 0;                         // this stream's id (for WINDOW_UPDATE etc.)
         std::int64_t send_window = kH2InitialWindow;  // peer's advertised window for us (send side)
@@ -416,6 +518,11 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
         flush();  // push our initial SETTINGS
         co_await (read_loop() || write_loop() || watchdog());
         m_alive = false;
+        // Release every producer still parked on outbound backpressure: the write
+        // loop is gone, so nothing will ever drain their queues.
+        for (auto& entry : m_streams) {
+            if (entry.second.out_space) entry.second.out_space->close();
+        }
         // Whichever loop finished first cancels the others, and a cancelled
         // async_write drops its buffer - so the GOAWAY the write loop had just taken
         // may never reach the wire, leaving the peer with a bare TCP close and no
@@ -800,6 +907,9 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
         if (it->second.recv_owed_conn > 0) {
             replenish_conn(it->second.recv_owed_conn);
         }
+        // Release a producer parked on backpressure: this stream will never
+        // drain now, so it must not be left waiting on a queue that is gone.
+        if (it->second.out_space) it->second.out_space->close();
         m_streams.erase(it);
     }
 
@@ -936,6 +1046,13 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
                 append_frame(codec::H2FrameType::Data, flags, stream_id, piece);
                 m_conn_send_window -= static_cast<std::int64_t>(take);
                 st.send_window -= static_cast<std::int64_t>(take);
+                st.out_queued -= take;
+                // Release a producer parked on backpressure once the queue is back
+                // under the low mark. A wake-up that arrives too early is harmless:
+                // the producer re-checks the watermark before queueing more.
+                if (st.out_queued <= kOutLowWatermark && st.out_space) {
+                    (void)st.out_space->try_send(error_code{});
+                }
 
                 if (front_done) {
                     st.out_queue.pop_front();
