@@ -223,7 +223,8 @@ class Http2ClientStream final : public ClientStream {
         return m_id;
     }
 
-    void cancel() override {
+    asio::awaitable<void> cancel() override {
+        co_await asio::dispatch(asio::bind_executor(m_session->get_executor(), asio::use_awaitable));
         m_session->stream_cancel(m_id);
     }
 
@@ -246,6 +247,10 @@ class Http2ClientSession final : public ClientSession,
                                  public std::enable_shared_from_this<Http2ClientSession<Transport>> {
   public:
     using Executor = decltype(std::declval<Transport&>().get_executor());
+
+    // The executor this session is pinned to. Streams dispatch onto it before
+    // touching session state, exactly as they do on the HTTP/1.1 side.
+    Executor get_executor() { return m_executor; }
 
     Http2ClientSession(std::shared_ptr<Transport> transport,
                        ClientTarget target,

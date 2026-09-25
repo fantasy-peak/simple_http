@@ -44,6 +44,20 @@ class Headers {
 
     bool contains(std::string_view name) const { return get(name).has_value(); }
 
+    // Removes every field matching `name` (case-insensitively), returning true
+    // if anything was removed. All matches go, not just the first: a duplicate
+    // Content-Length is a request-smuggling vector on the request side and
+    // ambiguous on the response side.
+    bool erase(std::string_view name) {
+        auto it = std::remove_if(m_fields.begin(), m_fields.end(),
+                                 [&](const value_type& f) { return iequals_ascii(f.first, name); });
+        if (it == m_fields.end()) {
+            return false;
+        }
+        m_fields.erase(it, m_fields.end());
+        return true;
+    }
+
     void clear() { m_fields.clear(); }
     bool empty() const { return m_fields.empty(); }
     std::size_t size() const { return m_fields.size(); }

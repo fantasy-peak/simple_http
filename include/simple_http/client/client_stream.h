@@ -21,9 +21,13 @@
 // fails with client_errc::session_busy, while an h2 session happily returns more
 // streams.
 //
-// Every operation is an awaitable and hops onto the session's executor before
-// touching the transport (concurrency model A), so a stream may be used from
-// another thread just like a server-side Response.
+// Every operation that touches the transport or the session - the reads, the
+// writes and cancel() - is an awaitable that hops onto the session's executor
+// first (concurrency model A), so a stream may be driven from another thread
+// just like a server-side Response. The remaining accessors (head(), status(),
+// finished(), id(), version()) are synchronous snapshots of the last value
+// published on that executor: safe to read, but not to call concurrently with an
+// operation on the same stream.
 
 #include <cstdint>
 #include <expected>
@@ -131,8 +135,9 @@ class ClientStream {
     virtual std::uint32_t id() const = 0;
     // Abandons the exchange: RST_STREAM on HTTP/2 (the connection survives),
     // connection close on HTTP/1.x (a half-written request leaves the peer at an
-    // unknown position).
-    virtual void cancel() = 0;
+    // unknown position). Hops like the operations above, because it changes
+    // session state the driving coroutine also touches.
+    [[nodiscard]] virtual asio::awaitable<void> cancel() = 0;
 
   protected:
     // Called by the session once the response head is parsed; `await_head()` must

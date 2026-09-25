@@ -20,8 +20,10 @@
 // to use from any thread.
 
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -37,6 +39,7 @@
 #include "../../core/logging.h"
 #include "../../core/types.h"
 #include "../../core/version.h"
+#include "../../proto/compressing_writer.h"
 #include "../../proto/request.h"
 #include "../../proto/response.h"
 #include "../../proto/response_writer.h"
@@ -85,7 +88,9 @@ class Http1ResponseWriter : public ResponseWriter {
         }
 
         headers.add_lower("content-length", std::to_string(body.size()));
-        std::string out = status_line(status);
+        std::string out;
+        out.reserve(kResponseOverhead + headers_bytes(headers) + body.size());
+        append_status_line(out, status);
         append_headers(out, headers);
         out.append("\r\n");
         if (m_head_request) {  // headers only
@@ -103,7 +108,9 @@ class Http1ResponseWriter : public ResponseWriter {
     asio::awaitable<error_code> send_bodyless(int status, Headers headers) override {
         co_await hop();
         if (!m_open) co_return make_error_code(asio::error::not_connected);
-        std::string out = status_line(status);
+        std::string out;
+        out.reserve(kResponseOverhead + headers_bytes(headers));
+        append_status_line(out, status);
         append_headers(out, headers);
         out.append("\r\n");
         auto ec = co_await write_raw(out);
@@ -132,7 +139,9 @@ class Http1ResponseWriter : public ResponseWriter {
         } else {
             headers.add_lower("transfer-encoding", "chunked");
         }
-        std::string out = status_line(status);
+        std::string out;
+        out.reserve(kResponseOverhead + headers_bytes(headers));
+        append_status_line(out, status);
         append_headers(out, headers);
         out.append("\r\n");
 
@@ -162,8 +171,12 @@ class Http1ResponseWriter : public ResponseWriter {
         co_return ec;
     }
 
-    bool connected() const override { return m_open; }
-    void close() override {
+    asio::awaitable<bool> connected() const override {
+        co_await hop();
+        co_return m_open;
+    }
+    asio::awaitable<void> close() override {
+        co_await hop();
         m_open = false;
         m_transport->close();
     }
@@ -175,12 +188,50 @@ class Http1ResponseWriter : public ResponseWriter {
     bool keep_alive_out() const { return m_keep_alive_out; }
 
   private:
-    std::string status_line(int status) const {
-        return std::format("{} {} {}\r\n",
-                            m_version == Version::Http1 ? "HTTP/1.0" : "HTTP/1.1", 
-                            status,
-                            reason_phrase(status));
+    // Headroom for what every response writes and headers_bytes() does not
+    // count: the status line, the connection line append_headers() may add, and
+    // the blank line closing the head. Sized for the longest of each.
+    static constexpr std::size_t kResponseOverhead = 96;
+
+    // Appends the status line ("HTTP/1.1 200 OK\r\n") straight onto `out`.
+    // Hand-appended rather than std::format: this runs once per response, and
+    // the format-string machinery costs more than the copies it saves.
+    void append_status_line(std::string& out, int status) const {
+        out.append(m_version == Version::Http1 ? "HTTP/1.0 " : "HTTP/1.1 ");
+        append_int(out, status);
+        out.push_back(' ');
+        out.append(reason_phrase(status));
+        out.append("\r\n");
     }
+
+    // Appends a non-negative integer without allocating.
+    static void append_int(std::string& out, int value) {
+        char buf[std::numeric_limits<int>::digits10 + 2];
+        auto [end, ec] = std::to_chars(buf, buf + sizeof(buf), value);
+        out.append(buf, static_cast<std::size_t>(end - buf));
+    }
+
+    // Appends a size as lowercase hex (chunked framing).
+    static void append_hex(std::string& out, std::size_t value) {
+        char buf[2 * sizeof(std::size_t)];
+        auto [end, ec] = std::to_chars(buf, buf + sizeof(buf), value, 16);
+        out.append(buf, static_cast<std::size_t>(end - buf));
+    }
+
+    // Wire size of the fields as append_headers() writes them, so a response
+    // buffer can be sized once instead of growing and recopying.
+    static std::size_t headers_bytes(const Headers& headers) {
+        std::size_t total = 0;
+        for (const auto& [name, value] : headers) {
+            total += name.size() + value.size() + 4;  // ": " + CRLF
+        }
+        return total;
+    }
+
+    // The connection field holds one of exactly two values, so the whole line
+    // is a compile-time constant rather than three appends per response.
+    static constexpr std::string_view kKeepAliveConnection = "connection: keep-alive\r\n";
+    static constexpr std::string_view kCloseConnection = "connection: close\r\n";
 
     void append_headers(std::string& out, const Headers& headers) const {
         bool saw_connection = false;
@@ -192,17 +243,14 @@ class Http1ResponseWriter : public ResponseWriter {
             out.append("\r\n");
         }
         if (!saw_connection) {
-            out.append("connection: ");
-            out.append(m_keep_alive_out ? "keep-alive" : "close");
-            out.append("\r\n");
+            out.append(m_keep_alive_out ? kKeepAliveConnection : kCloseConnection);
         }
     }
 
     static std::string encode_chunk(const std::string& data) {
         std::string out;
-        char size_buf[2 * sizeof(std::size_t) + 1];
-        int n = std::snprintf(size_buf, sizeof(size_buf), "%zx", data.size());
-        out.append(size_buf, static_cast<std::size_t>(n));
+        out.reserve(2 * sizeof(std::size_t) + 4 + data.size());  // hex size, CRLF, CRLF
+        append_hex(out, data.size());
         out.append("\r\n");
         out.append(data);
         out.append("\r\n");
@@ -222,7 +270,7 @@ class Http1ResponseWriter : public ResponseWriter {
         co_return ec;
     }
 
-    asio::awaitable<void> hop() {
+    asio::awaitable<void> hop() const {
         co_await asio::dispatch(asio::bind_executor(m_executor, asio::use_awaitable));
     }
 
@@ -327,7 +375,7 @@ class Http1Engine {
             // layer. On success serve_loop returns (the transport is no longer
             // owned by this engine).
             if (is_websocket_upgrade(head)) {
-                std::string ws_path = request_path(head.target);
+                std::string_view ws_path = request_path(head.target);
 
                 // 1) Byte-level proxy pass-through takes precedence.
                 if (m_ws_proxy_lookup) {
@@ -405,8 +453,15 @@ class Http1Engine {
             auto writer = std::make_shared<Http1ResponseWriter<Transport>>(m_transport, version, m_deadline,
                                                                            m_limits.idle_timeout);
             writer->set_keep_alive(keep_alive);
-            writer->set_head_request(head.method == Method::Head);
-            auto response = std::make_shared<Response>(writer);
+            const bool head_request = head.method == Method::Head;
+            writer->set_head_request(head_request);
+            // Compression wraps the writer, not the Response, so that every
+            // handler - the reverse proxy included - passes through it without
+            // knowing. maybe_compress_writer returns `writer` unchanged when
+            // compression is off or the client accepts none of what we produce.
+            auto response = std::make_shared<Response>(
+                maybe_compress_writer(writer, m_transport->get_executor(), m_limits.compression,
+                                      request->header("accept-encoding").value_or(std::string_view{}), head_request));
 
             // Run the handler to completion (h1 is half-duplex: the reader and the
             // response writer are the same coroutine, no concurrent read/write).
@@ -419,7 +474,8 @@ class Http1Engine {
             // connection.
             bool drained = co_await drain_body();
 
-            if (handler_failed || !keep_alive || !writer->connected() || !drained) {
+            const bool still_open = co_await writer->connected();
+            if (handler_failed || !keep_alive || !still_open || !drained) {
                 break;
             }
         }
@@ -688,16 +744,18 @@ class Http1Engine {
     // upgraded (the caller must not close it), false if no route matched.
     // Strips the query string from a request target, yielding the path used for
     // route/proxy lookup.
-    static std::string request_path(std::string_view target) {
-        std::string path{target};
-        if (auto q = path.find('?'); q != std::string::npos) {
-            path.resize(q);
+    // The path part of a request target, query string stripped. A view into
+    // `target` — every caller only reads it, so building a string here would be
+    // a copy per request.
+    static std::string_view request_path(std::string_view target) {
+        if (auto q = target.find('?'); q != std::string_view::npos) {
+            return target.substr(0, q);
         }
-        return path;
+        return target;
     }
 
     asio::awaitable<bool> try_websocket_upgrade(const ParsedHead& head) {
-        std::string path = request_path(head.target);
+        std::string_view path = request_path(head.target);
         auto handler = m_ws_lookup(path);
         if (!handler) {
             co_return false;
@@ -706,13 +764,11 @@ class Http1Engine {
         // Build and send the 101 Switching Protocols handshake response.
         auto key = head.headers.get("sec-websocket-key");
         std::string accept = ws_accept_key(*key);
-        std::string resp = std::format(
-            "HTTP/1.1 101 Switching Protocols\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            "Sec-WebSocket-Accept: {}\r\n\r\n",
-            accept
-        );
+        std::string resp;
+        resp.reserve(kWsHandshakeHead.size() + accept.size() + 4);
+        resp.append(kWsHandshakeHead);
+        resp.append(accept);
+        resp.append("\r\n\r\n");
         if (auto ec = co_await write_all(resp); ec) {
             co_return false;  // could not send handshake; connection is unusable
         }
@@ -790,12 +846,8 @@ class Http1Engine {
             if (!r->eof) body.append(r->data);
         }
 
-        // 101 Switching Protocols handshake response.
-        std::string resp;
-        resp.append("HTTP/1.1 101 Switching Protocols\r\n");
-        resp.append("Connection: Upgrade\r\n");
-        resp.append("Upgrade: h2c\r\n\r\n");
-        if (auto ec = co_await write_all(resp); ec) {
+        // 101 Switching Protocols handshake response — entirely constant.
+        if (auto ec = co_await write_all(kH2cUpgradeResponse); ec) {
             m_transport->close();
             co_return;
         }
@@ -810,7 +862,21 @@ class Http1Engine {
     }
 
     // Writes all of `out` to the transport (partial-write loop).
-    asio::awaitable<error_code> write_all(const std::string& out) {
+    // Both 101 handshakes are fixed except for the WebSocket accept value, so
+    // their constant parts live here instead of being reassembled per upgrade.
+    static constexpr std::string_view kWsHandshakeHead =
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Accept: ";
+    static constexpr std::string_view kH2cUpgradeResponse =
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Connection: Upgrade\r\n"
+        "Upgrade: h2c\r\n\r\n";
+
+    // Writes all of `out` to the transport. `out` must outlive the await, so
+    // callers pass either a local buffer or a string constant.
+    asio::awaitable<error_code> write_all(std::string_view out) {
         // Composed async_write: whole buffer or error, no partial-write loop.
         auto [ec, n] = co_await m_transport->async_write(
             std::as_bytes(std::span<const char>{out.data(), out.size()}));

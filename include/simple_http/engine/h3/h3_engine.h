@@ -40,9 +40,15 @@ class Http3ResponseWriter : public ResponseWriter {
     asio::awaitable<error_code> send_headers(int, Headers) override { co_return not_implemented(); }
     asio::awaitable<error_code> send_chunk(std::string) override { co_return not_implemented(); }
     asio::awaitable<error_code> send_last(std::string) override { co_return not_implemented(); }
-    bool connected() const override { return false; }
-    void close() override {
-        if (m_transport) m_transport->close();
+    // The interface hops before touching connection state; this skeleton has no
+    // executor of its own yet, so there is nothing to hop to. A real QUIC
+    // implementation will need the same hop the h1/h2 writers do.
+    asio::awaitable<bool> connected() const override { co_return false; }
+    asio::awaitable<void> close() override {
+        if (m_transport) {
+            m_transport->close();
+        }
+        co_return;
     }
     Version version() const override { return Version::Http3; }
 

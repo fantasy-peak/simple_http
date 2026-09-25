@@ -180,6 +180,17 @@ struct ClientConfig {
     bool tcp_nodelay{true};
     bool tcp_keepalive{false};
 
+    // Automatic response decompression. When on, the client advertises the
+    // encodings below and decodes whatever comes back, so a caller always sees
+    // the original bytes. Off by default: it changes what goes out on the wire,
+    // so it is opt-in. Requires SIMPLE_HTTP_ENABLE_COMPRESSION for the codecs -
+    // without it this is a no-op and no Accept-Encoding is sent.
+    bool auto_decompress{false};
+    // Encodings advertised when auto_decompress is on, most preferred first.
+    // Only the ones this build can actually decode are sent; a caller that sets
+    // accept-encoding itself keeps full control (nothing is injected).
+    std::vector<std::string> accept_encodings{"br", "gzip"};
+
     // Optional name-resolution override: return the endpoints to try, in order.
     // Lets an application plug in its own DNS (cache, DoH, …) instead of the
     // built-in asio resolver. Empty = asio::ip::tcp::resolver.
@@ -200,6 +211,7 @@ enum class client_errc : int {
     version_not_negotiated,  // the required HTTP version was not available
     header_too_large,        // head exceeded EngineLimits::max_header_bytes
     body_too_large,          // body exceeded the caller's cap
+    body_decode_failed,      // the body was compressed but did not decode
     session_busy,            // HTTP/1.1 session already has an exchange in flight
     session_closed,          // the session/connection is gone
     body_not_streaming,      // write() on a request whose body was sent up front

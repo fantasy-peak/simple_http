@@ -293,12 +293,11 @@ class FakeResponseWriter : public ResponseWriter {
         co_return error_code{};
     }
 
-    bool connected() const override {
-        return open;
-    }
+    asio::awaitable<bool> connected() const override { co_return open; }
 
-    void close() override {
+    asio::awaitable<void> close() override {
         open = false;
+        co_return;
     }
 
     Version version() const override {

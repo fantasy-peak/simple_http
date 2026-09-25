@@ -56,6 +56,7 @@
 #include "client_config.h"
 #include "client_pool.h"
 #include "client_stream.h"
+#include "decompressing_stream.h"
 #include "h1_client.h"
 #include "h2_client.h"
 #include "tls_client.h"
@@ -316,7 +317,7 @@ class HttpClient {
                 co_return std::move(*response);
 
             const error_code ec = response.error();
-            stream->cancel();  // h2: reset the stream, keeping the connection; h1: close it
+            (void)co_await stream->cancel();  // h2: reset the stream, keeping the connection; h1: close it
 
             // A pooled connection that died before answering may be replayed: it
             // was idle, so the request never reached anyone. A streamed body has
@@ -369,6 +370,16 @@ class HttpClient {
         if (spec.target.empty())
             spec.target = url_target.empty() ? "/" : url_target;
 
+        // Every public entry point funnels through here, so this is the one
+        // place that has to advertise what we can decode. A caller that set
+        // accept-encoding itself keeps full control of the negotiation.
+        if (m_config.auto_decompress && !spec.headers.contains("accept-encoding")) {
+            std::string wanted = accept_encoding_value(m_config.accept_encodings);
+            if (!wanted.empty()) {
+                spec.headers.add("accept-encoding", std::move(wanted));
+            }
+        }
+
         for (int attempt = 0; attempt < 2; ++attempt) {
             const bool allow_pool = !fresh_only && attempt == 0;
             auto acquired = co_await acquire(target, co_await asio::this_coro::executor, allow_pool);
@@ -377,7 +388,8 @@ class HttpClient {
 
             auto usable = co_await negotiate_and_open(acquired->session, target, spec);
             if (usable)
-                co_return OpenedStream{*usable, acquired->pooled};
+                co_return OpenedStream{maybe_decompressing_stream(*usable, m_config.auto_decompress),
+                                       acquired->pooled};
 
             // A pooled connection that had gone away fails as a transport error
             // on the first write or read; that is worth one try on a fresh
@@ -411,7 +423,7 @@ class HttpClient {
                     co_return std::unexpected{stream.error()};
                 // A pinned HTTP/2 policy is not satisfied by an ignored upgrade.
                 if (target.version == HttpVersionPolicy::Http2 && (*stream)->version() != Version::Http2) {
-                    (*stream)->cancel();
+                    (void)co_await (*stream)->cancel();
                     co_return std::unexpected{make_error_code(client_errc::version_not_negotiated)};
                 }
                 co_return *stream;

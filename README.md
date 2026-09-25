@@ -228,6 +228,77 @@ target("server")
 | `SIMPLE_HTTP_EXPERIMENT_WEBSOCKET` | Enables experimental WebSocket support. |
 | `SIMPLE_HTTP_USE_BOOST_REGEX` | Uses `boost::regex` instead of `std::regex` for better performance. |
 | `SIMPLE_HTTP_BIND_UNIX_SOCKET` | Enables support for binding to UNIX Domain Sockets (UDS). |
+| `SIMPLE_HTTP_ENABLE_COMPRESSION` | Compiles in gzip/brotli response-body compression. Needs zlib and brotli; see [Response Compression](#-response-compression). |
+
+---
+
+## 🗜 Response Compression
+
+A server can gzip or brotli response bodies for clients that ask for it. It is
+**off by default** and gets enabled twice: at build time, because the codecs sit
+behind a macro so a build that does not want compression needs neither the
+dependency nor the symbols; and at run time, through the server config.
+
+**Build** — define `SIMPLE_HTTP_ENABLE_COMPRESSION` and link zlib + brotli:
+
+```lua
+-- xmake
+add_requires("zlib", "brotli")
+target("app")
+    add_packages("zlib", "brotli")
+    add_defines("SIMPLE_HTTP_ENABLE_COMPRESSION")
+```
+
+```cmake
+# CMake
+set(SIMPLE_HTTP_WITH_COMPRESSION ON)  # before add_subdirectory / find_package
+```
+
+**Run** — turn it on in the config:
+
+```cpp
+sh::ServerConfig cfg;
+cfg.limits.compression.enabled = true;
+cfg.limits.compression.min_bytes = 1024;  // below this, compression is not worth it
+sh::Server server{cfg};
+```
+
+Handlers need no changes. Everything written through `Response` — the reverse
+proxy included — is compressed when the request's `Accept-Encoding` allows it,
+with brotli preferred over gzip.
+
+What it deliberately leaves alone:
+
+| Skipped | Why |
+| :--- | :--- |
+| Responses already carrying `Content-Encoding` | Double-encoding. This is also what lets a pre-compressed upstream pass through untouched. |
+| `206` / `Content-Range` | A byte range has to stay addressable. |
+| `204`, `304`, HEAD | No body. |
+| `Cache-Control: no-transform` | RFC 9110 §7.7 forbids rewriting the representation. |
+| Already entropy-coded types (`image/*` except `image/svg+xml`, `video/*`, `audio/*`, `font/*`) | Costs CPU and can make the body larger. |
+| Bodies under `min_bytes` | Same reason. Streamed responses are exempt — their length is not known in advance — so set `compress_streamed = false` to leave those alone too. |
+
+A `Vary: Accept-Encoding` is added and merged with any existing `Vary`, so caches
+key on it, and a strong `ETag` is demoted to weak, because the compressed body is
+a different representation. Both behaviours are configurable.
+
+**Client** — the other direction, also opt-in:
+
+```cpp
+sh::ClientConfig cfg;
+cfg.auto_decompress = true;  // advertise br, gzip and decode what comes back
+sh::HttpClient http{cfg};
+auto r = co_await http.get(url);
+// r->body is the original bytes; content-encoding and content-length are gone
+```
+
+The client takes `Accept-Encoding` from `cfg.accept_encodings`, filtered to what
+the build can actually decode, unless the request sets that header itself (then it
+is left alone). Decoding happens at the stream level, so `ClientStream::read()`
+hands out decoded bytes too — and the size caps in `read_all()` and the
+convenience layer apply to the *decoded* size, which means a compression bomb
+cannot slip past them by being small on the wire. A body that fails to decode
+comes back as `client_errc::body_decode_failed` rather than as half a body.
 
 ---
 

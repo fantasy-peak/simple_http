@@ -75,8 +75,9 @@ class Response {
     }
 
     // --- connection state ---
-    bool connected() const { return m_writer->connected(); }
-    void close() { m_writer->close(); }
+    // Both hop onto the connection executor inside the writer, like the writes.
+    [[nodiscard]] asio::awaitable<bool> connected() const { return m_writer->connected(); }
+    [[nodiscard]] asio::awaitable<void> close() { return m_writer->close(); }
     Version version() const { return m_writer->version(); }
 
     ResponseWriter& writer() { return *m_writer; }

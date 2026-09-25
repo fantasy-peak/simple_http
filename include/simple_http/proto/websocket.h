@@ -16,10 +16,14 @@
 // async_write). No boost::beast::websocket::stream.
 //
 // Concurrency (model A): a connection is pinned to one single-threaded
-// io_context. Every public operation (read/write/close) first hops onto that
-// connection's executor before touching connection state (m_open, the parser,
-// the transport), so the handle is safe to use from any coroutine or thread —
-// matching the guarantee the HTTP/2 ResponseWriter already gives. In addition,
+// io_context. Every public operation that touches connection state
+// (read/write/close) first hops onto that connection's executor before doing so,
+// which is what makes the handle safe to use from any coroutine or thread —
+// matching the guarantee the HTTP/2 ResponseWriter gives. Two exceptions:
+// is_open() is a synchronous snapshot of a flag (atomic, so reading it from
+// anywhere is race-free, though it can be a moment stale), and the destructor,
+// which cannot hop but posts instead - so the handle may be destroyed from any
+// thread and the teardown simply lands on the executor a moment later. In addition,
 // all writes are serialized through an internal write pump: write_* enqueue a
 // frame and await their own completion while a single pump coroutine
 // (run_writer, started by the engine) performs the async_writes one at a time.
@@ -33,6 +37,7 @@
 // read reports end-of-stream.
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -289,7 +294,23 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
     // Cancelling the watchdog timer wakes its coroutine immediately; it then sees
     // the closed state (or a failed weak_ptr lock) and exits without waiting out
     // the idle timeout.
+    // Callable from any thread. dispatch() gets both cases right: on the
+    // connection's executor the teardown runs inline, so destroying a handle
+    // there behaves exactly as it always did; from anywhere else it is queued
+    // onto that executor - and crucially never run in place, since everything it
+    // touches is state the executor also owns.
+    //
+    // Holding `self` across the dispatch is deliberate: it keeps the backend (and
+    // the transport under it) alive until the teardown runs, which is what lets a
+    // detached write pump finish and release its own reference.
     void abort() override {
+        auto self = this->shared_from_this();
+        asio::dispatch(m_executor, [self]() { self->do_abort(); });
+    }
+
+    // The executor-confined half of abort(): assumes it is already running on the
+    // connection's executor.
+    void do_abort() {
         m_open = false;
         m_notify.close();
         fail_pending_writes();
@@ -433,7 +454,9 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
     std::shared_ptr<asio::steady_timer> m_watchdog_timer;  // cancelled on teardown
     WriteQueue m_pending;  // queued frames: owned by us, cleared on teardown
     Notify m_notify;       // pump wake-up signal (carries only a trivial error_code)
-    bool m_open{true};
+    // Atomic so is_open() can be read from any thread without racing the
+    // executor's writes. Everything else in this class is executor-confined.
+    std::atomic<bool> m_open{true};
 };
 
 // User-facing WebSocket handle. Forwards to the type-erased backend.
@@ -443,6 +466,12 @@ class WebSocket {
 
     // Dropping the handle without awaiting close() must still stop the detached
     // write pump, otherwise it would keep the backend alive forever.
+    //
+    // Safe from any thread: abort() runs inline when it is already on the
+    // connection's executor and posts itself there otherwise, so a shared_ptr
+    // that happens to die on some unrelated thread no longer races the
+    // connection. The teardown then lands a moment later, which costs nothing -
+    // it is a non-blocking stop, not a synchronisation point.
     ~WebSocket() { m_backend->abort(); }
 
     // Reads one complete message (with its text/binary type). std::unexpected(ec)
@@ -460,6 +489,9 @@ class WebSocket {
     // Graceful close: sends a Close frame, then tears the connection down.
     asio::awaitable<error_code> close() { return m_backend->close(); }
 
+    // A snapshot, not a hopped operation: race-free to call from anywhere, but it
+    // can report the state as of a moment ago. Use read()/write() to act on the
+    // connection - those hop and so see the current state.
     bool is_open() const { return m_backend->is_open(); }
 
     // Runs the serializing write pump (started by the engine on the connection

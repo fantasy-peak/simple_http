@@ -112,7 +112,7 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req,
                                             HttpProxyTarget target,
                                             HttpClient& client) {
     auto fail_502 = [&res]() -> asio::awaitable<void> {
-        if (res->connected()) {
+        if (co_await res->connected()) {
             (void)co_await res->status(502).content_type("text/plain").send("Bad Gateway");
         }
         co_return;
@@ -253,7 +253,7 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req,
             if (!body_sent) {
                 // The request is half-sent: it cannot be replayed, and the
                 // frontend has not seen a response yet.
-                stream->cancel();
+                (void)co_await stream->cancel();
                 co_await fail_502();
                 co_return;
             }
@@ -267,14 +267,14 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req,
                                       target.host,
                                       target.port,
                                       head.error().message());
-                stream->cancel();
+                (void)co_await stream->cancel();
                 continue;
             }
             SIMPLE_HTTP_ERROR_LOG("http-proxy: no response head from {}:{} ({})",
                                   target.host,
                                   target.port,
                                   head.error().message());
-            stream->cancel();
+            (void)co_await stream->cancel();
             co_await fail_502();
             co_return;
         }
@@ -297,7 +297,7 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req,
             co_return;
         }
         if (auto ec = co_await res->begin(); ec) {
-            stream->cancel();  // the frontend went away; stop paying for the upstream
+            (void)co_await stream->cancel();  // the frontend went away; stop paying for the upstream
             co_return;
         }
 
@@ -311,12 +311,12 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req,
                                       target.host,
                                       target.port,
                                       chunk.error().message());
-                res->close();
+                (void)co_await res->close();
                 co_return;
             }
             if (chunk->eof) break;
             if (auto ec = co_await res->write(std::move(chunk->data)); ec) {
-                stream->cancel();
+                (void)co_await stream->cancel();
                 co_return;
             }
         }

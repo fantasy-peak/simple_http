@@ -14,6 +14,10 @@ set_policy("package.librarydeps.strict_compatibility", true)
 add_requires("boost", {configs = {asio=true, regex=true}})
 add_requires("openssl3")
 add_requires("catch2")  -- unit tests only (target `unittest`)
+-- Response-body compression (core/content_encoding.h). Only the targets that
+-- define SIMPLE_HTTP_ENABLE_COMPRESSION link these; the library itself stays
+-- dependency-free for downstream consumers that do not want compression.
+add_requires("zlib", "brotli")
 
 add_defines("SIMPLE_HTTP_EXPERIMENT_WEBSOCKET", "SIMPLE_HTTP_USE_BOOST_REGEX")
 
@@ -62,6 +66,8 @@ target("client")
     end)
     add_deps("simple_http")
     add_files("test/client.cpp")
+    add_packages("zlib", "brotli")
+    add_defines("SIMPLE_HTTP_ENABLE_COMPRESSION")
     set_rundir(".")
 target_end()
 
@@ -78,7 +84,8 @@ target("unittest")
     end)
     add_deps("simple_http")
     add_files("test/unit/*.cpp")
-    add_packages("catch2")
+    add_packages("catch2", "zlib", "brotli")
+    add_defines("SIMPLE_HTTP_ENABLE_COMPRESSION")
     set_rundir(".")
 target_end()
 

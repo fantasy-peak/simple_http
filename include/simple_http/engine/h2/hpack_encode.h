@@ -7,6 +7,7 @@
 // set_http2_* builders. Depends only on the standard library and the Huffman
 // codec (hpack_huffman.h).
 
+#include <charconv>
 #include <map>
 #include <string>
 
@@ -465,6 +466,20 @@ inline bool make_http2_headers_item2(std::string &hh_data, unsigned char hh_code
     hh_data.append((char *)&en_value[0], en_value.size());
     return true;
 }
+// Huffman-encodes `num` in decimal and appends it length-prefixed to `out`.
+// The integer is formatted into a stack buffer rather than through
+// std::to_string, which would heap-allocate on every encoded header. The length
+// prefix always carries the Huffman flag (0x80), as every value here is encoded.
+inline void hpack_append_huffman_int(std::string &out, unsigned long long num)
+{
+    char buf[24];
+    auto [end, ec] = std::to_chars(buf, buf + sizeof(buf), num);
+    std::string en_value;
+    http_huffman_encode(reinterpret_cast<unsigned char *>(buf), static_cast<unsigned int>(end - buf), en_value);
+    out.push_back((unsigned char)en_value.size() | 0x80);
+    out.append(en_value.data(), en_value.size());
+}
+
 inline bool make_http2_headers_item2(std::string &hh_data, unsigned char hh_code, unsigned long long num)
 {
     if (hh_code > 63)
@@ -476,11 +491,7 @@ inline bool make_http2_headers_item2(std::string &hh_data, unsigned char hh_code
     {
         hh_data.push_back(hh_code | 0x40);
     }
-    std::string value, en_value;
-    value = std::to_string(num);
-    http_huffman_encode((unsigned char *)&value[0], value.size(), en_value);
-    hh_data.push_back((unsigned char)en_value.size() | 0x80);
-    hh_data.append((char *)&en_value[0], en_value.size());
+    hpack_append_huffman_int(hh_data, num);
     return true;
 }
 inline bool make_http2_headers_item3(std::string &hh_data, const std::string &key, const std::string &value)
@@ -581,11 +592,7 @@ inline bool make_http2_headers_item3(std::string &hh_data, unsigned char hh_code
     {
         hh_data.push_back(hh_code | 0x00);
     }
-    std::string value, en_value;
-    value = std::to_string(num);
-    http_huffman_encode((unsigned char *)&value[0], value.size(), en_value);
-    hh_data.push_back((unsigned char)en_value.size() | 0x80);
-    hh_data.append((char *)&en_value[0], en_value.size());
+    hpack_append_huffman_int(hh_data, num);
     return true;
 }
 inline bool make_http2_headers_item4(std::string &hh_data, unsigned char hh_code, const std::string &value)
@@ -635,11 +642,7 @@ inline bool make_http2_headers_item4(std::string &hh_data, unsigned char hh_code
     {
         hh_data.push_back(hh_code | 0x10);
     }
-    std::string value, en_value;
-    value = std::to_string(num);
-    http_huffman_encode((unsigned char *)&value[0], value.size(), en_value);
-    hh_data.push_back((unsigned char)en_value.size() | 0x80);
-    hh_data.append((char *)&en_value[0], en_value.size());
+    hpack_append_huffman_int(hh_data, num);
     return true;
 }
 inline bool make_http2_headers_item4(std::string &hh_data, const std::string &key, const std::string &value)

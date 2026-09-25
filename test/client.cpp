@@ -154,7 +154,7 @@ FakeServer& make_fake(asio::io_context& ctx, std::string response, bool close_af
 
 sh::ServerConfig server_config(std::uint16_t port, std::optional<sh::TlsConfig> tls) {
     sh::ServerConfig cfg;
-    cfg.listen = {sh::Listen{"127.0.0.1", port, false}};
+    cfg.listen = sh::Listen{"127.0.0.1", port, false};
     cfg.worker_threads = 2;
     cfg.tls = std::move(tls);
     cfg.limits.idle_timeout = std::chrono::seconds(30);
@@ -696,7 +696,7 @@ asio::awaitable<void> suite_h2_multiplex(std::uint16_t plain) {
     if (st) {
         auto head = co_await (*st)->read_head();
         (void)head;
-        (*st)->cancel();
+        (void)co_await (*st)->cancel();
     }
     sh::RequestSpec again_spec;
     again_spec.target = "/world";
@@ -865,11 +865,205 @@ asio::awaitable<void> suite_raw_peer(asio::io_context& ctx) {
     co_return;
 }
 
+// Rebuilds what the /big?n=N route produces, so a decoded body can be compared
+// exactly rather than by size.
+std::string big_expected(std::size_t n) {
+    std::string body(n, 'x');
+    for (std::size_t i = 0; i < n; i += 4096) {
+        body[i] = 'a';
+    }
+    return body;
+}
+
+// Response compression, against a listener that has it enabled. The other
+// suites compare response bodies byte-for-byte, so they must keep running
+// against servers that do not compress. The client never asks for compression
+// or decodes it on its own, so this suite supplies Accept-Encoding and decodes
+// whatever comes back.
+asio::awaitable<void> suite_compression(std::uint16_t comp_port, std::uint16_t plain_port) {
+    std::printf("\n== response compression ==\n");
+
+    struct Mode {
+        const char* label;
+        sh::HttpVersionPolicy policy;
+        sh::H2cMode h2c;
+    };
+    const Mode modes[] = {
+        {"HTTP/1.1", sh::HttpVersionPolicy::Http11, sh::H2cMode::Off},
+        {"h2c", sh::HttpVersionPolicy::Http2, sh::H2cMode::PriorKnowledge},
+    };
+
+    const std::string want = big_expected(8192);
+
+    for (const Mode& mode : modes) {
+        auto cfg = base_config();
+        cfg.default_version = mode.policy;
+        cfg.default_h2c = mode.h2c;
+        sh::HttpClient http{cfg};
+        const std::string tag{mode.label};
+
+        // Both accepted: brotli is preferred.
+        {
+            sh::RequestSpec spec;
+            spec.headers.add("accept-encoding", "br, gzip");
+            auto r = co_await http.request(url(comp_port, "/big?n=8192"), spec);
+            const std::string enc = r ? std::string{r->header("content-encoding").value_or("")} : std::string{};
+            check(r && r->status == 200 && enc == "br" && r->body.size() < want.size() &&
+                      sh::decompress_all(enc, r->body) == want,
+                  tag + ": /big with 'br, gzip' -> " +
+                      (r ? enc + " " + std::to_string(r->body.size()) + "B of " + std::to_string(want.size()) + "B"
+                         : describe(r.error())));
+        }
+
+        // Only gzip accepted.
+        {
+            sh::RequestSpec spec;
+            spec.headers.add("accept-encoding", "gzip");
+            auto r = co_await http.request(url(comp_port, "/big?n=8192"), spec);
+            const std::string enc = r ? std::string{r->header("content-encoding").value_or("")} : std::string{};
+            check(r && enc == "gzip" && sh::decompress_all(enc, r->body) == want,
+                  tag + ": /big with 'gzip' -> " + (r ? enc : describe(r.error())));
+        }
+
+        // A client that did not ask must get the bytes unchanged.
+        {
+            auto r = co_await http.get(url(comp_port, "/big?n=8192"));
+            check(r && !r->header("content-encoding").has_value() && r->body == want,
+                  tag + ": /big without accept-encoding is untouched");
+        }
+
+        // identity explicitly requested.
+        {
+            sh::RequestSpec spec;
+            spec.headers.add("accept-encoding", "identity");
+            auto r = co_await http.request(url(comp_port, "/big?n=8192"), spec);
+            check(r && !r->header("content-encoding").has_value() && r->body == want,
+                  tag + ": /big with 'identity' is untouched");
+        }
+
+        // Under min_bytes.
+        {
+            sh::RequestSpec spec;
+            spec.headers.add("accept-encoding", "br, gzip");
+            auto r = co_await http.request(url(comp_port, "/world"), spec);
+            check(r && r->status == 200 && !r->header("content-encoding").has_value(),
+                  tag + ": a short response stays uncompressed");
+        }
+
+        // 204 has no body to compress.
+        {
+            auto r = co_await http.get(url(comp_port, "/empty"));
+            check(r && r->status == 204 && !r->header("content-encoding").has_value(),
+                  tag + ": 204 stays uncompressed");
+        }
+
+        // Streamed: the length is unknown up front, so min_bytes cannot apply and
+        // it is compressed anyway (compress_streamed defaults on). It must decode
+        // back exactly, and must not claim a length.
+        {
+            sh::RequestSpec spec;
+            spec.headers.add("accept-encoding", "gzip");
+            auto r = co_await http.request(url(comp_port, "/stream"), spec);
+            const std::string enc = r ? std::string{r->header("content-encoding").value_or("")} : std::string{};
+            check(r && enc == "gzip" && sh::decompress_all(enc, r->body) == "alpha-beta-gamma",
+                  tag + ": a streamed response round-trips -> " + (r ? enc : describe(r.error())));
+            check(r && !r->header("content-length").has_value(),
+                  tag + ": a streamed response states no Content-Length");
+        }
+
+        // HEAD carries no body, so nothing is encoded.
+        {
+            sh::RequestSpec spec;
+            spec.method = sh::Method::Head;
+            spec.headers.add("accept-encoding", "br, gzip");
+            auto r = co_await http.request(url(comp_port, "/big?n=8192"), spec);
+            check(r && r->status == 200 && r->bodyless && !r->header("content-encoding").has_value(),
+                  tag + ": HEAD is not compressed");
+        }
+    }
+
+    // A shared cache has to key on Accept-Encoding, or it can hand a gzipped
+    // body to a client that only understands identity.
+    {
+        sh::RequestSpec spec;
+        spec.headers.add("accept-encoding", "gzip");
+        sh::HttpClient http{base_config()};
+        auto r = co_await http.request(url(comp_port, "/big?n=8192"), spec);
+        const std::string vary = r ? std::string{r->header("vary").value_or("")} : std::string{};
+        check(r && vary.find("Accept-Encoding") != std::string::npos,
+              "a compressed response carries Vary: Accept-Encoding");
+    }
+
+    // The uncompressed listener must be unaffected: same request, no encoding.
+    {
+        sh::RequestSpec spec;
+        spec.headers.add("accept-encoding", "br, gzip");
+        sh::HttpClient http{base_config()};
+        auto r = co_await http.request(url(plain_port, "/big?n=8192"), spec);
+        check(r && !r->header("content-encoding").has_value() && r->body == want,
+              "a listener with compression off ignores accept-encoding");
+    }
+
+    // --- the client side: with auto_decompress on, callers see decoded bytes ---
+    for (const Mode& mode : modes) {
+        auto cfg = base_config();
+        cfg.default_version = mode.policy;
+        cfg.default_h2c = mode.h2c;
+        cfg.auto_decompress = true;
+        sh::HttpClient http{cfg};
+        const std::string tag = std::string{mode.label} + " + auto_decompress";
+
+        // The body is the original bytes, with no trace of the encoding left.
+        {
+            auto r = co_await http.get(url(comp_port, "/big?n=8192"));
+            check(r && r->status == 200 && r->body == want, tag + ": the body arrives decoded");
+            check(r && !r->header("content-encoding").has_value(), tag + ": the encoding header is gone");
+            check(r && !r->header("content-length").has_value(), tag + ": the stale Content-Length is gone");
+        }
+
+        // Proof that Accept-Encoding actually went out: /headers echoes the
+        // request head back (compressed in transit, decoded on arrival).
+        {
+            auto r = co_await http.get(url(comp_port, "/headers"));
+            check(r && r->body.find("accept-encoding:") != std::string::npos,
+                  tag + ": the request advertises what we can decode");
+        }
+
+        // A stream is decoded as it is read, not just the aggregate path.
+        {
+            sh::RequestSpec spec;
+            auto opened = co_await http.open_stream(url(comp_port, "/stream"), spec);
+            check(opened.has_value(), tag + ": the stream opens");
+            if (opened) {
+                auto all = co_await opened->stream->read_all();
+                check(all && *all == "alpha-beta-gamma",
+                      tag + ": a streamed body is decoded -> " +
+                          (all ? "got [" + *all + "] (" + std::to_string(all->size()) + " bytes)"
+                               : describe(all.error())));
+                check(!opened->stream->head().headers.contains("content-encoding"),
+                      tag + ": a streamed head drops the encoding");
+            }
+        }
+
+        // A caller that sets the header keeps control of the negotiation, and
+        // the result is still decoded.
+        {
+            sh::RequestSpec spec;
+            spec.headers.add("accept-encoding", "gzip");
+            auto r = co_await http.request(url(comp_port, "/big?n=8192"), spec);
+            check(r && r->body == want, tag + ": an explicit Accept-Encoding is respected");
+        }
+    }
+
+    co_return;
+}
+
 // Every suite, in order. A named coroutine rather than a lambda: a lambda
 // coroutine whose handle escapes (here, into co_spawn) trips a GCC
 // coroutine-frame lifetime problem in this toolchain, and the suites would then
 // run against a frame that has already been reused.
-asio::awaitable<void> run_all_suites(asio::io_context& ctx, std::uint16_t plain, std::uint16_t tls_port) {
+asio::awaitable<void> run_all_suites(asio::io_context& ctx, std::uint16_t plain, std::uint16_t tls_port,
+                                     std::uint16_t comp_port) {
     co_await suite_protocol_matrix(plain, tls_port);
     co_await suite_framing(plain, ctx);
     co_await suite_streaming(plain);
@@ -878,6 +1072,7 @@ asio::awaitable<void> run_all_suites(asio::io_context& ctx, std::uint16_t plain,
     co_await suite_tls(tls_port);
     co_await suite_reverse_proxy(plain);
     co_await suite_raw_peer(ctx);
+    co_await suite_compression(comp_port, plain);
     co_return;
 }
 
@@ -895,6 +1090,7 @@ int main() {
     // mutated while workers serve).
     constexpr std::uint16_t kPlainPort = 27910;
     constexpr std::uint16_t kTlsPort = 27911;
+    constexpr std::uint16_t kCompPort = 27912;
     sh::ServerConfig plain_cfg = server_config(kPlainPort, std::nullopt);
     // The proxy's client role must trust the test CA (and present the client
     // certificate) to reach this process's own mTLS listener.
@@ -911,6 +1107,13 @@ int main() {
     tls_cfg.ca_file = std::string{"./test/tls_certificates/ca_cert.pem"};
     sh::Server secure{server_config(kTlsPort, tls_cfg)};
     register_routes(secure);
+    // A third listener with response compression on. Its own port keeps the
+    // byte-for-byte body assertions of every other suite valid.
+    sh::ServerConfig comp_cfg = server_config(kCompPort, std::nullopt);
+    comp_cfg.limits.compression.enabled = true;
+    comp_cfg.limits.compression.min_bytes = 64;  // /world is 19 B: it must stay as-is
+    sh::Server compressed{comp_cfg};
+    register_routes(compressed);
     // Reverse-proxy routes: one to the plaintext listener (the historical
     // behaviour: a plaintext backend stays HTTP/1.1) and one to the TLS listener
     // (the backend leg is HTTPS, so ALPN decides — and offers h2).
@@ -924,18 +1127,20 @@ int main() {
         plain.http_proxy_regex("/rptls/(.*)", std::move(backend));
     }
 
-    if (!plain.start() || !secure.start()) {
+    if (!plain.start() || !secure.start() || !compressed.start()) {
         std::printf("only http://SimpleHttpServer:7788\n");
         std::printf("FAIL  servers did not start (run from the repository root)\n");
         return 1;
     }
     const auto plain_port = plain.port();
     const auto tls_port = secure.port();
-    std::printf("server up: http on :%u, https on :%u\n", plain_port, tls_port);
+    const auto comp_port = compressed.port();
+    std::printf("server up: http on :%u, https on :%u, compressed http on :%u\n", plain_port, tls_port, comp_port);
 
     asio::io_context ctx;
     bool finished = false;
-    asio::co_spawn(ctx, run_all_suites(ctx, plain_port, tls_port), [&finished](const std::exception_ptr& ep) {
+    asio::co_spawn(ctx, run_all_suites(ctx, plain_port, tls_port, comp_port),
+                   [&finished](const std::exception_ptr& ep) {
         try {
             if (ep)
                 std::rethrow_exception(ep);

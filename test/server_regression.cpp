@@ -39,7 +39,7 @@ constexpr std::size_t kMaxBodyBytes = 64 * 1024;
 
 sh::ServerConfig make_config(std::uint16_t port, std::optional<sh::TlsConfig> tls) {
     sh::ServerConfig cfg;
-    cfg.listen = {sh::Listen{"127.0.0.1", port, false}};
+    cfg.listen = sh::Listen{"127.0.0.1", port, false};
     cfg.worker_threads = 2;
     cfg.tls = std::move(tls);
     // Small limits, so the boundary cases stay cheap to produce.
@@ -954,4 +954,94 @@ TEST_CASE("regression/tls: a TLS 1.2-only client is refused", "[regression][tls]
     CHECK(ec);  // no version overlap
     sh::error_code ignored;
     stream->next_layer().close(ignored);
+}
+
+// --- accept topology ---------------------------------------------------------
+//
+// The endpoint is a single value and reuse_port turns it into one acceptor per
+// worker context. Both halves are observable from a client: every worker must
+// land on the *same* port (the probe resolves it once — re-binding a configured
+// port 0 would scatter the workers across different ephemeral ports, and only
+// the one behind `port()` would ever be reached), and the accept loops must
+// actually run.
+
+TEST_CASE("regression/server: reuse_port binds one acceptor per worker on one port",
+          "[regression][server]") {
+    sh::ServerConfig cfg;
+    cfg.listen = sh::Listen{"127.0.0.1", 0, false};  // 0: the probe picks the port
+    cfg.worker_threads = 4;
+    cfg.reuse_port = true;
+    sh::Server server{cfg};
+    register_routes(server);
+    REQUIRE(server.start());
+
+    const auto port = server.port();
+    REQUIRE(port != 0);
+    // This case is about the fan-out, so make sure it happened: a platform that
+    // rejects SO_REUSEPORT falls back to a single acceptor, and everything
+    // below would then pass for the wrong reason.
+#ifdef SO_REUSEPORT
+    CHECK(server.acceptor_count() == 4);
+#endif
+
+    // Four connections held open at once, so the kernel's hash has to choose
+    // among the fanned-out sockets rather than reusing one. A socket bound to a
+    // stray port, or an accept loop that never started, leaves its share of
+    // these unanswered.
+    std::vector<std::unique_ptr<asio::io_context>> contexts;
+    std::vector<std::unique_ptr<RawClient>> clients;
+    for (int i = 0; i < 4; ++i) {
+        contexts.push_back(std::make_unique<asio::io_context>());
+        clients.push_back(std::make_unique<RawClient>(*contexts.back()));
+        REQUIRE(clients.back()->connect(port));
+        clients.back()->send("GET /world HTTP/1.1\r\nHost: x\r\n\r\n");
+    }
+    for (auto& client : clients) {
+        CHECK(client->wait_for("hello"));
+    }
+    for (auto& client : clients) {
+        client->close();
+    }
+}
+
+// A single worker leaves the fan-out with nothing to do, and the one acceptor
+// it bound is pinned to the only context — so no connection may be lost to a
+// hand-off that no longer happens.
+TEST_CASE("regression/server: reuse_port with a single worker still serves", "[regression][server]") {
+    sh::ServerConfig cfg;
+    cfg.listen = sh::Listen{"127.0.0.1", 0, false};
+    cfg.worker_threads = 1;
+    cfg.reuse_port = true;
+    sh::Server server{cfg};
+    register_routes(server);
+    REQUIRE(server.start());
+    CHECK(server.acceptor_count() == 1);  // nothing to fan out to
+
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(server.port()));
+    client.send("GET /world HTTP/1.1\r\nHost: x\r\n\r\n");
+    CHECK(client.wait_for("hello"));
+    client.close();
+}
+
+// An IPv6 listener with v6_only off is dual-stack, so it answers IPv4 clients
+// too — one endpoint covering both families instead of two listeners. Where
+// IPv6 is unavailable the probe falls back to IPv4 rather than refusing to
+// serve, so this expectation holds on either kind of host.
+TEST_CASE("regression/server: an IPv6 listener serves IPv4 clients", "[regression][server]") {
+    sh::ServerConfig cfg;
+    cfg.listen = sh::Listen{"::", 0, false};
+    cfg.worker_threads = 2;
+    sh::Server server{cfg};
+    register_routes(server);
+    REQUIRE(server.start());
+    REQUIRE(server.port() != 0);
+
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(server.port()));
+    client.send("GET /world HTTP/1.1\r\nHost: x\r\n\r\n");
+    CHECK(client.wait_for("hello"));
+    client.close();
 }

@@ -22,6 +22,8 @@
 #include "simple_http/core/logging.h"
 #include "simple_http/core/mime.h"
 #include "simple_http/core/base64.h"
+#include "simple_http/core/compression.h"
+#include "simple_http/core/content_encoding.h"  // codecs need SIMPLE_HTTP_ENABLE_COMPRESSION
 #include "simple_http/core/io_pool.h"
 
 // --- proto layer (version-agnostic HTTP request/response model) ---
@@ -30,6 +32,7 @@
 #include "simple_http/proto/request.h"
 #include "simple_http/proto/response_writer.h"
 #include "simple_http/proto/response.h"
+#include "simple_http/proto/compressing_writer.h"  // opt-in via CompressionConfig::enabled
 
 // --- transport layer (byte-stream abstraction over TCP plain/TLS; QUIC later) ---
 #include "simple_http/transport/transport.h"

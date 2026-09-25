@@ -11,6 +11,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "compression.h"
+
 namespace simple_http {
 
 struct EngineLimits {
@@ -36,6 +38,12 @@ struct EngineLimits {
     // Our advertised initial receive window (SETTINGS_INITIAL_WINDOW_SIZE), per
     // stream and connection. Larger trades memory for throughput on fast links.
     std::int32_t h2_initial_window{65535};
+
+    // --- response compression (off by default) ---
+    // Lives here rather than on ServerConfig so that it reaches the engines by
+    // the same path every other tunable takes; see the note at the top of this
+    // file.
+    CompressionConfig compression{};
 };
 
 }  // namespace simple_http

@@ -29,10 +29,11 @@
 // unusable.
 
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
+#include <limits>
 #include <expected>
 #include <functional>
 #include <memory>
@@ -96,7 +97,8 @@ class Http1ClientStream final : public ClientStream {
         return 0;
     }
 
-    void cancel() override {
+    asio::awaitable<void> cancel() override {
+        co_await asio::dispatch(asio::bind_executor(m_session->get_executor(), asio::use_awaitable));
         m_session->cancel_exchange();
     }
 
@@ -416,6 +418,13 @@ class Http1ClientSession final : public ClientSession,
     // Builds the request head. Framing headers are ours: Host, Content-Length /
     // Transfer-Encoding and Connection are (re)written here, and any field with a
     // control byte is dropped rather than spliced into the message.
+    // The connection field — and the h2c upgrade preamble — hold fixed values, so
+    // they are written from constants rather than reassembled per request.
+    static constexpr std::string_view kKeepAliveConnection = "connection: keep-alive\r\n";
+    static constexpr std::string_view kCloseConnection = "connection: close\r\n";
+    static constexpr std::string_view kH2cUpgradeHeaders =
+        "connection: Upgrade, HTTP2-Settings\r\nupgrade: h2c\r\nhttp2-settings: ";
+
     error_code build_request_head(std::string& out) {
         const std::string_view method = to_string(m_spec.method);
         if (method.empty())
@@ -463,22 +472,18 @@ class Http1ClientSession final : public ClientSession,
             out.append("transfer-encoding: chunked\r\n");
         } else if (!m_spec.body.empty()) {
             out.append("content-length: ");
-            out.append(std::to_string(m_spec.body.size()));
+            append_size(out, m_spec.body.size());
             out.append("\r\n");
         } else if (method_expects_body(m_spec.method)) {
             out.append("content-length: 0\r\n");
         }
 
         if (m_upgrading) {
-            out.append("connection: Upgrade, HTTP2-Settings\r\n");
-            out.append("upgrade: h2c\r\n");
-            out.append("http2-settings: ");
+            out.append(kH2cUpgradeHeaders);
             out.append(m_upgrade_settings);
             out.append("\r\n");
         } else {
-            out.append("connection: ");
-            out.append(m_keep_alive ? "keep-alive" : "close");
-            out.append("\r\n");
+            out.append(m_keep_alive ? kKeepAliveConnection : kCloseConnection);
         }
         out.append("\r\n");
         return error_code{};
@@ -510,11 +515,25 @@ class Http1ClientSession final : public ClientSession,
         co_return error_code{};
     }
 
+    // Appends a size in lowercase hex (chunked framing) without the locale and
+    // formatted-output overhead of snprintf.
+    static void append_hex(std::string& out, std::size_t value) {
+        char buf[2 * sizeof(std::size_t)];
+        auto [end, ec] = std::to_chars(buf, buf + sizeof(buf), value, 16);
+        out.append(buf, static_cast<std::size_t>(end - buf));
+    }
+
+    // Appends a size in decimal without allocating.
+    static void append_size(std::string& out, std::size_t value) {
+        char buf[std::numeric_limits<std::size_t>::digits10 + 2];
+        auto [end, ec] = std::to_chars(buf, buf + sizeof(buf), value);
+        out.append(buf, static_cast<std::size_t>(end - buf));
+    }
+
     static std::string encode_chunk(const std::string& data) {
         std::string out;
-        char size_buf[2 * sizeof(std::size_t) + 1];
-        int n = std::snprintf(size_buf, sizeof(size_buf), "%zx", data.size());
-        out.append(size_buf, static_cast<std::size_t>(n));
+        out.reserve(2 * sizeof(std::size_t) + 4 + data.size());  // hex size, CRLF, CRLF
+        append_hex(out, data.size());
         out.append("\r\n");
         out.append(data);
         out.append("\r\n");

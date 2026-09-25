@@ -11,6 +11,22 @@
             },
             version = "1.90.0"
         },
+        ["brotli#f56260b5"] = {
+            repo = {
+                branch = "master",
+                commit = "3abfb00eecffc598dca57a4c4589d43274c5cc95",
+                url = "https://gitcode.com/xmake-io/xmake-repo.git"
+            },
+            version = "v1.2.0"
+        },
+        ["catch2#f56260b5"] = {
+            repo = {
+                branch = "master",
+                commit = "3abfb00eecffc598dca57a4c4589d43274c5cc95",
+                url = "https://gitcode.com/xmake-io/xmake-repo.git"
+            },
+            version = "v3.15.2"
+        },
         ["cmake#f56260b5"] = {
             repo = {
                 branch = "master",
@@ -34,6 +50,14 @@
                 url = "https://gitcode.com/xmake-io/xmake-repo.git"
             },
             version = "3.6.0"
+        },
+        ["zlib#f56260b5"] = {
+            repo = {
+                branch = "master",
+                commit = "3abfb00eecffc598dca57a4c4589d43274c5cc95",
+                url = "https://gitcode.com/xmake-io/xmake-repo.git"
+            },
+            version = "v1.3.2"
         }
     }
 }

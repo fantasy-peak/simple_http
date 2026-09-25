@@ -47,6 +47,7 @@
 #include "../../core/logging.h"
 #include "../../core/types.h"
 #include "../../core/version.h"
+#include "../../proto/compressing_writer.h"
 #include "../../proto/headers.h"
 #include "../../proto/request.h"
 #include "../../proto/response.h"
@@ -155,20 +156,27 @@ class Http2ResponseWriter : public ResponseWriter {
         co_return error_code{};
     }
 
-    bool connected() const override {
+    asio::awaitable<bool> connected() const override {
+        // The hop matters here more than anywhere: stream_writable() walks the
+        // engine's stream table, which the connection executor is inserting into
+        // and erasing from concurrently.
+        co_await hop();
         auto eng = m_engine.lock();
         // A reset/finished stream cannot take a response either: report the
         // response as unwritable so callers (e.g. a proxy's 502 path) stop
         // rather than trying to write onto a dead stream.
-        return eng && eng->alive() && eng->stream_writable(m_stream_id);
+        co_return eng && eng->alive() && eng->stream_writable(m_stream_id);
     }
-    void close() override {
-        if (auto eng = m_engine.lock()) eng->reset_stream(m_stream_id, codec::H2_CANCEL);
+    asio::awaitable<void> close() override {
+        co_await hop();  // reset_stream() touches the same table
+        if (auto eng = m_engine.lock()) {
+            eng->reset_stream(m_stream_id, codec::H2_CANCEL);
+        }
     }
     Version version() const override { return Version::Http2; }
 
   private:
-    asio::awaitable<void> hop() {
+    asio::awaitable<void> hop() const {
         co_await asio::dispatch(asio::bind_executor(m_executor, asio::use_awaitable));
     }
 
@@ -1099,7 +1107,13 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
         asio::co_spawn(
             m_executor,
             [self, request, writer, sid]() -> asio::awaitable<void> {
-                auto response = std::make_shared<Response>(writer);
+                // Same wrapper as h1: see the note there. `writer` stays in the
+                // engine's hands for stream bookkeeping; only the Response gets
+                // the compressing view.
+                auto response = std::make_shared<Response>(
+                    maybe_compress_writer(writer, self->m_executor, self->m_limits.compression,
+                                          request->header("accept-encoding").value_or(std::string_view{}),
+                                          request->method() == Method::Head));
                 try {
                     co_await self->m_dispatch(request, response, self->m_transport->tls_handle());
                 } catch (const std::exception& e) {

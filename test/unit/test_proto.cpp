@@ -269,7 +269,9 @@ TEST_CASE("proto/response: bodyless, streaming and state forwarding", "[proto]")
     auto writer = std::make_shared<FakeResponseWriter>();
     Response res{writer};
 
-    CHECK(res.connected());
+    auto open = run_on(ctx, res.connected());
+    REQUIRE(open.has_value());
+    CHECK(*open);
     CHECK(res.version() == Version::Http11);
     writer->ver = Version::Http2;
     CHECK(res.version() == Version::Http2);
@@ -287,8 +289,10 @@ TEST_CASE("proto/response: bodyless, streaming and state forwarding", "[proto]")
     CHECK(writer->chunks == std::vector<std::string>{"a", "b"});
     CHECK(writer->finished);
 
-    res.close();
-    CHECK_FALSE(res.connected());
+    REQUIRE(run_on(ctx, res.close()));
+    auto closed = run_on(ctx, res.connected());
+    REQUIRE(closed.has_value());
+    CHECK_FALSE(*closed);
 }
 
 TEST_CASE("proto/response: a writer error is reported to the caller", "[proto]") {

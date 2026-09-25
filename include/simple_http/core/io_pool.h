@@ -3,8 +3,9 @@
 // A pool of single-threaded io_contexts, each pinned to its own thread. Work is
 // distributed round-robin. Keeping one io_context per thread avoids handler
 // synchronization inside a context and gives predictable per-connection
-// affinity. The last context created is designated the "main" context, used for
-// acceptors.
+// affinity. A "main" context, created last, can be added for acceptors when the
+// accept topology needs a thread of its own (Server does this unless the
+// listener is fanned out with SO_REUSEPORT).
 
 #include <atomic>
 #include <cstddef>
@@ -61,6 +62,14 @@ class IoCtxPool final {
     // The context reserved for acceptors (added via add_main_context()).
     std::shared_ptr<asio::io_context>& main_context() {
         return m_io_contexts.back();
+    }
+
+    // The worker contexts only: a main context, if one was added, is not
+    // counted here and is never reachable through at().
+    std::size_t size() const { return m_pool_size; }
+
+    std::shared_ptr<asio::io_context>& at(std::size_t index) {
+        return m_io_contexts[index];
     }
 
     void add_main_context() {
