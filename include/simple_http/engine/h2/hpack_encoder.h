@@ -66,6 +66,21 @@ inline void hpack_append_literal(std::string& out, std::string_view name, std::s
     hpack_append_string(out, value);
 }
 
+// Appends an indexed header field (RFC 7541 §6.1): one byte for any entry in
+// the static table whose exact name *and* value we are sending (e.g. index 2 for
+// `:method: GET`).
+inline void hpack_append_indexed(std::string& out, uint64_t index) {
+    hpack_append_integer(out, 0x80, 7, index);
+}
+
+// Appends a literal field whose *name* comes from the table (RFC 7541 §6.2.2,
+// index prefix 4 bits): the name costs one byte instead of a Huffman-coded
+// string, which is what makes a request head mostly table references.
+inline void hpack_append_literal_indexed_name(std::string& out, uint64_t name_index, std::string_view value) {
+    hpack_append_integer(out, 0x00, 4, name_index);
+    hpack_append_string(out, value);
+}
+
 // Appends `:status` using the static-table index when the code is one of the
 // entries HPACK reserves (RFC 7541 Appendix A), else falls back to a literal.
 inline void hpack_append_status(std::string& out, int status) {

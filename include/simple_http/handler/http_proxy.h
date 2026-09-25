@@ -1,51 +1,44 @@
 #pragma once
 
-// HTTP reverse proxy — request-level, standard forward-proxy behaviour.
+// HTTP reverse proxy — request-level, standard forward-proxy behaviour, driven
+// by the client layer.
 //
-// Unlike the byte-level WebSocket tunnel (engine/h1/ws_proxy.h), this operates
-// on the parsed Request/Response abstraction, one request at a time:
-//
-//   1. take an idle TCP connection to the backend host:port from the pool (or
-//      open one if the pool is empty);
-//   2. send the request line (with rewritten target) + forwarded headers, then
-//      stream the request body through;
-//   3. read the backend's status line + headers with a small incremental
-//      parser;
-//   4. stream the backend's response body back to the client through the
-//      version-agnostic Response (so it works over HTTP/1.x and HTTP/2 alike).
+// Unlike the byte-level WebSocket tunnel (engine/h1/ws_proxy.h), this operates on
+// the parsed Request/Response abstraction, one request at a time, and the
+// upstream leg is an ordinary client exchange: the connection comes from the
+// client layer's pool, the request is re-framed there (chunked body on HTTP/1.1,
+// DATA frames on HTTP/2), and the response arrives as a head plus body chunks. So
+// the backend may be plaintext or TLS, HTTP/1.1 or HTTP/2 — see HttpProxyTarget.
 //
 // Standard reverse-proxy header handling (RFC 7230 §5.7.1 / §6.1):
 //   * append the client address to X-Forwarded-For, set X-Forwarded-Proto and
 //     X-Forwarded-Host;
-//   * rewrite Host to the backend authority;
+//   * the Host header (and, on HTTP/2, :authority) is the backend's — the client
+//     layer writes the origin's authority, so a `host` field from the frontend is
+//     dropped rather than forwarded;
 //   * strip hop-by-hop headers (Connection, Keep-Alive, Proxy-*, TE, Trailer,
 //     Transfer-Encoding, Upgrade) plus any field named in the Connection header,
 //     on both the request and the response.
 //
-// Concurrency (model A): the handler runs on the connection executor; the
-// backend socket is created on that same executor, so all I/O is single-
-// threaded. Idle backend connections are pooled and reused (see UpstreamPool) —
-// a proxy that reconnects per request falls over when the backend sits behind a
-// tunnel and the client opens requests in bursts.
+// Concurrency (model A): the handler runs on the connection executor, and the
+// client session it takes is bound to that same executor, so all I/O for one
+// request is single-threaded. Idle upstream connections are pooled and reused by
+// the client — a proxy that reconnects per request falls over when the backend
+// sits behind a tunnel and the client issues requests in bursts.
 
-#include <algorithm>
 #include <array>
 #include <cctype>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <memory>
-#include <mutex>
-#include <span>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include <boost/asio.hpp>
 
+#include "../client/http_client.h"
 #include "../core/logging.h"
 #include "../core/types.h"
 #include "../engine/dispatcher.h"  // HttpProxyTarget
@@ -106,202 +99,18 @@ inline bool contains_token(const std::vector<std::string>& tokens, std::string_v
     return false;
 }
 
-// Parsed status line + headers of a backend HTTP/1.x response. Body framing is
-// decided from these fields by the caller.
-struct BackendResponseHead {
-    int status = 0;
-    Headers headers;
-};
-
-// Incremental parser for a backend response head (status line + header block up
-// to CRLFCRLF). Mirrors the request-side H1Parser but for responses.
-class BackendResponseParser {
-  public:
-    enum class State { NeedMore, Done, Error };
-
-    void feed(const std::byte* data, std::size_t n) {
-        m_buf.append(reinterpret_cast<const char*>(data), n);
-    }
-
-    State parse() {
-        std::size_t end = m_buf.find("\r\n\r\n");
-        std::size_t sep = 4;
-        if (end == std::string::npos) {
-            end = m_buf.find("\n\n");
-            sep = 2;
-            if (end == std::string::npos) return State::NeedMore;
-        }
-        std::string_view block{m_buf.data(), end};
-        if (!parse_block(block)) return State::Error;
-        m_consumed = end + sep;
-        return State::Done;
-    }
-
-    const BackendResponseHead& head() const { return m_head; }
-
-    // Bytes buffered past the head — the start of the response body.
-    std::string_view remainder() const { return std::string_view{m_buf}.substr(m_consumed); }
-
-    std::size_t buffered() const { return m_buf.size(); }
-
-  private:
-    bool parse_block(std::string_view block) {
-        std::size_t pos = 0;
-        std::string_view line = next_line(block, pos);
-        if (!parse_status_line(line)) return false;
-        while (pos < block.size()) {
-            std::string_view hline = next_line(block, pos);
-            if (hline.empty()) continue;
-            if (!parse_header_line(hline)) return false;
-        }
-        return true;
-    }
-
-    static std::string_view next_line(std::string_view block, std::size_t& pos) {
-        std::size_t nl = block.find('\n', pos);
-        std::size_t line_end = (nl == std::string_view::npos) ? block.size() : nl;
-        std::size_t raw_end = line_end;
-        if (raw_end > pos && block[raw_end - 1] == '\r') raw_end -= 1;
-        std::string_view line = block.substr(pos, raw_end - pos);
-        pos = (nl == std::string_view::npos) ? block.size() : nl + 1;
-        return line;
-    }
-
-    bool parse_status_line(std::string_view line) {
-        // HTTP-version SP status-code SP reason-phrase
-        std::size_t sp1 = line.find(' ');
-        if (sp1 == std::string_view::npos) return false;
-        std::size_t sp2 = line.find(' ', sp1 + 1);
-        std::string_view code = (sp2 == std::string_view::npos) ? line.substr(sp1 + 1)
-                                                                : line.substr(sp1 + 1, sp2 - sp1 - 1);
-        int status = 0;
-        for (char c : code) {
-            if (c < '0' || c > '9') return false;
-            status = status * 10 + (c - '0');
-        }
-        if (status < 100 || status > 599) return false;
-        m_head.status = status;
-        return true;
-    }
-
-    bool parse_header_line(std::string_view line) {
-        std::size_t colon = line.find(':');
-        if (colon == std::string_view::npos || colon == 0) return false;
-        std::string_view key = line.substr(0, colon);
-        std::size_t vstart = colon + 1;
-        while (vstart < line.size() && (line[vstart] == ' ' || line[vstart] == '\t')) ++vstart;
-        std::string_view value = line.substr(vstart);
-        std::size_t vend = value.size();
-        while (vend > 0 && (value[vend - 1] == ' ' || value[vend - 1] == '\t')) --vend;
-        value = value.substr(0, vend);
-        m_head.headers.add(std::string{key}, std::string{value});
-        return true;
-    }
-
-    std::string m_buf;
-    std::size_t m_consumed = 0;
-    BackendResponseHead m_head;
-};
-
-// A small pool of idle upstream connections, keyed by (executor, host, port).
-//
-// Reusing upstream connections is what every production proxy does, and it
-// matters disproportionately here: the cost of a fresh connection is not a LAN
-// handshake but — when the backend is reached through a tunnel (frp, ngrok, …) —
-// a cross-tunnel round trip. A browser loads the code-server workbench with
-// dozens of concurrent requests, so connecting per request turned into a stampede
-// the tunnel could not absorb. Measured against an frp-tunnelled backend, 15
-// concurrent requests: 3 answered (one of them truncated) with a connection per
-// request, 15/15 once connections were reused.
-//
-// Connections are bound to the io_context that created them (an asio
-// requirement), so the pool is partitioned by executor. Only connections whose
-// response had an explicit end (Content-Length or chunked) may be pooled: an
-// EOF-delimited body leaves the connection at an unpredictable position.
-class UpstreamPool {
-  public:
-    using Socket = asio::ip::tcp::socket;
-
-    static UpstreamPool& instance() {
-        static UpstreamPool pool;
-        return pool;
-    }
-
-    // Takes an idle connection to `host:port` belonging to `ex`, or nullptr.
-    template <typename Executor>
-    std::shared_ptr<Socket> take(const Executor& ex, const std::string& host, std::uint16_t port) {
-        const Key key{executor_key(ex), host, port};
-        std::lock_guard<std::mutex> lock(m_mutex);
-        auto it = m_idle.find(key);
-        if (it == m_idle.end()) return nullptr;
-        auto& list = it->second;
-        prune(list);
-        if (list.empty()) return nullptr;
-        auto sock = std::move(list.back().sock);
-        list.pop_back();
-        return sock;
-    }
-
-    // Returns a connection still positioned at a response boundary.
-    template <typename Executor>
-    void put(const Executor& ex, const std::string& host, std::uint16_t port, std::shared_ptr<Socket> sock) {
-        const Key key{executor_key(ex), host, port};
-        std::lock_guard<std::mutex> lock(m_mutex);
-        auto& list = m_idle[key];
-        prune(list);
-        if (list.size() >= kMaxIdlePerTarget) list.erase(list.begin());
-        list.push_back(Idle{std::move(sock), std::chrono::steady_clock::now()});
-    }
-
-  private:
-    struct Key {
-        const void* ex;
-        std::string host;
-        std::uint16_t port;
-        bool operator==(const Key& o) const { return ex == o.ex && port == o.port && host == o.host; }
-    };
-    struct KeyHash {
-        std::size_t operator()(const Key& k) const {
-            return std::hash<const void*>{}(k.ex) * 31u + std::hash<std::string>{}(k.host) * 17u + k.port;
-        }
-    };
-    struct Idle {
-        std::shared_ptr<Socket> sock;
-        std::chrono::steady_clock::time_point since;
-    };
-
-    static constexpr std::size_t kMaxIdlePerTarget = 8;
-    // Idle connections are dropped after this long: a tunnelled backend closes
-    // idle connections on its own schedule, and handing out a half-closed one
-    // only costs a failed request.
-    static constexpr auto kIdleTtl = std::chrono::seconds(20);
-
-    static void prune(std::vector<Idle>& list) {
-        const auto now = std::chrono::steady_clock::now();
-        list.erase(std::remove_if(list.begin(), list.end(),
-                                  [&](const Idle& i) { return now - i.since > kIdleTtl; }),
-                   list.end());
-    }
-
-    template <typename Executor>
-    static const void* executor_key(const Executor& ex) {
-        return static_cast<const void*>(&ex.context());
-    }
-
-    std::mutex m_mutex;
-    std::unordered_map<Key, std::vector<Idle>, KeyHash> m_idle;
-};
-
 }  // namespace detail
 
 // Runs one request-level HTTP reverse-proxy exchange: forwards `req` to the
-// backend `target` and streams the response back through `res`. On any transport
-// error a 502 Bad Gateway is sent (if the response has not started yet).
-inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::shared_ptr<Response> res,
-                                            bool client_is_tls, HttpProxyTarget target) {
-    auto executor = co_await asio::this_coro::executor;
-    auto backend = std::make_shared<asio::ip::tcp::socket>(executor);
-
+// backend `target` through `client` and streams the response back through `res`.
+// On any upstream failure a 502 Bad Gateway is sent while the response has not
+// started yet; a failure once the body is flowing aborts the frontend response
+// instead (a truncated body must never look complete).
+inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req,
+                                            std::shared_ptr<Response> res,
+                                            bool client_is_tls,
+                                            HttpProxyTarget target,
+                                            HttpClient& client) {
     auto fail_502 = [&res]() -> asio::awaitable<void> {
         if (res->connected()) {
             (void)co_await res->status(502).content_type("text/plain").send("Bad Gateway");
@@ -309,49 +118,10 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
         co_return;
     };
 
-    // Opens a fresh connection to the backend on this connection's executor.
-    // Called once up front, or again if a pooled connection turns out stale.
-    auto open_backend = [&]() -> asio::awaitable<error_code> {
-        backend = std::make_shared<asio::ip::tcp::socket>(executor);
-        asio::ip::tcp::resolver resolver{executor};
-        auto [rec, endpoints] = co_await resolver.async_resolve(target.host, std::to_string(target.port),
-                                                                asio::as_tuple(asio::use_awaitable));
-        if (rec) {
-            SIMPLE_HTTP_ERROR_LOG("http-proxy resolve {}:{} failed: {}", target.host, target.port, rec.message());
-            co_return rec;
-        }
-        auto [cec, _] = co_await asio::async_connect(*backend, endpoints, asio::as_tuple(asio::use_awaitable));
-        if (cec) {
-            SIMPLE_HTTP_ERROR_LOG("http-proxy connect {}:{} failed: {}", target.host, target.port, cec.message());
-        }
-        co_return cec;
-    };
-
-    // Prefer an idle pooled connection (see UpstreamPool). Opening one per request
-    // is ruinous when the backend sits behind a tunnel - every new connection
-    // costs a cross-tunnel round trip - and browsers issue requests in bursts.
-    backend = detail::UpstreamPool::instance().take(executor, target.host, target.port);
-    bool reused = backend != nullptr;
-    if (!reused) {
-        if (auto ec = co_await open_backend(); ec) {
-            co_await fail_502();
-            co_return;
-        }
-    }
-
-    auto write_all = [&backend](const std::string& out) -> asio::awaitable<error_code> {
-        // Composed async_write: writes the whole buffer or returns an error.
-        auto [ec, n] =
-            co_await asio::async_write(*backend, asio::buffer(out.data(), out.size()), asio::as_tuple(asio::use_awaitable));
-        (void)n;
-        co_return ec;
-    };
-
-    // --- build the forwarded request head ---
-    std::string authority = target.host + ":" + std::to_string(target.port);
+    // --- the request to forward ---
     // The rewrite template operates on the path only (Router matches req->path(),
     // which excludes the query). Preserve the original query string so it is not
-    // lost when a rewrite is applied. If the rewrite itself already contains a
+    // lost when a rewrite is applied; if the rewrite itself already contains a
     // '?', respect it and do not append the original query.
     std::string forwarded_target;
     if (target.rewrite_path.empty()) {
@@ -373,49 +143,19 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
         co_return;
     }
 
-    std::string head;
-    head.append(req->method_token());
-    head.push_back(' ');
-    head.append(forwarded_target);
-    head.append(" HTTP/1.1\r\n");
+    RequestSpec spec;
+    spec.method = req->method();
+    spec.target = std::move(forwarded_target);
 
-    // Does the request carry a body? We must decide this *before* writing the
-    // request head (to advertise Transfer-Encoding: chunked). Header hints work
-    // for HTTP/1.x (Content-Length / Transfer-Encoding) but NOT for HTTP/2,
-    // which frames the body with END_STREAM and carries neither header. So we
-    // probe the body: read the first frame now; if it is a non-empty data chunk
-    // (or a data chunk before EOF) the request has a body. The peeked frame is
-    // forwarded first once the head is written. This is protocol-agnostic and
-    // correct for h1, h2 and h2c alike.
-    // A client that sent `Expect: 100-continue` waits for a go-ahead before sending
-    // its body. Answer it ourselves (RFC 9110 §10.1.1 allows an intermediary to) -
-    // otherwise this read would block until the client gives up waiting and sends the
-    // body anyway, and a client that never gives up would deadlock the request.
-    if (auto exp = req->header("expect"); exp && detail::to_lower(*exp).find("100-continue") != std::string::npos) {
-        (void)co_await res->writer().send_continue();
-    }
-
-    std::string first_chunk;
-    bool req_has_body = false;
-    {
-        auto frame = co_await req->body().read();
-        if (frame && !frame->eof) {
-            req_has_body = true;
-            first_chunk = std::move(frame->data);
-        }
-        // else: no body (immediate EOF), or a read error — forward with no body.
-    }
-
-    // Copy request headers, dropping hop-by-hop + Connection-listed ones, and
-    // overriding Host with the backend authority.
+    // Copy the frontend's fields, minus what the client layer owns (Host,
+    // Content-Length, the connection's own headers) and minus anything the
+    // Connection header lists.
     auto req_conn_tokens = detail::connection_tokens(req->headers());
-    bool saw_xff = false;
     std::string xff;
+    bool saw_xff = false;
     for (const auto& [name, value] : req->headers()) {
         if (detail::is_hop_by_hop(name) || detail::contains_token(req_conn_tokens, name)) continue;
-        if (name == "host") continue;              // replaced below
-        if (name == "expect") continue;            // answered locally above
-        if (name == "content-length") continue;    // re-framed as chunked below
+        if (name == "host" || name == "expect" || name == "content-length") continue;
         if (name == "x-forwarded-for") {
             saw_xff = true;
             xff = value;  // will append the client address below
@@ -426,335 +166,162 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
             co_await fail_502();
             co_return;
         }
-        head.append(name);
-        head.append(": ");
-        head.append(value);
-        head.append("\r\n");
+        spec.headers.add_lower(name, value);
+    }
+    spec.headers.add_lower("x-forwarded-for", saw_xff && !xff.empty() ? xff + ", " + req->peer_address()
+                                                                      : req->peer_address());
+    spec.headers.add_lower("x-forwarded-proto", client_is_tls ? "https" : "http");
+    if (auto host = req->header("host")) spec.headers.add_lower("x-forwarded-host", std::string{*host});
+
+    // Does the request carry a body? Header hints work for HTTP/1.x but NOT for
+    // HTTP/2, which frames the body with END_STREAM and carries neither header, so
+    // the body is probed: read the first frame now and forward it once the
+    // upstream exchange is open. A client that sent `Expect: 100-continue` waits
+    // for a go-ahead before sending its body: answer it here (RFC 9110 §10.1.1
+    // allows an intermediary to), otherwise this read would block until the client
+    // gives up.
+    if (auto expect = req->header("expect");
+        expect && detail::to_lower(*expect).find("100-continue") != std::string::npos) {
+        (void)co_await res->writer().send_continue();
+    }
+    std::string first_chunk;
+    bool has_body = false;
+    {
+        auto frame = co_await req->body().read();
+        if (frame && !frame->eof) {
+            has_body = true;
+            first_chunk = std::move(frame->data);
+        }
+        // else: no body (immediate EOF), or a read error — forward with no body.
+    }
+    spec.stream_body = has_body;
+
+    // --- the backend this target names ---
+    ClientTarget upstream;
+    upstream.host = target.host;
+    upstream.port = target.port;
+    upstream.use_tls = target.tls;
+    if (target.tls) {
+        upstream.version = HttpVersionPolicy::Auto;  // ALPN: h2 when the backend offers it
+    } else if (target.h2c) {
+        upstream.version = HttpVersionPolicy::Http2;
+        upstream.h2c = H2cMode::Upgrade;
+    } else {
+        upstream.version = HttpVersionPolicy::Http11;  // the historical default: plain HTTP/1.1
+        upstream.h2c = H2cMode::Off;
     }
 
-    // Host: backend authority.
-    head.append("Host: ");
-    head.append(authority);
-    head.append("\r\n");
-
-    // X-Forwarded-For: append this client's address to any existing chain.
-    std::string client_addr = req->peer_address();
-    head.append("X-Forwarded-For: ");
-    if (saw_xff && !xff.empty()) {
-        head.append(xff);
-        head.append(", ");
-    }
-    head.append(client_addr);
-    head.append("\r\n");
-
-    // X-Forwarded-Proto / X-Forwarded-Host.
-    head.append("X-Forwarded-Proto: ");
-    head.append(client_is_tls ? "https" : "http");
-    head.append("\r\n");
-    if (auto host = req->header("host")) {
-        head.append("X-Forwarded-Host: ");
-        head.append(*host);
-        head.append("\r\n");
-    }
-
-    // Re-frame any request body as chunked (so we need no Content-Length). The
-    // backend connection stays alive so it can go back to the pool; a response
-    // without an explicit length is still delimited by EOF, and such a connection
-    // is closed rather than pooled (see the pooling decision at the end).
-    if (req_has_body) {
-        head.append("Transfer-Encoding: chunked\r\n");
-    }
-    head.append("Connection: keep-alive\r\n");
-    head.append("\r\n");
-
-    // Send the request (head + body) and read the response head, retrying once
-    // when the connection came from the pool: an idle connection may have been
-    // closed by the backend - or by a tunnel in between - without our knowledge,
-    // and that surfaces as the first write or read failing. Requests carrying a
-    // body are never retried, since their body has already been consumed from the
-    // client; a stale pooled connection simply fails those.
-    detail::BackendResponseParser parser;
-    std::string leftover;  // response bytes read past the head (start of body)
-
+    // One retry, under the same rule the client's convenience layer uses: only a
+    // connection that came from the pool (so it sat idle and the peer may have
+    // closed it unnoticed) failing at the transport level, and only when the
+    // request can be sent again — a body already taken from the frontend cannot.
     for (int attempt = 0; attempt < 2; ++attempt) {
-        if (attempt == 1) {
-            SIMPLE_HTTP_ERROR_LOG("http-proxy: {}:{} dropped a pooled connection, retrying on a fresh one",
-                                  target.host, target.port);
-            if (auto ec = co_await open_backend(); ec) {
-                co_await fail_502();
-                co_return;
-            }
-            reused = false;
-            parser = detail::BackendResponseParser{};
-            leftover.clear();
-        }
-
-        if (auto ec = co_await write_all(head); ec) {
-            SIMPLE_HTTP_ERROR_LOG("http-proxy write head failed: {}", ec.message());
-            if (reused && !req_has_body) continue;  // stale pooled connection
+        auto opened = co_await client.open_stream(upstream, spec);
+        if (!opened) {
+            SIMPLE_HTTP_ERROR_LOG("http-proxy: no upstream connection to {}:{} ({})",
+                                  target.host,
+                                  target.port,
+                                  opened.error().message());
             co_await fail_502();
             co_return;
         }
+        auto& stream = opened->stream;
+        const bool may_retry = attempt == 0 && opened->pooled && !has_body;
 
-    // --- stream the request body to the backend as HTTP/1.1 chunked ---
-    if (req_has_body) {
-        // Encodes one non-empty buffer as an HTTP/1.1 chunk.
-        auto encode_chunk = [](const std::string& data) {
-            std::string chunk;
-            char size_buf[2 * sizeof(std::size_t) + 1];
-            int m = std::snprintf(size_buf, sizeof(size_buf), "%zx", data.size());
-            chunk.append(size_buf, static_cast<std::size_t>(m));
-            chunk.append("\r\n");
-            chunk.append(data);
-            chunk.append("\r\n");
-            return chunk;
-        };
-
-        // Forward the peeked first chunk, then the rest of the stream.
-        if (!first_chunk.empty()) {
-            if (auto ec = co_await write_all(encode_chunk(first_chunk)); ec) {
-                SIMPLE_HTTP_ERROR_LOG("http-proxy write body failed: {}", ec.message());
-                co_await fail_502();
-                co_return;
+        // --- request body ---
+        if (has_body) {
+            bool body_sent = true;
+            if (!first_chunk.empty()) {
+                if (auto ec = co_await stream->write(first_chunk); ec) body_sent = false;
             }
-        }
-        for (;;) {
-            auto frame = co_await req->body().read();
-            if (!frame || frame->eof) break;
-            if (frame->data.empty()) continue;
-            if (auto ec = co_await write_all(encode_chunk(frame->data)); ec) {
-                SIMPLE_HTTP_ERROR_LOG("http-proxy write body failed: {}", ec.message());
-                co_await fail_502();
-                co_return;
-            }
-        }
-        if (auto ec = co_await write_all("0\r\n\r\n"); ec) {  // last-chunk terminator
-            SIMPLE_HTTP_ERROR_LOG("http-proxy write body terminator failed: {}", ec.message());
-            co_await fail_502();
-            co_return;
-        }
-    }
-
-        // --- read the backend response head ---
-        {
-            std::array<std::byte, 8192> tmp;  // no init: read_some fills [0,n)
-            auto state = detail::BackendResponseParser::State::NeedMore;
-            error_code head_ec;
-            // Loop so informational responses (100 Continue, 103 Early Hints) are
-            // swallowed instead of being mistaken for the final response.
-            for (;;) {
-                while (state == detail::BackendResponseParser::State::NeedMore) {
-                    auto [ec, n] = co_await backend->async_read_some(asio::buffer(tmp.data(), tmp.size()),
-                                                                     asio::as_tuple(asio::use_awaitable));
-                    if (ec || n == 0) {
-                        SIMPLE_HTTP_ERROR_LOG("http-proxy read response head failed: {}",
-                                              ec ? ec.message() : std::string{"eof"});
-                        head_ec = ec ? ec : make_error_code(asio::error::eof);
-                        break;
-                    }
-                    parser.feed(tmp.data(), n);
-                    state = parser.parse();
-                }
-                if (head_ec) break;
-                if (state == detail::BackendResponseParser::State::Error) {
-                    SIMPLE_HTTP_ERROR_LOG("http-proxy malformed response head from {}:{}", target.host, target.port);
-                    head_ec = make_error_code(asio::error::invalid_argument);
+            for (; body_sent;) {
+                auto frame = co_await req->body().read();
+                if (!frame || frame->eof) break;  // a body read error just ends what we forward
+                if (frame->data.empty()) continue;
+                if (auto ec = co_await stream->write(std::move(frame->data)); ec) {
+                    SIMPLE_HTTP_ERROR_LOG("http-proxy: upstream {}:{} rejected the body ({})",
+                                          target.host,
+                                          target.port,
+                                          ec.message());
+                    body_sent = false;
                     break;
                 }
-                if (parser.head().status >= 200) break;  // final response
-                // Informational: discard it and parse the next head from what we have.
-                leftover.assign(parser.remainder());
-                parser = detail::BackendResponseParser{};
-                parser.feed(reinterpret_cast<const std::byte*>(leftover.data()), leftover.size());
-                leftover.clear();
-                state = parser.parse();
             }
-            if (head_ec) {
-                if (reused && !req_has_body) continue;  // stale pooled connection: retry
+            if (body_sent) {
+                if (auto ec = co_await stream->finish(std::string{}); ec) body_sent = false;
+            }
+            if (!body_sent) {
+                // The request is half-sent: it cannot be replayed, and the
+                // frontend has not seen a response yet.
+                stream->cancel();
                 co_await fail_502();
                 co_return;
             }
-            // Bytes read past the head are the start of the body.
-            leftover.assign(parser.remainder());
         }
-        break;  // final response head received
-    }  // end retry loop
 
-    const auto& bhead = parser.head();
-
-    // Determine backend response body framing.
-    bool resp_chunked = false;
-    bool resp_has_length = false;
-    std::uint64_t resp_length = 0;
-    if (auto te = bhead.headers.get("transfer-encoding"); te && detail::to_lower(*te).find("chunked") != std::string::npos) {
-        resp_chunked = true;
-    } else if (auto cl = bhead.headers.get("content-length")) {
-        std::uint64_t len = 0;
-        bool ok = !cl->empty();
-        for (char c : *cl) {
-            if (c < '0' || c > '9') { ok = false; break; }
-            len = len * 10 + static_cast<std::uint64_t>(c - '0');
+        // --- the backend's response head ---
+        auto head = co_await stream->read_head();
+        if (!head) {
+            if (may_retry && transport_failure(head.error())) {
+                SIMPLE_HTTP_ERROR_LOG("http-proxy: {}:{} dropped a pooled connection ({}), retrying",
+                                      target.host,
+                                      target.port,
+                                      head.error().message());
+                stream->cancel();
+                continue;
+            }
+            SIMPLE_HTTP_ERROR_LOG("http-proxy: no response head from {}:{} ({})",
+                                  target.host,
+                                  target.port,
+                                  head.error().message());
+            stream->cancel();
+            co_await fail_502();
+            co_return;
         }
-        if (ok) {
-            resp_has_length = true;
-            resp_length = len;
+
+        // --- stream it back through the version-agnostic Response ---
+        res->status(head->status);
+        auto resp_conn_tokens = detail::connection_tokens(head->headers);
+        for (const auto& [name, value] : head->headers) {
+            if (detail::is_hop_by_hop(name) || detail::contains_token(resp_conn_tokens, name)) continue;
+            // We stream the body, so the upstream Content-Length is replaced by our
+            // own framing — except for HEAD, whose response carries the headers a
+            // GET would have produced and no body at all.
+            if (name == "content-length" && req->method() != Method::Head) continue;
+            res->header(name, value);
         }
-    }
-    // A 204/304 or HEAD-style response has no body regardless of headers.
-    bool bodyless = (bhead.status == 204 || bhead.status == 304 ||
-                     (req->method() == Method::Head));
 
-    // --- start the client response with filtered headers ---
-    res->status(bhead.status);
-    auto resp_conn_tokens = detail::connection_tokens(bhead.headers);
-    for (const auto& [name, value] : bhead.headers) {
-        if (detail::is_hop_by_hop(name) || detail::contains_token(resp_conn_tokens, name)) continue;
-        // We stream the body, so the upstream Content-Length is replaced by our own
-        // framing - except for HEAD, whose response carries the headers a GET would
-        // have produced (Content-Length included) and no body at all.
-        if (name == "content-length" && req->method() != Method::Head) continue;
-        res->header(name, value);
-    }
-    if (bodyless) {
-        // Nothing follows the headers: no framing, no terminating chunk, no body.
-        // The connection sits at a well-defined boundary, so it can be reused.
-        (void)co_await res->send_bodyless();
-        detail::UpstreamPool::instance().put(executor, target.host, target.port, std::move(backend));
-        co_return;
-    }
+        if (head->bodyless) {
+            // Nothing follows the head (HEAD, 204/304): no framing, no terminator.
+            (void)co_await res->send_bodyless();
+            co_return;
+        }
+        if (auto ec = co_await res->begin(); ec) {
+            stream->cancel();  // the frontend went away; stop paying for the upstream
+            co_return;
+        }
 
-    if (auto ec = co_await res->begin(); ec) {
-        // Client went away; nothing more to do.
-        backend->close();
-        co_return;
-    }
-
-    // Helper: read more bytes from the backend into `leftover`. Returns false on
-    // EOF/error.
-    auto pump_more = [&backend, &leftover]() -> asio::awaitable<bool> {
-        std::array<std::byte, 8192> tmp;  // no init: read_some fills [0,n)
-        auto [ec, n] = co_await backend->async_read_some(asio::buffer(tmp.data(), tmp.size()),
-                                                         asio::as_tuple(asio::use_awaitable));
-        if (ec || n == 0) co_return false;
-        leftover.append(reinterpret_cast<const char*>(tmp.data()), n);
-        co_return true;
-    };
-
-    // An upstream that stops mid-body must not be reported to the client as a
-    // complete response: finishing cleanly hands the client a truncated body with a
-    // valid terminator and no error. Abort instead - HTTP/1.x closes the connection
-    // (so the response has no terminating chunk), HTTP/2 resets the stream - and the
-    // client sees the failure.
-    auto abort_truncated = [&res, &backend](const char* why) -> asio::awaitable<void> {
-        SIMPLE_HTTP_ERROR_LOG("http-proxy: {}; aborting the client response", why);
-        res->close();
-        backend->close();
-        co_return;
-    };
-    bool body_complete = false;
-
-    // --- stream the response body back to the client ---
-    if (resp_chunked) {
-        // Decode chunked from the backend and re-emit as opaque chunks to the client.
         for (;;) {
-            // read a size line
-            std::size_t nl;
-            while ((nl = leftover.find('\n')) == std::string::npos) {
-                if (!co_await pump_more()) {
-                    co_await abort_truncated("upstream ended inside a chunk header");
-                    co_return;
-                }
-            }
-            std::string size_line = leftover.substr(0, nl);
-            leftover.erase(0, nl + 1);
-            if (!size_line.empty() && size_line.back() == '\r') size_line.pop_back();
-            if (auto semi = size_line.find(';'); semi != std::string::npos) size_line.resize(semi);
-            std::uint64_t chunk_len = 0;
-            bool ok = !size_line.empty();
-            for (char c : size_line) {
-                unsigned d;
-                if (c >= '0' && c <= '9') d = static_cast<unsigned>(c - '0');
-                else if (c >= 'a' && c <= 'f') d = 10u + static_cast<unsigned>(c - 'a');
-                else if (c >= 'A' && c <= 'F') d = 10u + static_cast<unsigned>(c - 'A');
-                else { ok = false; break; }
-                chunk_len = chunk_len * 16 + d;
-            }
-            if (!ok) {
-                co_await abort_truncated("malformed chunk size line from upstream");
+            auto chunk = co_await stream->read();
+            if (!chunk) {
+                // An upstream that stops mid-body must not be reported to the
+                // frontend as a complete response: abort instead of finishing
+                // cleanly (HTTP/1.x closes, HTTP/2 resets the stream).
+                SIMPLE_HTTP_ERROR_LOG("http-proxy: {}:{} failed mid-body ({}), aborting the response",
+                                      target.host,
+                                      target.port,
+                                      chunk.error().message());
+                res->close();
                 co_return;
             }
-            if (chunk_len == 0) {
-                // consume trailer up to blank line
-                for (;;) {
-                    std::size_t tnl;
-                    while ((tnl = leftover.find('\n')) == std::string::npos) {
-                        if (!co_await pump_more()) break;
-                    }
-                    if ((tnl = leftover.find('\n')) == std::string::npos) break;
-                    std::string tline = leftover.substr(0, tnl);
-                    leftover.erase(0, tnl + 1);
-                    if (!tline.empty() && tline.back() == '\r') tline.pop_back();
-                    if (tline.empty()) {
-                        body_complete = true;  // trailers terminated: the body is whole
-                        break;
-                    }
-                }
-                break;
+            if (chunk->eof) break;
+            if (auto ec = co_await res->write(std::move(chunk->data)); ec) {
+                stream->cancel();
+                co_return;
             }
-            // read chunk_len bytes + trailing CRLF
-            while (leftover.size() < chunk_len + 2) {
-                if (!co_await pump_more()) break;
-            }
-            if (leftover.size() < chunk_len) break;
-            std::string data = leftover.substr(0, static_cast<std::size_t>(chunk_len));
-            leftover.erase(0, static_cast<std::size_t>(chunk_len));
-            // strip trailing CRLF if present
-            if (leftover.size() >= 2 && leftover[0] == '\r' && leftover[1] == '\n') leftover.erase(0, 2);
-            if (auto ec = co_await res->write(std::move(data)); ec) { backend->close(); co_return; }
         }
-    } else if (resp_has_length) {
-        std::uint64_t remaining = resp_length;
-        // emit whatever is already buffered
-        while (remaining > 0) {
-            if (leftover.empty()) {
-                if (!co_await pump_more()) break;
-            }
-            std::size_t take = static_cast<std::size_t>(
-                std::min<std::uint64_t>(remaining, leftover.size()));
-            std::string data = leftover.substr(0, take);
-            leftover.erase(0, take);
-            remaining -= take;
-            if (auto ec = co_await res->write(std::move(data)); ec) { backend->close(); co_return; }
-        }
-        body_complete = (remaining == 0);  // a short read means the upstream was cut off
-    } else {
-        // No length, no chunked: body runs until the backend closes (we sent
-        // Connection: close so the backend does too).
-        for (;;) {
-            if (!leftover.empty()) {
-                std::string data = std::move(leftover);
-                leftover.clear();
-                if (auto ec = co_await res->write(std::move(data)); ec) { backend->close(); co_return; }
-            }
-            if (!co_await pump_more()) break;
-        }
-        body_complete = true;  // no length was announced: the close *is* the terminator
-    }
-
-    // Only a response with an explicit end (Content-Length or chunked) leaves the
-    // connection at a known boundary. An EOF-delimited body does not, so that
-    // connection is closed instead of pooled.
-    const bool poolable = body_complete && (resp_chunked || resp_has_length);
-
-    if (body_complete) {
         (void)co_await res->finish();
-    } else {
-        co_await abort_truncated("upstream body truncated");
-    }
-    if (poolable) {
-        detail::UpstreamPool::instance().put(executor, target.host, target.port, std::move(backend));
-    } else {
-        backend->close();
+        co_return;
     }
     co_return;
 }

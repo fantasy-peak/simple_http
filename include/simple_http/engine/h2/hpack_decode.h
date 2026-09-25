@@ -5,14 +5,24 @@
 // The decoding *algorithm* is adapted from paozhu's http2parse::headertype1..4
 // (vendor/httpserver/http2_parse.cpp): the same prefix-bit dispatch, HPACK
 // integer decoding, Huffman string decoding and the dynamic-table maintenance
-// (push_front + a fixed 255-entry cap). paozhu wrote decoded fields straight
-// into its httppeer god-object; this version instead returns a plain list of
-// (name, value) pairs and owns a per-connection dynamic table, so it depends
-// only on the standard library and the ported Huffman codec.
+// (newest entry first). paozhu wrote decoded fields straight into its httppeer
+// god-object; this version instead returns a plain list of (name, value) pairs
+// and owns a per-connection dynamic table, so it depends only on the standard
+// library and the ported Huffman codec.
+//
+// The dynamic table is accounted in *bytes* (RFC 7541 §4.1: each entry costs
+// name + value + 32) against the size this decoder advertised in
+// SETTINGS_HEADER_TABLE_SIZE, and it honours a Dynamic Table Size Update (§6.3).
+// That matters beyond tidiness: an entry larger than the table must empty the
+// table and *not* be inserted (§4.4), so a peer that sends a big cookie and we
+// insert it anyway would shift every later dynamic index and silently hand back
+// the wrong header values. (Byte accounting also makes the previous fixed
+// 255-entry cap unnecessary; it is kept only as a belt-and-braces bound.)
 //
 // One HpackDecoder instance lives per HTTP/2 connection (the dynamic table is
 // connection-scoped and shared across streams, per the spec).
 
+#include <algorithm>
 #include <cstdint>
 #include <list>
 #include <string>
@@ -49,8 +59,21 @@ class HpackDecoder {
 
     unsigned int last_error() const { return m_error; }
 
-    // Dynamic-table maximum entry count (paozhu uses a fixed 255-entry cap
-    // rather than the RFC byte-size accounting).
+    // The size advertised in SETTINGS_HEADER_TABLE_SIZE: the largest dynamic
+    // table the peer may keep. A size update above it is a compression error
+    // (RFC 7541 §4.2), so the value must be set before decoding begins.
+    void set_max_table_size(std::size_t bytes) {
+        m_advertised_max = bytes;
+        m_max_size = bytes;
+    }
+
+    std::size_t max_table_size() const { return m_advertised_max; }
+    // Bytes currently occupied by the dynamic table.
+    std::size_t dynamic_table_size() const { return m_size; }
+
+    // Dynamic-table entry cap, a belt-and-braces bound on top of the RFC byte
+    // accounting (an entry can never be smaller than 32 bytes, so a legitimate
+    // table cannot exceed the size limit / 32 entries).
     static constexpr std::size_t kDynamicTableMaxEntries = 255;
 
   private:
@@ -67,7 +90,13 @@ class HpackDecoder {
 
     void dynamic_insert(std::string name, std::string value);
 
+    // Drops the oldest entries until the table fits in `m_max_size` (§4.3).
+    void evict_to_fit();
+
     std::list<std::pair<std::string, std::string>> m_dynamic;  // most-recent at front
+    std::size_t m_max_size = 4096;         // current table budget (may be lowered by a size update)
+    std::size_t m_advertised_max = 4096;   // what we advertised; a size update may not exceed it
+    std::size_t m_size = 0;                // bytes occupied (name + value + 32 per entry)
     unsigned int m_error = 0;
 };
 
@@ -161,8 +190,26 @@ inline bool HpackDecoder::resolve_index(uint64_t index, std::string& name, std::
 }
 
 inline void HpackDecoder::dynamic_insert(std::string name, std::string value) {
+    // RFC 7541 §4.1: an entry costs 32 bytes plus the name and value lengths.
+    const std::size_t entry_size = name.size() + value.size() + 32;
+    // §4.4: an entry larger than the whole table empties the table and is *not*
+    // inserted. Skipping this is what makes a later dynamic index point at the
+    // wrong entry, so the peer and we would disagree silently.
+    if (entry_size > m_max_size) {
+        m_dynamic.clear();
+        m_size = 0;
+        return;
+    }
+    m_size += entry_size;
     m_dynamic.push_front({std::move(name), std::move(value)});
-    if (m_dynamic.size() > kDynamicTableMaxEntries) {
+    evict_to_fit();
+}
+
+inline void HpackDecoder::evict_to_fit() {
+    while ((!m_dynamic.empty() && m_size > m_max_size) || m_dynamic.size() > kDynamicTableMaxEntries) {
+        const auto& oldest = m_dynamic.back();
+        const std::size_t entry_size = oldest.first.size() + oldest.second.size() + 32;
+        m_size -= std::min(m_size, entry_size);
         m_dynamic.pop_back();
     }
 }
@@ -203,11 +250,19 @@ inline bool HpackDecoder::decode(std::string_view block, std::vector<HpackHeader
             out.push_back({name, value});
             dynamic_insert(std::move(name), std::move(value));
         } else if (c & 0x20) {
-            // 6.3 Dynamic Table Size Update: 001xxxxx — read and ignore the size
-            // (paozhu uses a fixed entry-count cap and does not honor byte sizes).
+            // 6.3 Dynamic Table Size Update: 001xxxxx. The encoder tells us how
+            // much of the table it will use; anything above what we advertised
+            // is a compression error (§4.2), and lowering it evicts entries
+            // immediately (§4.3).
             pos += 1;
             uint64_t size = 0;
             if (!decode_integer(block, pos, 5, size)) return false;
+            if (size > m_advertised_max) {
+                m_error = 40160;
+                return false;
+            }
+            m_max_size = static_cast<std::size_t>(size);
+            evict_to_fit();
         } else {
             // 6.2.2 (0000xxxx) without indexing / 6.2.3 (0001xxxx) never indexed:
             // both use a 4-bit index prefix and are not added to the dynamic table.

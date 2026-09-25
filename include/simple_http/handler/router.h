@@ -17,6 +17,7 @@
 #include <boost/asio/awaitable.hpp>
 #include <boost/beast/http/status.hpp>
 
+#include "../client/http_client.h"  // HttpClient (reverse-proxy upstreams)
 #include "../core/logging.h"
 #include "../engine/dispatcher.h"  // WsProxyTarget, HttpProxyTarget
 #include "handler.h"
@@ -37,6 +38,12 @@ namespace http = boost::beast::http;
 
 class Router {
   public:
+    // `proxy_client` configures the client used by reverse-proxy routes: TLS
+    // policy for HTTPS backends (CA bundle, client certificate for mTLS, whether
+    // to verify), timeouts and pool sizing. The default suits public backends.
+    explicit Router(ClientConfig proxy_client = {})
+        : m_http_client(std::make_shared<HttpClient>(std::move(proxy_client))) {}
+
     // --- registration (fluent) ---
     template <typename F>
     Router& route(std::string path, F&& handler) {
@@ -195,7 +202,8 @@ class Router {
         // HTTP reverse-proxy routes take precedence over local handlers.
         if (auto target = find_http_proxy(path)) {
             bool client_is_tls = ssl.has_value() && *ssl != nullptr;
-            co_await run_http_proxy(std::move(req), std::move(res), client_is_tls, std::move(*target));
+            co_await run_http_proxy(std::move(req), std::move(res), client_is_tls, std::move(*target),
+                                    *m_http_client);
             co_return;
         }
 
@@ -269,6 +277,10 @@ class Router {
     std::vector<std::pair<simple_http_regex::regex, WsProxyTarget>> m_ws_proxy_regex;
 
     std::unordered_map<std::string, HttpProxyTarget, string_hash, std::equal_to<>> m_http_proxy_exact;
+    // One client for every proxy route: it owns the upstream connection pool and
+    // the TLS context, and serves any number of origins (the target carries the
+    // origin per request).
+    std::shared_ptr<HttpClient> m_http_client;
     std::vector<std::pair<simple_http_regex::regex, HttpProxyTarget>> m_http_proxy_regex;
 };
 

@@ -58,15 +58,23 @@ using WsProxyLookup = std::function<std::optional<WsProxyTarget>(std::string_vie
 
 // A backend a plain HTTP request should be reverse-proxied to (request-level
 // proxy). Unlike WsProxyTarget this is per-request: for each matching request
-// the proxy opens a TCP connection to host:port, forwards the request (with the
-// standard X-Forwarded-* headers added and hop-by-hop headers stripped), then
-// streams the backend's response back to the client. rewrite_path works like
-// WsProxyTarget's: a substitution template ($0/$1..$9/$$) for regex routes, or
-// a verbatim replacement for exact routes; empty keeps the original target.
+// the proxy takes an upstream connection to host:port (from the client layer's
+// pool), forwards the request (with the standard X-Forwarded-* headers added and
+// hop-by-hop headers stripped), then streams the backend's response back to the
+// client. rewrite_path works like WsProxyTarget's: a substitution template
+// ($0/$1..$9/$$) for regex routes, or a verbatim replacement for exact routes;
+// empty keeps the original target.
 struct HttpProxyTarget {
     std::string host;
     std::uint16_t port{0};
     std::string rewrite_path;
+    // Backend over TLS. ALPN then decides h2 vs HTTP/1.1, so an https backend
+    // gets HTTP/2 for free when it offers it.
+    bool tls{false};
+    // Plaintext backend that speaks HTTP/2: the first request on a connection
+    // carries `Upgrade: h2c` (one extra round trip); a backend that ignores it
+    // answers over HTTP/1.1 as usual. Ignored when `tls` is set.
+    bool h2c{false};
 };
 
 // Looks up an HTTP proxy backend for a request path; empty if the path is not a

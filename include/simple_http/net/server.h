@@ -51,6 +51,10 @@ struct ServerConfig {
     bool tcp_nodelay{true};
     // All protocol-engine tunables (timeouts, size caps, HTTP/2 windows/streams).
     EngineLimits limits{};
+    // Policy for the client that reverse-proxy routes (`http_proxy*`) use: TLS
+    // trust and client certificates for HTTPS backends, timeouts, pool sizing.
+    // Defaults suit public backends (system CA, verification on).
+    ClientConfig proxy_client{};
     // Optional per-accepted-socket hook (TCP_NODELAY / keepalive / buffer sizes …).
     // Invoked right after accept, before the transport or TLS handshake touches the
     // socket. Use the error_code overloads of set_option to avoid throwing.
@@ -62,7 +66,7 @@ class Server {
     explicit Server(ServerConfig config)
         : m_config(std::move(config)),
           m_pool(std::make_shared<IoCtxPool>(m_config.worker_threads == 0 ? 1 : m_config.worker_threads)),
-          m_router(std::make_shared<Router>()) {
+          m_router(std::make_shared<Router>(m_config.proxy_client)) {
         if (m_config.tls) {
             m_tls.emplace(*m_config.tls);
         }
@@ -128,18 +132,25 @@ class Server {
     // --- HTTP reverse-proxy route registration (request-level) ---
     // A matching request on `path` is forwarded to the backend host:port with the
     // standard X-Forwarded-* headers added and hop-by-hop headers stripped, and
-    // the backend's response streamed back. Works for HTTP/1.x, h2c and HTTP/2
-    // clients (the backend connection is always HTTP/1.1). rewrite_path rewrites
-    // the request target; for the regex form it is a substitution template
-    // ($1..$9 capture groups).
+    // the backend's response streamed back. The frontend may be HTTP/1.x, h2c or
+    // HTTP/2 — the re-framing is version-agnostic. rewrite_path rewrites the
+    // request target; for the regex form it is a substitution template ($1..$9
+    // capture groups). The short form proxies to a plaintext HTTP/1.1 backend;
+    // pass an HttpProxyTarget to reach a TLS (ALPN picks h2 when the backend
+    // offers it) or h2c backend instead.
     Server& http_proxy(std::string path, std::string host, std::uint16_t port, std::string rewrite_path = {}) {
-        m_router->http_proxy(std::move(path),
-                             HttpProxyTarget{std::move(host), port, std::move(rewrite_path)});
-        return *this;
+        return http_proxy(std::move(path), HttpProxyTarget{std::move(host), port, std::move(rewrite_path)});
     }
     Server& http_proxy_regex(const std::string& pattern, std::string host, std::uint16_t port,
                              std::string rewrite_path = {}) {
-        m_router->http_proxy_regex(pattern, HttpProxyTarget{std::move(host), port, std::move(rewrite_path)});
+        return http_proxy_regex(pattern, HttpProxyTarget{std::move(host), port, std::move(rewrite_path)});
+    }
+    Server& http_proxy(std::string path, HttpProxyTarget target) {
+        m_router->http_proxy(std::move(path), std::move(target));
+        return *this;
+    }
+    Server& http_proxy_regex(const std::string& pattern, HttpProxyTarget target) {
+        m_router->http_proxy_regex(pattern, std::move(target));
         return *this;
     }
 

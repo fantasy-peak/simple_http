@@ -1,7 +1,8 @@
 #pragma once
 
 // simple_http: a header-only HTTP/1.x + HTTP/2 (+ optional HTTP/3, WebSocket)
-// server, organized as a layered architecture under include/simple_http/:
+// server and client, organized as a layered architecture under
+// include/simple_http/:
 //
 //   core/       protocol-agnostic primitives (types, logging, io pool, base64)
 //   proto/      HTTP request/response model + the ResponseSink abstraction
@@ -10,6 +11,7 @@
 //   handler/    handler type system, router and dispatch
 //   net/        listeners and connection protocol detection
 //   server.h    the Server facade
+//   client/     outbound HTTP client (h1/h2, plaintext/TLS, pooling, h2c)
 //
 // This umbrella header aggregates the public API. During the ongoing rewrite it
 // grows layer by layer; see the task list for progress.
@@ -48,3 +50,6 @@
 // --- net layer (protocol detection + server facade) ---
 #include "simple_http/net/connection.h"
 #include "simple_http/net/server.h"
+
+// --- client layer (outbound requests; HTTP/1.1 + HTTP/2 over TCP/TLS) ---
+#include "simple_http/client/client.h"
