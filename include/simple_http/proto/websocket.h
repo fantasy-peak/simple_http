@@ -11,7 +11,7 @@
 //   co_await ws->write_binary(bytes);
 //
 // This is the beast-free implementation: the wire codec is hand-written in
-// ws_frame.h (ported from paozhu's websockets_parse.cpp) and reads/writes bytes
+// ws_frame.h and reads/writes bytes
 // straight through the simple_http Transport concept (async_read_some /
 // async_write). No boost::beast::websocket::stream.
 //
@@ -177,9 +177,17 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
             // A complete frame was decoded.
             switch (frame.opcode) {
                 case WsOpcode::Close:
-                    // Answer with a Close (echoing status if present) and stop.
+                    // Answer with a Close and stop (RFC 6455 §5.5.1). The reply
+                    // must be on the wire before the engine tears the transport
+                    // down, and the engine only waits inside close() - which is a
+                    // no-op once m_open is false - so this waits for the pump here.
                     m_open = false;
-                    co_await enqueue_control(WsOpcode::Close, ws_close_payload(), /*close_after=*/true);
+                    {
+                        auto done = std::make_shared<ResultChannel>(m_executor, 1);
+                        m_pending.push_back(make_req(WsOpcode::Close, ws_close_payload(), done, /*close_after=*/true));
+                        (void)m_notify.try_send(error_code{});
+                        co_await done->async_receive(asio::as_tuple(asio::use_awaitable));
+                    }
                     co_return std::unexpected(make_error_code(asio::error::eof));
 
                 case WsOpcode::Ping:

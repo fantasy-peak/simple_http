@@ -2,9 +2,9 @@
 
 // HTTP/2 frame constants and the 9-octet frame header (RFC 7540 §4.1),
 // framework-free. The frame-type / flag / settings / error enumerations and the
-// big-endian header layout mirror paozhu (vendor/httpserver/http2_parse.h and
-// http2_frame.h); here they are expressed as plain constants plus a small
-// parse/serialize pair over std::string_view, with no Asio or httppeer coupling.
+// big-endian header layout follow RFC 7540 §6; they are expressed as plain
+// constants plus a small parse/serialize pair over std::string_view, with no Asio
+// coupling.
 
 #include <cstddef>
 #include <cstdint>

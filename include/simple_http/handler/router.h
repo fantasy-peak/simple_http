@@ -4,7 +4,7 @@
 //
 // Matching order: exact path map -> regex list (first match) -> fallback.
 // Optional `before` and `cors` filters run first and may short-circuit. The
-// Router's dispatch(Request&, Response&, SslHandle) satisfies the engine's
+// Router's dispatch(shared_ptr<Request>, shared_ptr<Response>, SslHandle) matches the engine's
 // Dispatcher type, so the same router serves every protocol version.
 
 #include <optional>

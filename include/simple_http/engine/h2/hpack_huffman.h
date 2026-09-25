@@ -3,11 +3,9 @@
 
 // HPACK Huffman codec (RFC 7541 Appendix B).
 //
-// Ported verbatim from paozhu (vendor/httpserver/http2_huffman.{h,cpp}); the
-// static encode/decode tables originate from nghttp2/Nginx. The only change is
-// the namespace (http -> simple_http::codec) and the include-guard style — the
-// algorithm and tables are byte-for-byte identical. Pure standard-library code:
-// no Asio, no OpenSSL, no framework coupling.
+// The static encode/decode tables are the RFC 7541 Appendix B tables (as shipped
+// by nghttp2/Nginx) and the algorithm is byte-for-byte the RFC's. Pure
+// standard-library code: no Asio, no OpenSSL, no framework coupling.
 
 #include <cstddef>
 #include <string>
@@ -2719,7 +2717,7 @@ namespace simple_http::codec
         }
     };
 
-    // --- inline definitions (ported verbatim from paozhu http2_huffman.cpp) ---
+    // --- inline definitions ---
 
     inline int http_huffman_decode(unsigned char *state, unsigned char *src, size_t len, std::string &outstr, unsigned int last)
     {

@@ -7,7 +7,7 @@
 ![C++ Standard](https://img.shields.io/badge/C%2B%2B-20%2F23%2F26-blue.svg)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-`simple_http` is a lightweight, asynchronous HTTP/1.1 & HTTP/2 framework for C++20/23/26. Built upon **Boost.Beast** and **nghttp2**, it leverages modern C++ coroutines to provide a clean, high-performance API for both servers and clients.
+`simple_http` is a lightweight, asynchronous HTTP/1.1 & HTTP/2 framework for C++20/23/26. Built on **Boost.Asio** and **OpenSSL**, with its own HTTP/1.1, HTTP/2 and WebSocket codecs (no Beast/nghttp2 on the wire), it uses modern C++ coroutines to provide a clean, high-performance API for both servers and clients.
 
 ---
 
@@ -29,12 +29,13 @@
 - **📦 Header-only**: Simple to integrate; just include and go.
 - **🛡️ Modern C++**: Built with C++20/23/26 coroutines for intuitive async logic.
 - **🔄 Dual Protocol**: Seamless HTTP/1.1 & HTTP/2 support with ALPN negotiation.
-- **🔄 Server & Client**: Symmetrical API design for both roles.
+- **🔄 Server & Client**: Symmetrical API design for both roles — the client speaks http/https over HTTP/1.1 and HTTP/2, negotiating via ALPN or h2c.
 - **🔒 Secure**: Robust HTTPS and mTLS (Mutual TLS) support.
 - **🔌 Advanced Transport**: Supports **IPv4/IPv6** and **UNIX Domain Sockets** for high-speed local IPC.
 - **🧩 Middleware**: Flexible `setBefore` interceptors for pre-processing.
-- **🌊 Full Streaming**: Bi-directional streaming for client and server.
-- **🌐 Proxy**: Built-in client-side HTTP proxy support.
+- **🌊 Full Streaming**: Bi-directional streaming for client and server, with flow-control backpressure.
+- **♻️ Client Connections**: Keep-alive pooling, and HTTP/2 stream multiplexing on one connection.
+- **🌐 Proxy**: Built-in reverse proxy (request-level, streaming) with WebSocket pass-through; upstreams go through the client layer, so a backend may be plaintext or TLS and speaks HTTP/1.1 or HTTP/2.
 
 ---
 
@@ -125,83 +126,51 @@ int main() {
 <summary><b>Click to view Full Client Example</b></summary>
 
 ```cpp
-import std;
-import simple_http;
+#include <simple_http.h>
 
-asio::awaitable<void> client(simple_http::IoCtxPool& pool) {
-    simple_http::HttpClientConfig cfg{
-        .host = "127.0.0.1",
-        .port = 7788,
-        .concurrent_streams = 200,
-        .use_tls = true,
-        .verify_peer = true,
-        .ssl_ca = "./test/tls_certificates/ca_cert.pem",
-        .ssl_crt = "./test/tls_certificates/client_cert.pem",
-        .ssl_key = "./test/tls_certificates/client_key.pem",
-        .ssl_context = nullptr,
-        .tlsext_host_name = "SimpleHttpServer",
-    };
-    auto client = std::make_shared<simple_http::Http2Client>(cfg, pool.getIoContextPtr());
-    auto [ret, err] = co_await client->asyncStart(std::chrono::seconds(5), asio::use_awaitable);
-    if (!ret) {
-        std::println("{}", err);
+// The client negotiates the protocol itself: ALPN over TLS ("h2" or
+// "http/1.1"), h2c over plaintext (an Upgrade round trip, or prior knowledge).
+asio::awaitable<void> client() {
+    // One-shot: a whole response, with the body bounded by the request budget.
+    simple_http::HttpClient http;
+    auto r = co_await http.get("https://example.com/index.html");
+    if (!r) {
+        std::println("{}", r.error().message());
         co_return;
     }
-    std::vector<std::pair<std::string, std::string>> headers{{"test", "hello"}};
-    auto stream_spec = std::make_shared<simple_http::StreamSpec>(simple_http::http::verb::post, "/hello", headers);
-    auto opt = co_await client->openStream(stream_spec, asio::use_awaitable);
-    if (!opt) {
-        co_return;
-    }
-    auto& [w, r] = opt.value();
-    w->writerBody("hello", simple_http::WriteMode::More);
-    w->writerBody("client", simple_http::WriteMode::Last);
-    auto [ec, d] = co_await r->asyncReadDataFrame();
-    if (std::holds_alternative<simple_http::ParseHeaderDone>(d)) {
-        std::println("recv ParseHeaderDone");
-    }
-    for (;;) {
-        auto [ec, d] = co_await r->asyncReadDataFrame();
-        if (ec) {
-            std::println("read error: {}", ec.message());
-            break;
-        }
-        bool should_continue = std::visit(simple_http::overloaded{
-            [](std::string str) {
-                std::println("recv data: {}", str);
-                return true;
-            },
-            [](simple_http::Eof) { return false; },
-            [](simple_http::Disconnect) { return false; },
-            [](simple_http::ParseHeaderDone) { return false; }}
-        , std::move(d));
-        if (!should_continue) {
-            break;
-        }
-    }
-    co_return;
-}
+    std::println("{} {} ({} bytes)", r->status, std::string{to_string(r->version)}, r->body.size());
 
-int main() {
-    simple_http::LOG_CB = [](simple_http::LogLevel level, auto file, auto line, std::string msg) {
-        std::println("{} {} {} {}", to_string(level), file, line, msg);
-    };
-    simple_http::IoCtxPool pool{1};
-    pool.start();
-    asio::co_spawn(pool.getIoContext(), client(pool), [](const std::exception_ptr& ep) {
-        try {
-            if (ep) std::rethrow_exception(ep);
-        } catch (const std::exception& e) {
-            SIMPLE_HTTP_ERROR_LOG("{}", e.what());
-        } catch (...) {
-            SIMPLE_HTTP_ERROR_LOG("unknown exception");
-        }
-    });
-    while (true)
-        sleep(1000);
-    return 0;
+    // Session: one connection, streamed bodies both ways. On HTTP/2 the streams
+    // are multiplexed, so several of these can be open at once.
+    simple_http::ClientTarget target;
+    target.host = "127.0.0.1";
+    target.port = 7789;
+    target.use_tls = true;
+    auto session = co_await http.connect(target);
+    if (!session) co_return;
+
+    simple_http::RequestSpec spec;
+    spec.method = simple_http::Method::Post;
+    spec.target = "/upload";
+    spec.stream_body = true;  // chunked on HTTP/1.1, DATA frames on HTTP/2
+    auto stream = co_await (*session)->open_stream(spec);
+    if (!stream) co_return;
+
+    co_await (*stream)->write("hello ");     // body chunks…
+    co_await (*stream)->finish("client");    // …and the end of the body
+    auto head = co_await (*stream)->read_head();   // status + headers
+    while (auto chunk = co_await (*stream)->read()) {  // then the body
+        if (chunk->eof) break;
+        std::println("recv: {}", chunk->data);
+    }
+    std::println("backend said {} {}", head->status, head->bodyless ? "(no body)" : "");
 }
 ```
+
+TLS details (SNI, CA bundle, name verification, client certificates for mTLS,
+the ALPN list, the minimum version) live in `simple_http::TlsClientConfig`;
+timeouts, limits and pool sizing in `simple_http::ClientConfig`. See
+[test/client.cpp](test/client.cpp) for the full matrix.
 </details>
 
 ---
@@ -209,7 +178,7 @@ int main() {
 ## 📦 Requirements
 - **C++20/23/26** (GCC 13+, Clang 20+)
 - **xmake** Used for building examples and dependency management.
-- **Dependencies**: Boost.Beast, nghttp2, OpenSSL
+- **Dependencies**: Boost.Asio, OpenSSL
 
 ## 🧪 C++20 Modules Support (Experimental)
 `simple_http` provides native C++20 Modules support via `include/simple_http.cppm`.
@@ -257,7 +226,6 @@ target("server")
 | Macro | Description |
 | :--- | :--- |
 | `SIMPLE_HTTP_EXPERIMENT_WEBSOCKET` | Enables experimental WebSocket support. |
-| `SIMPLE_HTTP_EXPERIMENT_HTTP2CLIENT` | Enables experimental HTTP/2 client support. |
 | `SIMPLE_HTTP_USE_BOOST_REGEX` | Uses `boost::regex` instead of `std::regex` for better performance. |
 | `SIMPLE_HTTP_BIND_UNIX_SOCKET` | Enables support for binding to UNIX Domain Sockets (UDS). |
 
@@ -265,7 +233,7 @@ target("server")
 
 ### 📂 More Examples
 - **[server.cpp](test/server.cpp)**: A full-featured server example.
-- **[client.cpp](test/client.cpp)**: A client example with HTTP/2.
+- **[client.cpp](test/client.cpp)**: The client's exercise program — it starts a server in-process and drives the client over http/https × HTTP/1.1/HTTP/2 (plus h2c, streaming, multiplexing and TLS verification). Run it with `xmake run client` from the repository root.
 
 ---
 
@@ -300,6 +268,21 @@ req/s           :     100.72      124.03      105.92        4.56    71.10%
 ---
 
 ## 🧪 Testing Guide
+
+Three self-contained suites (no external services needed):
+
+```bash
+xmake build unittest   && xmake run unittest     # unit tests (Catch2): parsers, HPACK, frames, routing, URLs
+xmake build regression && xmake run regression   # server regression: malformed/boundary requests over raw sockets
+xmake build client     && xmake run client       # client integration: protocol matrix, streaming, multiplexing, TLS
+```
+
+`unittest` and `regression` are Catch2 binaries (filter with e.g. `xmake run unittest "[h2]"`);
+`client` prints PASS/FAIL per check and exits non-zero on failure. All three are self-contained
+C++ — no Python or external services. `test/manual_http1_keepalive.py` is an optional manual
+cross-check with a third-party client (`pip install requests`, then `xmake run server`).
+
+Against the example server (`xmake run server`), with external clients:
 
 ```bash
 curl -N -v --http2-prior-knowledge http://localhost:7788/hello\?key1\=value1\&key2\=value2

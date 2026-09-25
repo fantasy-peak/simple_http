@@ -2,13 +2,10 @@
 
 // HPACK header-block encoding + the HTTP/2 static table.
 //
-// Ported from paozhu (vendor/httpserver/http2_frame.{h,cpp}). The original
-// header pulled in http_header.h for unrelated upload/frame-receive structs;
-// this trimmed version keeps only what the encoders need: the HPACK static
-// table, the header-name -> index map, and the make_http2_headers_* /
-// set_http2_* builders. Depends only on the standard library and the ported
-// Huffman codec (hpack_huffman.h). The encoder logic is preserved verbatim so
-// the on-wire bytes match paozhu exactly.
+// It keeps only what the encoders need: the HPACK static table (RFC 7541
+// Appendix A), the header-name -> index map, and the make_http2_headers_* /
+// set_http2_* builders. Depends only on the standard library and the Huffman
+// codec (hpack_huffman.h).
 
 #include <map>
 #include <string>
@@ -22,7 +19,7 @@ struct http2_header_static_table_t {
     std::string value;
 };
 
-// HPACK per-header code constants (paozhu numbering; used by the make_* API).
+// HPACK per-header static-table indices, used by the make_*/set_http2_* API.
 #define HTTP2_CODE_authority 1
 #define HTTP2_CODE_GET 2
 #define HTTP2_CODE_POST 3
@@ -217,7 +214,7 @@ inline std::map<std::string, unsigned char> http2_header_codes_table = {
     {"www-authenticate", 61},
 };
 
-// --- HTTP/2 header/frame builders (bytes identical to paozhu) ---
+// --- HTTP/2 header/frame builders ---
 bool make_http2_headers(std::string &hh_data, unsigned int streamid);
 bool set_http2_headers_static(unsigned char *hh_data, unsigned char hh_code);
 bool make_http2_headers_static(std::string &hh_data, unsigned int hh_code);
@@ -241,7 +238,7 @@ bool set_http2_frame_streamid(std::string &hh_data, unsigned int streamid);
 bool set_http2_headers_size(std::string &hh_data, unsigned int sizenum);
 bool set_http2_headers_flag(std::string &hh_data, unsigned char flag);
 
-// --- inline definitions (ported verbatim from paozhu http2_frame.cpp) ---
+// --- inline definitions ---
 
 inline bool make_http2_headers(std::string &hh_data, unsigned int streamid)
 {

@@ -2,13 +2,11 @@
 
 // HTTP/1.x head parsers — beast-free, incremental, byte-level.
 //
-// The parsing approach follows paozhu's httpparse (vendor/httpserver/
-// http_parse.cpp): scan the start line for its tokens, then split each header
-// line on the first ':' with leading-whitespace folding and a lowercased field
-// name. paozhu wrote everything into its httppeer god-object and also decoded
-// the query string; here the parsers stay minimal and framework-free — they fill
-// a small struct and leave body framing to the caller. They depend only on the
-// standard library and simple_http core types (no Asio, no Beast).
+// The parsing approach: scan the start line for its tokens, then split each
+// header line on the first ':' with leading-whitespace folding and a lowercased
+// field name. The parsers stay minimal and framework-free — they fill a small
+// struct and leave body framing (and the query string) to the caller. They depend
+// only on the standard library and simple_http core types (no Asio, no Beast).
 //
 // Two parsers share the line/field scanning below:
 //   * H1Parser         — the request head (method / target / version), used by
@@ -56,7 +54,7 @@ enum class FieldLine { Ok, Malformed, NameTooLong };
 
 // Parses one "name: value" field line into `out`: split on the first ':', skip
 // leading whitespace in the value, trim trailing OWS, lowercase the name (done
-// by Headers::add). Mirrors paozhu's process_header_line.
+// by Headers::add).
 inline FieldLine parse_field_line(std::string_view line, Headers& out) {
     std::size_t colon = line.find(':');
     if (colon == std::string_view::npos || colon == 0) {
@@ -208,8 +206,8 @@ class H1Parser {
         return true;
     }
 
-    // Header field parsing mirrors paozhu process_header_line: split on the
-    // first ':', skip leading spaces in the value, lowercase the field name.
+    // Header field parsing: split on the first ':', skip leading spaces in the
+    // value, lowercase the field name.
     bool parse_header_line(std::string_view line) {
         switch (h1_detail::parse_field_line(line, m_head.headers)) {
             case h1_detail::FieldLine::Ok:

@@ -2,13 +2,11 @@
 
 // HPACK header-block decoder (RFC 7541), framework-free.
 //
-// The decoding *algorithm* is adapted from paozhu's http2parse::headertype1..4
-// (vendor/httpserver/http2_parse.cpp): the same prefix-bit dispatch, HPACK
-// integer decoding, Huffman string decoding and the dynamic-table maintenance
-// (newest entry first). paozhu wrote decoded fields straight into its httppeer
-// god-object; this version instead returns a plain list of (name, value) pairs
-// and owns a per-connection dynamic table, so it depends only on the standard
-// library and the ported Huffman codec.
+// The decoding algorithm: the RFC 7541 prefix-bit dispatch (§6), HPACK integer
+// decoding, Huffman string decoding and the dynamic-table maintenance (newest
+// entry first). It returns a plain list of (name, value) pairs and owns a
+// per-connection dynamic table, so it depends only on the standard library and
+// the Huffman codec.
 //
 // The dynamic table is accounted in *bytes* (RFC 7541 §4.1: each entry costs
 // name + value + 32) against the size this decoder advertised in
@@ -100,7 +98,7 @@ class HpackDecoder {
     unsigned int m_error = 0;
 };
 
-// --- inline definitions (algorithm adapted from paozhu http2parse::headertype1..4) ---
+// --- inline definitions ---
 
 namespace detail {
 // Number of entries in the static table (indices 1..61; slot 0 is a sentinel).

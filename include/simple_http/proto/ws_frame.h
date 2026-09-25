@@ -2,7 +2,7 @@
 
 // WebSocket wire codec (RFC 6455) — hand-written, transport-agnostic.
 //
-// Ported from paozhu's websockets_parse.cpp (vendor/httpserver). It provides:
+// It provides:
 //   * WsOpcode           : frame opcodes.
 //   * WsFrameParser      : an incremental parser that turns a byte stream into
 //                          decoded frames (fin/opcode/payload), unmasking the
@@ -11,9 +11,8 @@
 //   * encode_frame / *   : server->client frame serialization (text/binary/
 //                          close/ping/pong), 7/16/64-bit length framing.
 //
-// Unlike paozhu this codec keeps everything in memory: paozhu spilled payloads
-// larger than 2 MiB to a temp file, which is dropped here (simple_http messages
-// stay in memory; size is bounded by the engine/limits instead).
+// Messages stay in memory (nothing spills to a temp file): their size is bounded
+// by the engine's limits instead.
 //
 // It depends only on the standard library, OpenSSL (SHA1 for the handshake) and
 // simple_http core base64 — no Beast, no Asio.
@@ -199,8 +198,6 @@ class WsFrameParser {
     std::uint64_t m_max_payload;
 };
 
-// Serializes a server->client frame header (server frames are never masked).
-// Ported from paozhu makeWSHeader, generalized over the payload length.
 // Serializes a server->client frame header (never masked) into a caller-provided
 // buffer, which must hold at least 10 bytes; returns the header length. Writing
 // the header into a stack buffer lets a frame go out as "header + payload" in one

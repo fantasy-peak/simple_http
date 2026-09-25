@@ -82,4 +82,21 @@ target("unittest")
     set_rundir(".")
 target_end()
 
+-- Server regression suite: raw sockets against an in-process server, sending the
+-- malformed and boundary cases a well-behaved client will not send.
+--   xmake build regression && xmake run regression
+target("regression")
+    set_kind("binary")
+    set_default(false)
+    on_load(function (target)
+        if target:toolchain("gcc") then
+            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete")
+        end
+    end)
+    add_deps("simple_http")
+    add_files("test/server_regression.cpp", "test/unit/main.cpp")
+    add_packages("catch2")
+    set_rundir(".")
+target_end()
+
 

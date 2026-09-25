@@ -53,11 +53,13 @@ std::string describe(const sh::error_code& ec) {
 // is how the stale-pooled-connection and EOF-delimited cases are produced.
 class FakeServer {
   public:
-    FakeServer(asio::io_context& ctx, std::string response, bool close_after = true, bool read_request = true)
+    FakeServer(asio::io_context& ctx, std::string response, bool close_after = true, bool read_request = true,
+               bool split_write = false)
         : m_acceptor(ctx, asio::ip::tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0)),
           m_response(std::move(response)),
           m_close_after(close_after),
-          m_read_request(read_request) {
+          m_read_request(read_request),
+          m_split_write(split_write) {
         m_port = m_acceptor.local_endpoint().port();
         accept();
     }
@@ -97,7 +99,22 @@ class FakeServer {
                     break;
             }
         }
-        co_await asio::async_write(*socket, asio::buffer(m_response), asio::as_tuple(asio::use_awaitable));
+        if (m_split_write) {
+            // Deliver it in small pieces: a head that arrives complete is parsed in
+            // one go, so only the incremental path can observe a running size check.
+            asio::steady_timer timer{socket->get_executor()};
+            for (std::size_t off = 0; off < m_response.size(); off += 32) {
+                const auto piece = std::string_view{m_response}.substr(off, 32);
+                auto [wec, wn] = co_await asio::async_write(*socket, asio::buffer(piece.data(), piece.size()),
+                                                            asio::as_tuple(asio::use_awaitable));
+                (void)wn;
+                if (wec) co_return;
+                timer.expires_after(std::chrono::milliseconds(1));
+                co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+            }
+        } else {
+            co_await asio::async_write(*socket, asio::buffer(m_response), asio::as_tuple(asio::use_awaitable));
+        }
         if (m_close_after) {
             sh::error_code ec;
             socket->shutdown(asio::ip::tcp::socket::shutdown_both, ec);
@@ -119,6 +136,7 @@ class FakeServer {
     std::string m_response;
     bool m_close_after;
     bool m_read_request;
+    bool m_split_write;
     std::uint16_t m_port{0};
 };
 
@@ -126,8 +144,9 @@ class FakeServer {
 // holding a pending accept cannot be destroyed while the test's io_context runs.
 std::vector<std::shared_ptr<FakeServer>> g_fakes;
 
-FakeServer& make_fake(asio::io_context& ctx, std::string response, bool close_after = true) {
-    g_fakes.push_back(std::make_shared<FakeServer>(ctx, std::move(response), close_after));
+FakeServer& make_fake(asio::io_context& ctx, std::string response, bool close_after = true, bool split_write = false) {
+    g_fakes.push_back(std::make_shared<FakeServer>(ctx, std::move(response), close_after, /*read_request=*/true,
+                                                   split_write));
     return *g_fakes.back();
 }
 
@@ -348,7 +367,7 @@ asio::awaitable<void> suite_protocol_matrix(std::uint16_t plain, std::uint16_t t
     co_return;
 }
 
-asio::awaitable<void> suite_framing(std::uint16_t plain) {
+asio::awaitable<void> suite_framing(std::uint16_t plain, asio::io_context& ctx) {
     std::printf("\n== framing ==\n");
     sh::HttpClient http{base_config()};
 
@@ -391,6 +410,114 @@ asio::awaitable<void> suite_framing(std::uint16_t plain) {
     auto before = http.stats().connections_opened;
     auto again = co_await http.get(url(plain, "/world"));
     check(again && http.stats().connections_opened == before, "keep-alive reuses the pooled connection");
+
+    // read() before read_head(): the head is cached, so asking for it later (and
+    // repeatedly) still reports the same thing.
+    {
+        sh::RequestSpec spec;
+        spec.target = "/world";
+        auto opened = co_await http.open_stream(url(plain, "/world"), spec);
+        if (!opened) {
+            check(false, "read_head-after-read could not start: " + describe(opened.error()));
+        } else {
+            auto stream = opened->stream;
+            auto first_chunk = co_await stream->read();  // body first, without the head
+            auto head = co_await stream->read_head();
+            auto head_again = co_await stream->read_head();
+            auto rest = co_await stream->read_all(4096);
+            const bool chunk_ok = first_chunk.has_value() && !first_chunk->eof;
+            check(chunk_ok && head && head_again && rest && head->status == 200 &&
+                      head_again->status == 200 && head->headers.get("content-length") == head_again->headers.get("content-length") &&
+                      stream->status() == 200,
+                  "read_head() is idempotent and works after read()");
+        }
+    }
+
+    // h2 bodyless responses (HEAD and 204) — the same rule as on the h1 path.
+    {
+        auto cfg = base_config();
+        cfg.default_version = sh::HttpVersionPolicy::Http2;
+        cfg.default_h2c = sh::H2cMode::PriorKnowledge;
+        sh::HttpClient h2_http{cfg};
+        sh::RequestSpec head;
+        head.method = sh::Method::Head;
+        head.target = "/big?n=2048";
+        auto head_res = co_await h2_http.request(url(plain, "/big?n=2048"), head);
+        check(head_res && head_res->status == 200 && head_res->body.empty() && head_res->bodyless,
+              "HEAD over HTTP/2 ends at the headers");
+        auto empty = co_await h2_http.get(url(plain, "/empty"));
+        check(empty && empty->status == 204 && empty->bodyless, "204 over HTTP/2 is bodyless");
+    }
+
+    // Pool TTL: an idle pooled connection is dropped (and a fresh one dialed) once
+    // its keep-alive window has passed.
+    {
+        auto cfg = base_config();
+        cfg.idle_pool_ttl = std::chrono::milliseconds(200);
+        sh::HttpClient ttl_http{cfg};
+        auto first = co_await ttl_http.get(url(plain, "/world"));
+        const auto after_first = ttl_http.stats().connections_opened;
+        asio::steady_timer timer{co_await asio::this_coro::executor};
+        timer.expires_after(std::chrono::milliseconds(500));  // outlive the pool TTL
+        co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+        auto second = co_await ttl_http.get(url(plain, "/world"));
+        check(second && ttl_http.stats().connections_opened == after_first + 1,
+              "a request after the pool TTL dials a fresh connection");
+    }
+
+    // The configuration hooks are actually used.
+    {
+        auto cfg = base_config();
+        int resolves = 0;
+        int setups = 0;
+        cfg.resolve = [&resolves](std::string host,
+                                  std::string port) -> asio::awaitable<std::pair<sh::error_code, std::vector<asio::ip::tcp::endpoint>>> {
+            ++resolves;
+            asio::ip::tcp::resolver resolver{co_await asio::this_coro::executor};
+            auto [ec, results] = co_await resolver.async_resolve(host, port, asio::as_tuple(asio::use_awaitable));
+            std::vector<asio::ip::tcp::endpoint> endpoints;
+            if (!ec) {
+                for (const auto& entry : results) endpoints.push_back(entry.endpoint());
+            }
+            co_return std::make_pair(ec, std::move(endpoints));
+        };
+        cfg.socket_setup = [&setups](asio::ip::tcp::socket& socket) {
+            ++setups;
+            sh::error_code ec;
+            socket.set_option(asio::ip::tcp::no_delay(true), ec);
+        };
+        sh::HttpClient hooked{cfg};
+        auto response = co_await hooked.get(url(plain, "/world"));
+        check(response && resolves == 1 && setups == 1, "resolve and socket_setup hooks are invoked");
+    }
+
+    // 304 is bodyless and its connection stays at a request boundary.
+    {
+        FakeServer& fake = make_fake(ctx, "HTTP/1.1 304 Not Modified\r\nETag: \"abc\"\r\n\r\n",
+                                     /*close_after=*/false);
+        auto cfg = base_config();
+        cfg.default_version = sh::HttpVersionPolicy::Http11;
+        cfg.default_h2c = sh::H2cMode::Off;
+        sh::HttpClient fake_http{cfg};
+        auto r = co_await fake_http.get(url(fake.port(), "/cached"));
+        check(r && r->status == 304 && r->bodyless && r->header("etag") == "\"abc\"",
+              "a 304 is bodyless and keeps its validators");
+    }
+
+    // An oversized response head is refused instead of buffered.
+    {
+        FakeServer& fake = make_fake(ctx,
+                                     "HTTP/1.1 200 OK\r\nx-pad: " + std::string(4096, 'p') + "\r\n\r\n",
+                                     /*close_after=*/false, /*split_write=*/true);
+        auto cfg = base_config();
+        cfg.default_version = sh::HttpVersionPolicy::Http11;
+        cfg.default_h2c = sh::H2cMode::Off;
+        cfg.limits.max_header_bytes = 1024;
+        sh::HttpClient capped{cfg};
+        auto r = co_await capped.get(url(fake.port(), "/big-head"));
+        check(!r && r.error() == sh::client_errc::header_too_large,
+              "an oversized response head is refused with header_too_large");
+    }
     co_return;
 }
 
@@ -431,6 +558,37 @@ asio::awaitable<void> suite_streaming(std::uint16_t plain) {
               std::string{"streamed upload (1 MiB) over "} +
                   (mode == sh::H2cMode::Upgrade ? "h2c upgrade" : "h2c prior knowledge") + " -> " +
                   (body ? *body : describe(body.error())));
+    }
+    // An 8 MiB streamed upload: many flow-control rounds, and the response must
+    // still match what the handler counted.
+    {
+        auto cfg = base_config();
+        cfg.default_version = sh::HttpVersionPolicy::Http2;
+        cfg.default_h2c = sh::H2cMode::PriorKnowledge;
+        sh::HttpClient big_http{cfg};
+        sh::RequestSpec spec;
+        spec.method = sh::Method::Post;
+        spec.target = "/drain";
+        spec.stream_body = true;
+        auto opened = co_await big_http.open_stream(url(plain, "/drain"), spec);
+        if (!opened) {
+            check(false, "8 MiB streamed upload could not start: " + describe(opened.error()));
+        } else {
+            std::size_t sent = 0;
+            for (int i = 0; i < 128; ++i) {  // 128 x 64 KiB
+                std::string chunk(64 * 1024, 'z');
+                sent += chunk.size();
+                if (auto ec = co_await opened->stream->write(std::move(chunk)); ec) {
+                    check(false, "8 MiB upload write failed: " + describe(ec));
+                    break;
+                }
+            }
+            if (auto ec = co_await opened->stream->finish(""); ec) check(false, "8 MiB finish failed: " + describe(ec));
+            auto body = co_await opened->stream->read_all(1024);
+            check(body && *body == "received " + std::to_string(sent) + " bytes",
+                  "an 8 MiB streamed upload is framed and counted correctly -> " +
+                      (body ? *body : describe(body.error())));
+        }
     }
     co_return;
 }
@@ -485,6 +643,50 @@ asio::awaitable<void> suite_h2_multiplex(std::uint16_t plain) {
     check(elapsed.count() < 16 * 300,
           "16 x /delay?ms=300 ran concurrently (" + std::to_string(elapsed.count()) + " ms, serial would be 4800 ms)");
     check(http.stats().connections_opened == 1, "all 16 streams shared one connection");
+
+    // The multiplexing limit is the peer's, not ours: 64 concurrent streams on
+    // the same connection, with a body written on each.
+    {
+        constexpr int kWide = 64;
+        auto ex2 = co_await asio::this_coro::executor;
+        asio::experimental::concurrent_channel<void(sh::error_code)> done2{ex2, kWide};
+        for (int i = 0; i < kWide; ++i) {
+            asio::co_spawn(
+                ex2,
+                [&, session, i]() -> asio::awaitable<void> {  // i by value: the coroutine outlives the loop body
+                    sh::RequestSpec spec;
+                    spec.method = sh::Method::Post;
+                    spec.target = "/echo";
+                    spec.body = "stream-" + std::to_string(i);
+                    auto stream = co_await (*session)->open_stream(spec);
+                    if (!stream) {
+                        std::printf("  stream %d: open failed: %s\n", i, describe(stream.error()).c_str());
+                        (void)done2.try_send(stream.error());
+                        co_return;
+                    }
+                    auto body = co_await (*stream)->read_all(1024);
+                    const bool ok = body && *body == "stream-" + std::to_string(i);
+                    if (!ok) {
+                        std::printf("  stream %d: read failed: %s\n", i,
+                                    body ? ("body='" + *body + "'").c_str() : describe(body.error()).c_str());
+                    }
+                    (void)done2.try_send(ok ? sh::error_code{} : sh::make_error_code(sh::client_errc::protocol_error));
+                    co_return;
+                },
+                asio::detached);
+        }
+        int wide_failures = 0;
+        std::string first_error;
+        for (int i = 0; i < kWide; ++i) {
+            auto [ec] = co_await done2.async_receive(asio::as_tuple(asio::use_awaitable));
+            if (ec) {
+                ++wide_failures;
+                if (first_error.empty()) first_error = describe(ec);
+            }
+        }
+        check(wide_failures == 0, "64 concurrent streams on one connection answer independently -> " +
+                                      std::to_string(wide_failures) + " failed (" + first_error + ")");
+    }
 
     // A stream that is abandoned mid-body must not take the connection down: on
     // HTTP/2 the session resets just that stream.
@@ -669,7 +871,7 @@ asio::awaitable<void> suite_raw_peer(asio::io_context& ctx) {
 // run against a frame that has already been reused.
 asio::awaitable<void> run_all_suites(asio::io_context& ctx, std::uint16_t plain, std::uint16_t tls_port) {
     co_await suite_protocol_matrix(plain, tls_port);
-    co_await suite_framing(plain);
+    co_await suite_framing(plain, ctx);
     co_await suite_streaming(plain);
     co_await suite_h2_multiplex(plain);
     co_await suite_errors(plain);

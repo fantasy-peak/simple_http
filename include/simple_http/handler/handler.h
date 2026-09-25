@@ -3,10 +3,11 @@
 // Handler type system.
 //
 // A route handler is a coroutine in one of two interchangeable forms, selected
-// automatically at compile time by arity:
+// automatically at compile time by arity (the Request and Response are shared so
+// a handler may hand them to coroutines that outlive it):
 //
-//   no TLS : awaitable<void>(Request&, Response&)
-//   TLS    : awaitable<void>(Request&, Response&, SslHandle)
+//   no TLS : awaitable<void>(std::shared_ptr<Request>, std::shared_ptr<Response>)
+//   TLS    : awaitable<void>(std::shared_ptr<Request>, std::shared_ptr<Response>, SslHandle)
 //
 // Handlers are coroutines and may suspend freely (timers, async I/O, streaming).
 // They run on the connection executor; the Response's write operations are

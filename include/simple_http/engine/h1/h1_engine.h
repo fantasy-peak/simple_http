@@ -3,10 +3,9 @@
 // HTTP/1.x engine — beast-free.
 //
 // Http1Engine::run drives one connection: read bytes off the Transport into an
-// H1Parser (engine/h1/h1_parser.h, ported from paozhu's byte-level request-line
-// / header parsing) until a full head is parsed, frame the request body
-// (chunked / Content-Length / none) and feed it into Request::body(), then hand
-// the request to the dispatcher (Router) as (Request&, Response&, SslHandle).
+// H1Parser (engine/h1/h1_parser.h) until a full head is parsed, frame the request
+// body (chunked / Content-Length / none) and feed it into Request::body(), then
+// hand the request to the dispatcher (Router) with the transport's TLS handle.
 // The loop repeats while the connection is keep-alive. Responses go through
 // Http1ResponseWriter, which hand-serializes either a Content-Length reply
 // (one-shot) or a chunked stream directly onto the transport.

@@ -10,7 +10,7 @@
 //   * watchdog:   closes the connection after an idle timeout
 //
 // Framing and HPACK come from the sibling headers in this directory
-// (namespace simple_http::codec, ported from paozhu): frame
+// (namespace simple_http::codec): frame
 // header parse/serialize (h2_frame.h), HPACK decode (HpackDecoder) and a small
 // fresh HPACK response encoder (hpack_encoder.h). All connection state
 // (stream table, HPACK decoder, flow-control windows, output buffer) is touched
@@ -225,7 +225,7 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
         st.request->mutable_headers() = std::move(headers);
         if (!body.empty()) (void)st.request->body().feed(std::move(body));
         (void)st.request->body().finish();
-        m_next_peer_stream_id = 3;  // client-initiated ids after the upgraded 1
+        m_next_peer_stream_id = 1;  // the upgraded request's id is the highest seen so far
         dispatch_stream(1);
 
         co_await serve_loops();
@@ -451,6 +451,12 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
                 m_peer_max_frame_size = value;
             }
         }
+    }
+
+    // Whether `id` may open a new client-initiated stream: odd, and higher than
+    // any the peer has opened so far (RFC 9113 §5.1.1).
+    bool is_new_client_stream(std::uint32_t id) const {
+        return (id & 1u) == 1u && id > m_next_peer_stream_id;
     }
 
     // Whether adding `extra` bytes to a header block of `current` bytes would exceed
@@ -697,6 +703,16 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
 
     bool on_headers(const codec::H2FrameHeader& hdr, std::string_view payload) {
         if (hdr.stream_id == 0) { go_away(codec::H2_PROTOCOL_ERROR); return false; }
+        // RFC 9113 §5.1.1: a client opens odd-numbered streams, each higher than
+        // every stream it has opened before. A HEADERS on anything else - an even
+        // (server-initiated) id, or an id that goes backwards - is a connection
+        // error; tolerating it would let a peer open streams it must not.
+        if (m_streams.find(hdr.stream_id) == m_streams.end() && !is_new_client_stream(hdr.stream_id)) {
+            SIMPLE_HTTP_ERROR_LOG("h2: client opened stream {} (highest so far {}); GOAWAY", hdr.stream_id,
+                                  m_next_peer_stream_id);
+            go_away(codec::H2_PROTOCOL_ERROR);
+            return false;
+        }
         bool ok = false;
         std::string_view block = strip_padding(payload, hdr.has_flag(codec::H2_FLAG_PADDED),
                                                hdr.has_flag(codec::H2_FLAG_PRIORITY), ok);
