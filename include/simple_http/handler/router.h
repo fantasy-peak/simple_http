@@ -15,9 +15,9 @@
 #include <vector>
 
 #include <boost/asio/awaitable.hpp>
-#include <boost/beast/http/status.hpp>
 
 #include "../client/http_client.h"  // HttpClient (reverse-proxy upstreams)
+#include "../core/http_status.h"
 #include "../core/logging.h"
 #include "../engine/dispatcher.h"  // WsProxyTarget, HttpProxyTarget
 #include "handler.h"
@@ -34,7 +34,6 @@ namespace simple_http_regex = std;
 namespace simple_http {
 
 namespace asio = boost::asio;
-namespace http = boost::beast::http;
 
 class Router {
   public:
@@ -222,7 +221,7 @@ class Router {
             co_return;
         }
         // Built-in 404.
-        co_await res->status(http::status::not_found).send("");
+        co_await res->status(status::not_found).send("");
         co_return;
     }
 

@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
@@ -39,7 +40,7 @@ constexpr std::size_t kMaxBodyBytes = 64 * 1024;
 
 sh::ServerConfig make_config(std::uint16_t port, std::optional<sh::TlsConfig> tls) {
     sh::ServerConfig cfg;
-    cfg.listen = sh::Listen{"127.0.0.1", port, false};
+    cfg.listen = sh::InetAddress{"127.0.0.1", port, false};
     cfg.worker_threads = 2;
     cfg.tls = std::move(tls);
     // Small limits, so the boundary cases stay cheap to produce.
@@ -968,7 +969,7 @@ TEST_CASE("regression/tls: a TLS 1.2-only client is refused", "[regression][tls]
 TEST_CASE("regression/server: reuse_port binds one acceptor per worker on one port",
           "[regression][server]") {
     sh::ServerConfig cfg;
-    cfg.listen = sh::Listen{"127.0.0.1", 0, false};  // 0: the probe picks the port
+    cfg.listen = sh::InetAddress{"127.0.0.1", 0, false};  // 0: the probe picks the port
     cfg.worker_threads = 4;
     cfg.reuse_port = true;
     sh::Server server{cfg};
@@ -1009,7 +1010,7 @@ TEST_CASE("regression/server: reuse_port binds one acceptor per worker on one po
 // hand-off that no longer happens.
 TEST_CASE("regression/server: reuse_port with a single worker still serves", "[regression][server]") {
     sh::ServerConfig cfg;
-    cfg.listen = sh::Listen{"127.0.0.1", 0, false};
+    cfg.listen = sh::InetAddress{"127.0.0.1", 0, false};
     cfg.worker_threads = 1;
     cfg.reuse_port = true;
     sh::Server server{cfg};
@@ -1031,7 +1032,7 @@ TEST_CASE("regression/server: reuse_port with a single worker still serves", "[r
 // serve, so this expectation holds on either kind of host.
 TEST_CASE("regression/server: an IPv6 listener serves IPv4 clients", "[regression][server]") {
     sh::ServerConfig cfg;
-    cfg.listen = sh::Listen{"::", 0, false};
+    cfg.listen = sh::InetAddress{"::", 0, false};
     cfg.worker_threads = 2;
     sh::Server server{cfg};
     register_routes(server);
@@ -1044,4 +1045,107 @@ TEST_CASE("regression/server: an IPv6 listener serves IPv4 clients", "[regressio
     client.send("GET /world HTTP/1.1\r\nHost: x\r\n\r\n");
     CHECK(client.wait_for("hello"));
     client.close();
+}
+
+// The UNIX-domain listener shares everything with the TCP path except the
+// endpoint, so what is worth checking is what actually differs: it binds to a
+// path, answers over it, and can be restarted on the same path.
+TEST_CASE("regression/server: a UNIX-domain listener serves over its socket file", "[regression][server]") {
+    const std::string path = "/tmp/simple_http_regression.sock";
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+
+    sh::ServerConfig cfg;
+    cfg.listen = sh::UnixAddress{path};
+    cfg.worker_threads = 2;
+    sh::Server server{cfg};
+    register_routes(server);
+    REQUIRE(server.start());
+
+    asio::io_context ctx;
+    asio::local::stream_protocol::socket socket{ctx};
+    sh::error_code ec;
+    socket.connect(asio::local::stream_protocol::endpoint{path}, ec);
+    REQUIRE_FALSE(ec);
+
+    const std::string request = "GET /world HTTP/1.1\r\nHost: x\r\n\r\n";
+    asio::write(socket, asio::buffer(request), ec);
+    REQUIRE_FALSE(ec);
+
+    std::string response;
+    std::array<char, 4096> buf{};
+    while (response.find("hello") == std::string::npos) {
+        const auto n = socket.read_some(asio::buffer(buf), ec);
+        if (ec || n == 0) break;
+        response.append(buf.data(), n);
+    }
+    CHECK(response.find("200 OK") != std::string::npos);
+    CHECK(response.find("hello") != std::string::npos);
+    socket.close(ec);
+
+    // Restarting on the same path has to work: the socket file the first
+    // listener left behind is unlinked before the second binds. Without that
+    // step every restart fails with EADDRINUSE.
+    server.stop();
+    sh::Server restarted{cfg};
+    register_routes(restarted);
+    CHECK(restarted.start());
+    restarted.stop();
+    std::filesystem::remove(path, ignored);
+}
+
+// TLS over a UNIX-domain socket. The transport is templated on the socket type,
+// so this is nominally the same handshake as over TCP — but "should work" is not
+// "does work", and nothing else in the suite drives an encrypted AF_UNIX
+// connection (the plaintext UNIX case above is the only other one).
+TEST_CASE("regression/server: TLS over a UNIX-domain socket", "[regression][server][tls]") {
+    const std::string path = "/tmp/simple_http_regression_tls.sock";
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+
+    sh::ServerConfig cfg;
+    cfg.listen = sh::UnixAddress{path};
+    cfg.worker_threads = 2;
+    cfg.tls = sh::TlsConfig{
+        .cert_chain_file = "./test/tls_certificates/server_cert.pem",
+        .private_key_file = "./test/tls_certificates/server_key.pem",
+        .mutual = true,
+        .ca_file = "./test/tls_certificates/ca_cert.pem",
+    };
+    sh::Server server{cfg};
+    register_routes(server);
+    REQUIRE(server.start());
+
+    asio::io_context ctx;
+    asio::ssl::context client_ctx{asio::ssl::context::tls_client};
+    client_ctx.set_verify_mode(asio::ssl::verify_none);
+    client_ctx.use_certificate_chain_file("./test/tls_certificates/client_cert.pem");
+    client_ctx.use_private_key_file("./test/tls_certificates/client_key.pem", asio::ssl::context::pem);
+
+    auto stream = std::make_shared<asio::ssl::stream<asio::local::stream_protocol::socket>>(ctx, client_ctx);
+    sh::error_code ec;
+    stream->next_layer().connect(asio::local::stream_protocol::endpoint{path}, ec);
+    REQUIRE_FALSE(ec);
+
+    stream->async_handshake(asio::ssl::stream_base::client, [&](const sh::error_code& e) { ec = e; });
+    ctx.restart();
+    ctx.run_for(std::chrono::seconds(10));
+    REQUIRE_FALSE(ec);
+
+    const std::string request = "GET /world HTTP/1.1\r\nHost: x\r\n\r\n";
+    asio::write(*stream, asio::buffer(request), ec);
+    REQUIRE_FALSE(ec);
+
+    std::string response;
+    std::array<char, 4096> buf{};
+    while (response.find("hello") == std::string::npos) {
+        const auto n = stream->read_some(asio::buffer(buf), ec);
+        if (ec || n == 0) break;
+        response.append(buf.data(), n);
+    }
+    CHECK(response.find("200 OK") != std::string::npos);
+    stream->next_layer().close(ec);
+
+    server.stop();
+    std::filesystem::remove(path, ignored);
 }

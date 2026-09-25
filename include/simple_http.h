@@ -19,6 +19,8 @@
 // --- core layer ---
 #include "simple_http/core/version.h"
 #include "simple_http/core/types.h"
+#include "simple_http/core/http_field.h"
+#include "simple_http/core/http_status.h"
 #include "simple_http/core/logging.h"
 #include "simple_http/core/mime.h"
 #include "simple_http/core/base64.h"

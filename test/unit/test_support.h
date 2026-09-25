@@ -327,22 +327,20 @@ class FakeResponseWriter : public ResponseWriter {
     }
 };
 
-// --- the library's global log hook -------------------------------------------
+// --- the library's log sink ---------------------------------------------------
 
-// LOG_CB and log_level are process-wide; swap them for the duration of a scope and
-// put them back, so one test's capture cannot leak into another.
+// The installed sink is process-wide; swap it for the duration of a scope and put
+// it back, so one test's capture cannot leak into another. `minimum` is the
+// threshold the capture reports through LogSink::enabled, which is how a test
+// exercises level filtering now that the sink owns that decision.
 class ScopedLog {
   public:
-    ScopedLog() : m_cb(LOG_CB), m_level(log_level.load(std::memory_order_relaxed)) {
-        LOG_CB = [this](LogLevel level, std::string_view file, int line, std::string message) {
-            records.push_back({level, std::string{file}, line, std::move(message)});
-        };
+    explicit ScopedLog(LogLevel minimum = LogLevel::Trace) : m_minimum(minimum) {
+        m_previous = log_sink();
+        set_log_sink(std::make_shared<Capture>(this));
     }
 
-    ~ScopedLog() {
-        LOG_CB = std::move(m_cb);
-        log_level.store(m_level, std::memory_order_relaxed);
-    }
+    ~ScopedLog() { set_log_sink(std::move(m_previous)); }
 
     ScopedLog(const ScopedLog&) = delete;
     ScopedLog& operator=(const ScopedLog&) = delete;
@@ -357,8 +355,27 @@ class ScopedLog {
     std::vector<Record> records;
 
   private:
-    std::function<void(LogLevel, std::string_view, int, std::string)> m_cb;
-    LogLevel m_level;
+    // Everything is copied out here: the facade only guarantees a record's
+    // strings for the duration of the call.
+    class Capture final : public LogSink {
+      public:
+        explicit Capture(ScopedLog* owner) : m_owner(owner) {}
+
+        bool enabled(LogLevel level) const noexcept override {
+            return static_cast<int>(level) >= static_cast<int>(m_owner->m_minimum);
+        }
+
+        void log(const LogRecord& record) override {
+            m_owner->records.push_back(Record{record.level, std::string{record.where.file_name()},
+                                              static_cast<int>(record.where.line()), std::string{record.message}});
+        }
+
+      private:
+        ScopedLog* m_owner;
+    };
+
+    LogLevel m_minimum;
+    std::shared_ptr<LogSink> m_previous;
 };
 
 // --- WebSocket frame helpers -------------------------------------------------

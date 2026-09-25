@@ -106,4 +106,22 @@ target("regression")
     set_rundir(".")
 target_end()
 
+-- Compile check for the code samples in README.md. Documented code is not
+-- exercised by anything else, and the README had quietly drifted to APIs that no
+-- longer existed — a string of examples that looked plausible and would not
+-- build. Reproducing them here turns that drift into a build failure:
+--   xmake build readme_examples
+target("readme_examples")
+    set_kind("binary")
+    set_default(false)
+    on_load(function (target)
+        if target:toolchain("gcc") then
+            target:add("cxxflags", "-Wno-maybe-uninitialized")
+        end
+    end)
+    add_deps("simple_http")
+    add_files("test/readme_examples.cpp")
+    set_rundir(".")
+target_end()
+
 

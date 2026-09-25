@@ -88,19 +88,23 @@ class Http1ResponseWriter : public ResponseWriter {
         }
 
         headers.add_lower("content-length", std::to_string(body.size()));
-        std::string out;
-        out.reserve(kResponseOverhead + headers_bytes(headers) + body.size());
-        append_status_line(out, status);
-        append_headers(out, headers);
-        out.append("\r\n");
+        // The head gets its own buffer, and the body is streamed from wherever the
+        // caller handed it to us. Concatenating the two first would copy the whole
+        // body — plus a second allocation and its page faults — which is what made
+        // a large response expensive.
+        std::string head;
+        head.reserve(kResponseOverhead + headers_bytes(headers));
+        append_status_line(head, status);
+        append_headers(head, headers);
+        head.append("\r\n");
         if (m_head_request) {  // headers only
-            auto ec = co_await write_raw(out);
+            auto ec = co_await write_raw(head);
             if (ec) m_open = false;
             co_return ec;
         }
-        out.append(body);
 
-        auto ec = co_await write_raw(out);
+        const std::array<ConstByteSpan, 2> buffers{as_bytes(head), as_bytes(body)};
+        auto ec = co_await write_raw_seq(buffers);
         if (ec) m_open = false;
         co_return ec;
     }
@@ -154,7 +158,7 @@ class Http1ResponseWriter : public ResponseWriter {
         if (m_head_request) co_return error_code{};  // HEAD: headers only
         co_await hop();
         if (!m_open) co_return make_error_code(asio::error::not_connected);
-        auto ec = co_await write_raw(encode_chunk(data));
+        auto ec = co_await write_chunked(data, /*last=*/false);
         if (ec) m_open = false;
         co_return ec;
     }
@@ -163,10 +167,14 @@ class Http1ResponseWriter : public ResponseWriter {
         if (m_head_request) co_return error_code{};  // HEAD: headers only
         co_await hop();
         if (!m_open) co_return make_error_code(asio::error::not_connected);
-        std::string out;
-        if (!data.empty()) out = encode_chunk(data);
-        out.append("0\r\n\r\n");  // last-chunk + trailer-less terminator
-        auto ec = co_await write_raw(out);
+        // An empty final chunk is nothing but the terminator; otherwise the data
+        // chunk and the terminator go out together.
+        error_code ec;
+        if (data.empty()) {
+            ec = co_await write_raw(kLastChunk);
+        } else {
+            ec = co_await write_chunked(data, /*last=*/true);
+        }
         if (ec) m_open = false;
         co_return ec;
     }
@@ -211,11 +219,13 @@ class Http1ResponseWriter : public ResponseWriter {
         out.append(buf, static_cast<std::size_t>(end - buf));
     }
 
-    // Appends a size as lowercase hex (chunked framing).
-    static void append_hex(std::string& out, std::size_t value) {
-        char buf[2 * sizeof(std::size_t)];
-        auto [end, ec] = std::to_chars(buf, buf + sizeof(buf), value, 16);
-        out.append(buf, static_cast<std::size_t>(end - buf));
+    // Framing pieces the scatter-gather writes below share.
+    static constexpr std::string_view kCrLf = "\r\n";
+    static constexpr std::string_view kLastChunk = "0\r\n\r\n";  // trailer-less terminator
+
+    // The same bytes, as the transport's buffer type.
+    static ConstByteSpan as_bytes(std::string_view bytes) {
+        return std::as_bytes(std::span<const char>{bytes.data(), bytes.size()});
     }
 
     // Wire size of the fields as append_headers() writes them, so a response
@@ -247,27 +257,40 @@ class Http1ResponseWriter : public ResponseWriter {
         }
     }
 
-    static std::string encode_chunk(const std::string& data) {
-        std::string out;
-        out.reserve(2 * sizeof(std::size_t) + 4 + data.size());  // hex size, CRLF, CRLF
-        append_hex(out, data.size());
-        out.append("\r\n");
-        out.append(data);
-        out.append("\r\n");
-        return out;
+    // Writes one chunked frame — "<hex size>\r\n<data>\r\n" — straight from its
+    // pieces as a single operation, so a chunk payload is never copied into a
+    // framing buffer. With `last` the terminator rides along in the same write.
+    asio::awaitable<error_code> write_chunked(std::string_view data, bool last) {
+        char hex[2 * sizeof(std::size_t) + 2];
+        auto [end, ec] = std::to_chars(hex, hex + sizeof(hex) - 2, data.size(), 16);
+        *end++ = '\r';
+        *end++ = '\n';
+        const std::string_view size{hex, static_cast<std::size_t>(end - hex)};
+
+        const std::array<ConstByteSpan, 4> buffers{as_bytes(size), as_bytes(data), as_bytes(kCrLf),
+                                                   as_bytes(last ? kLastChunk : std::string_view{})};
+        co_return co_await write_raw_seq(std::span<const ConstByteSpan>{buffers.data(), last ? 4u : 3u});
     }
 
-    asio::awaitable<error_code> write_raw(const std::string& out) {
+    // Writes several buffers as one operation (a single writev where the platform
+    // has one). Concatenating them first would cost a scratch allocation plus a
+    // copy of everything in it — which is exactly what made large responses
+    // expensive, since the body is usually the bulk of the bytes.
+    asio::awaitable<error_code> write_raw_seq(std::span<const ConstByteSpan> buffers) {
         // Writing is connection activity: refresh the shared idle deadline so the
         // watchdog does not reap a connection busy streaming a response.
         if (m_deadline) *m_deadline = std::chrono::steady_clock::now() + m_idle_timeout;
+        auto [ec, n] = co_await m_transport->async_write_seq(buffers);
+        (void)n;
+        co_return ec;
+    }
+
+    asio::awaitable<error_code> write_raw(std::string_view out) {
         // Transport::async_write is a composed operation (asio::async_write): it
         // writes the whole buffer or returns an error, so no partial-write loop
         // is needed here.
-        auto [ec, n] = co_await m_transport->async_write(
-            std::as_bytes(std::span<const char>{out.data(), out.size()}));
-        (void)n;
-        co_return ec;
+        const std::array<ConstByteSpan, 1> buffers{as_bytes(out)};
+        co_return co_await write_raw_seq(buffers);
     }
 
     asio::awaitable<void> hop() const {

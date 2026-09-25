@@ -88,4 +88,50 @@ inline constexpr std::string_view reason_phrase(int status) noexcept {
     }
 }
 
+// Common status codes, so a handler can write `status::not_found` rather than
+// 404. Plain ints rather than an enum: the set of status codes is open (an
+// application is free to invent 599), and Response::status() already takes an
+// int, so these compose with literals instead of needing a cast.
+namespace status {
+
+inline constexpr int continue_ = 100;
+inline constexpr int switching_protocols = 101;
+inline constexpr int ok = 200;
+inline constexpr int created = 201;
+inline constexpr int accepted = 202;
+inline constexpr int no_content = 204;
+inline constexpr int partial_content = 206;
+inline constexpr int moved_permanently = 301;
+inline constexpr int found = 302;
+inline constexpr int see_other = 303;
+inline constexpr int not_modified = 304;
+inline constexpr int temporary_redirect = 307;
+inline constexpr int permanent_redirect = 308;
+inline constexpr int bad_request = 400;
+inline constexpr int unauthorized = 401;
+inline constexpr int forbidden = 403;
+inline constexpr int not_found = 404;
+inline constexpr int method_not_allowed = 405;
+inline constexpr int not_acceptable = 406;
+inline constexpr int request_timeout = 408;
+inline constexpr int conflict = 409;
+inline constexpr int gone = 410;
+inline constexpr int length_required = 411;
+inline constexpr int payload_too_large = 413;
+inline constexpr int uri_too_long = 414;
+inline constexpr int unsupported_media_type = 415;
+inline constexpr int range_not_satisfiable = 416;
+inline constexpr int expectation_failed = 417;
+inline constexpr int upgrade_required = 426;
+inline constexpr int too_many_requests = 429;
+inline constexpr int request_header_fields_too_large = 431;
+inline constexpr int internal_server_error = 500;
+inline constexpr int not_implemented = 501;
+inline constexpr int bad_gateway = 502;
+inline constexpr int service_unavailable = 503;
+inline constexpr int gateway_timeout = 504;
+inline constexpr int http_version_not_supported = 505;
+
+}  // namespace status
+
 }  // namespace simple_http

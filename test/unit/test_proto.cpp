@@ -5,9 +5,6 @@
 #include <memory>
 #include <string>
 
-#include <boost/beast/http/message.hpp>
-#include <boost/beast/http/string_body.hpp>
-
 #include "simple_http.h"
 #include "test_support.h"
 
@@ -219,26 +216,6 @@ TEST_CASE("proto/request: target splitting and method tokens", "[proto]") {
     CHECK(req.method_token() == "PROPFIND");
     req.set_method_token("POST");
     CHECK(req.method() == Method::Post);
-}
-
-TEST_CASE("proto/request: populating from a parsed HTTP/1.x message", "[proto]") {
-    namespace beast_http = boost::beast::http;
-    asio::io_context ctx;
-    Request req{Version::Http11, ctx.get_executor(), asio::ip::tcp::endpoint{}};
-
-    beast_http::request<beast_http::string_body> parsed{beast_http::verb::put, "/cfg?x=1", 11};
-    parsed.set(beast_http::field::host, "example.com");
-    parsed.set("X-Custom", "v");
-    req.assign_head(parsed);
-
-    CHECK(req.method() == Method::Put);
-    CHECK(req.method_token() == "PUT");
-    CHECK(req.target() == "/cfg?x=1");
-    CHECK(req.path() == "/cfg");
-    CHECK(req.query() == "x=1");
-    CHECK(req.header("host") == "example.com");
-    CHECK(req.header("x-custom") == "v");
-    CHECK(req.version() == Version::Http11);
 }
 
 // --- Response + a fake writer ------------------------------------------------

@@ -103,17 +103,13 @@ class TlsTransport {
     Stream& stream() { return *m_stream; }
     const std::shared_ptr<Stream>& stream_ptr() const { return m_stream; }
 
-    // The underlying Beast-compatible stream (for the HTTP/1.x engine). For TLS
-    // this is the ssl::stream itself, which Beast can read/write through.
-    Stream& beast_stream() { return *m_stream; }
-
   private:
     std::shared_ptr<Stream> m_stream;
     asio::ip::tcp::endpoint m_peer;
 };
 
 using TlsStreamTransport = TlsTransport<asio::ip::tcp::socket>;
-#ifdef SIMPLE_HTTP_BIND_UNIX_SOCKET
+#ifdef BOOST_ASIO_HAS_LOCAL_SOCKETS
 using TlsUnixTransport = TlsTransport<asio::local::stream_protocol::socket>;
 #endif
 

@@ -18,9 +18,9 @@
 #include <utility>
 
 #include <boost/asio/awaitable.hpp>
-#include <boost/beast/http/status.hpp>
-#include <boost/beast/http/field.hpp>
 
+#include "../core/http_field.h"
+#include "../core/http_status.h"
 #include "../core/types.h"
 #include "../core/version.h"
 #include "headers.h"
@@ -29,7 +29,6 @@
 namespace simple_http {
 
 namespace asio = boost::asio;
-namespace http = boost::beast::http;
 
 class Response {
   public:
@@ -40,14 +39,9 @@ class Response {
         m_status = code;
         return *this;
     }
-    Response& status(http::status code) { return status(static_cast<int>(code)); }
-
-    Response& header(std::string name, std::string value) {
-        m_headers.add(std::move(name), std::move(value));
+    Response& header(std::string_view name, std::string value) {
+        m_headers.add(std::string{name}, std::move(value));
         return *this;
-    }
-    Response& header(http::field field, std::string value) {
-        return header(std::string{http::to_string(field)}, std::move(value));
     }
     Response& content_type(std::string_view ct) { return header("content-type", std::string{ct}); }
 

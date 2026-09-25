@@ -12,14 +12,18 @@
 // round-robins the pool, or one acceptor per worker context (SO_REUSEPORT).
 
 #include <cstddef>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <boost/asio.hpp>
+#include <boost/asio/local/stream_protocol.hpp>
 #include <boost/asio/ssl.hpp>
 
 #include "../core/io_pool.h"
@@ -36,19 +40,30 @@ namespace simple_http {
 
 namespace asio = boost::asio;
 
-// The listening endpoint. Serving several addresses or protocol stacks is a
-// multi-process concern: start another Server, or another process sharing the
-// port via SO_REUSEPORT, rather than widening this.
-struct Listen {
+// An IP endpoint. Leave v6 false on an IPv6 host for dual-stack: `::` then also
+// accepts IPv4-mapped connections, so one listener covers both families.
+struct InetAddress {
     std::string host{"0.0.0.0"};
     std::uint16_t port{8080};
-    // IPV6_V6ONLY. Leave false on an IPv6 host for dual-stack: `::` then also
-    // accepts IPv4-mapped connections, so one listener covers both families.
-    bool v6{false};
+    bool v6{false};  // IPV6_V6ONLY
 };
 
+// A UNIX-domain socket at a filesystem path.
+struct UnixAddress {
+    std::string path;
+};
+
+// Where the server listens. Exactly one of the two — a configuration that named
+// both a port and a path would have no meaning, so the type makes it
+// unrepresentable rather than a rule to remember.
+//
+// Serving several addresses or protocol stacks is a multi-process concern:
+// start another Server, or another process sharing the port via
+// ServerConfig::reuse_port.
+using Listen = std::variant<InetAddress, UnixAddress>;
+
 struct ServerConfig {
-    Listen listen{"0.0.0.0", 8080, false};
+    Listen listen{InetAddress{}};
     std::optional<TlsConfig> tls;
     // Threads serving connections. Without reuse_port the pool also carries a
     // dedicated acceptor thread, so the process runs one more than this.
@@ -194,18 +209,32 @@ class Server {
             // — the acceptor dies with its coroutine.
             auto acceptor = listener.acceptor;
             asio::post(*listener.ctx, [acceptor] {
-                error_code ec;
-                acceptor->close(ec);
+                std::visit(
+                    [](const auto& socket) {
+                        error_code ec;
+                        socket->close(ec);
+                    },
+                    acceptor);
             });
         }
         m_pool->stop();
     }
 
-    // The local port the listener is using (useful with port 0 / ephemeral).
+    // The local port a TCP listener is using (useful with port 0 / ephemeral).
+    // Zero for a UNIX-domain socket, which has no port to report.
     std::uint16_t port() const {
         if (m_acceptors.empty()) return 0;
-        error_code ec;
-        return m_acceptors.front().acceptor->local_endpoint(ec).port();
+        return std::visit(
+            [](const auto& acceptor) {
+                using Acceptor = std::remove_reference_t<decltype(*acceptor)>;
+                if constexpr (std::is_same_v<Acceptor, asio::ip::tcp::acceptor>) {
+                    error_code ec;
+                    return acceptor->local_endpoint(ec).port();
+                } else {
+                    return std::uint16_t{0};
+                }
+            },
+            m_acceptors.front().acceptor);
     }
 
     // How many listening sockets the accept topology ended up with: 1 for the
@@ -216,9 +245,17 @@ class Server {
     std::shared_ptr<IoCtxPool> pool() { return m_pool; }
 
   private:
-    // An acceptor and the context its accept loop runs on.
+    // An acceptor of either family, and the context its accept loop runs on.
+    //
+    // Holding both behind one type is what keeps start and stop single: the
+    // socket types are unrelated, but nothing above this line has to care. The
+    // variant holds one alternative on a platform without AF_UNIX, and every
+    // std::visit over it still compiles.
+    using AnyAcceptor = std::variant<std::shared_ptr<asio::ip::tcp::acceptor>,
+                                     std::shared_ptr<asio::local::stream_protocol::acceptor>>;
+
     struct Listener {
-        std::shared_ptr<asio::ip::tcp::acceptor> acceptor;
+        AnyAcceptor acceptor;
         std::shared_ptr<asio::io_context> ctx;
     };
 
@@ -301,13 +338,13 @@ class Server {
     // for both families, so serving IPv4 alone beats refusing to serve at all.
     // A `v6 = true` host asked for IPv6 only, and quietly opening IPv4 instead
     // would hand out reachability nobody asked for — so that one fails loudly.
-    std::shared_ptr<asio::ip::tcp::acceptor> probe_acceptor(const Listen& l, error_code& ec) {
+    std::shared_ptr<asio::ip::tcp::acceptor> probe_acceptor(const InetAddress& address, error_code& ec) {
         auto ctx = acceptor_context();
-        auto acceptor = bind_acceptor(*ctx, l.host, l.port, l.v6, ec);
-        if (acceptor || l.v6 || !is_ipv6_host(l.host)) return acceptor;
-        SIMPLE_HTTP_ERROR_LOG("bind({}:{}): {}; retrying on 0.0.0.0", l.host, l.port, ec.message());
+        auto acceptor = bind_acceptor(*ctx, address.host, address.port, address.v6, ec);
+        if (acceptor || address.v6 || !is_ipv6_host(address.host)) return acceptor;
+        SIMPLE_HTTP_ERROR_LOG("bind({}:{}): {}; retrying on 0.0.0.0", address.host, address.port, ec.message());
         error_code ipv4_ec;
-        auto fallback = bind_acceptor(*ctx, "0.0.0.0", l.port, false, ipv4_ec);
+        auto fallback = bind_acceptor(*ctx, "0.0.0.0", address.port, false, ipv4_ec);
         if (!fallback) {
             ec = ipv4_ec;
         }
@@ -328,8 +365,13 @@ class Server {
             if (!acceptor) {
                 SIMPLE_HTTP_ERROR_LOG("reuse_port bind({}:{}) [{}]: {}", host, port, i, ec.message());
                 while (m_acceptors.size() > bound) {
-                    error_code ce;
-                    m_acceptors.back().acceptor->close(ce);
+                    const auto acceptor = m_acceptors.back().acceptor;
+                    std::visit(
+                        [](const auto& socket) {
+                            error_code ec;
+                            socket->close(ec);
+                        },
+                        acceptor);
                     m_acceptors.pop_back();
                 }
                 return false;
@@ -339,12 +381,18 @@ class Server {
         return true;
     }
 
+    // One entry point for both families. The variant decides which bind runs;
+    // everything after it — the accept loops, the logging — is shared, because
+    // by then the difference has already been erased.
     bool start_listeners() {
-        const Listen& l = m_config.listen;
+        return std::visit([this](const auto& address) { return start_listener(address); }, m_config.listen);
+    }
+
+    bool start_listener(const InetAddress& address) {
         error_code ec;
-        auto acceptor = probe_acceptor(l, ec);
+        auto acceptor = probe_acceptor(address, ec);
         if (!acceptor) {
-            SIMPLE_HTTP_ERROR_LOG("bind({}:{}): {}", l.host, l.port, ec.message());
+            SIMPLE_HTTP_ERROR_LOG("bind({}:{}): {}", address.host, address.port, ec.message());
             return false;
         }
         // The probe resolved the real endpoint, and every further socket must
@@ -353,30 +401,88 @@ class Server {
         // split the service across several.
         const auto host = local_address(*acceptor);
         const auto port = local_port(*acceptor);
-        m_acceptors.push_back(Listener{std::move(acceptor), acceptor_context()});
+        m_acceptors.push_back(Listener{acceptor, acceptor_context()});
 
         bool partitioned = false;
         if (m_config.reuse_port) {
-            partitioned = fan_out(host, port, l.v6 && is_ipv6_host(host));
+            partitioned = fan_out(host, port, address.v6 && is_ipv6_host(host));
             if (!partitioned) {
                 SIMPLE_HTTP_INFO_LOG("SO_REUSEPORT unavailable; serving {}:{} with a single acceptor", host, port);
             }
         }
-
-        for (auto& listener : m_acceptors) {
-            // Pinned only when the fan-out really happened: re-dispatching a
-            // connection the kernel already assigned to this socket would give
-            // back the affinity the fan-out bought.
-            asio::co_spawn(*listener.ctx, accept_loop(listener.acceptor, partitioned ? listener.ctx : nullptr),
-                           asio::detached);
-        }
+        spawn_accept_loops(partitioned);
         SIMPLE_HTTP_INFO_LOG("listening on {}:{} (tls={}, acceptors={})", host, port, m_tls.has_value(),
                              m_acceptors.size());
         return true;
     }
 
-    asio::awaitable<void> accept_loop(std::shared_ptr<asio::ip::tcp::acceptor> acceptor,
-                                      std::shared_ptr<asio::io_context> pinned) {
+    // AF_UNIX is a platform capability rather than a switch to set: asio
+    // reports it, nothing extra has to be linked, and a platform without it
+    // simply cannot be asked to bind a path. Hence no macro — the one thing a
+    // consumer could have got wrong is now impossible to get wrong.
+    bool start_listener(const UnixAddress& address) {
+#ifndef BOOST_ASIO_HAS_LOCAL_SOCKETS
+        SIMPLE_HTTP_ERROR_LOG("UNIX-domain sockets are unavailable on this platform: {}", address.path);
+        return false;
+#else
+        // A socket file left behind by a previous run makes bind() fail with
+        // EADDRINUSE, and there is no way to tell a stale one from a live
+        // listener by looking at it — so the path is unlinked first, which is
+        // what every UNIX-socket server does. The window that opens (two
+        // servers starting at once can unlink each other's) is the one they all
+        // accept.
+        std::error_code ignored;
+        std::filesystem::remove(address.path, ignored);  // best-effort
+
+        auto ctx = acceptor_context();
+        asio::local::stream_protocol::endpoint endpoint{address.path};
+        auto acceptor = std::make_shared<asio::local::stream_protocol::acceptor>(*ctx);
+
+        error_code ec;
+        acceptor->open(endpoint.protocol(), ec);
+        if (!ec) acceptor->bind(endpoint, ec);
+        if (!ec) acceptor->listen(asio::socket_base::max_listen_connections, ec);
+        if (ec) {
+            SIMPLE_HTTP_ERROR_LOG("bind(unix:{}): {}", address.path, ec.message());
+            return false;
+        }
+
+        // No fan-out, and therefore no pinning: neither reason the TCP side
+        // fans out applies to a path — SO_REUSEPORT means nothing there, and
+        // neither does an ephemeral port.
+        m_acceptors.push_back(Listener{acceptor, ctx});
+        spawn_accept_loops(/*partitioned=*/false);
+        SIMPLE_HTTP_INFO_LOG("listening on unix:{} (tls={})", address.path, m_tls.has_value());
+        return true;
+#endif
+    }
+
+    // Starts one accept loop per bound socket. The loop is templated on the
+    // acceptor/socket pair; this is the only place that names both, and the
+    // protocol hands the socket type back rather than making it a second
+    // parameter to thread through by hand.
+    void spawn_accept_loops(bool partitioned) {
+        for (auto& listener : m_acceptors) {
+            std::visit(
+                [&](const auto& acceptor) {
+                    using Acceptor = std::remove_reference_t<decltype(*acceptor)>;
+                    using Socket = typename Acceptor::protocol_type::socket;
+                    // Pinned only when the fan-out really happened: re-dispatching
+                    // a connection the kernel already assigned to this socket
+                    // would give back the affinity the fan-out bought.
+                    asio::co_spawn(*listener.ctx, accept_loop<Acceptor, Socket>(acceptor, partitioned ? listener.ctx : nullptr),
+                                   asio::detached);
+                },
+                listener.acceptor);
+        }
+    }
+
+    // `Acceptor` is asio::ip::tcp::acceptor or its UNIX-domain counterpart, and
+    // `Socket` the matching socket type. Everything from accepting a connection
+    // to serving it — pinning it to a context, TLS, the peer address — is the
+    // same for both; only the TCP-only extras are guarded.
+    template <typename Acceptor, typename Socket>
+    asio::awaitable<void> accept_loop(std::shared_ptr<Acceptor> acceptor, std::shared_ptr<asio::io_context> pinned) {
         auto dispatch = make_dispatcher();
         auto ws_lookup = make_ws_lookup();
         auto ws_proxy_lookup = make_ws_proxy_lookup();
@@ -385,36 +491,41 @@ class Server {
             // connection here. Otherwise round-robin the pool, which spreads
             // long-lived connections more evenly than the kernel's hash does.
             asio::io_context& ctx = pinned ? *pinned : *m_pool->next_ptr();
-            asio::ip::tcp::socket socket{ctx};
+            Socket socket{ctx};
             auto [ec] = co_await acceptor->async_accept(socket, asio::as_tuple(asio::use_awaitable));
             if (ec) {
                 if (ec == asio::error::operation_aborted) break;
                 continue;
             }
-            if (m_config.tcp_nodelay) {
-                error_code ne;
-                socket.set_option(asio::ip::tcp::no_delay(true), ne);  // best-effort
-            }
-            if (m_config.socket_setup) {
-                try {
-                    m_config.socket_setup(socket);
-                } catch (const std::exception& e) {
-                    SIMPLE_HTTP_ERROR_LOG("socket_setup threw: {}", e.what());
+
+            // The socket hook and the TCP linger option are typed for a TCP
+            // socket, and a UNIX-domain socket has neither — nor a peer address,
+            // which is why the transport's stays default-constructed.
+            asio::ip::tcp::endpoint peer;
+            if constexpr (std::is_same_v<Socket, asio::ip::tcp::socket>) {
+                if (m_config.tcp_nodelay) {
+                    error_code ne;
+                    socket.set_option(asio::ip::tcp::no_delay(true), ne);  // best-effort
                 }
+                if (m_config.socket_setup) {
+                    try {
+                        m_config.socket_setup(socket);
+                    } catch (const std::exception& e) {
+                        SIMPLE_HTTP_ERROR_LOG("socket_setup threw: {}", e.what());
+                    }
+                }
+                error_code pe;
+                peer = socket.remote_endpoint(pe);
             }
-            error_code pe;
-            auto peer = socket.remote_endpoint(pe);
 
             if (m_tls) {
-                auto stream = std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(std::move(socket),
-                                                                                        m_tls->context());
-                auto transport = std::make_shared<TlsStreamTransport>(std::move(stream), peer);
-                asio::co_spawn(ctx,
-                               serve_tls(transport, dispatch, ws_lookup, m_config.limits, ws_proxy_lookup),
+                auto stream = std::make_shared<asio::ssl::stream<Socket>>(std::move(socket), m_tls->context());
+                auto transport = std::make_shared<TlsTransport<Socket>>(std::move(stream), peer);
+                asio::co_spawn(ctx, serve_tls(transport, dispatch, ws_lookup, m_config.limits, ws_proxy_lookup),
                                asio::detached);
             } else {
-                auto sock_ptr = std::make_shared<asio::ip::tcp::socket>(std::move(socket));
-                auto transport = std::make_shared<TcpStreamTransport>(std::move(sock_ptr), peer);
+                auto sock_ptr = std::make_shared<Socket>(std::move(socket));
+                auto transport = std::make_shared<TcpTransport<Socket>>(std::move(sock_ptr), peer);
                 asio::co_spawn(ctx, serve_plaintext(transport, dispatch, ws_lookup, m_config.limits, ws_proxy_lookup),
                                asio::detached);
             }

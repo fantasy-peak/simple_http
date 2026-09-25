@@ -31,7 +31,9 @@ inline void shutdown_socket(asio::ip::tcp::socket& s) {
     }
 }
 
-#ifdef SIMPLE_HTTP_BIND_UNIX_SOCKET
+// Compiles in wherever the platform has AF_UNIX. asio is the one that knows, so
+// there is no switch for a consumer to set (and none to forget).
+#ifdef BOOST_ASIO_HAS_LOCAL_SOCKETS
 inline void shutdown_socket(asio::local::stream_protocol::socket& s) {
     if (s.is_open()) {
         error_code ec;
@@ -93,17 +95,13 @@ class TcpTransport {
     Socket& socket() { return *m_socket; }
     const std::shared_ptr<Socket>& socket_ptr() const { return m_socket; }
 
-    // The underlying Beast-compatible stream (for the HTTP/1.x engine, which
-    // uses Beast's parser/serializer directly). For plaintext this is the socket.
-    Socket& beast_stream() { return *m_socket; }
-
   private:
     std::shared_ptr<Socket> m_socket;
     asio::ip::tcp::endpoint m_peer;
 };
 
 using TcpStreamTransport = TcpTransport<asio::ip::tcp::socket>;
-#ifdef SIMPLE_HTTP_BIND_UNIX_SOCKET
+#ifdef BOOST_ASIO_HAS_LOCAL_SOCKETS
 using UnixStreamTransport = TcpTransport<asio::local::stream_protocol::socket>;
 #endif
 

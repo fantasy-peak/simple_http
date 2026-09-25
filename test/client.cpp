@@ -154,7 +154,7 @@ FakeServer& make_fake(asio::io_context& ctx, std::string response, bool close_af
 
 sh::ServerConfig server_config(std::uint16_t port, std::optional<sh::TlsConfig> tls) {
     sh::ServerConfig cfg;
-    cfg.listen = sh::Listen{"127.0.0.1", port, false};
+    cfg.listen = sh::InetAddress{"127.0.0.1", port, false};
     cfg.worker_threads = 2;
     cfg.tls = std::move(tls);
     cfg.limits.idle_timeout = std::chrono::seconds(30);
@@ -770,6 +770,18 @@ asio::awaitable<void> suite_tls(std::uint16_t tls_port) {
         auto r = co_await http.get(url(tls_port, "/world", true));
         check(r && r->version == sh::Version::Http11, "ALPN pinned to http/1.1 stays on HTTP/1.1");
     }
+    {
+        // A chunked response over TLS. The HTTP/1.x writer scatters each frame's
+        // pieces into separate buffers and lets the transport hand them to OpenSSL
+        // one at a time, so the wire framing has to come out identical to the
+        // concatenated form it replaced.
+        auto cfg = base_config();
+        cfg.default_version = sh::HttpVersionPolicy::Http11;
+        sh::HttpClient http{cfg};
+        auto r = co_await http.get(url(tls_port, "/stream", true));
+        check(r && r->version == sh::Version::Http11 && r->body == "alpha-beta-gamma",
+              "a chunked response over TLS decodes intact -> " + (r ? r->body : describe(r.error())));
+    }
     co_return;
 }
 
@@ -1079,10 +1091,7 @@ asio::awaitable<void> run_all_suites(asio::io_context& ctx, std::uint16_t plain,
 }  // namespace
 
 int main() {
-    sh::set_log_level(sh::LogLevel::Error);
-    sh::LOG_CB = [](sh::LogLevel, std::string_view file, int line, std::string msg) {
-        std::printf("  [lib] %s:%d %s\n", std::string{file}.c_str(), line, msg.c_str());
-    };
+    sh::set_log_sink(sh::make_stdout_sink(sh::LogLevel::Error));
 
     // The plaintext and TLS listeners of the library's own server, in-process.
     // Fixed ports, because the reverse-proxy routes below must name the backend's

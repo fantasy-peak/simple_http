@@ -1,13 +1,18 @@
 # simple_http 🚀
 
-> **Lightweight, Modern, High-Performance C++20 HTTP/1.1 & HTTP/2 Framework.**
+> **A lightweight, header-only HTTP/1.1, HTTP/2 and WebSocket framework for modern C++.**
 
 [![gcc](https://github.com/fantasy-peak/simple_http/actions/workflows/gcc.yaml/badge.svg)](https://github.com/fantasy-peak/simple_http/actions/workflows/gcc.yaml)
 [![clang](https://github.com/fantasy-peak/simple_http/actions/workflows/clang.yaml/badge.svg)](https://github.com/fantasy-peak/simple_http/actions/workflows/clang.yaml)
-![C++ Standard](https://img.shields.io/badge/C%2B%2B-20%2F23%2F26-blue.svg)
+![C++ Standard](https://img.shields.io/badge/C%2B%2B-23-blue.svg)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-`simple_http` is a lightweight, asynchronous HTTP/1.1 & HTTP/2 framework for C++20/23/26. Built on **Boost.Asio** and **OpenSSL**, with its own HTTP/1.1, HTTP/2 and WebSocket codecs (no Beast/nghttp2 on the wire), it uses modern C++ coroutines to provide a clean, high-performance API for both servers and clients.
+`simple_http` is an asynchronous HTTP/1.1, HTTP/2 and WebSocket framework built on
+**Boost.Asio** and **OpenSSL**. Its HTTP/1.1, HTTP/2 and WebSocket codecs are its
+own: no Beast, no nghttp2, nothing between your handler and the socket but Asio.
+The whole thing is C++23 coroutines from the acceptor down, it serves and it
+fetches — one route table covers HTTP/1.x, HTTP/2 and h2c, and the client speaks
+the same protocols outbound.
 
 ---
 
@@ -15,8 +20,11 @@
 - [✨ Features](#-features)
 - [🚀 Quick Start](#-quick-start)
 - [📦 Requirements](#-requirements)
-- [🧪 C++20 Modules Support (Experimental)](#-c20-modules-support-experimental)
 - [🛠 Configuration Macros](#-configuration-macros)
+- [📋 Logging](#-logging)
+- [🔒 TLS & mTLS](#-tls--mtls)
+- [🧭 Routing, Middleware & Proxy](#-routing-middleware--proxy)
+- [🗜 Response Compression](#-response-compression)
 - [📂 More Examples](#-more-examples)
 - [📊 Performance](#-performance)
 - [🧪 Testing Guide](#-testing-guide)
@@ -26,198 +34,144 @@
 
 ## ✨ Features
 
-- **📦 Header-only**: Simple to integrate; just include and go.
-- **🛡️ Modern C++**: Built with C++20/23/26 coroutines for intuitive async logic.
-- **🔄 Dual Protocol**: Seamless HTTP/1.1 & HTTP/2 support with ALPN negotiation.
-- **🔄 Server & Client**: Symmetrical API design for both roles — the client speaks http/https over HTTP/1.1 and HTTP/2, negotiating via ALPN or h2c.
-- **🔒 Secure**: Robust HTTPS and mTLS (Mutual TLS) support.
-- **🔌 Advanced Transport**: Supports **IPv4/IPv6** and **UNIX Domain Sockets** for high-speed local IPC.
-- **🧩 Middleware**: Flexible `setBefore` interceptors for pre-processing.
-- **🌊 Full Streaming**: Bi-directional streaming for client and server, with flow-control backpressure.
-- **♻️ Client Connections**: Keep-alive pooling, and HTTP/2 stream multiplexing on one connection.
-- **🌐 Proxy**: Built-in reverse proxy (request-level, streaming) with WebSocket pass-through; upstreams go through the client layer, so a backend may be plaintext or TLS and speaks HTTP/1.1 or HTTP/2.
+- **📦 Header-only** — include and go; the library itself links nothing but Boost.Asio and OpenSSL.
+- **🛡️ Modern C++** — C++23 coroutines (`asio::awaitable`), concepts, `std::expected`; no callbacks to thread through.
+- **🔄 One route table, every protocol** — HTTP/1.1, HTTP/2 (ALPN, h2c upgrade, prior knowledge) and h2c share handlers. Version differences live in the engines, not in your code.
+- **🔁 Server *and* client** — the client negotiates ALPN or h2c on its own, over `http://` and `https://`, with HTTP/2 stream multiplexing and a keep-alive pool.
+- **🔒 HTTPS & mTLS** — server and client side, including client-certificate inspection from a handler.
+- **🌊 Streaming both ways** — request and response bodies stream with flow-control backpressure; a large payload never has to be materialized.
+- **🌐 Reverse proxy** — request-level HTTP proxying (plaintext, TLS or h2c backends) and byte-level WebSocket pass-through.
+- **🔌 TCP and UNIX-domain sockets** — bind a path instead of a port when the peer is a local sidecar; TLS, WebSocket and proxying all work over either.
+- **🧩 Middleware** — `before` filters that can short-circuit, plus a CORS hook driven by the request's `Origin`.
+- **🧵 Lock-free connection handling** — each connection is pinned to one single-threaded `io_context` for its whole life, so engines and writers never synchronize.
+- **📋 Logging that does not pick a side** — a four-field `LogSink` interface with no third-party types in it; wire it to spdlog, an in-house library, or nothing.
+- **🗜 Optional compression** — gzip/brotli response bodies and transparent client-side decompression, both opt-in.
 
 ---
 
 ## 🚀 Quick Start
 
-### Simple Server Snippet
-```cpp
-import simple_http;
-
-hs.setHttpHandler("/hello", [](auto req, auto writer) -> asio::awaitable<void> {
-    writer->writeHttpResponse(simple_http::makeHttpResponse(http::status::ok, "Hello World!"));
-    co_return;
-});
-```
-
-<details>
-<summary><b>Click to view Full Server Example</b></summary>
-
-```cpp
-import std;
-import simple_http;
-
-asio::awaitable<void> start() {
-    simple_http::Config cfg{
-        .ip = "0.0.0.0",
-        .port = 7788,
-        .worker_num = 8,
-        .concurrent_streams = 200,
-        .window_size = std::nullopt,
-        .max_frame_size = std::nullopt,
-        .ssl_crt = "./test/tls_certificates/server_cert.pem",
-        .ssl_key = "./test/tls_certificates/server_key.pem",
-        .ssl_mutual = true,
-        .ssl_ca = "./test/tls_certificates/ca_cert.pem",
-        .socket_setup_cb =
-            [](asio::ip::tcp::socket& socket) {
-                socket.set_option(asio::socket_base::keep_alive(true));
-            },
-        .enable_ipv6 = true,
-        .ipv6_addr = "::1",
-        .ipv6_port = 7788,
-        .unix_socket = std::nullopt,
-        .websocket_setup_cb = [](auto socket) { std::visit([](auto&& arg) { arg->compress(false); }, socket); },
-    };
-    simple_http::HttpServer hs(cfg);
-    simple_http::LOG_CB = [](simple_http::LogLevel level, auto file, auto line, std::string msg) {
-        std::println("{} {} {} {}", to_string(level), file, line, msg);
-    };
-    hs.setBefore([](const auto& reader, const auto& writer) -> asio::awaitable<bool> {
-        if (reader->target() != "/hello") {
-            auto res = simple_http::makeHttpResponse(http::status::bad_request);
-            writer->writeHttpResponse(res);
-            co_return false;
-        }
-        co_return true;
-    });
-    hs.setHttpHandler("/hello",
-        [](auto req, auto writer) -> asio::awaitable<void> {
-            writer->writeStatus(200);
-            writer->writeHeader(http::field::content_type, simple_http::mime::text_plain);
-            writer->writeStreamHeaderEnd();
-            writer->writeStreamBody("hello world");
-            writer->writeStreamEnd();
-            co_return;
-        });
-    hs.setHttpHandler("/world",
-        [](auto req, auto writer) -> asio::awaitable<void> {
-            auto response = simple_http::makeHttpResponse(http::status::ok);
-            response->body() = "ok!";
-            writer->writeHttpResponse(response);
-            co_return;
-        });
-    co_await hs.start();
-}
-
-int main() {
-    simple_http::IoCtxPool pool{1};
-    pool.start();
-    asio::co_spawn(pool.getIoContext(), start(), asio::detached);
-    while (true)
-        sleep(1000);
-    return 0;
-}
-```
-</details>
-
-<details>
-<summary><b>Click to view Full Client Example</b></summary>
+### Server
 
 ```cpp
 #include <simple_http.h>
 
-// The client negotiates the protocol itself: ALPN over TLS ("h2" or
-// "http/1.1"), h2c over plaintext (an Upgrade round trip, or prior knowledge).
-asio::awaitable<void> client() {
-    // One-shot: a whole response, with the body bounded by the request budget.
-    simple_http::HttpClient http;
-    auto r = co_await http.get("https://example.com/index.html");
-    if (!r) {
-        std::println("{}", r.error().message());
-        co_return;
+namespace asio = boost::asio;
+
+int main() {
+    simple_http::ServerConfig cfg;
+    cfg.listen = InetAddress{"0.0.0.0", 7788, false};  // InetAddress{host, port, v6_only}
+    cfg.worker_threads = 4;
+
+    simple_http::Server server{cfg};
+
+    server.route("/hello", [](simple_http::RequestPtr, simple_http::ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(200).content_type(simple_http::mime::text_plain).send("Hello World!");
+    });
+
+    server.fallback([](simple_http::RequestPtr, simple_http::ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(404).send("not found");
+    });
+
+    if (!server.start()) {
+        return 1;  // a listener failed to bind
     }
-    std::println("{} {} ({} bytes)", r->status, std::string{to_string(r->version)}, r->body.size());
-
-    // Session: one connection, streamed bodies both ways. On HTTP/2 the streams
-    // are multiplexed, so several of these can be open at once.
-    simple_http::ClientTarget target;
-    target.host = "127.0.0.1";
-    target.port = 7789;
-    target.use_tls = true;
-    auto session = co_await http.connect(target);
-    if (!session) co_return;
-
-    simple_http::RequestSpec spec;
-    spec.method = simple_http::Method::Post;
-    spec.target = "/upload";
-    spec.stream_body = true;  // chunked on HTTP/1.1, DATA frames on HTTP/2
-    auto stream = co_await (*session)->open_stream(spec);
-    if (!stream) co_return;
-
-    co_await (*stream)->write("hello ");     // body chunks…
-    co_await (*stream)->finish("client");    // …and the end of the body
-    auto head = co_await (*stream)->read_head();   // status + headers
-    while (auto chunk = co_await (*stream)->read()) {  // then the body
-        if (chunk->eof) break;
-        std::println("recv: {}", chunk->data);
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::hours(1));  // the pool's threads do the work
     }
-    std::println("backend said {} {}", head->status, head->bodyless ? "(no body)" : "");
 }
 ```
 
-TLS details (SNI, CA bundle, name verification, client certificates for mTLS,
-the ALPN list, the minimum version) live in `simple_http::TlsClientConfig`;
-timeouts, limits and pool sizing in `simple_http::ClientConfig`. See
-[test/client.cpp](test/client.cpp) for the full matrix.
-</details>
+`cfg.listen` is a single endpoint on purpose. Serving several addresses or
+protocol stacks is a multi-process concern: start another `Server`, or another
+process sharing the port via `cfg.reuse_port`. IPv4 and IPv6 come from one
+listener — `{"::", port, false}` is dual-stack, and falls back to IPv4 where the
+platform has no IPv6.
+
+A UNIX-domain socket replaces the port with a path. There is no macro and
+nothing extra to link: `boost::asio::local::stream_protocol` is part of Asio, so
+the support is there wherever the platform has AF_UNIX. The socket file is
+unlinked before binding, so a restart reuses the path instead of failing on the
+leftover:
+
+```cpp
+cfg.listen = UnixAddress{"/run/myapp.sock"};
+```
+
+`Listen` is a `std::variant` of the two, so naming both a port and a path is not
+a rule to remember — it does not compile.
+
+Handlers take arguments by shape, picked at compile time:
+
+```cpp
+asio::awaitable<void>(RequestPtr, ResponsePtr)                  // ordinary
+asio::awaitable<void>(RequestPtr, ResponsePtr, SslHandle)       // + the TLS handle
+asio::awaitable<void>(RequestPtr, std::shared_ptr<WebSocket>)   // WebSocket route
+asio::awaitable<bool>(RequestPtr, ResponsePtr)                  // filter: false short-circuits
+```
+
+A response is fluent, one-shot or streamed:
+
+```cpp
+co_await res->status(200).content_type(simple_http::mime::app_json).send(payload);  // one-shot
+
+co_await res->status(200).begin();          // streamed: chunked on HTTP/1.1, DATA frames on HTTP/2
+co_await res->write("first ");
+co_await res->finish("last");
+```
+
+### Client
+
+```cpp
+#include <print>
+#include <simple_http.h>
+
+asio::awaitable<void> fetch() {
+    simple_http::HttpClient http;  // default policy
+
+    auto r = co_await http.get("https://example.com/");
+    if (!r) {
+        std::println("failed: {}", r.error().message());
+        co_return;
+    }
+    std::println("{} {} ({} bytes)", r->status, simple_http::to_string(r->version), r->body.size());
+}
+```
+
+One connection, streamed both ways:
+
+```cpp
+simple_http::ClientTarget target{.host = "127.0.0.1", .port = 7789, .use_tls = true};
+auto session = co_await http.connect(target);
+if (!session) co_return;
+
+simple_http::RequestSpec spec{.method = simple_http::Method::Post, .target = "/upload", .stream_body = true};
+auto stream = co_await (*session)->open_stream(spec);
+if (!stream) co_return;
+
+co_await (*stream)->write("hello ");     // body chunks…
+co_await (*stream)->finish("world");     // …and the end of the body
+
+auto head = co_await (*stream)->read_head();       // status + headers
+while (auto chunk = co_await (*stream)->read()) {  // then the body
+    if (chunk->eof) break;
+    std::println("recv: {}", chunk->data);
+}
+```
+
+On HTTP/2 those streams are multiplexed, so several can be open on one session at
+once. Timeouts, limits, pool sizing and decompression live in
+`simple_http::ClientConfig`; SNI, CA bundle, name verification, client
+certificates and the ALPN list in `simple_http::TlsClientConfig`.
 
 ---
 
 ## 📦 Requirements
-- **C++20/23/26** (GCC 13+, Clang 20+)
-- **xmake** Used for building examples and dependency management.
-- **Dependencies**: Boost.Asio, OpenSSL
 
-## 🧪 C++20 Modules Support (Experimental)
-`simple_http` provides native C++20 Modules support via `include/simple_http.cppm`.
-
-> **Status**: Verified on Clang 20+. Support for GCC and MSVC is on the roadmap.
-
-#### xmake Integration
-
-<details>
-<summary><b>Click to view detailed xmake.lua configuration</b></summary>
-
-The following example shows how to integrate `simple_http` as a C++20 module in your `xmake.lua` project:
-
-```lua
-add_requires("simple_http")
-
-set_policy("build.c++.modules", true)
-set_policy("build.c++.modules.std", true)
-
-target("server")
-    set_kind("binary")
-
-    add_cxflags("-fuse-ld=mold")
-    add_cxxflags("-stdlib=libc++")
-
-    on_load(function (target)
-        local pkg = target:pkg("simple_http")
-        if pkg then
-            local installdir = pkg:installdir()
-            local module_file = path.join(installdir, "include", "simple_http.cppm")
-            target:add("files", module_file)
-            print("Successfully linked C++20 module from: " .. module_file)
-        end
-    end)
-
-    add_files("src/main.cpp")
-    add_packages("simple_http")
-```
-</details>
+- **C++23** or newer (GCC 13+, Clang 20+).
+- **Boost.Asio** and **OpenSSL**. Nothing else — compression is opt-in and brings
+  its own two (zlib, brotli).
+- **xmake** for the example targets and dependency management; **CMake** is supported for consumption.
 
 ---
 
@@ -225,10 +179,175 @@ target("server")
 
 | Macro | Description |
 | :--- | :--- |
-| `SIMPLE_HTTP_EXPERIMENT_WEBSOCKET` | Enables experimental WebSocket support. |
-| `SIMPLE_HTTP_USE_BOOST_REGEX` | Uses `boost::regex` instead of `std::regex` for better performance. |
-| `SIMPLE_HTTP_BIND_UNIX_SOCKET` | Enables support for binding to UNIX Domain Sockets (UDS). |
+| `SIMPLE_HTTP_USE_BOOST_REGEX` | Uses `boost::regex` instead of `std::regex` for route matching. |
 | `SIMPLE_HTTP_ENABLE_COMPRESSION` | Compiles in gzip/brotli response-body compression. Needs zlib and brotli; see [Response Compression](#-response-compression). |
+| `SIMPLE_HTTP_ENABLE_LOG` | Master switch for the logging facade (`1` by default). Set to `0` and every `SIMPLE_HTTP_*_LOG` expands to `((void)0)`. |
+| `SIMPLE_HTTP_LOG_ACTIVE_LEVEL` | Compile-time floor, `0` (Trace) … `5` (Critical). Records below it are discarded at compile time, so they cost nothing at the call site. |
+| `SIMPLE_HTTP_ENABLE_HTTP3` | HTTP/3 skeleton; off by default and a no-op unless enabled. |
+
+WebSocket support has no macro — it is always compiled in.
+
+---
+
+## 📋 Logging
+
+The library formats a record and hands it to whatever `LogSink` is installed. It
+never writes to a stream itself, and it names no logging library — not in its
+headers, not in its build.
+
+```cpp
+simple_http::set_log_sink(simple_http::make_stdout_sink(simple_http::LogLevel::Info));
+```
+
+`make_stdout_sink` / `make_stderr_sink` take a minimum level and cover examples,
+tests and small tools. Installing a sink is safe while other threads are logging,
+so a deployment can swap its routing into place at any point.
+
+### Wiring up an existing logging library
+
+The adapter is deliberately **not** shipped in the library. A `spdlog_sink.h` in
+here would put spdlog on every consumer's include path and make the library
+responsible for tracking spdlog's API across versions. `LogSink` carries four
+fields and no third-party types, so adapting a backend is the ~30 lines below —
+`v2ray-cpp/src/flux.cpp` runs this exact code against an async spdlog logger.
+
+```cpp
+class SpdlogSink final : public simple_http::LogSink {
+  public:
+    explicit SpdlogSink(std::shared_ptr<spdlog::logger> logger) : m_logger(std::move(logger)) {}
+
+    bool enabled(simple_http::LogLevel level) const noexcept override {
+        return m_logger && m_logger->should_log(to_spdlog(level));
+    }
+
+    void log(const simple_http::LogRecord& record) override {
+        m_logger->log(to_spdlog(record.level), "{}:{}: {}",
+                      simple_http::basename(record.where.file_name()),
+                      record.where.line(), record.message);
+    }
+
+  private:
+    static spdlog::level::level_enum to_spdlog(simple_http::LogLevel level) noexcept {
+        switch (level) {
+            case simple_http::LogLevel::Trace: return spdlog::level::trace;
+            case simple_http::LogLevel::Debug: return spdlog::level::debug;
+            case simple_http::LogLevel::Info: return spdlog::level::info;
+            case simple_http::LogLevel::Warn: return spdlog::level::warn;
+            case simple_http::LogLevel::Error: return spdlog::level::err;
+            case simple_http::LogLevel::Critical: return spdlog::level::critical;
+        }
+        return spdlog::level::info;
+    }
+
+    std::shared_ptr<spdlog::logger> m_logger;
+};
+
+simple_http::set_log_sink(std::make_shared<SpdlogSink>(spdlog::default_logger()));
+```
+
+Four things worth knowing before writing your own:
+
+- **The sink owns the level.** `enabled()` is asked *before* the message is
+  formatted, so a record the sink would drop costs one virtual call — and
+  verbosity is configured in the logger you already have, not in two places.
+- **A record is valid only during the call.** `message` and `category` point at a
+  stack buffer; copy them if you need to keep them. The example above hands them
+  straight to spdlog, so it does not.
+- **Records carry a category, empty by default.** The library logs untagged; use
+  `SIMPLE_HTTP_ERROR_LOG_CAT("h2", …)` and friends when a backend routes on it.
+- **Nothing is allocated for the common case.** Messages up to 512 bytes are
+  formatted onto the stack.
+
+---
+
+## 🔒 TLS & mTLS
+
+TLS is one optional field on the server config, and one on the client's:
+
+```cpp
+simple_http::ServerConfig cfg;
+cfg.listen = {"0.0.0.0", 8443, false};
+cfg.tls = simple_http::TlsConfig{
+    .cert_chain_file = "server_cert.pem",
+    .private_key_file = "server_key.pem",
+    .mutual = true,                 // require a client certificate
+    .ca_file = "ca_cert.pem",
+};
+```
+
+ALPN picks HTTP/2 when the client offers it and HTTP/1.1 otherwise, so the same
+handlers serve both. On the client side the knobs are `verify_peer`,
+`verify_host`, `ca_file`, `cert_chain_file`, `private_key_file`, `sni_override`
+and `alpn`, all on `simple_http::TlsClientConfig`.
+
+A handler that takes the third argument receives the connection's `SslHandle`
+(`std::optional<SSL*>`, nullopt on plaintext), which is how you inspect a client
+certificate:
+
+```cpp
+server.route("/whoami", [](simple_http::RequestPtr, simple_http::ResponsePtr res,
+                           simple_http::SslHandle ssl) -> asio::awaitable<void> {
+    X509* cert = SSL_get_peer_certificate(*ssl);  // owned by the caller: X509_free it
+    // …
+});
+```
+
+---
+
+## 🧭 Routing, Middleware & Proxy
+
+```cpp
+// Exact and regex routes; the first match wins, `fallback` takes the rest.
+server.route("/world", handler);
+server.route_regex("^/api/(.*)$", handler);
+server.fallback(not_found);
+
+// A filter runs before routing; returning false short-circuits the request
+// (whatever it already wrote is the response).
+server.before([](simple_http::RequestPtr req, simple_http::ResponsePtr res) -> asio::awaitable<bool> {
+    if (!authorized(req)) {
+        co_await res->status(401).send("unauthorized");
+        co_return false;
+    }
+    co_return true;
+});
+
+// The CORS hook runs only for requests carrying an Origin header.
+server.cors(cors_filter);
+```
+
+Reverse proxy — request-level for HTTP, byte-level for WebSocket:
+
+```cpp
+// Plaintext HTTP/1.1 backend: the short form.
+server.http_proxy("/api", "backend.internal", 8080);
+// An https backend gets HTTP/2 for free when it offers it over ALPN — set `h2c`
+// instead to reach a plaintext HTTP/2 backend.
+server.http_proxy("/v2", HttpProxyTarget{.host = "10.0.0.5", .port = 8443, .tls = true});
+// Regex routes take capture groups in the rewrite.
+server.http_proxy_regex("^/v1/(.*)$", "10.0.0.5", 9000, "/$1");
+// WebSocket frames pass through untouched.
+server.ws_proxy("/ws", "backend.internal", 9000);
+```
+
+Proxying runs through the client layer, so the upstream may be plaintext or TLS
+and may speak HTTP/1.1 or HTTP/2, regardless of what the frontend speaks. Bodies
+stream in both directions; `X-Forwarded-*` headers are added and hop-by-hop
+headers are stripped.
+
+WebSocket routes hand you the socket directly:
+
+```cpp
+server.ws_route("/chat", [](simple_http::RequestPtr, std::shared_ptr<simple_http::WebSocket> ws)
+                              -> asio::awaitable<void> {
+    for (;;) {
+        auto msg = co_await ws->read();        // expected<WsMessage, error_code>
+        if (!msg) break;                       // peer closed, or an error
+        if (co_await ws->write("echo: " + msg->data, msg->text)) break;
+    }
+    co_return;  // returning sends a Close frame and shuts the socket down gracefully
+});
+```
 
 ---
 
@@ -302,9 +421,11 @@ comes back as `client_errc::body_decode_failed` rather than as half a body.
 
 ---
 
-### 📂 More Examples
-- **[server.cpp](test/server.cpp)**: A full-featured server example.
-- **[client.cpp](test/client.cpp)**: The client's exercise program — it starts a server in-process and drives the client over http/https × HTTP/1.1/HTTP/2 (plus h2c, streaming, multiplexing and TLS verification). Run it with `xmake run client` from the repository root.
+## 📂 More Examples
+
+- **[test/server.cpp](test/server.cpp)** — a server exercising every feature: routes, regex routes, middleware, h2c, WebSocket, a TLS listener with mTLS, and the reverse-proxy paths. Run it with `xmake run server`.
+- **[test/client.cpp](test/client.cpp)** — the client's exercise program. It starts a server in-process and drives the client over http/https × HTTP/1.1/HTTP/2, including h2c, streaming uploads, multiplexing and TLS verification. Run it with `xmake run client`.
+- **[v2ray-cpp/](v2ray-cpp/)** — a real deployment: a VLESS proxy built on this library, including the spdlog adapter shown above.
 
 ---
 
@@ -350,22 +471,20 @@ xmake build client     && xmake run client       # client integration: protocol 
 
 `unittest` and `regression` are Catch2 binaries (filter with e.g. `xmake run unittest "[h2]"`);
 `client` prints PASS/FAIL per check and exits non-zero on failure. All three are self-contained
-C++ — no Python or external services. `test/manual_http1_keepalive.py` is an optional manual
-cross-check with a third-party client (`pip install requests`, then `xmake run server`).
+C++ — no Python or external services.
 
-Against the example server (`xmake run server`), with external clients:
+Against the example server (`xmake run server`, plaintext on `:7788` and mTLS on `:7789`),
+with external clients:
 
 ```bash
 curl -N -v --http2-prior-knowledge http://localhost:7788/hello\?key1\=value1\&key2\=value2
 curl -N -v --http2-prior-knowledge http://localhost:7788/hello -d "abcd"
-curl -N -v --http2 http://localhost:7788/hello -d "abcd"
 
 nghttp --upgrade -v http://127.0.0.1:7788/hello
-nghttp --upgrade -v http://nghttp2.org
 h2load -n 60000 -c 1000 -m 200 -H 'Content-Type: application/json' --data=b.txt http://localhost:7788/hello
 
-need define SIMPLE_HTTP_BIND_UNIX_SOCKET macro
-curl --unix-socket /tmp/simple_http.sock https://SimpleHttpServer:7788/hello?123456 --cacert ca_cert.pem --cert client_cert.pem --key client_key.pem -X POST -d "123"
+curl -k --cert test/tls_certificates/client_cert.pem --key test/tls_certificates/client_key.pem \
+     https://127.0.0.1:7789/whoami
 ```
 
 ---

@@ -17,7 +17,6 @@
 #include "simple_http.h"
 
 namespace asio = boost::asio;
-namespace http = boost::beast::http;
 using namespace simple_http;
 
 // Returns the subject name of an X509 certificate, or "-" if none.
@@ -300,21 +299,18 @@ void register_routes(ServerT& server) {
 }
 
 int main() {
-    LOG_CB = [](LogLevel level, std::string_view file, int line, std::string msg) {
-        std::println("[{}] {}", to_string(level), msg);
-    };
-    set_log_level(LogLevel::Info);
+    set_log_sink(make_stdout_sink(LogLevel::Info));
 
     // Plaintext server: HTTP/1.1, h2c upgrade, HTTP/2 prior-knowledge.
     ServerConfig plain_cfg;
-    plain_cfg.listen = {"0.0.0.0", 7788, false};
+    plain_cfg.listen = InetAddress{"0.0.0.0", 7788, false};
     plain_cfg.worker_threads = 4;
     Server plain{plain_cfg};
     register_routes(plain);
 
     // TLS server: HTTP/1.1 and HTTP/2 selected by ALPN, with mutual TLS.
     ServerConfig tls_cfg;
-    tls_cfg.listen = {"0.0.0.0", 7789, false};
+    tls_cfg.listen = InetAddress{"0.0.0.0", 7789, false};
     tls_cfg.worker_threads = 4;
     tls_cfg.tls = TlsConfig{
         .cert_chain_file = "./test/tls_certificates/server_cert.pem",

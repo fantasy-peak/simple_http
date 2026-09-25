@@ -117,21 +117,28 @@ TEST_CASE("core/limits: defaults are protocol-legal", "[core]") {
 }
 
 TEST_CASE("core/logging: level filter, formatting and source location", "[core]") {
-    ScopedLog capture;  // note: `log` is also the library's logging function
-    set_log_level(LogLevel::Info);
-    log(LogLevel::Debug, __FILE__, __LINE__, "dropped {}", 1);  // below the level
+    ScopedLog capture{LogLevel::Info};  // note: `log` is also the library's logging function
+
+    SIMPLE_HTTP_DEBUG_LOG("dropped {}", 1);  // below the sink's threshold
     CHECK(capture.records.empty());
 
-    log(LogLevel::Error, "f.cpp", 42, "code {} message {}", 404, "nope");
+    // The recorded location is the real call site. std::source_location has no
+    // public constructor, so unlike a __FILE__/__LINE__ pair it cannot be faked —
+    // asserting against __LINE__ is asserting that the facade reports the truth.
+    const int expected_line = __LINE__ + 1;
+    SIMPLE_HTTP_ERROR_LOG("code {} message {}", 404, "nope");
     REQUIRE(capture.records.size() == 1);
     CHECK(capture.records[0].level == LogLevel::Error);
-    CHECK(capture.records[0].file == "f.cpp");
-    CHECK(capture.records[0].line == 42);
+    CHECK(simple_http::basename(capture.records[0].file) == "test_core.cpp");
+    CHECK(capture.records[0].line == expected_line);
     CHECK(capture.records[0].message == "code 404 message nope");
 
-    CHECK(to_string(LogLevel::Debug) == "Debug");
-    CHECK(to_string(LogLevel::Info) == "Info");
-    CHECK(to_string(LogLevel::Error) == "Error");
+    CHECK(to_string(LogLevel::Trace) == "trace");
+    CHECK(to_string(LogLevel::Debug) == "debug");
+    CHECK(to_string(LogLevel::Info) == "info");
+    CHECK(to_string(LogLevel::Warn) == "warn");
+    CHECK(to_string(LogLevel::Error) == "error");
+    CHECK(to_string(LogLevel::Critical) == "critical");
 }
 
 TEST_CASE("core/io_pool: round-robin, main context and clean shutdown", "[core]") {

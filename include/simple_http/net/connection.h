@@ -29,7 +29,6 @@
 namespace simple_http {
 
 namespace asio = boost::asio;
-namespace beast = boost::beast;
 
 // The HTTP/2 connection preface prefix (enough to identify prior-knowledge h2).
 inline constexpr std::string_view h2_preface_prefix = "PRI * HTTP/2.0";

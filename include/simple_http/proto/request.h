@@ -12,9 +12,6 @@
 #include <utility>
 
 #include <boost/asio.hpp>
-#include <boost/beast/http/verb.hpp>
-#include <boost/beast/http/message.hpp>
-#include <boost/beast/http/string_body.hpp>
 
 #include "../core/http_method.h"
 #include "../core/types.h"
@@ -24,35 +21,6 @@
 namespace simple_http {
 
 namespace asio = boost::asio;
-namespace http = boost::beast::http;
-
-// Maps a beast verb to the beast-free Method enum. Kept only for assign_head
-// (the h2c-upgrade path still hands over a beast request); the wire engines set
-// Method directly.
-inline Method method_from_verb(http::verb v) noexcept {
-    switch (v) {
-        case http::verb::get:
-            return Method::Get;
-        case http::verb::head:
-            return Method::Head;
-        case http::verb::post:
-            return Method::Post;
-        case http::verb::put:
-            return Method::Put;
-        case http::verb::delete_:
-            return Method::Delete;
-        case http::verb::options:
-            return Method::Options;
-        case http::verb::patch:
-            return Method::Patch;
-        case http::verb::connect:
-            return Method::Connect;
-        case http::verb::trace:
-            return Method::Trace;
-        default:
-            return Method::Unknown;
-    }
-}
 
 class Request {
   public:
@@ -93,22 +61,6 @@ class Request {
     }
 
     Headers& mutable_headers() { return m_headers; }
-
-    // Populate the request line + headers from a parsed Beast HTTP/1.x request,
-    // and stream its (already read) body into the Body.
-    // Populate the request line + headers from any parsed Beast HTTP/1.x request
-    // (works with string_body, buffer_body, etc. — only the header is read).
-    template <typename Body>
-    void assign_head(const http::request<Body>& req) {
-        m_method = method_from_verb(req.method());
-        m_method_token = std::string{http::to_string(req.method())};
-        set_target(std::string{req.target()});
-        m_headers.clear();
-        for (const auto& field : req) {
-            std::string name{field.name_string()};
-            m_headers.add(std::move(name), std::string{field.value()});
-        }
-    }
 
   private:
     void split_path_and_query() {
