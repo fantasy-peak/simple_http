@@ -565,7 +565,7 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
     asio::awaitable<void> read_loop() {
         // Parse any bytes carried over from protocol detection first.
         if (!parse_available()) co_return;
-        std::array<std::byte, 32 * 1024> buf{};
+        std::array<std::byte, 32 * 1024> buf;  // no init: read_some fills [0,n)
         for (;;) {
             m_deadline = std::chrono::steady_clock::now() + m_limits.idle_timeout;
             auto [ec, n] = co_await m_transport->async_read_some(std::span<std::byte>{buf});

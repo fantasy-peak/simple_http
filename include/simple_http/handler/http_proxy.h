@@ -537,7 +537,7 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
 
         // --- read the backend response head ---
         {
-            std::array<std::byte, 8192> tmp{};
+            std::array<std::byte, 8192> tmp;  // no init: read_some fills [0,n)
             auto state = detail::BackendResponseParser::State::NeedMore;
             error_code head_ec;
             // Loop so informational responses (100 Continue, 103 Early Hints) are
@@ -632,7 +632,7 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
     // Helper: read more bytes from the backend into `leftover`. Returns false on
     // EOF/error.
     auto pump_more = [&backend, &leftover]() -> asio::awaitable<bool> {
-        std::array<std::byte, 8192> tmp{};
+        std::array<std::byte, 8192> tmp;  // no init: read_some fills [0,n)
         auto [ec, n] = co_await backend->async_read_some(asio::buffer(tmp.data(), tmp.size()),
                                                          asio::as_tuple(asio::use_awaitable));
         if (ec || n == 0) co_return false;

@@ -163,7 +163,7 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
                 co_return std::unexpected(make_error_code(asio::error::invalid_argument));
             }
             if (status == WsFrameParser::Status::NeedMore) {
-                std::array<std::byte, 8192> tmp{};
+                std::array<std::byte, 8192> tmp;  // no init: read_some fills [0,n)
                 auto [ec, n] = co_await m_transport->async_read_some(std::span<std::byte>{tmp});
                 if (ec) {
                     m_open = false;

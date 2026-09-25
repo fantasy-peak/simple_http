@@ -148,7 +148,7 @@ inline asio::awaitable<bool> run_ws_proxy(std::shared_ptr<Transport> client, con
 
     // client -> backend: raw bytes off the transport, straight to the backend.
     auto client_to_backend = [&]() -> asio::awaitable<void> {
-        std::array<std::byte, 16384> buf{};
+        std::array<std::byte, 16384> buf;  // no init: read_some fills [0,n)
         for (;;) {
             auto [rec2, n] = co_await client->async_read_some(std::span<std::byte>{buf});
             if (rec2 || n == 0) break;
@@ -165,7 +165,7 @@ inline asio::awaitable<bool> run_ws_proxy(std::shared_ptr<Transport> client, con
 
     // backend -> client: raw bytes off the backend, straight to the transport.
     auto backend_to_client = [&]() -> asio::awaitable<void> {
-        std::array<std::byte, 16384> buf{};
+        std::array<std::byte, 16384> buf;  // no init: read_some fills [0,n)
         for (;;) {
             auto [rec2, n] = co_await backend->async_read_some(
                 asio::buffer(buf.data(), buf.size()), asio::as_tuple(asio::use_awaitable));

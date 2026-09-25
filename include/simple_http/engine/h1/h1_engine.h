@@ -304,7 +304,7 @@ class Http1Engine {
                     co_await send_error_response(431);  // Request Header Fields Too Large
                     co_return;
                 }
-                std::array<std::byte, 8192> tmp{};
+                std::array<std::byte, 8192> tmp;  // no init: read_some fills [0,n)
                 auto [ec, n] = co_await read_some(std::span<std::byte>{tmp});
                 if (ec) {
                     co_return;  // EOF or error before a full head — nothing more to do
@@ -476,7 +476,7 @@ class Http1Engine {
             co_return ReadResult::end();
         }
         if (m_buf.empty()) {
-            std::array<std::byte, 8192> tmp{};
+            std::array<std::byte, 8192> tmp;  // no init: read_some fills [0,n)
             auto [ec, n] = co_await read_some(std::span<std::byte>{tmp});
             if (ec) {
                 m_body_done = true;
@@ -629,7 +629,7 @@ class Http1Engine {
                 SIMPLE_HTTP_ERROR_LOG("h1 line longer than {} bytes; closing", m_limits.max_header_bytes);
                 co_return false;
             }
-            std::array<std::byte, 8192> tmp{};
+            std::array<std::byte, 8192> tmp;  // no init: read_some fills [0,n)
             auto [ec, n] = co_await read_some(std::span<std::byte>{tmp});
             if (ec) co_return false;
             m_buf.append(reinterpret_cast<const char*>(tmp.data()), n);
@@ -639,7 +639,7 @@ class Http1Engine {
     // Reads exactly `len` bytes from m_buf (topping up from the transport).
     asio::awaitable<bool> read_exact(std::size_t len, std::string& out) {
         while (m_buf.size() < len) {
-            std::array<std::byte, 8192> tmp{};
+            std::array<std::byte, 8192> tmp;  // no init: read_some fills [0,n)
             auto [ec, n] = co_await read_some(std::span<std::byte>{tmp});
             if (ec) co_return false;
             m_buf.append(reinterpret_cast<const char*>(tmp.data()), n);
