@@ -100,7 +100,21 @@ inline asio::awaitable<bool> run_ws_proxy(std::shared_ptr<Transport> client, con
     // Replay the client's raw upgrade request (rebuilt head + any buffered body
     // bytes) to the backend. The backend answers with its own 101, which we
     // splice straight back to the client below.
-    std::string preamble = rebuild_request_head(head, target.rewrite_path);
+    //
+    // The rewrite template replaces the *path* only. The query string is not part
+    // of the path, and it can carry data the endpoint needs — code-server's
+    // WebSocket endpoint puts its session token there
+    // (/…/stable-<hash>?reconnectionToken=…). Dropping it left the backend unable
+    // to associate the socket with a session, so the client waited forever for a
+    // handshake that could never complete. (http_proxy has always re-appended the
+    // query; this path did not.)
+    std::string replay_target{target.rewrite_path};
+    if (!replay_target.empty()) {
+        if (const auto q = head.target.find('?'); q != std::string_view::npos) {
+            replay_target.append(head.target.substr(q));
+        }
+    }
+    std::string preamble = rebuild_request_head(head, replay_target);
     preamble.append(initial);
     {
         // Composed async_write: writes the whole preamble or returns an error.

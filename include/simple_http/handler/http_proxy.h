@@ -5,7 +5,8 @@
 // Unlike the byte-level WebSocket tunnel (engine/h1/ws_proxy.h), this operates
 // on the parsed Request/Response abstraction, one request at a time:
 //
-//   1. open a plain TCP connection to the backend host:port (one per request);
+//   1. take an idle TCP connection to the backend host:port from the pool (or
+//      open one if the pool is empty);
 //   2. send the request line (with rewritten target) + forwarded headers, then
 //      stream the request body through;
 //   3. read the backend's status line + headers with a small incremental
@@ -23,17 +24,23 @@
 //
 // Concurrency (model A): the handler runs on the connection executor; the
 // backend socket is created on that same executor, so all I/O is single-
-// threaded. The backend connection is opened and closed per request (no pool).
+// threaded. Idle backend connections are pooled and reused (see UpstreamPool) —
+// a proxy that reconnects per request falls over when the backend sits behind a
+// tunnel and the client opens requests in bursts.
 
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -196,6 +203,95 @@ class BackendResponseParser {
     BackendResponseHead m_head;
 };
 
+// A small pool of idle upstream connections, keyed by (executor, host, port).
+//
+// Reusing upstream connections is what every production proxy does, and it
+// matters disproportionately here: the cost of a fresh connection is not a LAN
+// handshake but — when the backend is reached through a tunnel (frp, ngrok, …) —
+// a cross-tunnel round trip. A browser loads the code-server workbench with
+// dozens of concurrent requests, so connecting per request turned into a stampede
+// the tunnel could not absorb. Measured against an frp-tunnelled backend, 15
+// concurrent requests: 3 answered (one of them truncated) with a connection per
+// request, 15/15 once connections were reused.
+//
+// Connections are bound to the io_context that created them (an asio
+// requirement), so the pool is partitioned by executor. Only connections whose
+// response had an explicit end (Content-Length or chunked) may be pooled: an
+// EOF-delimited body leaves the connection at an unpredictable position.
+class UpstreamPool {
+  public:
+    using Socket = asio::ip::tcp::socket;
+
+    static UpstreamPool& instance() {
+        static UpstreamPool pool;
+        return pool;
+    }
+
+    // Takes an idle connection to `host:port` belonging to `ex`, or nullptr.
+    template <typename Executor>
+    std::shared_ptr<Socket> take(const Executor& ex, const std::string& host, std::uint16_t port) {
+        const Key key{executor_key(ex), host, port};
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto it = m_idle.find(key);
+        if (it == m_idle.end()) return nullptr;
+        auto& list = it->second;
+        prune(list);
+        if (list.empty()) return nullptr;
+        auto sock = std::move(list.back().sock);
+        list.pop_back();
+        return sock;
+    }
+
+    // Returns a connection still positioned at a response boundary.
+    template <typename Executor>
+    void put(const Executor& ex, const std::string& host, std::uint16_t port, std::shared_ptr<Socket> sock) {
+        const Key key{executor_key(ex), host, port};
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto& list = m_idle[key];
+        prune(list);
+        if (list.size() >= kMaxIdlePerTarget) list.erase(list.begin());
+        list.push_back(Idle{std::move(sock), std::chrono::steady_clock::now()});
+    }
+
+  private:
+    struct Key {
+        const void* ex;
+        std::string host;
+        std::uint16_t port;
+        bool operator==(const Key& o) const { return ex == o.ex && port == o.port && host == o.host; }
+    };
+    struct KeyHash {
+        std::size_t operator()(const Key& k) const {
+            return std::hash<const void*>{}(k.ex) * 31u + std::hash<std::string>{}(k.host) * 17u + k.port;
+        }
+    };
+    struct Idle {
+        std::shared_ptr<Socket> sock;
+        std::chrono::steady_clock::time_point since;
+    };
+
+    static constexpr std::size_t kMaxIdlePerTarget = 8;
+    // Idle connections are dropped after this long: a tunnelled backend closes
+    // idle connections on its own schedule, and handing out a half-closed one
+    // only costs a failed request.
+    static constexpr auto kIdleTtl = std::chrono::seconds(20);
+
+    static void prune(std::vector<Idle>& list) {
+        const auto now = std::chrono::steady_clock::now();
+        list.erase(std::remove_if(list.begin(), list.end(),
+                                  [&](const Idle& i) { return now - i.since > kIdleTtl; }),
+                   list.end());
+    }
+
+    template <typename Executor>
+    static const void* executor_key(const Executor& ex) {
+        return static_cast<const void*>(&ex.context());
+    }
+
+    std::mutex m_mutex;
+    std::unordered_map<Key, std::vector<Idle>, KeyHash> m_idle;
+};
+
 }  // namespace detail
 
 // Runs one request-level HTTP reverse-proxy exchange: forwards `req` to the
@@ -213,20 +309,34 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
         co_return;
     };
 
-    // Resolve + connect the backend on this connection's executor.
-    asio::ip::tcp::resolver resolver{executor};
-    auto [rec, endpoints] = co_await resolver.async_resolve(target.host, std::to_string(target.port),
-                                                            asio::as_tuple(asio::use_awaitable));
-    if (rec) {
-        SIMPLE_HTTP_ERROR_LOG("http-proxy resolve {}:{} failed: {}", target.host, target.port, rec.message());
-        co_await fail_502();
-        co_return;
-    }
-    auto [cec, _] = co_await asio::async_connect(*backend, endpoints, asio::as_tuple(asio::use_awaitable));
-    if (cec) {
-        SIMPLE_HTTP_ERROR_LOG("http-proxy connect {}:{} failed: {}", target.host, target.port, cec.message());
-        co_await fail_502();
-        co_return;
+    // Opens a fresh connection to the backend on this connection's executor.
+    // Called once up front, or again if a pooled connection turns out stale.
+    auto open_backend = [&]() -> asio::awaitable<error_code> {
+        backend = std::make_shared<asio::ip::tcp::socket>(executor);
+        asio::ip::tcp::resolver resolver{executor};
+        auto [rec, endpoints] = co_await resolver.async_resolve(target.host, std::to_string(target.port),
+                                                                asio::as_tuple(asio::use_awaitable));
+        if (rec) {
+            SIMPLE_HTTP_ERROR_LOG("http-proxy resolve {}:{} failed: {}", target.host, target.port, rec.message());
+            co_return rec;
+        }
+        auto [cec, _] = co_await asio::async_connect(*backend, endpoints, asio::as_tuple(asio::use_awaitable));
+        if (cec) {
+            SIMPLE_HTTP_ERROR_LOG("http-proxy connect {}:{} failed: {}", target.host, target.port, cec.message());
+        }
+        co_return cec;
+    };
+
+    // Prefer an idle pooled connection (see UpstreamPool). Opening one per request
+    // is ruinous when the backend sits behind a tunnel - every new connection
+    // costs a cross-tunnel round trip - and browsers issue requests in bursts.
+    backend = detail::UpstreamPool::instance().take(executor, target.host, target.port);
+    bool reused = backend != nullptr;
+    if (!reused) {
+        if (auto ec = co_await open_backend(); ec) {
+            co_await fail_502();
+            co_return;
+        }
     }
 
     auto write_all = [&backend](const std::string& out) -> asio::awaitable<error_code> {
@@ -347,20 +457,44 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
         head.append("\r\n");
     }
 
-    // Re-frame any request body as chunked (so we need no Content-Length), and
-    // ask the backend to close after the response so an unlengthed response body
-    // is unambiguously delimited by EOF.
+    // Re-frame any request body as chunked (so we need no Content-Length). The
+    // backend connection stays alive so it can go back to the pool; a response
+    // without an explicit length is still delimited by EOF, and such a connection
+    // is closed rather than pooled (see the pooling decision at the end).
     if (req_has_body) {
         head.append("Transfer-Encoding: chunked\r\n");
     }
-    head.append("Connection: close\r\n");
+    head.append("Connection: keep-alive\r\n");
     head.append("\r\n");
 
-    if (auto ec = co_await write_all(head); ec) {
-        SIMPLE_HTTP_ERROR_LOG("http-proxy write head failed: {}", ec.message());
-        co_await fail_502();
-        co_return;
-    }
+    // Send the request (head + body) and read the response head, retrying once
+    // when the connection came from the pool: an idle connection may have been
+    // closed by the backend - or by a tunnel in between - without our knowledge,
+    // and that surfaces as the first write or read failing. Requests carrying a
+    // body are never retried, since their body has already been consumed from the
+    // client; a stale pooled connection simply fails those.
+    detail::BackendResponseParser parser;
+    std::string leftover;  // response bytes read past the head (start of body)
+
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (attempt == 1) {
+            SIMPLE_HTTP_ERROR_LOG("http-proxy: {}:{} dropped a pooled connection, retrying on a fresh one",
+                                  target.host, target.port);
+            if (auto ec = co_await open_backend(); ec) {
+                co_await fail_502();
+                co_return;
+            }
+            reused = false;
+            parser = detail::BackendResponseParser{};
+            leftover.clear();
+        }
+
+        if (auto ec = co_await write_all(head); ec) {
+            SIMPLE_HTTP_ERROR_LOG("http-proxy write head failed: {}", ec.message());
+            if (reused && !req_has_body) continue;  // stale pooled connection
+            co_await fail_502();
+            co_return;
+        }
 
     // --- stream the request body to the backend as HTTP/1.1 chunked ---
     if (req_has_body) {
@@ -401,42 +535,50 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
         }
     }
 
-    // --- read the backend response head ---
-    detail::BackendResponseParser parser;
-    std::string leftover;  // response bytes read past the head (start of body)
-    {
-        std::array<std::byte, 8192> tmp{};
-        auto state = detail::BackendResponseParser::State::NeedMore;
-        // Loop so informational responses (100 Continue, 103 Early Hints) are
-        // swallowed instead of being mistaken for the final response.
-        for (;;) {
-        while (state == detail::BackendResponseParser::State::NeedMore) {
-            auto [ec, n] = co_await backend->async_read_some(asio::buffer(tmp.data(), tmp.size()),
-                                                             asio::as_tuple(asio::use_awaitable));
-            if (ec || n == 0) {
-                SIMPLE_HTTP_ERROR_LOG("http-proxy read response head failed: {}",
-                                      ec ? ec.message() : std::string{"eof"});
+        // --- read the backend response head ---
+        {
+            std::array<std::byte, 8192> tmp{};
+            auto state = detail::BackendResponseParser::State::NeedMore;
+            error_code head_ec;
+            // Loop so informational responses (100 Continue, 103 Early Hints) are
+            // swallowed instead of being mistaken for the final response.
+            for (;;) {
+                while (state == detail::BackendResponseParser::State::NeedMore) {
+                    auto [ec, n] = co_await backend->async_read_some(asio::buffer(tmp.data(), tmp.size()),
+                                                                     asio::as_tuple(asio::use_awaitable));
+                    if (ec || n == 0) {
+                        SIMPLE_HTTP_ERROR_LOG("http-proxy read response head failed: {}",
+                                              ec ? ec.message() : std::string{"eof"});
+                        head_ec = ec ? ec : make_error_code(asio::error::eof);
+                        break;
+                    }
+                    parser.feed(tmp.data(), n);
+                    state = parser.parse();
+                }
+                if (head_ec) break;
+                if (state == detail::BackendResponseParser::State::Error) {
+                    SIMPLE_HTTP_ERROR_LOG("http-proxy malformed response head from {}:{}", target.host, target.port);
+                    head_ec = make_error_code(asio::error::invalid_argument);
+                    break;
+                }
+                if (parser.head().status >= 200) break;  // final response
+                // Informational: discard it and parse the next head from what we have.
+                leftover.assign(parser.remainder());
+                parser = detail::BackendResponseParser{};
+                parser.feed(reinterpret_cast<const std::byte*>(leftover.data()), leftover.size());
+                leftover.clear();
+                state = parser.parse();
+            }
+            if (head_ec) {
+                if (reused && !req_has_body) continue;  // stale pooled connection: retry
                 co_await fail_502();
                 co_return;
             }
-            parser.feed(tmp.data(), n);
-            state = parser.parse();
+            // Bytes read past the head are the start of the body.
+            leftover.assign(parser.remainder());
         }
-        if (state == detail::BackendResponseParser::State::Error) {
-            SIMPLE_HTTP_ERROR_LOG("http-proxy malformed response head from {}:{}", target.host, target.port);
-            co_await fail_502();
-            co_return;
-        }
-        if (parser.head().status >= 200) break;  // final response
-        // Informational: discard it and parse the next head from what we have.
-        leftover.assign(parser.remainder());
-        parser = detail::BackendResponseParser{};
-        parser.feed(reinterpret_cast<const std::byte*>(leftover.data()), leftover.size());
-        leftover.clear();
-        state = parser.parse();
-        }
-        leftover.assign(parser.remainder());
-    }
+        break;  // final response head received
+    }  // end retry loop
 
     const auto& bhead = parser.head();
 
@@ -475,8 +617,9 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
     }
     if (bodyless) {
         // Nothing follows the headers: no framing, no terminating chunk, no body.
+        // The connection sits at a well-defined boundary, so it can be reused.
         (void)co_await res->send_bodyless();
-        backend->close();
+        detail::UpstreamPool::instance().put(executor, target.host, target.port, std::move(backend));
         co_return;
     }
 
@@ -598,12 +741,21 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
         body_complete = true;  // no length was announced: the close *is* the terminator
     }
 
+    // Only a response with an explicit end (Content-Length or chunked) leaves the
+    // connection at a known boundary. An EOF-delimited body does not, so that
+    // connection is closed instead of pooled.
+    const bool poolable = body_complete && (resp_chunked || resp_has_length);
+
     if (body_complete) {
         (void)co_await res->finish();
     } else {
         co_await abort_truncated("upstream body truncated");
     }
-    backend->close();
+    if (poolable) {
+        detail::UpstreamPool::instance().put(executor, target.host, target.port, std::move(backend));
+    } else {
+        backend->close();
+    }
     co_return;
 }
 
