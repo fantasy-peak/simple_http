@@ -106,6 +106,26 @@ target("regression")
     set_rundir(".")
 target_end()
 
+-- Python-side protocol tests. The C++ suites drive simple_http with its own
+-- client, so a spec misreading shared by both halves cancels out; these use
+-- httpx / hyper-h2 / websockets instead, which are independent implementations.
+-- First run:
+--   python3 -m venv test/python/.venv
+--   test/python/.venv/bin/pip install -r test/python/requirements.txt
+-- Then:
+--   xmake python-tests
+target("python-tests")
+    set_kind("phony")
+    add_deps("server")
+    on_run(function ()
+        local python = "test/python/.venv/bin/python"
+        if not os.isfile(python) then
+            raise("no virtualenv at test/python/.venv — see test/python/requirements.txt")
+        end
+        os.execv(python, {"test/python/run.py"})
+    end)
+target_end()
+
 -- Compile check for the code samples in README.md. Documented code is not
 -- exercised by anything else, and the README had quietly drifted to APIs that no
 -- longer existed — a string of examples that looked plausible and would not

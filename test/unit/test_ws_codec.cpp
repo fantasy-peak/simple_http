@@ -15,6 +15,37 @@ using namespace simple_http::test;
 
 namespace {
 
+// A client-to-server frame: mask bit set, a 4-byte key, payload XORed with it.
+//
+// WsFrameParser only ever sees this direction, and now rejects an unmasked frame
+// (RFC 6455 §5.1). The ws_encode_* helpers produce the *other* direction — server
+// frames, never masked — so feeding their output to the parser was testing a
+// combination the wire cannot produce. What the two directions share (the length
+// encoding, the opcode) is what these cases are actually about.
+std::string client_frame(WsOpcode opcode, std::string_view payload) {
+    static constexpr unsigned char kMask[4] = {0x11, 0x22, 0x33, 0x44};
+    const std::size_t n = payload.size();
+    std::string frame;
+    frame.push_back(static_cast<char>(0x80 | static_cast<unsigned char>(opcode)));
+    if (n < 126) {
+        frame.push_back(static_cast<char>(0x80 | n));
+    } else if (n < 65536) {
+        frame.push_back(static_cast<char>(0x80 | 126));
+        frame.push_back(static_cast<char>((n >> 8) & 0xFF));
+        frame.push_back(static_cast<char>(n & 0xFF));
+    } else {
+        frame.push_back(static_cast<char>(0x80 | 127));
+        for (int i = 7; i >= 0; --i) {
+            frame.push_back(static_cast<char>((n >> (8 * i)) & 0xFF));
+        }
+    }
+    frame.append(reinterpret_cast<const char*>(kMask), 4);
+    for (std::size_t i = 0; i < n; ++i) {
+        frame.push_back(static_cast<char>(static_cast<unsigned char>(payload[i]) ^ kMask[i % 4]));
+    }
+    return frame;
+}
+
 std::string hex_of(std::string_view bytes) {
     static constexpr char kHex[] = "0123456789abcdef";
     std::string out;
@@ -105,7 +136,7 @@ TEST_CASE("ws/encode: length framing boundaries", "[ws]") {
 TEST_CASE("ws/encode: frames round-trip through the parser", "[ws]") {
     const std::string payload = "payload with \x01\x02 binary bytes";
     for (auto opcode : {WsOpcode::Text, WsOpcode::Binary}) {
-        const std::string frame = ws_encode_frame(opcode, payload);
+        const std::string frame = client_frame(opcode, payload);
         WsFrameParser parser;
         parser.append(frame);
         WsFrame out;
@@ -115,7 +146,7 @@ TEST_CASE("ws/encode: frames round-trip through the parser", "[ws]") {
         CHECK(out.payload == payload);
     }
 
-    const std::string close = ws_encode_close(1001);
+    const std::string close = client_frame(WsOpcode::Close, ws_close_payload(1001));
     WsFrameParser parser;
     parser.append(close);
     WsFrame out;
@@ -129,8 +160,8 @@ TEST_CASE("ws/encode: frames round-trip through the parser", "[ws]") {
 // --- frame parsing -----------------------------------------------------------
 
 TEST_CASE("ws/parser: incremental input and several frames per buffer", "[ws]") {
-    const std::string a = ws_encode_text("first");
-    const std::string b = ws_encode_binary("second");
+    const std::string a = client_frame(WsOpcode::Text, "first");
+    const std::string b = client_frame(WsOpcode::Binary, "second");
     const std::string two = a + b;
 
     {

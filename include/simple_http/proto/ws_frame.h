@@ -170,8 +170,15 @@ class WsFrameParser {
 
         if (payload_len > m_max_payload) return Status::Error;
 
+        // RFC 6455 §5.1: every frame a client sends MUST be masked. This parser
+        // only ever sees client-to-server frames (WsBackendImpl is its only user),
+        // so an unmasked one is a protocol error and not a permissiveness to
+        // tolerate — the mask is what stops a cache-poisoning intermediary from
+        // replaying a client's bytes verbatim into another connection.
+        if (!mask) return Status::Error;
+
         unsigned char mask_key[4] = {0, 0, 0, 0};
-        if (mask) {
+        {
             if (size < pos + 4) return Status::NeedMore;
             mask_key[0] = data[pos];
             mask_key[1] = data[pos + 1];
@@ -185,9 +192,7 @@ class WsFrameParser {
         out.fin = fin;
         out.opcode = static_cast<WsOpcode>(opcode);
         out.payload.assign(reinterpret_cast<const char*>(data + pos), static_cast<std::size_t>(payload_len));
-        if (mask) {
-            ws_unmask(out.payload.data(), out.payload.size(), mask_key);
-        }
+        ws_unmask(out.payload.data(), out.payload.size(), mask_key);  // every frame past the check above is masked
 
         m_buf.erase(0, pos + static_cast<std::size_t>(payload_len));
         return Status::Frame;

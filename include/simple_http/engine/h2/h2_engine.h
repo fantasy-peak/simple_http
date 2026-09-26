@@ -24,6 +24,7 @@
 // Http2ResponseWriter holds a weak_ptr and lock()s it per operation.
 
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <deque>
@@ -408,6 +409,12 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
         bool half_closed_remote = false;  // client sent END_STREAM
         bool end_stream_sent = false;     // our terminating DATA (END_STREAM) emitted
 
+        // The request's declared body length (content-length), or -1 when it
+        // declared none, and the body octets seen so far. A body that does not
+        // match the declared length is malformed (§8.1.2.6).
+        std::int64_t declared_content_length = -1;
+        std::int64_t body_received = 0;
+
         // Inbound backpressure: a DATA frame the body channel refused. Held here
         // (rather than dropped) until the handler consumes enough to make room;
         // see on_data() and on_body_consumed().
@@ -663,6 +670,11 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
         if (m_body_paused) return true;
         std::size_t pos = 0;
         while (m_recv_buf.size() - pos >= codec::kH2FrameHeaderSize) {
+            // Checked per frame, not just on entry: on_data() sets this mid-loop
+            // when the body channel refuses a frame, and without the check here
+            // the loop would keep going and overwrite the frame it just parked —
+            // losing it, which is precisely what the parking is for.
+            if (m_body_paused) break;
             codec::H2FrameHeader hdr;
             codec::parse_frame_header(std::string_view{m_recv_buf}.substr(pos), hdr);
             // RFC 9113 §4.2: a frame larger than our advertised SETTINGS_MAX_FRAME_SIZE
@@ -768,6 +780,17 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
             return false;
         }
         Stream& st = ensure_stream(hdr.stream_id);
+        // RFC 9113 §5.1: once the peer has closed its half of the stream, only
+        // WINDOW_UPDATE, PRIORITY and RST_STREAM are still in order there — a
+        // HEADERS is a STREAM_CLOSED stream error. Checked before the trailing
+        // -block rule below so the error code follows the stream state rather
+        // than the frame's flags.
+        if (st.half_closed_remote) {
+            SIMPLE_HTTP_ERROR_LOG("h2: HEADERS on a half-closed(remote) stream (stream={}); resetting",
+                                  hdr.stream_id);
+            reset_stream(hdr.stream_id, codec::H2_STREAM_CLOSED);
+            return true;
+        }
         st.header_block.append(block);
         if (hdr.stream_id > m_next_peer_stream_id) m_next_peer_stream_id = hdr.stream_id;
 
@@ -775,6 +798,16 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
         bool end_stream = hdr.has_flag(codec::H2_FLAG_END_STREAM);
 
         if (hdr.has_flag(codec::H2_FLAG_END_HEADERS)) {
+            // A trailing header block completes the request, so it must also end
+            // the stream (§8.1): a second HEADERS without END_STREAM describes a
+            // message that never terminates. `dispatched` is read before
+            // finish_header_block, which may erase `st`.
+            if (st.dispatched && !hdr.has_flag(codec::H2_FLAG_END_STREAM)) {
+                SIMPLE_HTTP_ERROR_LOG("h2: trailing HEADERS without END_STREAM (stream={}); resetting",
+                                      hdr.stream_id);
+                reset_stream(hdr.stream_id, codec::H2_PROTOCOL_ERROR);
+                return true;
+            }
             if (!finish_header_block(hdr.stream_id, st)) return false;
             // finish_header_block may have reset (and erased) a malformed stream, so
             // `st` must not be used again: re-look it up before dispatching.
@@ -825,6 +858,25 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
 
     // Decodes an accumulated header block into the stream's Request and clears
     // the buffer. Dispatch happens once END_STREAM is also seen.
+    // RFC 9113 §8.2.1: HTTP/2 field names are lowercase. An uppercase byte makes
+    // the request malformed rather than something to fold away — folding is how
+    // HTTP/1.1 tolerated it, and this layer deliberately does not.
+    static bool has_upper_ascii(std::string_view s) noexcept {
+        for (char c : s) {
+            if (ascii_lower(c) != c) return true;
+        }
+        return false;
+    }
+
+    // RFC 9113 §8.2.2: the HTTP/1.1 connection-specific fields, which a client
+    // must not send in HTTP/2. A hop downstream that acted on one — say
+    // `transfer-encoding: chunked` replayed through a proxy route — would be
+    // framing a message the sender never described.
+    static bool is_connection_specific_field(std::string_view name) noexcept {
+        return name == "connection" || name == "keep-alive" || name == "proxy-connection" ||
+               name == "transfer-encoding" || name == "upgrade";
+    }
+
     bool finish_header_block(std::uint32_t stream_id, Stream& st) {
         std::vector<codec::HpackHeader> fields;
         if (!m_decoder.decode(st.header_block, fields)) {
@@ -833,9 +885,30 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
             return false;
         }
         st.header_block.clear();
+
+        // A header block on a stream that has already been dispatched is a
+        // trailing block (§8.1), and a trailing block carries no pseudo-header.
+        const bool trailers = st.dispatched;
+
         // :authority is collected here and applied after the loop, so a real
         // Host field — which may follow it — wins over the synthesized one.
         std::string authority;
+        // Presence flags, so a missing or duplicated request pseudo-header is a
+        // malformed request rather than a silently-synthesized default (§8.3.1).
+        bool seen_method = false;
+        bool seen_scheme = false;
+        bool seen_path = false;
+        bool seen_authority = false;
+        bool seen_regular_field = false;
+
+        // Every rejection below is a *stream* error (§8.1.1): the connection stays
+        // usable and only the offending stream is reset. Returning true then means
+        // "handled" — the caller must not dispatch a stream that is already gone.
+        auto malformed = [&](std::string why) {
+            SIMPLE_HTTP_ERROR_LOG("h2 malformed request (stream={}): {}; resetting stream", stream_id, why);
+            reset_stream(stream_id, codec::H2_PROTOCOL_ERROR);
+        };
+
         for (auto& f : fields) {
             // RFC 9113 §8.2.1: a field name or value must not contain CR, LF or NUL.
             // HTTP/2 has no line folding, so these bytes survive decoding verbatim and
@@ -847,18 +920,108 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
                 reset_stream(stream_id, codec::H2_PROTOCOL_ERROR);
                 return true;  // stream is gone: the caller must not dispatch it
             }
-            if (f.name == ":method") {
-                st.request->set_method_token(f.value);
-            } else if (f.name == ":path") {
-                st.request->set_target(std::move(f.value));
-            } else if (f.name == ":authority") {
-                authority = std::move(f.value);
-            } else if (!f.name.empty() && f.name[0] == ':') {
-                // :scheme and the rest of the pseudo-headers are not surfaced.
-            } else {
-                st.request->mutable_headers().add_lower(std::move(f.name), std::move(f.value));
+
+            const bool pseudo = !f.name.empty() && f.name[0] == ':';
+            // §8.1: trailers describe a request that has already been received, so
+            // they carry no pseudo-header fields.
+            if (pseudo && trailers) {
+                malformed("pseudo-header in trailers");
+                return true;
+            }
+            // §8.2.1: pseudo-header fields must appear before every regular field.
+            if (pseudo && seen_regular_field) {
+                malformed("pseudo-header after a regular field");
+                return true;
+            }
+
+            if (pseudo) {
+                bool* seen = nullptr;
+                if (f.name == ":method") {
+                    seen = &seen_method;
+                } else if (f.name == ":scheme") {
+                    seen = &seen_scheme;
+                } else if (f.name == ":path") {
+                    seen = &seen_path;
+                } else if (f.name == ":authority") {
+                    seen = &seen_authority;
+                } else {
+                    // :status and every other pseudo-header belong to a response,
+                    // or to nothing at all — either way a client must not send one.
+                    malformed(std::string{"unknown pseudo-header "} + f.name);
+                    return true;
+                }
+                if (*seen) {
+                    malformed(std::string{"duplicate "} + f.name);
+                    return true;
+                }
+                *seen = true;
+
+                if (f.name == ":method") {
+                    st.request->set_method_token(f.value);
+                } else if (f.name == ":path") {
+                    st.request->set_target(std::move(f.value));
+                } else if (f.name == ":authority") {
+                    authority = std::move(f.value);
+                }
+                // :scheme is checked for presence and then dropped: nothing
+                // downstream consumes it, and an engine only runs once the
+                // connection's security is already settled.
+                continue;
+            }
+
+            seen_regular_field = true;
+            if (has_upper_ascii(f.name)) {
+                malformed("uppercase field name");
+                return true;
+            }
+            // §8.2.2: connection-specific fields are prohibited in HTTP/2.
+            if (is_connection_specific_field(f.name)) {
+                malformed("connection-specific field");
+                return true;
+            }
+            // §8.2.2: TE is the one exception to that rule, and only with the
+            // value "trailers".
+            if (f.name == "te" && !iequals_ci(f.value, "trailers")) {
+                malformed("TE with a value other than trailers");
+                return true;
+            }
+            st.request->mutable_headers().add_lower(std::move(f.name), std::move(f.value));
+        }
+
+        // §8.3.1: a request carries :method, :scheme and :path — CONNECT is the
+        // one method that must omit the latter two.
+        if (!trailers) {
+            if (!seen_method) {
+                malformed("missing :method");
+                return true;
+            }
+            if (st.request->method() != Method::Connect) {
+                if (!seen_scheme) {
+                    malformed("missing :scheme");
+                    return true;
+                }
+                if (!seen_path) {
+                    malformed("missing :path");
+                    return true;
+                }
+                if (st.request->target().empty()) {
+                    malformed("empty :path");
+                    return true;
+                }
+            }
+            // §8.1.2.6: content-length is a non-negative decimal integer. The body
+            // that follows is then held to it — see on_data().
+            if (auto declared = st.request->header("content-length")) {
+                std::uint64_t value = 0;
+                auto [ptr, ec] = std::from_chars(declared->data(), declared->data() + declared->size(), value);
+                if (ec != std::errc{} || ptr != declared->data() + declared->size()) {
+                    malformed("invalid content-length");
+                    return true;
+                }
+                st.declared_content_length = static_cast<std::int64_t>(value);
             }
         }
+
         // :authority is HTTP/2's spelling of Host, and a compliant client sends
         // it with no Host field at all — so without this every h2 request reaches
         // handlers, and the reverse proxy's x-forwarded-host, host-less. Done
@@ -866,7 +1029,6 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
         if (!authority.empty() && !st.request->mutable_headers().contains("host")) {
             st.request->mutable_headers().add_lower("host", std::move(authority));
         }
-        (void)stream_id;
         // Dispatch is triggered by the caller once END_STREAM is also observed.
         return true;
     }
@@ -903,6 +1065,17 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
             if (padding > 0) credit_consumed(st, padding);
 
             if (!data.empty()) {
+                // §8.1.2.6: a body that overruns its declared content-length is
+                // malformed. Caught as the overrun arrives — before the bytes
+                // reach the handler — so an unterminated body is caught as well.
+                st.body_received += static_cast<std::int64_t>(data.size());
+                if (st.declared_content_length >= 0 && st.body_received > st.declared_content_length) {
+                    SIMPLE_HTTP_ERROR_LOG(
+                        "h2: request body overruns content-length (stream={}, declared={}, seen={})", hdr.stream_id,
+                        st.declared_content_length, st.body_received);
+                    reset_stream(hdr.stream_id, codec::H2_PROTOCOL_ERROR);
+                    return true;
+                }
                 // These delivered bytes owe connection-level credit until the
                 // handler consumes them (or the stream is torn down).
                 st.recv_owed_conn += static_cast<std::int64_t>(data.size());
@@ -921,6 +1094,16 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
             }
             if (hdr.has_flag(codec::H2_FLAG_END_STREAM)) {
                 st.half_closed_remote = true;
+                // §8.1.2.6, the other half: a body that stops short of its
+                // declared content-length is malformed too. Unlike the overrun
+                // above, this is only knowable here, where the body ends.
+                if (st.declared_content_length >= 0 && st.body_received != st.declared_content_length) {
+                    SIMPLE_HTTP_ERROR_LOG(
+                        "h2: request body short of content-length (stream={}, declared={}, seen={})", hdr.stream_id,
+                        st.declared_content_length, st.body_received);
+                    reset_stream(hdr.stream_id, codec::H2_PROTOCOL_ERROR);
+                    return true;
+                }
                 // End of request body. The handler (already dispatched at
                 // END_HEADERS) observes end-of-body on its next Body::read().
                 // finish() cannot be dropped: it is recorded out of band, because
