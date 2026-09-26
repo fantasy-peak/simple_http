@@ -22,6 +22,7 @@
 #include "../engine/dispatcher.h"  // WsProxyTarget, HttpProxyTarget
 #include "handler.h"
 #include "http_proxy.h"
+#include "static_files.h"  // the static stage (m_static)
 
 #ifdef SIMPLE_HTTP_USE_BOOST_REGEX
 #include <boost/regex.hpp>
@@ -64,6 +65,24 @@ class Router {
         } catch (const std::exception& e) {
             SIMPLE_HTTP_ERROR_LOG("invalid route regex [{}]: {}", pattern, e.what());
         }
+        return *this;
+    }
+
+    // Registers a static file site. It becomes a *stage* of dispatch rather than
+    // a route, which is what makes the ordering guarantee structural: a real
+    // route always wins over a file of the same name, and — because the built-in
+    // 404 sits behind the stage — a site that declines every path still cannot
+    // leave a request unanswered.
+    //
+    // A disabled site (empty root) is ignored rather than registered, with the
+    // reason logged: "why is my site serving 404s" should not be a silent
+    // configuration mistake.
+    Router& static_files(std::shared_ptr<StaticFiles> site) {
+        if (!site || !site->enabled()) {
+            SIMPLE_HTTP_INFO_LOG("static files: ignoring a disabled site");
+            return *this;
+        }
+        m_static.push_back(std::move(site));
         return *this;
     }
 
@@ -241,6 +260,15 @@ class Router {
                 }
             }
         }
+        // The static stage. Running it here — after the routes, before the
+        // fallback — is what keeps a placeholder file from shadowing a real
+        // endpoint, and it is also why a site's try_serve may return "not mine"
+        // at any point without the request being dropped: whatever comes next in
+        // this function still runs, and the built-in 404 is the last of them.
+        for (const auto& site : m_static) {
+            if (co_await site->try_serve(req, res)) co_return;
+        }
+
         if (m_fallback) {
             co_await invoke_handler(*m_fallback, std::move(req), std::move(res), ssl);
             co_return;
@@ -290,6 +318,10 @@ class Router {
 
     std::unordered_map<std::string, Handler, string_hash, std::equal_to<>> m_exact;
     std::vector<std::pair<simple_http_regex::regex, Handler>> m_regex;
+    // Static file sites, consulted in registration order after the regex routes
+    // and before the fallback. A vector rather than one slot so mounting several
+    // roots is a later addition rather than a change of shape.
+    std::vector<std::shared_ptr<StaticFiles>> m_static;
     std::optional<Handler> m_fallback;
     Filter m_before;
     Filter m_cors;

@@ -172,6 +172,23 @@ void readme_websocket(simple_http::Server& server) {
                     });
 }
 
+// --- Static files (README → Static Files) ------------------------------------
+
+void readme_static_files(simple_http::Server& server) {
+    simple_http::StaticFilesConfig cfg;
+    cfg.table.root = "./web/dist";
+    cfg.table.immutable_prefixes = {"/assets/"};  // content-hashed build output
+    cfg.spa_fallback = "index.html";              // for a client-side router; "" = off
+
+    auto site = std::make_shared<simple_http::StaticFiles>(std::move(cfg));
+    std::string error;
+    if (!site->load(error)) {
+        std::println(stderr, "{}", error);  // a bad root is a startup failure, not a 404
+        return;
+    }
+    server.static_files(std::move(site));
+}
+
 // --- Logging (README → Logging) ---------------------------------------------
 
 void readme_logging() {

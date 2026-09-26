@@ -351,6 +351,53 @@ server.ws_route("/chat", [](simple_http::RequestPtr, std::shared_ptr<simple_http
 
 ---
 
+## 📁 Static Files
+
+Serve a directory — build output, a docs site, a single-page app — without ever
+letting a request path near the filesystem. The root is scanned **once**, at
+startup, into a table of canonical paths; at request time a URL is decoded,
+normalized and looked up in that table. Nothing else.
+
+That single decision is the whole design. Directory traversal cannot be
+expressed in a normalized key, and even if it could, no such key exists. Symlinks
+are skipped during the scan and never followed, so nothing outside the root can
+become reachable. No `stat()` or `open()` ever happens on a path the peer chose,
+so there is no window between the check and the use. Only regular files are
+admitted, so a FIFO in the tree cannot hang a worker. And because ETag and
+`Last-Modified` come from the scan's own metadata, a `304` is answered without
+opening anything.
+
+```cpp
+sh::StaticFilesConfig cfg;
+cfg.table.root = "./web/dist";
+cfg.table.immutable_prefixes = {"/assets/"};  // content-hashed build output
+cfg.spa_fallback = "index.html";              // for a client-side router; "" = off
+
+auto site = std::make_shared<sh::StaticFiles>(std::move(cfg));
+std::string error;
+if (!site->load(error)) {
+    std::cerr << error << '\n';  // a bad root is a startup failure, not a 404
+    return 1;
+}
+server.static_files(std::move(site));
+```
+
+The site is a **stage** of routing rather than a route, so it runs after every
+real route and before the fallback — `/api/...` always wins over a file that
+happens to share its name, and a request the site declines still gets the
+router's 404 rather than being left unanswered.
+
+It answers `GET` and `HEAD`, conditional requests (`ETag`, `Last-Modified`,
+`If-Range`), single-part `Range` with `206`/`416`, and negotiated pre-compressed
+siblings (`app.js.br`, `app.js.gz`) with a per-representation validator. It never
+compresses anything itself — it only picks between bytes already on disk.
+
+What it deliberately leaves out: directory listings, multi-range responses,
+following symlinks, and cache-freshness policy beyond three buckets (`immutable`
+for `immutable_prefixes`, `no-cache` for HTML, an hour or a day for the rest).
+Each of `StaticTableConfig`'s fields documents its own default and the reason for
+it.
+
 ## 🗜 Response Compression
 
 A server can gzip or brotli response bodies for clients that ask for it. It is

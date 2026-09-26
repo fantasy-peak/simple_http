@@ -26,6 +26,11 @@
 #include "simple_http/core/base64.h"
 #include "simple_http/core/compression.h"
 #include "simple_http/core/content_encoding.h"  // codecs need SIMPLE_HTTP_ENABLE_COMPRESSION
+#include "simple_http/core/http_date.h"
+#include "simple_http/core/url_path.h"
+#include "simple_http/core/accept_encoding.h"  // reuses types.h; must not redefine content_encoding.h names
+#include "simple_http/core/validators.h"
+#include "simple_http/core/static_table.h"
 #include "simple_http/core/io_pool.h"
 
 // --- proto layer (version-agnostic HTTP request/response model) ---
@@ -50,6 +55,7 @@
 // --- handler layer (handler type system + router/dispatch) ---
 #include "simple_http/engine/dispatcher.h"
 #include "simple_http/handler/handler.h"
+#include "simple_http/handler/static_files.h"
 #include "simple_http/handler/router.h"
 
 // --- net layer (protocol detection + server facade) ---

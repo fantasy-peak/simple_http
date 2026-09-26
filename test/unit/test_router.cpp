@@ -7,6 +7,7 @@
 #include <string>
 
 #include "simple_http.h"
+#include "../static_fixture.h"
 #include "test_support.h"
 
 using namespace simple_http;
@@ -230,4 +231,89 @@ TEST_CASE("router: the websocket handler lookup", "[router]") {
 
     CHECK(router.find_ws("/chat") != nullptr);
     CHECK(router.find_ws("/other") == nullptr);
+}
+
+TEST_CASE("router: the static stage sits between the routes and the fallback", "[router]") {
+    StaticFixture fx;
+    fx.write("index.html", "<html>root</html>");
+    fx.write("shared.html", "<html>from the site</html>");
+
+    StaticFilesConfig cfg;
+    cfg.table.root = fx.root_string();
+    auto site = std::make_shared<StaticFiles>(std::move(cfg));
+    std::string error;
+    REQUIRE(site->load(error));
+
+    Router router;
+    router.route("/shared.html", body_handler("from the route"));
+    router.route_regex("/r/.*", body_handler("from the regex"));
+    router.static_files(site);
+    router.fallback(body_handler("from the fallback"));
+
+    asio::io_context ctx;
+    auto dispatch = [&](const std::string& path) {
+        auto writer = std::make_shared<FakeResponseWriter>();
+        auto req = make_request(ctx, path);
+        auto res = std::make_shared<Response>(writer);
+        REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
+        return writer;
+    };
+
+    // A real route always wins over a file of the same name — the file is there,
+    // and the route still answers.
+    CHECK(dispatch("/shared.html")->last_body == "from the route");
+    CHECK(dispatch("/r/anything")->last_body == "from the regex");
+
+    // The site answers what no route claimed.
+    CHECK(dispatch("/")->last_body == "<html>root</html>");
+    CHECK(dispatch("/index.html")->last_body == "<html>root</html>");
+
+    // And the fallback still sees what the site declines.
+    CHECK(dispatch("/nowhere")->last_body == "from the fallback");
+}
+
+TEST_CASE("router: a declining static stage cannot leave a request unanswered", "[router]") {
+    StaticFixture fx;
+    fx.write("index.html", "hi");
+
+    StaticFilesConfig cfg;
+    cfg.table.root = fx.root_string();
+    auto site = std::make_shared<StaticFiles>(std::move(cfg));
+    std::string error;
+    REQUIRE(site->load(error));
+
+    // No fallback registered. The stage declines everything except "/", and the
+    // router's own 404 is what answers the rest — which is the structural fix for
+    // the old arrangement, where a site had to be registered as a catch-all regex
+    // and an early return would have hung the client.
+    Router router;
+    router.static_files(site);
+
+    asio::io_context ctx;
+    auto writer = std::make_shared<FakeResponseWriter>();
+    auto req = make_request(ctx, "/not-in-the-site");
+    auto res = std::make_shared<Response>(writer);
+    REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
+
+    CHECK(writer->last_status == 404);  // written by the router, not left hanging
+}
+
+TEST_CASE("router: registering a disabled site is a no-op, not a silent 404 machine", "[router]") {
+    StaticFilesConfig cfg;  // empty root: disabled
+    auto site = std::make_shared<StaticFiles>(std::move(cfg));
+    std::string error;
+    REQUIRE(site->load(error));
+    REQUIRE_FALSE(site->enabled());
+
+    Router router;
+    router.static_files(site);  // ignored
+    router.route("/", body_handler("route still works"));
+
+    asio::io_context ctx;
+    auto writer = std::make_shared<FakeResponseWriter>();
+    auto req = make_request(ctx, "/");
+    auto res = std::make_shared<Response>(writer);
+    REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
+
+    CHECK(writer->last_body == "route still works");
 }

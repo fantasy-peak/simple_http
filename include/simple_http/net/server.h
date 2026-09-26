@@ -191,6 +191,15 @@ class Server {
                              std::string rewrite_path = {}) {
         return http_proxy_regex(pattern, HttpProxyTarget{std::move(host), port, std::move(rewrite_path)});
     }
+    // --- static file serving ---
+    // Registers a site built from a document root. The site becomes a dispatch
+    // stage rather than a route, so it is consulted after every real route and
+    // before the fallback — see Router::static_files for why that matters.
+    Server& static_files(std::shared_ptr<StaticFiles> site) {
+        m_router->static_files(std::move(site));
+        return *this;
+    }
+
     Server& http_proxy(std::string path, HttpProxyTarget target) {
         m_router->http_proxy(std::move(path), std::move(target));
         return *this;

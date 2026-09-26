@@ -15,7 +15,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <memory>
+#include <stdexcept>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -50,7 +52,53 @@ sh::ServerConfig make_config(std::uint16_t port, std::optional<sh::TlsConfig> tl
     return cfg;
 }
 
+// --- a document root for the static cases -----------------------------------
+//
+// Process-wide rather than per-test, because the servers below are singletons
+// too: built once, alive for the whole binary. The tree is small and fixed so
+// every case can state its expectation in bytes rather than in derivations.
+
+const std::filesystem::path& static_root() {
+    static const std::filesystem::path root = [] {
+        const auto dir = std::filesystem::temp_directory_path() / "simple_http_regression_static";
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+        std::filesystem::create_directories(dir);
+        auto write = [&](const char* rel, std::string_view body) {
+            std::filesystem::create_directories(dir / std::filesystem::path{rel}.parent_path());
+            std::ofstream out(dir / rel, std::ios::binary);
+            out.write(body.data(), static_cast<std::streamsize>(body.size()));
+        };
+        write("index.html", "<html>index</html>");
+        write("404.html", "<html>missing</html>");
+        write("app.js", "console.log('app');");
+        write("app.js.br", "BR:console.log('app');");
+        write("assets/chunk-abc.js", "console.log('chunk');");
+        return dir;
+    }();
+    return root;
+}
+
+std::shared_ptr<sh::StaticFiles> static_site() {
+    static const std::shared_ptr<sh::StaticFiles> site = [] {
+        sh::StaticFilesConfig cfg;
+        cfg.table.root = static_root().string();
+        cfg.table.immutable_prefixes = {"/assets/"};
+        auto s = std::make_shared<sh::StaticFiles>(std::move(cfg));
+        std::string error;
+        if (!s->load(error)) {
+            throw std::runtime_error("static site failed to load: " + error);
+        }
+        return s;
+    }();
+    return site;
+}
+
 void register_routes(sh::Server& server) {
+    // Registered first but consulted last among the routes: the static stage sits
+    // between the regex routes and the fallback, so every route below still wins.
+    server.static_files(static_site());
+
     server.route("/world", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
         co_await res->status(200).content_type("text/plain").send("hello");
     });
@@ -252,6 +300,35 @@ bool head_has(std::string_view response, std::string_view field) {
         return out;
     };
     return lowered(head).find(lowered(field)) != std::string::npos;
+}
+
+// The value of a response-head field, or nullopt when it is absent. Same
+// case-insensitive matching as head_has.
+std::optional<std::string> head_value(std::string_view response, std::string_view name) {
+    const auto head_end = response.find("\r\n\r\n");
+    const std::string_view head = response.substr(0, head_end);
+    auto lowered = [](std::string_view in) {
+        std::string out{in};
+        for (auto& c : out)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return out;
+    };
+    const std::string wanted = lowered(name);
+    std::size_t pos = 0;
+    while (pos < head.size()) {
+        auto eol = head.find("\r\n", pos);
+        if (eol == std::string_view::npos) eol = head.size();
+        const std::string_view line = head.substr(pos, eol - pos);
+        const auto colon = line.find(':');
+        if (colon != std::string_view::npos && lowered(line.substr(0, colon)) == wanted) {
+            std::string_view value = line.substr(colon + 1);
+            while (!value.empty() && value.front() == ' ')
+                value.remove_prefix(1);
+            return std::string{value};
+        }
+        pos = eol + 2;
+    }
+    return std::nullopt;
 }
 
 // Everything after the response head.
@@ -1307,4 +1384,272 @@ TEST_CASE("regression/server: TLS over a UNIX-domain socket", "[regression][serv
 
     server.stop();
     std::filesystem::remove(path, ignored);
+}
+
+// --- static files over a real socket -----------------------------------------
+//
+// The unit tests drive the same component through FakeResponseWriter, which sees
+// headers as a collection. These see them as bytes on the wire, which is where
+// the two things that component sets by hand actually matter: a length on a HEAD
+// or a 416 (or the response is delimited by connection close instead), and the
+// fact that HTTP/2 forwards our header block untouched while HTTP/1.1 recomputes
+// the length from the body.
+
+TEST_CASE("regression/static: a GET is the file, byte for byte", "[regression][static]") {
+    plain_server();
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(kPlainPort));
+
+    client.send("GET /app.js HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(client.wait_head());
+    CHECK(status_of(client.received()) == 200);
+    CHECK(head_has(client.received(), "etag:"));
+    CHECK(head_has(client.received(), "last-modified:"));
+
+    const std::string body = body_of(client.received());
+    CHECK(body == "console.log('app');");
+
+    // The length the engine wrote must describe the body it wrote.
+    auto cl = head_value(client.received(), "content-length");
+    REQUIRE(cl.has_value());
+    CHECK(*cl == std::to_string(body.size()));
+
+    client.close();
+}
+
+TEST_CASE("regression/static: a HEAD carries the length a GET would have", "[regression][static]") {
+    plain_server();
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(kPlainPort));
+
+    client.send("HEAD /app.js HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(client.wait_head());
+    CHECK(status_of(client.received()) == 200);
+
+    auto cl = head_value(client.received(), "content-length");
+    REQUIRE(cl.has_value());
+    CHECK(*cl == std::to_string(std::string{"console.log('app');"}.size()));
+
+    // And no body follows: give it a bounded window to arrive, then assert that
+    // nothing did.
+    client.pump(std::chrono::milliseconds(150));
+    CHECK(body_of(client.received()).empty());
+
+    client.close();
+}
+
+TEST_CASE("regression/static: a pre-compressed sibling is negotiated on the wire", "[regression][static]") {
+    plain_server();
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(kPlainPort));
+
+    client.send("GET /app.js HTTP/1.1\r\nHost: x\r\nAccept-Encoding: br\r\n\r\n");
+    REQUIRE(client.wait_head());
+    CHECK(status_of(client.received()) == 200);
+    CHECK(head_has(client.received(), "content-encoding: br"));
+
+    // The bytes are the .br sibling's, delivered as-is: nothing re-compressed it.
+    CHECK(body_of(client.received()) == "BR:console.log('app');");
+
+    auto cl = head_value(client.received(), "content-length");
+    REQUIRE(cl.has_value());
+    CHECK(*cl == std::to_string(std::string{"BR:console.log('app');"}.size()));
+
+    client.close();
+}
+
+TEST_CASE("regression/static: a range comes back as 206 with the right slice", "[regression][static]") {
+    plain_server();
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(kPlainPort));
+
+    client.send("GET /app.js HTTP/1.1\r\nHost: x\r\nRange: bytes=0-4\r\n\r\n");
+    REQUIRE(client.wait_head());
+    CHECK(status_of(client.received()) == 206);
+    CHECK(head_has(client.received(), "content-range: bytes 0-4/" +
+                                           std::to_string(std::string{"console.log('app');"}.size())));
+    CHECK(body_of(client.received()) == "conso");
+    CHECK(*head_value(client.received(), "content-length") == "5");
+
+    client.close();
+}
+
+TEST_CASE("regression/static: a 416 does not wedge the connection", "[regression][static]") {
+    plain_server();
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(kPlainPort));
+
+    client.send("GET /app.js HTTP/1.1\r\nHost: x\r\nRange: bytes=9999-\r\n\r\n");
+    REQUIRE(client.wait_head());
+    CHECK(status_of(client.received()) == 416);
+    REQUIRE(head_value(client.received(), "content-length").has_value());
+    CHECK(*head_value(client.received(), "content-length") == "0");
+    CHECK(body_of(client.received()).empty());
+
+    // This is the regression the length exists for. A 416 that omitted both
+    // content-length and transfer-encoding is delimited by connection close in
+    // HTTP/1.1, so the client would sit waiting for the idle watchdog instead of
+    // reading a response that is already complete. If that were the case here,
+    // this second request would never be answered.
+    client.send("GET /app.js HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(client.pump_until([&] { return client.received().find("console.log") != std::string::npos; },
+                              std::chrono::seconds(5)));
+
+    client.close();
+}
+
+TEST_CASE("regression/static: a conditional request is a 304 with no body", "[regression][static]") {
+    plain_server();
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(kPlainPort));
+
+    // Learn the validator first.
+    client.send("GET /app.js HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(client.wait_head());
+    auto etag = head_value(client.received(), "etag");
+    REQUIRE(etag.has_value());
+    client.close();
+
+    RawClient second{ctx};
+    REQUIRE(second.connect(kPlainPort));
+    second.send("GET /app.js HTTP/1.1\r\nHost: x\r\nIf-None-Match: " + *etag + "\r\n\r\n");
+    REQUIRE(second.wait_head());
+    CHECK(status_of(second.received()) == 304);
+    CHECK_FALSE(head_has(second.received(), "content-length:"));  // RFC 9110 §15.4.5
+
+    second.pump(std::chrono::milliseconds(150));
+    CHECK(body_of(second.received()).empty());
+
+    second.close();
+}
+
+TEST_CASE("regression/static: an encoded traversal is refused and the connection closed", "[regression][static]") {
+    plain_server();
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(kPlainPort));
+
+    // Encoded, so it survives the HTTP/1.1 request-line parser intact and reaches
+    // the static layer as a path rather than being rejected as a bad target.
+    client.send("GET /%2e%2e/etc/passwd HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(client.wait_head());
+    CHECK(status_of(client.received()) == 400);
+    CHECK(client.wait_eof());  // a malformed target says the peer is not a browser
+
+    client.close();
+}
+
+TEST_CASE("regression/static: a POST to an existing file is a 405", "[regression][static]") {
+    plain_server();
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(kPlainPort));
+
+    client.send("POST /index.html HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n");
+    REQUIRE(client.wait_head());
+    CHECK(status_of(client.received()) == 405);
+    CHECK(head_has(client.received(), "allow: GET, HEAD"));
+
+    client.close();
+}
+
+TEST_CASE("regression/static: two requests on one connection both succeed", "[regression][static]") {
+    plain_server();
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(kPlainPort));
+
+    // Proves the stage leaves no per-request state behind — no lock held across a
+    // co_await, no stream left half-written.
+    client.send("GET /app.js HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(client.pump_until([&] { return client.received().find("console.log") != std::string::npos; },
+                              std::chrono::seconds(5)));
+    client.send("GET /index.html HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(client.pump_until([&] { return client.received().find("<html>index</html>") != std::string::npos; },
+                              std::chrono::seconds(5)));
+
+    client.close();
+}
+
+TEST_CASE("regression/static: the same responses over h2c", "[regression][static][h2]") {
+    // The unit tests cover these paths through a recording writer, which cannot
+    // see the difference that matters here: the HTTP/2 engine forwards our header
+    // block verbatim and never computes a length, so the branches that set
+    // content-length by hand are only load-bearing on this side.
+    plain_server();
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(kPlainPort));
+    client.send(h2_preface_and_settings());
+
+    auto send_get = [&](const std::string& path, std::uint32_t stream_id,
+                        const std::vector<std::pair<std::string, std::string>>& extra) {
+        std::string block;
+        sh::codec::hpack_append_literal(block, ":method", "GET");
+        sh::codec::hpack_append_literal(block, ":scheme", "http");
+        sh::codec::hpack_append_literal(block, ":authority", "127.0.0.1");
+        sh::codec::hpack_append_literal(block, ":path", path);
+        for (const auto& [name, value] : extra) sh::codec::hpack_append_literal(block, name, value);
+        client.send(h2_frame(sh::codec::H2FrameType::Headers,
+                             sh::codec::H2_FLAG_END_HEADERS | sh::codec::H2_FLAG_END_STREAM, stream_id, block));
+    };
+
+    // 200, with the length we set by hand for the encoding case.
+    send_get("/app.js", 1, {{"accept-encoding", "br"}});
+    REQUIRE(client.pump_until(
+        [&] {
+            auto frames = parse_frames(client.received());
+            for (const auto& f : frames) {
+                if (f.header.type == static_cast<std::uint8_t>(sh::codec::H2FrameType::Data) &&
+                    f.header.stream_id == 1 && f.payload == "BR:console.log('app');") {
+                    return true;
+                }
+            }
+            return false;
+        },
+        std::chrono::seconds(5)));
+
+    // 304: no DATA frame at all, and the stream is closed by the response itself.
+    std::string etag_block;
+    {
+        auto frames = parse_frames(client.received());
+        for (const auto& f : frames) {
+            if (f.header.type == static_cast<std::uint8_t>(sh::codec::H2FrameType::Headers)) break;
+        }
+    }
+    send_get("/app.js", 3, {});
+    REQUIRE(client.pump_until(
+        [&] {
+            for (const auto& f : parse_frames(client.received())) {
+                if (f.header.stream_id == 3 &&
+                    f.header.type == static_cast<std::uint8_t>(sh::codec::H2FrameType::Data)) {
+                    return true;
+                }
+            }
+            return false;
+        },
+        std::chrono::seconds(5)));
+
+    // 206 with a content-range, which the h2 engine must forward untouched.
+    send_get("/app.js", 5, {{"range", "bytes=0-4"}});
+    REQUIRE(client.pump_until(
+        [&] {
+            for (const auto& f : parse_frames(client.received())) {
+                if (f.header.stream_id == 5 &&
+                    f.header.type == static_cast<std::uint8_t>(sh::codec::H2FrameType::Data) &&
+                    f.payload == "conso") {
+                    return true;
+                }
+            }
+            return false;
+        },
+        std::chrono::seconds(5)));
+
+    client.close();
 }

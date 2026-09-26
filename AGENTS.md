@@ -37,7 +37,12 @@ include/
       http_method.h        Method 枚举
       http_status.h        状态码常量 + reason_phrase
       logging.h            日志 facade（LogSink / set_log_sink / SIMPLE_HTTP_*_LOG）
-      mime.h               MIME 类型
+      mime.h               MIME 类型常量 + by_extension（扩展名→类型）
+      http_date.h          IMF-fixdate 格式化/解析 + now_unix（手写，不用 strftime）
+      url_path.h           请求路径解码与规范化（查找键）+ under_prefix
+      accept_encoding.h    Accept-Encoding qvalue 解析（独立于编码器层）
+      validators.h         ETag / 弱比较 / Range 解析
+      static_table.h       文档根 → 不可变查找表（静态服务的协议无关半边）
       base64.h             base64（含 WebSocket 握手用标准 base64）
       io_pool.h            IoCtxPool（单线程 io_context 池，并发模型 A）
       limits.h             EngineLimits（超时/大小上限/HTTP2 窗口等）
@@ -63,8 +68,9 @@ include/
       h3/                  HTTP/3 骨架（#ifdef SIMPLE_HTTP_ENABLE_HTTP3，默认空）
     handler/               handler 类型系统 + 路由
       handler.h            Handler 类型别名与 make_handler/invoke_handler
-      router.h             Router（含一条反代路由用的 HttpClient、反代匹配）
+      router.h             Router（含反代用的 HttpClient、反代匹配、静态阶段）
       http_proxy.h         请求级反代：上游走 client 层（连接池/TLS/h2），响应流式回传
+      static_files.h       静态文件服务（static_table.h 的 serving 半边 + SPA fallback）
     net/                   监听与连接协议检测
       connection.h         serve_plaintext / serve_tls（协议检测）
       server.h             Server 门面 + ServerConfig / Listen
