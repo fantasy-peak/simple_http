@@ -83,11 +83,42 @@ Handler make_handler(F&& fn) {
 
 // Invokes a Handler: both forms are coroutines and are awaited. The Request and
 // Response are shared so a handler may hand them to coroutines that outlive it.
+//
+// A handler that throws becomes a 500. Without this the exception unwinds out of
+// the engine's dispatch loop and the connection is dropped mid-request: the
+// client sees a protocol error rather than a server error, and a keep-alive
+// connection dies with it. (Found by driving the server with httpx, which
+// reports it as "Server disconnected without sending a response".)
 inline asio::awaitable<void> invoke_handler(const Handler& handler, RequestPtr req, ResponsePtr res, SslHandle ssl) {
-    if (handler.index() == 0) {
-        co_await std::get<CoroHandler>(handler)(std::move(req), std::move(res));
-    } else {
-        co_await std::get<CoroSslHandler>(handler)(std::move(req), std::move(res), ssl);
+    // Kept back because `res` is moved into the handler; both point at the same
+    // Response, so this is the same object the handler was given.
+    const ResponsePtr fallback = res;
+    // The catch blocks only record — `co_await` is not permitted inside a
+    // coroutine's handler, so the 500 is sent after the try has been left.
+    bool threw = false;
+    std::string why;
+    try {
+        if (handler.index() == 0) {
+            co_await std::get<CoroHandler>(handler)(std::move(req), std::move(res));
+        } else {
+            co_await std::get<CoroSslHandler>(handler)(std::move(req), std::move(res), ssl);
+        }
+    } catch (const std::exception& e) {
+        threw = true;
+        why = e.what();
+    } catch (...) {
+        threw = true;
+        why = "non-std exception";
+    }
+
+    if (threw) {
+        SIMPLE_HTTP_ERROR_LOG("handler threw: {}", why);
+        if (fallback) {
+            // A handler that throws has usually not answered yet. If it already
+            // did, the writer refuses the second send, which is the right outcome
+            // — better than dropping the connection either way.
+            co_await fallback->status(status::internal_server_error).send("");
+        }
     }
     co_return;
 }
