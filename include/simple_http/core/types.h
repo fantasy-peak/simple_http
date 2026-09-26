@@ -26,6 +26,28 @@ inline bool contains_ctl(std::string_view s) noexcept {
     return false;
 }
 
+// ASCII case folding and comparison. They live here, in the layer that depends on
+// nothing but the standard library, because both the field-name layer and the
+// content-encoding layer need them — and the alternative was a copy in each.
+inline char ascii_lower(char c) noexcept {
+    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+}
+
+// Symmetric: either side may be mixed case. (proto/headers.h has a
+// lower-`rhs`-only variant that is faster, but it is only valid where the other
+// side is a stored, already-folded name — which is why it is private there.)
+inline bool iequals_ci(std::string_view a, std::string_view b) noexcept {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (ascii_lower(a[i]) != ascii_lower(b[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // The wire protocol a request/response is being served over.
 enum class Version : std::uint8_t {
     Http1 = 0,   // HTTP/1.0

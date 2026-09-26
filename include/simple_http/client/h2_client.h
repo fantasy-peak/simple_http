@@ -302,6 +302,17 @@ class Http2ClientSession final : public ClientSession,
             co_return std::unexpected{make_error_code(client_errc::goaway)};
         if (!m_alive)
             co_return std::unexpected{make_error_code(client_errc::session_closed)};
+        // See h1_client's open_exchange: a spec asking for both an up-front body
+        // and a streamed one is a contradiction, and the two engines used to
+        // resolve it differently. One answer, in both places.
+        if (spec.stream_body && !spec.body.empty())
+            co_return std::unexpected{make_error_code(client_errc::invalid_spec)};
+        // RequestSpec::close is documented as keeping the connection out of the
+        // pool. HTTP/1.1 sends `Connection: close` for it; HTTP/2 has no such
+        // header, so the intent has to be remembered here — this engine used not
+        // to read the field at all, and pooled the session anyway.
+        if (spec.close)
+            m_close_requested = true;
         if (m_peer_max_concurrent_streams != 0 && m_streams.size() >= m_peer_max_concurrent_streams) {
             co_return std::unexpected{make_error_code(client_errc::too_many_streams)};
         }
@@ -347,7 +358,10 @@ class Http2ClientSession final : public ClientSession,
     }
 
     bool reusable() const override {
-        return m_alive && !m_goaway_received && m_streams.empty();
+        // A request that asked to close (`RequestSpec::close`) keeps the session
+        // out of the pool even when the peer raised no objection: HTTP/2 has no
+        // `Connection: close` to send, so this flag is the whole of the mechanism.
+        return m_alive && !m_goaway_received && m_streams.empty() && !m_close_requested;
     }
 
     Version version() const override {
@@ -419,29 +433,44 @@ class Http2ClientSession final : public ClientSession,
 
     asio::awaitable<error_code> stream_write(std::uint32_t id, std::string data, bool last) {
         co_await hop();
-        auto it = m_streams.find(id);
-        if (it == m_streams.end())
-            co_return make_error_code(client_errc::session_closed);
-        Stream& st = it->second;
-        if (st.write_error)
-            co_return st.write_error;  // a failed write poisons the stream
-        if (st.reset || st.failed)
-            co_return st.error ? st.error : make_error_code(client_errc::stream_reset);
-        if (st.local_end || st.out_finished)
-            co_return make_error_code(client_errc::body_not_streaming);
+        {
+            auto it = m_streams.find(id);
+            if (it == m_streams.end())
+                co_return make_error_code(client_errc::session_closed);
+            Stream& st = it->second;
+            if (st.write_error)
+                co_return st.write_error;  // a failed write poisons the stream
+            if (st.reset || st.failed)
+                co_return st.error ? st.error : make_error_code(client_errc::stream_reset);
+            if (st.local_end || st.out_finished)
+                co_return make_error_code(client_errc::body_not_streaming);
+        }
 
         if (!data.empty()) {
             // Backpressure: park while this stream's queue is over the high mark,
             // so a fast writer is paced by the peer's window.
-            if (auto ec = co_await await_out_space(st); ec) {
-                st.write_error = ec;
+            if (auto ec = co_await await_out_space(id); ec) {
+                // The stream may have been retired while we parked, so no
+                // reference taken before the suspension may be touched here.
+                // Re-resolving afterwards is what the id parameter is for.
+                if (auto retired = m_streams.find(id); retired != m_streams.end()) {
+                    retired->second.write_error = ec;
+                }
                 co_return ec;
             }
-            st.out_queued += data.size();
-            st.out_queue.push_back(std::move(data));
+            auto it = m_streams.find(id);
+            if (it == m_streams.end())
+                co_return make_error_code(client_errc::session_closed);
+            it->second.out_queued += data.size();
+            it->second.out_queue.push_back(std::move(data));
         }
-        if (last)
-            st.out_finished = true;
+
+        if (last) {
+            auto it = m_streams.find(id);
+            if (it == m_streams.end())
+                co_return make_error_code(client_errc::session_closed);
+            it->second.out_finished = true;
+        }
         flush();
         co_return error_code{};
     }
@@ -479,19 +508,28 @@ class Http2ClientSession final : public ClientSession,
 
     asio::awaitable<std::expected<ReadResult, error_code>> stream_read(std::uint32_t id) {
         co_await hop();
-        auto it = m_streams.find(id);
-        if (it == m_streams.end())
+        if (!m_streams.contains(id)) {
             co_return std::unexpected{make_error_code(client_errc::session_closed)};
-        Stream& st = it->second;
+        }
 
         // The head is not a body event: make sure it has been parsed (and thus
-        // published to the handle), then hand back body bytes.
-        if (!st.head_seen) {
+        // published to the handle), then hand back body bytes. Re-resolved
+        // afterwards, because that await can retire the stream.
+        if (auto it = m_streams.find(id); it != m_streams.end() && !it->second.head_seen) {
             if (auto ec = co_await await_stream_head(id); ec)
                 co_return std::unexpected{ec};
         }
 
+        // Re-resolve on every pass. An await can retire this stream — a reset, a
+        // GOAWAY, the session closing — and a `Stream&` or an iterator captured
+        // before the suspension would then be dangling. (await_stream_head above
+        // already follows this rule; the rest of the session did not.)
         for (;;) {
+            auto it = m_streams.find(id);
+            if (it == m_streams.end()) {
+                co_return std::unexpected{make_error_code(client_errc::session_closed)};
+            }
+            Stream& st = it->second;
             if (!st.in_queue.empty()) {
                 std::string data = std::move(st.in_queue.front());
                 st.in_queue.pop_front();
@@ -520,12 +558,14 @@ class Http2ClientSession final : public ClientSession,
                 st.in_notify =
                     std::make_shared<asio::experimental::concurrent_channel<void(error_code)>>(m_executor, 1);
             }
+            // `st` is not touched past this point. `outcome` is a shared_ptr, so it
+            // outlives the map entry and can still say why the wake happened even
+            // if the stream was retired while we waited.
             auto notify = st.in_notify;
+            auto outcome = st.outcome;
             auto [ec] = co_await notify->async_receive(asio::as_tuple(asio::use_awaitable));
             if (ec) {
-                // The channel was closed while we waited: the stream (or the whole
-                // session) ended, and the outcome says how.
-                co_return outcome_result(*st.outcome);
+                co_return outcome_result(*outcome);
             }
         }
     }
@@ -1365,9 +1405,16 @@ class Http2ClientSession final : public ClientSession,
         Stream& st = it->second;
         st.failed = st.failed || state == StreamState::Failed;
         st.outcome->set(state, ec);
-        if (st.in_notify)
-            (void)st.in_notify->try_send(error_code{});
+        // Erase before waking. The wake can resume a reader inline on this
+        // executor, and that reader retires the stream itself — which would leave
+        // the erase below with an iterator into a node it had just dropped.
+        // `outcome` is a shared_ptr, so the reader still reports the terminal
+        // state after the entry is gone.
+        auto notify = st.in_notify;
         erase_stream(it);
+        if (notify) {
+            (void)notify->try_send(error_code{});
+        }
     }
 
     void reset_stream(std::uint32_t id, std::uint32_t error) {
@@ -1399,6 +1446,11 @@ class Http2ClientSession final : public ClientSession,
     }
 
     void fail_all_streams(client_errc code) {
+        // State first, wakes afterwards. A wake can resume a reader inline on this
+        // executor, and that reader retires its stream — mutating the very map
+        // this loop is walking. Collecting the channels and signalling them once
+        // the walk is over keeps the traversal safe.
+        std::vector<std::shared_ptr<asio::experimental::concurrent_channel<void(error_code)>>> notifies;
         for (auto& [id, st] : m_streams) {
             st.failed = true;
             st.error = make_error_code(code);
@@ -1406,15 +1458,26 @@ class Http2ClientSession final : public ClientSession,
             if (st.out_space)
                 st.out_space->close();
             if (st.in_notify)
-                (void)st.in_notify->try_send(error_code{});
+                notifies.push_back(st.in_notify);
+        }
+        for (auto& notify : notifies) {
+            (void)notify->try_send(error_code{});
         }
     }
 
     // Parks a writer until this stream's outbound queue drains below the low
     // mark. Returns an error once the stream is gone, so a parked writer is never
     // stranded.
-    asio::awaitable<error_code> await_out_space(Stream& st) {
+    //
+    // Takes the id rather than a `Stream&`: this coroutine suspends, and a
+    // reference taken before the suspension would be dangling if the stream were
+    // retired meanwhile — which is exactly what a reset or a GOAWAY does.
+    asio::awaitable<error_code> await_out_space(std::uint32_t id) {
         for (;;) {
+            auto it = m_streams.find(id);
+            if (it == m_streams.end())
+                co_return make_error_code(client_errc::session_closed);
+            Stream& st = it->second;
             if (st.failed || st.reset) {
                 co_return st.error ? st.error : make_error_code(client_errc::stream_reset);
             }
@@ -1424,6 +1487,8 @@ class Http2ClientSession final : public ClientSession,
                 st.out_space =
                     std::make_shared<asio::experimental::concurrent_channel<void(error_code)>>(m_executor, 1);
             }
+            // The channel is a shared_ptr, so it survives the stream being erased;
+            // `st` is not touched after the await below.
             auto space = st.out_space;
             auto [ec] = co_await space->async_receive(asio::as_tuple(asio::use_awaitable));
             if (ec)
@@ -1533,6 +1598,9 @@ class Http2ClientSession final : public ClientSession,
     std::uint32_t m_peer_max_concurrent_streams{0};  // 0 = no limit announced yet
 
     bool m_alive{false};
+    // Set by a stream whose RequestSpec::close asked for the connection to end
+    // after that exchange; keeps the session out of the pool (see reusable()).
+    bool m_close_requested{false};
     bool m_goaway_sent{false};
     bool m_goaway_received{false};
 };

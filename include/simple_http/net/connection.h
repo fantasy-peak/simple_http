@@ -60,16 +60,24 @@ inline asio::awaitable<void> serve_plaintext(std::shared_ptr<Transport> transpor
         }
         co_return;
     };
+    bool timed_out = false;
     auto detection_deadline = [&]() -> asio::awaitable<void> {
-        if (limits.idle_timeout.count() <= 0) {
-            co_return;  // idle timeout disabled
-        }
         asio::steady_timer timer{co_await asio::this_coro::executor};
         timer.expires_after(limits.idle_timeout);
         co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+        timed_out = true;
     };
 
-    co_await (read_head() || detection_deadline());
+    // Race the read against the deadline only when there is a deadline. Racing a
+    // no-op against it is not a harmless simplification: `a || b` completes as
+    // soon as either side does, so a "disabled" branch that returns without
+    // suspending wins instantly, cancels the read before a byte arrives, and
+    // every connection is accepted and dropped.
+    if (limits.idle_timeout.count() <= 0) {
+        co_await read_head();
+    } else {
+        co_await (read_head() || detection_deadline());
+    }
     if (n == 0) {
         transport->close();
         co_return;
@@ -98,7 +106,29 @@ template <typename TlsTransportT>
 inline asio::awaitable<void> serve_tls(std::shared_ptr<TlsTransportT> transport, Dispatcher dispatch,
                                        WsLookup ws_lookup = {}, EngineLimits limits = {},
                                        WsProxyLookup ws_proxy_lookup = {}) {
-    if (auto ec = co_await transport->handshake(); ec) {
+    using namespace asio::experimental::awaitable_operators;
+
+    // The handshake is bounded for exactly the reason the plaintext detection
+    // read is: a peer that completes the TCP handshake and then sends nothing
+    // would otherwise pin a socket, a coroutine frame and executor capacity
+    // forever — the engines' watchdogs only start once a protocol is chosen.
+    error_code ec;
+    if (limits.idle_timeout.count() <= 0) {
+        ec = co_await transport->handshake();
+    } else {
+        auto deadline = [&]() -> asio::awaitable<error_code> {
+            asio::steady_timer timer{co_await asio::this_coro::executor};
+            timer.expires_after(limits.idle_timeout);
+            co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+            co_return make_error_code(asio::error::timed_out);
+        };
+        // `||` yields a variant, and both arms are error_code — the index is
+        // what says which one finished, not the value.
+        auto raced = co_await (transport->handshake() || deadline());
+        ec = raced.index() == 1 ? std::get<1>(raced) : std::get<0>(raced);
+    }
+    if (ec) {
+        SIMPLE_HTTP_ERROR_LOG("TLS handshake failed: {}", ec.message());
         transport->close();
         co_return;
     }

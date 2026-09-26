@@ -28,8 +28,8 @@
 #include <utility>
 #include <vector>
 
-#include "hpack_encode.h"   // http2_header_static_table
-#include "hpack_huffman.h"  // http_huffman_decode, HUFFMAN_OK
+#include "hpack_huffman.h"        // http_huffman_decode, HUFFMAN_OK
+#include "hpack_static_table.h"   // http2_header_static_table
 
 namespace simple_http::codec {
 
@@ -102,7 +102,9 @@ class HpackDecoder {
 
 namespace detail {
 // Number of entries in the static table (indices 1..61; slot 0 is a sentinel).
-inline constexpr uint64_t kStaticTableCount = 61;
+// Derived from the table rather than written out: the table's first entry is the
+// RFC's "no index" sentinel, so the real entries are everything after it.
+inline constexpr uint64_t kStaticTableCount = http2_header_static_table.size() - 1;
 }  // namespace detail
 
 inline bool HpackDecoder::decode_integer(std::string_view block, std::size_t& pos, unsigned int prefix_bits,

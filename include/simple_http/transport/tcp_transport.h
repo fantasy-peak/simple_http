@@ -43,6 +43,9 @@ inline void shutdown_socket(asio::local::stream_protocol::socket& s) {
 }
 #endif
 
+// Most buffers one scatter-gather write accepts; see async_write_seq.
+inline constexpr std::size_t kMaxWriteBuffers = 8;
+
 template <typename Socket>
 class TcpTransport {
   public:
@@ -73,7 +76,12 @@ class TcpTransport {
     // its payload need not be concatenated first. Like async_write this is a
     // composed operation: it completes only once every byte has been written.
     asio::awaitable<IoResult> async_write_seq(std::span<const ConstByteSpan> buffers) {
-        const std::size_t count = std::min<std::size_t>(buffers.size(), 8);
+        // Bounded by the iovec this builds. Callers pass a handful at most (a head
+        // and a body, a frame header and its payload), so the cap is a backstop
+        // rather than a real limit — dropping buffers past it would write a
+        // *shorter* message and still report success, which is silent truncation.
+        assert(buffers.size() <= kMaxWriteBuffers);
+        const std::size_t count = std::min<std::size_t>(buffers.size(), kMaxWriteBuffers);
         std::array<asio::const_buffer, 8> bufs{};
         for (std::size_t i = 0; i < count; ++i) {
             bufs[i] = asio::buffer(buffers[i].data(), buffers[i].size());

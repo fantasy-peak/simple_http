@@ -46,7 +46,14 @@ class Router {
     // --- registration (fluent) ---
     template <typename F>
     Router& route(std::string path, F&& handler) {
-        m_exact.emplace(std::move(path), make_handler(std::forward<F>(handler)));
+        // emplace, not insert_or_assign: the first registration wins, and that is
+        // deliberate — test_router.cpp pins it by name. What it should not do is
+        // keep the second one *silently*, since re-registering a path is a likely
+        // result of moving a route around, so the duplicate says so.
+        auto [it, inserted] = m_exact.emplace(std::move(path), make_handler(std::forward<F>(handler)));
+        if (!inserted) {
+            SIMPLE_HTTP_INFO_LOG("route [{}] already registered; the first handler stays", it->first);
+        }
         return *this;
     }
 
@@ -126,6 +133,9 @@ class Router {
         if (auto it = m_ws_exact.find(path); it != m_ws_exact.end()) {
             return &it->second;
         }
+        if (m_ws_regex.empty()) {
+            return nullptr;  // nothing to match, and no string to build for it
+        }
         std::string p{path};
         for (const auto& [pattern, handler] : m_ws_regex) {
             if (simple_http_regex::regex_match(p, pattern)) {
@@ -145,6 +155,9 @@ class Router {
     std::optional<WsProxyTarget> find_ws_proxy(std::string_view path) const {
         if (auto it = m_ws_proxy_exact.find(path); it != m_ws_proxy_exact.end()) {
             return it->second;  // exact route: rewrite_path used verbatim
+        }
+        if (m_ws_proxy_regex.empty()) {
+            return std::nullopt;
         }
         std::string p{path};
         for (const auto& [pattern, target] : m_ws_proxy_regex) {
@@ -167,6 +180,9 @@ class Router {
     std::optional<HttpProxyTarget> find_http_proxy(std::string_view path) const {
         if (auto it = m_http_proxy_exact.find(path); it != m_http_proxy_exact.end()) {
             return it->second;
+        }
+        if (m_http_proxy_regex.empty()) {
+            return std::nullopt;
         }
         std::string p{path};
         for (const auto& [pattern, target] : m_http_proxy_regex) {
@@ -196,7 +212,13 @@ class Router {
             }
         }
 
-        std::string path{req->path()};
+        // A view, not a copy: the exact maps have transparent hashers, so they can
+        // be probed with the request's own path, and the proxy lookups take a
+        // string_view too. The copy is only needed for the regex walk — and only
+        // when there are regex routes, which is the uncommon case. `req->path()`
+        // stays valid until req is moved into a handler below, and it is not
+        // touched after that.
+        const std::string_view path = req->path();
 
         // HTTP reverse-proxy routes take precedence over local handlers.
         if (auto target = find_http_proxy(path)) {
@@ -210,10 +232,13 @@ class Router {
             co_await invoke_handler(it->second, std::move(req), std::move(res), ssl);
             co_return;
         }
-        for (const auto& [pattern, handler] : m_regex) {
-            if (simple_http_regex::regex_match(path, pattern)) {
-                co_await invoke_handler(handler, std::move(req), std::move(res), ssl);
-                co_return;
+        if (!m_regex.empty()) {
+            const std::string owned_path{path};  // regex_match needs a string
+            for (const auto& [pattern, handler] : m_regex) {
+                if (simple_http_regex::regex_match(owned_path, pattern)) {
+                    co_await invoke_handler(handler, std::move(req), std::move(res), ssl);
+                    co_return;
+                }
             }
         }
         if (m_fallback) {

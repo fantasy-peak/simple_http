@@ -16,6 +16,7 @@
 #include <expected>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <variant>
@@ -75,6 +76,17 @@ class Body {
             frame = std::move(f);
         });
         if (!got) {
+            // A finish()/fail() that could not fit when it arrived. Reaching here
+            // means the queue is drained (try_receive failed), so delivering the
+            // recorded terminator now is exactly what a queued one would have done.
+            if (m_pending_error) {
+                m_eof = true;
+                co_return std::unexpected(*m_pending_error);
+            }
+            if (m_pending_eof) {
+                m_eof = true;
+                co_return ReadResult::end();
+            }
             std::tie(ec, frame) = co_await m_channel->async_receive(asio::as_tuple(asio::use_awaitable));
         }
         if (ec) {
@@ -114,14 +126,34 @@ class Body {
 
     // --- producer API (protocol engine side) ---
 
-    // Enqueues a body chunk. Returns false if the channel is full/closed.
+    // Enqueues a body chunk. Returns false if the channel is full or closed.
+    //
+    // There is no way to ask "is there room?" first: asio's concurrent_channel
+    // reports readiness for *sending or receiving*, which stays true while a
+    // reader is parked, not whether the buffer has space. So the caller must
+    // check this result and keep the frame — a dropped frame is silent data loss,
+    // and on HTTP/2 it also strands the connection, because those bytes were
+    // already debited against the connection window and the credit is only
+    // returned when the handler consumes.
     [[nodiscard]] bool feed(std::string data) { return m_channel->try_send(error_code{}, Frame{std::move(data)}); }
 
     // Signals normal end-of-body.
-    [[nodiscard]] bool finish() { return m_channel->try_send(error_code{}, Frame{Eof{}}); }
+    //
+    // Unlike feed(), this must never be droppable: the consumer *waits* for it, so
+    // losing it hangs the reader rather than truncating it. It is therefore also
+    // recorded out of band, and read() reports it once the queued frames have
+    // drained — whether or not the channel had room when it arrived.
+    void finish() {
+        m_pending_eof = true;
+        (void)m_channel->try_send(error_code{}, Frame{Eof{}});
+    }
 
-    // Signals a stream failure (reset/disconnect) to the consumer.
-    [[nodiscard]] bool fail(error_code ec) { return m_channel->try_send(ec, Frame{Eof{}}); }
+    // Signals a stream failure (reset/disconnect) to the consumer. Same
+    // out-of-band guarantee as finish(), and for the same reason.
+    void fail(error_code ec) {
+        m_pending_error = ec;
+        (void)m_channel->try_send(ec, Frame{Eof{}});
+    }
 
     // Installs a consumption hook invoked (from the consumer's context) with the
     // byte count of each data chunk the handler reads. The HTTP/2 engine uses it
@@ -144,6 +176,9 @@ class Body {
   private:
     std::shared_ptr<Channel> m_channel;
     bool m_eof{false};
+    // Terminators that did not fit on the channel when they arrived; see finish().
+    bool m_pending_eof{false};
+    std::optional<error_code> m_pending_error;
     std::function<void(std::size_t)> m_on_consumed;
     PullProvider m_pull;  // set in pull mode (HTTP/1.x); unset = pushed channel (HTTP/2)
 };

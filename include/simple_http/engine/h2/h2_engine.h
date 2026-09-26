@@ -221,6 +221,17 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
         m_dispatch = std::move(dispatch);
         // Apply the client's SETTINGS payload (raw settings frame body).
         std::string settings = base64_url_decode(settings_b64);
+        // A SETTINGS body is a whole number of 6-octet entries (RFC 9113 §6.5).
+        // on_settings() enforces that for a SETTINGS frame on the wire; this path
+        // decodes a header and used to skip the check, and apply_settings_payload
+        // silently ignores a trailing partial entry — so a corrupt HTTP2-Settings
+        // header would be applied as if it were well-formed. base64_url_decode
+        // stopping at the first invalid character is what makes that reachable:
+        // one bad byte truncates the payload instead of failing it.
+        if (settings.size() % 6 != 0) {
+            go_away(codec::H2_FRAME_SIZE_ERROR);
+            co_return;
+        }
         apply_settings_payload(settings);
         if (m_goaway_sent) co_return;  // the h2c HTTP2-Settings were rejected
         queue_settings();
@@ -396,6 +407,12 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
         bool dispatched = false;
         bool half_closed_remote = false;  // client sent END_STREAM
         bool end_stream_sent = false;     // our terminating DATA (END_STREAM) emitted
+
+        // Inbound backpressure: a DATA frame the body channel refused. Held here
+        // (rather than dropped) until the handler consumes enough to make room;
+        // see on_data() and on_body_consumed().
+        std::string paused_frame;
+        bool has_paused_frame = false;
 
         bool out_drained() const { return out_finished && out_queue.empty(); }
     };
@@ -639,6 +656,11 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
     bool parse_available() {
         if (!consume_client_preface()) return false;   // fatal: not the h2 preface
         if (!m_preface_consumed) return true;           // still waiting for the full preface
+        // A stream's body channel filled up: stop here rather than reading ahead,
+        // which is the only backpressure available — this loop never suspends, so
+        // the consumer coroutine cannot run while it drains. m_recv_buf grows by
+        // at most one flow-control window, and on_body_consumed() clears this.
+        if (m_body_paused) return true;
         std::size_t pos = 0;
         while (m_recv_buf.size() - pos >= codec::kH2FrameHeaderSize) {
             codec::H2FrameHeader hdr;
@@ -652,6 +674,7 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
             }
             std::size_t frame_end = pos + codec::kH2FrameHeaderSize + hdr.length;
             if (frame_end > m_recv_buf.size()) break;  // wait for the rest of this frame
+
             std::string_view payload =
                 std::string_view{m_recv_buf}.substr(pos + codec::kH2FrameHeaderSize, hdr.length);
             if (!handle_frame(hdr, payload)) {
@@ -810,6 +833,9 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
             return false;
         }
         st.header_block.clear();
+        // :authority is collected here and applied after the loop, so a real
+        // Host field — which may follow it — wins over the synthesized one.
+        std::string authority;
         for (auto& f : fields) {
             // RFC 9113 §8.2.1: a field name or value must not contain CR, LF or NUL.
             // HTTP/2 has no line folding, so these bytes survive decoding verbatim and
@@ -825,11 +851,20 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
                 st.request->set_method_token(f.value);
             } else if (f.name == ":path") {
                 st.request->set_target(std::move(f.value));
+            } else if (f.name == ":authority") {
+                authority = std::move(f.value);
             } else if (!f.name.empty() && f.name[0] == ':') {
-                // :scheme / :authority — not surfaced as ordinary headers.
+                // :scheme and the rest of the pseudo-headers are not surfaced.
             } else {
                 st.request->mutable_headers().add_lower(std::move(f.name), std::move(f.value));
             }
+        }
+        // :authority is HTTP/2's spelling of Host, and a compliant client sends
+        // it with no Host field at all — so without this every h2 request reaches
+        // handlers, and the reverse proxy's x-forwarded-host, host-less. Done
+        // after the loop so a real Host field wins over the synthesized one.
+        if (!authority.empty() && !st.request->mutable_headers().contains("host")) {
+            st.request->mutable_headers().add_lower("host", std::move(authority));
         }
         (void)stream_id;
         // Dispatch is triggered by the caller once END_STREAM is also observed.
@@ -871,13 +906,26 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
                 // These delivered bytes owe connection-level credit until the
                 // handler consumes them (or the stream is torn down).
                 st.recv_owed_conn += static_cast<std::int64_t>(data.size());
-                (void)st.request->body().feed(std::string{data});
+                if (!st.request->body().feed(std::string{data})) {
+                    // The handler has not drained the body, so the channel is
+                    // full. Keep the frame rather than dropping it — the bytes are
+                    // already counted against the connection window, so losing
+                    // them would strand the connection as well as truncate the
+                    // request — and stop parsing: m_recv_buf then grows by at most
+                    // one flow-control window, and on_body_consumed() resumes.
+                    st.paused_frame = std::string{data};
+                    st.has_paused_frame = true;
+                    m_body_paused = true;
+                    return true;  // frame taken; the data lives in paused_frame
+                }
             }
             if (hdr.has_flag(codec::H2_FLAG_END_STREAM)) {
                 st.half_closed_remote = true;
                 // End of request body. The handler (already dispatched at
                 // END_HEADERS) observes end-of-body on its next Body::read().
-                (void)st.request->body().finish();
+                // finish() cannot be dropped: it is recorded out of band, because
+                // a lost terminator hangs the reader instead of truncating it.
+                st.request->body().finish();
                 // If our response already finished, the stream is now complete.
                 maybe_complete_stream(hdr.stream_id);
             }
@@ -991,6 +1039,23 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
         if (it->second.recv_owed_conn < 0) it->second.recv_owed_conn = 0;  // defensive
         credit_consumed(it->second, static_cast<std::int64_t>(n));
         flush();
+
+        // The handler made room: hand over the frame the channel refused, then
+        // resume parsing. Without this the connection stalls the first time a body
+        // fills the channel — which a peer sending many small DATA frames can
+        // force deliberately.
+        if (it->second.has_paused_frame) {
+            if (it->second.request->body().feed(std::move(it->second.paused_frame))) {
+                it->second.has_paused_frame = false;
+                it->second.paused_frame.clear();
+                m_body_paused = false;
+            } else {
+                return;  // still full: stay paused, try again on the next consume
+            }
+        }
+        if (!m_recv_buf.empty()) {
+            (void)parse_available();
+        }
     }
 
     // Reclaims a fully-completed stream: once both the request body has ended
@@ -1156,6 +1221,10 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
     bool m_alive = true;
     bool m_goaway_sent = false;
     bool m_preface_consumed = false;  // client connection preface stripped yet?
+    // Set when a stream's body channel refused a frame; cleared by
+    // on_body_consumed() once it has been delivered. Stops parse_available() from
+    // reading ahead of a handler that is not draining its body.
+    bool m_body_paused = false;
 
     friend class Http2ResponseWriter<Transport>;
 };  // class Http2Engine

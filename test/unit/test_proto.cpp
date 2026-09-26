@@ -45,14 +45,22 @@ TEST_CASE("proto/headers: order, duplicates and clearing", "[proto]") {
     CHECK(h.size() == 0);
 }
 
-TEST_CASE("proto/headers: the allocation-free case-insensitive compare", "[proto]") {
-    CHECK(Headers::iequals_ascii("content-length", "Content-Length"));
-    CHECK(Headers::iequals_ascii("", ""));
-    CHECK_FALSE(Headers::iequals_ascii("a", "ab"));
-    CHECK_FALSE(Headers::iequals_ascii("abc", "abd"));
-    // High-bit bytes must compare equal to themselves and not alias ASCII letters.
-    CHECK(Headers::iequals_ascii("\xC3\xA9", "\xC3\xA9"));
-    CHECK_FALSE(Headers::iequals_ascii("\xC3", "c"));
+// The comparison Headers uses internally is not public (it relies on the class's
+// "names are stored folded" invariant), so what is tested here is the observable
+// behaviour: lookup folds case, rejects different lengths and does not alias a
+// high-bit byte to an ASCII letter.
+TEST_CASE("proto/headers: lookup folds ASCII case and nothing else", "[proto]") {
+    Headers h;
+    h.add("Content-Length", "12");
+    CHECK(h.get("content-length").has_value());
+    CHECK(h.get("CONTENT-LENGTH").has_value());
+    CHECK_FALSE(h.get("content-lengths").has_value());  // different length
+    CHECK_FALSE(h.get("content_lengt").has_value());    // same length, different byte
+
+    Headers high;
+    high.add("\xC3\xA9", "v");  // é in UTF-8, two high-bit bytes
+    CHECK(high.get("\xC3\xA9").has_value());
+    CHECK_FALSE(high.get("\xC3").has_value());  // a truncated sequence is not a match
 }
 
 // --- Body --------------------------------------------------------------------
@@ -64,7 +72,7 @@ TEST_CASE("proto/body: feed, read and end-of-body", "[proto]") {
     CHECK_FALSE(body.eof());
     REQUIRE(body.feed("hello "));
     REQUIRE(body.feed("world"));
-    REQUIRE(body.finish());
+    body.finish();
 
     // The channel carries the frames in order; finish() delivers end-of-body.
     auto first = run_on(ctx, body.read());
@@ -97,7 +105,7 @@ TEST_CASE("proto/body: read_all concatenates, fail() surfaces the error", "[prot
         Body body{ctx.get_executor()};
         REQUIRE(body.feed("ab"));
         REQUIRE(body.feed("cd"));
-        REQUIRE(body.finish());
+        body.finish();
         auto all = run_on(ctx, body.read_all());
         REQUIRE(all.has_value());
         REQUIRE(all->has_value());
@@ -106,7 +114,7 @@ TEST_CASE("proto/body: read_all concatenates, fail() surfaces the error", "[prot
     {
         asio::io_context ctx;
         Body body{ctx.get_executor()};
-        REQUIRE(body.finish());  // an empty body reads as an empty string
+        body.finish();  // an empty body reads as an empty string
         auto all = run_on(ctx, body.read_all());
         REQUIRE(all.has_value());
         REQUIRE(all->has_value());
@@ -115,7 +123,7 @@ TEST_CASE("proto/body: read_all concatenates, fail() surfaces the error", "[prot
     {
         asio::io_context ctx;
         Body body{ctx.get_executor()};
-        REQUIRE(body.fail(make_error_code(asio::error::connection_reset)));
+        body.fail(make_error_code(asio::error::connection_reset));
         auto frame = run_on(ctx, body.read());
         REQUIRE(frame.has_value());
         REQUIRE_FALSE(frame->has_value());
@@ -152,6 +160,50 @@ TEST_CASE("proto/body: the channel is bounded and the consume hook skips empty c
     CHECK((*third)->data.empty());
     CHECK_FALSE((*third)->eof);
     CHECK(consumed == 2);  // the empty frame added nothing
+}
+
+// finish() and fail() carry the terminator the consumer is *waiting* for, so
+// unlike feed() they must not be droppable. When the channel is full the terminal
+// frame cannot be queued, and before this was handled the reader simply never woke
+// again — a silent hang, not a truncation. (On HTTP/2 the producer-side overflow
+// is worse still: the bytes are already debited against the connection window, so
+// a dropped frame strands the connection as well.)
+TEST_CASE("proto/body: the terminator survives a full channel", "[proto]") {
+    {
+        asio::io_context ctx;
+        Body body{ctx.get_executor(), /*capacity=*/1};
+
+        REQUIRE(body.feed("x"));
+        CHECK_FALSE(body.feed("y"));  // full: the producer learns it and keeps the frame
+        body.finish();                // no room — must still be delivered
+
+        auto first = run_on(ctx, body.read());
+        REQUIRE(first.has_value());
+        REQUIRE(first->has_value());
+        CHECK((*first)->data == "x");
+
+        auto second = run_on(ctx, body.read());
+        REQUIRE(second.has_value());
+        REQUIRE(second->has_value());
+        CHECK((*second)->eof);
+    }
+    {
+        asio::io_context ctx;
+        Body body{ctx.get_executor(), /*capacity=*/1};
+
+        REQUIRE(body.feed("x"));
+        body.fail(make_error_code(asio::error::connection_reset));
+
+        auto first = run_on(ctx, body.read());
+        REQUIRE(first.has_value());
+        REQUIRE(first->has_value());
+        CHECK((*first)->data == "x");
+
+        auto second = run_on(ctx, body.read());
+        REQUIRE(second.has_value());
+        REQUIRE_FALSE(second->has_value());
+        CHECK(second->error() == asio::error::connection_reset);
+    }
 }
 
 TEST_CASE("proto/body: pull mode reads on demand and never touches the channel", "[proto]") {

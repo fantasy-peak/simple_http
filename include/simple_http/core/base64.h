@@ -17,10 +17,15 @@ inline constexpr char base64_url_alphabet[] = {
 
 inline std::string base64_url_encode(std::string_view in) {
     std::string out;
-    int val = 0;
+    out.reserve((in.size() * 4 + 2) / 3);
+    // The accumulator is masked to the bits not yet emitted, so it never grows
+    // past the 24 it needs. As a plain `int` left unmasked, `val << 8` eventually
+    // shifts into the sign bit: signed overflow, which is undefined behaviour and
+    // not merely a wrong character.
+    std::uint32_t val = 0;
     int bits = -6;
     for (unsigned char c : in) {
-        val = (val << 8) + c;
+        val = ((val << 8) | c) & 0xFFFFFFu;
         bits += 8;
         while (bits >= 0) {
             out.push_back(base64_url_alphabet[(val >> bits) & 0x3F]);
@@ -74,23 +79,33 @@ inline std::string base64_encode(std::string_view in) {
     return out;
 }
 
+// Decodes standard base64url, stopping at the first character outside the
+// alphabet (see the test that pins that: a stray '=' or space ends the payload).
 inline std::string base64_url_decode(std::string_view in) {
-    // Reverse lookup table: character -> 6-bit value, or -1 if not in alphabet.
-    std::array<int, 256> rev;
-    rev.fill(-1);
-    for (int i = 0; i < 64; ++i) {
-        rev[static_cast<unsigned char>(base64_url_alphabet[i])] = i;
-    }
+    // Character -> 6-bit value, or -1. A function-local static, built once: this
+    // used to be a 1 KiB array filled on every call.
+    static const std::array<int, 256> rev = [] {
+        std::array<int, 256> table{};
+        table.fill(-1);
+        for (int i = 0; i < 64; ++i) {
+            table[static_cast<unsigned char>(base64_url_alphabet[i])] = i;
+        }
+        return table;
+    }();
 
     std::string out;
-    int val = 0;
+    out.reserve(in.size() * 3 / 4);
+    // Masked to the bits not yet emitted, exactly as in the encoder: left
+    // unmasked, `val << 6` walks into the sign bit and the shift becomes
+    // undefined behaviour rather than merely wrong output.
+    std::uint32_t val = 0;
     int bits = -8;
     for (unsigned char c : in) {
-        int mapped = rev[c];
+        const int mapped = rev[c];
         if (mapped == -1) {
-            break;  // stop at the first character outside the alphabet
+            break;
         }
-        val = (val << 6) + mapped;
+        val = ((val << 6) | static_cast<std::uint32_t>(mapped)) & 0xFFFFFFu;
         bits += 6;
         if (bits >= 0) {
             out.push_back(static_cast<char>((val >> bits) & 0xFF));

@@ -1,8 +1,14 @@
 @PACKAGE_INIT@
 
-# The exported target links zlib/brotli when compression was enabled at build
-# time, so those imported targets must exist before it is included.
+# The exported target carries its dependencies as INTERFACE link libraries, so
+# those imported targets must exist before simple_httpTargets.cmake is included.
 include(CMakeFindDependencyMacro)
+
+find_dependency(Boost CONFIG)
+find_dependency(OpenSSL)
+
+# Only when the library was built with compression: otherwise the codecs are not
+# compiled in and nothing links against them.
 if(@SIMPLE_HTTP_WITH_COMPRESSION@)
     find_dependency(ZLIB)
     find_dependency(Brotli)

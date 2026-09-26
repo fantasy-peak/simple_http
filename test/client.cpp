@@ -1074,6 +1074,86 @@ asio::awaitable<void> suite_compression(std::uint16_t comp_port, std::uint16_t p
 // coroutine whose handle escapes (here, into co_spawn) trips a GCC
 // coroutine-frame lifetime problem in this toolchain, and the suites would then
 // run against a frame that has already been reused.
+// A RequestSpec asking for both an up-front body and a streamed one is a
+// contradiction. The engines used to resolve it differently and silently —
+// HTTP/2 sent `body` as the first chunk, HTTP/1.1 dropped it entirely — so the
+// answer is now one refusal in both places.
+asio::awaitable<void> suite_spec_validation(std::uint16_t plain_port) {
+    std::printf("\n== request spec validation ==\n");
+    auto cfg = base_config();
+    sh::HttpClient http{cfg};
+
+    auto session = co_await http.connect(url(plain_port, "/orld", false));
+    if (!session) {
+        check(false, "spec validation: could not open a session: " + describe(session.error()));
+        co_return;
+    }
+
+    sh::RequestSpec contradictory{
+        .method = sh::Method::Post, .target = "/echo", .body = "x", .stream_body = true};
+    auto stream = co_await (*session)->open_stream(contradictory);
+    check(!stream && stream.error() == sh::client_errc::invalid_spec,
+          "a spec with both body and stream_body is refused -> " + describe(stream.error()));
+
+    // The control: either one alone is fine, so the check above is not just
+    // rejecting every POST.
+    sh::RequestSpec up_front{.method = sh::Method::Post, .target = "/echo", .body = "x"};
+    auto ok_stream = co_await (*session)->open_stream(up_front);
+    check(static_cast<bool>(ok_stream), "an up-front body alone is accepted");
+
+    // RequestSpec::close is documented as keeping the connection out of the pool.
+    // HTTP/1.1 sends `Connection: close` for it; HTTP/2 has no such header and has
+    // to remember the intent — it used not to read the field at all, and pooled
+    // the session regardless.
+    {
+        auto s = co_await http.connect(url(plain_port, "/world", false));
+        if (s) {
+            sh::RequestSpec normal{.method = sh::Method::Get, .target = "/world"};
+            if (auto st = co_await (*s)->open_stream(normal)) {
+                (void)co_await (*st)->read_all();
+            }
+            check((*s)->reusable(), "without close = true the session stays reusable");
+        }
+    }
+    {
+        auto s = co_await http.connect(url(plain_port, "/world", false));
+        if (s) {
+            sh::RequestSpec closing{.method = sh::Method::Get, .target = "/world", .close = true};
+            if (auto st = co_await (*s)->open_stream(closing)) {
+                (void)co_await (*st)->read_all();
+            }
+            check(!(*s)->reusable(), "close = true takes the session out of the pool");
+        }
+    }
+    // And the same intent over HTTP/2, which has no `Connection: close` header to
+    // send — that engine has to remember the flag instead, so it is a different
+    // mechanism and the checks above (HTTP/1.1) do not exercise it.
+    {
+        auto cfg2 = base_config();
+        cfg2.default_version = sh::HttpVersionPolicy::Http2;
+        cfg2.default_h2c = sh::H2cMode::PriorKnowledge;
+        sh::HttpClient h2_http{cfg2};
+
+        auto s = co_await h2_http.connect(url(plain_port, "/world", false));
+        if (s) {
+            sh::RequestSpec normal{.method = sh::Method::Get, .target = "/world"};
+            if (auto st = co_await (*s)->open_stream(normal)) {
+                (void)co_await (*st)->read_all();
+            }
+            check((*s)->reusable(), "HTTP/2: without close = true the session stays reusable");
+        }
+        auto s2 = co_await h2_http.connect(url(plain_port, "/world", false));
+        if (s2) {
+            sh::RequestSpec closing{.method = sh::Method::Get, .target = "/world", .close = true};
+            if (auto st = co_await (*s2)->open_stream(closing)) {
+                (void)co_await (*st)->read_all();
+            }
+            check(!(*s2)->reusable(), "HTTP/2: close = true takes the session out of the pool");
+        }
+    }
+    co_return;
+}
+
 asio::awaitable<void> run_all_suites(asio::io_context& ctx, std::uint16_t plain, std::uint16_t tls_port,
                                      std::uint16_t comp_port) {
     co_await suite_protocol_matrix(plain, tls_port);
@@ -1081,6 +1161,7 @@ asio::awaitable<void> run_all_suites(asio::io_context& ctx, std::uint16_t plain,
     co_await suite_streaming(plain);
     co_await suite_h2_multiplex(plain);
     co_await suite_errors(plain);
+    co_await suite_spec_validation(plain);
     co_await suite_tls(tls_port);
     co_await suite_reverse_proxy(plain);
     co_await suite_raw_peer(ctx);

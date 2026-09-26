@@ -221,6 +221,7 @@ enum class client_errc : int {
     goaway,                  // the peer is draining the connection (GOAWAY)
     connect_timeout,
     request_timeout,
+    invalid_spec,  // the caller's RequestSpec contradicts itself (body + stream_body)
 };
 
 }  // namespace simple_http
@@ -279,6 +280,8 @@ class ClientErrorCategory : public boost::system::error_category {
                 return "connection attempt timed out";
             case client_errc::request_timeout:
                 return "request timed out";
+            case client_errc::invalid_spec:
+                return "the request spec sets both body and stream_body";
             default:
                 return "unknown client error";
         }

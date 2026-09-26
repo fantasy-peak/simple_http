@@ -39,6 +39,28 @@ inline Method method_from_string(std::string_view s) noexcept {
     return Method::Unknown;
 }
 
+// Whether replaying a request with this method is harmless when its outcome is
+// unknown. RFC 9110 §9.2.2 defines exactly these as idempotent, which is what
+// makes a retry safe: a duplicate has the same effect as the original. POST and
+// PATCH are not on the list, and a replay of one can double a side effect.
+inline constexpr bool is_idempotent(Method m) noexcept {
+    switch (m) {
+        case Method::Get:
+        case Method::Head:
+        case Method::Put:
+        case Method::Delete:
+        case Method::Options:
+        case Method::Trace:
+            return true;
+        case Method::Post:
+        case Method::Patch:
+        case Method::Connect:
+        case Method::Unknown:
+            return false;
+    }
+    return false;
+}
+
 inline constexpr std::string_view to_string(Method m) noexcept {
     switch (m) {
         case Method::Get:

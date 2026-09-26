@@ -2,12 +2,13 @@
 
 // HPACK response header-block encoder (RFC 7541), framework-free.
 //
-// This is a fresh, minimal encoder — it does not reuse the ported
-// `make_http2_headers_item*` helpers in hpack_encode.h (their varint
-// continuation-byte math is wrong for values >= 127 and they double-emit the
-// length prefix), only the two primitives that are byte-for-byte correct:
-// the Huffman codec (`codec::http_huffman_encode`) and the HPACK static table
-// (`codec::http2_header_static_table`).
+// This is a fresh, minimal encoder built on the two primitives that are
+// byte-for-byte correct: the Huffman codec (`codec::http_huffman_encode`) and the
+// HPACK static table (`codec::http2_header_static_table`). It does not reuse the
+// ported `make_http2_headers_item*` builders that used to live beside that table
+// — their varint continuation-byte math was wrong for values >= 127 and they
+// double-emitted the length prefix — and those have since been deleted
+// (hpack_static_table.h is all that remains of that file).
 //
 // Strategy: every header field is encoded as "Literal Header Field without
 // Indexing" (RFC 7541 §6.2.2), with both name and value Huffman-coded. This is

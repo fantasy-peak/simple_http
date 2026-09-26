@@ -67,28 +67,30 @@ class Headers {
 
     const std::vector<value_type>& fields() const { return m_fields; }
 
-    // Allocation-free ASCII case-insensitive equality. `lhs` is a stored,
-    // already-lowercased field name; `rhs` is the caller-provided name.
+  private:
+    // Allocation-free ASCII case-insensitive equality, lowercasing only `rhs`.
+    //
+    // That is sound *here* and nowhere else: `lhs` is always a stored field name,
+    // and this class stores them lowercased (to_lower below, and add()). It is
+    // private for exactly that reason — it used to be public and static, so a
+    // caller comparing two names, or passing a mixed-case `lhs`, got a silent
+    // mismatch instead of a compile error. The symmetric version, for anyone who
+    // needs one, is core/content_encoding.h's iequals_ci.
     static bool iequals_ascii(std::string_view lhs, std::string_view rhs) {
         if (lhs.size() != rhs.size()) {
             return false;
         }
         for (std::size_t i = 0; i < lhs.size(); ++i) {
-            if (lhs[i] != to_lower_ascii(rhs[i])) {
+            if (lhs[i] != ascii_lower(rhs[i])) {
                 return false;
             }
         }
         return true;
     }
 
-  private:
-    static char to_lower_ascii(char c) {
-        return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
-    }
-
     static void to_lower(std::string& s) {
         std::transform(s.begin(), s.end(), s.begin(),
-                       [](unsigned char c) { return static_cast<char>(to_lower_ascii(static_cast<char>(c))); });
+                       [](unsigned char c) { return ascii_lower(static_cast<char>(c)); });
     }
 
     std::vector<value_type> m_fields;

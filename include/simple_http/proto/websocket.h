@@ -356,6 +356,15 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
                 break;  // transport error, or a Close frame just went out
             }
         }
+        // Terminal by construction: once this loop is left, no pump will ever run
+        // again. Anything still queued would therefore wait forever — a waiter is
+        // parked on its `done` channel with no timeout, and nothing else signals
+        // it — so releasing them here is what turns "the transport died" into an
+        // error its callers can actually see. Idempotent: close() may already
+        // have done this.
+        self->m_open = false;
+        self->fail_pending_writes();
+        self->m_notify.close();
         co_return;
     }
 
@@ -365,10 +374,21 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
         co_await asio::dispatch(asio::bind_executor(m_executor, asio::use_awaitable));
     }
 
-    // Enqueue a control frame (Pong/Close). Fire-and-forget for Pong; the caller
-    // is already on the connection executor (read() hopped). If the queue is
-    // closed/full the connection is going away, so mark it not-open.
+    // Bound on the outbound queue, so a peer cannot grow it without limit.
+    static constexpr std::size_t kMaxPendingFrames = 64;
+
+    // Enqueue a control frame (Pong). Fire-and-forget: nobody awaits this frame's
+    // result, so it is dropped outright once the connection is going away rather
+    // than queued behind a pump that will never run again.
+    //
+    // The queue is bounded because a peer may ping faster than the pump drains,
+    // and dropping a Pong is explicitly allowed (RFC 6455 §5.5.3): a Pong is not
+    // required for every Ping. Unbounded growth here would be a remote memory
+    // exhaustion vector.
     asio::awaitable<void> enqueue_control(WsOpcode opcode, std::string payload, bool close_after = false) {
+        if (!m_open || m_pending.size() >= kMaxPendingFrames) {
+            co_return;
+        }
         m_pending.push_back(make_req(opcode, std::move(payload), nullptr, close_after));
         (void)m_notify.try_send(error_code{});
         co_return;

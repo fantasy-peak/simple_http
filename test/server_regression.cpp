@@ -78,6 +78,15 @@ void register_routes(sh::Server& server) {
         co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
         co_await res->status(200).send("late");
     });
+    // A field carrying CR/LF is response splitting; the response must not go out.
+    server.route("/inject", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+        (void)co_await res->status(200).header("x-bad", "a\r\ninjected: 1").send("hi");
+    });
+    // A handler that sets its own Content-Length: the writer owns that field and
+    // must replace it, not append a second one.
+    server.route("/clash", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(200).header("content-length", "999").send("hi");
+    });
     server.ws_route("/chat", [](sh::RequestPtr, std::shared_ptr<sh::WebSocket> ws) -> asio::awaitable<void> {
         for (;;) {
             auto message = co_await ws->read();
@@ -937,7 +946,7 @@ TEST_CASE("regression/tls: a TLS 1.2-only client is refused", "[regression][tls]
     tls_server();
     asio::io_context ctx;
 
-    // The library's server context is TLS 1.3-only (disable_tls12).
+    // The library's server context is TLS 1.3-only, by its context flavour.
     asio::ssl::context client_ctx{asio::ssl::context::tls_client};
     client_ctx.set_options(asio::ssl::context::no_tlsv1_3);
     client_ctx.set_verify_mode(asio::ssl::verify_none);
@@ -1045,6 +1054,156 @@ TEST_CASE("regression/server: an IPv6 listener serves IPv4 clients", "[regressio
     client.send("GET /world HTTP/1.1\r\nHost: x\r\n\r\n");
     CHECK(client.wait_for("hello"));
     client.close();
+}
+
+// A customization hook must not be able to turn client-certificate verification
+// off by accident. It is applied *before* the security policy, not instead of it:
+// the hook used to replace the whole policy branch, so a caller adding a cipher
+// list silently got verify_none with cfg.mutual == true.
+TEST_CASE("regression/tls: a setup hook does not disable mutual TLS", "[regression][tls]") {
+    sh::ServerConfig cfg = make_config(
+        0, sh::TlsConfig{
+               .cert_chain_file = "./test/tls_certificates/server_cert.pem",
+               .private_key_file = "./test/tls_certificates/server_key.pem",
+               .mutual = true,
+               .ca_file = "./test/tls_certificates/ca_cert.pem",
+               // Something innocuous — the kind of thing this hook exists for.
+               .setup = [](asio::ssl::context& ctx) { ctx.set_options(asio::ssl::context::default_workarounds); },
+           });
+    sh::Server server{cfg};
+    register_routes(server);
+    REQUIRE(server.start());
+
+    // Sends a request and reports whether a *response* came back. The distinction
+    // matters: "the read failed" is also what an idle timeout looks like, so a
+    // bare error check would pass even with verification switched off — and did,
+    // until this was written as a comparison.
+    auto ask = [&](bool with_certificate) {
+        asio::io_context ctx;
+        asio::ssl::context client_ctx{asio::ssl::context::tls_client};
+        client_ctx.set_verify_mode(asio::ssl::verify_none);
+        if (with_certificate) {
+            client_ctx.use_certificate_chain_file("./test/tls_certificates/client_cert.pem");
+            client_ctx.use_private_key_file("./test/tls_certificates/client_key.pem", asio::ssl::context::pem);
+        }
+        auto stream = std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(ctx, client_ctx);
+
+        std::string seen;
+        sh::error_code ec;
+        stream->next_layer().connect(asio::ip::tcp::endpoint(asio::ip::make_address("127.0.0.1"), server.port()), ec);
+        if (ec) return false;
+        stream->async_handshake(asio::ssl::stream_base::client, [&](const sh::error_code& e) { ec = e; });
+        ctx.restart();
+        ctx.run_for(std::chrono::seconds(5));
+        if (ec) return false;
+
+        const std::string request = "GET /world HTTP/1.1\r\nHost: x\r\n\r\n";
+        asio::async_write(*stream, asio::buffer(request), [&](const sh::error_code& e, std::size_t) { ec = e; });
+        ctx.restart();
+        ctx.run_for(std::chrono::seconds(5));
+        if (ec) return false;
+
+        std::array<char, 512> buf{};
+        stream->async_read_some(asio::buffer(buf), [&](const sh::error_code& e, std::size_t n) {
+            ec = e;
+            if (!e) seen.assign(buf.data(), n);
+        });
+        ctx.restart();
+        ctx.run_for(std::chrono::seconds(5));
+        stream->next_layer().close(ec);
+        return seen.find("hello") != std::string::npos;
+    };
+
+    // The control first: with a certificate the same path serves normally, so a
+    // failure below cannot be blamed on a broken listener.
+    CHECK(ask(/*with_certificate=*/true));
+    // And without one it must not: the hook did not get to turn verification off.
+    CHECK_FALSE(ask(/*with_certificate=*/false));
+
+    server.stop();
+}
+
+// The writer sets Content-Length itself, so a handler that set one must have it
+// *replaced*. Two conflicting Content-Length fields on one response is a
+// response-splitting vector for any intermediary — and this framework is one.
+TEST_CASE("regression/h1: a handler's own Content-Length is replaced, not duplicated", "[regression][h1]") {
+    plain_server();
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(kPlainPort));
+    client.send("GET /clash HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(client.wait_head());
+
+    const std::string& head = client.received();
+    std::size_t count = 0;
+    for (auto at = head.find("content-length"); at != std::string::npos; at = head.find("content-length", at + 1)) {
+        ++count;
+    }
+    CHECK(count == 1);
+    CHECK(head.find("content-length: 2\r\n") != std::string::npos);  // "hi", not the handler's 999
+    client.close();
+}
+
+// A response field carrying CR/LF is response splitting: it splices a field of the
+// handler's choosing into the head. HTTP/2 already refuses the stream for it; the
+// HTTP/1.1 writer used to write it verbatim, so the same handler was safe on one
+// protocol and exploitable on the other.
+TEST_CASE("regression/h1: a response field with CR/LF is refused, not spliced", "[regression][h1]") {
+    plain_server();
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(kPlainPort));
+    client.send("GET /inject HTTP/1.1\r\nHost: x\r\n\r\n");
+    client.pump(std::chrono::milliseconds(200));
+    // Neither the injected field nor a well-formed head: the response is withheld
+    // rather than emitted with a head the handler did not intend.
+    CHECK(client.received().find("injected") == std::string::npos);
+    CHECK(client.received().find("200 OK") == std::string::npos);
+    client.close();
+}
+
+// RFC 9112 §7.1 requires CRLF after each chunk's data. Accepting any two bytes
+// there is the lenient half of a request-smuggling split with a CRLF-strict
+// front-end, and a proxy is exactly where that disagreement gets exploited.
+TEST_CASE("regression/h1: a chunk trailer that is not CRLF is not accepted", "[regression][h1]") {
+    plain_server();
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(kPlainPort));
+    client.send("POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloXY");
+    REQUIRE(client.wait_head());
+    // /echo reports what it could read, so this is what separates the two
+    // behaviours: treating "XY" as the trailer yields "len=5:hello", while
+    // rejecting it leaves the body unreadable. The engine's own response is a 200
+    // either way — the route decides that — so the body is the observable.
+    CHECK(client.received().find("len=5:hello") == std::string::npos);
+
+    // A malformed chunk leaves the stream position unknown, so the connection
+    // must not be reused for a following request on it.
+    client.send("GET /world HTTP/1.1\r\nHost: x\r\n\r\n");
+    client.pump(std::chrono::milliseconds(200));
+    CHECK(client.received().find("hello from") == std::string::npos);
+    client.close();
+}
+
+// "Disabled" has to mean "no deadline", not "close immediately". Racing a no-op
+// deadline against the detection read made `a || b` complete at once, cancelling
+// the read before a byte arrived — so every connection was accepted and dropped.
+TEST_CASE("regression/server: idle_timeout = 0 disables the deadline instead of closing at once",
+          "[regression][server]") {
+    auto cfg = make_config(0, std::nullopt);
+    cfg.limits.idle_timeout = std::chrono::seconds(0);
+    sh::Server server{cfg};
+    register_routes(server);
+    REQUIRE(server.start());
+
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(server.port()));
+    client.send("GET /world HTTP/1.1\r\nHost: x\r\n\r\n");
+    CHECK(client.wait_for("hello"));
+    client.close();
+    server.stop();
 }
 
 // The UNIX-domain listener shares everything with the TCP path except the

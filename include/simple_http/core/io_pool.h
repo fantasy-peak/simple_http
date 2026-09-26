@@ -8,6 +8,7 @@
 // listener is fanned out with SO_REUSEPORT).
 
 #include <atomic>
+#include <cassert>
 #include <cstddef>
 #include <memory>
 #include <stdexcept>
@@ -31,6 +32,12 @@ class IoCtxPool final {
         }
     }
 
+    // A started pool owns joinable threads, and std::thread's destructor
+    // terminates the process while one is still joinable — so a pool destroyed
+    // without an explicit stop() would abort. stop() is idempotent (it skips
+    // threads that are already joined), which makes this safe either way.
+    ~IoCtxPool() { stop(); }
+
     void start() {
         for (auto& context : m_io_contexts) {
             m_threads.emplace_back([ctx = context] { ctx->run(); });
@@ -50,11 +57,12 @@ class IoCtxPool final {
     }
 
     // Round-robin selection of the next worker io_context.
-    asio::io_context& next() {
-        return *next_ptr();
-    }
+    asio::io_context& next() { return *next_ptr(); }
 
-    std::shared_ptr<asio::io_context>& next_ptr() {
+    // The same, as the shared_ptr. A *const* reference: handing out a mutable one
+    // let any caller rebind a pooled context, which left "the main context is
+    // never handed out as a worker" a comment rather than a guarantee.
+    const std::shared_ptr<asio::io_context>& next_ptr() {
         std::size_t index = m_cursor.fetch_add(1, std::memory_order_relaxed);
         return m_io_contexts[index % m_pool_size];
     }
@@ -68,7 +76,11 @@ class IoCtxPool final {
     // counted here and is never reachable through at().
     std::size_t size() const { return m_pool_size; }
 
-    std::shared_ptr<asio::io_context>& at(std::size_t index) {
+    // Bounds-checked, as the name implies. An out-of-range index used to read
+    // past the end — or, for index == pool_size, hand back the main context,
+    // which is precisely the one this accessor exists to keep away from workers.
+    const std::shared_ptr<asio::io_context>& at(std::size_t index) {
+        assert(index < m_pool_size);
         return m_io_contexts[index];
     }
 

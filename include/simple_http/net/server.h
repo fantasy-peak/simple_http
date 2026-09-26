@@ -11,8 +11,10 @@
 // The accept topology follows ServerConfig::reuse_port: a single acceptor that
 // round-robins the pool, or one acceptor per worker context (SO_REUSEPORT).
 
+#include <atomic>
 #include <cstddef>
 #include <filesystem>
+#include <future>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -200,24 +202,56 @@ class Server {
     bool start() { return start_listeners(); }
 
     void stop() {
-        if (m_stopped) return;
-        m_stopped = true;
+        if (m_stopped.exchange(true)) return;
+
+        // Close each acceptor on its own context — async_accept is running there
+        // and acceptor::close is not thread-safe — and wait for those closes to
+        // land before stopping the pool.
+        //
+        // The waiting is the load-bearing part. io_context::stop() abandons
+        // queued handlers, so posting a close and then stopping immediately (or
+        // simply stopping first) leaves the listening sockets bound for the
+        // lifetime of this object: the port keeps listening into a backlog
+        // nobody drains, a restart on it fails with EADDRINUSE, and a later
+        // start() stacks a second acceptor onto the first.
+        std::atomic<std::size_t> remaining{m_acceptors.size()};
+        std::promise<void> all_closed;
+        auto closed = all_closed.get_future();
         for (auto& listener : m_acceptors) {
-            // Close on the context that owns the acceptor: async_accept is
-            // running there and acceptor::close is not thread-safe. If the
-            // pool stops first the close is simply dropped, which is safe too
-            // — the acceptor dies with its coroutine.
             auto acceptor = listener.acceptor;
-            asio::post(*listener.ctx, [acceptor] {
+            auto mark_done = [&remaining, &all_closed] {
+                if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    all_closed.set_value();
+                }
+            };
+            if (listener.ctx->stopped()) {
+                // That loop is already gone, so no handler can be running there:
+                // closing from this thread is safe, and a posted close would
+                // never execute at all.
                 std::visit(
                     [](const auto& socket) {
                         error_code ec;
                         socket->close(ec);
                     },
                     acceptor);
+                mark_done();
+                continue;
+            }
+            asio::post(*listener.ctx, [acceptor, mark_done] {
+                std::visit(
+                    [](const auto& socket) {
+                        error_code ec;
+                        socket->close(ec);
+                    },
+                    acceptor);
+                mark_done();
             });
         }
+        if (!m_acceptors.empty()) {
+            closed.wait();
+        }
         m_pool->stop();
+        m_acceptors.clear();
     }
 
     // The local port a TCP listener is using (useful with port 0 / ephemeral).
@@ -495,6 +529,11 @@ class Server {
             auto [ec] = co_await acceptor->async_accept(socket, asio::as_tuple(asio::use_awaitable));
             if (ec) {
                 if (ec == asio::error::operation_aborted) break;
+                // Never retry in silence: a persistent accept error — EMFILE and
+                // ENOBUFS are both reachable, since this loop opens a socket per
+                // connection — would otherwise spin a core with no diagnostic at
+                // all, and the port would look merely "slow" from outside.
+                SIMPLE_HTTP_ERROR_LOG("accept: {}", ec.message());
                 continue;
             }
 
@@ -554,7 +593,9 @@ class Server {
     std::shared_ptr<Router> m_router;
     std::optional<TlsContext> m_tls;
     std::vector<Listener> m_acceptors;
-    bool m_stopped{false};
+    // Atomic: stop() is the one member a signal handler or a second thread has
+    // any business calling, and double-stopping must not race.
+    std::atomic<bool> m_stopped{false};
 };
 
 }  // namespace simple_http

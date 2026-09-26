@@ -37,22 +37,6 @@ inline constexpr std::string_view kEncodingIdentity = "identity";
 
 // --- small text helpers ---------------------------------------------------
 
-inline char ascii_lower(char c) {
-    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
-}
-
-inline bool iequals_ci(std::string_view a, std::string_view b) {
-    if (a.size() != b.size()) {
-        return false;
-    }
-    for (std::size_t i = 0; i < a.size(); ++i) {
-        if (ascii_lower(a[i]) != ascii_lower(b[i])) {
-            return false;
-        }
-    }
-    return true;
-}
-
 inline bool starts_with_ci(std::string_view s, std::string_view prefix) {
     return s.size() >= prefix.size() && iequals_ci(s.substr(0, prefix.size()), prefix);
 }
@@ -547,6 +531,17 @@ inline std::optional<std::string> negotiate_encoding(std::string_view accept_enc
 inline bool default_compressible_type(std::string_view essence) {
     // Media types are case-insensitive (RFC 9110 §8.3), so every comparison here
     // is too - a client that sends "APPLICATION/JSON" means the same thing.
+    //
+    // Server-sent events are the exception to the text/* rule. The whole point of
+    // the format is that each event reaches the client as it happens, and a
+    // compressed body gives the codec nothing to emit until it has buffered
+    // enough to be worth a block — so the events would sit inside zlib and an
+    // EventSource would simply look stalled. The streaming path has no flush to
+    // force them out (see ContentEncoder), which is why the type is excluded
+    // rather than left to careful configuration.
+    if (iequals_ci(essence, "text/event-stream")) {
+        return false;
+    }
     if (starts_with_ci(essence, "text/")) {
         return true;
     }

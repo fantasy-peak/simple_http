@@ -19,7 +19,7 @@ RequestPtr make_request(asio::io_context& ctx, std::string path) {
     req->set_target(std::move(path));
     // The engines always end the request body; the reverse proxy probes it before
     // dialing, so a test must do the same or that read waits forever.
-    (void)req->body().finish();
+    req->body().finish();
     return req;
 }
 

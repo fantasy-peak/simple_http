@@ -87,6 +87,11 @@ class Http1ResponseWriter : public ResponseWriter {
             co_return co_await send_bodyless(status, std::move(headers));
         }
 
+        // Erase first: add_lower appends, so a handler that set its own
+        // content-length would otherwise put two conflicting ones on the wire —
+        // a response-splitting vector for any intermediary, and this library is
+        // one. compressing_writer.h already does exactly this.
+        headers.erase("content-length");
         headers.add_lower("content-length", std::to_string(body.size()));
         // The head gets its own buffer, and the body is streamed from wherever the
         // caller handed it to us. Concatenating the two first would copy the whole
@@ -616,6 +621,14 @@ class Http1Engine {
         if (!co_await read_exact(2, crlf)) {  // trailing CRLF after chunk data
             m_body_done = true;
             co_return std::unexpected(make_error_code(asio::error::eof));
+        }
+        // The trailer is framing, not padding. Accepting any two bytes here is
+        // the lenient half of a request-smuggling split with a CRLF-strict
+        // front-end — RFC 9112 §7.1 requires the CRLF, and a proxy is exactly
+        // where the disagreement gets exploited.
+        if (crlf != "\r\n") {
+            m_body_done = true;
+            co_return std::unexpected(make_error_code(asio::error::invalid_argument));
         }
         co_return ReadResult::chunk(std::move(chunk));
     }

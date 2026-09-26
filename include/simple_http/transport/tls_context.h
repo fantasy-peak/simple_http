@@ -30,7 +30,6 @@ struct TlsConfig {
     std::string private_key_file;                   // server private key (PEM)
     bool mutual = false;                            // require & verify a client certificate
     std::optional<std::string> ca_file;             // CA bundle for mutual TLS (else system defaults)
-    bool disable_tls12 = true;                      // if true, require TLS 1.3
     std::function<void(asio::ssl::context&)> setup; // optional customization hook
 };
 
@@ -70,23 +69,29 @@ class TlsContext {
             throw std::runtime_error(std::format("TLS private key not found: {}", cfg.private_key_file));
         }
 
+        // TLS 1.3 only, expressed by the context flavour rather than by stacking
+        // no_tlsv1* option flags. `tlsv13_server` pins both bounds, which is the
+        // entire policy — and there is deliberately no knob to lower it: the
+        // previous one could not actually re-enable TLS 1.2 (removing an option
+        // flag re-enables nothing once the flavour has pinned the version), so it
+        // only ever produced silent handshake failures.
+        m_ctx.set_options(asio::ssl::context::default_workarounds);
+
+        // The hook customizes the context; it does not get to replace the
+        // security policy. Running it first and applying the policy after means
+        // a caller adding a cipher list cannot silently lose client-certificate
+        // verification — which is exactly what happened when the hook was the
+        // whole branch instead of an addition to it. To customize verification
+        // itself, use set_verify_callback.
         if (cfg.setup) {
             cfg.setup(m_ctx);
-        } else {
-            std::uint64_t opts = asio::ssl::context::default_workarounds | asio::ssl::context::no_tlsv1 |
-                                 asio::ssl::context::no_tlsv1_1;
-            if (cfg.disable_tls12) {
-                opts |= asio::ssl::context::no_tlsv1_2;
-            }
-            m_ctx.set_options(opts);
-
-            if (cfg.mutual) {
-                m_ctx.set_verify_mode(asio::ssl::verify_peer | asio::ssl::verify_fail_if_no_peer_cert);
-                if (cfg.ca_file) {
-                    m_ctx.load_verify_file(*cfg.ca_file);
-                } else {
-                    m_ctx.set_default_verify_paths();
-                }
+        }
+        if (cfg.mutual) {
+            m_ctx.set_verify_mode(asio::ssl::verify_peer | asio::ssl::verify_fail_if_no_peer_cert);
+            if (cfg.ca_file) {
+                m_ctx.load_verify_file(*cfg.ca_file);
+            } else {
+                m_ctx.set_default_verify_paths();
             }
         }
 

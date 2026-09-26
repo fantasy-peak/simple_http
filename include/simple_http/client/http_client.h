@@ -319,10 +319,19 @@ class HttpClient {
             const error_code ec = response.error();
             (void)co_await stream->cancel();  // h2: reset the stream, keeping the connection; h1: close it
 
-            // A pooled connection that died before answering may be replayed: it
-            // was idle, so the request never reached anyone. A streamed body has
-            // already been taken from the caller and cannot be sent again.
-            if (attempt == 0 && opened->pooled && !spec.stream_body && transport_failure(ec)) {
+            // Replay only when a duplicate cannot cause a second side effect. The
+            // old rule — "the pooled connection died before answering, so it was
+            // idle and the request never reached anyone" — does not hold: by the
+            // time an error surfaces here the request has already been written, so
+            // a peer that processed the POST and died before answering would see
+            // it twice. What is genuinely safe is a peer that said it did not
+            // process the request (REFUSED_STREAM / a GOAWAY covering the stream),
+            // or a method that is idempotent by definition.
+            //
+            // A streamed body is excluded either way: it has already been taken
+            // from the caller and cannot be sent again.
+            if (attempt == 0 && opened->pooled && !spec.stream_body &&
+                (is_retryable(ec) || is_idempotent(spec.method))) {
                 SIMPLE_HTTP_ERROR_LOG("client: pooled connection to {} died before answering ({}), retrying",
                                       target.authority(),
                                       ec.message());

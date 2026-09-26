@@ -295,6 +295,12 @@ class Http1ClientSession final : public ClientSession,
             co_return std::unexpected{closed_error()};
         if (m_busy)
             co_return std::unexpected{make_error_code(client_errc::session_busy)};
+        // A body supplied up front and a body to be streamed are two different
+        // things; asking for both is a contradiction, and the engines resolved it
+        // differently — HTTP/2 sent `body` as the first chunk, HTTP/1.1 dropped it
+        // without a word. Refusing is the only answer that cannot lose data.
+        if (spec.stream_body && !spec.body.empty())
+            co_return std::unexpected{make_error_code(client_errc::invalid_spec)};
 
         auto stream = std::make_shared<Http1ClientStream<Transport>>(this->shared_from_this());
         m_stream = stream;
@@ -870,7 +876,11 @@ class Http1ClientSession final : public ClientSession,
         // An explicit body length is what leaves the connection at a request
         // boundary; anything else (EOF-delimited body, a `Connection: close` from
         // either side, stray bytes the peer already sent) means it must be closed.
-        m_reusable = m_alive && m_explicit_length && !m_close_after && m_buf.empty();
+        // `m_keep_alive` is the *request's* intent, `m_close_after` only the
+        // response's. A spec that asked to close must not end up pooled just
+        // because the peer did not echo `Connection: close` back — the next
+        // request would then fail on a connection this side is done with.
+        m_reusable = m_alive && m_explicit_length && !m_close_after && m_keep_alive && m_buf.empty();
         notify_idle();
     }
 

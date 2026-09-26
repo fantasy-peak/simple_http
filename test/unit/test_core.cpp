@@ -141,6 +141,36 @@ TEST_CASE("core/logging: level filter, formatting and source location", "[core]"
     CHECK(to_string(LogLevel::Critical) == "critical");
 }
 
+TEST_CASE("core/compression: server-sent events are never compressed", "[core]") {
+    // A compressed SSE stream delivers nothing until the codec has buffered enough
+    // to emit a block, and the streaming path has no flush to force it — an
+    // EventSource fed that way looks stalled, not slow.
+    CHECK_FALSE(default_compressible_type("text/event-stream"));
+    CHECK_FALSE(default_compressible_type("TEXT/EVENT-STREAM"));  // media types are case-insensitive
+    // The rest of the text/* rule is untouched.
+    CHECK(default_compressible_type("text/plain"));
+    CHECK(default_compressible_type("text/html"));
+    CHECK(default_compressible_type("text/css"));
+}
+
+TEST_CASE("core/method: idempotence decides whether a request may be replayed", "[core]") {
+    // RFC 9110 §9.2.2. The client's retry path consults this: replaying a request
+    // whose outcome is unknown is only safe when a duplicate has the same effect
+    // as the original. POST and PATCH are the ones that matter — a retry of either
+    // can double a side effect, and the replay path used to ignore the method
+    // entirely.
+    CHECK(is_idempotent(Method::Get));
+    CHECK(is_idempotent(Method::Head));
+    CHECK(is_idempotent(Method::Put));
+    CHECK(is_idempotent(Method::Delete));
+    CHECK(is_idempotent(Method::Options));
+    CHECK(is_idempotent(Method::Trace));
+    CHECK_FALSE(is_idempotent(Method::Post));
+    CHECK_FALSE(is_idempotent(Method::Patch));
+    CHECK_FALSE(is_idempotent(Method::Connect));
+    CHECK_FALSE(is_idempotent(Method::Unknown));
+}
+
 TEST_CASE("core/io_pool: round-robin, main context and clean shutdown", "[core]") {
     CHECK_THROWS_AS(IoCtxPool{0}, std::runtime_error);
 
