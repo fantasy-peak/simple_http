@@ -394,6 +394,22 @@ class Http1Engine {
 
             const auto& head = parser.head();
             Version version = head.version;
+            // RFC 9112 §3.2: a request carries exactly one Host. Zero leaves no
+            // authority to route on; more than one is ambiguous, and two hops
+            // reading different copies is the classic smuggling shape. HTTP/1.0
+            // made Host optional, so only the "more than one" half applies there.
+            //
+            // Checked here rather than in H1Parser: "name: value" lines are the
+            // parser's business, but which fields must be *present* is HTTP
+            // semantics — and the parser's own unit tests are syntax tests that
+            // build minimal requests.
+            {
+                const std::size_t hosts = head.headers.count("host");
+                if (hosts > 1 || (hosts == 0 && version == Version::Http11)) {
+                    co_await send_error_response(400);
+                    co_return;
+                }
+            }
             bool keep_alive = connection_keep_alive(head, version);
 
             // WebSocket upgrade: an Upgrade: websocket request with a

@@ -473,6 +473,20 @@ xmake build client     && xmake run client       # client integration: protocol 
 `client` prints PASS/FAIL per check and exits non-zero on failure. All three are self-contained
 C++ — no Python or external services.
 
+A fourth suite drives the same server with **third-party clients** — httpx,
+hyper-h2 and websockets — and that is the point rather than an implementation
+detail: the C++ suites use simple_http's own client, so a spec misreading shared
+by both halves cancels out and the two agree on something wrong. An independent
+implementation disagrees exactly where the server is wrong. It found, for
+instance, a handler that threw taking the connection down instead of answering
+500, which no C++ client surfaced.
+
+```bash
+python3 -m venv test/python/.venv
+test/python/.venv/bin/pip install -r test/python/requirements.txt
+xmake run python-tests      # needs `xmake build server` first
+```
+
 Against the example server (`xmake run server`, plaintext on `:7788` and mTLS on `:7789`),
 with external clients:
 

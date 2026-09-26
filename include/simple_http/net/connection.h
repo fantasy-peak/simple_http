@@ -33,6 +33,20 @@ namespace asio = boost::asio;
 // The HTTP/2 connection preface prefix (enough to identify prior-knowledge h2).
 inline constexpr std::string_view h2_preface_prefix = "PRI * HTTP/2.0";
 
+// Which protocols a plaintext listener serves. A TLS listener negotiates this
+// with ALPN instead and ignores it.
+//
+// Both is the sniffing default; the two single-protocol values exist because
+// sniffing cannot answer a peer that opens with neither. A malformed HTTP/2
+// preface and an HTTP/1.x request line are the same bytes until you have decided
+// which protocol you are speaking, so one of the two readings is always wrong —
+// and the two conformance suites want opposite ones.
+enum class PlaintextProtocols {
+    Http1,  // parse every connection as HTTP/1.x
+    Http2,  // require the HTTP/2 connection preface on every connection
+    Both,   // sniff (the default)
+};
+
 // Serve a plaintext transport: detect prior-knowledge h2, else HTTP/1.x.
 //
 // HTTP/2 prior knowledge is recognised by the start of the client preface, so we
@@ -46,8 +60,25 @@ inline constexpr std::string_view h2_preface_prefix = "PRI * HTTP/2.0";
 template <typename Transport>
 inline asio::awaitable<void> serve_plaintext(std::shared_ptr<Transport> transport, Dispatcher dispatch,
                                              WsLookup ws_lookup = {}, EngineLimits limits = {},
-                                             WsProxyLookup ws_proxy_lookup = {}) {
+                                             WsProxyLookup ws_proxy_lookup = {},
+                                             PlaintextProtocols protocols = PlaintextProtocols::Both) {
     using namespace asio::experimental::awaitable_operators;
+
+    // A listener that serves one protocol does not sniff — that is the whole
+    // point of declaring it (see PlaintextProtocols).
+    if (protocols == PlaintextProtocols::Http2) {
+        // No pre-read: the engine reads and verifies all 24 octets of the preface
+        // itself (RFC 9113 §3.4), so a peer that opened with anything else gets the
+        // connection error it earned rather than being answered as HTTP/1.x.
+        auto engine = std::make_shared<Http2Engine<Transport>>(transport, limits);
+        co_await engine->run(std::move(dispatch));
+        co_return;
+    }
+    if (protocols == PlaintextProtocols::Http1) {
+        Http1Engine<Transport> engine{transport, limits};
+        co_await engine.run(dispatch, {}, std::move(ws_lookup), std::move(ws_proxy_lookup));
+        co_return;
+    }
 
     std::array<std::byte, h2_preface_prefix.size()> head{};
     std::size_t n = 0;

@@ -17,6 +17,7 @@
 // It depends only on the standard library, OpenSSL (SHA1 for the handshake) and
 // simple_http core base64 — no Beast, no Asio.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -61,6 +62,11 @@ struct WsFrame {
     bool fin = true;
     WsOpcode opcode = WsOpcode::Text;
     std::string payload;
+    // How many leading octets of `payload` were already handed out by
+    // take_partial_payload() while the frame was still arriving, and so have
+    // already been inspected. A caller that validates incrementally skips this
+    // prefix rather than feeding the same octets through twice.
+    std::size_t already_delivered = 0;
 };
 
 // Unmask a WebSocket payload in place (RFC 6455 §5.3: data[i] ^= key[i % 4]).
@@ -105,6 +111,12 @@ class WsFrameParser {
         Error,       // protocol violation (e.g. reserved opcode, oversize)
     };
 
+    // Payload octets of the in-flight frame, as far as they have arrived.
+    struct PartialPayload {
+        std::string bytes;   // unmasked octets not yet delivered; may be empty
+        bool first = false;  // true on the frame's first delivery
+    };
+
     // Payload size cap; frames larger than this are rejected. The engine sets
     // this from its EngineLimits before serving.
     explicit WsFrameParser(std::uint64_t max_payload = 16u * 1024 * 1024) : m_max_payload(max_payload) {}
@@ -123,6 +135,11 @@ class WsFrameParser {
 
         bool fin = (data[0] >> 7) & 0x01;
         std::uint8_t opcode = data[0] & 0x0F;
+
+        // RFC 6455 §5.2: RSV1-3 must be zero unless an extension that defines
+        // them was negotiated. No extension is ever accepted here, so a set bit is
+        // a protocol error rather than something to mask off and carry on.
+        if ((data[0] & 0x70) != 0) return Status::Error;
 
         // Validate the opcode: only the defined ones are accepted.
         switch (opcode) {
@@ -187,20 +204,71 @@ class WsFrameParser {
             pos += 4;
         }
 
+        // Record the in-flight frame before the completeness check, so its payload
+        // can be handed out as it arrives — see take_partial_payload().
+        m_partial_active = true;
+        m_partial_opcode = static_cast<WsOpcode>(opcode);
+        m_partial_start = pos;
+        m_partial_len = static_cast<std::size_t>(payload_len);
+        m_partial_off = 0;
+        std::memcpy(m_partial_key, mask_key, sizeof(m_partial_key));
+
         if (size < pos + payload_len) return Status::NeedMore;
 
         out.fin = fin;
         out.opcode = static_cast<WsOpcode>(opcode);
         out.payload.assign(reinterpret_cast<const char*>(data + pos), static_cast<std::size_t>(payload_len));
+        out.already_delivered = m_partial_off;
         ws_unmask(out.payload.data(), out.payload.size(), mask_key);  // every frame past the check above is masked
 
+        m_partial_active = false;
         m_buf.erase(0, pos + static_cast<std::size_t>(payload_len));
         return Status::Frame;
+    }
+
+    // Hands out the payload of the frame currently being accumulated, as it
+    // arrives. Without it, a caller that must act on a frame before it is whole —
+    // rejecting invalid UTF-8 the moment the offending octet appears, which
+    // Autobahn's 6.4.3 pins down — could only look once the frame had completed.
+    // Each call drains what has arrived since the last one, so no octet is
+    // delivered twice; `first` marks the frame's first delivery.
+    PartialPayload take_partial_payload() {
+        PartialPayload out;
+        if (!m_partial_active) return out;
+        const std::size_t arrived = m_buf.size() > m_partial_start ? m_buf.size() - m_partial_start : 0;
+        const std::size_t have = std::min(arrived, m_partial_len);
+        out.first = m_partial_off == 0;
+        if (have <= m_partial_off) return out;
+        out.bytes.assign(m_buf, m_partial_start + m_partial_off, have - m_partial_off);
+        // Payload octet i is masked with key[i % 4], and this chunk starts at
+        // octet m_partial_off, so the key has to be rotated into phase.
+        unsigned char rotated[4];
+        for (std::size_t i = 0; i < 4; ++i) {
+            rotated[i] = m_partial_key[(m_partial_off + i) % 4];
+        }
+        ws_unmask(out.bytes.data(), out.bytes.size(), rotated);
+        m_partial_off = have;
+        return out;
+    }
+
+    // The opcode of the frame being accumulated, if one is in flight. Lets the
+    // caller decide whether the arriving octets are worth inspecting at all.
+    std::optional<WsOpcode> pending_opcode() const {
+        if (!m_partial_active) return std::nullopt;
+        return m_partial_opcode;
     }
 
   private:
     std::string m_buf;
     std::uint64_t m_max_payload;
+
+    // In-flight frame bookkeeping for take_partial_payload().
+    bool m_partial_active = false;
+    WsOpcode m_partial_opcode = WsOpcode::Text;
+    std::size_t m_partial_start = 0;  // the payload's offset within m_buf
+    std::size_t m_partial_len = 0;    // the frame's declared payload length
+    std::size_t m_partial_off = 0;    // octets already delivered
+    unsigned char m_partial_key[4] = {0, 0, 0, 0};
 };
 
 // Serializes a server->client frame header (never masked) into a caller-provided
@@ -244,6 +312,92 @@ inline std::string ws_encode_text(std::string_view payload) { return ws_encode_f
 inline std::string ws_encode_binary(std::string_view payload) { return ws_encode_frame(WsOpcode::Binary, payload); }
 inline std::string ws_encode_pong(std::string_view payload) { return ws_encode_frame(WsOpcode::Pong, payload); }
 inline std::string ws_encode_ping(std::string_view payload) { return ws_encode_frame(WsOpcode::Ping, payload); }
+
+// Whether `code` is one a peer is allowed to put on the wire (RFC 6455 §7.4.1).
+// 1004 is reserved, 1005/1006 exist only to be *reported* locally, and 1012-2999
+// were unassigned — a Close carrying any of them is a protocol error, not a
+// close to echo back.
+inline bool ws_valid_close_code(std::uint16_t code) {
+    if (code >= 3000 && code <= 4999) return true;
+    switch (code) {
+        case 1000:
+        case 1001:
+        case 1002:
+        case 1003:
+        case 1007:
+        case 1008:
+        case 1009:
+        case 1010:
+        case 1011:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Incremental UTF-8 validator (RFC 3629), for text messages.
+//
+// Validation cannot wait for the reassembled message: RFC 6455 §8.1 makes an
+// invalid octet a failure the moment it arrives, and a codepoint may straddle a
+// fragment boundary — so the state of a half-read sequence has to survive from
+// one frame to the next. Hence a feed()/complete() pair rather than a function
+// over a finished string.
+//
+// The byte ranges are the ones that reject every non-shortest form, the
+// surrogate range U+D800-DFFF and codepoints past U+10FFFF, which a plain
+// "count the continuation bytes" check would let through.
+class Utf8Validator {
+  public:
+    // Feeds octets; false the moment the stream stops being valid UTF-8.
+    bool feed(std::string_view bytes) {
+        for (char ch : bytes) {
+            const auto b = static_cast<unsigned char>(ch);
+            if (m_need == 0) {
+                if (b < 0x80) continue;  // ASCII
+                if (b >= 0xC2 && b <= 0xDF) {
+                    start(1, 0x80, 0xBF);
+                } else if (b == 0xE0) {
+                    start(2, 0xA0, 0xBF);  // excludes overlong
+                } else if (b >= 0xE1 && b <= 0xEC) {
+                    start(2, 0x80, 0xBF);
+                } else if (b == 0xED) {
+                    start(2, 0x80, 0x9F);  // excludes U+D800-DFFF
+                } else if (b >= 0xEE && b <= 0xEF) {
+                    start(2, 0x80, 0xBF);
+                } else if (b == 0xF0) {
+                    start(3, 0x90, 0xBF);  // excludes overlong
+                } else if (b >= 0xF1 && b <= 0xF3) {
+                    start(3, 0x80, 0xBF);
+                } else if (b == 0xF4) {
+                    start(3, 0x80, 0x8F);  // excludes past U+10FFFF
+                } else {
+                    return false;  // 0x80-0xC1 (stray continuation/overlong), 0xF5-0xFF
+                }
+                continue;
+            }
+            if (b < m_lower || b > m_upper) return false;
+            m_lower = 0x80;  // later continuation octets take the ordinary range
+            m_upper = 0xBF;
+            --m_need;
+        }
+        return true;
+    }
+
+    // Whether the stream stopped on a codepoint boundary: false when a sequence
+    // was left half-read, which is how a truncated final character is caught.
+    bool complete() const { return m_need == 0; }
+
+  private:
+    void start(int need, unsigned char lower, unsigned char upper) {
+        m_need = need;
+        m_lower = lower;
+        m_upper = upper;
+    }
+
+    int m_need = 0;
+    unsigned char m_lower = 0x80;
+    unsigned char m_upper = 0xBF;
+};
 
 // The payload of a Close frame: an optional status code as a 2-byte prefix.
 inline std::string ws_close_payload(std::uint16_t code = 1000) {

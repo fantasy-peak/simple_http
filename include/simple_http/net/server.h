@@ -84,6 +84,12 @@ struct ServerConfig {
     // which hurts both latency and throughput on request/response workloads.
     // Set to false to keep Nagle enabled.
     bool tcp_nodelay{true};
+    // Which protocols a plaintext listener serves. A TLS listener negotiates this
+    // with ALPN and ignores it. The default sniffs, which serves both — but
+    // sniffing cannot tell a malformed HTTP/2 opening from an HTTP/1.x request,
+    // so one of the two readings is always wrong. Declare a single protocol when
+    // a peer has to be answered in that protocol's terms.
+    PlaintextProtocols plaintext_protocols{PlaintextProtocols::Both};
     // All protocol-engine tunables (timeouts, size caps, HTTP/2 windows/streams).
     EngineLimits limits{};
     // Policy for the client that reverse-proxy routes (`http_proxy*`) use: TLS
@@ -565,7 +571,9 @@ class Server {
             } else {
                 auto sock_ptr = std::make_shared<Socket>(std::move(socket));
                 auto transport = std::make_shared<TcpTransport<Socket>>(std::move(sock_ptr), peer);
-                asio::co_spawn(ctx, serve_plaintext(transport, dispatch, ws_lookup, m_config.limits, ws_proxy_lookup),
+                asio::co_spawn(ctx,
+                               serve_plaintext(transport, dispatch, ws_lookup, m_config.limits, ws_proxy_lookup,
+                                               m_config.plaintext_protocols),
                                asio::detached);
             }
         }

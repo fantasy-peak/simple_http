@@ -93,6 +93,19 @@ void register_routes(ServerT& server) {
         co_await res->status(200).send(*body);
     });
 
+    // Root: the same echo. Protocol-conformance suites target "/" and cannot be
+    // pointed elsewhere, so this is not a duplicate of /echo but the path they
+    // actually need — h1spec sends every case to it and checks the body comes
+    // back verbatim under any method.
+    server.route("/", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
+        auto body = co_await req->body().read_all();
+        if (!body) {
+            co_await res->status(400).send("read error");
+            co_return;
+        }
+        co_await res->status(200).send(*body);
+    });
+
     // A simple one-shot handler.
     server.route("/sync", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
         co_await res->status(200).content_type("text/plain").send("simple one-shot reply");
@@ -271,6 +284,19 @@ void register_routes(ServerT& server) {
         co_return;
     });
 
+    // Plain echo, for protocol-conformance suites (Autobahn's fuzzingclient).
+    // It must return exactly what it was sent — same text/binary type, no prefix,
+    // no server-initiated frames — or every case reads the extra traffic as a
+    // protocol error. /chat above is the demo, this is the test surface.
+    server.ws_route("/echo", [](std::shared_ptr<Request>, std::shared_ptr<WebSocket> ws) -> asio::awaitable<void> {
+        for (;;) {
+            auto msg = co_await ws->read();
+            if (!msg) break;
+            if (auto ec = co_await ws->write(msg->data, msg->text)) break;
+        }
+        co_return;
+    });
+
     // Byte-level WebSocket reverse proxy: an Upgrade: websocket on /wsproxy is
     // spliced verbatim to the backend below. Frames, fragmentation, masking and
     // control frames all pass through untouched (no re-framing, no size cap).
@@ -321,8 +347,27 @@ int main() {
     Server tls{tls_cfg};
     register_routes(tls);
 
-    bool ok = plain.start() && tls.start();
-    std::println("servers started: plaintext :7788, tls :7789 (ok={})", ok);
+    // Single-protocol plaintext listeners, for the conformance suites. Each one
+    // declares what it speaks instead of sniffing, because on the sniffing port
+    // above a malformed HTTP/2 opening and an HTTP/1.x request line are the same
+    // bytes: h2spec's "invalid connection preface" wants a GOAWAY, h1spec's
+    // "invalid prefix of request" wants a 400, and sniffing can only pick one.
+    ServerConfig h2c_cfg;
+    h2c_cfg.listen = InetAddress{"0.0.0.0", 7790, false};
+    h2c_cfg.worker_threads = 4;
+    h2c_cfg.plaintext_protocols = PlaintextProtocols::Http2;
+    Server h2c{h2c_cfg};
+    register_routes(h2c);
+
+    ServerConfig h1_cfg;
+    h1_cfg.listen = InetAddress{"0.0.0.0", 7791, false};
+    h1_cfg.worker_threads = 4;
+    h1_cfg.plaintext_protocols = PlaintextProtocols::Http1;
+    Server h1{h1_cfg};
+    register_routes(h1);
+
+    bool ok = plain.start() && tls.start() && h2c.start() && h1.start();
+    std::println("servers started: plaintext :7788 (sniffing), tls :7789, h2c-only :7790, h1-only :7791 (ok={})", ok);
 
     for (;;) {
         std::this_thread::sleep_for(std::chrono::seconds(60));

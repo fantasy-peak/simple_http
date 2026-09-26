@@ -66,6 +66,11 @@ class Http2Engine;
 
 // Default HTTP/2 flow-control window (RFC 7540 §6.9.2): 65,535 octets.
 inline constexpr std::int32_t kH2InitialWindow = 65535;
+
+// The largest flow-control window either endpoint may hold (RFC 9113 §6.9.1).
+// Exceeding it is a FLOW_CONTROL_ERROR, and it is also the bound that keeps the
+// signed window arithmetic from wrapping.
+inline constexpr std::int64_t kH2MaxWindow = 2147483647;  // 2^31 - 1
 // Protocol default max frame size (RFC 7540 §6.5.2): the value a peer uses
 // until it announces its own SETTINGS_MAX_FRAME_SIZE.
 inline constexpr std::size_t kH2MaxFrameSize = 16384;
@@ -467,9 +472,23 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
                 (static_cast<unsigned char>(payload[i]) << 8) | static_cast<unsigned char>(payload[i + 1]));
             std::uint32_t value = codec::read_u32(payload, i + 2);
             if (id == codec::H2_SETTINGS_INITIAL_WINDOW_SIZE) {
+                // §6.5.2: a window larger than 2^31-1 is a FLOW_CONTROL_ERROR, not
+                // a value to be stored.
+                if (value > static_cast<std::uint32_t>(kH2MaxWindow)) {
+                    go_away(codec::H2_FLOW_CONTROL_ERROR);
+                    return;
+                }
                 std::int64_t delta = static_cast<std::int64_t>(value) - m_peer_initial_window;
                 m_peer_initial_window = static_cast<std::int32_t>(value);
                 for (auto& [sid, st] : m_streams) st.send_window += delta;
+            } else if (id == codec::H2_SETTINGS_ENABLE_PUSH) {
+                // §6.5.2: ENABLE_PUSH is a boolean. This endpoint never pushes, so
+                // the value is not acted on — but a peer sending anything but 0 or
+                // 1 is malformed and must be sent away.
+                if (value > 1u) {
+                    go_away(codec::H2_PROTOCOL_ERROR);
+                    return;
+                }
             } else if (id == codec::H2_SETTINGS_MAX_FRAME_SIZE) {
                 // RFC 7540 §6.5.2: the value must lie in [2^14, 2^24-1]; anything
                 // else is a connection error. Accepting 0 here (reachable from a
@@ -699,7 +718,19 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
     }
 
     bool handle_frame(const codec::H2FrameHeader& hdr, std::string_view payload) {
-        switch (static_cast<codec::H2FrameType>(hdr.type)) {
+        const auto type = static_cast<codec::H2FrameType>(hdr.type);
+
+        // RFC 9113 §6.10: between a HEADERS without END_HEADERS and its closing
+        // CONTINUATION, nothing may be interleaved on that stream. Only the frame
+        // *type* is judged here; on_continuation() checks the stream it names.
+        if (m_continuation_stream != 0 && type != codec::H2FrameType::Continuation) {
+            SIMPLE_HTTP_ERROR_LOG("h2: frame type {} interleaved in a header block (stream={})", hdr.type,
+                                  m_continuation_stream);
+            go_away(codec::H2_PROTOCOL_ERROR);
+            return false;
+        }
+
+        switch (type) {
             case codec::H2FrameType::Headers:
                 return on_headers(hdr, payload);
             case codec::H2FrameType::Continuation:
@@ -711,17 +742,49 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
             case codec::H2FrameType::WindowUpdate:
                 return on_window_update(hdr, payload);
             case codec::H2FrameType::RstStream:
-                on_rst_stream(hdr);
-                return true;
+                return on_rst_stream(hdr);
             case codec::H2FrameType::Ping:
                 return on_ping(hdr, payload);
             case codec::H2FrameType::Goaway:
+                // §6.8: the stream identifier of a GOAWAY is reserved and must
+                // be zero.
+                if (hdr.stream_id != 0) {
+                    go_away(codec::H2_PROTOCOL_ERROR);
+                    return false;
+                }
                 return true;  // peer is going away; let the read EOF close us
             case codec::H2FrameType::Priority:
+                return on_priority(hdr, payload);
             case codec::H2FrameType::PushPromise:
+                // §8.2: only clients receive pushes. A server that is sent one is
+                // talking to a peer that has the direction wrong.
+                go_away(codec::H2_PROTOCOL_ERROR);
+                return false;
             default:
-                return true;  // ignored / not applicable to a server receive path
+                // §5.5: unknown frame types must be ignored. This branch now
+                // means exactly that, and nothing else.
+                return true;
         }
+    }
+
+    // RFC 9113 §6.3: the priority scheme is advisory, so the frame may be
+    // ignored outright — but its framing is still checked, and §5.3.1 makes a
+    // stream that depends on itself a stream error.
+    bool on_priority(const codec::H2FrameHeader& hdr, std::string_view payload) {
+        if (hdr.stream_id == 0) {
+            go_away(codec::H2_PROTOCOL_ERROR);
+            return false;
+        }
+        if (hdr.length != 5) {
+            go_away(codec::H2_FRAME_SIZE_ERROR);
+            return false;
+        }
+        const std::uint32_t dependency = codec::read_u32(payload, 0) & 0x7FFFFFFFu;
+        if (dependency == hdr.stream_id) {
+            reset_stream(hdr.stream_id, codec::H2_PROTOCOL_ERROR);
+            return true;
+        }
+        return true;  // nothing to reorder: this engine sends one stream at a time
     }
 
     // Strips optional padding (RFC 7540 §6.1/§6.2) from a DATA/HEADERS payload,
@@ -760,6 +823,16 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
         std::string_view block = strip_padding(payload, hdr.has_flag(codec::H2_FLAG_PADDED),
                                                hdr.has_flag(codec::H2_FLAG_PRIORITY), ok);
         if (!ok) { go_away(codec::H2_PROTOCOL_ERROR); return false; }
+
+        // §5.3.1: a stream cannot depend on itself. The priority prefix was just
+        // skipped over, so the dependency it held is re-read here for the check.
+        if (hdr.has_flag(codec::H2_FLAG_PRIORITY)) {
+            const std::size_t off = hdr.has_flag(codec::H2_FLAG_PADDED) ? 1 : 0;
+            if ((codec::read_u32(payload, off) & 0x7FFFFFFFu) == hdr.stream_id) {
+                reset_stream(hdr.stream_id, codec::H2_PROTOCOL_ERROR);
+                return true;
+            }
+        }
 
         // Refuse streams beyond the concurrency limit we advertise (RFC 9113 §5.1.2):
         // each accepted stream allocates a Request (with its Body channel), a
@@ -1052,6 +1125,13 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
         auto it = m_streams.find(hdr.stream_id);
         if (it != m_streams.end()) {
             Stream& st = it->second;
+            // §5.1: once the peer has ended its side of the stream it may send no
+            // more DATA. Checked ahead of the flow-control accounting so the
+            // outcome follows the stream state rather than the window.
+            if (st.half_closed_remote) {
+                reset_stream(hdr.stream_id, codec::H2_STREAM_CLOSED);
+                return true;
+            }
             st.recv_window -= frame_len;
             if (st.recv_window < 0) {
                 // Stream-level overrun: reset just this stream, keep the connection.
@@ -1113,16 +1193,40 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
                 maybe_complete_stream(hdr.stream_id);
             }
         } else {
-            // DATA on an unknown/closed stream still counted against the
-            // connection window; give that credit straight back.
+            // DATA on a stream we do not hold still counted against the connection
+            // window; give that credit straight back.
             replenish_conn(frame_len);
+            // §5.1: a stream the peer never opened is idle, and DATA there is a
+            // connection error; on a stream that has already closed it is a stream
+            // error instead. Which one it is, is what m_next_peer_stream_id says.
+            if (hdr.stream_id > m_next_peer_stream_id) {
+                go_away(codec::H2_PROTOCOL_ERROR);
+                return false;
+            }
+            reset_stream(hdr.stream_id, codec::H2_STREAM_CLOSED);
         }
         return true;
     }
 
     bool on_settings(const codec::H2FrameHeader& hdr, std::string_view payload) {
-        if (hdr.has_flag(codec::H2_FLAG_ACK)) return true;  // our SETTINGS was acked
-        if (payload.size() % 6 != 0) { go_away(codec::H2_FRAME_SIZE_ERROR); return false; }
+        // §6.5: SETTINGS applies to the connection, so its stream id must be 0.
+        if (hdr.stream_id != 0) {
+            go_away(codec::H2_PROTOCOL_ERROR);
+            return false;
+        }
+        if (hdr.has_flag(codec::H2_FLAG_ACK)) {
+            // §6.5: an ACK is a bare acknowledgement, so any payload is a
+            // FRAME_SIZE_ERROR — not a settings block to be applied.
+            if (!payload.empty()) {
+                go_away(codec::H2_FRAME_SIZE_ERROR);
+                return false;
+            }
+            return true;  // our SETTINGS was acked
+        }
+        if (payload.size() % 6 != 0) {
+            go_away(codec::H2_FRAME_SIZE_ERROR);
+            return false;
+        }
         apply_settings_payload(payload);
         if (m_goaway_sent) return false;  // a rejected setting sent us away: no ACK
         append_frame(codec::H2FrameType::Settings, codec::H2_FLAG_ACK, 0, {});  // ACK
@@ -1130,27 +1234,72 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
     }
 
     bool on_window_update(const codec::H2FrameHeader& hdr, std::string_view payload) {
-        if (payload.size() != 4) { go_away(codec::H2_FRAME_SIZE_ERROR); return false; }
-        std::uint32_t increment = codec::read_u32(payload, 0) & 0x7FFFFFFF;
+        if (payload.size() != 4) {
+            go_away(codec::H2_FRAME_SIZE_ERROR);
+            return false;
+        }
+        const std::uint32_t increment = codec::read_u32(payload, 0) & 0x7FFFFFFFu;
+        // §6.9: a zero increment is a PROTOCOL_ERROR — a connection error on
+        // stream 0, a stream error anywhere else.
         if (increment == 0) {
-            if (hdr.stream_id != 0) reset_stream(hdr.stream_id, codec::H2_PROTOCOL_ERROR);
+            if (hdr.stream_id == 0) {
+                go_away(codec::H2_PROTOCOL_ERROR);
+                return false;
+            }
+            reset_stream(hdr.stream_id, codec::H2_PROTOCOL_ERROR);
             return true;
         }
         if (hdr.stream_id == 0) {
             m_conn_send_window += increment;
-        } else {
-            auto it = m_streams.find(hdr.stream_id);
-            if (it != m_streams.end()) it->second.send_window += increment;
+            // §6.9.1: a window may not exceed 2^31-1.
+            if (m_conn_send_window > kH2MaxWindow) {
+                go_away(codec::H2_FLOW_CONTROL_ERROR);
+                return false;
+            }
+            return true;
+        }
+        auto it = m_streams.find(hdr.stream_id);
+        if (it == m_streams.end()) {
+            // §5.1: WINDOW_UPDATE on a stream that was never opened is a
+            // connection error, and on a closed one it is ignored.
+            if (hdr.stream_id > m_next_peer_stream_id) {
+                go_away(codec::H2_PROTOCOL_ERROR);
+                return false;
+            }
+            return true;
+        }
+        it->second.send_window += increment;
+        if (it->second.send_window > kH2MaxWindow) {
+            reset_stream(hdr.stream_id, codec::H2_FLOW_CONTROL_ERROR);
+            return true;
         }
         return true;
     }
 
-    void on_rst_stream(const codec::H2FrameHeader& hdr) {
-        auto it = m_streams.find(hdr.stream_id);
-        if (it != m_streams.end()) {
-            (void)it->second.request->body().fail(make_error_code(asio::error::connection_reset));
-            erase_stream(hdr.stream_id);
+    bool on_rst_stream(const codec::H2FrameHeader& hdr) {
+        // §6.4: an RST_STREAM carries a 4-octet error code, on a non-zero stream.
+        if (hdr.length != 4) {
+            go_away(codec::H2_FRAME_SIZE_ERROR);
+            return false;
         }
+        if (hdr.stream_id == 0) {
+            go_away(codec::H2_PROTOCOL_ERROR);
+            return false;
+        }
+        auto it = m_streams.find(hdr.stream_id);
+        if (it == m_streams.end()) {
+            // §5.1: on a stream the peer never opened this is a connection error;
+            // on one that has already closed it is ignored — the peer may have
+            // sent it before it saw our own end of the stream.
+            if (hdr.stream_id > m_next_peer_stream_id) {
+                go_away(codec::H2_PROTOCOL_ERROR);
+                return false;
+            }
+            return true;
+        }
+        (void)it->second.request->body().fail(make_error_code(asio::error::connection_reset));
+        erase_stream(hdr.stream_id);
+        return true;
     }
 
     // Removes a stream from the table, first returning any connection-level flow
@@ -1169,8 +1318,16 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
     }
 
     bool on_ping(const codec::H2FrameHeader& hdr, std::string_view payload) {
+        // §6.7: a PING is 8 octets, and applies to the connection.
+        if (hdr.stream_id != 0) {
+            go_away(codec::H2_PROTOCOL_ERROR);
+            return false;
+        }
+        if (payload.size() != 8) {
+            go_away(codec::H2_FRAME_SIZE_ERROR);
+            return false;
+        }
         if (hdr.has_flag(codec::H2_FLAG_ACK)) return true;
-        if (payload.size() != 8) { go_away(codec::H2_FRAME_SIZE_ERROR); return false; }
         append_frame(codec::H2FrameType::Ping, codec::H2_FLAG_ACK, 0, payload);  // echo
         return true;
     }

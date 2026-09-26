@@ -44,6 +44,14 @@ class Headers {
 
     bool contains(std::string_view name) const { return get(name).has_value(); }
 
+    // How many fields carry `name` (case-insensitively). The request side needs
+    // this for Host, where the rule is "exactly one" (RFC 9112 §3.2) and not "at
+    // least one" — a second copy is a smuggling vector, not a repeatable field.
+    std::size_t count(std::string_view name) const {
+        return static_cast<std::size_t>(std::count_if(
+            m_fields.begin(), m_fields.end(), [&](const value_type& f) { return iequals_ascii(f.first, name); }));
+    }
+
     // Removes every field matching `name` (case-insensitively), returning true
     // if anything was removed. All matches go, not just the first: a duplicate
     // Content-Length is a request-smuggling vector on the request side and

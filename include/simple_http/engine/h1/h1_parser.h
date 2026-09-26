@@ -52,6 +52,48 @@ inline std::string_view next_line(std::string_view block, std::size_t& pos) {
 // Why a header line was rejected (the callers report it differently).
 enum class FieldLine { Ok, Malformed, NameTooLong };
 
+// Whether `c` may appear in a field name: RFC 9110 §5.6.2's tchar. Anything else
+// — a bracket, a space, a bare CR left behind by a line that did not end in CRLF
+// — makes the line malformed rather than something to fold into the name.
+inline bool is_tchar(unsigned char c) {
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
+        return true;
+    }
+    switch (c) {
+        case '!':
+        case '#':
+        case '$':
+        case '%':
+        case '&':
+        case '\'':
+        case '*':
+        case '+':
+        case '-':
+        case '.':
+        case '^':
+        case '_':
+        case '`':
+        case '|':
+        case '~':
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Whether a field value carries a byte it may not (RFC 9110 §5.5): a control
+// character other than HTAB, or DEL. obs-text (0x80-0xFF) stays legal. Letting
+// one through would put it into whatever the handler or the reverse proxy builds
+// downstream, where it means something the sender never said.
+inline bool has_forbidden_field_value_byte(std::string_view value) {
+    for (char ch : value) {
+        const auto c = static_cast<unsigned char>(ch);
+        if (c == '\t') continue;
+        if (c < 0x20 || c == 0x7F) return true;
+    }
+    return false;
+}
+
 // Parses one "name: value" field line into `out`: split on the first ':', skip
 // leading whitespace in the value, trim trailing OWS, lowercase the name (done
 // by Headers::add).
@@ -61,6 +103,11 @@ inline FieldLine parse_field_line(std::string_view line, Headers& out) {
         return FieldLine::Malformed;
     }
     std::string_view key = line.substr(0, colon);
+    for (char ch : key) {
+        if (!is_tchar(static_cast<unsigned char>(ch))) {
+            return FieldLine::Malformed;
+        }
+    }
     std::size_t vstart = colon + 1;
     while (vstart < line.size() && (line[vstart] == ' ' || line[vstart] == '\t')) {
         ++vstart;
@@ -74,6 +121,9 @@ inline FieldLine parse_field_line(std::string_view line, Headers& out) {
 
     if (key.size() > 200) {  // sanity bound on field-name length
         return FieldLine::NameTooLong;
+    }
+    if (has_forbidden_field_value_byte(value)) {
+        return FieldLine::Malformed;
     }
     out.add(std::string{key}, std::string{value});
     return FieldLine::Ok;
@@ -200,6 +250,11 @@ class H1Parser {
         } else if (version == "HTTP/1.0") {
             m_head.version = Version::Http1;
         } else {
+            // A version this server does not speak, or no version at all — both are
+            // malformed request lines and a 400 says so. A listener that serves
+            // HTTP/2 only never reaches here: it does not sniff, so its peer's
+            // octets are judged as an HTTP/2 preface instead (see
+            // PlaintextProtocols in net/connection.h).
             m_error = 40005;
             return false;
         }

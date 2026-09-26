@@ -370,9 +370,9 @@ TEST_CASE("regression/h1: malformed request heads are rejected with 400", "[regr
     asio::io_context ctx;
 
     const std::array<std::pair<std::string_view, const char*>, 4> cases = {{
-        {"GET/ HTTP/1.1\r\n\r\n", "no space after the method"},
+        {"GET/ HTTP/1.1\r\nHost: x\r\n\r\n", "no space after the method"},
         {"GET / HTTP/2.0\r\n\r\n", "an unknown version"},
-        {"GET / HTTP/1.1\r\nBroken\r\n\r\n", "a header line without a colon"},
+        {"GET / HTTP/1.1\r\nHost: x\r\nBroken\r\n\r\n", "a header line without a colon"},
         {"GET / HTTP/1.1\r\nHost: x\r\n folded\r\n\r\n", "an obs-fold continuation"},
     }};
 
@@ -396,7 +396,7 @@ TEST_CASE("regression/h1: an oversized head is refused with 431", "[regression][
 
     // The limit is enforced while the head is still incomplete, so the padding
     // is sent without its terminating blank line.
-    std::string request = "GET / HTTP/1.1\r\n";
+    std::string request = "GET / HTTP/1.1\r\nHost: x\r\n";
     while (request.size() < kMaxHeaderBytes + 512) {
         request += "x-padding-header: " + std::string(200, 'p') + "\r\n";
     }
@@ -413,7 +413,7 @@ TEST_CASE("regression/h1: a body larger than the cap is refused with 413", "[reg
     RawClient client{ctx};
     REQUIRE(client.connect(kPlainPort));
 
-    client.send("POST /echo HTTP/1.1\r\ncontent-length: " + std::to_string(kMaxBodyBytes + 1) + "\r\n\r\n");
+    client.send("POST /echo HTTP/1.1\r\nHost: x\r\ncontent-length: " + std::to_string(kMaxBodyBytes + 1) + "\r\n\r\n");
     REQUIRE(client.wait_head());
     CHECK(status_of(client.received()) == 413);
     client.close();
@@ -429,7 +429,7 @@ TEST_CASE("regression/h1: Content-Length with Transfer-Encoding frames as chunke
     // Content-Length must not be believed — otherwise a smuggled message slips
     // past a front-end that framed it differently).
     client.send(
-        "POST /echo HTTP/1.1\r\ncontent-length: 5\r\ntransfer-encoding: chunked\r\n\r\n"
+        "POST /echo HTTP/1.1\r\nHost: x\r\ncontent-length: 5\r\ntransfer-encoding: chunked\r\n\r\n"
         "4\r\nabcd\r\n0\r\n\r\n");
     REQUIRE(client.wait_for("len="));
     CHECK(status_of(client.received()) == 200);
@@ -445,7 +445,7 @@ TEST_CASE("regression/h1: a malformed chunk size is answered then dropped", "[re
 
     // The handler is dispatched as soon as the head is parsed, so it answers
     // 200; the broken body then ends the connection instead of hanging.
-    client.send("POST /echo HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\nzz\r\nbody\r\n0\r\n\r\n");
+    client.send("POST /echo HTTP/1.1\r\nHost: x\r\ntransfer-encoding: chunked\r\n\r\nzz\r\nbody\r\n0\r\n\r\n");
     REQUIRE(client.wait_head());
     CHECK(client.wait_eof());
     client.close();
@@ -458,7 +458,7 @@ TEST_CASE("regression/h1: chunked trailers are consumed", "[regression][h1]") {
     REQUIRE(client.connect(kPlainPort));
 
     client.send(
-        "POST /echo HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\n"
+        "POST /echo HTTP/1.1\r\nHost: x\r\ntransfer-encoding: chunked\r\n\r\n"
         "3\r\nabc\r\n0\r\nx-trailer: yes\r\n\r\n");
     REQUIRE(client.wait_for("len="));
     CHECK(body_of(client.received()) == "len=3:abc");
@@ -472,8 +472,8 @@ TEST_CASE("regression/h1: pipelined requests are answered in order", "[regressio
     REQUIRE(client.connect(kPlainPort));
 
     client.send(
-        "GET /echo HTTP/1.1\r\ncontent-length: 1\r\n\r\nA"  // a body exercies the pipelining boundary
-        "GET /world HTTP/1.1\r\n\r\n");
+        "GET /echo HTTP/1.1\r\nHost: x\r\ncontent-length: 1\r\n\r\nA"  // a body exercies the pipelining boundary
+        "GET /world HTTP/1.1\r\nHost: x\r\n\r\n");
     REQUIRE(client.pump_until(
         [&] {
             const auto& r = client.received();
@@ -492,23 +492,23 @@ TEST_CASE("regression/h1: HEAD and 204 carry no body", "[regression][h1]") {
     {
         RawClient client{ctx};
         REQUIRE(client.connect(kPlainPort));
-        client.send("HEAD /big HTTP/1.1\r\n\r\n");
+        client.send("HEAD /big HTTP/1.1\r\nHost: x\r\n\r\n");
         REQUIRE(client.wait_head());
         CHECK(status_of(client.received()) == 200);
         CHECK(head_has(client.received(), "content-length: 9000"));  // what a GET would produce…
         CHECK(body_of(client.received()).empty());                   // …but no body follows the head
-        client.send("GET /world HTTP/1.1\r\n\r\n");                  // and the connection stays usable
+        client.send("GET /world HTTP/1.1\r\nHost: x\r\n\r\n");                  // and the connection stays usable
         REQUIRE(client.wait_for("hello"));
         client.close();
     }
     {
         RawClient client{ctx};
         REQUIRE(client.connect(kPlainPort));
-        client.send("GET /empty HTTP/1.1\r\n\r\n");
+        client.send("GET /empty HTTP/1.1\r\nHost: x\r\n\r\n");
         REQUIRE(client.wait_head());
         CHECK(status_of(client.received()) == 204);
         CHECK(body_of(client.received()).empty());
-        client.send("GET /world HTTP/1.1\r\n\r\n");
+        client.send("GET /world HTTP/1.1\r\nHost: x\r\n\r\n");
         REQUIRE(client.wait_for("hello"));
         client.close();
     }
@@ -520,7 +520,7 @@ TEST_CASE("regression/h1: Connection: close is honoured", "[regression][h1]") {
     RawClient client{ctx};
     REQUIRE(client.connect(kPlainPort));
 
-    client.send("GET /world HTTP/1.1\r\nconnection: close\r\n\r\n");
+    client.send("GET /world HTTP/1.1\r\nHost: x\r\nconnection: close\r\n\r\n");
     REQUIRE(client.wait_for("hello"));
     CHECK(head_has(client.received(), "connection: close"));
     CHECK(client.wait_eof());
@@ -533,7 +533,7 @@ TEST_CASE("regression/h1: an idle connection is closed by the watchdog", "[regre
     RawClient client{ctx};
     REQUIRE(client.connect(kPlainPort));
 
-    client.send("GET /world HTTP/1.1\r\n\r\n");
+    client.send("GET /world HTTP/1.1\r\nHost: x\r\n\r\n");
     REQUIRE(client.wait_for("hello"));
     // limits.idle_timeout is 2s in this suite: a silent connection must be reaped.
     CHECK(client.wait_eof(std::chrono::seconds(6)));
@@ -548,7 +548,7 @@ TEST_CASE("regression/h1: Expect: 100-continue is not answered by default", "[re
 
     // The engine does not send 100 Continue on its own (a handler may, via
     // send_continue()). A client that sends the body anyway must be served.
-    client.send("POST /echo HTTP/1.1\r\nexpect: 100-continue\r\ncontent-length: 2\r\n\r\n");
+    client.send("POST /echo HTTP/1.1\r\nHost: x\r\nexpect: 100-continue\r\ncontent-length: 2\r\n\r\n");
     client.pump(std::chrono::milliseconds(100));
     CHECK(client.received().find("100 Continue") == std::string::npos);
 
@@ -924,7 +924,7 @@ TEST_CASE("regression/tls: mutual TLS requires a client certificate", "[regressi
     // TLS 1.3 lets the client finish its side before the peer's verdict arrives, so
     // the rejection surfaces on the first application I/O (an alert, or a close).
     if (!ec) {
-        std::string probe = "GET /world HTTP/1.1\r\n\r\n";
+        std::string probe = "GET /world HTTP/1.1\r\nHost: x\r\n\r\n";
         stream->async_write_some(asio::buffer(probe),
                                  [&](const sh::error_code& write_ec, std::size_t) { ec = write_ec; });
         ctx.restart();

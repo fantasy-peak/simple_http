@@ -154,11 +154,28 @@ inline bool HpackDecoder::decode_string(std::string_view block, std::size_t& pos
         return false;
     }
     if (huffman) {
+        const std::size_t decoded_at = out.size();
         unsigned char state = 0;
         if (http_huffman_decode(&state, reinterpret_cast<unsigned char*>(const_cast<char*>(block.data() + pos)),
                                 static_cast<std::size_t>(len), out, 1) != HUFFMAN_OK) {
             m_error = 40144;
             return false;
+        }
+        // RFC 7541 §5.2: the trailing padding must be under 8 bits and must be a
+        // prefix of the EOS code (30 ones). The decoder's end-state check rejects
+        // a tail that is no EOS prefix at all, but not padding made of ones that
+        // is merely too long — eight ones are still a valid EOS prefix. Re-encoding
+        // settles it: a conforming encoder emits the shortest form, so anything
+        // longer cannot round-trip. Over-long padding always leaves the final
+        // octet 0xff, and that is what keeps this off the common path.
+        if (len > 0 && static_cast<unsigned char>(block[pos + len - 1]) == 0xff) {
+            std::string reencoded;
+            http_huffman_encode(reinterpret_cast<unsigned char*>(out.data() + decoded_at),
+                                static_cast<unsigned int>(out.size() - decoded_at), reencoded);
+            if (reencoded.size() != len || !std::equal(reencoded.begin(), reencoded.end(), block.begin() + pos)) {
+                m_error = 40145;
+                return false;
+            }
         }
     } else {
         out.append(block.data() + pos, static_cast<std::size_t>(len));
@@ -217,6 +234,9 @@ inline void HpackDecoder::evict_to_fit() {
 inline bool HpackDecoder::decode(std::string_view block, std::vector<HpackHeader>& out) {
     m_error = 0;
     std::size_t pos = 0;
+    // Whether any field representation has been decoded yet. Only a dynamic
+    // table size update that opens the block is legal (RFC 7541 §4.2).
+    bool seen_field = false;
     while (pos < block.size()) {
         unsigned char c = static_cast<unsigned char>(block[pos]);
 
@@ -231,6 +251,7 @@ inline bool HpackDecoder::decode(std::string_view block, std::vector<HpackHeader
                 return false;
             }
             out.push_back({std::move(name), std::move(value)});
+            seen_field = true;
         } else if (c & 0x40) {
             // 6.2.1 Literal Header Field with Incremental Indexing: 01xxxxxx
             pos += 1;
@@ -249,11 +270,18 @@ inline bool HpackDecoder::decode(std::string_view block, std::vector<HpackHeader
             if (!decode_string(block, pos, value)) return false;
             out.push_back({name, value});
             dynamic_insert(std::move(name), std::move(value));
+            seen_field = true;
         } else if (c & 0x20) {
             // 6.3 Dynamic Table Size Update: 001xxxxx. The encoder tells us how
             // much of the table it will use; anything above what we advertised
             // is a compression error (§4.2), and lowering it evicts entries
             // immediately (§4.3).
+            if (seen_field) {
+                // §4.2: the update must open the block. One that follows a field
+                // representation is a decoding error, not a resize applied late.
+                m_error = 40161;
+                return false;
+            }
             pos += 1;
             uint64_t size = 0;
             if (!decode_integer(block, pos, 5, size)) return false;
@@ -281,6 +309,7 @@ inline bool HpackDecoder::decode(std::string_view block, std::vector<HpackHeader
             }
             if (!decode_string(block, pos, value)) return false;
             out.push_back({std::move(name), std::move(value)});
+            seen_field = true;
         }
     }
     return true;
