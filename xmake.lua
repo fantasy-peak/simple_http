@@ -11,8 +11,17 @@ set_policy("package.requires_lock", true)
 set_policy("package.librarydeps.strict_compatibility", true)
 
 -- PACKAGES --
+-- HTTP/3 的 QUIC 与帧层来自 ngtcp2 + nghttp3（都是 C 库，只有 h3 路径用）。
+-- 上游 xmake-repo 的 ngtcp2 包是 `-DENABLE_OPENSSL=OFF` 构建的，不产 crypto
+-- helper——没有它就没有 TLS，QUIC 无从谈起。私有仓库里那份把它改成了
+-- `-DENABLE_OPENSSL=ON`（openssl3 >= 3.5 才有上游 CMake 探测的
+-- SSL_set_quic_tls_cbs，从而构建 libngtcp2_crypto_ossl），nghttp3 那份也在。
+-- 注意：这里不能用 /opt/h3/lib 的预编译库——那是对系统 OpenSSL 3.5.5 编的，
+-- 而本仓库用的是 openssl3 3.6.3，混链是 ABI 风险。让 xmake 从源码构建。
+add_repositories("my_private_repo https://github.com/fantasy-peak/xmake-repo.git")
 add_requires("boost", {configs = {asio=true, regex=true}})
-add_requires("openssl3", "ls-qpack")
+add_requires("openssl3")
+add_requires("ngtcp2", "nghttp3")
 add_requires("catch2")  -- unit tests only (target `unittest`)
 -- Response-body compression (core/content_encoding.h). Only the targets that
 -- define SIMPLE_HTTP_ENABLE_COMPRESSION link these; the library itself stays
@@ -25,7 +34,8 @@ target("simple_http")
     set_kind("static")
     add_includedirs("include", { public = true })
     add_packages(
-        "ls-qpack",
+        "ngtcp2",
+        "nghttp3",
         "boost",
         "openssl3",
         {public = true}

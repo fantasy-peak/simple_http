@@ -1,2100 +1,1020 @@
 #pragma once
 
-// A QUIC connection: packets in, packets out, streams and flow control in
-// between (RFC 9000).
+// One QUIC connection, owned by ngtcp2.
 //
-// Shape, and why:
+// What this file is *not* any more: a QUIC implementation. Packet parsing,
+// header protection, key derivation, ACK tracking, loss detection, PTO,
+// congestion control, stream state machines and flow control all live in
+// ngtcp2 now. What is left is the part a library cannot do for us — driving it
+// from asio, and deciding when to send, when to close, and who to tell.
 //
-//   * **Everything runs on one executor.** A connection is pinned to the
-//     io_context that owns its UDP socket, so there are no locks and no
-//     atomics. Datagrams arrive as direct calls rather than through a channel:
-//     handling one is entirely synchronous (the handshake is driven by
-//     `SSL_do_handshake`, which never blocks), so a queue would only add a copy
-//     and a hop.
-//   * **Two coroutines, raced.** `write_loop` builds datagrams and parks until
-//     something wants to send; `timer_loop` drives loss detection, PTO and the
-//     idle timeout. Racing them is the whole shutdown mechanism — the same
-//     idiom as the h2 engine's `serve_loops`.
-//   * **The connection knows nothing about HTTP.** It produces streams; what
-//     the bytes on them mean is the engine's business. `accept_stream` and
-//     `open_uni_stream` are the whole interface upward.
+// The shape of that driving:
 //
-// Three things here are easy to get wrong and are called out where they happen:
-// the amplification limit (§8.1) applies until the peer's address is validated;
-// header protection forces a two-pass parse (§17.2); and a coalesced datagram
-// has to be split before either pass, because header protection addresses "the
-// first octet of the packet" and only the first packet in a datagram has that
-// octet at offset zero.
+//   * One coroutine, `run()`, owns the connection's lifetime. It writes
+//     datagrams out, then parks until either a wake-up (a datagram arrived,
+//     crypto data is ready, an ACK freed the window) or ngtcp2's own timer
+//     expiry — whichever comes first.
+//
+//   * `on_datagram()` is called by the endpoint on this connection's executor,
+//     never concurrently. It hands the bytes to ngtcp2 and pokes the loop.
+//
+//   * The `Protocol` (the HTTP/3 engine) is pulled from, not pushed to: when
+//     ngtcp2 asks for a packet, this class asks the engine for the next slice
+//     of stream data. That inversion is nghttp3's design, and it is why the
+//     engine has no write loop of its own.
+//
+// Everything here runs on the connection's single-threaded executor
+// (concurrency model A), so there are no locks. The callbacks ngtcp2 invokes
+// are the exception to "no re-entrancy": they must not call back into ngtcp2,
+// must not throw, and must not block — see `protocol.h`.
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <deque>
 #include <functional>
-#include <map>
+#include <limits>
 #include <memory>
 #include <optional>
-#include <random>
-#include <set>
 #include <span>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
+#include <openssl/rand.h>
+
 #include <boost/asio.hpp>
 #include <boost/asio/experimental/awaitable_operators.hpp>
 #include <boost/asio/experimental/concurrent_channel.hpp>
+#include <ngtcp2/ngtcp2.h>
 
 #include "../core/logging.h"
 #include "../core/types.h"
-#include "ack.h"
-#include "congestion.h"
-#include "crypto.h"
-#include "frame.h"
-#include "packet.h"
-#include "quic_stream_transport.h"
-#include "recovery.h"
-#include "stream_state.h"
+#include "../transport/transport.h"  // SslHandle
+#include "ngtcp2_config.h"
+#include "ngtcp2_crypto.h"
+#include "protocol.h"
 #include "tls.h"
-#include "transport_params.h"
-#include "wire.h"
 
 namespace simple_http::quic {
 
 namespace asio = boost::asio;
 
-// The largest offset a stream can reach (RFC 9000 §4.5): 2^62 - 1.
-inline constexpr std::uint64_t kMaxStreamOffset = (1ULL << 62) - 1;
+// One datagram in flight, and where it goes. The connection hands these to the
+// endpoint, which owns the socket.
+using DatagramSink = std::function<void(std::span<const std::uint8_t>, const asio::ip::udp::endpoint&)>;
 
-// How many closed peer streams are accumulated before MAX_STREAMS advertises
-// them, unless the peer is (or is about to be) out of credit — see
-// QuicConnection::credit_stream_slot.
-inline constexpr std::uint64_t kStreamCreditBatch = 8;
-
-// The levels in the order packets are coalesced into a datagram.
-inline constexpr std::array<EncryptionLevel, 4> kAllLevels{EncryptionLevel::Initial, EncryptionLevel::ZeroRtt,
-                                                           EncryptionLevel::Handshake, EncryptionLevel::OneRtt};
-
-// Tunables for a connection, all advertised to the peer in transport
-// parameters except the purely local ones.
-struct QuicConnectionConfig {
-    std::uint64_t max_idle_timeout_ms{30000};
-    std::uint64_t max_udp_payload_size{1472};
-    std::uint64_t initial_max_data{1u << 20};
-    std::uint64_t initial_max_stream_data_bidi_local{256u << 10};
-    std::uint64_t initial_max_stream_data_bidi_remote{256u << 10};
-    std::uint64_t initial_max_stream_data_uni{256u << 10};
-    std::uint64_t initial_max_streams_bidi{100};
-    std::uint64_t initial_max_streams_uni{100};
-    std::uint64_t active_connection_id_limit{4};
-    std::uint64_t ack_delay_exponent{3};
-    std::uint64_t max_ack_delay_ms{25};
-
-    std::size_t connection_id_length{8};
-    // Bound on handshake data held in flight, both directions
-    // (CRYPTO_BUFFER_EXCEEDED).
-    std::size_t max_crypto_buffer{64 * 1024};
-    // A backstop behind MAX_STREAMS.
-    std::size_t max_streams{512};
-    bool disable_active_migration{false};
-    bool enable_0rtt{false};
+// What the endpoint learned from the client's first Initial, before a
+// connection existed to hold it.
+struct QuicBootstrap {
+    // The client's Source Connection ID, which becomes our Destination
+    // Connection ID: RFC 9000 §7.2 requires the server to send it back.
+    std::array<std::uint8_t, NGTCP2_MAX_CIDLEN> client_scid{};
+    std::size_t client_scid_len{0};
+    // The Destination Connection ID the client used. This is the
+    // original_destination_connection_id the server must echo in its transport
+    // parameters (§7.3), and it is what the client compares against to detect a
+    // forged first flight.
+    std::array<std::uint8_t, NGTCP2_MAX_CIDLEN> original_dcid{};
+    std::size_t original_dcid_len{0};
+    // True when this Initial came in answer to a Retry, in which case the
+    // client's DCID is the Retry's SCID and has to be echoed as
+    // retry_source_connection_id.
+    bool retried{false};
+    // The version the client chose (already validated against our list).
+    std::uint32_t version{0};
+    // The Retry token the client echoed back, if any, and ngtcp2's
+    // classification of it. Copied rather than referenced: ngtcp2 keeps reading
+    // the token while the connection is being set up, and the datagram it
+    // arrived in is gone by then.
+    std::vector<std::uint8_t> token{};
+    ngtcp2_token_type token_type{NGTCP2_TOKEN_TYPE_UNKNOWN};
 };
 
-// Where a connection's datagrams go: a lambda the endpoint supplies, writing to
-// the UDP socket the connection arrived on.
-using QuicDatagramSink = std::function<void(Bytes, const asio::ip::udp::endpoint&)>;
+// The largest datagram we will produce. QUIC's minimum MTU is 1200; 1500 covers
+// a stock Ethernet path without fragmentation, and ngtcp2 will not exceed the
+// peer's advertised limit or our own `max_udp_payload_size`.
+inline constexpr std::size_t kMaxDatagram = 1500;
+
+// How many packets the send loop will pack into one buffer before flushing.
+// One: this transport has no GSO (asio's udp socket has no sendmsg path), so
+// asking ngtcp2 to coalesce would only make it build a buffer we then have to
+// split ourselves.
+inline constexpr std::size_t kPacketsPerFlush = 1;
+
+// What `ngtcp2_conn_get_expiry2` returns when the connection has no timer armed.
+inline constexpr ngtcp2_tstamp kNoExpiry = std::numeric_limits<ngtcp2_tstamp>::max();
+
+// Bound on stream data held before the protocol engine exists. It can only be
+// filled by a client that sends application data in the same flight as its
+// handshake, so a generous cap is still far more than a well-behaved peer will
+// ever reach; past it the connection is closed rather than buffered.
+inline constexpr std::size_t kMaxPendingStreamBytes = 256 * 1024;
+
+// One STREAM event held until an engine can consume it.
+struct PendingStreamData {
+    std::uint32_t flags{0};
+    std::int64_t stream_id{-1};
+    std::vector<std::uint8_t> data{};
+};
 
 template <typename Executor>
-class QuicConnection : public std::enable_shared_from_this<QuicConnection<Executor>> {
+class QuicConnection : public std::enable_shared_from_this<QuicConnection<Executor>>,
+                       public ConnectionCryptoBase {
   public:
     using executor_type = Executor;
-    using StreamTransport = QuicStreamTransport<Executor>;
-    using Clock = std::chrono::steady_clock;
+    using Timer = asio::steady_timer;
+    using Channel = asio::experimental::concurrent_channel<void(error_code)>;
 
-    QuicConnection(Executor exec, SSL_CTX* ssl_ctx, QuicConnectionConfig config, std::string original_dcid,
-                   std::string peer_scid, QuicDatagramSink sink, asio::ip::udp::endpoint peer,
-                   std::function<std::string()> cid_factory, bool address_validated)
-        : m_executor(std::move(exec)), m_config(config), m_original_dcid(std::move(original_dcid)),
-          m_peer_scid(std::move(peer_scid)), m_sink(std::move(sink)), m_peer(std::move(peer)),
-          m_cid_factory(std::move(cid_factory)), m_recovery(kMaxDatagramSize) {
-        m_ssl_ctx = ssl_ctx;
-        m_local_scid = m_cid_factory ? m_cid_factory() : std::string(m_config.connection_id_length, '\0');
-        m_stream_notify =
-            std::make_shared<asio::experimental::concurrent_channel<void(error_code)>>(m_executor, 1);
-        m_send_notify =
-            std::make_shared<asio::experimental::concurrent_channel<void(error_code)>>(m_executor, 1);
-
-        // The Initial keys come from the *client's* destination connection ID
-        // with a fixed salt, not from TLS (RFC 9001 §5.2) — which is what makes
-        // the first flight readable before any secret exists.
-        auto [client_secret, server_secret] = initial_secrets(m_original_dcid);
-        m_initial_tx = derive_initial_keys(server_secret);
-        m_initial_rx = derive_initial_keys(client_secret);
-
-        m_recv_max_data = m_config.initial_max_data;
-        m_recv_data_start = m_config.initial_max_data;
-        m_local_max_streams_bidi = m_config.initial_max_streams_bidi;
-        m_local_max_streams_uni = m_config.initial_max_streams_uni;
-
-        m_recovery.set_max_ack_delay(std::chrono::milliseconds(m_config.max_ack_delay_ms));
-        m_recovery.set_address_validated(address_validated);
+    QuicConnection(Executor exec, SSL_CTX* ssl_ctx, QuicConnectionConfig config, QuicBootstrap bootstrap,
+                   std::vector<std::uint32_t> versions, asio::ip::udp::endpoint local,
+                   asio::ip::udp::endpoint remote, DatagramSink sink)
+        : m_executor(exec), m_timer(exec), m_wake(exec, 1), m_closed_signal(exec, 1), m_config(config),
+          m_bootstrap(bootstrap), m_versions(std::move(versions)), m_local(std::move(local)),
+          m_remote(std::move(remote)), m_sink(std::move(sink)), m_crypto(this) {
+        ngtcp2_ccerr_default(&m_last_error);
+        if (!m_crypto.init(ssl_ctx)) {
+            m_init_failed = true;
+        }
     }
 
-    ~QuicConnection() = default;
+    ~QuicConnection() override {
+        if (m_conn) ngtcp2_conn_del(m_conn);
+    }
 
-    // Set up the TLS handshake. Must happen before the first datagram is
-    // handed in: the client's Initial carries the ClientHello, and there is
-    // nothing to feed it into until the SSL object exists. Returns false if the
-    // context is unusable, in which case the connection must be dropped.
-    bool init() { return init_tls(); }
+    QuicConnection(const QuicConnection&) = delete;
+    QuicConnection& operator=(const QuicConnection&) = delete;
 
     [[nodiscard]] Executor get_executor() const { return m_executor; }
-    // `TransportLike` (and Request, which carries a peer address) speaks in TCP
-    // endpoints. A QUIC peer is a UDP address; the port and address are the same
-    // numbers, so the conversion is a restatement rather than a translation —
-    // which is why it is done here and not left to every caller.
+    [[nodiscard]] bool closed() const noexcept { return m_closed; }
+    [[nodiscard]] bool init_failed() const noexcept { return m_init_failed; }
+
+    // The peer as the rest of the library thinks of it. Requests carry a
+    // tcp::endpoint because that is what the h1/h2 engines have always
+    // produced; QUIC has no port of its own to report, so the UDP one stands
+    // in.
     [[nodiscard]] asio::ip::tcp::endpoint peer() const {
-        return asio::ip::tcp::endpoint{m_peer.address(), m_peer.port()};
+        return asio::ip::tcp::endpoint{m_remote.address(), m_remote.port()};
     }
-    [[nodiscard]] const asio::ip::udp::endpoint& udp_peer() const { return m_peer; }
-    [[nodiscard]] SslHandle tls_handle() const { return m_tls.ssl(); }
-    [[nodiscard]] const std::string& local_scid() const noexcept { return m_local_scid; }
-    [[nodiscard]] bool closed() const noexcept { return !m_alive; }
 
-    // --- the engine's view -------------------------------------------------
+    [[nodiscard]] SslHandle tls_handle() const {
+        auto* self = const_cast<QuicConnection*>(this);
+        SSL* ssl = self->m_crypto.ssl();
+        return ssl != nullptr ? SslHandle{ssl} : SslHandle{};
+    }
 
-    // The next peer-initiated stream, in arrival order. Resolves to nullptr once
-    // the connection is closed, which is how an engine's accept loop ends.
-    asio::awaitable<std::shared_ptr<StreamTransport>> accept_stream() {
-        for (;;) {
-            if (!m_incoming.empty()) {
-                const std::uint64_t id = m_incoming.front();
-                m_incoming.pop_front();
-                auto it = m_transports.find(id);
-                if (it != m_transports.end()) {
-                    co_return it->second;
-                }
-                continue;
+    // --- endpoint-facing -----------------------------------------------------
+
+    // Create the ngtcp2 connection. Separate from the constructor because it
+    // can fail, and because the endpoint must be able to report why.
+    [[nodiscard]] bool init();
+
+    // Feed one received datagram in. Runs on this connection's executor.
+    void on_datagram(std::span<const std::uint8_t> datagram);
+
+    // Drive the connection until it is closed. The endpoint spawns this; when it
+    // returns, the connection is finished and `closed()` is true.
+    asio::awaitable<void> run();
+
+    // --- protocol-engine-facing ---------------------------------------------
+
+    // Hand the connection its protocol engine.
+    //
+    // The endpoint feeds the client's Initial as soon as the connection exists,
+    // because that packet is what starts the handshake — but the engine that
+    // rides on the connection is built by the *server*, asynchronously, a moment
+    // later. Anything ngtcp2 reports in between would otherwise be delivered to
+    // nobody: the 1-RTT keys (which is when the engine may open its control
+    // streams at all), and any stream data that arrived in the same flight.
+    //
+    // So those two are held here and replayed on registration. The reference
+    // implementation instead drops them on the floor, which for stream data
+    // also means never crediting the peer for bytes it has handed over — its
+    // flow-control window shrinks a little on every connection.
+    void set_protocol(std::shared_ptr<Protocol> protocol) {
+        m_protocol = protocol;
+        if (protocol == nullptr) return;
+
+        if (m_tx_keys_pending) {
+            m_tx_keys_pending = false;
+            protocol->on_tx_keys_ready();
+        }
+        if (!m_pending_stream_data.empty()) {
+            std::vector<PendingStreamData> pending = std::move(m_pending_stream_data);
+            m_pending_stream_data.clear();
+            for (const PendingStreamData& event : pending) {
+                protocol->on_stream_data(event.flags, event.stream_id,
+                                         std::span<const std::uint8_t>{event.data.data(), event.data.size()});
             }
-            if (!m_alive) co_return nullptr;
-            auto [ec] = co_await m_stream_notify->async_receive(asio::as_tuple(asio::use_awaitable));
-            if (ec) co_return nullptr;
         }
+        if (m_closed) protocol->on_connection_closed();
+        poke();
     }
 
-    // A new locally-initiated unidirectional stream: the HTTP/3 control stream
-    // and its two QPACK streams. Nothing goes on it until the caller writes.
-    std::shared_ptr<StreamTransport> open_uni_stream() {
-        if (!m_alive) return nullptr;
-        if (m_next_local_uni / 4 >= m_peer_max_streams_uni) {
-            SIMPLE_HTTP_ERROR_LOG("QUIC: peer's unidirectional stream limit reached");
-            return nullptr;
-        }
-        const std::uint64_t id = m_next_local_uni;
-        m_next_local_uni += 4;
-        return make_stream(id);
+    // Wake the send loop: the engine has data to write.
+    void flush() noexcept { poke(); }
+
+    // A timestamp ngtcp2 understands. ngtcp2 measures in nanoseconds from an
+    // arbitrary epoch, and every call that takes one must use the same clock —
+    // mixing in a different origin would compute an RTT of decades.
+    [[nodiscard]] ngtcp2_tstamp now() const noexcept { return ngtcp2_tstamp(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                               std::chrono::steady_clock::now().time_since_epoch())
+                                                                               .count()); }
+
+    // How many unidirectional streams we may still open. The HTTP/3 engine
+    // needs three (control + the two QPACK streams) and asks before trying.
+    [[nodiscard]] std::uint64_t streams_uni_left() const noexcept {
+        return m_conn != nullptr ? ngtcp2_conn_get_streams_uni_left2(m_conn) : 0;
     }
 
-    std::shared_ptr<StreamTransport> open_bidi_stream() {
-        if (!m_alive) return nullptr;
-        if (m_next_local_bidi / 4 >= m_peer_max_streams_bidi) return nullptr;
-        const std::uint64_t id = m_next_local_bidi;
-        m_next_local_bidi += 4;
-        return make_stream(id);
+    // Our advertised `initial_max_streams_bidi`, which nghttp3 needs to know so
+    // its own accounting matches our transport parameters.
+    [[nodiscard]] std::uint64_t local_max_streams_bidi() const noexcept {
+        if (m_conn == nullptr) return 0;
+        const auto* params = ngtcp2_conn_get_local_transport_params2(m_conn);
+        return params != nullptr ? params->initial_max_streams_bidi : 0;
     }
 
-    // Abort one stream without disturbing the others. This is what a cancelled
-    // HTTP/3 request uses, and the reason HTTP/3 runs over QUIC at all.
-    void reset_stream(std::uint64_t stream_id, std::uint64_t error_code) {
-        auto it = m_streams.find(stream_id);
-        if (it != m_streams.end()) reset_stream_impl(it->second, error_code);
-    }
+    // Wait until the connection has finished. The engine's `run()` returns when
+    // this does.
+    asio::awaitable<void> await_closed();
 
-    // Close the whole connection with an application error (CONNECTION_CLOSE
-    // type 0x1d), which is what an HTTP/3 engine does on a protocol error.
-    void close(std::uint64_t error_code, std::string_view reason) {
-        if (!m_alive || m_closing) return;
-        SIMPLE_HTTP_WARN_LOG("QUIC: application close, code=0x{:x} reason={}", error_code, reason);
-        m_close_error = error_code;
-        m_close_reason.assign(reason);
-        m_close_application = true;
-        m_closing = true;
-        flush();
-    }
+    // Open a unidirectional stream. Returns nullopt when the peer's limit is
+    // reached — which for the three HTTP/3 critical streams is fatal, not a
+    // retry.
+    [[nodiscard]] std::optional<std::int64_t> open_uni_stream();
 
-    void shutdown(std::uint64_t error_code) { close(error_code, {}); }
+    // Credit the peer for `count` bytes the application consumed. Both halves
+    // matter: the stream window and the connection window.
+    void extend_stream_offset(std::int64_t stream_id, std::uint64_t count) noexcept;
+    void extend_connection_offset(std::uint64_t count) noexcept;
 
-    [[nodiscard]] std::uint64_t recv_consumed() const noexcept { return m_recv_consumed; }
+    // Tell ngtcp2 we will not read this stream any more (the peer reset it, or
+    // sent STOP_SENDING).
+    void shutdown_stream_read(std::int64_t stream_id, std::uint64_t app_error_code) noexcept;
 
-    // --- the endpoint's view ----------------------------------------------
+    // Give the peer credit for a request stream that has finished, so it may
+    // open another.
+    //
+    // ngtcp2 raises MAX_STREAMS by itself only for streams it never announced
+    // through `stream_open`; for every other one the application has to say when
+    // it is done. A server that never says it lets a client open exactly
+    // `initial_max_streams_bidi` requests on a connection and then stall — which
+    // looks like a working server that dies on the hundredth request.
+    void extend_max_streams_bidi(std::uint64_t count = 1) noexcept;
 
-    // A datagram for this connection. Called on the connection's executor.
-    void on_datagram(std::span<const std::uint8_t> data, const asio::ip::udp::endpoint& from) {
-        if (!m_alive) return;
-        m_bytes_received += data.size();
-        m_last_activity = Clock::now();
+    // Cancel the response half: RESET_STREAM with this application code.
+    void reset_stream(std::int64_t stream_id, std::uint64_t app_error_code) noexcept;
 
-        if (from != m_peer) {
-            if (!on_migrating_datagram(data, from)) return;
-        }
-        process_datagram(data);
-        // Whatever arrived may have freed flow-control credit or produced
-        // frames to acknowledge.
-        flush();
-    }
+    // The same, but only the send half — what nghttp3 asks for when it decides a
+    // stream must be reset rather than when the application does.
+    void shutdown_stream_write(std::int64_t stream_id, std::uint64_t app_error_code) noexcept;
 
-    asio::awaitable<void> run() {
-        using namespace asio::experimental::awaitable_operators;
-        m_deadline = Clock::now() + std::chrono::milliseconds(m_config.max_idle_timeout_ms);
+    // Application-level close with an HTTP/3 error code.
+    void close(std::uint64_t app_error_code, std::string_view reason) noexcept;
 
-        // TLS was set up before the first datagram was fed in, and the
-        // ClientHello may already have advanced the handshake past its first
-        // flight. Re-driving it here is what turns "received bytes" into
-        // "produced bytes" for anything still queued.
-        //
-        // A *failed* handshake is not a reason to return: the failure queued a
-        // CONNECTION_CLOSE carrying the TLS alert that explains it, and bailing
-        // out here would drop it, leaving the peer with a connection that simply
-        // stops. The loops below send it and then end on their own — closing is
-        // what makes them return.
-        (void)drive_handshake();
+    // The same, for a QUIC transport error ngtcp2 raised.
+    void shutdown(std::uint64_t app_error_code) noexcept { close(app_error_code, {}); }
 
-        co_await (write_loop() || timer_loop());
+    // ngtcp2's connection, for the crypto helper's `get_conn`.
+    [[nodiscard]] ngtcp2_conn* native_conn() noexcept override { return m_conn; }
 
-        m_alive = false;
-        // Unpark everything that could be waiting on this connection. A reader
-        // parked on a channel nobody will ever write to is a leak, not a stall.
-        for (auto& [id, stream] : m_streams) {
-            (void)id;
-            if (stream->notify) stream->notify->close();
-            if (stream->write_space) stream->write_space->close();
-        }
-        m_incoming.clear();
-        if (m_stream_notify) m_stream_notify->close();
-        if (m_send_notify) m_send_notify->close();
+  private:
+    // --- ngtcp2 callbacks ----------------------------------------------------
+    //
+    // Every one of these is a static trampoline that recovers the connection
+    // from `user_data` and forwards. They return int per ngtcp2's ABI: anything
+    // non-zero is turned into NGTCP2_ERR_CALLBACK_FAILURE, and 0 means
+    // "continue". They must not throw — a C library has no way to see a C++
+    // exception. `noexcept` here is load-bearing, not decoration.
+
+    static QuicConnection* from(void* user_data) noexcept { return static_cast<QuicConnection*>(user_data); }
+
+    static int cb_recv_stream_data(ngtcp2_conn*, std::uint32_t flags, std::int64_t stream_id, std::uint64_t, const std::uint8_t* data,
+                                   std::size_t datalen, void* user_data, void*) noexcept;
+    static int cb_acked_stream_data_offset(ngtcp2_conn*, std::int64_t stream_id, std::uint64_t, std::uint64_t datalen, void* user_data,
+                                           void*) noexcept;
+    static int cb_stream_close(ngtcp2_conn*, std::uint32_t flags, std::int64_t stream_id, std::uint64_t app_error_code,
+                               void* user_data, void*) noexcept;
+    static int cb_stream_reset(ngtcp2_conn*, std::int64_t stream_id, std::uint64_t final_size, std::uint64_t app_error_code,
+                               void* user_data, void*) noexcept;
+    static int cb_stream_stop_sending(ngtcp2_conn*, std::int64_t stream_id, std::uint64_t app_error_code, void* user_data,
+                                      void*) noexcept;
+    static int cb_extend_max_stream_data(ngtcp2_conn*, std::int64_t stream_id, std::uint64_t max_data, void* user_data,
+                                         void*) noexcept;
+    static int cb_extend_max_remote_streams_bidi(ngtcp2_conn*, std::uint64_t max_streams, void* user_data) noexcept;
+    static int cb_recv_tx_key(ngtcp2_conn*, ngtcp2_encryption_level level, void* user_data) noexcept;
+    static int cb_get_new_connection_id(ngtcp2_conn*, ngtcp2_cid* cid, ngtcp2_stateless_reset_token* token, std::size_t cidlen,
+                                        void* user_data) noexcept;
+    static int cb_remove_connection_id(ngtcp2_conn*, const ngtcp2_cid* cid, void* user_data) noexcept;
+    static void cb_rand(std::uint8_t* dest, std::size_t destlen, const ngtcp2_rand_ctx*) noexcept;
+    static int cb_handshake_completed(ngtcp2_conn*, void* user_data) noexcept;
+    static ngtcp2_ssize cb_write_pkt(ngtcp2_conn*, ngtcp2_path* path, ngtcp2_pkt_info* pi, std::uint8_t* dest, std::size_t destlen,
+                                     ngtcp2_tstamp ts, void* user_data) noexcept;
+
+    // The endpoint needs to hear about CIDs ngtcp2 hands out mid-connection, so
+    // that datagrams addressed to a new CID still find this connection.
+    using CidCallback = std::function<void(std::span<const std::uint8_t>, std::span<const std::uint8_t>)>;
+    using CidRetireCallback = std::function<void(std::span<const std::uint8_t>)>;
+
+  public:
+    void set_cid_callbacks(CidCallback on_new, CidRetireCallback on_retire) {
+        m_on_new_cid = std::move(on_new);
+        m_on_retire_cid = std::move(on_retire);
     }
 
   private:
-    // --- set-up -----------------------------------------------------------
-
-    bool init_tls() {
-        // The destination connection ID the client used is the one the *peer*
-        // must confirm it saw, so it is what goes in
-        // original_destination_connection_id (RFC 9000 §7.3).
-        TransportParams ours;
-        ours.has_original_dcid = true;
-        ours.original_dcid = m_original_dcid;
-        ours.max_idle_timeout = m_config.max_idle_timeout_ms;
-        ours.max_udp_payload_size = m_config.max_udp_payload_size;
-        ours.initial_max_data = m_config.initial_max_data;
-        ours.initial_max_stream_data_bidi_local = m_config.initial_max_stream_data_bidi_local;
-        ours.initial_max_stream_data_bidi_remote = m_config.initial_max_stream_data_bidi_remote;
-        ours.initial_max_stream_data_uni = m_config.initial_max_stream_data_uni;
-        ours.initial_max_streams_bidi = m_config.initial_max_streams_bidi;
-        ours.initial_max_streams_uni = m_config.initial_max_streams_uni;
-        ours.ack_delay_exponent = m_config.ack_delay_exponent;
-        ours.max_ack_delay = m_config.max_ack_delay_ms;
-        ours.active_connection_id_limit = m_config.active_connection_id_limit;
-        ours.initial_source_connection_id = m_local_scid;
-        ours.disable_active_migration = m_config.disable_active_migration;
-        ours.has_stateless_reset_token = true;
-        for (auto& byte : ours.stateless_reset_token) byte = static_cast<std::uint8_t>(m_random());
-
-        QuicTlsHooks hooks;
-        hooks.on_crypto_ready = [this](EncryptionLevel) { flush(); };
-        hooks.on_keys = [this](EncryptionLevel level, bool read) {
-            // 1-RTT keys are not handed to the TLS object's array — they go into
-            // dedicated members because they are the ones key update rewrites.
-            const PacketKeys& keys = m_tls.keys(level, read);
-            if (level == EncryptionLevel::OneRtt) {
-                if (read) {
-                    m_one_rtt_rx = keys;
-                } else {
-                    m_one_rtt_tx = keys;
-                }
-            } else if (level == EncryptionLevel::ZeroRtt && read) {
-                m_zero_rtt_rx = keys;
-                if (m_config.enable_0rtt) replay_undecryptable();
-            }
-        };
-        hooks.on_peer_transport_params = [](std::string_view) {};
-        hooks.on_alert = [this](std::uint8_t alert) {
-            // RFC 9001 §4.8: a TLS alert becomes a QUIC CRYPTO_ERROR, whose code
-            // is 0x100 plus the alert. Reporting it as an internal error throws
-            // away the only thing the peer needs to tell a protocol mismatch from
-            // a rejected certificate — and it is what the TLS alert is *for*.
-            transport_close(static_cast<TransportError>(0x100 + alert), kNoFrame, "TLS alert");
-        };
-
-        if (m_ssl_ctx == nullptr) return false;
-        return m_tls.init(m_ssl_ctx, ours, std::move(hooks), m_config.enable_0rtt);
-    }
-
-    // --- stream plumbing --------------------------------------------------
-
-    std::shared_ptr<StreamTransport> make_stream(std::uint64_t id) {
-        auto state = std::make_shared<QuicStreamState>();
-        state->id = id;
-        state->notify =
-            std::make_shared<asio::experimental::concurrent_channel<void(error_code)>>(m_executor, 1);
-        // The receive window this stream starts with depends on who opened it
-        // and how: the peer's transport parameters name three separate limits,
-        // and using the wrong one is a flow-control error the peer closes on.
-        const bool local = stream_is_local(id, /*server=*/true);
-        const bool bidi = stream_is_bidi(id);
-        // The receive window is *ours*: it is what we advertised in our own
-        // transport parameters, so it is known from the first moment and must be
-        // set here rather than left for the handshake to fill in. Leaving it at
-        // zero makes every byte the peer sends a flow-control violation — and
-        // only for streams created after the handshake, because the ones that
-        // existed at the time get fixed up by on_handshake_complete. A real
-        // client opens its request stream after the handshake, which is why the
-        // hand-written one never noticed.
-        const std::uint64_t recv_limit = bidi ? (local ? m_config.initial_max_stream_data_bidi_local
-                                                       : m_config.initial_max_stream_data_bidi_remote)
-                                              : m_config.initial_max_stream_data_uni;
-        state->recv_start = recv_limit;
-        state->recv.set_max_data(recv_limit);
-        // The *send* window is the peer's, so it really is unknown until the
-        // peer's transport parameters arrive — which for a stream created later
-        // they already have.
-        state->send_max_data = m_handshake_complete
-                                   ? (bidi ? (local ? m_peer_initial_max_stream_data_bidi_remote
-                                                    : m_peer_initial_max_stream_data_bidi_local)
-                                           : m_peer_initial_max_stream_data_uni)
-                                   : 0;
-        state->wake_send = [this] { flush(); };
-
-        typename StreamTransport::Hooks hooks;
-        hooks.wake_send = [this] { flush(); };
-        std::weak_ptr<QuicStreamState> weak = state;
-        hooks.on_consumed = [this, weak](std::uint64_t n) {
-            auto s = weak.lock();
-            if (!s) return;
-            s->consumed += n;
-            m_recv_consumed += n;
-            maybe_extend_stream_window(*s);
-            maybe_extend_connection_window();
-        };
-        hooks.on_reset = [this, id](std::uint64_t code) {
-            auto it = m_streams.find(id);
-            if (it != m_streams.end()) reset_stream_impl(it->second, code);
-        };
-
-        auto transport = std::make_shared<StreamTransport>(state, m_executor, peer(), SslHandle{m_tls.ssl()},
-                                                           std::move(hooks));
-        m_streams.emplace(id, state);
-        m_transports.emplace(id, transport);
-        return transport;
-    }
-
-    std::shared_ptr<QuicStreamState> find_stream(std::uint64_t id) {
-        auto it = m_streams.find(id);
-        return it == m_streams.end() ? nullptr : it->second;
-    }
-
-    void maybe_extend_stream_window(QuicStreamState& state) {
-        // Never credit a stream the peer has finished. It will not send again on
-        // it, so the frame is pointless — and worse than pointless: the peer is
-        // entitled to have retired the stream the moment it sent its FIN, and a
-        // MAX_STREAM_DATA naming a stream it no longer has is a stream state
-        // error *at its end*. The connection then dies reporting our frame as the
-        // cause, several layers away from here.
-        if (state.remote_closed) return;
-        // The advertised limit slides with the reader: it is always "everything
-        // consumed, plus one full window". Crediting only what was consumed — so
-        // that the peer's limit equals what it has already sent — leaves it with
-        // no headroom the moment the reader catches up, and a peer sitting exactly
-        // at its limit while the reader waits for more is a deadlock rather than
-        // backpressure. A body of a few windows is exactly where it shows up.
-        //
-        // Credited in half-window steps, the same batching the h2 engine uses:
-        // acknowledging every read would put a MAX_STREAM_DATA frame in nearly
-        // every packet a streaming reader receives.
-        const std::uint64_t window = state.recv_start;
-        const std::uint64_t target = state.consumed + window;
-        if (target - state.recv.max_data() < window / 2) return;
-        state.consumed_credited = state.consumed;
-        state.recv.set_max_data(target);
-        Bytes frame;
-        append_max_stream_data(frame, state.id, target);
-        queue_control(std::move(frame), PacketNumberSpace::Application, state.id);
-    }
-
-    void maybe_extend_connection_window() {
-        // The same sliding window as a single stream's, for the same reason: the
-        // peer is allowed one full window of unread data, not exactly what has
-        // been read.
-        const std::uint64_t window = m_recv_data_start;
-        const std::uint64_t target = m_recv_consumed + window;
-        if (target - m_recv_max_data < window / 2) return;
-        m_recv_credited = m_recv_consumed;
-        m_recv_max_data = target;
-        Bytes frame;
-        append_max_data(frame, target);
-        queue_control(std::move(frame));
-    }
-
-    // A control frame that has to survive loss. The bytes are kept until the
-    // packet carrying them is acknowledged, and re-queued if it is not — which
-    // is what makes RESET_STREAM, whose retransmission is mandatory, need no
-    // special case.
-    // `space` is not decoration. RFC 9000 §12.5 allows only PADDING, PING, ACK,
-    // CRYPTO and CONNECTION_CLOSE outside the application space, so a control
-    // frame written into whichever packet happened to be under construction is a
-    // PROTOCOL_VIOLATION — and the peer reports it as a bare violation with no
-    // frame type, pointing nowhere near the cause. Every control frame this
-    // connection queues is an application-space one, which is why the default is
-    // the application space rather than the packet's.
-    // No stream is addressed by default; only the flow-control frames name one,
-    // and they are the ones whose usefulness can expire before they are sent.
-    static constexpr std::uint64_t kNoSubjectStream = static_cast<std::uint64_t>(-1);
-
-    void queue_control(Bytes frame, PacketNumberSpace space = PacketNumberSpace::Application,
-                       std::uint64_t subject = kNoSubjectStream) {
-        m_pending_control.push_back(PendingControl{std::move(frame), space, m_next_control_id++, false, subject});
-    }
-
-    // --- sending ----------------------------------------------------------
-
-    void flush() {
-        if (m_alive && m_send_notify) (void)m_send_notify->try_send(error_code{});
-    }
-
-    void transport_close(TransportError error, std::uint64_t frame_type, std::string_view reason) {
-        if (m_closing) return;
-        SIMPLE_HTTP_WARN_LOG("QUIC: closing connection, error=0x{:x} frame=0x{:x} reason={}",
-                             static_cast<std::uint64_t>(error), frame_type, reason);
-        m_close_error = static_cast<std::uint64_t>(error);
-        m_close_reason.assign(reason);
-        m_close_frame_type = frame_type;
-        m_close_application = false;
-        m_closing = true;
-        flush();
-    }
-
-    [[nodiscard]] const PacketKeys* send_keys(EncryptionLevel level) const {
-        switch (level) {
-            case EncryptionLevel::Initial:
-                return m_initial_tx.valid ? &m_initial_tx : nullptr;
-            case EncryptionLevel::Handshake:
-                return m_tls.keys(level, false).valid ? &m_tls.keys(level, false) : nullptr;
-            case EncryptionLevel::OneRtt:
-                return m_one_rtt_tx.valid ? &m_one_rtt_tx : nullptr;
-            case EncryptionLevel::ZeroRtt:
-                return nullptr;  // a server never sends 0-RTT
-        }
-        return nullptr;
-    }
-
-    [[nodiscard]] const PacketKeys* receive_keys(EncryptionLevel level) const {
-        switch (level) {
-            case EncryptionLevel::Initial:
-                return m_initial_rx.valid ? &m_initial_rx : nullptr;
-            case EncryptionLevel::Handshake:
-                return m_tls.keys(level, true).valid ? &m_tls.keys(level, true) : nullptr;
-            case EncryptionLevel::ZeroRtt:
-                return m_zero_rtt_rx.valid ? &m_zero_rtt_rx : nullptr;
-            case EncryptionLevel::OneRtt:
-                return m_one_rtt_rx.valid ? &m_one_rtt_rx : nullptr;
-        }
-        return nullptr;
-    }
-
-    [[nodiscard]] bool has_sendable() const {
-        if (m_closing) return !m_close_sent;
-        for (const bool owed : m_ack_owed) {
-            if (owed) return true;
-        }
-        if (!m_pending_control.empty()) return true;
-        for (const auto& [id, stream] : m_streams) {
-            (void)id;
-            if (stream->send.has_pending()) return true;
-        }
-        for (const EncryptionLevel level : kAllLevels) {
-            if (m_tls.has_crypto_to_send(level)) return true;
-        }
-        return false;
-    }
-
-    // The anti-amplification limit: until the peer's address is validated, a
-    // server may send at most three times what it has received (RFC 9000 §8.1).
-    // Without it a spoofed source address turns a QUIC server into a reflector.
-    [[nodiscard]] bool amplification_allows(std::size_t bytes) const {
-        if (m_recovery.address_validated()) return true;
-        return m_bytes_sent + bytes <= 3 * m_bytes_received;
-    }
-
-    asio::awaitable<void> write_loop() {
-        for (;;) {
-            while (m_alive && has_sendable()) {
-                if (!send_one_datagram()) break;
-            }
-            // A closing connection has said everything it is going to say. Parking
-            // here would keep it — and every coroutine frame it owns, including
-            // the engine's — alive until the idle timeout, so "closing" would mean
-            // "idle" and a peer that closed cleanly would still cost a connection
-            // table entry and a set of buffers for the timeout's duration.
-            if (m_closing && m_close_sent) co_return;
-            if (!m_alive) co_return;
-            auto [ec] = co_await m_send_notify->async_receive(asio::as_tuple(asio::use_awaitable));
-            if (ec) co_return;
-        }
-    }
-
-    // Build and send one datagram. False means nothing more can go out right
-    // now — congestion-limited, amplification-limited, or nothing to say.
-    bool send_one_datagram() {
-        if (m_closing) {
-            if (m_close_sent) return false;
-            // Drain before saying goodbye. Closing is not a truncation: bytes the
-            // application already handed over — an HTTP/3 GOAWAY, most of all —
-            // are still sitting in a stream's send buffer, because `async_write`
-            // only *queues* them and wakes this loop. Sending CONNECTION_CLOSE
-            // first would drop them, and the peer would see a bare transport
-            // close instead of the frame that explained it: a different answer,
-            // not a later one. The budget bounds the delay so a peer that has
-            // stopped reading cannot hold the close off.
-            Bytes datagram;
-            if (m_close_drain > 0 && build_data_datagram(datagram)) {
-                --m_close_drain;
-                return transmit(std::move(datagram));
-            }
-            datagram.clear();
-            build_close_packet(datagram);
-            m_close_sent = true;
-            if (datagram.empty()) return false;
-            return transmit(std::move(datagram));
-        }
-
-        Bytes datagram;
-        if (!build_data_datagram(datagram)) return false;
-        return transmit(std::move(datagram));
-    }
-
-    // Build one datagram of ordinary frames. False when there is nothing to put
-    // in one — which, in the closing state, is the signal to send the close.
-    bool build_data_datagram(Bytes& datagram) {
-        const std::size_t budget = m_max_datagram_size;
-        if (!amplification_allows(budget)) return false;
-
-        datagram.clear();
-        bool ack_eliciting_initial = false;
-        std::vector<std::uint64_t> used_control;
-        std::vector<SentPacket> emitted;
-
-        // Coalescing order matters: Initial, then Handshake, then 1-RTT
-        // (RFC 9000 §12.2). A receiver parses them in that order, and the short
-        // header packet has to be last because it has no length field.
-        for (const EncryptionLevel level : {EncryptionLevel::Initial, EncryptionLevel::Handshake,
-                                            EncryptionLevel::OneRtt}) {
-            if (!send_keys(level) || !send_keys(level)->valid) continue;
-            const std::size_t remaining = budget > datagram.size() ? budget - datagram.size() : 0;
-            if (remaining < 64) continue;
-
-            Bytes packet;
-            SentPacket sent;
-            const bool ack_eliciting = build_packet(level, packet, remaining, sent, used_control);
-            if (packet.empty()) continue;
-            if (level == EncryptionLevel::Initial && ack_eliciting) ack_eliciting_initial = true;
-            datagram += packet;
-            // Every packet is recorded, not only the ack-eliciting ones. An
-            // ACK-only packet is not tracked for loss — it has nothing to
-            // retransmit — but it *was* sent, so a peer that acknowledges it must
-            // not be told it acknowledged something that never existed. Recording
-            // only the ack-eliciting ones leaves the largest-sent number stale,
-            // and the next acknowledgement of an ACK-only packet becomes a
-            // spurious PROTOCOL_VIOLATION.
-            emitted.push_back(std::move(sent));
-        }
-
-        if (datagram.empty()) return false;
-
-        // A server must expand every datagram carrying an ack-eliciting Initial
-        // packet to 1200 octets (RFC 9000 §14.1): a smaller one is not a valid
-        // Initial, and the peer may reject it.
-        if (ack_eliciting_initial && datagram.size() < kMinInitialDatagramSize) {
-            datagram.resize(kMinInitialDatagramSize, '\0');
-        }
-
-        // Commit only now that the bytes are going out. Everything the packet
-        // builders reserved — packet numbers, stream offsets, control frames —
-        // is only real once the datagram exists.
-        for (const std::uint64_t id : used_control) {
-            for (auto& control : m_pending_control) {
-                if (control.id == id) control.in_flight = true;
-            }
-        }
-        for (SentPacket& sent : emitted) m_recovery.on_packet_sent(sent);
-        return true;
-    }
-
-    bool transmit(Bytes datagram) {
-        m_bytes_sent += datagram.size();
-        m_last_activity = Clock::now();
-        if (m_sink) m_sink(std::move(datagram), m_peer);
-        return true;
-    }
-
-    // Fill `packet` with one packet at `level`, and `sent` with what went into
-    // it. The packet number is taken from `sent.packet_number`, which the caller
-    // must have set.
-    bool build_packet(EncryptionLevel level, Bytes& packet, std::size_t budget, SentPacket& sent,
-                      std::vector<std::uint64_t>& used_control) {
-        const PacketKeys* keys = send_keys(level);
-        if (!keys || !keys->valid) return false;
-
-        const PacketNumberSpace space = space_of_level(level);
-        const std::size_t index = space_index(space);
-        const std::uint64_t pn = m_next_pn[index];
-        const std::uint64_t largest_acked = m_recovery.has_largest_acked(space) ? m_recovery.largest_acked(space) : 0;
-        const std::size_t pn_len = packet_number_len(pn, largest_acked);
-
-        // The Length field is a varint whose width depends on the payload, so
-        // the header cannot be written until the payload's size is known. Build
-        // the frames into a scratch buffer against the worst-case header.
-        const std::size_t header_max = header_overhead(level, pn_len);
-        if (budget <= header_max + kAeadTagLen + 8) return false;
-        const std::size_t frames_budget = budget - header_max - kAeadTagLen;
-
-        Bytes frames;
-        bool ack_eliciting = false;
-        append_frames(level, space, frames_budget, frames, ack_eliciting, sent, used_control);
-        if (frames.empty()) return false;
-
-        std::size_t pn_offset = 0;
-        if (level == EncryptionLevel::OneRtt) {
-            append_short_header(packet, m_peer_scid, m_key_phase, pn_len, pn_offset);
-        } else {
-            // A server's Initial carries no token: the token field exists for a
-            // client to echo back what a Retry gave it.
-            const std::uint64_t length = pn_len + frames.size() + kAeadTagLen;
-            append_long_header(packet, long_type_of(level), kQuicVersion1, m_peer_scid, m_local_scid, {},
-                               length, pn_len, pn_offset);
-        }
-        append_packet_number(packet, pn, pn_len);
-        packet += frames;
-
-        const std::string_view aad{packet.data(), pn_offset + pn_len};
-        const std::string_view plaintext{packet.data() + pn_offset + pn_len,
-                                         packet.size() - pn_offset - pn_len};
-        Bytes ciphertext;
-        if (!aead_seal(*keys, pn, aad, plaintext, ciphertext)) {
-            // The stream cursors have already advanced, so the data in this
-            // packet cannot simply be dropped; the connection is unusable now
-            // and has to be closed rather than continued.
-            packet.clear();
-            transport_close(TransportError::InternalError, kNoFrame, "packet protection failed");
-            return false;
-        }
-        packet.resize(pn_offset + pn_len);
-        packet += ciphertext;
-        apply_header_protection(*keys, packet, pn_offset, pn_len);
-
-        sent.packet_number = pn;
-        sent.space = space;
-        sent.time_sent = Clock::now();
-        sent.sent_bytes = packet.size();
-        sent.ack_eliciting = ack_eliciting;
-        // An ACK-only packet stays out of the congestion window: a window that
-        // counted acknowledgements could deadlock on its own feedback
-        // (RFC 9002 §B.2).
-        sent.in_flight = ack_eliciting;
-        m_next_pn[index] = pn + 1;
-        return ack_eliciting;
-    }
-
-    [[nodiscard]] std::size_t header_overhead(EncryptionLevel level, std::size_t pn_len) const {
-        if (level == EncryptionLevel::OneRtt) return 1 + m_peer_scid.size() + pn_len;
-        // first octet + version + two length-prefixed CIDs + an 8-octet length
-        // (the worst case for a varint) + the packet number + the token length
-        return 1 + 4 + 1 + m_peer_scid.size() + 1 + m_local_scid.size() + 8 + pn_len + 1;
-    }
-
-    static LongHeaderType long_type_of(EncryptionLevel level) {
-        switch (level) {
-            case EncryptionLevel::Initial:
-                return LongHeaderType::Initial;
-            case EncryptionLevel::Handshake:
-                return LongHeaderType::Handshake;
-            case EncryptionLevel::ZeroRtt:
-                return LongHeaderType::ZeroRtt;
-            case EncryptionLevel::OneRtt:
-                break;
-        }
-        return LongHeaderType::Handshake;
-    }
-
-    void append_close_packet(Bytes& datagram, EncryptionLevel level) {
-        const PacketKeys* keys = send_keys(level);
-        if (!keys || !keys->valid) return;
-        const PacketNumberSpace space = space_of_level(level);
-        const std::size_t index = space_index(space);
-        const std::uint64_t pn = m_next_pn[index];
-        const std::size_t pn_len = 1;
-        Bytes frames;
-        append_connection_close(frames, m_close_error, m_close_reason, m_close_application, m_close_frame_type);
-        Bytes packet;
-        std::size_t pn_offset = 0;
-        if (level == EncryptionLevel::OneRtt) {
-            append_short_header(packet, m_peer_scid, m_key_phase, pn_len, pn_offset);
-        } else {
-            append_long_header(packet, long_type_of(level), kQuicVersion1, m_peer_scid, m_local_scid, {},
-                               pn_len + frames.size() + kAeadTagLen, pn_len, pn_offset);
-        }
-        append_packet_number(packet, pn, pn_len);
-        packet += frames;
-        const std::string_view aad{packet.data(), pn_offset + pn_len};
-        const std::string_view plaintext{packet.data() + pn_offset + pn_len,
-                                         packet.size() - pn_offset - pn_len};
-        Bytes ciphertext;
-        if (!aead_seal(*keys, pn, aad, plaintext, ciphertext)) return;
-        packet.resize(pn_offset + pn_len);
-        packet += ciphertext;
-        apply_header_protection(*keys, packet, pn_offset, pn_len);
-        // The close packet is not tracked for loss recovery: there is nothing
-        // left to retransmit into, and retrying it would be a loop.
-        m_next_pn[index] = pn + 1;
-        datagram += packet;
-    }
-
-    void build_close_packet(Bytes& datagram) {
-        // Prefer the highest level the peer can read, falling back so that a
-        // handshake failure is still reportable.
-        for (const EncryptionLevel level : {EncryptionLevel::OneRtt, EncryptionLevel::Handshake,
-                                            EncryptionLevel::Initial}) {
-            if (!send_keys(level) || !send_keys(level)->valid) continue;
-            // The close echoes the key phase in use, so a peer updating keys
-            // concurrently can still read it.
-            append_close_packet(datagram, level);
-            return;
-        }
-    }
-
-    // Append whichever frames this level and space have to offer, up to
-    // `budget`, recording what went in so loss recovery can re-send it.
-    void append_frames(EncryptionLevel level, PacketNumberSpace space, std::size_t budget, Bytes& frames,
-                       bool& ack_eliciting, SentPacket& sent, std::vector<std::uint64_t>& used_control) {
-        const std::size_t index = space_index(space);
-
-        // An acknowledgement first: it is what the peer is waiting for, and the
-        // cheapest frame there is.
-        if (m_ack_owed[index]) {
-            // The Largest Acknowledged comes from the ranges themselves, not from
-            // a separate counter: §19.3.1 hangs the first range directly below
-            // that field, so the two have to agree, and taking both from one
-            // place is what makes disagreeing impossible.
-            const std::vector<AckRange> ranges = m_acks[index].ranges();
-            Bytes ack;
-            append_ack(ack, ranges.empty() ? 0 : ranges[0].largest,
-                       ack_delay_units(m_acks[index], Clock::now()), ranges);
-            if (ack.size() <= budget) {
-                frames += ack;
-                m_ack_owed[index] = false;
-                // What this frame tells the peer, remembered against the packet
-                // that carries it: when the peer confirms it has the packet, it
-                // has the acknowledgement too, and these ranges can be forgotten.
-                // An empty range set still goes out as Largest Acknowledged 0 —
-                // legal, and the peer's loss detection is what it is for — so
-                // there is nothing to remember in that case.
-                if (!ranges.empty()) sent.acked_peer_largest = ranges[0].largest;
-            }
-        }
-
-        // Handshake bytes at this level.
-        while (m_tls.has_crypto_to_send(level)) {
-            if (frames.size() + 24 >= budget) break;
-            std::uint64_t offset = 0;
-            std::string_view data;
-            if (!m_tls.next_crypto(level, budget - frames.size() - 24, kMaxStreamOffset, offset, data)) break;
-            if (data.empty()) break;
-            append_crypto(frames, offset, data);
-            ack_eliciting = true;
-            sent.ranges.push_back(StreamRange{true, space, 0, offset, static_cast<std::uint64_t>(data.size())});
-        }
-
-        // HANDSHAKE_DONE tells the client its handshake is confirmed, which is
-        // what lets it drop the handshake keys and stop sending Initials.
-        if (space == PacketNumberSpace::Application && m_send_handshake_done) {
-            Bytes done;
-            append_handshake_done(done);
-            if (frames.size() + done.size() <= budget) {
-                frames += done;
-                ack_eliciting = true;
-                m_send_handshake_done = false;
-            }
-        }
-
-        // Control frames that must be repeated until acknowledged.
-        for (std::size_t i = 0; i < m_pending_control.size();) {
-            PendingControl& control = m_pending_control[i];
-            if (control.in_flight || control.bytes.empty() || control.space != space) {
-                ++i;
-                continue;
-            }
-            // A frame about a stream the peer has finished (or that is gone) can
-            // only do harm: the peer may have retired the stream, and naming one
-            // it no longer has is a stream state error at its end — the connection
-            // then dies reporting our frame as the cause.
-            if (control.subject != kNoSubjectStream) {
-                auto subject = find_stream(control.subject);
-                if (!subject || subject->remote_closed) {
-                    m_pending_control.erase(m_pending_control.begin() + static_cast<std::ptrdiff_t>(i));
-                    continue;
-                }
-            }
-            if (frames.size() + control.bytes.size() > budget) break;
-            frames += control.bytes;
-            ack_eliciting = true;
-            control.in_flight = true;
-            sent.control_ids.push_back(control.id);
-            used_control.push_back(control.id);
-            ++i;
-        }
-
-        if (space != PacketNumberSpace::Application) return;
-
-        // Stream data. Congestion control can stop it, but a probe cannot be
-        // stopped: a connection whose only loss was a PTO would otherwise never
-        // recover, because the packet it is waiting to re-send is exactly the
-        // one the window is holding back.
-        // A probe is exempt from the window because the packet it carries is the
-        // one the window is holding back; a closing connection is exempt because
-        // congestion control has nothing left to protect.
-        const bool exempt = m_closing || (m_probe_pending && m_probe_space == space);
-        if (!exempt && m_recovery.congestion().send_allowance() == 0) return;
-
-        for (auto& [id, stream] : m_streams) {
-            if (frames.size() + 32 >= budget) break;
-            if (!stream->send.has_pending()) continue;
-            // Two limits, two spaces. `limit` is what the peer will accept on
-            // *this* stream, so it is the stream's own window. The connection's
-            // limit is a sum over every stream's high-water mark, so what it
-            // bounds is how many new octets may go out now — not any offset.
-            // Taking the smaller of the two as if both were offsets lets a
-            // connection-wide total be spent once per stream: enough concurrent
-            // large responses then exceed what the peer granted and it closes the
-            // connection with FLOW_CONTROL_ERROR.
-            const std::uint64_t limit = stream->send_max_data;
-            const std::uint64_t conn_room =
-                m_send_data >= m_peer_max_data ? 0 : m_peer_max_data - m_send_data;
-            const std::uint64_t before = stream->send.next_offset();
-            const std::size_t room = budget - frames.size();
-            SendStream::Chunk chunk;
-            if (!stream->send.next(room > 24 ? room - 24 : 0, limit, conn_room, chunk)) continue;
-            if (chunk.data.empty() && !chunk.fin) continue;
-            append_stream(frames, id, chunk.offset, chunk.data, chunk.fin);
-            ack_eliciting = true;
-            sent.ranges.push_back(
-                StreamRange{false, space, id, chunk.offset, static_cast<std::uint64_t>(chunk.data.size())});
-            // Connection-level flow control counts every stream octet ever sent,
-            // retransmissions included — but a retransmission does not raise the
-            // high-water mark, so only the growth counts.
-            const std::uint64_t end = chunk.offset + chunk.data.size();
-            if (end > before) m_send_data += end - before;
-        }
-    }
-
-    [[nodiscard]] std::uint64_t ack_delay_units(const AckTracker& tracker, Clock::time_point now) const {
-        // The exponent is ours to choose and is advertised so the peer can undo
-        // it (RFC 9000 §18.2). Applying it on send and removing it on receipt is
-        // what keeps the two ends symmetric.
-        const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(now - tracker.largest_time());
-        return static_cast<std::uint64_t>(micros.count()) >> m_config.ack_delay_exponent;
-    }
-
-    // --- receiving --------------------------------------------------------
-
-    void process_datagram(std::span<const std::uint8_t> data) {
-        std::size_t offset = 0;
-        while (offset < data.size()) {
-            const std::size_t consumed = process_one_packet(data.subspan(offset));
-            if (consumed == 0) break;
-            offset += consumed;
-        }
-    }
-
-    // Parse and handle one packet, returning how many datagram octets it used.
-    // Zero means "stop parsing this datagram".
-    std::size_t process_one_packet(std::span<const std::uint8_t> data) {
-        Reader r{data};
-        PacketHeader hdr;
-        switch (parse_packet_header(r, m_local_scid.size(), hdr)) {
-            case PacketParseStatus::Ok:
-                break;
-            case PacketParseStatus::UnsupportedVersion:
-                m_version_negotiation_requested = hdr;
-                return 0;
-            case PacketParseStatus::Retry:
-                // A server never receives a Retry, and answering one would let a
-                // single forged packet create a connection.
-                return 0;
-            case PacketParseStatus::VersionNegotiation:
-            case PacketParseStatus::NotQuic:
-            case PacketParseStatus::Malformed:
-                return 0;
-        }
-
-        // A long header states its own length, which is what makes a coalesced
-        // datagram splittable before anything is decrypted. A short header does
-        // not: it runs to the end, and the RFC requires it to be last.
-        std::size_t extent = data.size();
-        if (hdr.long_header) {
-            const std::uint64_t total = hdr.pn_offset + hdr.length;
-            if (total > data.size()) return 0;
-            extent = static_cast<std::size_t>(total);
-        }
-
-        EncryptionLevel level = EncryptionLevel::OneRtt;
-        if (hdr.long_header) {
-            switch (hdr.type) {
-                case LongHeaderType::Initial:
-                    level = EncryptionLevel::Initial;
-                    break;
-                case LongHeaderType::ZeroRtt:
-                    level = EncryptionLevel::ZeroRtt;
-                    break;
-                case LongHeaderType::Handshake:
-                    level = EncryptionLevel::Handshake;
-                    break;
-                case LongHeaderType::Retry:
-                    return extent;
-            }
-        }
-
-        // A packet is decrypted out of its own buffer, not out of the datagram:
-        // header protection addresses "the first octet", which is the packet's,
-        // and only happens to be the datagram's for the first packet in it.
-        Bytes packet{reinterpret_cast<const char*>(data.data()), extent};
-        process_protected_packet(std::move(packet), hdr, level, space_of_level(level));
-        return extent;
-    }
-
-    bool process_protected_packet(Bytes packet, PacketHeader& hdr, EncryptionLevel level,
-                                  PacketNumberSpace space) {
-        const PacketKeys* keys = receive_keys(level);
-        // No keys yet is not an error: 0-RTT and 1-RTT packets routinely arrive
-        // before the handshake has produced them, and RFC 9001 §5.7 requires
-        // them to be buffered rather than discarded.
-        if (!keys || !keys->valid) {
-            if ((level == EncryptionLevel::OneRtt || level == EncryptionLevel::ZeroRtt) &&
-                m_undecryptable.size() < 32) {
-                m_undecryptable.push_back(std::move(packet));
-            }
-            return false;
-        }
-
-        std::size_t pn_len = 0;
-        if (!remove_header_protection(*keys, packet, hdr.pn_offset, pn_len)) return false;
-
-        // The reserved bits are zero before header protection and must be zero
-        // after it is removed; anything else means the peer set them
-        // deliberately, which RFC 9000 §17.2 and §17.3.1 both make a connection
-        // error. They are checked here because this is the first moment they are
-        // readable — the mask covers exactly these bits.
-        {
-            const auto first = static_cast<std::uint8_t>(packet[0]);
-            const std::uint8_t reserved = hdr.long_header ? 0x0c : 0x18;
-            if ((first & reserved) != 0) {
-                transport_close(TransportError::ProtocolViolation, kNoFrame, "reserved bits are not zero");
-                return false;
-            }
-        }
-        const std::size_t index = space_index(space);
-        Reader r = reader_of(packet);
-        if (!read_packet_number(r, hdr, m_acks[index].has_any() ? m_acks[index].largest() : 0)) return false;
-
-        const std::size_t header_len = hdr.pn_offset + hdr.pn_len;
-        const std::string_view aad{packet.data(), header_len};
-        const std::string_view ciphertext{packet.data() + header_len, packet.size() - header_len};
-        Bytes plaintext;
-        if (!aead_open(*keys, hdr.packet_number, aad, ciphertext, plaintext)) {
-            // A packet that will not authenticate is dropped, not a connection
-            // error: an attacker injecting garbage must not be able to kill a
-            // connection with it.
-            return false;
-        }
-
-        if (!m_recovery.address_validated() &&
-            (level == EncryptionLevel::Handshake || level == EncryptionLevel::OneRtt)) {
-            // A packet that decrypts proves the peer receives at this address,
-            // which is the whole of address validation for a server.
-            m_recovery.set_address_validated(true);
-            flush();
-        }
-
-        // A duplicate is still worth acknowledging, but nothing in it may be
-        // processed twice (RFC 9000 §12.3).
-        if (!m_acks[index].record(hdr.packet_number, Clock::now())) {
-            // A duplicate is still worth acknowledging, but nothing in it may be
-            // processed twice (RFC 9000 §12.3).
-            m_ack_owed[index] = true;
-            flush();
-            return true;
-        }
-
-        // §12.4: a packet whose payload contains no frames — not even PADDING —
-        // is a connection error. The check is "no frames" rather than "no bytes",
-        // because a run of PADDING octets is itself a frame.
-        if (plaintext.empty()) {
-            transport_close(TransportError::ProtocolViolation, kNoFrame, "packet with no frames");
-            return false;
-        }
-
-        Reader payload{reinterpret_cast<const std::uint8_t*>(plaintext.data()), plaintext.size()};
-        Frame frame;
-        bool saw_ack_eliciting = false;
-        while (!payload.empty()) {
-            const FrameParseStatus result = parse_frame(payload, frame);
-            if (result == FrameParseStatus::Unknown) {
-                transport_close(TransportError::FrameEncodingError, kNoFrame, "unknown frame type");
-                return false;
-            }
-            if (result == FrameParseStatus::ProtocolViolation) {
-                transport_close(TransportError::ProtocolViolation, kNoFrame, "non-minimal frame type");
-                return false;
-            }
-            if (result != FrameParseStatus::Ok) {
-                transport_close(TransportError::FrameEncodingError, kNoFrame, "malformed frame");
-                return false;
-            }
-            if (frame.ack_eliciting()) saw_ack_eliciting = true;
-            if (!handle_frame(frame, level, space)) return false;
-            if (!m_alive) return false;
-        }
-        if (saw_ack_eliciting) {
-            m_ack_owed[index] = true;
-            flush();
-        }
-        m_last_activity = Clock::now();
-        m_deadline = m_last_activity + std::chrono::milliseconds(m_config.max_idle_timeout_ms);
-        return true;
-    }
-
-    // --- frame handling ---------------------------------------------------
-
-    // False means the connection must stop processing (it is closing).
-    bool handle_frame(const Frame& frame, EncryptionLevel level, PacketNumberSpace space) {
-        // §12.5: most frames belong to the application space only, and the rule
-        // matters — without it a peer could open streams before the handshake
-        // proves who it is.
-        if (space != PacketNumberSpace::Application) {
-            switch (frame.type) {
-                case FrameType::Padding:
-                case FrameType::Ping:
-                case FrameType::Ack:
-                case FrameType::Crypto:
-                case FrameType::ConnectionClose:
-                    break;
-                default:
-                    transport_close(TransportError::ProtocolViolation,
-                                    static_cast<std::uint64_t>(frame.type),
-                                    "frame not permitted in this packet number space");
-                    return false;
-            }
-        }
-        if (level == EncryptionLevel::ZeroRtt && frame.type == FrameType::Crypto) {
-            // §12.5: a 0-RTT packet may not carry CRYPTO, because the keys it is
-            // protected with come from a session the peer has not proven it owns.
-            transport_close(TransportError::ProtocolViolation, 0x06, "CRYPTO in a 0-RTT packet");
-            return false;
-        }
-
-        switch (frame.type) {
-            case FrameType::Padding:
-            case FrameType::Ping:
-                return true;
-            case FrameType::Ack:
-                return on_ack(frame, space);
-            case FrameType::Crypto:
-                return on_crypto(frame, level);
-            case FrameType::Stream:
-                return on_stream_frame(frame);
-            case FrameType::ResetStream:
-                return on_reset_stream(frame);
-            case FrameType::StopSending:
-                return on_stop_sending(frame);
-            case FrameType::MaxData:
-                if (frame.limit > kMaxStreamOffset) {
-                    transport_close(TransportError::FrameEncodingError, 0x10, "MAX_DATA too large");
-                    return false;
-                }
-                m_peer_max_data = std::max(m_peer_max_data, frame.limit);
-                flush();
-                return true;
-            case FrameType::MaxStreamData: {
-                // §19.10: a receive-only stream is one this endpoint can only
-                // *receive* on — a unidirectional stream the peer opened — so a
-                // window for us to send is meaningless, and the peer naming one
-                // means it has the direction backwards.
-                if (!stream_is_bidi(frame.stream_id) && is_remote_stream(frame.stream_id)) {
-                    transport_close(TransportError::StreamStateError, 0x11,
-                                    "MAX_STREAM_DATA for a receive-only stream");
-                    return false;
-                }
-                bool bad = false;
-                bool stale = false;
-                auto stream = resolve_peer_stream(frame.stream_id, bad, stale);
-                if (stale) return true;  // a frame about a stream that is closed and forgotten
-                if (bad) {
-                    transport_close(TransportError::StreamStateError, 0x11,
-                                    "MAX_STREAM_DATA for unopened local stream");
-                    return false;
-                }
-                if (frame.limit > kMaxStreamOffset) {
-                    transport_close(TransportError::FrameEncodingError, 0x11, "MAX_STREAM_DATA too large");
-                    return false;
-                }
-                stream->send_max_data = std::max(stream->send_max_data, frame.limit);
-                flush();
-                return true;
-            }
-            case FrameType::MaxStreams:
-                if (frame.limit > (1ULL << 60)) {
-                    transport_close(TransportError::FrameEncodingError, 0x12, "MAX_STREAMS too large");
-                    return false;
-                }
-                if (frame.bidirectional) {
-                    m_peer_max_streams_bidi = std::max(m_peer_max_streams_bidi, frame.limit);
-                } else {
-                    m_peer_max_streams_uni = std::max(m_peer_max_streams_uni, frame.limit);
-                }
-                return true;
-            case FrameType::DataBlocked:
-            case FrameType::StreamDataBlocked:
-                // The peer is reporting itself stuck. Our windows are raised
-                // from consumption, so there is nothing to react to beyond
-                // making sure any queued MAX_* frame goes out.
-                flush();
-                return true;
-            case FrameType::StreamsBlocked:
-                // §19.14: the limit names a stream count, and one that would
-                // permit a stream id beyond 2^62-1 cannot be represented. Only
-                // the encoding is checked here; the count itself is a report, not
-                // a request, so there is nothing else to act on.
-                if (frame.limit > (1ULL << 60)) {
-                    transport_close(TransportError::FrameEncodingError, 0x16, "STREAMS_BLOCKED too large");
-                    return false;
-                }
-                flush();
-                return true;
-            case FrameType::NewConnectionId:
-                return on_new_connection_id(frame);
-            case FrameType::RetireConnectionId:
-                if (frame.sequence >= m_next_cid_sequence) {
-                    transport_close(TransportError::ProtocolViolation, 0x19,
-                                    "RETIRE_CONNECTION_ID for an unissued sequence");
-                    return false;
-                }
-                return true;
-            case FrameType::PathChallenge:
-                return on_path_challenge(frame);
-            case FrameType::PathResponse:
-                return on_path_response(frame);
-            case FrameType::ConnectionClose:
-                // The peer is done. Stop without answering: two endpoints
-                // exchanging closes is how a connection never dies. The code and
-                // reason are the peer's whole diagnosis, so they are logged —
-                // silently treating it as "the connection ended" throws away the
-                // only explanation of why.
-                SIMPLE_HTTP_WARN_LOG("QUIC: peer closed the connection: app={} code=0x{:x} frame=0x{:x} reason={}",
-                                     frame.application, frame.error_code, frame.frame_type, frame.reason);
-                m_alive = false;
-                return false;
-            case FrameType::HandshakeDone:
-                transport_close(TransportError::ProtocolViolation, 0x1e, "HANDSHAKE_DONE from a client");
-                return false;
-            case FrameType::NewToken:
-                transport_close(TransportError::ProtocolViolation, 0x07, "NEW_TOKEN from a client");
-                return false;
-        }
-        return true;
-    }
-
-    bool on_ack(const Frame& frame, PacketNumberSpace space) {
-        AckOutcome outcome;
-        if (!m_recovery.on_ack_received(frame, space, Clock::now(), outcome)) {
-            transport_close(TransportError::ProtocolViolation, 0x02, "ACK for an unsent packet");
-            return false;
-        }
-
-        std::set<std::uint64_t> acked_control;
-        for (const SentPacket& packet : outcome.acked) {
-            for (const std::uint64_t id : packet.control_ids) acked_control.insert(id);
-            apply_ranges(packet, /*lost=*/false);
-        }
-        for (const SentPacket& packet : outcome.lost) apply_ranges(packet, /*lost=*/true);
-
-        for (auto it = m_pending_control.begin(); it != m_pending_control.end();) {
-            if (acked_control.count(it->id) != 0) {
-                it = m_pending_control.erase(it);
-            } else {
-                ++it;
-            }
-        }
-        for (SentPacket& packet : outcome.lost) {
-            for (const std::uint64_t id : packet.control_ids) {
-                for (auto& control : m_pending_control) {
-                    if (control.id == id) control.in_flight = false;
-                }
-            }
-            packet.control_ids.clear();
-        }
-
-        // Our acknowledgement of the peer's packets is only useful until the peer
-        // says it has received it. Once it has, repeating those ranges would grow
-        // the ACK frame forever.
-        //
-        // The number to forget below is the *peer's*, and it comes from the
-        // packet the peer just acknowledged: that packet carried an ACK frame
-        // saying "I have your packets up to N", and now that the peer has the
-        // packet, it has that statement. This connection's own largest-acked is a
-        // number in a different space entirely — both count from zero in
-        // parallel and neither bounds the other — so pruning by it discards
-        // ranges the peer was never told about. The ACK frame built next then
-        // says nothing has been received at all, and the peer retransmits
-        // everything it had already been told about: a round trip of stall per
-        // occurrence, intermittent because it depends on how the two packet
-        // number sequences happen to drift past each other.
-        const std::size_t index = space_index(space);
-        for (const SentPacket& packet : outcome.acked) {
-            if (packet.acked_peer_largest != kNoPeerAck) {
-                m_acks[index].drop_below(packet.acked_peer_largest);
-            }
-        }
-
-        if (!outcome.acked.empty()) m_probe_pending = false;
-        flush();
-        return true;
-    }
-
-    // Hand one packet's byte ranges back to whatever owns them.
-    void apply_ranges(const SentPacket& packet, bool lost) {
-        for (const StreamRange& range : packet.ranges) {
-            if (range.crypto) {
-                if (lost) {
-                    m_tls.crypto_lost(level_for_space(range.space), range.offset, range.length);
-                } else {
-                    m_tls.crypto_acked(level_for_space(range.space), range.offset, range.length);
-                }
-                continue;
-            }
-            auto stream = find_stream(range.stream_id);
-            if (!stream) continue;
-            if (lost) {
-                stream->send.on_lost(range.offset, range.length);
-            } else {
-                stream->send.on_acked(range.offset, range.length);
-                on_stream_acked(*stream);
-            }
-        }
-    }
-
-    void on_stream_acked(QuicStreamState& stream) {
-        // Wake a producer parked on the outbound watermark.
-        if (stream.write_space && stream.send.buffered() <= kStreamOutLowWatermark) {
-            (void)stream.write_space->try_send(error_code{});
-        }
-        retire_stream_if_done(stream);
-    }
-
-    bool on_crypto(const Frame& frame, EncryptionLevel level) {
-        if (m_tls.crypto_pending(level) > m_config.max_crypto_buffer) {
-            transport_close(TransportError::CryptoBufferExceeded, 0x06, "crypto buffer exceeded");
-            return false;
-        }
-        if (!m_tls.provide_crypto(level, frame.offset, frame.data)) {
-            transport_close(TransportError::ProtocolViolation, 0x06, "crypto data at the wrong level");
-            return false;
-        }
-        return drive_handshake();
-    }
-
-    // Advance the TLS handshake as far as the crypto data on hand allows.
-    bool drive_handshake() {
-        if (!m_tls.valid()) return true;
-        for (;;) {
-            const QuicTls::Status status = m_tls.tick();
-            if (status == QuicTls::Status::Error) {
-                transport_close(TransportError::InternalError, kNoFrame, "TLS handshake failed");
-                return false;
-            }
-            if (status == QuicTls::Status::WantData) break;
-            // A completed handshake keeps being ticked: post-handshake messages
-            // (NewSessionTicket, a KeyUpdate) arrive through the same path.
-            if (m_tls.complete()) break;
-        }
-        if (m_tls.complete() && !m_handshake_complete) {
-            const std::string alpn = m_tls.alpn_selected();
-            if (alpn != kHttp3Alpn) {
-                // OpenSSL checked that *an* ALPN was negotiated, not that it was
-                // ours. A client that offered only something else must be turned
-                // away rather than served HTTP/3 it did not ask for.
-                transport_close(TransportError::InternalError, kNoFrame, "ALPN is not h3");
-                return false;
-            }
-            m_handshake_complete = true;
-            SIMPLE_HTTP_DEBUG_LOG("QUIC: handshake complete (peer {}, alpn={})", m_peer.address().to_string(),
-                                 alpn);
-            m_recovery.set_handshake_confirmed(true);
-            m_recovery.set_handshake_keys_available(true);
-            m_send_handshake_done = true;
-            replay_undecryptable();
-            return on_handshake_complete();
-        }
-        flush();
-        return true;
-    }
-
-    // Packets that arrived before their keys did are replayed once the keys
-    // exist (RFC 9001 §5.7) — for a server that is the client's 1-RTT flight.
-    void replay_undecryptable() {
-        if (m_undecryptable.empty()) return;
-        std::vector<Bytes> pending;
-        pending.swap(m_undecryptable);
-        for (Bytes& packet : pending) {
-            PacketHeader hdr;
-            Reader r = reader_of(packet);
-            if (parse_packet_header(r, m_local_scid.size(), hdr) != PacketParseStatus::Ok) continue;
-            const EncryptionLevel level = hdr.long_header && hdr.type == LongHeaderType::ZeroRtt
-                                              ? EncryptionLevel::ZeroRtt
-                                              : EncryptionLevel::OneRtt;
-            if (!receive_keys(level) || !receive_keys(level)->valid) {
-                m_undecryptable.push_back(std::move(packet));
-                continue;
-            }
-            process_protected_packet(std::move(packet), hdr, level, space_of_level(level));
-        }
-    }
-
-    bool on_handshake_complete() {
-        // The peer's transport parameters are validated now that they are
-        // authenticated: the connection IDs they name must match what was
-        // actually observed, which is what detects an attacker rewriting a
-        // connection ID in flight (RFC 9000 §7.3).
-        const std::string_view encoded = m_tls.peer_transport_params();
-        if (encoded.empty()) {
-            // RFC 9001 §8.2: a ClientHello with no quic_transport_parameters
-            // extension is answered with the missing_extension alert, and §4.8
-            // turns a TLS alert into a CRYPTO_ERROR whose code is 0x100 + the
-            // alert. Reporting TRANSPORT_PARAMETER_ERROR instead — which is what
-            // decoding an empty buffer produces — sends the peer looking for a
-            // parameter it never wrote.
-            transport_close(static_cast<TransportError>(0x100 + 109), kNoFrame,
-                            "no quic_transport_parameters extension");
-            return false;
-        }
-        TransportParams peer_params;
-        if (!decode_transport_params(
-                std::span<const std::uint8_t>{reinterpret_cast<const std::uint8_t*>(encoded.data()),
-                                              encoded.size()},
-                /*from_client=*/true, peer_params)) {
-            transport_close(TransportError::TransportParameterError, kNoFrame, "invalid peer parameters");
-            return false;
-        }
-        if (peer_params.initial_source_connection_id != m_peer_scid) {
-            transport_close(TransportError::TransportParameterError, kNoFrame,
-                            "initial_source_connection_id mismatch");
-            return false;
-        }
-
-        m_peer_max_data = peer_params.initial_max_data;
-        m_peer_initial_max_stream_data_bidi_local = peer_params.initial_max_stream_data_bidi_local;
-        m_peer_initial_max_stream_data_bidi_remote = peer_params.initial_max_stream_data_bidi_remote;
-        m_peer_initial_max_stream_data_uni = peer_params.initial_max_stream_data_uni;
-        m_peer_max_streams_bidi = peer_params.initial_max_streams_bidi;
-        m_peer_max_streams_uni = peer_params.initial_max_streams_uni;
-        m_recovery.set_peer_ack_delay_exponent(peer_params.ack_delay_exponent);
-        m_peer_max_udp_payload_size = peer_params.max_udp_payload_size;
-        // The datagram size we may send is bounded by what the peer will accept,
-        // and by our own conservative 1200 until path MTU is discovered.
-        m_max_datagram_size = static_cast<std::size_t>(
-            std::min<std::uint64_t>(peer_params.max_udp_payload_size, kMaxDatagramSize));
-
-        // Streams created before their windows were known get the real limits
-        // now; anything created later is made with them.
-        for (auto& [id, stream] : m_streams) {
-            const bool local = stream_is_local(id, /*server=*/true);
-            const bool bidi = stream_is_bidi(id);
-            std::uint64_t limit = 0;
-            if (bidi) {
-                limit = local ? m_peer_initial_max_stream_data_bidi_remote
-                              : m_peer_initial_max_stream_data_bidi_local;
-            } else {
-                limit = m_peer_initial_max_stream_data_uni;
-            }
-            // Only the send window is filled in here: the receive window was
-            // ours from the start and make_stream already set it.
-            stream->send_max_data = std::max(stream->send_max_data, limit);
-        }
-
-        // A server must issue connection IDs up to the peer's limit so the peer
-        // can migrate with them (RFC 9000 §5.1.1).
-        issue_connection_id();
-
-        // Initial and Handshake are done, and both spaces go. Dropping a space
-        // drops its packets from loss recovery — a packet the peer can no longer
-        // acknowledge would otherwise stay in flight forever, firing PTOs for a
-        // space that will never produce another packet, and the exponential
-        // backoff those PTOs drive is shared with the space that is still doing
-        // work (RFC 9001 §4.9.2, RFC 9002 §B.9).
-        m_initial_tx = PacketKeys{};
-        m_initial_rx = PacketKeys{};
-        m_recovery.discard_space(PacketNumberSpace::Initial);
-        m_recovery.discard_space(PacketNumberSpace::Handshake);
-        m_recovery.set_handshake_confirmed(true);
-        flush();
-        return true;
-    }
-
-
-    // Resolve a stream a control frame named, creating it if the peer was
-    // entitled to open it.
-    //
-    // The RFC's rule is asymmetric and easy to invert: a *locally-initiated*
-    // stream that has not been created is a stream state error (§19.4, §19.5,
-    // §19.10), while a frame naming a peer-initiated stream the peer may open
-    // *creates* it — the peer is not obliged to send a STREAM frame first when
-    // all it wants to do is raise our window or cancel what we owe it. Getting
-    // this backwards makes a connection that works against a hand-written client
-    // fail against a real one, because a real one opens the stream and adjusts
-    // its window from the same flight.
-    // `error` is an id the peer had no right to name — a stream state error.
-    // `stale` is an id whose stream is closed and forgotten: legal to receive,
-    // and nothing to do with it.
-    std::shared_ptr<QuicStreamState> resolve_peer_stream(std::uint64_t id, bool& error, bool& stale) {
-        error = false;
-        stale = false;
-        if (auto stream = find_stream(id)) return stream;
-        if (id > kMaxStreamId || !is_remote_stream(id)) {
-            SIMPLE_HTTP_WARN_LOG("QUIC: frame named stream {} which is local and never created", id);
-            error = true;
-            return nullptr;
-        }
-        const bool bidi = stream_is_bidi(id);
-        const std::uint64_t limit = bidi ? m_local_max_streams_bidi : m_local_max_streams_uni;
-        if (id / 4 >= limit || m_streams.size() >= m_config.max_streams) {
-            SIMPLE_HTTP_WARN_LOG("QUIC: stream {} is above the limit ({} created, limit {})", id, m_streams.size(),
-                                 limit);
-            error = true;
-            return nullptr;
-        }
-        // A control frame naming a stream this endpoint has already retired is
-        // stale — recreating it would hand the engine a stream it has already
-        // finished with. The test is the retirement record, not how far the peer
-        // has opened: the ids of one direction are consecutive, so a lower id
-        // whose first frame is still in flight looks exactly like a retired one
-        // when only the index is consulted.
-        if (peer_stream_retired(id)) {
-            stale = true;
-            return nullptr;
-        }
-        auto transport = make_stream(id);
-        (void)transport;
-        m_incoming.push_back(id);
-        (void)m_stream_notify->try_send(error_code{});
-        return find_stream(id);
-    }
-
-    bool on_stream_frame(const Frame& frame) {
-        const std::uint64_t id = frame.stream_id;
-        if (id > kMaxStreamId) {
-            transport_close(TransportError::FrameEncodingError, 0x08, "stream id too large");
-            return false;
-        }
-        if (!is_remote_stream(id)) {
-            // Client-initiated ids are 0 and 2; a client sending on 1 or 3 is
-            // sending on a stream it does not own.
-            transport_close(TransportError::StreamStateError, 0x08, "data on a locally-initiated stream");
-            return false;
-        }
-        const bool bidi = stream_is_bidi(id);
-        const std::uint64_t index = id / 4;
-        const std::uint64_t limit = bidi ? m_local_max_streams_bidi : m_local_max_streams_uni;
-        if (index >= limit) {
-            transport_close(TransportError::StreamLimitError, 0x08, "stream id above our limit");
-            return false;
-        }
-        // Stream ids of one kind are consecutive, so the highest index seen is
-        // one less than the number opened. The credit rule below needs that
-        // number to tell "the peer still has room" from "the peer is stuck".
-        if (bidi) {
-            m_peer_bidi_opened = std::max(m_peer_bidi_opened, index + 1);
-        } else {
-            m_peer_uni_opened = std::max(m_peer_uni_opened, index + 1);
-        }
-
-        auto stream = find_stream(id);
-        if (!stream) {
-            // A missing stream is not necessarily a new one. A stream this
-            // endpoint has already retired is gone from the table, and a
-            // *retransmission* of its data would otherwise look like the peer
-            // opening it afresh — handing the engine the same request a second
-            // time. Only the retirement record answers that, and answering it by
-            // index alone is wrong: delivery order is not opening order, so a
-            // stream whose first frame is still in flight sits below ids that
-            // have already arrived and would be dropped as a retransmission. A
-            // dropped *critical* stream leaves nothing to unblock the field
-            // sections waiting on it, and the connection answers no further.
-            //
-            // (The frame is still acknowledged: whether we have anything to do
-            // with the data is a separate question from whether it arrived.)
-            if (peer_stream_retired(id)) return true;
-
-            if (m_streams.size() >= m_config.max_streams) {
-                transport_close(TransportError::StreamLimitError, 0x08, "too many streams");
-                return false;
-            }
-            auto transport = make_stream(id);
-            (void)transport;
-            stream = find_stream(id);
-            m_incoming.push_back(id);
-            (void)m_stream_notify->try_send(error_code{});
-        }
-        // A STREAM frame on a stream the peer has already finished is not an
-        // error: RFC 9000 §19.8 permits retransmission of data below the final
-        // size, and a peer that repeats a frame because it believes the first
-        // was lost is doing exactly that. What *is* an error — data past the
-        // final size — is caught by the reassembler below, which knows the size
-        // and ignores what it already has; rejecting the frame here would refuse
-        // the retransmission as well.
-
-        const std::uint64_t end = frame.offset + frame.data.size();
-        // Connection-level flow control counts the growth of every stream's high
-        // mark, and exceeding it is a connection error — unlike the stream-level
-        // limit below, which must not take the connection down.
-        if (end > stream->recv_highest) {
-            if (m_recv_data + (end - stream->recv_highest) > m_recv_max_data) {
-                transport_close(TransportError::FlowControlError, 0x08, "connection flow control exceeded");
-                return false;
-            }
-        }
-        if (end > stream->recv.max_data()) {
-            reset_stream_impl(stream, static_cast<std::uint64_t>(TransportError::FlowControlError));
-            return true;
-        }
-
-        if (!stream->recv.push(frame.offset, frame.data, frame.fin)) {
-            transport_close(TransportError::FinalSizeError, 0x08, "stream final size conflict");
-            return false;
-        }
-        if (end > stream->recv_highest) {
-            m_recv_data += end - stream->recv_highest;
-            stream->recv_highest = end;
-        }
-        if (frame.fin) stream->remote_closed = true;
-        if (stream->notify) (void)stream->notify->try_send(error_code{});
-        return true;
-    }
-
-    bool on_reset_stream(const Frame& frame) {
-        bool bad = false;
-        bool stale = false;
-        auto stream = resolve_peer_stream(frame.stream_id, bad, stale);
-        if (stale) return true;  // a frame about a stream that is closed and forgotten
-        if (bad) {
-            transport_close(TransportError::StreamStateError, 0x04,
-                            "RESET_STREAM for unopened local stream");
-            return false;
-        }
-        // A RESET_STREAM for a stream that has already finished is not an error:
-        // the stream moves from "Data Recvd" to "Reset Recvd" (RFC 9000 §3.2), and
-        // a repeat of one already received is redundant — the peer is entitled to
-        // resend it if it thinks the first was lost. Refusing either would let a
-        // perfectly ordinary teardown kill the connection.
-        if (stream->recv.reset_received()) return true;
-        // The final size still has to agree with what already arrived, or a peer
-        // could shrink a stream it had already grown.
-        if (frame.final_size < stream->recv_highest) {
-            transport_close(TransportError::FinalSizeError, 0x04, "RESET_STREAM final size too small");
-            return false;
-        }
-        stream->recv.reset(frame.error_code);
-        stream->remote_closed = true;
-        stream->send.reset(frame.error_code);
-        if (stream->notify) (void)stream->notify->try_send(error_code{});
-        retire_stream_if_done(*stream);
-        return true;
-    }
-
-    bool on_stop_sending(const Frame& frame) {
-        bool bad = false;
-        bool stale = false;
-        auto stream = resolve_peer_stream(frame.stream_id, bad, stale);
-        if (stale) return true;  // a frame about a stream that is closed and forgotten
-        if (bad) {
-            transport_close(TransportError::StreamStateError, 0x05,
-                            "STOP_SENDING for unopened local stream");
-            return false;
-        }
-        // The peer does not want our data. Answering with RESET_STREAM is what
-        // makes STOP_SENDING a request rather than a notification
-        // (RFC 9000 §3.5).
-        if (!stream->send.reset_sent()) {
-            reset_stream_impl(stream, frame.error_code);
-        }
-        return true;
-    }
-
-    bool on_new_connection_id(const Frame& frame) {
-        if (frame.sequence >= 8) {
-            // More than a handful is more than we will hold; the peer's
-            // active_connection_id_limit is what bounds it in practice.
-            transport_close(TransportError::ConnectionIdLimitError, 0x18, "too many connection IDs");
-            return false;
-        }
-        if (frame.retire_prior_to > frame.sequence) {
-            transport_close(TransportError::FrameEncodingError, 0x18, "retire_prior_to above sequence");
-            return false;
-        }
-        m_peer_cids[frame.sequence] = frame.connection_id;
-        return true;
-    }
-
-    bool on_path_challenge(const Frame& frame) {
-        // The response goes to the address the challenge came from, not to the
-        // address we currently think the peer is at: that is the whole point of
-        // the exchange (RFC 9000 §8.2).
-        Bytes response;
-        append_path_response(response, frame.path_data);
-        queue_control(std::move(response));
-        flush();
-        return true;
-    }
-
-    bool on_path_response(const Frame& frame) {
-        if (!m_migration_peer.has_value() || frame.path_data != m_migration_challenge) return true;
-        // The new path works. Switch to it and start a fresh congestion window:
-        // the old window measured a different path and has nothing to say about
-        // this one (RFC 9000 §9.4).
-        m_peer = *m_migration_peer;
-        m_migration_peer.reset();
-        m_recovery.congestion() = NewReno(m_max_datagram_size);
-        m_recovery.set_address_validated(true);
-        issue_connection_id();
-        if (!m_pending_migrating_datagram.empty()) {
-            Bytes replay = std::move(m_pending_migrating_datagram);
-            m_pending_migrating_datagram.clear();
-            process_datagram(std::span<const std::uint8_t>{
-                reinterpret_cast<const std::uint8_t*>(replay.data()), replay.size()});
-        }
-        return true;
-    }
-
-    // Returns false when the datagram must not be processed as the peer's.
-    bool on_migrating_datagram(std::span<const std::uint8_t> data, const asio::ip::udp::endpoint& from) {
-        if (m_config.disable_active_migration) return false;
-        if (m_migration_peer.has_value() && *m_migration_peer == from) {
-            // A challenge is already outstanding for this address; hold the
-            // datagram until the response proves it real.
-            m_pending_migrating_datagram.assign(reinterpret_cast<const char*>(data.data()), data.size());
-            return false;
-        }
-        // A packet from an unfamiliar address could be a migration or a spoof.
-        // The only way to tell is to make the peer prove it can receive there,
-        // so a challenge goes out and the datagram waits (RFC 9000 §9).
-        m_migration_peer = from;
-        for (auto& byte : m_migration_challenge) byte = static_cast<std::uint8_t>(m_random());
-        Bytes challenge;
-        append_path_challenge(challenge, m_migration_challenge);
-        queue_control(std::move(challenge));
-        m_pending_migrating_datagram.assign(reinterpret_cast<const char*>(data.data()), data.size());
-        flush();
-        return false;
-    }
-
-    void issue_connection_id() {
-        if (m_next_cid_sequence >= 2) return;
-        const std::uint64_t sequence = m_next_cid_sequence++;
-        std::string cid = m_cid_factory ? m_cid_factory() : std::string(m_config.connection_id_length, '\0');
-        std::array<std::uint8_t, 16> token{};
-        for (auto& byte : token) byte = static_cast<std::uint8_t>(m_random());
-        m_issued_cids[sequence] = cid;
-        Bytes frame;
-        append_new_connection_id(frame, sequence, 0, cid, token);
-        queue_control(std::move(frame));
-    }
-
-    // --- housekeeping -----------------------------------------------------
-
-    void reset_stream_impl(const std::shared_ptr<QuicStreamState>& stream, std::uint64_t error_code) {
-        if (!stream || stream->send.reset_sent()) return;
-        stream->send.reset(error_code);
-        Bytes frame;
-        // The final size is this endpoint's own: it is the size of the stream in
-        // the direction *we* send (§19.4). `recv_highest` is the other direction
-        // — what the peer sent us — and announcing it here tells the peer we sent
-        // fewer octets than it has already received, which §4.5 makes it close the
-        // whole connection over (FINAL_SIZE_ERROR). Cancelling a large download is
-        // the ordinary way to reach this: the request head is a few hundred bytes
-        // and the response already on the wire is not.
-        append_reset_stream(frame, stream->id, error_code, stream->send.next_offset());
-        queue_control(std::move(frame));
-        if (stream->notify) stream->notify->close();
-        flush();
-    }
-
-    void retire_stream(std::uint64_t id) {
-        auto it = m_streams.find(id);
-        if (it == m_streams.end()) return;
-        if (it->second->notify) it->second->notify->close();
-        if (it->second->write_space) it->second->write_space->close();
-        m_streams.erase(it);
-        m_transports.erase(id);
-        {
-            static const auto t0 = Clock::now();
-            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
-            SIMPLE_HTTP_INFO_LOG("QUIC: retired stream {} at {}ms ({} live)", id, ms, m_streams.size());
-        }
-        if (is_remote_stream(id)) {
-            record_peer_stream_retired(id);
-            credit_stream_slot(stream_is_bidi(id));
-        }
-    }
-
-    // --- which peer streams are already retired ---------------------------
-    //
-    // The only reason to drop a frame naming a stream this endpoint does not have
-    // is that the stream was *retired* — a retransmission of data the engine has
-    // finished with. "Below the highest id the peer has opened" does not mean
-    // that: the peer opens the streams of one direction consecutively, but the
-    // frames arrive in whatever order the network delivers them, so an id below
-    // the highest seen may simply be a stream whose first frame is later.
-    //
-    // Retirement is recorded per direction as a watermark over the ids that
-    // retired in order, plus the ones that retired ahead of it. Traffic retires
-    // in order, so the set stays empty; a stream that never arrives holds the
-    // watermark back, and with it the stream credit, which is what keeps the set
-    // bounded by the credit in flight rather than by the life of the connection.
-    [[nodiscard]] bool peer_stream_retired(std::uint64_t id) const {
-        const std::uint64_t index = id / 4;
-        if (stream_is_bidi(id)) {
-            return index < m_peer_bidi_retired_below || m_peer_bidi_retired_ooo.contains(index);
-        }
-        return index < m_peer_uni_retired_below || m_peer_uni_retired_ooo.contains(index);
-    }
-
-    void record_peer_stream_retired(std::uint64_t id) {
-        const std::uint64_t index = id / 4;
-        const bool bidi = stream_is_bidi(id);
-        auto& below = bidi ? m_peer_bidi_retired_below : m_peer_uni_retired_below;
-        auto& ooo = bidi ? m_peer_bidi_retired_ooo : m_peer_uni_retired_ooo;
-        if (index != below) {
-            ooo.insert(index);
-            return;
-        }
-        ++below;
-        while (ooo.erase(below) != 0) ++below;
-    }
-
-    // A stream the peer opened has closed, so its slot can be advertised again.
-    //
-    // The limit is *cumulative* (RFC 9000 §4.6), which means closing a stream
-    // frees nothing by itself: until the credit is sent, the peer is simply out.
-    // A connection that never sends MAX_STREAMS serves exactly as many requests
-    // as it first advertised and then stops — which is what a load run against
-    // it shows, at precisely the initial_max_streams count.
-    //
-    // Batched, because a frame per closed stream is overhead on every one of
-    // them; but flushed the moment the peer might be out, because §4.6 is
-    // explicit that an endpoint must not wait to be told: the peer would be
-    // blocked for a round trip at best, and forever if it never sends
-    // STREAMS_BLOCKED.
-    void credit_stream_slot(bool bidi) {
-        if (bidi) {
-            ++m_stream_credit_bidi;
-        } else {
-            ++m_stream_credit_uni;
-        }
-        const std::uint64_t accrued = bidi ? m_stream_credit_bidi : m_stream_credit_uni;
-        const std::uint64_t limit = bidi ? m_local_max_streams_bidi : m_local_max_streams_uni;
-        const std::uint64_t opened = bidi ? m_peer_bidi_opened : m_peer_uni_opened;
-        // The peer is out — or would be after the credit it does not know about
-        // yet — so this cannot wait for a batch.
-        const bool peer_may_be_stuck = opened + accrued >= limit;
-        if (!peer_may_be_stuck && accrued < kStreamCreditBatch) return;
-
-        if (bidi) {
-            m_stream_credit_bidi = 0;
-            m_local_max_streams_bidi += accrued;
-        } else {
-            m_stream_credit_uni = 0;
-            m_local_max_streams_uni += accrued;
-        }
-        Bytes frame;
-        append_max_streams(frame, bidi ? m_local_max_streams_bidi : m_local_max_streams_uni, bidi);
-        queue_control(std::move(frame));
-        flush();
-    }
-
-    void retire_stream_if_done(QuicStreamState& stream) {
-        // Both halves have to be over, and on the send side "over" is not "the
-        // buffer is empty right now". The peer's FIN arrives with the request,
-        // long before the response is written, so `remote_closed` is true from the
-        // start; and `all_acked` is true whenever nothing is buffered, which for a
-        // stream that has written one chunk and not yet the next is exactly the
-        // state after that chunk is acknowledged. Retiring there drops the stream
-        // the application is still writing to: the next write succeeds — nothing
-        // marks the stream closed — and the bytes go nowhere, because the send
-        // path walks `m_streams` and this entry is gone. A streamed response is
-        // then truncated in silence.
-        //
-        // So a stream the application has written to waits for its FIN to be
-        // acknowledged. A stream it never wrote to has no FIN to wait for, and
-        // that is not a special case but the ordinary shape of a peer's
-        // unidirectional stream: requiring a FIN there would keep every control
-        // and QPACK stream in the table for the life of the connection.
-        // Both halves have to be over, and on the send side "over" is not "the
-        // buffer is empty right now". The peer's FIN arrives with the request,
-        // long before the response is written, so `remote_closed` is true from the
-        // start; and `all_acked` is true whenever nothing is outstanding, which
-        // for a stream that has written one chunk and not yet the next is exactly
-        // the state after that chunk is acknowledged. Retiring there drops the
-        // stream the application is still writing to: the next write succeeds —
-        // nothing marks the stream closed — and the bytes go nowhere, because the
-        // send path walks `m_streams` and this entry is gone. A streamed response
-        // is then truncated in silence. See `SendStream::send_complete`.
-        if (stream.remote_closed && stream.send.send_complete()) retire_stream(stream.id);
-    }
-
-    // A stream the peer initiated: the low bit of its id says who opened it, and
-    // a client's streams all have it clear.
-    [[nodiscard]] static bool is_remote_stream(std::uint64_t id) noexcept {
-        return (id & kStreamIdInitiatorBit) == 0;
-    }
-
-    static PacketNumberSpace space_of_level(EncryptionLevel level) {
-        switch (level) {
-            case EncryptionLevel::Initial:
-                return PacketNumberSpace::Initial;
-            case EncryptionLevel::Handshake:
-                return PacketNumberSpace::Handshake;
-            default:
-                return PacketNumberSpace::Application;
-        }
-    }
-
-    static EncryptionLevel level_for_space(PacketNumberSpace space) {
-        switch (space) {
-            case PacketNumberSpace::Initial:
-                return EncryptionLevel::Initial;
-            case PacketNumberSpace::Handshake:
-                return EncryptionLevel::Handshake;
-            case PacketNumberSpace::Application:
-                return EncryptionLevel::OneRtt;
-        }
-        return EncryptionLevel::OneRtt;
-    }
-
-    asio::awaitable<void> timer_loop() {
-        asio::steady_timer timer{m_executor};
-        for (;;) {
-            if (!m_alive) co_return;
-            const Clock::time_point now = Clock::now();
-
-            Clock::time_point wake = m_deadline;
-            const auto [loss_time, loss_space] = m_recovery.loss_time();
-            if (loss_time != Clock::time_point{} && loss_time < wake) wake = loss_time;
-            const auto [pto_time, pto_space] = m_recovery.pto(now);
-            if (pto_time != Clock::time_point{} && pto_time < wake) wake = pto_time;
-            if (m_closing || !m_recovery.has_ack_eliciting_in_flight()) {
-                // Nothing outstanding means nothing to detect lost; only the
-                // idle timeout is left to watch, plus the closing state's grace
-                // period for the peer to see our close.
-                const Clock::time_point closing_deadline = now + 3 * m_recovery.rtt().pto_base();
-                if (m_closing && closing_deadline < wake) wake = closing_deadline;
-            }
-            if (wake <= now) wake = now + std::chrono::milliseconds(1);
-
-            timer.expires_at(wake);
-            co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
-            if (!m_alive) co_return;
-
-            const Clock::time_point fired = Clock::now();
-            if (fired >= m_deadline) {
-                // Nothing has arrived for the idle timeout, so the connection is
-                // over whether or not either side says so.
-                m_alive = false;
-                co_return;
-            }
-            if (m_closing && fired >= now + 3 * m_recovery.rtt().pto_base()) {
-                m_alive = false;
-                co_return;
-            }
-
-            const auto [loss_now, loss_space_now] = m_recovery.loss_time();
-            if (loss_now != Clock::time_point{} && fired >= loss_now) {
-                AckOutcome outcome;
-                m_recovery.on_loss_timeout(loss_space_now, fired, outcome);
-                for (const SentPacket& packet : outcome.lost) {
-                    apply_ranges(packet, /*lost=*/true);
-                    for (const std::uint64_t id : packet.control_ids) {
-                        for (auto& control : m_pending_control) {
-                            if (control.id == id) control.in_flight = false;
-                        }
-                    }
-                }
-                flush();
-                continue;
-            }
-
-            auto [pto_now, pto_space_now] = m_recovery.pto(fired);
-            if (pto_now != Clock::time_point{} && fired >= pto_now) {
-                // A probe: the peer has been silent for a PTO, so something has
-                // to go out that demands an acknowledgement, even if nothing new
-                // is queued (RFC 9002 §6.2.4: "a sender MUST send at least one
-                // ack-eliciting packet ... as a probe"). Without it a connection
-                // whose only loss was the last packet would wait forever.
-                //
-                // It goes out unconditionally, and that is the point. Queuing it
-                // only when nothing ack-eliciting is in flight assumes loss
-                // recovery is about to resend whatever is in flight — but
-                // detection needs a largest acknowledged to work from, so an
-                // opening flight that was lost in its entirety is never declared
-                // lost and never resent. The probe is then suppressed by the very
-                // packet it should be replacing: the endpoint sends ACK-only
-                // packets, which elicit nothing, the peer stays silent, the PTO
-                // doubles, and the connection spends the rest of its life backing
-                // off through a space it will never leave.
-                m_recovery.on_pto_fired();
-                m_probe_pending = true;
-                m_probe_space = pto_space_now;
-                // The probe carries whatever the peer is missing, when there is
-                // such a packet: a bare PING elicits an acknowledgement and
-                // nothing else, which is not enough when what the peer is waiting
-                // for is our data. See LossRecovery::on_pto_probe.
-                {
-                    AckOutcome outcome;
-                    m_recovery.on_pto_probe(pto_space_now, outcome);
-                    for (const SentPacket& packet : outcome.lost) apply_ranges(packet, /*lost=*/true);
-                }
-                Bytes ping;
-                append_ping(ping);
-                queue_control(std::move(ping));
-                flush();
-            }
-        }
-    }
-
-    // --- state ------------------------------------------------------------
+    // --- internals ----------------------------------------------------------
+
+    void poke() noexcept;
+
+    // The engine, if it is still there. Every use goes through this — see the
+    // note on `m_protocol`.
+    [[nodiscard]] std::shared_ptr<Protocol> protocol() const noexcept { return m_protocol.lock(); }
+
+    // Write everything ngtcp2 has to send. Returns false if the connection must
+    // be torn down (and has been).
+    [[nodiscard]] bool flush_writes();
+    // Produce one packet's worth of stream data for ngtcp2. Called from inside
+    // ngtcp2's write loop, so: no allocation, no throw, no re-entry.
+    ngtcp2_ssize write_pkt(ngtcp2_path* path, ngtcp2_pkt_info* pi, std::uint8_t* dest, std::size_t destlen,
+                           ngtcp2_tstamp ts) noexcept;
+    // ngtcp2's timer expired — or, since any wake-up runs this, might have.
+    void handle_expiry_due();
+    // Emit the terminal packet and mark the connection finished.
+    void close_now();
+    // Turn a fatal ngtcp2 error into a close.
+    void fail(int liberr);
+    // Park until there is work or ngtcp2's timer expires.
+    asio::awaitable<void> wait_for_event();
+
+    void arm_timer();
 
     Executor m_executor;
+    Timer m_timer;
+    Channel m_wake;
+    // Latched once when the connection finishes. Capacity 1 means a close that
+    // happens before anyone waits is still observed by the waiter — which is
+    // the common case, since the engine's `run()` usually outlives the closes.
+    Channel m_closed_signal;
+
     QuicConnectionConfig m_config;
-    std::string m_original_dcid;
-    std::string m_peer_scid;
-    std::string m_local_scid;
-    QuicDatagramSink m_sink;
-    asio::ip::udp::endpoint m_peer;
-    std::function<std::string()> m_cid_factory;
+    QuicBootstrap m_bootstrap;
+    std::vector<std::uint32_t> m_versions;
+    asio::ip::udp::endpoint m_local;
+    asio::ip::udp::endpoint m_remote;
+    DatagramSink m_sink;
 
-    QuicTls m_tls;
-    PacketKeys m_initial_tx;
-    PacketKeys m_initial_rx;
-    PacketKeys m_zero_rtt_rx;
-    PacketKeys m_one_rtt_rx;
-    PacketKeys m_one_rtt_tx;
-    bool m_key_phase{false};
+    QuicCrypto m_crypto;
+    ngtcp2_conn* m_conn{nullptr};
+    ngtcp2_ccerr m_last_error{};
+    ngtcp2_cid m_scid{};
 
-    LossRecovery m_recovery;
-    std::array<AckTracker, kPacketNumberSpaceCount> m_acks{};
-    std::array<std::uint64_t, kPacketNumberSpaceCount> m_next_pn{};
-    // Whether an acknowledgement is *owed* for each space. Distinct from "the
-    // tracker has ranges": those stay recorded so a duplicate can be recognised,
-    // and treating them as a reason to send would make the write loop spin
-    // forever on the same ACK frame.
-    std::array<bool, kPacketNumberSpaceCount> m_ack_owed{};
+    // Held *weakly*, and that is load-bearing. The engine owns this connection
+    // (it holds a shared_ptr to it), so a strong reference here would close the
+    // loop: neither object's count ever reaches zero and the connection — with
+    // its ngtcp2 connection, its nghttp3 connection and its SSL — is never
+    // destroyed. A sanitizer run over the h3 load found exactly that: 200
+    // connections, 200 leaked ngtcp2 connections, 24 MB.
+    //
+    // The engine outlives the connection because the server's serve callback
+    // holds it for as long as `run()` is on the stack, which is the connection's
+    // whole life. `lock()` is what makes each use safe: it keeps the engine
+    // alive for the duration of the call even if the connection is being torn
+    // down inside it.
+    std::weak_ptr<Protocol> m_protocol;
+    // See set_protocol(): work that arrived before there was anyone to hand it
+    // to.
+    std::vector<PendingStreamData> m_pending_stream_data;
+    std::size_t m_pending_stream_bytes{0};
+    bool m_tx_keys_pending{false};
+    CidCallback m_on_new_cid;
+    CidRetireCallback m_on_retire_cid;
 
-    std::map<std::uint64_t, std::shared_ptr<QuicStreamState>> m_streams;
-    std::map<std::uint64_t, std::shared_ptr<StreamTransport>> m_transports;
-    std::deque<std::uint64_t> m_incoming;
-    std::shared_ptr<asio::experimental::concurrent_channel<void(error_code)>> m_stream_notify;
-    std::shared_ptr<asio::experimental::concurrent_channel<void(error_code)>> m_send_notify;
+    // Scratch for the scatter list handed to ngtcp2. A member rather than a
+    // local because the bytes have to survive until the packet is written, and
+    // because `write_pkt` runs inside ngtcp2's frame.
+    std::array<ngtcp2_vec, 8> m_vec_scratch{};
 
-    struct PendingControl {
-        Bytes bytes;
-        PacketNumberSpace space;
-        std::uint64_t id;
-        bool in_flight;
-        // The stream the frame is about, when it is about one. Checked at send
-        // time rather than at queue time: a credit is queued the moment the
-        // application consumes, and the FIN that makes it pointless can arrive
-        // in between.
-        std::uint64_t subject{kNoSubjectStream};
-    };
-    std::deque<PendingControl> m_pending_control;
-    std::uint64_t m_next_control_id{1};
-
-    // Flow control, both directions.
-    std::uint64_t m_peer_max_data{0};
-    std::uint64_t m_send_data{0};
-    std::uint64_t m_peer_initial_max_stream_data_bidi_local{0};
-    std::uint64_t m_peer_initial_max_stream_data_bidi_remote{0};
-    std::uint64_t m_peer_initial_max_stream_data_uni{0};
-    // HTTP/3 needs three unidirectional streams; a peer that grants none would
-    // make the protocol unusable, so this starts at the minimum it requires
-    // rather than at zero.
-    std::uint64_t m_peer_max_streams_bidi{0};
-    std::uint64_t m_peer_max_streams_uni{3};
-    std::uint64_t m_recv_max_data{0};
-    std::uint64_t m_recv_data{0};
-    std::uint64_t m_recv_consumed{0};
-    std::uint64_t m_recv_credited{0};
-    std::uint64_t m_recv_data_start{0};
-    std::uint64_t m_local_max_streams_bidi{0};
-    std::uint64_t m_local_max_streams_uni{0};
-    // How many streams of each kind the peer has opened, and how many of its
-    // closed ones have not been credited back yet.
-    std::uint64_t m_peer_bidi_opened{0};
-    std::uint64_t m_peer_uni_opened{0};
-    // Retired peer stream indices, as a watermark plus the ids that retired out
-    // of order — see peer_stream_retired().
-    std::uint64_t m_peer_bidi_retired_below{0};
-    std::uint64_t m_peer_uni_retired_below{0};
-    std::set<std::uint64_t> m_peer_bidi_retired_ooo;
-    std::set<std::uint64_t> m_peer_uni_retired_ooo;
-    std::uint64_t m_stream_credit_bidi{0};
-    std::uint64_t m_stream_credit_uni{0};
-    std::uint64_t m_next_local_bidi{1};  // a server's bidirectional streams: 1, 5, 9, ...
-    std::uint64_t m_next_local_uni{3};   // ... and unidirectional: 3, 7, 11, ...
-
-    std::map<std::uint64_t, std::string> m_peer_cids;
-    std::map<std::uint64_t, std::string> m_issued_cids;
-    std::uint64_t m_next_cid_sequence{1};
-
-    std::vector<Bytes> m_undecryptable;
-    std::optional<asio::ip::udp::endpoint> m_migration_peer;
-    std::array<std::uint8_t, 8> m_migration_challenge{};
-    Bytes m_pending_migrating_datagram;
-    PacketHeader m_version_negotiation_requested;
-
-    SSL_CTX* m_ssl_ctx{nullptr};
-    std::uint64_t m_bytes_received{0};
-    std::uint64_t m_bytes_sent{0};
-    std::size_t m_max_datagram_size{kMaxDatagramSize};
-    std::uint64_t m_peer_max_udp_payload_size{kDefaultMaxUdpPayloadSize};
-
-    std::uint64_t m_close_error{0};
-    std::uint64_t m_close_frame_type{kNoFrame};
-    std::string m_close_reason;
-    bool m_close_application{false};
+    bool m_closed{false};
+    bool m_init_failed{false};
     bool m_close_sent{false};
-    bool m_closing{false};
-    // How many datagrams of already-queued data may still go out before the
-    // CONNECTION_CLOSE. Enough for a small frame plus its retransmission, few
-    // enough that a peer which stopped reading cannot hold the close off.
-    unsigned m_close_drain{4};
-    bool m_handshake_complete{false};
-    bool m_send_handshake_done{false};
-    bool m_probe_pending{false};
-    PacketNumberSpace m_probe_space{PacketNumberSpace::Initial};
-    bool m_alive{true};
-
-    Clock::time_point m_deadline{};
-    Clock::time_point m_last_activity{};
-    std::mt19937_64 m_random{std::random_device{}()};
+    // Whether `m_last_error` carries a reason. ngtcp2's `ngtcp2_ccerr` has no
+    // "unset" state — `ngtcp2_ccerr_default` produces a valid transport error
+    // with code 0 — so "did anyone record why" has to be tracked separately, or
+    // a close for an unrelated reason would report itself as a clean transport
+    // close.
+    bool m_has_error{false};
 };
+
+// ---------------------------------------------------------------------------
+// Definition
+// ---------------------------------------------------------------------------
+
+template <typename Executor>
+bool QuicConnection<Executor>::init() {
+    if (m_init_failed) return false;
+
+    // Our Source Connection ID: the name the client will use from now on. It is
+    // ours to choose and must not be predictable (RFC 9000 §7.3), so it comes
+    // from the CSPRNG rather than a counter.
+    m_scid.datalen = std::min<std::size_t>(m_config.connection_id_length, NGTCP2_MAX_CIDLEN);
+    if (RAND_bytes(m_scid.data, static_cast<int>(m_scid.datalen)) != 1) {
+        SIMPLE_HTTP_ERROR_LOG("quic: could not generate a source connection id");
+        return false;
+    }
+
+    ngtcp2_cid client_scid{};
+    ngtcp2_cid_init(&client_scid, m_bootstrap.client_scid.data(), m_bootstrap.client_scid_len);
+    ngtcp2_cid original_dcid{};
+    ngtcp2_cid_init(&original_dcid, m_bootstrap.original_dcid.data(), m_bootstrap.original_dcid_len);
+
+    // The path is the quadruple ngtcp2 uses to identify where this connection
+    // lives. It copies the addresses into the connection, so a local storage
+    // object is enough.
+    ngtcp2_path_storage ps;
+    ngtcp2_path_storage_init(&ps, reinterpret_cast<const ngtcp2_sockaddr*>(m_local.data()),
+                             static_cast<ngtcp2_socklen>(m_local.size()),
+                             reinterpret_cast<const ngtcp2_sockaddr*>(m_remote.data()),
+                             static_cast<ngtcp2_socklen>(m_remote.size()), nullptr);
+
+    auto params = make_ngtcp2_params(m_config, now());
+    params.settings.available_versions = m_versions.data();
+    params.settings.available_versionslen = m_versions.size();
+    // The client's Retry token, if it presented one. ngtcp2 validates it
+    // during connection setup and rejects the connection itself when the token
+    // does not hold up, which is why the endpoint's only job was to route by
+    // CID.
+    params.settings.token = m_bootstrap.token.empty() ? nullptr : m_bootstrap.token.data();
+    params.settings.tokenlen = m_bootstrap.token.size();
+    params.settings.token_type = m_bootstrap.token_type;
+    // §7.3: the server must echo the client's original Destination Connection
+    // ID, and (after a Retry) the Source Connection ID the Retry carried. The
+    // client checks both against what it sent; a mismatch is a forged first
+    // flight and it tears the connection down.
+    params.transport.original_dcid = original_dcid;
+    params.transport.original_dcid_present = 1;
+    if (m_bootstrap.retried) {
+        params.transport.retry_scid = original_dcid;
+        params.transport.retry_scid_present = 1;
+    }
+
+    static constexpr ngtcp2_callbacks callbacks = [] {
+        ngtcp2_callbacks cb{};
+        // The whole crypto layer is the helper's, not ours: these ten callbacks
+        // are where the handshake, packet protection and key updates live.
+        cb.recv_client_initial = ngtcp2_crypto_recv_client_initial_cb;
+        cb.recv_crypto_data = ngtcp2_crypto_recv_crypto_data_cb;
+        cb.encrypt = ngtcp2_crypto_encrypt_cb;
+        cb.decrypt = ngtcp2_crypto_decrypt_cb;
+        cb.hp_mask = ngtcp2_crypto_hp_mask_cb;
+        cb.update_key = ngtcp2_crypto_update_key_cb;
+        cb.delete_crypto_aead_ctx = ngtcp2_crypto_delete_crypto_aead_ctx_cb;
+        cb.delete_crypto_cipher_ctx = ngtcp2_crypto_delete_crypto_cipher_ctx_cb;
+        cb.get_path_challenge_data2 = ngtcp2_crypto_get_path_challenge_data2_cb;
+        cb.version_negotiation = ngtcp2_crypto_version_negotiation_cb;
+        // Ours: the things only the application can answer.
+        cb.recv_stream_data = &QuicConnection::cb_recv_stream_data;
+        cb.acked_stream_data_offset = &QuicConnection::cb_acked_stream_data_offset;
+        cb.stream_close = &QuicConnection::cb_stream_close;
+        cb.stream_reset = &QuicConnection::cb_stream_reset;
+        cb.stream_stop_sending = &QuicConnection::cb_stream_stop_sending;
+        cb.extend_max_stream_data = &QuicConnection::cb_extend_max_stream_data;
+        cb.extend_max_remote_streams_bidi = &QuicConnection::cb_extend_max_remote_streams_bidi;
+        cb.recv_tx_key = &QuicConnection::cb_recv_tx_key;
+        cb.handshake_completed = &QuicConnection::cb_handshake_completed;
+        cb.get_new_connection_id2 = &QuicConnection::cb_get_new_connection_id;
+        cb.remove_connection_id = &QuicConnection::cb_remove_connection_id;
+        cb.rand = &QuicConnection::cb_rand;
+        return cb;
+    }();
+
+    const int rv = ngtcp2_conn_server_new(&m_conn, &client_scid, &m_scid, &ps.path, m_bootstrap.version, &callbacks,
+                                          &params.settings, &params.transport, ngtcp2_mem_default(), this);
+    if (rv != 0) {
+        SIMPLE_HTTP_ERROR_LOG("quic: ngtcp2_conn_server_new: {}", ngtcp2_strerror(rv));
+        m_conn = nullptr;
+        return false;
+    }
+    // Where the OpenSSL crypto helper keeps this connection's handshake state.
+    // ngtcp2 looks it up through the connection on every CRYPTO callback and
+    // dereferences the result, so this is not optional.
+    ngtcp2_conn_set_tls_native_handle(m_conn, m_crypto.native_handle());
+
+    // ngtcp2 pre-allocates `active_connection_id_limit` connection IDs, and the
+    // endpoint has to know all of them up front — a client may switch to any of
+    // them on its very next packet, and a datagram addressed to a CID we do not
+    // recognise is indistinguishable from one for a connection that no longer
+    // exists.
+    if (m_on_new_cid) {
+        const std::size_t count = ngtcp2_conn_get_scid2(m_conn, nullptr);
+        std::vector<ngtcp2_cid> cids(count);
+        ngtcp2_conn_get_scid2(m_conn, cids.data());
+        for (const ngtcp2_cid& cid : cids) {
+            m_on_new_cid(std::span<const std::uint8_t>{cid.data, cid.datalen}, {});
+        }
+    }
+    return true;
+}
+
+template <typename Executor>
+void QuicConnection<Executor>::on_datagram(std::span<const std::uint8_t> datagram) {
+    if (m_closed || m_conn == nullptr) return;
+
+    ngtcp2_path_storage ps;
+    ngtcp2_path_storage_init(&ps, reinterpret_cast<const ngtcp2_sockaddr*>(m_local.data()),
+                             static_cast<ngtcp2_socklen>(m_local.size()),
+                             reinterpret_cast<const ngtcp2_sockaddr*>(m_remote.data()),
+                             static_cast<ngtcp2_socklen>(m_remote.size()), nullptr);
+    ngtcp2_pkt_info pi{};
+
+    const int rv = ngtcp2_conn_read_pkt(m_conn, &ps.path, &pi, datagram.data(), datagram.size(), now());
+    if (rv != 0) {
+        // A datagram that arrives for a connection already closing is expected,
+        // not an error: the peer has not seen our close yet.
+        if (rv == NGTCP2_ERR_DRAINING) {
+            close_now();
+            return;
+        }
+        if (rv == NGTCP2_ERR_CALLBACK_FAILURE && m_has_error) {
+            close_now();
+            return;
+        }
+        fail(rv);
+        return;
+    }
+    // Reading a packet can have queued ACKs, opened the peer's flow-control
+    // window, or completed the handshake. All of that is "the send loop has
+    // something to do".
+    poke();
+}
+
+template <typename Executor>
+asio::awaitable<void> QuicConnection<Executor>::run() {
+    if (m_conn == nullptr) {
+        close_now();
+        co_return;
+    }
+    // The first flight (ServerHello and friends) is queued by the handshake,
+    // which the crypto helper already drove when the client's Initial was read.
+    if (!flush_writes()) co_return;
+
+    while (!m_closed) {
+        arm_timer();
+        co_await wait_for_event();
+        if (m_closed) break;
+        handle_expiry_due();
+        if (m_closed) break;
+        if (!flush_writes()) break;
+    }
+    co_return;
+}
+
+template <typename Executor>
+asio::awaitable<void> QuicConnection<Executor>::await_closed() {
+    if (m_closed) co_return;
+    co_await m_closed_signal.async_receive(asio::as_tuple(asio::use_awaitable));
+    co_return;
+}
+
+template <typename Executor>
+std::optional<std::int64_t> QuicConnection<Executor>::open_uni_stream() {
+    if (m_closed || m_conn == nullptr) return std::nullopt;
+    std::int64_t stream_id = -1;
+    const int rv = ngtcp2_conn_open_uni_stream(m_conn, &stream_id, nullptr);
+    if (rv != 0) return std::nullopt;
+    return stream_id;
+}
+
+template <typename Executor>
+void QuicConnection<Executor>::extend_stream_offset(std::int64_t stream_id, std::uint64_t count) noexcept {
+    if (m_closed || m_conn == nullptr || count == 0) return;
+    // ngtcp2 queues a MAX_STREAM_DATA (and MAX_DATA) frame rather than sending
+    // one immediately, so this cannot fail for want of window and cannot
+    // re-enter the write path.
+    (void)ngtcp2_conn_extend_max_stream_offset(m_conn, stream_id, count);
+    poke();
+}
+
+template <typename Executor>
+void QuicConnection<Executor>::extend_connection_offset(std::uint64_t count) noexcept {
+    if (m_closed || m_conn == nullptr || count == 0) return;
+    ngtcp2_conn_extend_max_offset(m_conn, count);
+    poke();
+}
+
+template <typename Executor>
+void QuicConnection<Executor>::shutdown_stream_read(std::int64_t stream_id, std::uint64_t app_error_code) noexcept {
+    if (m_closed || m_conn == nullptr) return;
+    if (ngtcp2_conn_shutdown_stream_read(m_conn, 0, stream_id, app_error_code) != 0) {
+        // The stream is usually already gone — the peer reset it, or the
+        // connection is closing. Nothing left to do either way.
+        return;
+    }
+    poke();
+}
+
+template <typename Executor>
+void QuicConnection<Executor>::reset_stream(std::int64_t stream_id, std::uint64_t app_error_code) noexcept {
+    if (m_closed || m_conn == nullptr) return;
+    if (ngtcp2_conn_shutdown_stream(m_conn, 0, stream_id, app_error_code) != 0) return;
+    poke();
+}
+
+template <typename Executor>
+void QuicConnection<Executor>::extend_max_streams_bidi(std::uint64_t count) noexcept {
+    if (m_closed || m_conn == nullptr || count == 0) return;
+    ngtcp2_conn_extend_max_streams_bidi(m_conn, count);
+    poke();
+}
+
+template <typename Executor>
+void QuicConnection<Executor>::shutdown_stream_write(std::int64_t stream_id, std::uint64_t app_error_code) noexcept {
+    if (m_closed || m_conn == nullptr) return;
+    if (ngtcp2_conn_shutdown_stream_write(m_conn, 0, stream_id, app_error_code) != 0) return;
+    poke();
+}
+
+template <typename Executor>
+void QuicConnection<Executor>::close(std::uint64_t app_error_code, std::string_view reason) noexcept {
+    if (m_closed || m_conn == nullptr) {
+        close_now();
+        return;
+    }
+    // An application close carries the HTTP/3 error code; ngtcp2 frames it as
+    // CONNECTION_CLOSE with error code 0x1d (RFC 9000 §19.19).
+    ngtcp2_ccerr_set_application_error(&m_last_error, app_error_code,
+                                       reinterpret_cast<const std::uint8_t*>(reason.data()), reason.size());
+    m_has_error = true;
+    close_now();
+}
+
+// --- the send path ---------------------------------------------------------
+
+template <typename Executor>
+void QuicConnection<Executor>::poke() noexcept {
+    // Coalescing on purpose: a wake that arrives while one is already queued
+    // adds no information. `try_send` posts rather than inlining the wake-up,
+    // which matters because `poke` is called from ngtcp2 callbacks.
+    (void)m_wake.try_send(error_code{});
+    // The timer is the other half of the wait. Cancelling one that is not
+    // armed is a no-op, so this needs no state.
+    (void)m_timer.cancel();
+}
+
+template <typename Executor>
+void QuicConnection<Executor>::arm_timer() {
+    if (m_conn == nullptr) return;
+    const ngtcp2_tstamp expiry = ngtcp2_conn_get_expiry2(m_conn);
+    if (expiry == kNoExpiry) {
+        m_timer.expires_at(Timer::time_point::max());
+        return;
+    }
+    m_timer.expires_at(Timer::time_point{} + std::chrono::nanoseconds(expiry));
+}
+
+template <typename Executor>
+void QuicConnection<Executor>::handle_expiry_due() {
+    if (m_conn == nullptr) return;
+    const ngtcp2_tstamp expiry = ngtcp2_conn_get_expiry2(m_conn);
+    // Any wake-up runs this, so the common case is that the timer has not
+    // actually expired and there is nothing to do.
+    if (expiry == kNoExpiry || now() < expiry) return;
+
+    const int rv = ngtcp2_conn_handle_expiry(m_conn, now());
+    if (rv == NGTCP2_ERR_IDLE_CLOSE) {
+        // The idle timer fired: drop the connection without a terminal packet,
+        // which is what the peer will do too — both sides time out.
+        close_now();
+        return;
+    }
+    if (rv != 0) {
+        fail(rv);
+        return;
+    }
+    // A PTO probe or a retransmission is now queued; the caller's flush writes
+    // it.
+}
+
+template <typename Executor>
+ngtcp2_ssize QuicConnection<Executor>::write_pkt(ngtcp2_path* path, ngtcp2_pkt_info* pi, std::uint8_t* dest,
+                                                 std::size_t destlen, ngtcp2_tstamp ts) noexcept {
+    // ngtcp2's write loop, as documented: after NGTCP2_ERR_WRITE_MORE the same
+    // call must be repeated with the *same* conn/path/pi/dest/destlen/ts, and
+    // no other ngtcp2 function may be called in between. The only two
+    // exceptions are the close and shutdown calls — which is exactly what the
+    // block/stop paths below need. Everything here is therefore either a local
+    // computation or one of those few allowed calls.
+    for (;;) {
+        std::int64_t stream_id = -1;
+        int fin = 0;
+        std::size_t veccnt = 0;
+
+        std::uint64_t engine_error = 0;
+        const std::shared_ptr<Protocol> proto = protocol();
+        if (proto != nullptr && ngtcp2_conn_get_max_data_left2(m_conn) > 0) {
+            const StreamData sd = proto->next_stream_data();
+            engine_error = sd.error;
+            if (sd.error == 0 && sd.stream_id >= 0) {
+                stream_id = sd.stream_id;
+                fin = sd.fin;
+                veccnt = std::min(sd.vec.size(), m_vec_scratch.size());
+                for (std::size_t i = 0; i < veccnt; ++i) {
+                    m_vec_scratch[i].base = const_cast<std::uint8_t*>(sd.vec[i].base);
+                    m_vec_scratch[i].len = sd.vec[i].len;
+                }
+            }
+        }
+        if (engine_error != 0) {
+            // The engine found a connection-level error while producing data
+            // (a QPACK failure, say). Ask for a close with its error code.
+            ngtcp2_ccerr_set_application_error(&m_last_error, engine_error, nullptr, 0);
+            m_has_error = true;
+            return NGTCP2_ERR_CALLBACK_FAILURE;
+        }
+
+        std::uint32_t flags = NGTCP2_WRITE_STREAM_FLAG_MORE;
+        if (fin != 0) flags |= NGTCP2_WRITE_STREAM_FLAG_FIN;
+
+        ngtcp2_ssize datalen = -1;
+        const ngtcp2_ssize nwrite = ngtcp2_conn_writev_stream(m_conn, path, pi, dest, destlen, &datalen, flags, stream_id,
+                                                              m_vec_scratch.data(), veccnt, ts);
+        if (nwrite < 0) {
+            switch (nwrite) {
+                case NGTCP2_ERR_STREAM_DATA_BLOCKED:
+                    // The peer's stream window is full. nghttp3 has to stop
+                    // offering this stream until MAX_STREAM_DATA arrives.
+                    proto->on_stream_blocked(stream_id);
+                    continue;
+                case NGTCP2_ERR_STREAM_SHUT_WR:
+                    // The stream is gone from the sending side — the peer reset
+                    // it, or we did. nghttp3 has to stop writing to it.
+                    proto->on_stream_shut_wr(stream_id);
+                    continue;
+                case NGTCP2_ERR_WRITE_MORE:
+                    // Accepted into a packet that is already being built. The
+                    // offset has to advance by exactly what ngtcp2 took, or the
+                    // same bytes are offered again forever.
+                    proto->on_stream_data_written(stream_id, static_cast<std::size_t>(datalen));
+                    continue;
+                default:
+                    break;
+            }
+            ngtcp2_ccerr_set_liberr(&m_last_error, static_cast<int>(nwrite), nullptr, 0);
+            m_has_error = true;
+            return NGTCP2_ERR_CALLBACK_FAILURE;
+        }
+        if (datalen >= 0 && proto != nullptr) {
+            proto->on_stream_data_written(stream_id, static_cast<std::size_t>(datalen));
+        }
+        return nwrite;
+    }
+}
+
+template <typename Executor>
+bool QuicConnection<Executor>::flush_writes() {
+    if (m_closed || m_conn == nullptr) return false;
+
+    for (;;) {
+        std::array<std::uint8_t, kMaxDatagram> buf{};
+        ngtcp2_path_storage ps;
+        ngtcp2_path_storage_zero(&ps);
+        ngtcp2_pkt_info pi{};
+        std::size_t gso_size = 0;
+        const ngtcp2_tstamp ts = now();
+
+        const ngtcp2_ssize n = ngtcp2_conn_write_aggregate_pkt2(m_conn, &ps.path, &pi, buf.data(), buf.size(), &gso_size,
+                                                                &QuicConnection::cb_write_pkt, kPacketsPerFlush, ts);
+        if (n < 0) {
+            // NGTCP2_ERR_CALLBACK_FAILURE means one of our callbacks already set
+            // `m_last_error`; anything else — a TLS alert included — is
+            // ngtcp2's own diagnosis, which `fail` knows how to frame.
+            fail(static_cast<int>(n));
+            return false;
+        }
+        // Must be called after a writev_stream sequence, per ngtcp2's
+        // documentation — it is what paces packet transmission.
+        ngtcp2_conn_update_pkt_tx_time(m_conn, ts);
+
+        if (n == 0) {
+            return true;
+        }
+        m_sink(std::span<const std::uint8_t>{buf.data(), static_cast<std::size_t>(n)}, m_remote);
+    }
+}
+
+template <typename Executor>
+void QuicConnection<Executor>::close_now() {
+    if (m_closed) return;
+    m_closed = true;
+
+    if (m_conn != nullptr && !m_close_sent) {
+        m_close_sent = true;
+        std::array<std::uint8_t, kMaxDatagram> buf{};
+        ngtcp2_path_storage ps;
+        ngtcp2_path_storage_zero(&ps);
+        ngtcp2_pkt_info pi{};
+        const ngtcp2_ssize n = ngtcp2_conn_write_connection_close(m_conn, &ps.path, &pi, buf.data(), buf.size(),
+                                                                  &m_last_error, now());
+        if (n > 0) {
+            m_sink(std::span<const std::uint8_t>{buf.data(), static_cast<std::size_t>(n)}, m_remote);
+        }
+    }
+
+    // Release the engine and anyone waiting: nothing will feed them again.
+    if (auto proto = protocol()) proto->on_connection_closed();
+    (void)m_closed_signal.try_send(error_code{});
+    (void)m_wake.try_send(error_code{});
+}
+
+template <typename Executor>
+void QuicConnection<Executor>::fail(int liberr) {
+    if (m_closed) return;
+    // A callback may already have recorded something more specific than
+    // `liberr` says — an HTTP/3 or QPACK error code, say. That one wins.
+    if (!m_has_error) {
+        if (liberr == NGTCP2_ERR_CRYPTO) {
+            // RFC 9001 §4.8: a TLS alert is reported as CRYPTO_ERROR, whose
+            // value *is* the alert description. Collapsing it into the generic
+            // transport error ngtcp2 wraps around it would tell the peer
+            // "protocol violation" when it needs to hear, for instance,
+            // "no_application_protocol".
+            ngtcp2_ccerr_set_tls_alert(&m_last_error, ngtcp2_conn_get_tls_alert2(m_conn), nullptr, 0);
+        } else {
+            ngtcp2_ccerr_set_liberr(&m_last_error, liberr, nullptr, 0);
+        }
+        m_has_error = true;
+    }
+    close_now();
+}
+
+template <typename Executor>
+asio::awaitable<void> QuicConnection<Executor>::wait_for_event() {
+    using namespace asio::experimental::awaitable_operators;
+    // Whichever finishes first cancels the other: the timer is cancelled by a
+    // wake, and the receive is cancelled by the timer. Both are expected, not
+    // errors, and the caller re-derives what to do from the connection's state.
+    auto tick = m_timer.async_wait(asio::as_tuple(asio::use_awaitable));
+    auto woke = m_wake.async_receive(asio::as_tuple(asio::use_awaitable));
+    (void)co_await (std::move(tick) || std::move(woke));
+    co_return;
+}
+
+// --- ngtcp2 callbacks ------------------------------------------------------
+//
+// All of these recover the connection and forward. They run inside ngtcp2, so
+// none may throw, block, or call back into ngtcp2 — the last is why the
+// forwarders below only touch the engine's own state and post wake-ups.
+
+template <typename Executor>
+int QuicConnection<Executor>::cb_recv_stream_data(ngtcp2_conn*, std::uint32_t flags, std::int64_t stream_id, std::uint64_t,
+                                                  const std::uint8_t* data, std::size_t datalen, void* user_data,
+                                                  void*) noexcept {
+    auto* self = from(user_data);
+    // ngtcp2's flags are not the engine's vocabulary; the one bit that crosses
+    // the seam is translated here so `engine/h3/` needs no ngtcp2 header.
+    const std::uint32_t translated = (flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0 ? quic::kStreamDataFin : 0u;
+    if (auto proto = self->protocol()) {
+        proto->on_stream_data(translated, stream_id, std::span<const std::uint8_t>{data, datalen});
+        return 0;
+    }
+    // No engine yet — see set_protocol(). Hold the event and let the engine
+    // credit the peer when it replays.
+    self->m_pending_stream_bytes += datalen;
+    if (self->m_pending_stream_bytes > kMaxPendingStreamBytes) {
+        return NGTCP2_ERR_CALLBACK_FAILURE;
+    }
+    self->m_pending_stream_data.push_back(
+        PendingStreamData{translated, stream_id, std::vector<std::uint8_t>(data, data + datalen)});
+    return 0;
+}
+
+template <typename Executor>
+int QuicConnection<Executor>::cb_acked_stream_data_offset(ngtcp2_conn*, std::int64_t stream_id, std::uint64_t, std::uint64_t datalen,
+                                                          void* user_data, void*) noexcept {
+    auto* self = from(user_data);
+    if (auto proto = self->protocol()) proto->on_acked_stream_data(stream_id, datalen);
+    return 0;
+}
+
+template <typename Executor>
+int QuicConnection<Executor>::cb_stream_close(ngtcp2_conn* conn, std::uint32_t flags, std::int64_t stream_id,
+                                              std::uint64_t app_error_code, void* user_data, void*) noexcept {
+    auto* self = from(user_data);
+    // Hand the stream slot back. `ngtcp2_is_bidi_stream` and bit 0 together
+    // spell "the client opened this one" — this is a server, so streams we
+    // initiate are the other parity, and crediting those would be crediting
+    // ourselves.
+    if (ngtcp2_is_bidi_stream(stream_id) != 0 && (stream_id & 0x1) == 0) {
+        ngtcp2_conn_extend_max_streams_bidi(conn, 1);
+    }
+    if (auto proto = self->protocol()) {
+        // ngtcp2 1.24 reports a single application error code, and only when it
+        // is meaningful; the flag says which.
+        const bool has_code = (flags & NGTCP2_STREAM_CLOSE_FLAG_APP_ERROR_CODE_SET) != 0;
+        proto->on_stream_close(stream_id, has_code ? std::optional<std::uint64_t>{app_error_code} : std::nullopt,
+                               std::nullopt);
+    }
+    return 0;
+}
+
+template <typename Executor>
+int QuicConnection<Executor>::cb_stream_reset(ngtcp2_conn*, std::int64_t stream_id, std::uint64_t, std::uint64_t app_error_code,
+                                              void* user_data, void*) noexcept {
+    auto* self = from(user_data);
+    if (auto proto = self->protocol()) proto->on_stream_reset(stream_id, app_error_code);
+    return 0;
+}
+
+template <typename Executor>
+int QuicConnection<Executor>::cb_stream_stop_sending(ngtcp2_conn*, std::int64_t stream_id, std::uint64_t app_error_code,
+                                                     void* user_data, void*) noexcept {
+    auto* self = from(user_data);
+    if (auto proto = self->protocol()) proto->on_stream_stop_sending(stream_id, app_error_code);
+    return 0;
+}
+
+template <typename Executor>
+int QuicConnection<Executor>::cb_extend_max_stream_data(ngtcp2_conn*, std::int64_t stream_id, std::uint64_t max_data,
+                                                        void* user_data, void*) noexcept {
+    auto* self = from(user_data);
+    if (auto proto = self->protocol()) proto->on_extend_max_stream_data(stream_id, max_data);
+    self->poke();
+    return 0;
+}
+
+template <typename Executor>
+int QuicConnection<Executor>::cb_extend_max_remote_streams_bidi(ngtcp2_conn*, std::uint64_t max_streams, void* user_data) noexcept {
+    auto* self = from(user_data);
+    if (auto proto = self->protocol()) proto->on_extend_max_remote_streams_bidi(max_streams);
+    return 0;
+}
+
+template <typename Executor>
+int QuicConnection<Executor>::cb_recv_tx_key(ngtcp2_conn*, ngtcp2_encryption_level level, void* user_data) noexcept {
+    // Only the application (1-RTT) keys matter: the HTTP/3 control and QPACK
+    // streams cannot be opened before them, and opening them earlier would be
+    // sending application data at the wrong encryption level.
+    if (level != NGTCP2_ENCRYPTION_LEVEL_1RTT) return 0;
+    auto* self = from(user_data);
+    if (auto proto = self->protocol()) {
+        proto->on_tx_keys_ready();
+    } else {
+        self->m_tx_keys_pending = true;
+    }
+    self->poke();
+    return 0;
+}
+
+template <typename Executor>
+int QuicConnection<Executor>::cb_handshake_completed(ngtcp2_conn*, void* user_data) noexcept {
+    from(user_data)->poke();
+    return 0;
+}
+
+template <typename Executor>
+int QuicConnection<Executor>::cb_get_new_connection_id(ngtcp2_conn*, ngtcp2_cid* cid, ngtcp2_stateless_reset_token* token,
+                                                       std::size_t cidlen, void* user_data) noexcept {
+    auto* self = from(user_data);
+    // ngtcp2 asks for a fresh connection ID; we mint the bytes and tell the
+    // endpoint so that a datagram addressed to it still finds this connection.
+    if (RAND_bytes(cid->data, static_cast<int>(cidlen)) != 1) return NGTCP2_ERR_CALLBACK_FAILURE;
+    cid->datalen = cidlen;
+    if (RAND_bytes(token->data, sizeof(token->data)) != 1) return NGTCP2_ERR_CALLBACK_FAILURE;
+    if (self->m_on_new_cid) {
+        self->m_on_new_cid(std::span<const std::uint8_t>{cid->data, cid->datalen},
+                           std::span<const std::uint8_t>{token->data, sizeof(token->data)});
+    }
+    return 0;
+}
+
+template <typename Executor>
+int QuicConnection<Executor>::cb_remove_connection_id(ngtcp2_conn*, const ngtcp2_cid* cid, void* user_data) noexcept {
+    auto* self = from(user_data);
+    if (self->m_on_retire_cid) {
+        self->m_on_retire_cid(std::span<const std::uint8_t>{cid->data, cid->datalen});
+    }
+    return 0;
+}
+
+template <typename Executor>
+void QuicConnection<Executor>::cb_rand(std::uint8_t* dest, std::size_t destlen, const ngtcp2_rand_ctx*) noexcept {
+    // ngtcp2 uses this for the random it needs in its own protocol machinery.
+    // Failure here is unrecoverable — there is no return value to report it
+    // with — so the process is in no state to continue if the CSPRNG is gone.
+    if (RAND_bytes(dest, static_cast<int>(destlen)) != 1) {
+        std::abort();
+    }
+}
+
+template <typename Executor>
+ngtcp2_ssize QuicConnection<Executor>::cb_write_pkt(ngtcp2_conn*, ngtcp2_path* path, ngtcp2_pkt_info* pi, std::uint8_t* dest,
+                                                    std::size_t destlen, ngtcp2_tstamp ts, void* user_data) noexcept {
+    return from(user_data)->write_pkt(path, pi, dest, destlen, ts);
+}
 
 }  // namespace simple_http::quic

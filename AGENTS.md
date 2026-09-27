@@ -66,13 +66,29 @@ include/
                            h2c 升级）；ws_proxy.h 是字节级 WebSocket 隧道（与 handler/http_proxy.h
                            的请求级反代相对）
       h2/                  HTTP/2 引擎 + 帧层 + HPACK（h2_frame / hpack_*）
-      h3/                  HTTP/3 引擎 + 帧层 + QPACK（qpack.h，编解码走 ls-qpack）
+      h3/                  HTTP/3 引擎——nghttp3（帧层 + QPACK）与本库 Dispatcher 之间的
+                           适配层：h3_engine.h（引擎 + Http3ResponseWriter）、
+                           h3_stream.h（每流的收发队列与唤醒）、h3_callbacks.h（nghttp3
+                           回调表）。行数比手写时少一半，因为帧层、QPACK、SETTINGS/GOAWAY
+                           与请求合法性校验都归 nghttp3 了
                            （#ifdef SIMPLE_HTTP_ENABLE_HTTP3）
     handler/               handler 类型系统 + 路由
       handler.h            Handler 类型别名与 make_handler/invoke_handler
       router.h             Router（含反代用的 HttpClient、反代匹配、静态阶段）
       http_proxy.h         请求级反代：上游走 client 层（连接池/TLS/h2），响应流式回传
       static_files.h       静态文件服务（static_table.h 的 serving 半边 + SPA fallback）
+    quic/                  QUIC 传输（#ifdef SIMPLE_HTTP_ENABLE_HTTP3）——ngtcp2 的包装，
+                           不是一份 QUIC 实现：包解析、密钥派生、ACK、丢包恢复、拥塞控制、
+                           流状态机与流控都在 ngtcp2 里
+      protocol.h           quic::Protocol：连接↔协议引擎的窄接缝（事件上报 +
+                           next_stream_data()：由连接从引擎"拉"要发的字节）
+      connection.h         QuicConnection——驱动 ngtcp2：收发、定时器、回调表
+      endpoint.h           QuicEndpoint——一个 UDP socket 与它上面所有连接；按 CID 解复用，
+                           外加 Version Negotiation / Retry / stateless reset 三件无状态答复
+      ngtcp2_config.h      QuicConnectionConfig → ngtcp2_settings / transport_params 的映射，
+                           以及哪些旋钮在 ngtcp2 下没有对应物
+      ngtcp2_crypto.h      每连接的 SSL 与 ngtcp2_crypto_ossl_ctx（TLS 握手由它驱动）
+      tls.h                QuicTlsContext（SSL_CTX + ALPN + mTLS）与 h3 ALPN 常量
     net/                   监听与连接协议检测
       connection.h         serve_plaintext / serve_tls（协议检测）
       server.h             Server 门面 + ServerConfig / Listen
@@ -285,7 +301,14 @@ INTERFACE 目标安装，供下游 `find_package`）。日常开发用 xmake。
   既能留下错误日志，又不为被丢弃的级别生成任何代码。
 - `SIMPLE_HTTP_ENABLE_HTTP3`（默认未定义）：编入 HTTP/3 引擎与 QUIC 监听。未定义时
   `ServerConfig::quic` 与 QUIC 调优字段**本身不存在**，所以不定义它的构建不可能要到一个
-  UDP 侧——想用 QUIC 就必须显式打开并依赖 ngtcp2 之外的那套现有依赖。
+  UDP 侧。
+  打开它就要编入 **ngtcp2 + nghttp3**（两个 C 库，只有这条路径用）。这曾是反过来的：QUIC
+  与 HTTP/3 都是手写的，依赖里明确不含 ngtcp2。改的原因是手写一份 RFC 9000 的代价——
+  丢包恢复、PTO、流生命周期这些只在丢包与"同一条连接的第 N 个请求"下才暴露的地方，出过
+  两次真问题（见下面两节）。xmake 的包来自私有仓库 `fantasy-peak/xmake-repo`：上游
+  xmake-repo 的 ngtcp2 是 `-DENABLE_OPENSSL=OFF` 构建的，**不产 crypto helper**，没有它
+  就没有 TLS。`nghttp3` 用上游包即可。**不要链 `/opt/h3/lib` 的预编译库**——那是对系统
+  OpenSSL 3.5.5 编的，本仓库用 openssl3 3.6.3，混链是 ABI 风险。
 
 常用命令：
 
@@ -345,6 +368,7 @@ test/conformance/run.sh h2spec   # 只跑指定的（h2spec / h1spec / autobahn�
 | **h2spec** | `:7790`（纯 h2c） | HTTP/2 帧层、流状态机、HPACK | **146/146**（`-S` strict 147/147） |
 | **h1spec** | `:7791`（纯 h1） | HTTP/1.1 请求行与字段解析、分片到达 | **33/33** |
 | **Autobahn** | `:7788`（嗅探） | WebSocket / RFC 6455 | 517 用例：**FAILED 0、NON-STRICT 0** |
+| **h3spec** | `udp :7792`（纯 h3） | QUIC 传输 + HTTP/3 错误路径 | **49 用例：总数 49、通过 ≥47** |
 
 - **端口不能混用。** `7790`/`7791` 是 `ServerConfig::plaintext_protocols` 声明的单协议端点
   （见 `net/connection.h`）：嗅探端口上"畸形的 HTTP/2 前导"和"畸形的 HTTP/1.x 请求行"是
@@ -388,22 +412,62 @@ test/stress/run.sh h3       # 只跑指定的（h1 / h2 / h3）
   `h2load --version` 编不编都打印同一行——而是在服务器起来之后**实测一发**；缺了会打印
   自编配方并以非零退出。自编的装到别处时用 `H2LOAD=` 指过来（非静态链接还要给
   `LD_LIBRARY_PATH`）。
-- **它抓到过**（三套一致性套件、四套自研套件一概没看见）：HTTP/3 在「上一条流 retire 之后
-  再开新流」时把新流**静默吞掉**。判据是「id 低于见过的最大 id 就当成已 retire 的重传」，
-  可**帧的到达顺序不是流被打开的顺序**——承载 QPACK 动态表插入的 encoder 流（客户端 uni
-  流 6）落在先到的 decoder 流之后，于是被丢弃、从未创建，引用动态表的字段段永远 Blocked，
-  请求无限期挂起（没有任何超时兜底）。表现是 `-n 10 -c 1 -m 1` 只成 1 个、卡满 30 秒，
-  同一台机器上 h1/h2 一切正常。修在 `quic/connection.h` 的 `peer_stream_retired`。
+- **压测要在 sanitizer 下跑一遍。** CI 的 ASan+UBSan job 只跑 `unittest`/`regression`/`client`
+  ——**h3 那条路径它一条都覆盖不到**（项目没有 h3 客户端，也没有 h3 单测）。做法：按 gcc.yaml
+  的参数构建（`--cxxflags='-fsanitize=address,undefined -fno-omit-frame-pointer'`
+  `--ldflags='-fsanitize=address,undefined'`，**别加 `--toolchain=gcc`**，那会触发 boost 包重装），
+  然后 `ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1`
+  跑 `test/stress/run.sh`。
+  **LeakSanitizer 只在 `exit()` 时报告**，所以示例服务器必须能优雅退出——`test/server.cpp`
+  为此装了 SIGINT/SIGTERM 处理器（处理器只置 `sig_atomic_t` 标志，主循环看到了才调
+  `Server::stop()`，因为 stop 本身不是 async-signal-safe）。硬杀进程的话泄漏检测等于没跑；
+  在 gdb 下调 `__lsan_do_leak_check()` 也不行，LSan 明确不支持 ptrace。
+  **它抓到过**：连接与引擎之间的 `shared_ptr` **引用环**——`set_protocol(shared_from_this())`
+  让连接持有引擎、引擎又持有连接，于是 200 个连接连同它们的 ngtcp2 conn、nghttp3 conn 与
+  SSL 全都不析构（24.3 MB / 30058 次分配）。修法是把连接那侧改成 `std::weak_ptr` 并逐点
+  `lock()`；**不能**在 `close_now()` 里 `reset()`——`on_stream_data` 的调用栈里就是引擎，
+  reset 会把正在执行的对象析构掉。
+- **QUIC 侧要开 `ServerConfig::reuse_port`，否则它会跑在机器的一小部分上。** 不开时 QUIC
+  监听只有**一个** UDP socket、落在**一个** worker context 上（`server.h` 里
+  `sockets = reuse_port ? pool->size() : 1`），而同一台服务器上 h2c 的连接是被轮转分散到
+  整个池子的——于是 h3 等于拿一个核去打人家的四个核。实测
+  `-t 4 -n 200000 -c 200 -m 20`：**7.2k → 21k req/s（约 3×），p99 700ms → 110ms**；
+  开了之后还反超 ngtcp2 官方参考服务端（21k vs 13.5k，它是单 socket）。TCP 侧几乎不受
+  影响（98.6k → 94.2k，噪声边缘）。`test/server.cpp` 的 dual 端点已按此配置。
+- **它抓到过两次，都是"同一条连接上第 N 个请求"这一类**，而三套一致性套件与四套自研
+  套件一概看不见：
+  1. *手写实现*：HTTP/3 在「上一条流 retire 之后再开新流」时把新流**静默吞掉**。判据是
+     「id 低于见过的最大 id 就当成已 retire 的重传」，可**帧的到达顺序不是流被打开的
+     顺序**——承载 QPACK 动态表插入的 encoder 流（客户端 uni 流 6）落在先到的 decoder 流
+     之后，于是被丢弃、从未创建，引用动态表的字段段永远 Blocked，请求无限期挂起。表现是
+     `-n 10 -c 1 -m 1` 只成 1 个、卡满 30 秒。
+  2. *ngtcp2 版*：客户端跑完 `initial_max_streams_bidi`（100）个请求后再也开不了新流——
+     ngtcp2 **不会自动归还** MAX_STREAMS，只有它自己没通过 `stream_open` 报告过的流才自动
+     加。服务端必须在流关闭时调 `ngtcp2_conn_extend_max_streams_bidi`。表现极具特征：
+     复用档恰好 **100/200**，负载档 18 万失败。修在 `quic/connection.h` 的 `cb_stream_close`。
+  两次都只在复用档暴露，这正是这一档存在的理由——门线是「一条连接串行 200 个请求必须
+  全成」，少一个就是连接生命周期出了问题。
 
 ### 丢包与乱序下的复现（手工，需要 root）
 
 一致性套件和负载套件都在**无丢包**的回环上跑，而 QUIC 的恢复路径只在丢包时才被走到——
-有一类问题它们看不见。抓到过：**PTO 探测包不携带重传数据**。服务端的首飞（ServerHello）
-整体丢失时，丢包检测的阈值没有「确认」可作基准，那个包就永远留在在飞队列里、既不判丢也
-不重传；客户端收不到 ServerHello，便以翻倍间隔重传 ClientHello 五十秒以上，而服务端每次
-都成功解密它、只回 ACK-only 包（ACK-only 不引出 ACK），两边各自退避到死。两万请求里
-会有几千到一万四千个失败（就看哪些连接掷到丢首飞），而同一台机器上的另一个 QUIC 实现
-0 失败。
+有一类问题它们看不见。手写实现时抓到过：**PTO 探测包不携带重传数据**。服务端的首飞
+（ServerHello）整体丢失时，丢包检测的阈值没有「确认」可作基准，那个包就永远留在在飞队列
+里、既不判丢也不重传；客户端收不到 ServerHello，便以翻倍间隔重传 ClientHello 五十秒以上，
+而服务端每次都成功解密它、只回 ACK-only 包（ACK-only 不引出 ACK），两边各自退避到死。
+两万请求里会有几千到一万四千个失败（就看哪些连接掷到丢首飞），而同一台机器上的另一个
+QUIC 实现 0 失败。
+
+那份实现已经不在了（恢复逻辑现在归 ngtcp2），**这一节的手法仍然要留着**：丢包路径是换
+实现时最容易被新引入的代码弄坏、又最不容易被发现的地方——它不在这三套一致性套件和负载
+套件里任何一档的射程内。
+
+**ngtcp2 版实测（2026-09-27，`-t 4 -n 20000 -c 10 -m 20`）**：无丢包 20257 req/s；
+`netem loss 3%` 三轮、`loss 10%` 两轮，**每轮都是 20000/20000 全成、0 失败**。吞吐随丢包率
+单调下滑（3% 约 1.6 万，10% 约 0.5–1 万），这既是"netem 真的生效"的证据，也说明环境确实
+够狠。同一台机器上官方 `osslserver` 在 3% 下同样 0 失败，可作对照。对比手写实现当年
+「两万请求里几千到一万四千个失败」，**这个 bug 不是被修好了，而是随着恢复逻辑一起交出去、
+结构上不可能再出现**。
 
 在回环上注入丢包（**改的是整台机器的回环，用完必须撤掉**）：
 

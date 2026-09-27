@@ -6,6 +6,7 @@
 // (chunked over HTTP/1.1, DATA frames over HTTP/2).
 
 #include <charconv>
+#include <csignal>
 #include <format>
 #include <print>
 #include <string>
@@ -343,8 +344,29 @@ void register_routes(ServerT& server) {
     });
 }
 
+namespace {
+
+// Set by the signal handler, read by the main loop. `sig_atomic_t` is the only
+// type the C standard guarantees a handler may touch, and a handler may do
+// nothing else that is not async-signal-safe — which rules out Server::stop()
+// itself (it posts to other contexts and waits on a future).
+volatile std::sig_atomic_t g_stop_requested = 0;
+
+void request_stop(int) { g_stop_requested = 1; }
+
+}  // namespace
+
 int main() {
     set_log_sink(make_stdout_sink(LogLevel::Info));
+
+    // Ctrl-C, or the `kill` every test script ends with, stops the servers
+    // rather than the process: a clean teardown drains connections and closes
+    // the listeners, so the port is free immediately and the run is a normal
+    // exit. That last part is what lets a sanitizer see the end of the program
+    // at all — LeakSanitizer reports on exit, and a process killed outright
+    // never gets there.
+    std::signal(SIGINT, request_stop);
+    std::signal(SIGTERM, request_stop);
 
     // Plaintext server: HTTP/1.1, h2c upgrade, HTTP/2 prior-knowledge.
     ServerConfig plain_cfg;
@@ -409,6 +431,14 @@ int main() {
     dual_cfg.listen = InetAddress{"0.0.0.0", 7792, false};
     dual_cfg.quic = QuicAddress{"0.0.0.0", 7792, false};
     dual_cfg.worker_threads = 4;
+    // Measured, not assumed. Without this the QUIC side gets *one* UDP socket
+    // on one worker context, while the TCP side's connections are spread across
+    // the whole pool — so h3 was effectively running on a quarter of the
+    // machine and lost ~3x against its own h2c endpoint on the same box
+    // (`-t 4 -n 200000 -c 200 -m 20`: 7.2k req/s vs 21k req/s). With it, h3 is
+    // also faster than the ngtcp2 reference server (21k vs 13.5k), which is
+    // single-socket, so the driver itself was never the problem.
+    dual_cfg.reuse_port = true;
     dual_cfg.limits.h3_alt_svc_port = 7792;
     dual_cfg.tls = TlsConfig{
         .cert_chain_file = "./test/tls_certificates/server_cert.pem",
@@ -428,8 +458,16 @@ int main() {
     ok = ok && dual_ok;
 #endif
 
-    for (;;) {
-        std::this_thread::sleep_for(std::chrono::seconds(60));
+    while (g_stop_requested == 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
+
+    plain.stop();
+    tls.stop();
+    h2c.stop();
+    h1.stop();
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+    dual.stop();
+#endif
     return 0;
 }

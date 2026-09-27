@@ -1,92 +1,92 @@
 #pragma once
 
-// The QUIC listener: one UDP socket, and the connection table behind it.
+// The UDP side: one socket, and every QUIC connection that arrives on it.
 //
-// A UDP socket has no accept, so "which connection is this?" has to be answered
-// from the packet itself — by its destination connection ID. That is the whole
-// job of this file:
+// QUIC has no accept. A connection is identified by the Connection IDs in its
+// packets, so the listener's job is to demultiplex: read a datagram, work out
+// which connection it belongs to, and hand it over. That is what makes a QUIC
+// "listener" a routing table rather than a queue of sockets.
 //
-//   * a table from connection ID to connection, keyed by *both* the ID we chose
-//     for a connection and the original one the client used, because a client
-//     retransmits its Initial under its own ID until our first reply reaches it;
-//   * creating a connection when an Initial for an unknown ID turns up, which
-//     is the closest thing QUIC has to an accept;
-//   * the two replies a listener owes a stranger: a Version Negotiation packet
-//     for a version we do not speak, and a stateless reset for a connection ID
-//     that used to be ours.
-//   * optionally, a Retry — which is what stops a spoofed source address from
-//     making the server do the work of a handshake.
+// Three things have to be answered without a connection, because they are
+// exactly the cases where there is none (RFC 9000 §5.2, §7.2, §10.3):
 //
-// The endpoint is pinned to one executor and owns its socket there, so the
-// connection table needs no lock. Several sockets on one port (SO_REUSEPORT) are
-// several endpoints in several contexts; the kernel's four-tuple hash keeps one
-// connection's datagrams together, which is what makes that safe. The cost is
-// that a connection cannot migrate *between* sockets — within one, it can.
+//   * A version we do not speak — answer with a Version Negotiation packet.
+//   * An Initial with no (or a stale) Retry token, when address validation is
+//     on — answer with a Retry.
+//   * A short-header packet for a connection we have never heard of — answer
+//     with a stateless reset, so a peer whose connection died does not retry
+//     forever.
+//
+// All three are forged-source hazards: each answer must be cheap and must not
+// allocate state, or the listener becomes a memory amplifier. The stateless
+// reset in particular is derived from the packet's own Destination Connection
+// ID and a secret, so no table lookup is needed to produce it.
+//
+// The connection objects are keyed by Connection ID. A connection owns its IDs
+// and tells us about new ones (ngtcp2 mints them); every ID it has ever
+// advertised must keep routing here, because the client may switch to any of
+// them at any time.
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <functional>
-#include <map>
 #include <memory>
-#include <random>
 #include <span>
 #include <string>
-#include <string_view>
 #include <unordered_map>
 #include <utility>
+#include <vector>
+
+#include <openssl/rand.h>
 
 #include <boost/asio.hpp>
-#include <algorithm>
-#include <ranges>
-
-#include <openssl/evp.h>
-#include <openssl/hmac.h>
-#include <openssl/rand.h>
+#include <ngtcp2/ngtcp2.h>
+#include <ngtcp2/ngtcp2_crypto.h>
 
 #include "../core/logging.h"
 #include "../core/types.h"
 #include "connection.h"
-#include "crypto.h"
-#include "frame.h"
-#include "packet.h"
 #include "tls.h"
-#include "transport_params.h"
-#include "wire.h"
 
 namespace simple_http::quic {
 
 namespace asio = boost::asio;
 
-// The UDP socket buffer a QUIC listener asks the kernel for. One socket carries
-// every connection on the port, so the default is a queue for one flow rather
-// than for a server.
-inline constexpr std::size_t kSocketBufferBytes = 8u << 20;
+// QUIC version 1 (RFC 9000). The only one this server speaks.
+inline constexpr std::uint32_t kQuicVersion1 = 0x00000001;
 
-// How many recently-closed connection IDs to remember for stateless resets. The
-// window only has to outlast a peer's last flight, and each entry is a string.
-inline constexpr std::size_t kRecentCidLimit = 64;
+// How long a Retry token stays valid. Bounded because the token is what proves
+// the client owned its address at some point, and "some point" has to expire.
+inline constexpr ngtcp2_duration kRetryTokenTimeout = 30 * NGTCP2_SECONDS;
 
+// The receive buffer. A QUIC datagram is at most the path MTU (1500 or so), but
+// the socket may hand us more if a peer sends a giant datagram; ngtcp2 will
+// reject anything past its own limit. 64 KiB matches what the previous
+// implementation used and is well past any legitimate packet.
+inline constexpr std::size_t kReceiveBufferSize = 64 * 1024;
+
+// A UDP endpoint for QUIC. The fields mirror InetAddress, and that is the whole
+// difference: QUIC is another *transport*, not another address family.
 struct QuicEndpointConfig {
     QuicConnectionConfig connection{};
-    // Ask for a Retry before doing any handshake work. Costs one round trip on
-    // every new connection and buys address validation up front: without it a
-    // spoofed source address makes the server commit memory and a handshake to
-    // a peer that will never receive the answer.
+    // Ask the client to prove it owns its address before any state is created.
+    // Costs one round trip at connection setup and buys resistance to
+    // spoofed-source floods.
     bool retry{false};
-    // The address a Version Negotiation packet advertises. Unused for now
-    // because only one version exists here, but the packet still has to be
-    // *sent* for an unknown version.
+    // The versions we will speak, advertised in Version Negotiation and offered
+    // to ngtcp2.
     std::vector<std::uint32_t> supported_versions{kQuicVersion1};
 };
 
 template <typename Executor>
-class QuicEndpoint : public std::enable_shared_from_this<QuicEndpoint<Executor>> {
+class QuicEndpoint {
   public:
     using Connection = QuicConnection<Executor>;
-    using StreamTransport = typename Connection::StreamTransport;
+
     // What to do with a connection once it exists. The server supplies this; it
     // is where the HTTP/3 engine is built, which is what keeps this file free of
     // any knowledge of HTTP.
@@ -95,410 +95,372 @@ class QuicEndpoint : public std::enable_shared_from_this<QuicEndpoint<Executor>>
     QuicEndpoint(Executor exec, SSL_CTX* ssl_ctx, QuicEndpointConfig config, ServeFn serve)
         : m_executor(std::move(exec)), m_socket(m_executor), m_ssl_ctx(ssl_ctx), m_config(std::move(config)),
           m_serve(std::move(serve)) {
-        m_retry_key.fill(0);
-        RAND_bytes(m_retry_key.data(), static_cast<int>(m_retry_key.size()));
-        m_reset_key.fill(0);
-        RAND_bytes(m_reset_key.data(), static_cast<int>(m_reset_key.size()));
+        if (RAND_bytes(m_secret.data(), static_cast<int>(m_secret.size())) != 1) {
+            SIMPLE_HTTP_ERROR_LOG("quic: could not generate the endpoint secret");
+        }
     }
+
+    QuicEndpoint(const QuicEndpoint&) = delete;
+    QuicEndpoint& operator=(const QuicEndpoint&) = delete;
 
     // Bind the socket. Returns false and reports why on failure.
     bool open(const asio::ip::udp::endpoint& endpoint, bool reuse_port, error_code& ec) {
         m_socket.open(endpoint.protocol(), ec);
         if (ec) return false;
         if (reuse_port) {
-#ifdef SO_REUSEPORT
-            m_socket.set_option(asio::detail::socket_option::boolean<SOL_SOCKET, SO_REUSEPORT>(true), ec);
+            m_socket.set_option(asio::socket_base::reuse_address(true), ec);
             if (ec) {
-                SIMPLE_HTTP_ERROR_LOG("QUIC SO_REUSEPORT: {}", ec.message());
+                SIMPLE_HTTP_ERROR_LOG("quic: SO_REUSEADDR: {}", ec.message());
                 ec.clear();
             }
-#else
-            ec.clear();
+#ifdef SO_REUSEPORT
+            int one = 1;
+            ::setsockopt(m_socket.native_handle(), SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
 #endif
         }
-        // Large kernel buffers, best-effort.
-        //
-        // A QUIC server's UDP socket takes a whole connection's traffic as a
-        // burst — a client's Initial flight, a window's worth of stream data, a
-        // batch of acknowledgements — and the kernel default (a couple of
-        // hundred kilobytes) drops the overflow. QUIC's own loss recovery then
-        // does its job, which is to say the connection stalls for a PTO and
-        // backs off, and a load run shows multi-second pauses that look like
-        // nothing in the code. The kernel caps this at rmem_max/wmem_max, so a
-        // failure here is a smaller buffer, not a broken socket.
-        m_socket.set_option(asio::socket_base::receive_buffer_size(kSocketBufferBytes), ec);
+        // A generous receive buffer: QUIC's own flow control is the real limit,
+        // and a small kernel buffer turns a burst into avoidable loss.
+        m_socket.set_option(asio::socket_base::receive_buffer_size(8 * 1024 * 1024), ec);
         ec.clear();
-        m_socket.set_option(asio::socket_base::send_buffer_size(kSocketBufferBytes), ec);
-        ec.clear();
-
         m_socket.bind(endpoint, ec);
-        return !ec;
+        if (ec) return false;
+        return true;
     }
 
     [[nodiscard]] std::uint16_t port() const {
         error_code ec;
-        return m_socket.local_endpoint(ec).port();
+        const auto endpoint = m_socket.local_endpoint(ec);
+        return ec ? 0 : endpoint.port();
     }
 
-    // Start receiving. The endpoint must be held by a shared_ptr for the
-    // coroutine to keep it alive.
+    // Start reading. Returns immediately; the receive loop runs until close().
     void start() {
-        auto self = this->shared_from_this();
-        asio::co_spawn(m_executor, recv_loop(self), asio::detached);
+        if (m_started) return;
+        m_started = true;
+        asio::co_spawn(m_executor, receive_loop(), asio::detached);
+        asio::co_spawn(m_executor, send_loop(), asio::detached);
     }
 
+    // Stop listening. Connections are left alone; use shutdown_connections()
+    // first to wind them down.
     void close() {
+        if (m_closed) return;
+        m_closed = true;
         error_code ec;
-        m_socket.close(ec);
+        (void)m_socket.close(ec);
+        (void)m_send_wake.try_send(error_code{});
+        (void)ec;
     }
 
-    // Ask every connection on this endpoint to close.
-    //
-    // Posted, not called: a connection's state belongs to the endpoint's
-    // executor, and this is called from whichever thread is stopping the server.
-    // Closing the socket above stops new connections arriving but leaves the
-    // running ones exactly as they were — their engines are parked on stream
-    // reads, and each would hold the pool's context until its idle timeout.
+    // Ask every live connection to close. This is the shutdown path the Server
+    // uses: it is not a connection error, so each connection gets a proper
+    // application close rather than a silent socket drop.
     void shutdown_connections() {
-        auto self = this->shared_from_this();
-        asio::post(m_executor, [self] {
-            for (auto& [cid, connection] : self->m_by_cid) {
-                (void)cid;
-                connection->close(0, "server stopping");
-            }
-        });
+        // The CID table holds weak references, so each entry has to be promoted
+        // — and a connection may legitimately be gone already.
+        for (auto& [id, weak] : m_by_cid) {
+            if (auto conn = weak.lock()) conn->close(0, "server stopping");
+        }
     }
-
-    // Drop connection IDs so a peer that keeps talking after the connection is
-    // gone gets a stateless reset rather than silence.
-    void remember_cid(std::string cid) {
-        m_recent_cids.push_back(std::move(cid));
-        while (m_recent_cids.size() > kRecentCidLimit) m_recent_cids.pop_front();
-    }
-
-    [[nodiscard]] std::size_t connection_count() const noexcept { return m_by_cid.size(); }
 
   private:
-    using Clock = std::chrono::steady_clock;
+    using ConnectionPtr = std::shared_ptr<Connection>;
 
-    asio::awaitable<void> recv_loop(std::shared_ptr<QuicEndpoint> self) {
-        std::array<std::byte, 2048> buffer{};
+    // --- datagram in -------------------------------------------------------
+
+    asio::awaitable<void> receive_loop() {
+        std::vector<std::uint8_t> buffer(kReceiveBufferSize);
         for (;;) {
-            asio::ip::udp::endpoint from;
-            auto [ec, n] = co_await m_socket.async_receive_from(asio::buffer(buffer), from,
-                                                                asio::as_tuple(asio::use_awaitable));
+            asio::ip::udp::endpoint remote;
+            auto [ec, n] = co_await m_socket.async_receive_from(asio::buffer(buffer), remote,
+                                                               asio::as_tuple(asio::use_awaitable));
             if (ec) {
                 if (ec == asio::error::operation_aborted) co_return;
-                // A persistent receive error would otherwise spin a core with no
-                // diagnostic at all — the port would just look "slow".
-                SIMPLE_HTTP_ERROR_LOG("QUIC recv: {}", ec.message());
+                // A connection-refused on a UDP socket means a previous send
+                // drew an ICMP port-unreachable. Not fatal, and there is nothing
+                // to reply to.
                 continue;
             }
             if (n == 0) continue;
-            handle_datagram(std::span<const std::uint8_t>{reinterpret_cast<const std::uint8_t*>(buffer.data()),
-                                                          n},
-                            from);
+            handle_datagram(std::span<const std::uint8_t>{buffer.data(), n}, remote);
         }
     }
 
-    void handle_datagram(std::span<const std::uint8_t> data, const asio::ip::udp::endpoint& from) {
-        Reader r{data};
-        PacketHeader hdr;
-        const PacketParseStatus status = parse_packet_header(r, m_config.connection.connection_id_length, hdr);
-
-        if (status == PacketParseStatus::UnsupportedVersion) {
-            // A version we do not speak. The peer cannot know that without being
-            // told, and the packet's connection IDs are there precisely so this
-            // reply can be addressed (RFC 9000 §6).
-            send_version_negotiation(hdr, from);
-            return;
-        }
-        if (status != PacketParseStatus::Ok) return;
-
-        if (auto it = m_by_cid.find(hdr.dcid); it != m_by_cid.end()) {
-            it->second->on_datagram(data, from);
-            return;
+    void handle_datagram(std::span<const std::uint8_t> data, const asio::ip::udp::endpoint& remote) {
+        ngtcp2_version_cid vc{};
+        const std::size_t scid_len = m_config.connection.connection_id_length;
+        switch (const int rv = ngtcp2_pkt_decode_version_cid(&vc, data.data(), data.size(), scid_len)) {
+            case 0:
+                break;
+            case NGTCP2_ERR_VERSION_NEGOTIATION:
+                // The client offered a version we do not speak. Tell it what we
+                // do speak, and drop the packet: there is no connection yet and
+                // creating one for a version we cannot complete would be worse
+                // than saying so.
+                send_version_negotiation(vc, remote);
+                return;
+            default:
+                return;
         }
 
-        if (hdr.long_header && hdr.type == LongHeaderType::Initial) {
-            if (m_config.retry && !token_valid(hdr.token, from, hdr.dcid)) {
-                send_retry(hdr, from);
+        const std::string key = cid_key(vc.dcid, vc.dcidlen);
+        auto it = m_by_cid.find(key);
+        if (it != m_by_cid.end()) {
+            if (auto conn = it->second.lock()) {
+                conn->on_datagram(data);
+            } else {
+                m_by_cid.erase(it);
+            }
+            return;
+        }
+
+        // No connection owns this Destination Connection ID. Either it is a new
+        // Initial (which is how connections are born), or it is a stale packet
+        // for a connection that is gone.
+        ngtcp2_pkt_hd hd{};
+        if (ngtcp2_accept(&hd, data.data(), data.size()) != 0) {
+            // A packet we cannot accept. If it is a short-header packet long
+            // enough to be indistinguishable from a reset, answer with a
+            // stateless reset — that is the only way a peer learns its
+            // connection is dead (RFC 9000 §10.3).
+            if (!(data[0] & 0x80) && data.size() >= NGTCP2_MIN_STATELESS_RESET_RANDLEN) {
+                send_stateless_reset(data.size(), vc, remote);
+            }
+            return;
+        }
+
+        // hd is an Initial. Decide whether to validate the client's address.
+        std::vector<std::uint8_t> token;
+        ngtcp2_token_type token_type = NGTCP2_TOKEN_TYPE_UNKNOWN;
+        std::array<std::uint8_t, NGTCP2_MAX_CIDLEN> original_dcid{};
+        std::size_t original_dcid_len = 0;
+        bool retried = false;
+
+        if (m_config.retry) {
+            if (hd.tokenlen == 0) {
+                send_retry(hd, vc, remote);
                 return;
             }
-            create_connection(data, from, hdr);
-            return;
+            ngtcp2_cid odcid{};
+            ngtcp2_cid retry_scid{};
+            ngtcp2_cid_init(&retry_scid, vc.scid, vc.scidlen);
+            const int vrv = ngtcp2_crypto_verify_retry_token2(
+                &odcid, hd.token, hd.tokenlen, m_secret.data(), m_secret.size(), hd.version,
+                reinterpret_cast<const ngtcp2_sockaddr*>(remote.data()), static_cast<ngtcp2_socklen>(remote.size()),
+                &retry_scid, kRetryTokenTimeout, std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                   std::chrono::steady_clock::now().time_since_epoch())
+                                                   .count());
+            if (vrv != 0) {
+                // The token is unreadable, expired, or was issued for a
+                // different address. Ask again rather than guessing.
+                send_retry(hd, vc, remote);
+                return;
+            }
+            // After a Retry the client's DCID is the Retry's SCID, and the
+            // *original* DCID is what the token carried.
+            original_dcid_len = std::min<std::size_t>(odcid.datalen, original_dcid.size());
+            std::copy(odcid.data, odcid.data + original_dcid_len, original_dcid.begin());
+            retried = true;
+            token.assign(hd.token, hd.token + hd.tokenlen);
+            token_type = NGTCP2_TOKEN_TYPE_RETRY;
+        } else {
+            // Address validation off: the client's DCID is the original one.
+            original_dcid_len = std::min<std::size_t>(vc.dcidlen, original_dcid.size());
+            std::copy(vc.dcid, vc.dcid + original_dcid_len, original_dcid.begin());
+            if (hd.tokenlen > 0) {
+                token.assign(hd.token, hd.token + hd.tokenlen);
+                token_type = NGTCP2_TOKEN_TYPE_NEW_TOKEN;
+            }
         }
 
-        // Nothing matches. If the connection ID looks like one we issued, the
-        // peer is talking to a connection that has closed: a stateless reset
-        // tells it so without keeping any state (RFC 9000 §10.3).
-        if (!hdr.long_header) maybe_stateless_reset(hdr.dcid, from);
-    }
+        QuicBootstrap bootstrap;
+        bootstrap.client_scid_len = std::min<std::size_t>(hd.scid.datalen, bootstrap.client_scid.size());
+        std::copy(hd.scid.data, hd.scid.data + bootstrap.client_scid_len, bootstrap.client_scid.begin());
+        bootstrap.original_dcid = original_dcid;
+        bootstrap.original_dcid_len = original_dcid_len;
+        bootstrap.retried = retried;
+        bootstrap.version = hd.version;
+        bootstrap.token = std::move(token);
+        bootstrap.token_type = token_type;
 
-    void create_connection(std::span<const std::uint8_t> data, const asio::ip::udp::endpoint& from,
-                           const PacketHeader& hdr) {
-        if (m_by_cid.size() / 2 >= m_config.connection.max_streams) {
-            // A crude bound, but the point is that an attacker cannot make the
-            // table grow without limit by opening connections.
-            SIMPLE_HTTP_WARN_LOG("QUIC: too many connections, dropping Initial");
+        auto self = this;
+        error_code local_ec;
+        auto local = m_socket.local_endpoint(local_ec);
+        if (local_ec) local = asio::ip::udp::endpoint{};
+
+        auto conn = std::make_shared<Connection>(m_executor, m_ssl_ctx, m_config.connection, bootstrap,
+                                                 m_config.supported_versions, local, remote,
+                                                 [self](std::span<const std::uint8_t> datagram,
+                                                        const asio::ip::udp::endpoint& to) {
+                                                     self->queue_datagram(datagram, to);
+                                                 });
+        if (conn->init_failed()) {
+            SIMPLE_HTTP_ERROR_LOG("quic: could not set up TLS for a new connection");
             return;
         }
-
-        const std::string original_dcid{hdr.dcid};
-        const std::string peer_scid{hdr.scid};
-        auto self = this->shared_from_this();
-
-        auto connection = std::make_shared<Connection>(
-            m_executor, m_ssl_ctx, m_config.connection, original_dcid, peer_scid,
-            [self](Bytes datagram, const asio::ip::udp::endpoint& to) { self->send(std::move(datagram), to); },
-            from, [self] { return self->make_connection_id(); }, /*address_validated=*/m_config.retry);
-        if (!connection->init()) {
-            SIMPLE_HTTP_ERROR_LOG("QUIC: TLS setup failed for a new connection");
-            return;
-        }
-
-        // Registered under both IDs: ours, because that is what the peer will
-        // use from its next flight on, and the client's original one, because
-        // until our first reply arrives the client keeps retransmitting its
-        // Initial under that.
-        m_by_cid[connection->local_scid()] = connection;
-        m_by_cid[original_dcid] = connection;
-        m_original_of[connection.get()] = original_dcid;
-
-        // The Initial that created this connection is fed in first, so the
-        // handshake has something to chew on before the loops start — and so an
-        // engine that asks for a stream immediately is not waiting on a
-        // datagram that has already been consumed.
-        connection->on_datagram(data, from);
-
-        // The loops. `run` owns them and returns when the connection is over;
-        // it must be spawned before the engine, because the engine's writes are
-        // only turned into packets by the write loop inside it.
-        asio::co_spawn(m_executor, connection->run(), asio::detached);
-
-        asio::co_spawn(
-            m_executor,
-            [self, connection]() -> asio::awaitable<void> {
-                co_await self->m_serve(connection);
-                // The engine's accept loop has returned. The connection's own
-                // loops may still be draining, so wait for it to report itself
-                // closed before retiring its connection IDs.
-                while (!connection->closed()) {
-                    asio::steady_timer timer{self->m_executor};
-                    timer.expires_after(std::chrono::milliseconds(20));
-                    co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
-                }
-                self->retire(std::move(connection));
+        // Every CID ngtcp2 may hand out later has to route here too. Without
+        // this a client that migrates to a fresh connection ID becomes
+        // unreachable — and its packets look exactly like those of a connection
+        // that never existed.
+        conn->set_cid_callbacks(
+            [self, weak = std::weak_ptr<Connection>(conn)](std::span<const std::uint8_t> cid, std::span<const std::uint8_t>) {
+                self->associate_cid(cid, weak);
             },
-            asio::detached);
-    }
+            [self](std::span<const std::uint8_t> cid) { self->dissociate_cid(cid); });
 
-    void retire(std::shared_ptr<Connection> connection) {
-        const std::string local = connection->local_scid();
-        auto it = m_original_of.find(connection.get());
-        if (it != m_original_of.end()) {
-            m_by_cid.erase(it->second);
-            m_original_of.erase(it);
-        }
-        m_by_cid.erase(local);
-        // The IDs stay remembered so that a late packet gets a stateless reset
-        // instead of being silently dropped — which is what a peer interprets as
-        // a stalled connection.
-        remember_cid(local);
-    }
-
-    void send(Bytes datagram, const asio::ip::udp::endpoint& to) {
-        // A best-effort send, synchronous because a UDP send only blocks when
-        // the socket buffer is full and every datagram here is at most one MTU.
-        // Errors are dropped on purpose: they are per-datagram, and QUIC's own
-        // loss detection is what recovers from a datagram that never arrives.
-        error_code ec;
-        m_socket.send_to(asio::buffer(datagram), to, 0, ec);
-    }
-
-    std::string make_connection_id() {
-        std::string cid(m_config.connection.connection_id_length, '\0');
-        auto* out = reinterpret_cast<unsigned char*>(cid.data());
-        RAND_bytes(out, static_cast<int>(cid.size()));
-        return cid;
-    }
-
-    void send_version_negotiation(const PacketHeader& hdr, const asio::ip::udp::endpoint& from) {
-        // The reply echoes the peer's IDs *swapped*: their source is our
-        // destination and vice versa, so the packet is addressed back to them
-        // (RFC 9000 §17.2.1).
-        Bytes packet;
-        append_version_negotiation(packet, hdr.scid, hdr.dcid,
-                                   std::span<const std::uint32_t>{m_config.supported_versions});
-        send(std::move(packet), from);
-    }
-
-    void send_retry(const PacketHeader& hdr, const asio::ip::udp::endpoint& from) {
-        // The Retry's source connection ID is freshly chosen: the client will
-        // use it as its destination from now on, and its token is bound to it.
-        const std::string new_scid = make_connection_id();
-        const std::string token = make_token(from, hdr.dcid, new_scid);
-
-        Bytes without_tag;
-        Bytes packet;
-        append_retry(packet, hdr.scid, new_scid, token, std::string(16, '\0'));
-        without_tag = packet;
-        // Trim the placeholder tag before computing the pseudo-packet; the tag is
-        // computed over the Retry *without* it (RFC 9001 §5.8).
-        without_tag.resize(without_tag.size() - 16);
-
-        Bytes pseudo;
-        append_retry_pseudo_packet(pseudo, hdr.dcid, without_tag);
-        Bytes tag;
-        retry_integrity_tag(pseudo, tag);
-        if (tag.size() != 16) return;
-
-        packet.resize(without_tag.size());
-        packet += tag;
-        send(std::move(packet), from);
-    }
-
-    // The token is minted by us and travels through the peer, so it has to be
-    // both unforgeable and bound to the address that asked for it — otherwise it
-    // is a connection slot an attacker can hand out.
-    Bytes make_token(const asio::ip::udp::endpoint& from, std::string_view original_dcid,
-                     std::string_view new_scid) {
-        Bytes plain;
-        append_address(plain, from);
-        append_varint(plain, original_dcid.size());
-        plain.append(original_dcid);
-        append_varint(plain, new_scid.size());
-        plain.append(new_scid);
-
-        PacketKeys keys = retry_token_keys();
-        Bytes nonce(12, '\0');
-        RAND_bytes(reinterpret_cast<unsigned char*>(nonce.data()), 12);
-        Bytes aad;
-        Bytes sealed;
-        // The nonce has to reach the peer, so it is prepended rather than
-        // derived; the AEAD then also authenticates the address it was minted
-        // for, and the tag is what makes forgery detectable.
-        PacketKeys nonced = keys;
-        nonced.iv = nonce;
-        if (!aead_seal(nonced, 0, aad, plain, sealed)) return {};
-        Bytes token = nonce;
-        token += sealed;
-        return token;
-    }
-
-    bool token_valid(std::string_view token, const asio::ip::udp::endpoint& from, std::string& out_dcid) {
-        if (token.size() < 12 + kAeadTagLen + 1) return false;
-        Bytes nonce{token.substr(0, 12)};
-        PacketKeys nonced = retry_token_keys();
-        nonced.iv = nonce;
-        Bytes plain;
-        Bytes aad;
-        if (!aead_open(nonced, 0, aad, token.substr(12), plain)) return false;
-
-        Reader r = reader_of(plain);
-        asio::ip::udp::endpoint bound;
-        if (!read_address(r, bound)) return false;
-        if (bound != from) return false;  // minted for someone else
-        const std::uint64_t dcid_len = r.varint();
-        if (r.failed() || r.remaining() < dcid_len) return false;
-        out_dcid.assign(reinterpret_cast<const char*>(r.rest().data()), static_cast<std::size_t>(dcid_len));
-        return !out_dcid.empty() || dcid_len == 0;
-    }
-
-    [[nodiscard]] PacketKeys retry_token_keys() {
-        // A key that lives as long as the endpoint: a token is only useful
-        // within one connection attempt, so rotating it would buy nothing and
-        // cost a synchronization point.
-        PacketKeys keys;
-        keys.valid = true;
-        keys.md = EVP_sha256();
-        keys.aead = EVP_aes_128_gcm();
-        keys.hp = EVP_aes_128_ecb();
-        keys.key.assign(reinterpret_cast<const char*>(m_retry_key.data()), 16);
-        keys.iv.assign(12, '\0');
-        keys.secret.assign(reinterpret_cast<const char*>(m_retry_key.data()), m_retry_key.size());
-        return keys;
-    }
-
-    static void append_address(Bytes& out, const asio::ip::udp::endpoint& endpoint) {
-        const auto addr = endpoint.address();
-        if (addr.is_v6()) {
-            append_u8(out, 6);
-            const auto bytes = addr.to_v6().to_bytes();
-            out.append(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-        } else {
-            append_u8(out, 4);
-            const auto bytes = addr.to_v4().to_bytes();
-            out.append(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-        }
-        append_u16(out, endpoint.port());
-    }
-
-    static bool read_address(Reader& r, asio::ip::udp::endpoint& out) {
-        const std::uint8_t family = r.u8();
-        if (r.failed()) return false;
-        if (family == 4) {
-            const auto bytes = r.bytes(4);
-            if (r.failed()) return false;
-            asio::ip::address_v4::bytes_type b{};
-            std::ranges::copy(bytes, b.begin());
-            out.address(asio::ip::address_v4{b});
-        } else if (family == 6) {
-            const auto bytes = r.bytes(16);
-            if (r.failed()) return false;
-            asio::ip::address_v6::bytes_type b{};
-            std::ranges::copy(bytes, b.begin());
-            out.address(asio::ip::address_v6{b});
-        } else {
-            return false;
-        }
-        out.port(r.u16());
-        return !r.failed();
-    }
-
-    void maybe_stateless_reset(std::string_view dcid, const asio::ip::udp::endpoint& from) {
-        if (dcid.size() < 21) return;  // too short to carry a reset token
-        const bool known =
-            std::find(m_recent_cids.begin(), m_recent_cids.end(), dcid) != m_recent_cids.end();
-        if (!known) return;
-
-        // The reset is a short header packet whose last 16 octets are a token
-        // derived from the connection ID, so the peer — which knows the same
-        // token from the transport parameters — recognises it (RFC 9000 §10.3).
-        Bytes packet;
-        std::uint8_t first = static_cast<std::uint8_t>(0x40 | 0x02);  // fixed bit, 4-octet pn length
-        append_u8(packet, first);
-        packet.append(dcid);
-        for (std::size_t i = 0; i < 4; ++i) {
-            packet.push_back(static_cast<char>(m_random() & 0xff));
-        }
-        while (packet.size() + 16 < kMinInitialDatagramSize) {
-            packet.push_back(static_cast<char>(m_random() & 0xff));
-        }
-        std::array<unsigned char, 32> mac{};
-        unsigned int mac_len = 0;
-        if (HMAC(EVP_sha256(), m_reset_key.data(), static_cast<int>(m_reset_key.size()),
-                 reinterpret_cast<const unsigned char*>(dcid.data()), dcid.size(), mac.data(), &mac_len) ==
-            nullptr) {
+        if (!conn->init()) {
+            SIMPLE_HTTP_ERROR_LOG("quic: ngtcp2 could not create a connection");
             return;
         }
-        packet.append(reinterpret_cast<const char*>(mac.data()), 16);
-        send(std::move(packet), from);
+        // The Initial itself still has to be delivered — it carries the
+        // ClientHello. Our own Source Connection ID is already in the table:
+        // `init()` walks the IDs ngtcp2 pre-allocated and registers each one.
+        m_live.push_back(conn);
+        conn->on_datagram(data);
+
+        asio::co_spawn(m_executor, serve(conn), asio::detached);
+    }
+
+    asio::awaitable<void> serve(ConnectionPtr conn) {
+        // The engine's own run() drives the connection; this wrapper exists to
+        // keep the connection alive until it is finished and to drop the
+        // bookkeeping entry afterwards.
+        co_await m_serve(conn);
+        co_await conn->await_closed();
+        m_live.erase(std::remove(m_live.begin(), m_live.end(), conn), m_live.end());
+        co_return;
+    }
+
+    // --- CID table ---------------------------------------------------------
+
+    static std::string cid_key(const std::uint8_t* data, std::size_t len) {
+        return std::string{reinterpret_cast<const char*>(data), len};
+    }
+
+    void associate_cid(std::span<const std::uint8_t> cid, const std::weak_ptr<Connection>& conn) {
+        if (cid.empty()) return;
+        m_by_cid[cid_key(cid.data(), cid.size())] = conn;
+    }
+
+    void dissociate_cid(std::span<const std::uint8_t> cid) {
+        if (cid.empty()) return;
+        m_by_cid.erase(cid_key(cid.data(), cid.size()));
+    }
+
+    // --- stateless answers --------------------------------------------------
+
+    void send_version_negotiation(const ngtcp2_version_cid& vc, const asio::ip::udp::endpoint& remote) {
+        std::array<std::uint8_t, kMaxDatagram> buf{};
+        // The server must swap the connection IDs in its answer (§6.1): the
+        // client checks that its own SCID came back as the DCID, which is what
+        // stops an off-path attacker from injecting a downgrade.
+        const ngtcp2_ssize n = ngtcp2_pkt_write_version_negotiation(
+            buf.data(), buf.size(), static_cast<std::uint8_t>(random_byte()), vc.scid, vc.scidlen, vc.dcid, vc.dcidlen,
+            m_config.supported_versions.data(), m_config.supported_versions.size());
+        if (n > 0) queue_datagram(std::span<const std::uint8_t>{buf.data(), static_cast<std::size_t>(n)}, remote);
+    }
+
+    void send_retry(const ngtcp2_pkt_hd& hd, const ngtcp2_version_cid& vc, const asio::ip::udp::endpoint& remote) {
+        std::array<std::uint8_t, kMaxDatagram> buf{};
+        std::array<std::uint8_t, NGTCP2_CRYPTO_MAX_RETRY_TOKENLEN2> token{};
+        // The Retry's own Source Connection ID, which the client will echo as
+        // its DCID. Validating against it is what binds the token to the Retry.
+        ngtcp2_cid retry_scid{};
+        retry_scid.datalen = std::min<std::size_t>(m_config.connection.connection_id_length, NGTCP2_MAX_CIDLEN);
+        if (RAND_bytes(retry_scid.data, static_cast<int>(retry_scid.datalen)) != 1) return;
+
+        ngtcp2_cid odcid{};
+        ngtcp2_cid_init(&odcid, vc.dcid, vc.dcidlen);
+
+        const ngtcp2_ssize tokenlen = ngtcp2_crypto_generate_retry_token2(
+            token.data(), m_secret.data(), m_secret.size(), hd.version,
+            reinterpret_cast<const ngtcp2_sockaddr*>(remote.data()), static_cast<ngtcp2_socklen>(remote.size()),
+            &retry_scid, &odcid, std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch())
+                                     .count());
+        if (tokenlen < 0) return;
+
+        const ngtcp2_ssize n = ngtcp2_crypto_write_retry(buf.data(), buf.size(), hd.version, &hd.scid, &retry_scid, &hd.dcid,
+                                                         token.data(), static_cast<std::size_t>(tokenlen));
+        if (n > 0) queue_datagram(std::span<const std::uint8_t>{buf.data(), static_cast<std::size_t>(n)}, remote);
+    }
+
+    void send_stateless_reset(std::size_t /*packet_len*/, const ngtcp2_version_cid& vc,
+                              const asio::ip::udp::endpoint& remote) {
+        std::array<std::uint8_t, kMaxDatagram> buf{};
+        std::array<std::uint8_t, NGTCP2_STATELESS_RESET_TOKENLEN> token{};
+        ngtcp2_cid cid{};
+        // Derived from the DCID in the packet and our secret, so any observer of
+        // that packet can compute it (RFC 9000 §10.3.1) — which is exactly what
+        // makes it unforgeable by an attacker who cannot see the traffic, and
+        // verifiable by the peer that can.
+        ngtcp2_cid_init(&cid, vc.dcid, vc.dcidlen);
+        if (ngtcp2_crypto_generate_stateless_reset_token(token.data(), m_secret.data(), m_secret.size(), &cid) != 0) {
+            return;
+        }
+        std::array<std::uint8_t, NGTCP2_STATELESS_RESET_TOKENLEN> rand{};
+        if (RAND_bytes(rand.data(), static_cast<int>(rand.size())) != 1) return;
+        const ngtcp2_ssize n = ngtcp2_pkt_write_stateless_reset(buf.data(), buf.size(), token.data(), rand.data(), rand.size());
+        if (n > 0) queue_datagram(std::span<const std::uint8_t>{buf.data(), static_cast<std::size_t>(n)}, remote);
+    }
+
+    static std::uint8_t random_byte() {
+        std::uint8_t b = 0;
+        if (RAND_bytes(&b, 1) != 1) return 0;
+        return b;
+    }
+
+    // --- datagram out -------------------------------------------------------
+    //
+    // Sends are queued and drained by one coroutine rather than issued inline.
+    // The reason is that connections produce datagrams from inside ngtcp2
+    // callbacks and from a send loop that must not block; a socket that is
+    // briefly unwritable would otherwise either stall a connection or force it
+    // to drop a packet it has already committed to retransmitting.
+
+    void queue_datagram(std::span<const std::uint8_t> datagram, const asio::ip::udp::endpoint& to) {
+        if (m_closed) return;
+        m_send_queue.emplace_back(std::vector<std::uint8_t>(datagram.begin(), datagram.end()), to);
+        (void)m_send_wake.try_send(error_code{});
+    }
+
+    asio::awaitable<void> send_loop() {
+        while (!m_closed) {
+            auto [ec] = co_await m_send_wake.async_receive(asio::as_tuple(asio::use_awaitable));
+            (void)ec;
+            while (!m_send_queue.empty() && !m_closed) {
+                auto [payload, to] = std::move(m_send_queue.front());
+                auto [send_ec, sent] = co_await m_socket.async_send_to(asio::buffer(payload), to,
+                                                                     asio::as_tuple(asio::use_awaitable));
+                if (send_ec) {
+                    // A datagram that could not be sent is a loss, and QUIC is
+                    // built to tolerate loss. Retrying it would be worse:
+                    // retransmission belongs to ngtcp2, which knows the packet
+                    // number and the deadline.
+                    break;
+                }
+                (void)sent;
+                m_send_queue.pop_front();
+            }
+        }
+        co_return;
     }
 
     Executor m_executor;
     asio::ip::udp::socket m_socket;
-    SSL_CTX* m_ssl_ctx{nullptr};
+    SSL_CTX* m_ssl_ctx;
     QuicEndpointConfig m_config;
     ServeFn m_serve;
 
-    std::unordered_map<std::string, std::shared_ptr<Connection>> m_by_cid;
-    std::unordered_map<const Connection*, std::string> m_original_of;
-    std::deque<std::string> m_recent_cids;
+    std::array<std::uint8_t, 32> m_secret{};
 
-    std::array<unsigned char, 16> m_retry_key{};
-    std::array<unsigned char, 32> m_reset_key{};
-    std::mt19937_64 m_random{std::random_device{}()};
+    std::unordered_map<std::string, std::weak_ptr<Connection>> m_by_cid;
+    std::vector<ConnectionPtr> m_live;
+
+    std::deque<std::pair<std::vector<std::uint8_t>, asio::ip::udp::endpoint>> m_send_queue;
+    asio::experimental::concurrent_channel<void(error_code)> m_send_wake{m_executor, 128};
+    bool m_started{false};
+    bool m_closed{false};
 };
 
 }  // namespace simple_http::quic
