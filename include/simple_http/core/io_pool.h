@@ -9,8 +9,11 @@
 
 #include <atomic>
 #include <cassert>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -39,15 +42,53 @@ class IoCtxPool final {
     ~IoCtxPool() { stop(); }
 
     void start() {
+        m_running = m_io_contexts.size();
         for (auto& context : m_io_contexts) {
-            m_threads.emplace_back([ctx = context] { ctx->run(); });
+            m_threads.emplace_back([this, ctx = context] {
+                ctx->run();
+                // This context has nothing left to do; stop() waits on this
+                // before it forces anything.
+                {
+                    std::lock_guard lock(m_idle_mutex);
+                    --m_running;
+                }
+                m_idle_cv.notify_all();
+            });
         }
     }
 
+    // How long stop() lets the contexts drain before it forces them. The drain
+    // is normally over in microseconds — the caller has already cancelled
+    // whatever was in flight — so this is the bound on a handler that will not
+    // finish on its own, not the usual case.
+    static constexpr auto kDrainGrace = std::chrono::seconds(2);
+
+    // Stop every context and join its thread, draining first.
+    //
+    // The draining is the point. A connection coroutine parked on a read is
+    // unwound *by* its own completion handler: the read completes with
+    // operation_aborted, the coroutine runs to its end, and the frame is
+    // destroyed from a place that knows its invariants. Calling stop() on the
+    // context first abandons that handler, and the frame is then destroyed from
+    // the io_context's destructor instead — several layers from anything that
+    // knows what the frame holds. For an engine that races two child coroutines
+    // with `operator||`, that destruction walks state the operator's own
+    // teardown has already released.
+    //
+    // stop() remains the backstop: a context still busy after the grace period
+    // is stopped the hard way, which is what makes a stuck handler a delayed
+    // shutdown rather than a hung process.
     void stop() {
         m_work.clear();
-        for (auto& context : m_io_contexts) {
-            context->stop();
+        if (!m_threads.empty()) {
+            std::unique_lock lock(m_idle_mutex);
+            const bool drained = m_idle_cv.wait_for(lock, kDrainGrace, [this] { return m_running == 0; });
+            if (!drained) {
+                lock.unlock();
+                for (auto& context : m_io_contexts) {
+                    context->stop();
+                }
+            }
         }
         for (auto& thread : m_threads) {
             if (thread.joinable()) {
@@ -97,6 +138,11 @@ class IoCtxPool final {
 
     std::vector<std::shared_ptr<asio::io_context>> m_io_contexts;
     std::vector<asio::executor_work_guard<asio::io_context::executor_type>> m_work;
+    // Contexts still running their loop. Only meaningful once start() has
+    // spawned the threads; a pool that was never started has nothing to wait for.
+    std::mutex m_idle_mutex;
+    std::condition_variable m_idle_cv;
+    std::size_t m_running{0};
     std::atomic_uint64_t m_cursor{0};
     std::vector<std::thread> m_threads;
     std::size_t m_pool_size;

@@ -10,6 +10,9 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <format>
+#include <optional>
+#include <string>
 
 #include "compression.h"
 
@@ -38,6 +41,34 @@ struct EngineLimits {
     // Our advertised initial receive window (SETTINGS_INITIAL_WINDOW_SIZE), per
     // stream and connection. Larger trades memory for throughput on fast links.
     std::int32_t h2_initial_window{65535};
+
+    // --- HTTP/3 advertisement ---
+    // The port a browser should reach this origin's HTTP/3 endpoint on: the
+    // value of the Alt-Svc field (RFC 7838) that the HTTP/1.x and HTTP/2
+    // engines send. Empty means "do not advertise", which is the only correct
+    // answer for a server with no QUIC listener — and is what alt_svc_value()
+    // always answers in a build without HTTP/3, so the fields exist only there.
+    // A build that cannot serve HTTP/3 cannot be configured to advertise it.
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+    std::optional<std::uint16_t> h3_alt_svc_port{};
+    std::uint32_t h3_alt_svc_max_age{86400};
+#endif
+
+    // The Alt-Svc field value, or empty when there is nothing to advertise.
+    //
+    // The macro is read here and nowhere else. The engines that send the header
+    // call this unconditionally and never branch on it, and the one engine that
+    // must *not* send it — HTTP/3 itself, where advertising an alternative to
+    // the connection the response arrived on would be nonsense — simply never
+    // asks.
+    [[nodiscard]] std::string alt_svc_value() const {
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+        if (!h3_alt_svc_port) return {};
+        return std::format("h3=\":{}\"; ma={}", *h3_alt_svc_port, h3_alt_svc_max_age);
+#else
+        return {};
+#endif
+    }
 
     // --- response compression (off by default) ---
     // Lives here rather than on ServerConfig so that it reaches the engines by

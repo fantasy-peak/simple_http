@@ -64,14 +64,18 @@ template <TransportLike Transport>
 class Http1ResponseWriter : public ResponseWriter {
   public:
     // `deadline` and `idle_timeout` let a write refresh the connection's idle
-    // deadline (shared with the engine's read path and watchdog).
+    // deadline (shared with the engine's read path and watchdog). `alt_svc` is
+    // the already-rendered value of the Alt-Svc field, or empty for none: the
+    // writer has no business knowing about ports or cache lifetimes, only about
+    // where the octets go.
     Http1ResponseWriter(std::shared_ptr<Transport> transport, Version version, SharedDeadline deadline,
-                        std::chrono::steady_clock::duration idle_timeout)
+                        std::chrono::steady_clock::duration idle_timeout, std::string alt_svc = {})
         : m_transport(std::move(transport)),
           m_executor(m_transport->get_executor()),
           m_version(version),
           m_deadline(std::move(deadline)),
-          m_idle_timeout(idle_timeout) {}
+          m_idle_timeout(idle_timeout),
+          m_alt_svc(std::move(alt_svc)) {}
 
     // Set by the engine when the request method was HEAD: the response keeps its
     // headers (so the client learns the entity length) but carries no body
@@ -98,7 +102,7 @@ class Http1ResponseWriter : public ResponseWriter {
         // body — plus a second allocation and its page faults — which is what made
         // a large response expensive.
         std::string head;
-        head.reserve(kResponseOverhead + headers_bytes(headers));
+        head.reserve(kResponseOverhead + headers_bytes_with_alt_svc(headers));
         append_status_line(head, status);
         append_headers(head, headers);
         head.append("\r\n");
@@ -118,7 +122,7 @@ class Http1ResponseWriter : public ResponseWriter {
         co_await hop();
         if (!m_open) co_return make_error_code(asio::error::not_connected);
         std::string out;
-        out.reserve(kResponseOverhead + headers_bytes(headers));
+        out.reserve(kResponseOverhead + headers_bytes_with_alt_svc(headers));
         append_status_line(out, status);
         append_headers(out, headers);
         out.append("\r\n");
@@ -149,7 +153,7 @@ class Http1ResponseWriter : public ResponseWriter {
             headers.add_lower("transfer-encoding", "chunked");
         }
         std::string out;
-        out.reserve(kResponseOverhead + headers_bytes(headers));
+        out.reserve(kResponseOverhead + headers_bytes_with_alt_svc(headers));
         append_status_line(out, status);
         append_headers(out, headers);
         out.append("\r\n");
@@ -243,6 +247,16 @@ class Http1ResponseWriter : public ResponseWriter {
         return total;
     }
 
+    // The same, plus the Alt-Svc line append_headers() adds on its own, so the
+    // reserve stays an upper bound rather than an estimate that reallocates once.
+    [[nodiscard]] std::size_t headers_bytes_with_alt_svc(const Headers& headers) const {
+        std::size_t total = headers_bytes(headers);
+        if (!m_alt_svc.empty()) total += kAltSvcPrefix.size() + m_alt_svc.size() + 2;
+        return total;
+    }
+
+    static constexpr std::string_view kAltSvcPrefix = "alt-svc: ";
+
     // The connection field holds one of exactly two values, so the whole line
     // is a compile-time constant rather than three appends per response.
     static constexpr std::string_view kKeepAliveConnection = "connection: keep-alive\r\n";
@@ -255,6 +269,15 @@ class Http1ResponseWriter : public ResponseWriter {
             out.append(name);
             out.append(": ");
             out.append(value);
+            out.append("\r\n");
+        }
+        // Alt-Svc: how a browser learns this origin also speaks HTTP/3
+        // (RFC 7838). Sent on every response rather than once — it is a cache
+        // entry with an expiry, and a client that arrives on a fresh profile has
+        // seen none of the earlier ones.
+        if (!m_alt_svc.empty()) {
+            out.append(kAltSvcPrefix);
+            out.append(m_alt_svc);
             out.append("\r\n");
         }
         if (!saw_connection) {
@@ -310,6 +333,7 @@ class Http1ResponseWriter : public ResponseWriter {
     bool m_head_request{false};  // response to HEAD: no body (RFC 9110 §9.3.2)
     SharedDeadline m_deadline;  // shared with the engine (read path + watchdog)
     std::chrono::steady_clock::duration m_idle_timeout{};
+    std::string m_alt_svc;  // rendered Alt-Svc value; empty for none
 };
 
 template <TransportLike Transport>
@@ -494,8 +518,8 @@ class Http1Engine {
                     co_return co_await pull_body_chunk();
                 });
 
-            auto writer = std::make_shared<Http1ResponseWriter<Transport>>(m_transport, version, m_deadline,
-                                                                           m_limits.idle_timeout);
+            auto writer = std::make_shared<Http1ResponseWriter<Transport>>(
+                m_transport, version, m_deadline, m_limits.idle_timeout, m_limits.alt_svc_value());
             writer->set_keep_alive(keep_alive);
             const bool head_request = head.method == Method::Head;
             writer->set_head_request(head_request);
@@ -772,8 +796,8 @@ class Http1Engine {
     }
 
     asio::awaitable<void> send_error_response(int status) {
-        auto writer = std::make_shared<Http1ResponseWriter<Transport>>(m_transport, Version::Http11, m_deadline,
-                                                                        m_limits.idle_timeout);
+        auto writer = std::make_shared<Http1ResponseWriter<Transport>>(
+            m_transport, Version::Http11, m_deadline, m_limits.idle_timeout, m_limits.alt_svc_value());
         writer->set_keep_alive(false);
         Headers headers;
         std::string body{reason_phrase(status)};

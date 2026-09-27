@@ -6,9 +6,10 @@
 
 `simple_http` 是一个 **header-only 的 C++ HTTP 服务器 + 客户端库**，基于
 `boost.asio` C++20 协程实现。服务端支持 HTTP/1.0、HTTP/1.1、HTTP/2（h2 / h2c /
-prior-knowledge）、WebSocket；客户端（`client/` 层）支持 http/https × HTTP/1.1/HTTP/2，
-通过 ALPN（TLS）或 h2c（明文，Upgrade 或 prior-knowledge）自动协商。HTTP/3 预留了
-骨架（默认关闭）。
+prior-knowledge）、HTTP/3（QUIC）、WebSocket；客户端（`client/` 层）支持
+http/https × HTTP/1.1/HTTP/2，通过 ALPN（TLS）或 h2c（明文，Upgrade 或
+prior-knowledge）自动协商。**HTTP/3 只有服务端**，且默认关闭
+（`SIMPLE_HTTP_ENABLE_HTTP3`）。
 
 关键事实（来自代码）：
 
@@ -65,7 +66,8 @@ include/
                            h2c 升级）；ws_proxy.h 是字节级 WebSocket 隧道（与 handler/http_proxy.h
                            的请求级反代相对）
       h2/                  HTTP/2 引擎 + 帧层 + HPACK（h2_frame / hpack_*）
-      h3/                  HTTP/3 骨架（#ifdef SIMPLE_HTTP_ENABLE_HTTP3，默认空）
+      h3/                  HTTP/3 引擎 + 帧层 + QPACK（qpack.h，编解码走 ls-qpack）
+                           （#ifdef SIMPLE_HTTP_ENABLE_HTTP3）
     handler/               handler 类型系统 + 路由
       handler.h            Handler 类型别名与 make_handler/invoke_handler
       router.h             Router（含反代用的 HttpClient、反代匹配、静态阶段）
@@ -89,8 +91,9 @@ include/
 其它目录：
 
 - `test/`：`server.cpp` 是示例服务器；`client.cpp` 是客户端整合自检；`server_regression.cpp`
-  是服务端对抗性回归；`unit/` 是 Catch2 单元测试；`manual_http1_keepalive.py` 是可选的**手工**
-  交叉验证；`tls_certificates/` 是测试证书（`server.cpp.test` 是未参与构建的旧快照）。
+  是服务端对抗性回归；`unit/` 是 Catch2 单元测试；`conformance/` 与 `stress/` 是两套**外部**
+  驱动脚本（见下两节）；`python/` 是第三方客户端套件；`manual_http1_keepalive.py` 是可选的
+  **手工**交叉验证；`tls_certificates/` 是测试证书（`server.cpp.test` 是未参与构建的旧快照）。
 - 没有 `docs/` 目录：架构说明就在本文件与各头文件顶部注释里。
 
 ## 架构要点（来自代码与设计）
@@ -101,7 +104,7 @@ include/
    HTTP 版本无关，版本差异只藏在 `engine/` 与 `ResponseWriter` 实现里，上层
    没有 `if (version==…)`。
 3. **传输与协议解耦**：引擎通过 `Transport` 抽象读写字节，不直接依赖具体
-   socket 类型（TCP 明文 / TLS，未来 QUIC）。
+   socket 类型（TCP 明文 / TLS / QUIC 流）。
 4. **并发模型 A（单线程 io_context 绑定）**：每个连接在 accept 时被绑定到
    `IoCtxPool` 中一个单线程 `io_context`，该连接的所有引擎/writer 工作都只在这一个
    线程上运行，因此天然串行、无需锁。绑定的方式取决于 `ServerConfig::reuse_port`：
@@ -280,7 +283,9 @@ INTERFACE 目标安装，供下游 `find_package`）。日常开发用 xmake。
 - `SIMPLE_HTTP_LOG_ACTIVE_LEVEL`（默认 0 = Trace）：低于该级别的记录在**编译期**被丢弃
   （只留 Warn 及以上就配 3，只留 Error 及以上配 4）。比 `SIMPLE_HTTP_ENABLE_LOG=0` 更细：
   既能留下错误日志，又不为被丢弃的级别生成任何代码。
-- `SIMPLE_HTTP_ENABLE_HTTP3`（默认未定义）：HTTP/3 骨架开关。
+- `SIMPLE_HTTP_ENABLE_HTTP3`（默认未定义）：编入 HTTP/3 引擎与 QUIC 监听。未定义时
+  `ServerConfig::quic` 与 QUIC 调优字段**本身不存在**，所以不定义它的构建不可能要到一个
+  UDP 侧——想用 QUIC 就必须显式打开并依赖 ngtcp2 之外的那套现有依赖。
 
 常用命令：
 
@@ -356,6 +361,68 @@ test/conformance/run.sh h2spec   # 只跑指定的（h2spec / h1spec / autobahn�
 - **它们抓到过什么**（自研套件一概看不见）：RSV 位不校验、text 消息完全不校验 UTF-8、
   close code 不校验、协议错误不发 Close 帧只静默断连、Host 缺失/重复不检查、字段名与字段值
   的字符集不检查，以及"靠请求行形状猜协议"这个做法本身与 HTTP/1.1 语义的冲突。
+
+### 负载与连接生命周期套件（改传输层或流的生老病死之后必跑）
+
+一致性套件每个用例都从一条**干净的连接**开始，正好把连接的生命周期整个跳过去——它看不见
+「同一条连接上第 N 个请求」。这一套专问那件事：
+
+```sh
+test/stress/run.sh          # 三档依次跑；非零退出码 = 有未达标或环境不全
+test/stress/run.sh h3       # 只跑指定的（h1 / h2 / h3）
+```
+
+| 档 | 打哪个端口 | 复用门线 | 吞吐 |
+|---|---|---|---|
+| **h1** | `:7791`（纯 h1） | 一条连接串行 200 个请求，**必须 200/200** | 只报告 |
+| **h2** | `:7790`（纯 h2c） | 同上 | 只报告 |
+| **h3** | `udp :7792`（双传输端点的 QUIC 侧） | 同上 | 只报告 |
+
+- **门线只有一条：失败数必须为 0。** 吞吐**不写死**：req/s 依赖机器（核数、内存带宽、
+  回环实现），写死一个数会在别的机器上误报；而「一条连接上连发 200 个请求，少一个就是
+  连接生命周期出了问题」是与机器无关的确定性判断。
+- **`7789` 不要拿来做负载**：它是 mTLS 端口，`h2load` 不带客户端证书（它的选项里就没有
+  这一项），ALPN 之后走不下去。
+- **h3 需要一份编了 ngtcp2/nghttp3 的 `h2load`。** 系统包里的那份**没编**，压 h3 会退化成
+  TCP TLS 然后 ALPN 谈崩（`No supported protocol was negotiated`）。脚本**不看版本号**——
+  `h2load --version` 编不编都打印同一行——而是在服务器起来之后**实测一发**；缺了会打印
+  自编配方并以非零退出。自编的装到别处时用 `H2LOAD=` 指过来（非静态链接还要给
+  `LD_LIBRARY_PATH`）。
+- **它抓到过**（三套一致性套件、四套自研套件一概没看见）：HTTP/3 在「上一条流 retire 之后
+  再开新流」时把新流**静默吞掉**。判据是「id 低于见过的最大 id 就当成已 retire 的重传」，
+  可**帧的到达顺序不是流被打开的顺序**——承载 QPACK 动态表插入的 encoder 流（客户端 uni
+  流 6）落在先到的 decoder 流之后，于是被丢弃、从未创建，引用动态表的字段段永远 Blocked，
+  请求无限期挂起（没有任何超时兜底）。表现是 `-n 10 -c 1 -m 1` 只成 1 个、卡满 30 秒，
+  同一台机器上 h1/h2 一切正常。修在 `quic/connection.h` 的 `peer_stream_retired`。
+
+### 丢包与乱序下的复现（手工，需要 root）
+
+一致性套件和负载套件都在**无丢包**的回环上跑，而 QUIC 的恢复路径只在丢包时才被走到——
+有一类问题它们看不见。抓到过：**PTO 探测包不携带重传数据**。服务端的首飞（ServerHello）
+整体丢失时，丢包检测的阈值没有「确认」可作基准，那个包就永远留在在飞队列里、既不判丢也
+不重传；客户端收不到 ServerHello，便以翻倍间隔重传 ClientHello 五十秒以上，而服务端每次
+都成功解密它、只回 ACK-only 包（ACK-only 不引出 ACK），两边各自退避到死。两万请求里
+会有几千到一万四千个失败（就看哪些连接掷到丢首飞），而同一台机器上的另一个 QUIC 实现
+0 失败。
+
+在回环上注入丢包（**改的是整台机器的回环，用完必须撤掉**）：
+
+```sh
+sudo tc qdisc add dev loopback0 root netem loss 3%    # 接口名见下
+h2load --alpn-list=h3 -t 4 -n 20000 -c 10 -m 20 https://127.0.0.1:7792/world
+sudo tc qdisc del dev loopback0 root
+```
+
+- **先确认 netem 真的生效。** 0% 和 5% 的吞吐一样就说明接口加错了，而这个错误不会报
+  任何警。接口名要看平台：WSL2 的回环流量走 `loopback0`（`lo` 上加了等于没加，抓包也
+  只能看到 `loopback0`），普通 Linux 上是 `lo`。
+- **必须重复跑。** 这个场景的方差在 4 倍量级：哪些连接丢掉首飞是掷骰子，同一份二进制在
+  3% 下的失败数会在 0 到 14000 之间跳。判断一个改动有没有用，用**交替 A/B**（改前改后
+  轮流跑同样多轮）比中位数，而不是各跑一次比大小——本仓库在这上面栽过：一个改动曾被
+  单次运行「证明」有效 4–10×，重复测量后两组分布几乎完全重叠。
+- **找一个对照实现。** 同一台机器上起一个别的 QUIC 服务端，用同一个 `h2load` 打同样的
+  参数，能立刻分开「这是本库的问题」和「这是环境的账」——上面那个 bug 就是靠它定位的。
+  同一个手法在 TLS 上也用过一次，结论恰好相反（那次是环境）。
 
 ## 代码风格
 

@@ -283,6 +283,15 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
             }
             codec::hpack_append_literal(block, name, value);
         }
+        // Alt-Svc: how a browser learns this origin also speaks HTTP/3
+        // (RFC 7838). Sent on every response rather than once — it is a cache
+        // entry with an expiry, and a client arriving on a fresh profile has
+        // seen none of the earlier ones. HTTP/3 never sends it: advertising an
+        // alternative to the connection the response arrived on would be
+        // telling the peer about itself.
+        if (const std::string alt_svc = m_limits.alt_svc_value(); !alt_svc.empty()) {
+            codec::hpack_append_literal(block, "alt-svc", alt_svc);
+        }
         // A header block larger than the peer's advertised frame size must be split
         // over HEADERS + CONTINUATION frames (RFC 9113 §6.2/§6.10): a compliant peer
         // answers a larger frame with FRAME_SIZE_ERROR and closes the connection.

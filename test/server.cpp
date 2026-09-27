@@ -140,6 +140,25 @@ void register_routes(ServerT& server) {
         co_await res->status(200).send(std::string(n, 'x'));
     });
 
+    // A response written in pieces, spaced out in time so each piece is
+    // acknowledged before the next one is produced. That ordering is the whole
+    // point: a plain GET ends its request with the FIN, so on a stream whose
+    // response is produced slowly, "the peer is done and nothing is
+    // unacknowledged right now" is true between every pair of pieces — and a
+    // server that retires the stream on that condition truncates the response
+    // without an error anywhere. Each piece is flushed as it is written, so a
+    // client sees the gap rather than one coalesced body.
+    server.route("/stream", [](std::shared_ptr<Request>, std::shared_ptr<Response> res) -> asio::awaitable<void> {
+        co_await res->status(200).content_type("text/plain").begin();
+        for (int i = 0; i < 3; ++i) {
+            asio::steady_timer timer{co_await asio::this_coro::executor};
+            timer.expires_after(std::chrono::milliseconds(120));
+            co_await timer.async_wait(asio::use_awaitable);
+            co_await res->write(std::format("part{} ", i));
+        }
+        co_await res->finish("end\n");
+    });
+
     // Reads the entire request body and replies with its length — exercises
     // large body upload + flow control.
     server.route("/drain", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
@@ -344,6 +363,19 @@ int main() {
         .mutual = true,
         .ca_file = "./test/tls_certificates/ca_cert.pem",
     };
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+    // HTTP/3 alongside HTTP/1.1 and HTTP/2 on the *same port number*, which is
+    // the usual deployment and the reason the two listeners are configured
+    // separately: TCP and UDP do not collide, and the client picks a transport
+    // with ALPN. This is nginx's `listen 443 ssl` plus `listen 443 quic`.
+    // Inherits the mTLS policy above, so it also exercises client certificates
+    // over QUIC.
+    tls_cfg.quic = QuicAddress{"0.0.0.0", 7789, false};
+    // Advertise it over the TCP side, which is where a browser that has never
+    // seen this origin arrives (RFC 7838). Same port number, different
+    // transport — that is the whole shape of the deployment.
+    tls_cfg.limits.h3_alt_svc_port = 7789;
+#endif
     Server tls{tls_cfg};
     register_routes(tls);
 
@@ -366,8 +398,35 @@ int main() {
     Server h1{h1_cfg};
     register_routes(h1);
 
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+    // A dual-transport listener with no client-certificate requirement, for the
+    // conformance suite and for curl, neither of which has a client cert: the
+    // same routes on TCP :7792 (HTTP/1.x and h2c) and UDP :7792 (HTTP/3), from
+    // one Server — one thread pool, one router, one configuration. The two
+    // transports do not collide because one is TCP and the other UDP, which is
+    // why they are two fields rather than two servers.
+    ServerConfig dual_cfg;
+    dual_cfg.listen = InetAddress{"0.0.0.0", 7792, false};
+    dual_cfg.quic = QuicAddress{"0.0.0.0", 7792, false};
+    dual_cfg.worker_threads = 4;
+    dual_cfg.limits.h3_alt_svc_port = 7792;
+    dual_cfg.tls = TlsConfig{
+        .cert_chain_file = "./test/tls_certificates/server_cert.pem",
+        .private_key_file = "./test/tls_certificates/server_key.pem",
+    };
+    Server dual{dual_cfg};
+    register_routes(dual);
+#endif
+
     bool ok = plain.start() && tls.start() && h2c.start() && h1.start();
     std::println("servers started: plaintext :7788 (sniffing), tls :7789, h2c-only :7790, h1-only :7791 (ok={})", ok);
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+    // Started last and reported separately: a QUIC bind failure is its own
+    // answer, not a reason for the TCP listeners to report failure.
+    const bool dual_ok = dual.start();
+    std::println("dual-transport :7792 tcp+udp started (ok={}), http/3 also on udp :7789", dual_ok);
+    ok = ok && dual_ok;
+#endif
 
     for (;;) {
         std::this_thread::sleep_for(std::chrono::seconds(60));

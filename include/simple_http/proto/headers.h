@@ -11,6 +11,8 @@
 #include <utility>
 #include <vector>
 
+#include "../core/types.h"  // ascii_lower / iequals_ci: used below, and this header must stand alone
+
 namespace simple_http {
 
 class Headers {

@@ -4,7 +4,7 @@
 //
 // Responsibilities: load the server certificate chain and private key, optional
 // mutual-TLS peer verification, TLS protocol floor, and ALPN advertisement
-// (h2 + http/1.1, and h3 when HTTP/3 is enabled). A user hook may customize the
+// (h2 + http/1.1; h3 lives on the QUIC listener's own context). A user hook may customize the
 // ssl::context before certificates are applied.
 
 #include <cstdint>
@@ -20,6 +20,7 @@
 #include <openssl/ssl.h>
 
 #include "../core/logging.h"
+#include "../core/types.h"  // error_code: used below, and this header must stand alone
 
 namespace simple_http {
 
@@ -33,17 +34,16 @@ struct TlsConfig {
     std::function<void(asio::ssl::context&)> setup; // optional customization hook
 };
 
-// The ALPN protocol list advertised by the server, in TLS wire format
+// The ALPN protocol list a TCP-TLS listener advertises, in TLS wire format
 // (length-prefixed). h2 is preferred over http/1.1.
+//
+// h3 is deliberately absent, even when HTTP/3 is compiled in: `h3` means QUIC,
+// and a client that selected it here would have negotiated a protocol this
+// connection cannot speak. HTTP/3 has its own ALPN list and its own context
+// (quic/tls.h).
 inline const std::vector<unsigned char>& alpn_wire_list() {
-    static const std::vector<unsigned char> list = [] {
-        std::vector<unsigned char> v{0x02, 'h', '2', 0x08, 'h', 't', 't', 'p', '/', '1', '.', '1'};
-#ifdef SIMPLE_HTTP_ENABLE_HTTP3
-        // Advertise h3 as well when HTTP/3 support is compiled in.
-        v.insert(v.begin(), {0x02, 'h', '3'});
-#endif
-        return v;
-    }();
+    static const std::vector<unsigned char> list{0x02, 'h', '2', 0x08, 'h', 't', 't', 'p', '/',
+                                                 '1',  '.', '1'};
     return list;
 }
 

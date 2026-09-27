@@ -11,7 +11,7 @@
 #
 # 用法：
 #   test/conformance/run.sh              # 三套全跑（默认）
-#   test/conformance/run.sh h2spec       # 只跑指定的（h2spec / h1spec / autobahn）
+#   test/conformance/run.sh h3spec       # 只跑指定的（h2spec / h1spec / autobahn / h3spec）
 #
 # 退出码：0 = 三套都达到基线；1 = 有套件未达标，或环境不全（缺什么会打印出来）。
 #
@@ -37,11 +37,24 @@ DENO_IMAGE="denoland/deno"
 PORT_H2C=7790
 PORT_H1=7791
 PORT_SNIFF=7788
+PORT_H3=7792
 
 # 基线。低于它就退出非零 —— 数字写死是有意的：套件自己会随上游版本变化，
 # 而"通过数变少了"必须是个信号，不能悄悄跟着漂。
 EXPECT_H2SPEC_PASSED=146
 EXPECT_H1SPEC_TOTAL=33
+EXPECT_H3SPEC_TOTAL=49
+# 47/49 是稳定值（同一二进制连跑多次一致）。剩下两条 TLS 8.2 是套件自身的产物：
+# h3spec 的客户端钩子把自己 ClientHello 里的 quic_transport_parameters 扩展摘掉后，
+# 它自己的 TLS 栈就先抛出 missing_extension（报告里写作 TransportErrorIsSent），
+# 而它的断言 cryptoErrorsIn 只接受 TransportErrorIsReceived —— 于是它看不到我们
+# 在线上回的同一个码。我们的行为与 RFC 9001 §8.2 一致，且与对端发出的一致
+# （双方都是 CONNECTION_CLOSE 0x16d）。
+EXPECT_H3SPEC_PASSED=47
+
+# h3spec 的二进制名带平台后缀（release 资产就叫 h3spec-linux-x86_64），所以这里
+# 按名字查而不是猜路径。
+H3SPEC_BIN=h3spec-linux-x86_64
 
 SERVER_PID=""
 FAILURES=0
@@ -71,6 +84,14 @@ require_h2spec() {
     warn "缺 h2spec（HTTP/2 一致性套件）"
     say  "      curl -fsSL -o /tmp/h2spec.tgz ${H2SPEC_URL}"
     say  "      tar xzf /tmp/h2spec.tgz -C /usr/local/bin h2spec"
+    return 1
+}
+
+require_h3spec() {
+    command -v "$H3SPEC_BIN" >/dev/null 2>&1 && return 0
+    warn "缺 h3spec（QUIC/HTTP-3 错误路径套件，h2spec 的对应物）"
+    say  "      https://github.com/kazu-yamamoto/h3spec/releases —— 取 h3spec-linux-x86_64"
+    say  "      放进 PATH（本脚本按该名字查找，不猜路径）"
     return 1
 }
 
@@ -110,7 +131,7 @@ start_server() {
         head_ "构建 server"
         ( cd "$ROOT" && xmake build server ) || { bad "xmake build server 失败"; return 1; }
     fi
-    head_ "启动示例服务器（:7788 嗅探 / :7789 TLS / :7790 h2c / :7791 h1）"
+    head_ "启动示例服务器（:7788 嗅探 / :7789 TLS / :7790 h2c / :7791 h1 / :7792 tcp+udp）"
     # 必须在仓库根目录起：证书路径是相对路径。
     # exec 让子 shell 被 server 自己替换掉，$! 才是 server 的 PID —— 否则 kill
     # 落在中间那层 shell 上，server 会变成孤儿继续占着端口。
@@ -118,7 +139,10 @@ start_server() {
     SERVER_PID=$!
 
     local port ready i
-    for port in "$PORT_SNIFF" "$PORT_H2C" "$PORT_H1"; do
+    # 7792 是双传输端点：TCP 与 UDP 同号，所以这里的 TCP 探活对它同样有效。
+    # 纯 QUIC 端点是探不到的 —— /dev/tcp 看不见 UDP —— 需要另起一个端点时，
+    # 这里的探活也要一起改。
+    for port in "$PORT_SNIFF" "$PORT_H2C" "$PORT_H1" "$PORT_H3"; do
         ready=0
         for i in $(seq 1 50); do
             # 只探 TCP 可连：h2c 端点会拒掉普通 GET（那本来就是无效前导），
@@ -202,6 +226,31 @@ run_h1spec() {
     ok "通过 ${passed}/${total}"
 }
 
+run_h3spec() {
+    head_ "h3spec —— QUIC 传输与 HTTP/3 错误路径（udp :${PORT_H3}，纯 h3）"
+    local out total failed passed
+    # -n 跳过证书校验：测试证书是自签的，套件不带 CA 就没法连。
+    out="$("$H3SPEC_BIN" -n 127.0.0.1 "$PORT_H3" 2>&1)"
+    read -r total failed <<<"$(printf '%s\n' "$out" \
+        | sed -n 's/^\([0-9]\+\) examples, \([0-9]\+\) failures$/\1 \2/p' | tail -1)"
+    if [[ -z "${total:-}" ]]; then
+        bad "没解析出用例统计，见下"
+        printf '%s\n' "$out" | tail -n 20 | sed 's/^/      /'
+        return 1
+    fi
+    passed=$((total - failed))
+    if [[ "$total" != "$EXPECT_H3SPEC_TOTAL" ]]; then
+        bad "用例总数是 ${total}，基线是 ${EXPECT_H3SPEC_TOTAL} —— 上游套件变了，请复核基线"
+        return 1
+    fi
+    if [[ "$passed" -lt "$EXPECT_H3SPEC_PASSED" ]]; then
+        bad "通过 ${passed}/${total}（基线 ${EXPECT_H3SPEC_PASSED}）"
+        printf '%s\n' "$out" | grep -aE '^ *[0-9]+\) ' | sed 's/^/      /'
+        return 1
+    fi
+    ok "通过 ${passed}/${total}（基线 ${EXPECT_H3SPEC_PASSED}）"
+}
+
 run_autobahn() {
     head_ "Autobahn —— WebSocket / RFC 6455（:${PORT_SNIFF}，嗅探端点）"
     require_docker_image "$AUTOBAHN_IMAGE" || return 1
@@ -279,7 +328,7 @@ want() {
 for arg in "$@"; do
     case "$arg" in
         -h|--help) usage; exit 0 ;;
-        h2spec|h1spec|autobahn) SUITES+=("$arg") ;;
+        h2spec|h1spec|autobahn|h3spec) SUITES+=("$arg") ;;
         *) say "未知参数：$arg"; usage; exit 2 ;;
     esac
 done
@@ -290,6 +339,7 @@ head_ "环境自检"
 ENV_OK=1
 want h2spec   && { require_h2spec   || ENV_OK=0; }
 want h1spec   && { require_h1spec >/dev/null || ENV_OK=0; }
+want h3spec   && { require_h3spec   || ENV_OK=0; }
 want autobahn && {
     require_docker_image "$AUTOBAHN_IMAGE" || ENV_OK=0
 }
@@ -305,6 +355,7 @@ start_server || exit 1
 
 want h2spec   && run_h2spec
 want h1spec   && run_h1spec
+want h3spec   && run_h3spec
 want autobahn && run_autobahn
 
 stop_server

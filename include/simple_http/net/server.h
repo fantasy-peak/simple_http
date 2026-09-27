@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <mutex>
 #include <filesystem>
 #include <future>
 #include <functional>
@@ -38,6 +39,11 @@
 #include "../transport/tls_transport.h"
 #include "connection.h"
 
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+#include "../engine/h3/h3_engine.h"
+#include "../quic/endpoint.h"
+#endif
+
 namespace simple_http {
 
 namespace asio = boost::asio;
@@ -55,17 +61,33 @@ struct UnixAddress {
     std::string path;
 };
 
-// Where the server listens. Exactly one of the two — a configuration that named
-// both a port and a path would have no meaning, so the type makes it
-// unrepresentable rather than a rule to remember.
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+// A UDP endpoint for QUIC. The fields mirror InetAddress, and that is the whole
+// difference: QUIC is another *transport*, not another address family. It is a
+// separate field rather than another alternative in `Listen` because the two are
+// not exclusive — HTTP/2 over TCP and HTTP/3 over QUIC share a port number by
+// convention and are served together, exactly as nginx's `listen ... ssl` and
+// `listen ... quic` are.
 //
-// Serving several addresses or protocol stacks is a multi-process concern:
-// start another Server, or another process sharing the port via
-// ServerConfig::reuse_port.
+// QUIC always has TLS, so ServerConfig::tls is required alongside it; without it
+// start() fails, rather than running an unencrypted QUIC, which the protocol
+// does not define.
+struct QuicAddress {
+    std::string host{"0.0.0.0"};
+    std::uint16_t port{443};
+    bool v6{false};
+};
+#endif
+
+// A TCP endpoint: a port, or a UNIX-domain path. The variant makes "both a port
+// and a path at once" unrepresentable rather than a rule to remember.
 using Listen = std::variant<InetAddress, UnixAddress>;
 
 struct ServerConfig {
-    Listen listen{InetAddress{}};
+    // The TCP listener, for HTTP/1.x and HTTP/2. Absent means "do not listen on
+    // TCP" — a QUIC-only server, or the reverse, is a configuration rather than
+    // a special case.
+    std::optional<Listen> listen{InetAddress{}};
     std::optional<TlsConfig> tls;
     // Threads serving connections. Without reuse_port the pool also carries a
     // dedicated acceptor thread, so the process runs one more than this.
@@ -100,6 +122,16 @@ struct ServerConfig {
     // Invoked right after accept, before the transport or TLS handshake touches the
     // socket. Use the error_code overloads of set_option to avoid throwing.
     std::function<void(asio::ip::tcp::socket&)> socket_setup;
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+    // The QUIC listener, for HTTP/3. Independent of `listen`: both may be set,
+    // which is the usual deployment — one port number, two transports, and the
+    // client picks with ALPN. Behind the macro because the type is: a build
+    // without HTTP/3 has no QUIC endpoint to configure, which is also why a
+    // consumer that never defines it cannot accidentally ask for one.
+    std::optional<QuicAddress> quic{};
+    // QUIC tunables, used only when `quic` is set.
+    quic::QuicEndpointConfig quic_options{};
+#endif
 };
 
 class Server {
@@ -265,13 +297,42 @@ class Server {
         if (!m_acceptors.empty()) {
             closed.wait();
         }
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+        // Take the QUIC connections down, but do not close the sockets yet: a
+        // CONNECTION_CLOSE has to leave through the socket its connection
+        // arrived on, so closing the listener first would leave the peer with a
+        // port that merely stopped answering — it would wait for its own
+        // timeout instead of being told. The sockets go after the drain, below.
+        for (auto& quic : m_quic) {
+            quic->shutdown_connections();
+        }
+#endif
+        // The same for TCP: close what is in flight so those coroutines finish
+        // and the pool drains rather than abandoning their frames.
+        shutdown_connections();
         m_pool->stop();
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+        for (auto& quic : m_quic) {
+            quic->close();
+        }
+        m_quic.clear();
+#endif
         m_acceptors.clear();
     }
+
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+    // The port the QUIC listener is on; 0 when there is none. Separate from
+    // port(), because a dual-transport server has two answers and one getter
+    // returning either would be a silent lie whenever the other was wanted.
+    std::uint16_t quic_port() const { return m_quic.empty() ? 0 : m_quic.front()->port(); }
+#endif
 
     // The local port a TCP listener is using (useful with port 0 / ephemeral).
     // Zero for a UNIX-domain socket, which has no port to report.
     std::uint16_t port() const {
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+        if (m_acceptors.empty()) return m_quic.empty() ? 0 : m_quic.front()->port();
+#endif
         if (m_acceptors.empty()) return 0;
         return std::visit(
             [](const auto& acceptor) {
@@ -294,6 +355,14 @@ class Server {
     std::shared_ptr<IoCtxPool> pool() { return m_pool; }
 
   private:
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+    // The QUIC types the listener and the HTTP/3 engine are built from. Declared
+    // here rather than beside the members because `make_h3_serve` names them and
+    // a class's member declarations are not visible to its earlier members.
+    using QuicConnectionType = quic::QuicConnection<asio::io_context::executor_type>;
+    using QuicEndpointType = quic::QuicEndpoint<asio::io_context::executor_type>;
+#endif
+
     // An acceptor of either family, and the context its accept loop runs on.
     //
     // Holding both behind one type is what keeps start and stop single: the
@@ -430,11 +499,24 @@ class Server {
         return true;
     }
 
-    // One entry point for both families. The variant decides which bind runs;
-    // everything after it — the accept loops, the logging — is shared, because
-    // by then the difference has already been erased.
+    // One entry point for every listener. The variant decides which TCP bind
+    // runs; the QUIC listener is started beside it rather than instead of it,
+    // because both are usually wanted at once (nginx's `listen ... ssl` plus
+    // `listen ... quic`).
     bool start_listeners() {
-        return std::visit([this](const auto& address) { return start_listener(address); }, m_config.listen);
+        bool ok = true;
+        if (m_config.listen) {
+            ok = std::visit([this](const auto& address) { return start_listener(address); }, *m_config.listen);
+        }
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+        // A failed TCP bind does not stop the QUIC listener from being tried —
+        // they are independent sockets, and one being unavailable says nothing
+        // about the other.
+        if (m_config.quic) {
+            ok = start_listener(*m_config.quic) && ok;
+        }
+#endif
+        return ok;
     }
 
     bool start_listener(const InetAddress& address) {
@@ -506,6 +588,137 @@ class Server {
 #endif
     }
 
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+    // Bind a QUIC listener. QUIC has no accept: the endpoint demuxes by
+    // connection ID and hands each connection to `make_h3_serve`, which is the
+    // only place this file names the HTTP/3 engine.
+    bool start_listener(const QuicAddress& address) {
+        if (!m_config.tls) {
+            // Not a fallback to something else: QUIC has no plaintext mode, and
+            // serving HTTP/3 without TLS is not a thing that exists.
+            SIMPLE_HTTP_ERROR_LOG("QUIC listener on {}:{} needs ServerConfig::tls", address.host,
+                                  address.port);
+            return false;
+        }
+        try {
+            m_quic_tls.emplace(*m_config.tls);
+        } catch (const std::exception& e) {
+            SIMPLE_HTTP_ERROR_LOG("QUIC TLS setup: {}", e.what());
+            return false;
+        }
+
+        error_code ec;
+        const auto addr = asio::ip::make_address(address.host, ec);
+        if (ec) {
+            SIMPLE_HTTP_ERROR_LOG("QUIC bind({}:{}): {}", address.host, address.port, ec.message());
+            return false;
+        }
+        const asio::ip::udp::endpoint endpoint{addr, address.port};
+
+        // The same pinning rule the TCP side follows, on the *same* pool: a
+        // QUIC endpoint owns its socket on one context, and without reuse_port
+        // that context is the acceptor's. With reuse_port each worker gets its
+        // own socket, and the kernel's four-tuple hash keeps one connection's
+        // datagrams together on whichever socket they arrive at — which is what
+        // makes the fan-out safe. (A connection cannot migrate *between*
+        // sockets; within one it can.)
+        const std::size_t sockets = m_config.reuse_port ? m_pool->size() : 1;
+        for (std::size_t i = 0; i < sockets; ++i) {
+            const std::shared_ptr<asio::io_context>& ctx =
+                m_config.reuse_port ? m_pool->at(i) : acceptor_context();
+            auto quic = std::make_shared<QuicEndpointType>(ctx->get_executor(), m_quic_tls->native_handle(),
+                                                           m_config.quic_options, make_h3_serve());
+            if (!quic->open(endpoint, m_config.reuse_port, ec)) {
+                SIMPLE_HTTP_ERROR_LOG("QUIC bind({}:{}) [{}]: {}", address.host, address.port, i, ec.message());
+                // Undo the sockets already bound, leaving the listener down
+                // rather than half-serving on a port the caller thinks failed.
+                for (auto& bound : m_quic) bound->close();
+                m_quic.clear();
+                return false;
+            }
+            quic->start();
+            m_quic.push_back(quic);
+        }
+        SIMPLE_HTTP_INFO_LOG("listening on udp {}:{} (quic, alpn=h3, sockets={})", address.host, quic_port(),
+                             m_quic.size());
+        return true;
+    }
+
+    typename QuicEndpointType::ServeFn make_h3_serve() {
+        auto router = m_router;
+        auto limits = m_config.limits;
+        return [router, limits](std::shared_ptr<QuicConnectionType> conn) -> asio::awaitable<void> {
+            // Shared, not automatic: the engine hands a weak_ptr to every stream
+            // writer and keeps itself alive from the handlers it spawns, so it has
+            // to outlive run() for the same reason the HTTP/2 engine does.
+            auto engine = std::make_shared<Http3Engine<QuicConnectionType>>(conn, limits);
+            co_await engine->run([router](std::shared_ptr<Request> req, std::shared_ptr<Response> res,
+                                          SslHandle ssl) -> asio::awaitable<void> {
+                co_await router->dispatch(std::move(req), std::move(res), ssl);
+            });
+            co_return;
+        };
+    }
+#endif
+
+    // A connection the server is still serving.
+    //
+    // stop() needs it so it can take connections down *before* the io_context
+    // pool goes away. A connection coroutine parked on a read is unwound by its
+    // own completion handler — the read completes with operation_aborted and the
+    // coroutine runs to its end — which is the only destruction path that knows
+    // what the frame holds. Tearing the pool down first abandons that handler
+    // and destroys the frame from the io_context's destructor instead; for an
+    // engine that races two child coroutines with `operator||`, that walks state
+    // the operator's own teardown has already released.
+    //
+    // `shutdown` is posted to the connection's own executor rather than called
+    // from the stopping thread: closing a socket from another thread would race
+    // the read parked on it, and keeping a connection's state to one thread is
+    // the model the whole server is built on.
+    struct LiveConnection {
+        std::shared_ptr<asio::io_context> ctx;
+        std::function<void()> shutdown;
+    };
+
+    // Register a connection, keeping its entry alive for as long as the returned
+    // handle is. Held by the connection's completion handler, so the entry
+    // expires exactly when the connection is over.
+    std::shared_ptr<LiveConnection> track_connection(const std::shared_ptr<asio::io_context>& ctx,
+                                                     std::function<void()> shutdown) {
+        auto live = std::make_shared<LiveConnection>();
+        live->ctx = ctx;
+        live->shutdown = std::move(shutdown);
+        std::lock_guard lock(m_live_mutex);
+        // Expired entries are dropped once they outnumber a round of
+        // connections, so a long-lived server does not accumulate a weak_ptr per
+        // connection it has ever served.
+        if (m_live.size() > 64) {
+            std::erase_if(m_live, [](const std::weak_ptr<LiveConnection>& entry) { return entry.expired(); });
+        }
+        m_live.push_back(live);
+        return live;
+    }
+
+    // Ask every live connection to close. Returns immediately: the closes land
+    // on their own executors, and the drain in IoCtxPool::stop() is what waits
+    // for them to be processed.
+    void shutdown_connections() {
+        std::vector<std::shared_ptr<LiveConnection>> live;
+        {
+            std::lock_guard lock(m_live_mutex);
+            for (auto& entry : m_live) {
+                if (auto handle = entry.lock()) {
+                    live.push_back(std::move(handle));
+                }
+            }
+            m_live.clear();
+        }
+        for (auto& handle : live) {
+            asio::post(*handle->ctx, [handle] { handle->shutdown(); });
+        }
+    }
+
     // Starts one accept loop per bound socket. The loop is templated on the
     // acceptor/socket pair; this is the only place that names both, and the
     // protocol hands the socket type back rather than making it a second
@@ -539,7 +752,8 @@ class Server {
             // Pinned: the kernel already picked this socket, so keep the
             // connection here. Otherwise round-robin the pool, which spreads
             // long-lived connections more evenly than the kernel's hash does.
-            asio::io_context& ctx = pinned ? *pinned : *m_pool->next_ptr();
+            const std::shared_ptr<asio::io_context>& ctx_ptr = pinned ? pinned : m_pool->next_ptr();
+            asio::io_context& ctx = *ctx_ptr;
             Socket socket{ctx};
             auto [ec] = co_await acceptor->async_accept(socket, asio::as_tuple(asio::use_awaitable));
             if (ec) {
@@ -575,15 +789,19 @@ class Server {
             if (m_tls) {
                 auto stream = std::make_shared<asio::ssl::stream<Socket>>(std::move(socket), m_tls->context());
                 auto transport = std::make_shared<TlsTransport<Socket>>(std::move(stream), peer);
+                auto live = track_connection(ctx_ptr, [transport] { transport->close(); });
+                // The handler is not `detached`: it holds the registry handle, so
+                // the entry lives exactly as long as the connection does.
                 asio::co_spawn(ctx, serve_tls(transport, dispatch, ws_lookup, m_config.limits, ws_proxy_lookup),
-                               asio::detached);
+                               [live](std::exception_ptr) {});
             } else {
                 auto sock_ptr = std::make_shared<Socket>(std::move(socket));
                 auto transport = std::make_shared<TcpTransport<Socket>>(std::move(sock_ptr), peer);
+                auto live = track_connection(ctx_ptr, [transport] { transport->close(); });
                 asio::co_spawn(ctx,
                                serve_plaintext(transport, dispatch, ws_lookup, m_config.limits, ws_proxy_lookup,
                                                m_config.plaintext_protocols),
-                               asio::detached);
+                               [live](std::exception_ptr) {});
             }
         }
         co_return;
@@ -610,6 +828,17 @@ class Server {
     std::shared_ptr<Router> m_router;
     std::optional<TlsContext> m_tls;
     std::vector<Listener> m_acceptors;
+    // Connections still being served, so stop() can take them down. Guarded by a
+    // mutex because accept loops run on several threads and each registers its
+    // own connections.
+    std::mutex m_live_mutex;
+    std::vector<std::weak_ptr<LiveConnection>> m_live;
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+    // Its own SSL_CTX: the TCP one advertises h2 and http/1.1, and a QUIC
+    // listener must offer h3 and nothing else.
+    std::optional<quic::QuicTlsContext> m_quic_tls;
+    std::vector<std::shared_ptr<QuicEndpointType>> m_quic;
+#endif
     // Atomic: stop() is the one member a signal handler or a second thread has
     // any business calling, and double-stopping must not race.
     std::atomic<bool> m_stopped{false};

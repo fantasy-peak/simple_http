@@ -183,7 +183,7 @@ certificates and the ALPN list in `simple_http::TlsClientConfig`.
 | `SIMPLE_HTTP_ENABLE_COMPRESSION` | Compiles in gzip/brotli response-body compression. Needs zlib and brotli; see [Response Compression](#-response-compression). |
 | `SIMPLE_HTTP_ENABLE_LOG` | Master switch for the logging facade (`1` by default). Set to `0` and every `SIMPLE_HTTP_*_LOG` expands to `((void)0)`. |
 | `SIMPLE_HTTP_LOG_ACTIVE_LEVEL` | Compile-time floor, `0` (Trace) … `5` (Critical). Records below it are discarded at compile time, so they cost nothing at the call site. |
-| `SIMPLE_HTTP_ENABLE_HTTP3` | HTTP/3 skeleton; off by default and a no-op unless enabled. |
+| `SIMPLE_HTTP_ENABLE_HTTP3` | Compiles in the HTTP/3 engine and the QUIC listener. Off by default: without it `ServerConfig::quic` and the QUIC tunables do not exist, so a build that does not define it cannot ask for a UDP side at all. |
 
 WebSocket support has no macro — it is always compiled in.
 
@@ -504,6 +504,12 @@ req/s           :     100.72      124.03      105.92        4.56    71.10%
 > **Benchmark Command**:
 > `h2load -t 4 -n 1000000 -c 1000 -m 40 -H 'Content-Type: application/json' --data=b.txt http://localhost:7788/hello`
 
+Note what `/hello` does: it echoes the request body frame by frame and prints a line
+per frame. That makes the server's stdout part of the measurement — leave it on the
+terminal or send it to `/dev/null`. Redirecting it to a file turns the run into a test
+of log throughput, and the number comes out around a third of the one above without
+anything on the wire being slower.
+
 ---
 
 ## 🧪 Testing Guide
@@ -533,6 +539,20 @@ python3 -m venv test/python/.venv
 test/python/.venv/bin/pip install -r test/python/requirements.txt
 xmake run python-tests      # needs `xmake build server` first
 ```
+
+Two more suites drive the same server with tools the repository does not carry, so
+each one checks for what it needs and prints the preparation command rather than
+skipping silently. They are described in full in [AGENTS.md](AGENTS.md):
+
+```bash
+test/conformance/run.sh   # h2spec, h1spec and Autobahn against the :7790/:7791/:7788 endpoints
+test/stress/run.sh        # connection reuse and load, one gate per protocol
+```
+
+The first asks whether the protocol is implemented correctly and starts every case
+on a fresh connection; the second asks whether a connection survives being reused,
+which is the question the first cannot see. Both exit non-zero when a suite falls
+below its recorded baseline.
 
 Against the example server (`xmake run server`, plaintext on `:7788` and mTLS on `:7789`),
 with external clients:

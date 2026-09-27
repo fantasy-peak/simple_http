@@ -12,7 +12,7 @@ set_policy("package.librarydeps.strict_compatibility", true)
 
 -- PACKAGES --
 add_requires("boost", {configs = {asio=true, regex=true}})
-add_requires("openssl3")
+add_requires("openssl3", "ls-qpack")
 add_requires("catch2")  -- unit tests only (target `unittest`)
 -- Response-body compression (core/content_encoding.h). Only the targets that
 -- define SIMPLE_HTTP_ENABLE_COMPRESSION link these; the library itself stays
@@ -25,6 +25,7 @@ target("simple_http")
     set_kind("static")
     add_includedirs("include", { public = true })
     add_packages(
+        "ls-qpack",
         "boost",
         "openssl3",
         {public = true}
@@ -49,6 +50,7 @@ target("server")
     end)
     add_deps("simple_http")
     add_files("test/server.cpp")
+    add_defines("SIMPLE_HTTP_ENABLE_HTTP3")
     set_rundir(".")
 target_end()
 
@@ -77,6 +79,7 @@ target_end()
 target("unittest")
     set_kind("binary")
     set_default(false)
+    add_defines("SIMPLE_HTTP_ENABLE_HTTP3")
     on_load(function (target)
         if target:toolchain("gcc") then
             target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete")
@@ -95,6 +98,7 @@ target_end()
 target("regression")
     set_kind("binary")
     set_default(false)
+    add_defines("SIMPLE_HTTP_ENABLE_HTTP3")
     on_load(function (target)
         if target:toolchain("gcc") then
             target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete")
