@@ -74,6 +74,7 @@ include/
                            （#ifdef SIMPLE_HTTP_ENABLE_HTTP3）
     handler/               handler 类型系统 + 路由
       handler.h            Handler 类型别名与 make_handler/invoke_handler
+      cors.h               内建 CORS：CorsConfig 编译成 Filter（预检在 filter 内应答 204，不进路由）
       router.h             Router（含反代用的 HttpClient、反代匹配、静态阶段）
       http_proxy.h         请求级反代：上游走 client 层（连接池/TLS/h2），响应流式回传
       static_files.h       静态文件服务（static_table.h 的 serving 半边 + SPA fallback）
@@ -173,6 +174,23 @@ server.start();      // 同步：启动所有监听并阻塞至绑定完成，�
 // 或 co_await server.run();  // 协程版
 server.stop();
 ```
+
+CORS 是策略入口（`handler/cors.h`）：`CorsConfig` 编译成 `Filter` 存进 `m_cors`。
+
+```cpp
+// 带 Origin + Access-Control-Request-Method 的 OPTIONS 在 filter 内应答 204（无 body、
+// 无 framing）并短路，所以预检永远不会落到路由上——引擎层不特判 OPTIONS，交给路由只会
+// 得到 404，浏览器据此判定预检失败。
+server.cors(CorsConfig{.allow_origins = {"https://app.example"}});  // {} = 任意 origin
+```
+
+`CorsConfig` 的字段语义见 `README.md` 的 CORS 段。`CorsConfig` 表达不了的策略（按路径
+分白名单、运行期查列表、PNA 预检）放 `before` filter——注意 `before` 对每个请求都跑，
+需自行判 `Origin` 并自己加 `Vary: Origin`；只想收窄内建行为可用 `make_cors_filter()`。
+
+三条容易踩的边界：被拒 origin 的预检同样回 204（只是不带 CORS 头，这样浏览器发出的
+OPTIONS 不会在日志里变成 404）；实际请求不会因此被拦（CORS 是浏览器闸门而非鉴权）；
+WebSocket 升级走 `WsLookup`、不经 dispatch，不受此影响。
 
 `Response`（fluent，一次性或流式）：
 

@@ -45,7 +45,7 @@ using Handler = std::variant<CoroHandler, CoroSslHandler>;
 // (e.g. a separate writer) that may outlive the handler body.
 using WsHandler = std::function<asio::awaitable<void>(RequestPtr, std::shared_ptr<WebSocket>)>;
 
-// A filter (before/cors hook): returns false to short-circuit the request.
+// A filter (the before hook): returns false to short-circuit the request.
 using Filter = std::function<asio::awaitable<bool>(RequestPtr, ResponsePtr)>;
 
 namespace detail {

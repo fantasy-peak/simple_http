@@ -20,6 +20,7 @@
 #include "../core/http_status.h"
 #include "../core/logging.h"
 #include "../engine/dispatcher.h"  // WsProxyTarget, HttpProxyTarget
+#include "cors.h"  // CorsConfig (built-in CORS -> a Filter)
 #include "handler.h"
 #include "http_proxy.h"
 #include "static_files.h"  // the static stage (m_static)
@@ -96,8 +97,12 @@ class Router {
         m_before = std::move(filter);
         return *this;
     }
-    Router& cors(Filter filter) {
-        m_cors = std::move(filter);
+    // CORS: a policy in, and the filter it compiles to is what dispatch runs. See
+    // handler/cors.h — including why a preflight never reaches a route. A policy the
+    // config cannot express goes in a before() filter instead, which can start from
+    // make_cors_filter() if it only wants to narrow the built-in behaviour.
+    Router& cors(CorsConfig config) {
+        m_cors = make_cors_filter(std::move(config));
         return *this;
     }
 
@@ -219,7 +224,8 @@ class Router {
 
     // --- dispatch (satisfies the engine Dispatcher) ---
     asio::awaitable<void> dispatch(RequestPtr req, ResponsePtr res, SslHandle ssl) const {
-        // CORS filter runs only for cross-origin requests.
+        // CORS runs only for cross-origin requests. The filter answers an OPTIONS
+        // preflight here and returns false, so a preflight never reaches a route.
         if (m_cors && req->header("origin").has_value()) {
             if (!co_await m_cors(req, res)) {
                 co_return;

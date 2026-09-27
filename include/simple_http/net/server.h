@@ -177,8 +177,9 @@ class Server {
         m_router->before(std::move(f));
         return *this;
     }
-    Server& cors(Filter f) {
-        m_router->cors(std::move(f));
+    // CORS — see handler/cors.h for the policy and the preflight rule.
+    Server& cors(CorsConfig config) {
+        m_router->cors(std::move(config));
         return *this;
     }
 

@@ -5,7 +5,7 @@
 #include <string_view>
 
 #define SIMPLE_HTTP_VERSION_MAJOR 0
-#define SIMPLE_HTTP_VERSION_MINOR 7
+#define SIMPLE_HTTP_VERSION_MINOR 8
 #define SIMPLE_HTTP_VERSION_PATCH 0
 
 #define SIMPLE_HTTP_STR_HELPER(x) #x

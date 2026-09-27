@@ -68,14 +68,9 @@ TEST_CASE("router: dispatch without a fallback answers 404", "[router]") {
     CHECK(writer->last_body.empty());
 }
 
-TEST_CASE("router: filters short-circuit and see the request", "[router]") {
+TEST_CASE("router: before filters short-circuit and see the request", "[router]") {
     Router router;
     bool before_called = false;
-    bool cors_called = false;
-    router.cors([&](RequestPtr, ResponsePtr) -> asio::awaitable<bool> {
-        cors_called = true;
-        co_return true;
-    });
     router.before([&](RequestPtr req, ResponsePtr res) -> asio::awaitable<bool> {
         before_called = true;
         if (req->path() == "/blocked") {
@@ -98,22 +93,10 @@ TEST_CASE("router: filters short-circuit and see the request", "[router]") {
         CHECK(writer->last_body == "denied");
     }
     {
-        cors_called = false;
-        auto writer = std::make_shared<FakeResponseWriter>();
-        auto req = make_request(ctx, "/allowed");  // no Origin header: cors is skipped
-        auto res = std::make_shared<Response>(writer);
-        REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
-        CHECK_FALSE(cors_called);
-        CHECK(writer->last_body == "allowed");
-    }
-    {
-        cors_called = false;
         auto writer = std::make_shared<FakeResponseWriter>();
         auto req = make_request(ctx, "/allowed");
-        req->mutable_headers().add_lower("origin", "https://example.com");
         auto res = std::make_shared<Response>(writer);
         REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
-        CHECK(cors_called);
         CHECK(writer->last_body == "allowed");
     }
 }

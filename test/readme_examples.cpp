@@ -150,7 +150,9 @@ void readme_routing(simple_http::Server& server) {
         co_return true;
     });
 
-    server.cors([](RequestPtr, ResponsePtr) -> asio::awaitable<bool> { co_return true; });
+    // CORS: an OPTIONS preflight is answered 204 here and never reaches a route.
+    // See the CORS section for the policy.
+    server.cors(simple_http::CorsConfig{.allow_origins = {"https://app.example"}});
 }
 
 void readme_proxy(simple_http::Server& server) {
@@ -170,6 +172,33 @@ void readme_websocket(simple_http::Server& server) {
                         }
                         co_return;  // returning sends a Close frame and shuts the socket down
                     });
+}
+
+// --- CORS (README → CORS) ----------------------------------------------------
+
+void readme_cors(simple_http::Server& server) {
+    server.cors(simple_http::CorsConfig{
+        .allow_origins = {"https://app.example.com"},  // exact origins; {} = any
+        .allow_credentials = true,                     // mirrors the origin, never "*"
+        .allow_methods = {"GET", "POST", "DELETE"},    // {} = whatever the browser asks
+        .allow_headers = {"content-type", "authorization"},
+        .expose_headers = {"x-request-id"},
+        .max_age = std::chrono::seconds{600},
+    });
+}
+
+void readme_cors_custom(simple_http::Server& server) {
+    server.before([](RequestPtr req, ResponsePtr res) -> asio::awaitable<bool> {
+        const auto origin = req->header("origin");
+        if (!origin) {
+            co_return true;  // not a CORS request
+        }
+        if (req->path().starts_with("/public") || *origin == "https://app.example") {
+            res->header(simple_http::field::access_control_allow_origin, std::string{*origin});
+            res->header(simple_http::field::vary, "Origin");
+        }
+        co_return true;
+    });
 }
 
 // --- Static files (README → Static Files) ------------------------------------

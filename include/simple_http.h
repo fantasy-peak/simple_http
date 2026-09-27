@@ -55,6 +55,7 @@
 // --- handler layer (handler type system + router/dispatch) ---
 #include "simple_http/engine/dispatcher.h"
 #include "simple_http/handler/handler.h"
+#include "simple_http/handler/cors.h"  // CorsConfig (public: exported for server.cors)
 #include "simple_http/handler/static_files.h"
 #include "simple_http/handler/router.h"
 

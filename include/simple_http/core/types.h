@@ -26,6 +26,48 @@ inline bool contains_ctl(std::string_view s) noexcept {
     return false;
 }
 
+// RFC 9110 §5.6.2's tchar — the bytes an HTTP token (a method name, a field
+// name) may contain. Spelled out here rather than shared with the HTTP/1
+// parser's `is_tchar`: that one lives in engine/, which handler/ must not
+// include, and a value about to be echoed into a response head is not the place
+// to start skipping the check.
+inline bool is_token_char(unsigned char c) noexcept {
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
+        return true;
+    }
+    switch (c) {
+        case '!':
+        case '#':
+        case '$':
+        case '%':
+        case '&':
+        case '\'':
+        case '*':
+        case '+':
+        case '-':
+        case '.':
+        case '^':
+        case '_':
+        case '`':
+        case '|':
+        case '~':
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Whether `s` is a non-empty run of tchars. Checked before a peer-supplied token
+// (a preflight's Access-Control-Request-Method) is echoed into a response head,
+// so what goes out is always a string that would re-parse as the same thing.
+inline bool is_http_token(std::string_view s) noexcept {
+    if (s.empty()) return false;
+    for (char c : s) {
+        if (!is_token_char(static_cast<unsigned char>(c))) return false;
+    }
+    return true;
+}
+
 // ASCII case folding and comparison. They live here, in the layer that depends on
 // nothing but the standard library, because both the field-name layer and the
 // content-encoding layer need them — and the alternative was a copy in each.

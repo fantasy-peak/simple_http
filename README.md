@@ -42,7 +42,7 @@ the same protocols outbound.
 - **🌊 Streaming both ways** — request and response bodies stream with flow-control backpressure; a large payload never has to be materialized.
 - **🌐 Reverse proxy** — request-level HTTP proxying (plaintext, TLS or h2c backends) and byte-level WebSocket pass-through.
 - **🔌 TCP and UNIX-domain sockets** — bind a path instead of a port when the peer is a local sidecar; TLS, WebSocket and proxying all work over either.
-- **🧩 Middleware** — `before` filters that can short-circuit, plus a CORS hook driven by the request's `Origin`.
+- **🧩 Middleware** — `before` filters that can short-circuit, plus built-in CORS: preflights answered automatically, `Vary: Origin` handled.
 - **🧵 Lock-free connection handling** — each connection is pinned to one single-threaded `io_context` for its whole life, so engines and writers never synchronize.
 - **📋 Logging that does not pick a side** — a four-field `LogSink` interface with no third-party types in it; wire it to spdlog, an in-house library, or nothing.
 - **🗜 Optional compression** — gzip/brotli response bodies and transparent client-side decompression, both opt-in.
@@ -312,8 +312,9 @@ server.before([](simple_http::RequestPtr req, simple_http::ResponsePtr res) -> a
     co_return true;
 });
 
-// The CORS hook runs only for requests carrying an Origin header.
-server.cors(cors_filter);
+// CORS: an OPTIONS preflight is answered 204 here and never reaches a route.
+// See the CORS section for the policy.
+server.cors(simple_http::CorsConfig{.allow_origins = {"https://app.example"}});
 ```
 
 Reverse proxy — request-level for HTTP, byte-level for WebSocket:
@@ -348,6 +349,80 @@ server.ws_route("/chat", [](simple_http::RequestPtr, std::shared_ptr<simple_http
     co_return;  // returning sends a Close frame and shuts the socket down gracefully
 });
 ```
+
+---
+
+## 🌐 CORS
+
+`CorsConfig` is the built-in policy. An `OPTIONS` carrying `Origin` **and**
+`Access-Control-Request-Method` is answered **204** right here and never reaches a
+route — a preflight for an origin the policy rejects gets the same 204, just
+without the CORS headers. That is why it is answered here rather than left to
+routing: nothing in the engines special-cases `OPTIONS`, so a preflight passed to
+the router comes back 404 and the browser fails it whatever the route offers.
+
+```cpp
+server.cors(simple_http::CorsConfig{
+    .allow_origins = {"https://app.example.com"},  // exact origins; {} = any
+    .allow_credentials = true,                     // mirrors the origin, never "*"
+    .allow_methods = {"GET", "POST", "DELETE"},    // {} = whatever the browser asks
+    .allow_headers = {"content-type", "authorization"},
+    .expose_headers = {"x-request-id"},
+    .max_age = std::chrono::seconds{600},
+});
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `allow_origins` | `{}` | Serialized origins — `scheme://host[:port]`, no trailing slash — compared whole and case-insensitively. Empty, or a literal `"*"`, allows any origin. |
+| `allow_credentials` | `false` | Sends `Access-Control-Allow-Credentials: true`. `*` is illegal alongside it, so the request's own origin is mirrored instead. |
+| `allow_methods` | `{}` | Methods advertised on a preflight. Empty echoes the preflight's own `Access-Control-Request-Method`, so the default does not silently break a `PUT`/`DELETE` API. |
+| `allow_headers` | `{}` | Empty echoes the preflight's `Access-Control-Request-Headers` (bounded — see `max_echoed_request_headers`). Non-empty is enforced: it is echoed only if every requested name is on it. |
+| `expose_headers` | `{}` | Response headers a browser may read. Sent on actual responses only. |
+| `max_age` | `0` | `Access-Control-Max-Age` on a preflight. Zero omits the field and leaves the browser its own (very short) default. |
+| `max_echoed_request_headers` | `1024` | Byte cap on an echoed `Access-Control-Request-Headers`; past it the field is omitted and the preflight fails. |
+
+Things worth knowing before relying on it:
+
+- **`Vary: Origin`** is added whenever the origin is mirrored — credentials on, or
+  an explicit allowlist — because the reply then depends on the request's
+  `Origin`, and a cache keyed on the URL alone must not hand one origin's answer
+  to another. Under a `*` policy the reply is origin-independent and no `Vary` is
+  sent.
+- **A rejected origin is not a blocked request.** The route still runs; the CORS
+  headers are simply omitted, so the browser is the one that refuses the reply.
+  CORS is a browser gate, not authorization — enforce access in the handler or in
+  a `before` filter.
+- **WebSocket upgrades are not covered.** `ws_route` and `ws_proxy` connections are
+  looked up ahead of dispatch, so they get no CORS handling here. A browser
+  WebSocket handshake is not subject to CORS in the first place, so this is a
+  boundary to know rather than a gap to work around — validate `Origin` in the
+  handler if you need it.
+- **A reverse-proxied upstream that sends its own `Access-Control-Allow-Origin`**
+  produces two of them, which browsers reject outright. Strip CORS headers at the
+  upstream, or handle CORS in a `before` filter instead.
+
+A policy this config cannot express — a per-path allowlist, one looked up at
+request time, a PNA preflight — goes in a `before` filter instead. The built-in
+filter runs only for requests carrying an `Origin`; a `before` filter runs for
+every request, so check first, and add your own `Vary: Origin`:
+
+```cpp
+server.before([](simple_http::RequestPtr req, simple_http::ResponsePtr res) -> asio::awaitable<bool> {
+    const auto origin = req->header("origin");
+    if (!origin) {
+        co_return true;  // not a CORS request
+    }
+    if (req->path().starts_with("/public") || *origin == "https://app.example") {
+        res->header(simple_http::field::access_control_allow_origin, std::string{*origin});
+        res->header(simple_http::field::vary, "Origin");
+    }
+    co_return true;
+});
+```
+
+`make_cors_filter()` is public if you would rather narrow the built-in policy than
+rebuild it.
 
 ---
 
