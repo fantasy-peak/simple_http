@@ -11,7 +11,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <format>
-#include <optional>
 #include <string>
 
 #include "compression.h"
@@ -43,30 +42,50 @@ struct EngineLimits {
     std::int32_t h2_initial_window{65535};
 
     // --- HTTP/3 advertisement ---
-    // The port a browser should reach this origin's HTTP/3 endpoint on: the
-    // value of the Alt-Svc field (RFC 7838) that the HTTP/1.x and HTTP/2
-    // engines send. Empty means "do not advertise", which is the only correct
-    // answer for a server with no QUIC listener — and is what alt_svc_value()
-    // always answers in a build without HTTP/3, so the fields exist only there.
-    // A build that cannot serve HTTP/3 cannot be configured to advertise it.
+    // Whether to advertise this origin's HTTP/3 endpoint in its HTTP/1.x and
+    // HTTP/2 responses (RFC 7838). Alt-Svc is the only way a browser learns the
+    // QUIC endpoint exists — it never guesses, so the first visit to an origin
+    // always arrives over TCP — and leaving this off keeps browsers on TCP while
+    // clients that ask for HTTP/3 explicitly (curl, a conformance suite) still
+    // reach it.
+    //
+    // The port is deliberately not a setting: it is always the QUIC listener's
+    // own (ServerConfig::quic), which is what the Server renders below.
+    // Advertising a port nobody listens on is a configuration mistake, not a
+    // feature, and requiring the number to be repeated here only invited the
+    // two to drift — including the silent failure of a QUIC listener that no
+    // response ever mentions.
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
-    std::optional<std::uint16_t> h3_alt_svc_port{};
+    bool h3_alt_svc{true};
     std::uint32_t h3_alt_svc_max_age{86400};
+
+    // Render the Alt-Svc value for a QUIC listener on `quic_port`, or empty when
+    // there is nothing to advertise. Called by the Server while it assembles its
+    // configuration. The macro is read here and nowhere else, so a build that
+    // cannot serve HTTP/3 has nothing to render.
+    [[nodiscard]] std::string render_alt_svc(std::uint16_t quic_port) const {
+        if (!h3_alt_svc || quic_port == 0) return {};
+        return std::format("h3=\":{}\"; ma={}", quic_port, h3_alt_svc_max_age);
+    }
+
+    // The rendered field, written verbatim into every HTTP/1.x and HTTP/2
+    // response head. Filled in by the Server, and only when there is a QUIC
+    // listener — a build without HTTP/3 never sets it.
+    std::string alt_svc;
 #endif
 
     // The Alt-Svc field value, or empty when there is nothing to advertise.
     //
-    // The macro is read here and nowhere else. The engines that send the header
-    // call this unconditionally and never branch on it, and the one engine that
-    // must *not* send it — HTTP/3 itself, where advertising an alternative to
-    // the connection the response arrived on would be nonsense — simply never
-    // asks.
-    [[nodiscard]] std::string alt_svc_value() const {
+    // The engines that send the header call this unconditionally and never
+    // branch on how the value was produced, and the one engine that must *not*
+    // send it — HTTP/3 itself, where advertising an alternative to the
+    // connection the response arrived on would be nonsense — simply never asks.
+    [[nodiscard]] const std::string& alt_svc_value() const {
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
-        if (!h3_alt_svc_port) return {};
-        return std::format("h3=\":{}\"; ma={}", *h3_alt_svc_port, h3_alt_svc_max_age);
+        return alt_svc;
 #else
-        return {};
+        static const std::string none{};
+        return none;
 #endif
     }
 

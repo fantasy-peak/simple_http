@@ -143,6 +143,15 @@ class Server {
         if (m_config.tls) {
             m_tls.emplace(*m_config.tls);
         }
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+        // Alt-Svc is derived, never configured: the port a client should reach
+        // HTTP/3 on is the QUIC listener's own, and with no QUIC listener there
+        // is nothing to advertise. Done before anything is accepted, so every
+        // engine built from these limits sees the final value.
+        if (m_config.quic) {
+            m_config.limits.alt_svc = m_config.limits.render_alt_svc(m_config.quic->port);
+        }
+#endif
         if (!m_config.reuse_port) {
             // Dedicated acceptor context, created last so it is never handed
             // out as a worker. With reuse_port the workers accept for

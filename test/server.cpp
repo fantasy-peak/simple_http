@@ -393,10 +393,9 @@ int main() {
     // Inherits the mTLS policy above, so it also exercises client certificates
     // over QUIC.
     tls_cfg.quic = QuicAddress{"0.0.0.0", 7789, false};
-    // Advertise it over the TCP side, which is where a browser that has never
-    // seen this origin arrives (RFC 7838). Same port number, different
-    // transport — that is the whole shape of the deployment.
-    tls_cfg.limits.h3_alt_svc_port = 7789;
+    // It advertises itself over the TCP side, on the same port number — which is
+    // where a browser that has never seen this origin arrives (RFC 7838), and is
+    // the whole shape of the deployment: one number, two transports.
 #endif
     Server tls{tls_cfg};
     register_routes(tls);
@@ -439,7 +438,6 @@ int main() {
     // also faster than the ngtcp2 reference server (21k vs 13.5k), which is
     // single-socket, so the driver itself was never the problem.
     dual_cfg.reuse_port = true;
-    dual_cfg.limits.h3_alt_svc_port = 7792;
     dual_cfg.tls = TlsConfig{
         .cert_chain_file = "./test/tls_certificates/server_cert.pem",
         .private_key_file = "./test/tls_certificates/server_key.pem",
