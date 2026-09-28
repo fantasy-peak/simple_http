@@ -356,7 +356,8 @@ xmake build server && xmake run python-tests    # 第三方客户端驱动服务
 - **`test/unit/`（Catch2）**：不碰 socket 的单元测试——core（types/method/status/base64/logging/
   io_pool）、proto（Headers/Body/Request/Response + 假 ResponseWriter）、h1 请求与响应解析器、
   h2 帧/HPACK/Huffman、WebSocket 帧与消息层（用 `MockTransport` 驱动）、路由匹配与 `$1` 重写、
-  客户端 URL/配置/TLS 参数/错误码。`test/unit/test_support.h` 放共用测试替身。按标签过滤：
+  CORS 策略（预检应答、origin 匹配、回显上限）、客户端 URL/配置/TLS 参数/错误码。
+  `test/unit/test_support.h` 放共用测试替身。按标签过滤：
   `xmake run unittest "[h2]"`。
 - **`test/server_regression.cpp`**：起进程内服务器（明文 + mTLS），用**裸 socket** 发畸形/边界
   请求并断言线上行为——400/431/413、CL+TE 冲突、坏 chunked、trailers、流水线、HEAD/204、

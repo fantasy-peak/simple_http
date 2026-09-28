@@ -19,8 +19,9 @@ set_policy("package.librarydeps.strict_compatibility", true)
 -- 注意：这里不能用 /opt/h3/lib 的预编译库——那是对系统 OpenSSL 3.5.5 编的，
 -- 而本仓库用的是 openssl3 3.6.3，混链是 ABI 风险。让 xmake 从源码构建。
 add_repositories("my_private_repo https://github.com/fantasy-peak/xmake-repo.git")
-add_requires("boost", {configs = {asio=true, regex=true}})
+add_requires("boost", {configs = {cmake = true, asio=true, regex=true}})
 add_requires("openssl3")
+add_requires("nghttp2 1.70.0")
 add_requires("ngtcp2", "nghttp3")
 add_requires("catch2")  -- unit tests only (target `unittest`)
 -- Response-body compression (core/content_encoding.h). Only the targets that
@@ -35,6 +36,7 @@ target("simple_http")
     add_includedirs("include", { public = true })
     add_packages(
         "ngtcp2",
+        "nghttp2",
         "nghttp3",
         "boost",
         "openssl3",

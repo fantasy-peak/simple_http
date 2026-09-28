@@ -91,12 +91,10 @@ inline asio::awaitable<void> serve_plaintext(std::shared_ptr<Transport> transpor
         }
         co_return;
     };
-    bool timed_out = false;
     auto detection_deadline = [&]() -> asio::awaitable<void> {
         asio::steady_timer timer{co_await asio::this_coro::executor};
         timer.expires_after(limits.idle_timeout);
         co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
-        timed_out = true;
     };
 
     // Race the read against the deadline only when there is a deadline. Racing a
