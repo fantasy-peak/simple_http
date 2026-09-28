@@ -795,10 +795,11 @@ class Http2ClientSession final : public ClientSession,
     }
 
     asio::awaitable<void> write_loop() {
+        std::string chunk;
         for (;;) {
             fill_data_frames();  // frame as much queued DATA as flow control allows
             while (!m_out.empty()) {
-                std::string chunk;
+                chunk.clear();
                 chunk.swap(m_out);
                 m_deadline = std::chrono::steady_clock::now() + m_idle_timeout;
                 auto [ec, n] =

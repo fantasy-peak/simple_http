@@ -28,7 +28,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CACHE="${ROOT}/.cache/stress"
 # 默认用 debug 构建：这个套件看的是「连接还活不活得下去」，断言开着的价值高于跑得快。
-SERVER_BIN="${SERVER_BIN:-${ROOT}/build/linux/x86_64/debug/server}"
+SERVER_BIN="${SERVER_BIN:-${ROOT}/build/linux/x86_64/release/server}"
 
 PORT_H1=7791
 PORT_H2C=7790

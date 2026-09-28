@@ -54,8 +54,7 @@ template <typename ServerT>
 void register_routes(ServerT& server) {
     // One-shot response.
     server.route("/world", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
-        std::string body = std::string{"hello from "} + std::string{to_string(res->version())};
-        co_await res->status(200).send(body);
+        co_await res->status(200).send(std::string(1*1024, 'a'));
     });
 
     // Bidirectional streaming: read each request-body frame, log it, and echo a
