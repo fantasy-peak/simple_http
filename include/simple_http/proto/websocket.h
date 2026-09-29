@@ -49,7 +49,7 @@
 #include <utility>
 
 #include <boost/asio.hpp>
-#include <boost/asio/experimental/concurrent_channel.hpp>
+#include <boost/asio/experimental/channel.hpp>
 
 #include "../core/types.h"
 #include "../transport/transport.h"  // ConstByteSpan / kMaxWriteSegments
@@ -96,7 +96,16 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
     using Executor = decltype(std::declval<Transport&>().get_executor());
 
     // One queued outbound frame + a channel to deliver its write result.
-    using ResultChannel = asio::experimental::concurrent_channel<void(error_code)>;
+    //
+    // Lock-free `channel` (not `concurrent_channel`) — deliberately. Every
+    // operation on these channels first re-enters the connection's executor:
+    // write()/close_with() hop, the pump and the watchdog are co_spawn'd on it,
+    // and abort() dispatches to it. Under Model A one thread drives that
+    // executor, so all channel access is serialized on that one thread and the
+    // thread-safe `concurrent_channel` would only pay a mutex per message for a
+    // guarantee nothing here uses. If a future caller ever touches them from a
+    // different executor without a hop, this becomes a data race.
+    using ResultChannel = asio::experimental::channel<void(error_code)>;
     struct WriteReq {
         std::string payload;                   // frame payload: the caller's buffer, moved in
         char header[10]{};                     // serialized frame header (at most 10 bytes)
@@ -113,7 +122,7 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
     // heap member it owns (here the frame payload) leaks. The channel below
     // therefore carries only an error_code, purely as a pump wake-up signal.
     using WriteQueue = std::deque<WriteReq>;
-    using Notify = asio::experimental::concurrent_channel<void(error_code)>;
+    using Notify = asio::experimental::channel<void(error_code)>;
 
     // Builds a queued frame without any concatenation buffer: the header is
     // serialized into the request itself (10 bytes inline) and the payload's
