@@ -270,3 +270,61 @@ TEST_CASE("ws proxy: the replayed upgrade request keeps its shape", "[h1]") {
     http10.version = Version::Http1;
     CHECK(rebuild_request_head(http10).starts_with("GET /chat?reconnectionToken=abc HTTP/1.0\r\n"));
 }
+
+TEST_CASE("h1/parser: forbidden field-value bytes, SWAR fast path matches the naive check", "[h1]") {
+    namespace hd = h1_detail;
+    auto naive = [](std::string_view v) {
+        for (char ch : v) {
+            auto c = static_cast<unsigned char>(ch);
+            if (c == '\t') continue;
+            if (c < 0x20 || c == 0x7F) return true;
+        }
+        return false;
+    };
+
+    // Every single byte value, alone.
+    for (int b = 0; b < 256; ++b) {
+        const std::string s(1, static_cast<char>(b));
+        CHECK(hd::has_forbidden_field_value_byte(s) == naive(s));
+    }
+
+    // All two-byte combinations over a representative subset of the byte range,
+    // so masked lanes straddle the 8-byte window at every offset.
+    for (unsigned a = 0; a < 256; a += 7) {
+        for (unsigned b = 0; b < 256; b += 11) {
+            const std::string s{static_cast<char>(a), static_cast<char>(b)};
+            CHECK(hd::has_forbidden_field_value_byte(s) == naive(s));
+        }
+    }
+
+    // Boundary lengths around the 8-byte scan window, with a forbidden byte at
+    // the tail (crossing mask edges).
+    for (std::size_t len : {0u, 1u, 7u, 8u, 9u, 15u, 16u, 17u, 31u, 32u, 33u}) {
+        const int tails[] = {0x01, 0x1F, 0x20, 0x7F, 0x09, static_cast<int>('A')};
+        for (int tail : tails) {
+            std::string s(static_cast<std::size_t>(len), 'A');
+            if (len > 0) {
+                s[0] = static_cast<char>(tail);        // head
+                s.back() = static_cast<char>(tail);    // tail
+            }
+            CHECK(hd::has_forbidden_field_value_byte(s) == naive(s));
+        }
+    }
+
+    // Tab-only and tab-heavy values stay legal.
+    CHECK_FALSE(hd::has_forbidden_field_value_byte("\t\t\t"));
+    CHECK_FALSE(hd::has_forbidden_field_value_byte("a\tb\tc"));
+
+    // Deterministic pseudo-random fuzz over the full byte range.
+    std::uint32_t x = 0x12345678u;
+    for (int iter = 0; iter < 50000; ++iter) {
+        x = x * 1103515245u + 12345u;
+        std::size_t len = (x >> 16) % 40;
+        std::string s(len, '\0');
+        for (std::size_t j = 0; j < len; ++j) {
+            x = x * 1103515245u + 12345u;
+            s[j] = static_cast<char>(x >> 24);
+        }
+        CHECK(hd::has_forbidden_field_value_byte(s) == naive(s));
+    }
+}

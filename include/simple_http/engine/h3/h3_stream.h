@@ -30,7 +30,7 @@
 #include <memory>
 #include <string>
 
-#include <boost/asio/experimental/concurrent_channel.hpp>
+#include <boost/asio/experimental/channel.hpp>
 
 #include "../../core/types.h"
 #include "../../proto/request.h"
@@ -42,8 +42,10 @@ namespace asio = boost::asio;
 
 // A one-shot wake-up with a coalescing send. `try_send` posts rather than
 // inlining the wake, which is what makes it safe to call from inside an ngtcp2
-// or nghttp3 callback.
-using Channel = asio::experimental::concurrent_channel<void(error_code)>;
+// or nghttp3 callback. Lock-free `channel` (not `concurrent_channel`): those
+// callbacks run on the connection's executor (model A, one thread) and so do
+// the consumers who await the signal, so no lock is needed.
+using Channel = asio::experimental::channel<void(error_code)>;
 using Signal = std::shared_ptr<Channel>;
 
 inline void wake(const Signal& signal) noexcept {

@@ -21,6 +21,8 @@
 
 #include <cctype>
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -86,8 +88,30 @@ inline bool is_tchar(unsigned char c) {
 // one through would put it into whatever the handler or the reverse proxy builds
 // downstream, where it means something the sender never said.
 inline bool has_forbidden_field_value_byte(std::string_view value) {
-    for (char ch : value) {
-        const auto c = static_cast<unsigned char>(ch);
+    // Fast path: skip clean 8-byte words with a SWAR existence test, then fall
+    // through to the exact per-byte scan for anything flagged. The SWAR only
+    // ever over-approximates (bytes == HTAB count as suspicious too, and the
+    // classic lane masks are "exists" checks, not per-lane exact): when it stays
+    // silent the word has no byte < 0x20 and no 0x7F, so nothing to report;
+    // when it flags we confirm byte-exactly. Correctness never depends on the
+    // masks.
+    const auto* p = reinterpret_cast<const unsigned char*>(value.data());
+    const std::size_t n = value.size();
+    constexpr std::uint64_t k01 = 0x0101010101010101ULL;
+    constexpr std::uint64_t k80 = 0x8080808080808080ULL;
+    std::size_t i = 0;
+    while (i + 8 <= n) {
+        std::uint64_t w{};
+        std::memcpy(&w, p + i, 8);
+        const std::uint64_t lo = (w - k01 * 0x20) & ~w & k80;   // any lane < 0x20
+        const std::uint64_t del = ((w ^ (k01 * 0x7F)) - k01) & ~(w ^ (k01 * 0x7F)) & k80;  // any lane == 0x7F
+        if (((lo | del) != 0)) {
+            break;  // suspicious word: confirm byte-exactly below
+        }
+        i += 8;
+    }
+    for (; i < n; ++i) {
+        const auto c = p[i];
         if (c == '\t') continue;
         if (c < 0x20 || c == 0x7F) return true;
     }

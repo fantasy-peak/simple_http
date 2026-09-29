@@ -37,7 +37,7 @@
 
 #include <boost/asio.hpp>
 #include <boost/asio/experimental/awaitable_operators.hpp>
-#include <boost/asio/experimental/concurrent_channel.hpp>
+#include <boost/asio/experimental/channel.hpp>
 
 #include "h2_frame.h"
 #include "hpack_decode.h"
@@ -366,7 +366,11 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
     // rather than waiting forever.
     //
     // Callers hop onto the connection executor first, so the check-then-wait
-    // sequence below cannot race the write loop (single-threaded model A).
+    // sequence below cannot race the write loop (single-threaded model A). The
+    // channel is deliberately the lock-free `channel`, not `concurrent_channel`:
+    // every producer (the write loop's low-watermark refill) and consumer (this
+    // wait) runs on the connection executor, so the thread-safe variant would
+    // pay a mutex per window update for a guarantee nothing here uses.
     asio::awaitable<error_code> await_out_space(std::uint32_t stream_id) {
         for (;;) {
             auto it = m_streams.find(stream_id);
@@ -374,7 +378,7 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
             if (it->second.out_queued <= kOutHighWatermark) co_return error_code{};
             if (!it->second.out_space) {
                 it->second.out_space =
-                    std::make_shared<asio::experimental::concurrent_channel<void(error_code)>>(m_executor, 1);
+                    std::make_shared<asio::experimental::channel<void(error_code)>>(m_executor, 1);
             }
             // Keep the channel alive across the wait: the stream entry itself may
             // be erased (and the channel closed, waking us) while we are parked.
@@ -412,7 +416,7 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
         // Wakes a producer parked on backpressure. Created lazily on the first
         // wait, closed on teardown (stream erased, connection ending) so a parked
         // producer is always released rather than stranded.
-        std::shared_ptr<asio::experimental::concurrent_channel<void(error_code)>> out_space;
+        std::shared_ptr<asio::experimental::channel<void(error_code)>> out_space;
 
         std::uint32_t id = 0;                         // this stream's id (for WINDOW_UPDATE etc.)
         std::int64_t send_window = kH2InitialWindow;  // peer's advertised window for us (send side)
@@ -1546,7 +1550,7 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
     // --- members (touched only on the connection executor) ---
     std::shared_ptr<Transport> m_transport;
     Executor m_executor;
-    asio::experimental::concurrent_channel<void(error_code)> m_notify;
+    asio::experimental::channel<void(error_code)> m_notify;
     EngineLimits m_limits;
     std::chrono::steady_clock::time_point m_deadline{};
 

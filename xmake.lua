@@ -48,7 +48,7 @@ target("server")
     set_kind("binary")
     on_load(function (target)
         if target:toolchain("gcc") then
-            target:add("cxxflags", "-Wno-maybe-uninitialized")
+            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete")
         end
         -- xmake f --toolchain=llvm --runtimes=c++_static -c -v
         if target:toolchain("llvm") then

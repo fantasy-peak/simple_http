@@ -56,7 +56,7 @@
 
 #include <boost/asio.hpp>
 #include <boost/asio/experimental/awaitable_operators.hpp>
-#include <boost/asio/experimental/concurrent_channel.hpp>
+#include <boost/asio/experimental/channel.hpp>
 #include <nghttp3/nghttp3.h>
 
 #include "../../core/http_method.h"
