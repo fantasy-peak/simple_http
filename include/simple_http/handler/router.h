@@ -45,6 +45,19 @@ class Router {
     explicit Router(ClientConfig proxy_client = {})
         : m_http_client(std::make_shared<HttpClient>(std::move(proxy_client))) {}
 
+    // The reverse-proxy upstream client's pooled sessions are idle keep-alive
+    // connections bound to worker executors — the server has to close them when
+    // it stops, or they outlive the process (their TLS streams leak at exit:
+    // ASan finds them as ssl::streams never freed). The server calls this just
+    // before stopping its io pool; the pool's drain is what unwinds the posted
+    // closes. Idle only: a session in the middle of a request is not in the
+    // pool and is left alone.
+    void close_proxy_client() {
+        if (m_http_client) {
+            m_http_client->close_idle();
+        }
+    }
+
     // --- registration (fluent) ---
     template <typename F>
     Router& route(std::string path, F&& handler) {

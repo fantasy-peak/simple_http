@@ -320,6 +320,12 @@ class Server {
         // The same for TCP: close what is in flight so those coroutines finish
         // and the pool drains rather than abandoning their frames.
         shutdown_connections();
+        // The reverse-proxy upstream client pools idle keep-alive connections
+        // on the worker executors, and nothing in the connection table ever
+        // touched them — close them before the pool stops, or those sessions
+        // (with their TLS streams) leak past process exit. The drain in
+        // stop() below is what actually unwinds the posted closes.
+        m_router->close_proxy_client();
         m_pool->stop();
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
         for (auto& quic : m_quic) {
