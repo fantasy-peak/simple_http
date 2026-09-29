@@ -350,10 +350,31 @@ class Utf8Validator {
   public:
     // Feeds octets; false the moment the stream stops being valid UTF-8.
     bool feed(std::string_view bytes) {
-        for (char ch : bytes) {
-            const auto b = static_cast<unsigned char>(ch);
+        const auto* p = reinterpret_cast<const unsigned char*>(bytes.data());
+        const std::size_t n = bytes.size();
+        std::size_t i = 0;
+        while (i < n) {
+            // Fast path: at a codepoint boundary (m_need == 0) a run of pure
+            // ASCII octets leaves the state unchanged and is always valid, so
+            // skip it wholesale (8 octets per check) instead of branching per
+            // byte. The ws echo benchmark is all-ASCII, and this stat was the
+            // single hottest symbol in the ws path. Mid-sequence ASCII is
+            // always invalid (continuations must be >= 0x80), so the skip is
+            // gated on m_need == 0; the switch below then sees only
+            // non-ASCII bytes.
             if (m_need == 0) {
-                if (b < 0x80) continue;  // ASCII
+                while (i + 8 <= n) {
+                    std::uint64_t word{};
+                    std::memcpy(&word, p + i, 8);
+                    if ((word & std::uint64_t{0x8080808080808080ULL}) != 0) break;  // some octet >= 0x80
+                    i += 8;
+                }
+                while (i < n && p[i] < 0x80) ++i;
+                if (i == n) break;
+            }
+            const auto b = p[i];
+            if (m_need == 0) {
+                // b >= 0x80 here: the ASCII case was consumed by the fast path.
                 if (b >= 0xC2 && b <= 0xDF) {
                     start(1, 0x80, 0xBF);
                 } else if (b == 0xE0) {
@@ -373,12 +394,14 @@ class Utf8Validator {
                 } else {
                     return false;  // 0x80-0xC1 (stray continuation/overlong), 0xF5-0xFF
                 }
+                ++i;
                 continue;
             }
             if (b < m_lower || b > m_upper) return false;
             m_lower = 0x80;  // later continuation octets take the ordinary range
             m_upper = 0xBF;
             --m_need;
+            ++i;
         }
         return true;
     }

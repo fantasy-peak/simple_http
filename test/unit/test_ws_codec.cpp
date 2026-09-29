@@ -343,3 +343,64 @@ TEST_CASE("ws/backend: messages, fragmentation, Ping and Close", "[ws]") {
         CHECK(written.substr(2) == "out");
     }
 }
+
+TEST_CASE("ws: incremental UTF-8 validation", "[ws][utf8]") {
+    using octets = std::string;
+
+    auto valid = [](std::string_view s) {
+        Utf8Validator v;
+        return v.feed(s) && v.complete();
+    };
+
+    // ASCII-only runs, including a long one that exercises the 8-octet fast path.
+    CHECK(valid(""));
+    CHECK(valid("hello"));
+    CHECK(valid(octets(1024, 'x')));
+    CHECK(valid(octets(100, 'a') + " " + octets(100, '\t')));
+
+    // Valid multi-byte sequences.
+    CHECK(valid(octets("\xC3\xA9")));                        // é
+    CHECK(valid(octets("\xE2\x82\xAC")));                   // €
+    CHECK(valid(octets("\xF0\x90\x8D\x88")));               // U+10348
+    CHECK(valid("a" + octets("\xE2\x82\xAC") + "b"));       // UTF-8 around ASCII
+
+    // A sequence split across feed() calls carries its state between them.
+    Utf8Validator frag;
+    CHECK(frag.feed(octets("\xE2\x82")));
+    CHECK_FALSE(frag.complete());
+    CHECK(frag.feed(octets("\xAC-tail")));
+    CHECK(frag.complete());
+
+    // Feed boundaries never split the ASCII fast path across a sequence start:
+    // the lead byte after an ASCII run is where the state machine takes over.
+    Utf8Validator split_ascii;
+    CHECK(split_ascii.feed(octets("abc\xC3")));
+    CHECK(split_ascii.feed(octets("")));
+    CHECK_FALSE(split_ascii.complete());
+    CHECK(split_ascii.feed(octets("\xA9")));
+    CHECK(split_ascii.complete());
+
+    // Rejected: stray continuation / overlong lead bytes at a boundary.
+    CHECK_FALSE(valid(octets("\x80")));
+    CHECK_FALSE(valid(octets("\xBF")));
+    CHECK_FALSE(valid(octets("\xC0\xAF")));                       // overlong 2-byte
+    CHECK_FALSE(valid("x\xC1\x81"));                              // overlong mid-string
+
+    // Rejected: overlong 3-byte, surrogates, and beyond U+10FFFF.
+    CHECK_FALSE(valid(octets("\xE0\x80\x80")));                   // overlong €-shaped
+    CHECK_FALSE(valid(octets("\xED\xA0\x80")));                   // U+D800 surrogate
+    CHECK_FALSE(valid(octets("\xED\xBF\xBF")));                   // U+DFFF surrogate
+    CHECK_FALSE(valid(octets("\xF0\x80\x80\x80")));               // overlong 4-byte
+    CHECK_FALSE(valid(octets("\xF4\x90\x80\x80")));               // U+110000
+    CHECK_FALSE(valid(octets("\xF5\x80\x80\x80")));               // invalid lead
+
+    // Rejected: continuation bytes out of the allowed window.
+    CHECK_FALSE(valid("\xC3" + octets("\x40")));                  // continuation < 0x80
+    CHECK_FALSE(valid("\xF0" + octets("\x8F\x80\x80")));          // first continuation < 0x90
+    CHECK_FALSE(valid("\xE2" + octets("\xBF\x40")));              // last continuation < 0x80
+
+    // Truncated sequences: feed() stays pending until complete() is asked.
+    Utf8Validator truncated;
+    CHECK(truncated.feed(octets("\xE2\x82")));
+    CHECK_FALSE(truncated.complete());
+}
