@@ -48,9 +48,19 @@
 #include <openssl/rand.h>
 
 #include <boost/asio.hpp>
-#include <boost/asio/experimental/awaitable_operators.hpp>
 #include <boost/asio/experimental/concurrent_channel.hpp>
 #include <ngtcp2/ngtcp2.h>
+
+#if defined(__linux__)
+// The GSO knobs (SOL_UDP, UDP_SEGMENT) come from the libc <netinet/udp.h>,
+// which exported UDP_SEGMENT since glibc 2.36. It has to be pulled in before
+// the `kPacketsPerFlush` probe below evaluates; on older glibc the macro is
+// absent and batching quietly stays off, which is fine. (The kernel's own
+// <linux/udp.h> is deliberately *not* included: it declares `struct udphdr`,
+// which the libc header also declares, and the redefinition is a compile
+// error.)
+#include <netinet/udp.h>
+#endif
 
 #include "../core/logging.h"
 #include "../core/types.h"
@@ -64,9 +74,21 @@ namespace simple_http::quic {
 
 namespace asio = boost::asio;
 
-// One datagram in flight, and where it goes. The connection hands these to the
-// endpoint, which owns the socket.
-using DatagramSink = std::function<void(std::span<const std::uint8_t>, const asio::ip::udp::endpoint&)>;
+// One datagram in flight, and where it goes.
+//
+// When `gso_size` is nonzero, `data` is a GSO segment: several QUIC packets
+// written back to back, which the kernel splits into separate datagrams on the
+// wire (UDP_SEGMENT). The connection allocates the buffer; from here on the
+// endpoint owns it, and it is *moved* into the send queue, never copied.
+struct SendItem {
+    std::vector<std::uint8_t> data;
+    asio::ip::udp::endpoint to;
+    std::uint16_t gso_size{0};
+};
+
+// The connection hands finished datagrams to the endpoint, which owns the
+// socket.
+using DatagramSink = std::function<void(SendItem&&)>;
 
 // What the endpoint learned from the client's first Initial, before a
 // connection existed to hold it.
@@ -100,11 +122,21 @@ struct QuicBootstrap {
 // peer's advertised limit or our own `max_udp_payload_size`.
 inline constexpr std::size_t kMaxDatagram = 1500;
 
-// How many packets the send loop will pack into one buffer before flushing.
-// One: this transport has no GSO (asio's udp socket has no sendmsg path), so
-// asking ngtcp2 to coalesce would only make it build a buffer we then have to
-// split ourselves.
+// How many packets the send loop packs into one UDP datagram. Each packet in a
+// batch is padded to the path MTU (see the PADDING flag in `write_pkt`), which
+// is what makes ngtcp2's packet aggregation engage — `write_aggregate_pkt2`
+// only batches when the first packet is full. The endpoint sends the batch with
+// UDP_SEGMENT, so every packet still lands as its own datagram on the wire, for
+// the price of one syscall instead of one per packet.
+//
+// On platforms without GSO (non-Linux), batching is off: one packet per
+// datagram, exactly what the stack has always done — the aggregation above
+// exists only because GSO can deliver it.
+#if defined(__linux__) && defined(SOL_UDP) && defined(UDP_SEGMENT)
+inline constexpr std::size_t kPacketsPerFlush = 8;
+#else
 inline constexpr std::size_t kPacketsPerFlush = 1;
+#endif
 
 // What `ngtcp2_conn_get_expiry2` returns when the connection has no timer armed.
 inline constexpr ngtcp2_tstamp kNoExpiry = std::numeric_limits<ngtcp2_tstamp>::max();
@@ -669,12 +701,24 @@ void QuicConnection<Executor>::poke() noexcept {
 template <typename Executor>
 void QuicConnection<Executor>::arm_timer() {
     if (m_conn == nullptr) return;
+    // asio allows one outstanding wait per timer; the previous arm is either a
+    // no-op cancel (already fired) or a live wait that must go before re-arming.
+    (void)m_timer.cancel();
     const ngtcp2_tstamp expiry = ngtcp2_conn_get_expiry2(m_conn);
     if (expiry == kNoExpiry) {
         m_timer.expires_at(Timer::time_point::max());
-        return;
+    } else {
+        m_timer.expires_at(Timer::time_point{} + std::chrono::nanoseconds(expiry));
     }
-    m_timer.expires_at(Timer::time_point{} + std::chrono::nanoseconds(expiry));
+    // The expiry becomes a wake: the loop is waiting on the channel, so posting
+    // into it is how the timer is observed at all (see wait_for_event). A
+    // cancellation (poke) lands here too with operation_aborted and is dropped —
+    // the loop re-derives what to do from the connection's state either way.
+    m_timer.async_wait([this](const error_code& ec) {
+        if (!ec && !m_closed) {
+            (void)m_wake.try_send(error_code{});
+        }
+    });
 }
 
 template <typename Executor>
@@ -739,6 +783,15 @@ ngtcp2_ssize QuicConnection<Executor>::write_pkt(ngtcp2_path* path, ngtcp2_pkt_i
 
         std::uint32_t flags = NGTCP2_WRITE_STREAM_FLAG_MORE;
         if (fin != 0) flags |= NGTCP2_WRITE_STREAM_FLAG_FIN;
+        if constexpr (kPacketsPerFlush > 1) {
+            // Pad 1-RTT ack-eliciting packets to the path MTU: ngtcp2 only
+            // aggregates (`write_aggregate_pkt2`) when the first packet in the
+            // buffer is full-size, and padding is how a small response becomes
+            // full-size. ngtcp2 itself excludes handshake-level packets, so the
+            // anti-amplification limit is untouched; ACK-only packets are not
+            // ack-eliciting and are likewise left alone.
+            flags |= NGTCP2_WRITE_STREAM_FLAG_PADDING;
+        }
 
         ngtcp2_ssize datalen = -1;
         const ngtcp2_ssize nwrite = ngtcp2_conn_writev_stream(m_conn, path, pi, dest, destlen, &datalen, flags, stream_id,
@@ -780,7 +833,12 @@ bool QuicConnection<Executor>::flush_writes() {
     if (m_closed || m_conn == nullptr) return false;
 
     for (;;) {
-        std::array<std::uint8_t, kMaxDatagram> buf{};
+        // The aggregate buffer: up to kPacketsPerFlush full datagrams, one GSO
+        // segment when there is that much to say. The vector is moved into the
+        // send queue and ends up at the socket un-copied; allocating it per
+        // flush avoids threading a lifetime through (and the allocator's
+        // per-thread cache keeps the cost of doing so negligible).
+        std::vector<std::uint8_t> buf(static_cast<std::size_t>(kMaxDatagram) * kPacketsPerFlush);
         ngtcp2_path_storage ps;
         ngtcp2_path_storage_zero(&ps);
         ngtcp2_pkt_info pi{};
@@ -803,7 +861,13 @@ bool QuicConnection<Executor>::flush_writes() {
         if (n == 0) {
             return true;
         }
-        m_sink(std::span<const std::uint8_t>{buf.data(), static_cast<std::size_t>(n)}, m_remote);
+
+        SendItem item;
+        item.to = m_remote;
+        item.gso_size = static_cast<std::uint16_t>(gso_size);
+        buf.resize(static_cast<std::size_t>(n));
+        item.data = std::move(buf);
+        m_sink(std::move(item));
     }
 }
 
@@ -821,7 +885,13 @@ void QuicConnection<Executor>::close_now() {
         const ngtcp2_ssize n = ngtcp2_conn_write_connection_close(m_conn, &ps.path, &pi, buf.data(), buf.size(),
                                                                   &m_last_error, now());
         if (n > 0) {
-            m_sink(std::span<const std::uint8_t>{buf.data(), static_cast<std::size_t>(n)}, m_remote);
+            // The terminal packet is built into a stack buffer; the sink wants
+            // ownership, so hand it a copy — this is once per connection, not
+            // per datagram, and not worth threading a buffer through.
+            SendItem item;
+            item.data.assign(buf.data(), buf.data() + n);
+            item.to = m_remote;
+            m_sink(std::move(item));
         }
     }
 
@@ -829,6 +899,8 @@ void QuicConnection<Executor>::close_now() {
     if (auto proto = protocol()) proto->on_connection_closed();
     (void)m_closed_signal.try_send(error_code{});
     (void)m_wake.try_send(error_code{});
+    // Drop the arming handler so it cannot fire into the loop afterwards.
+    (void)m_timer.cancel();
 }
 
 template <typename Executor>
@@ -854,13 +926,12 @@ void QuicConnection<Executor>::fail(int liberr) {
 
 template <typename Executor>
 asio::awaitable<void> QuicConnection<Executor>::wait_for_event() {
-    using namespace asio::experimental::awaitable_operators;
-    // Whichever finishes first cancels the other: the timer is cancelled by a
-    // wake, and the receive is cancelled by the timer. Both are expected, not
-    // errors, and the caller re-derives what to do from the connection's state.
-    auto tick = m_timer.async_wait(asio::as_tuple(asio::use_awaitable));
-    auto woke = m_wake.async_receive(asio::as_tuple(asio::use_awaitable));
-    (void)co_await (std::move(tick) || std::move(woke));
+    // Not a race between the timer and the channel any more: the timer's
+    // completion handler *posts into this channel* (arm_timer), so a single
+    // receive observes both a wake and a real expiry. That removes asio's
+    // parallel-group machinery — shared state and a heap allocation per wait —
+    // from the hot loop, where a sustained-load profile showed it.
+    co_await m_wake.async_receive(asio::as_tuple(asio::use_awaitable));
     co_return;
 }
 
