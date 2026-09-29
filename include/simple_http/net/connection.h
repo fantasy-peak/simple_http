@@ -60,7 +60,7 @@ enum class PlaintextProtocols {
 template <typename Transport>
 inline asio::awaitable<void> serve_plaintext(std::shared_ptr<Transport> transport, Dispatcher dispatch,
                                              WsLookup ws_lookup = {}, EngineLimits limits = {},
-                                             WsProxyLookup ws_proxy_lookup = {},
+                                             WsProxyLookup ws_proxy_lookup = {}, WsLookup ws_regex_lookup = {},
                                              PlaintextProtocols protocols = PlaintextProtocols::Both) {
     using namespace asio::experimental::awaitable_operators;
 
@@ -76,7 +76,8 @@ inline asio::awaitable<void> serve_plaintext(std::shared_ptr<Transport> transpor
     }
     if (protocols == PlaintextProtocols::Http1) {
         Http1Engine<Transport> engine{transport, limits};
-        co_await engine.run(dispatch, {}, std::move(ws_lookup), std::move(ws_proxy_lookup));
+        co_await engine.run(dispatch, {}, std::move(ws_lookup), std::move(ws_proxy_lookup),
+                            std::move(ws_regex_lookup));
         co_return;
     }
 
@@ -126,7 +127,8 @@ inline asio::awaitable<void> serve_plaintext(std::shared_ptr<Transport> transpor
     // A registered WebSocket route (ws_lookup) enables the Upgrade: websocket
     // handshake inside the h1 engine.
     Http1Engine<Transport> engine{transport, limits};
-    co_await engine.run(dispatch, std::string{header}, std::move(ws_lookup), std::move(ws_proxy_lookup));
+    co_await engine.run(dispatch, std::string{header}, std::move(ws_lookup), std::move(ws_proxy_lookup),
+                        std::move(ws_regex_lookup));
     co_return;
 }
 
@@ -134,7 +136,7 @@ inline asio::awaitable<void> serve_plaintext(std::shared_ptr<Transport> transpor
 template <typename TlsTransportT>
 inline asio::awaitable<void> serve_tls(std::shared_ptr<TlsTransportT> transport, Dispatcher dispatch,
                                        WsLookup ws_lookup = {}, EngineLimits limits = {},
-                                       WsProxyLookup ws_proxy_lookup = {}) {
+                                       WsProxyLookup ws_proxy_lookup = {}, WsLookup ws_regex_lookup = {}) {
     using namespace asio::experimental::awaitable_operators;
 
     // The handshake is bounded for exactly the reason the plaintext detection
@@ -166,7 +168,8 @@ inline asio::awaitable<void> serve_tls(std::shared_ptr<TlsTransportT> transport,
         co_await engine->run(std::move(dispatch));
     } else {
         Http1Engine<TlsTransportT> engine{transport, limits};
-        co_await engine.run(dispatch, {}, std::move(ws_lookup), std::move(ws_proxy_lookup));
+        co_await engine.run(dispatch, {}, std::move(ws_lookup), std::move(ws_proxy_lookup),
+                            std::move(ws_regex_lookup));
     }
     co_return;
 }

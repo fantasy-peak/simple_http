@@ -398,8 +398,20 @@ class Server {
     WsLookup make_ws_lookup() {
         auto router = m_router;
         return [router](std::string_view path) -> std::optional<WsHandlerFn> {
-            if (const WsHandler* h = router->find_ws(path)) {
+            // Exact local ws routes only; the h1 engine consults this before
+            // the byte-level proxy lookup (nginx order).
+            if (const WsHandler* h = router->find_ws_exact(path)) {
                 return *h;  // copy the handler for the engine to run
+            }
+            return std::nullopt;
+        };
+    }
+
+    WsLookup make_ws_regex_lookup() {
+        auto router = m_router;
+        return [router](std::string_view path) -> std::optional<WsHandlerFn> {
+            if (const WsHandler* h = router->find_ws_regex(path)) {
+                return *h;
             }
             return std::nullopt;
         };
@@ -758,6 +770,7 @@ class Server {
         auto dispatch = make_dispatcher();
         auto ws_lookup = make_ws_lookup();
         auto ws_proxy_lookup = make_ws_proxy_lookup();
+        auto ws_regex_lookup = make_ws_regex_lookup();
         for (;;) {
             // Pinned: the kernel already picked this socket, so keep the
             // connection here. Otherwise round-robin the pool, which spreads
@@ -802,7 +815,7 @@ class Server {
                 auto live = track_connection(ctx_ptr, [transport] { transport->close(); });
                 // The handler is not `detached`: it holds the registry handle, so
                 // the entry lives exactly as long as the connection does.
-                asio::co_spawn(ctx, serve_tls(transport, dispatch, ws_lookup, m_config.limits, ws_proxy_lookup),
+                asio::co_spawn(ctx, serve_tls(transport, dispatch, ws_lookup, m_config.limits, ws_proxy_lookup, ws_regex_lookup),
                                [live](std::exception_ptr) {});
             } else {
                 auto sock_ptr = std::make_shared<Socket>(std::move(socket));
@@ -810,7 +823,7 @@ class Server {
                 auto live = track_connection(ctx_ptr, [transport] { transport->close(); });
                 asio::co_spawn(ctx,
                                serve_plaintext(transport, dispatch, ws_lookup, m_config.limits, ws_proxy_lookup,
-                                               m_config.plaintext_protocols),
+                                               ws_regex_lookup, m_config.plaintext_protocols),
                                [live](std::exception_ptr) {});
             }
         }

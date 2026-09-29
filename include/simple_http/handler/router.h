@@ -62,7 +62,7 @@ class Router {
     template <typename F>
     Router& route_regex(const std::string& pattern, F&& handler) {
         try {
-            m_regex.emplace_back(simple_http_regex::regex{pattern}, make_handler(std::forward<F>(handler)));
+            m_regex.emplace_back(RegexRoute{simple_http_regex::regex{pattern}, literal_prefix(pattern)}, make_handler(std::forward<F>(handler)));
         } catch (const std::exception& e) {
             SIMPLE_HTTP_ERROR_LOG("invalid route regex [{}]: {}", pattern, e.what());
         }
@@ -114,7 +114,7 @@ class Router {
 
     Router& ws_route_regex(const std::string& pattern, WsHandler handler) {
         try {
-            m_ws_regex.emplace_back(simple_http_regex::regex{pattern}, std::move(handler));
+            m_ws_regex.emplace_back(RegexRoute{simple_http_regex::regex{pattern}, literal_prefix(pattern)}, std::move(handler));
         } catch (const std::exception& e) {
             SIMPLE_HTTP_ERROR_LOG("invalid ws route regex [{}]: {}", pattern, e.what());
         }
@@ -129,7 +129,7 @@ class Router {
 
     Router& ws_proxy_regex(const std::string& pattern, WsProxyTarget target) {
         try {
-            m_ws_proxy_regex.emplace_back(simple_http_regex::regex{pattern}, std::move(target));
+            m_ws_proxy_regex.emplace_back(RegexRoute{simple_http_regex::regex{pattern}, literal_prefix(pattern)}, std::move(target));
         } catch (const std::exception& e) {
             SIMPLE_HTTP_ERROR_LOG("invalid ws proxy regex [{}]: {}", pattern, e.what());
         }
@@ -144,34 +144,50 @@ class Router {
 
     Router& http_proxy_regex(const std::string& pattern, HttpProxyTarget target) {
         try {
-            m_http_proxy_regex.emplace_back(simple_http_regex::regex{pattern}, std::move(target));
+            m_http_proxy_regex.emplace_back(RegexRoute{simple_http_regex::regex{pattern}, literal_prefix(pattern)}, std::move(target));
         } catch (const std::exception& e) {
             SIMPLE_HTTP_ERROR_LOG("invalid http proxy regex [{}]: {}", pattern, e.what());
         }
         return *this;
     }
 
-    // Looks up a WebSocket handler for a path (exact then regex). Returns nullptr
-    // if none matches. Used by the engine after a successful upgrade handshake.
-    const WsHandler* find_ws(std::string_view path) const {
+    // Local WebSocket handler for an exact path (nginx `location = /path`):
+    // the h1 engine consults this before a proxy route for the same path.
+    const WsHandler* find_ws_exact(std::string_view path) const {
         if (auto it = m_ws_exact.find(path); it != m_ws_exact.end()) {
             return &it->second;
         }
+        return nullptr;
+    }
+
+    // Local WebSocket handler via the regex routes, consulted after the proxy
+    // lookup. Same literal-prefix fast path as the other regex walks.
+    const WsHandler* find_ws_regex(std::string_view path) const {
         if (m_ws_regex.empty()) {
             return nullptr;  // nothing to match, and no string to build for it
         }
-        std::string p{path};
-        for (const auto& [pattern, handler] : m_ws_regex) {
-            if (simple_http_regex::regex_match(p, pattern)) {
+        for (const auto& [route, handler] : m_ws_regex) {
+            if (!route.literal_prefix.empty() && !path.starts_with(route.literal_prefix)) continue;
+            const std::string p{path};  // regex_match needs std::string; built only when a prefix may match
+            if (simple_http_regex::regex_match(p, route.pattern)) {
                 return &handler;
             }
         }
         return nullptr;
     }
 
+    // Combined exact-then-regex lookup. The engine uses find_ws_exact and
+    // find_ws_regex separately (in nginx order a proxy route sits between
+    // them); this form is kept for callers that only ask "is there a local ws
+    // handler at all".
+    const WsHandler* find_ws(std::string_view path) const {
+        if (const WsHandler* h = find_ws_exact(path)) return h;
+        return find_ws_regex(path);
+    }
+
     // Looks up a WebSocket proxy backend for a path (exact then regex). Returns
-    // std::nullopt if the path is not a proxy route. Used by the engine before
-    // the local ws handler lookup, so proxy routes take precedence.
+    // std::nullopt if the path is not a proxy route. Consulted by the engine
+    // between the local exact and the local regex ws handler.
     //
     // For a regex route whose rewrite_path is a substitution template, capture
     // groups from the match are expanded here, so the returned target's
@@ -183,10 +199,11 @@ class Router {
         if (m_ws_proxy_regex.empty()) {
             return std::nullopt;
         }
-        std::string p{path};
-        for (const auto& [pattern, target] : m_ws_proxy_regex) {
+        for (const auto& [route, target] : m_ws_proxy_regex) {
+            if (!route.literal_prefix.empty() && !path.starts_with(route.literal_prefix)) continue;
+            const std::string p{path};  // regex_match needs std::string; built only when a prefix may match
             simple_http_regex::smatch m;
-            if (simple_http_regex::regex_match(p, m, pattern)) {
+            if (simple_http_regex::regex_match(p, m, route.pattern)) {
                 WsProxyTarget out = target;
                 if (!out.rewrite_path.empty()) {
                     out.rewrite_path = expand_rewrite(target.rewrite_path, m);
@@ -208,10 +225,11 @@ class Router {
         if (m_http_proxy_regex.empty()) {
             return std::nullopt;
         }
-        std::string p{path};
-        for (const auto& [pattern, target] : m_http_proxy_regex) {
+        for (const auto& [route, target] : m_http_proxy_regex) {
+            if (!route.literal_prefix.empty() && !path.starts_with(route.literal_prefix)) continue;
+            const std::string p{path};  // regex_match needs std::string; built only when a prefix may match
             simple_http_regex::smatch m;
-            if (simple_http_regex::regex_match(p, m, pattern)) {
+            if (simple_http_regex::regex_match(p, m, route.pattern)) {
                 HttpProxyTarget out = target;
                 if (!out.rewrite_path.empty()) {
                     out.rewrite_path = expand_rewrite(target.rewrite_path, m);
@@ -245,7 +263,17 @@ class Router {
         // touched after that.
         const std::string_view path = req->path();
 
-        // HTTP reverse-proxy routes take precedence over local handlers.
+        // Local exact routes win outright — nginx's `location = /path` beats
+        // everything, a proxy registered for the same path included. An exact
+        // endpoint therefore never pays the reverse-proxy lookup at all.
+        if (auto it = m_exact.find(path); it != m_exact.end()) {
+            co_await invoke_handler(it->second, std::move(req), std::move(res), ssl);
+            co_return;
+        }
+
+        // HTTP reverse-proxy routes: consulted after the exact local match but
+        // before local regex/static handlers (exact before regex in both
+        // tables). A dead backend still surfaces as a 502 for proxy-only paths.
         if (auto target = find_http_proxy(path)) {
             bool client_is_tls = ssl.has_value() && *ssl != nullptr;
             co_await run_http_proxy(std::move(req), std::move(res), client_is_tls, std::move(*target),
@@ -253,14 +281,11 @@ class Router {
             co_return;
         }
 
-        if (auto it = m_exact.find(path); it != m_exact.end()) {
-            co_await invoke_handler(it->second, std::move(req), std::move(res), ssl);
-            co_return;
-        }
         if (!m_regex.empty()) {
             const std::string owned_path{path};  // regex_match needs a string
-            for (const auto& [pattern, handler] : m_regex) {
-                if (simple_http_regex::regex_match(owned_path, pattern)) {
+            for (const auto& [route, handler] : m_regex) {
+                if (!route.literal_prefix.empty() && !path.starts_with(route.literal_prefix)) continue;
+                if (simple_http_regex::regex_match(owned_path, route.pattern)) {
                     co_await invoke_handler(handler, std::move(req), std::move(res), ssl);
                     co_return;
                 }
@@ -317,13 +342,52 @@ class Router {
         return out;
     }
 
+    struct RegexRoute {
+        simple_http_regex::regex pattern;
+        std::string literal_prefix;  // leading literal bytes; empty = pattern starts with a metachar
+    };
+
+    // Leading literal characters of a regex source — everything before the first
+    // metacharacter ('\ ^ $ . [ ] * + ? ( ) { } |'). Both regex engines are
+    // configured case-sensitive and regex_match spans the whole input, so any
+    // path that could match MUST begin with these exact bytes. Checking the
+    // prefix first spares every non-matching request a full backtracking match
+    // (Boost.Regex especially); when the prefix is empty nothing is skipped and
+    // semantics are byte-for-byte unchanged.
+    static std::string literal_prefix(std::string_view pattern) {
+        std::string out;
+        out.reserve(pattern.size());
+        for (char c : pattern) {
+            switch (c) {
+                case '\\':
+                case '^':
+                case '$':
+                case '.':
+                case '[':
+                case ']':
+                case '*':
+                case '+':
+                case '?':
+                case '(':
+                case ')':
+                case '{':
+                case '}':
+                case '|':
+                    return out;  // metacharacter ends the literal run
+                default:
+                    out.push_back(c);
+            }
+        }
+        return out;
+    }
+
     struct string_hash {
         using is_transparent = void;
         std::size_t operator()(std::string_view s) const { return std::hash<std::string_view>{}(s); }
     };
 
     std::unordered_map<std::string, Handler, string_hash, std::equal_to<>> m_exact;
-    std::vector<std::pair<simple_http_regex::regex, Handler>> m_regex;
+    std::vector<std::pair<RegexRoute, Handler>> m_regex;
     // Static file sites, consulted in registration order after the regex routes
     // and before the fallback. A vector rather than one slot so mounting several
     // roots is a later addition rather than a change of shape.
@@ -333,17 +397,17 @@ class Router {
     Filter m_cors;
 
     std::unordered_map<std::string, WsHandler, string_hash, std::equal_to<>> m_ws_exact;
-    std::vector<std::pair<simple_http_regex::regex, WsHandler>> m_ws_regex;
+    std::vector<std::pair<RegexRoute, WsHandler>> m_ws_regex;
 
     std::unordered_map<std::string, WsProxyTarget, string_hash, std::equal_to<>> m_ws_proxy_exact;
-    std::vector<std::pair<simple_http_regex::regex, WsProxyTarget>> m_ws_proxy_regex;
+    std::vector<std::pair<RegexRoute, WsProxyTarget>> m_ws_proxy_regex;
 
     std::unordered_map<std::string, HttpProxyTarget, string_hash, std::equal_to<>> m_http_proxy_exact;
     // One client for every proxy route: it owns the upstream connection pool and
     // the TLS context, and serves any number of origins (the target carries the
     // origin per request).
     std::shared_ptr<HttpClient> m_http_client;
-    std::vector<std::pair<simple_http_regex::regex, HttpProxyTarget>> m_http_proxy_regex;
+    std::vector<std::pair<RegexRoute, HttpProxyTarget>> m_http_proxy_regex;
 };
 
 }  // namespace simple_http

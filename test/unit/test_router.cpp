@@ -134,24 +134,44 @@ TEST_CASE("router: reverse-proxy routes are found and rewritten", "[router]") {
     CHECK_FALSE(router.find_http_proxy("/api/users").has_value());  // the regex needs both groups
     CHECK_FALSE(router.find_http_proxy("/other").has_value());
 
-    // A local route with the same path loses: proxy routes are consulted first,
-    // and a backend that cannot be reached turns into a 502. A closed port is not
-    // portable for this (some environments drop rather than reject), so the
-    // failure is pinned to a short connect timeout instead.
+    // Nginx-style precedence: a local exact route wins over a proxy route for
+    // the same path (nginx's `location = /path` beats everything), so the
+    // unreachable backend is never contacted for it. A path that only the
+    // proxy knows still proxies, and a dead backend fails into a 502. A closed
+    // port is not portable for that (some environments drop rather than
+    // reject), so the failure is pinned to a short connect timeout instead.
     ClientConfig proxy_cfg;
     proxy_cfg.connect_timeout = std::chrono::milliseconds(100);
-    Router dead_backend{proxy_cfg};
-    dead_backend.http_proxy("/p", HttpProxyTarget{"127.0.0.1", 1, {}});
-    dead_backend.route("/p", body_handler("local"));
     asio::io_context ctx;
-    auto writer = std::make_shared<FakeResponseWriter>();
-    auto req = make_request(ctx, "/p");
-    auto res = std::make_shared<Response>(writer);
-    ScopedLog capture;
-    REQUIRE(run_on(ctx, dead_backend.dispatch(req, res, std::nullopt), std::chrono::seconds(2)));
-    CHECK(writer->last_status == 502);
-    CHECK(writer->last_body == "Bad Gateway");
-    CHECK_FALSE(capture.records.empty());  // the failed upstream is logged, not swallowed
+    {
+        // Proxy-only path: find_http_proxy is consulted after the exact local
+        // miss, the dead backend fails, and the 502 is logged, not swallowed.
+        Router dead_backend{proxy_cfg};
+        dead_backend.http_proxy("/p", HttpProxyTarget{"127.0.0.1", 1, {}});
+        auto writer = std::make_shared<FakeResponseWriter>();
+        auto req = make_request(ctx, "/p");
+        auto res = std::make_shared<Response>(writer);
+        ScopedLog capture;
+        REQUIRE(run_on(ctx, dead_backend.dispatch(req, res, std::nullopt), std::chrono::seconds(2)));
+        CHECK(writer->last_status == 502);
+        CHECK(writer->last_body == "Bad Gateway");
+        CHECK_FALSE(capture.records.empty());  // the failed upstream is logged
+    }
+    {
+        // Local exact route registered alongside the same-path proxy: the local
+        // route wins and the dead backend is never contacted.
+        Router both{proxy_cfg};
+        both.http_proxy("/p", HttpProxyTarget{"127.0.0.1", 1, {}});
+        both.route("/p", body_handler("local"));
+        auto writer = std::make_shared<FakeResponseWriter>();
+        auto req = make_request(ctx, "/p");
+        auto res = std::make_shared<Response>(writer);
+        ScopedLog capture;
+        REQUIRE(run_on(ctx, both.dispatch(req, res, std::nullopt), std::chrono::seconds(2)));
+        CHECK(writer->last_status == 200);
+        CHECK(writer->last_body == "local");
+        CHECK(capture.records.empty());  // the proxy was never consulted
+    }
 }
 
 TEST_CASE("router: websocket proxy routes and their rewrite", "[router]") {

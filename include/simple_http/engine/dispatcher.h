@@ -52,8 +52,9 @@ struct WsProxyTarget {
 };
 
 // Looks up a proxy backend for a request path; empty if the path is not a proxy
-// route. The engine consults this before the in-process ws handler lookup, so a
-// path registered for proxying takes precedence over a local ws handler.
+// route. The h1 engine consults this between the local exact and the local
+// regex ws handler (nginx order): a proxied path beats a local regex ws
+// handler, but loses to a local exact one.
 using WsProxyLookup = std::function<std::optional<WsProxyTarget>(std::string_view path)>;
 
 // A backend a plain HTTP request should be reverse-proxied to (request-level
@@ -78,8 +79,9 @@ struct HttpProxyTarget {
 };
 
 // Looks up an HTTP proxy backend for a request path; empty if the path is not a
-// proxy route. The Router consults this in dispatch before matching a local
-// handler, so a proxied path takes precedence.
+// proxy route. The Router consults this in dispatch after the exact local match
+// misses, so a proxied path beats a local regex handler but loses to an exact
+// one (nginx order).
 using HttpProxyLookup = std::function<std::optional<HttpProxyTarget>(std::string_view path)>;
 
 }  // namespace simple_http

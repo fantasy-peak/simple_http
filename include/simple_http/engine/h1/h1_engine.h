@@ -347,10 +347,11 @@ class Http1Engine {
     // contain bytes already read from the transport during protocol detection
     // (e.g. by a preceding peek); they are consumed before reading more.
     asio::awaitable<void> run(const Dispatcher& dispatch, std::string initial = {}, WsLookup ws_lookup = {},
-                              WsProxyLookup ws_proxy_lookup = {}) {
+                              WsProxyLookup ws_proxy_lookup = {}, WsLookup ws_regex_lookup = {}) {
         using namespace asio::experimental::awaitable_operators;
         m_ws_lookup = std::move(ws_lookup);
         m_ws_proxy_lookup = std::move(ws_proxy_lookup);
+        m_ws_regex_lookup = std::move(ws_regex_lookup);
         *m_deadline = std::chrono::steady_clock::now() + m_limits.idle_timeout;
         co_await (serve_loop(dispatch, std::move(initial)) || watchdog());
         if (!m_upgraded) {
@@ -445,7 +446,24 @@ class Http1Engine {
             if (is_websocket_upgrade(head)) {
                 std::string_view ws_path = request_path(head.target);
 
-                // 1) Byte-level proxy pass-through takes precedence.
+                // Nginx-style precedence: a local exact ws route wins over a
+                // byte-level proxy route for the same path; the proxy still
+                // beats a local regex ws route. If an exact handler is
+                // registered but its upgrade fails, close rather than fall
+                // through — a failed handshake leaves the connection unusable.
+                if (m_ws_lookup) {
+                    if (auto handler = m_ws_lookup(ws_path)) {
+                        m_buf.assign(parser.remainder());
+                        if (co_await try_websocket_upgrade(head, *handler)) {
+                            co_return;  // connection upgraded; run() must not close it
+                        }
+                        co_await send_error_response(404);
+                        co_return;
+                    }
+                }
+
+                // Byte-level proxy pass-through, between the exact and the regex
+                // local ws routes.
                 if (m_ws_proxy_lookup) {
                     if (auto target = m_ws_proxy_lookup(ws_path)) {
                         m_upgraded = true;  // stop the watchdog from closing the transport
@@ -455,16 +473,20 @@ class Http1Engine {
                     }
                 }
 
-                // 2) Local WebSocket handler.
-                if (m_ws_lookup) {
-                    m_buf.assign(parser.remainder());
-                    if (co_await try_websocket_upgrade(head)) {
-                        co_return;  // connection upgraded; run() must not close it
+                // Local regex WebSocket handlers, consulted last.
+                if (m_ws_regex_lookup) {
+                    if (auto handler = m_ws_regex_lookup(ws_path)) {
+                        m_buf.assign(parser.remainder());
+                        if (co_await try_websocket_upgrade(head, *handler)) {
+                            co_return;  // connection upgraded; run() must not close it
+                        }
+                        co_await send_error_response(404);
+                        co_return;
                     }
                 }
 
-                // Upgrade requested but no proxy/route matched (or handshake
-                // failed): reply 404 and close.
+                // Upgrade requested but no proxy/route matched: reply 404 and
+                // close.
                 co_await send_error_response(404);
                 co_return;
             }
@@ -830,13 +852,7 @@ class Http1Engine {
         return target;
     }
 
-    asio::awaitable<bool> try_websocket_upgrade(const ParsedHead& head) {
-        std::string_view path = request_path(head.target);
-        auto handler = m_ws_lookup(path);
-        if (!handler) {
-            co_return false;
-        }
-
+    asio::awaitable<bool> try_websocket_upgrade(const ParsedHead& head, const WsHandlerFn& handler) {
         // Build and send the 101 Switching Protocols handshake response.
         auto key = head.headers.get("sec-websocket-key");
         std::string accept = ws_accept_key(*key);
@@ -879,7 +895,7 @@ class Http1Engine {
 
         // Run the handler to completion.
         try {
-            co_await run_ws_handler(*handler, request, ws);
+            co_await run_ws_handler(handler, request, ws);
         } catch (const std::exception& e) {
             SIMPLE_HTTP_ERROR_LOG("ws handler threw: {}", e.what());
         } catch (...) {
@@ -973,8 +989,9 @@ class Http1Engine {
     // Shared so response writers can refresh it on writes too (see SharedDeadline).
     SharedDeadline m_deadline{std::make_shared<std::chrono::steady_clock::time_point>()};
     std::string m_buf;  // bytes read past the most recently parsed head
-    WsLookup m_ws_lookup;  // WebSocket route lookup (empty if ws disabled)
+    WsLookup m_ws_lookup;  // local WebSocket route lookup, exact only (empty if ws disabled)
     WsProxyLookup m_ws_proxy_lookup;  // WebSocket proxy-route lookup (empty if none)
+    WsLookup m_ws_regex_lookup;  // local WebSocket route lookup, regex only (empty if none)
     bool m_upgraded{false};  // connection handed off to the WebSocket / proxy layer
 };
 

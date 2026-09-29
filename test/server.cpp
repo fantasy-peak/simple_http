@@ -52,9 +52,11 @@ static std::size_t query_uint(std::string_view query, std::string_view key, std:
 // Registers the shared route table on a server.
 template <typename ServerT>
 void register_routes(ServerT& server) {
-    // One-shot response.
+    // One-shot response. Body size configurable via ?n= (default 1 KiB) so the
+    // stress suite can compare 1k / 10k / 50k response packages.
     server.route("/world", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
-        co_await res->status(200).send(std::string(1*1024, 'a'));
+        std::size_t n = query_uint(req->query(), "n", 1024);
+        co_await res->status(200).send(std::string(n, 'a'));
     });
 
     // Bidirectional streaming: read each request-body frame, log it, and echo a
