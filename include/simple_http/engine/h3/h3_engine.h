@@ -296,6 +296,16 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
             if (contains_ctl(name) || contains_ctl(value)) continue;
             m_nva.push_back(make_nv(name, value));
         }
+        // Alt-Svc (RFC 7838): how a browser learns this origin also speaks
+        // HTTP/3, and on an h3 response it is what renews the cache entry's
+        // expiry. The value is the one the Server rendered from the QUIC
+        // listener's own port, shared with the h1/h2 engines; it is empty when
+        // there is nothing to advertise (h3_alt_svc off, or no QUIC listener).
+        // The nv pointers must stay valid until submit_response, which the
+        // member m_limits outlives.
+        if (const std::string& alt_svc = m_limits.alt_svc_value(); !alt_svc.empty()) {
+            m_nva.push_back(make_nv("alt-svc", alt_svc));
+        }
 
         nghttp3_data_reader reader{};
         const nghttp3_data_reader* reader_ptr = nullptr;

@@ -42,12 +42,12 @@ struct EngineLimits {
     std::int32_t h2_initial_window{65535};
 
     // --- HTTP/3 advertisement ---
-    // Whether to advertise this origin's HTTP/3 endpoint in its HTTP/1.x and
-    // HTTP/2 responses (RFC 7838). Alt-Svc is the only way a browser learns the
-    // QUIC endpoint exists — it never guesses, so the first visit to an origin
-    // always arrives over TCP — and leaving this off keeps browsers on TCP while
-    // clients that ask for HTTP/3 explicitly (curl, a conformance suite) still
-    // reach it.
+    // Whether to advertise this origin's HTTP/3 endpoint in its HTTP/1.x,
+    // HTTP/2 and HTTP/3 responses (RFC 7838). Alt-Svc is the only way a
+    // browser learns the QUIC endpoint exists — it never guesses, so the first
+    // visit to an origin always arrives over TCP — and leaving this off keeps
+    // browsers on TCP while clients that ask for HTTP/3 explicitly (curl, a
+    // conformance suite) still reach it.
     //
     // The port is deliberately not a setting: it is always the QUIC listener's
     // own (ServerConfig::quic), which is what the Server renders below.
@@ -77,9 +77,10 @@ struct EngineLimits {
     // The Alt-Svc field value, or empty when there is nothing to advertise.
     //
     // The engines that send the header call this unconditionally and never
-    // branch on how the value was produced, and the one engine that must *not*
-    // send it — HTTP/3 itself, where advertising an alternative to the
-    // connection the response arrived on would be nonsense — simply never asks.
+    // branch on how the value was produced. HTTP/3 sends it too — on a port
+    // that differs from the one the connection arrived on it is real
+    // information, and on the listener's own port it is harmless — so all three
+    // engines ask.
     [[nodiscard]] const std::string& alt_svc_value() const {
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
         return alt_svc;
