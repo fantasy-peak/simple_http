@@ -180,6 +180,14 @@ def run_checks():
     check("axum example: /orders/{order_id}/items/{item_id}",
           r.status_code == 200 and o.get("id") == 3 and o.get("pet_id") == 10)
 
+    # A plain route (no typed Params, no doc entry) still routes templates and
+    # exposes the captures via req->param(name).
+    r = client.get("/echo/hi/times/3")
+    check("plain route /echo/{what}/times/{n} captures via req->param",
+          r.status_code == 200 and r.text == "what=hi n=3")
+    r = client.get("/echo/hi/times")
+    check("plain template: segment-count mismatch is a 404", r.status_code == 404)
+
     # --- 3. methods, security, keep-alive ---------------------------------------
     r = client.post("/pets", json={"name": "x"})
     check("POST /pets without token is 401",

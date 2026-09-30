@@ -31,7 +31,7 @@ add_requires("glaze")  -- OpenAPI typed-route schemas (opt-in: SIMPLE_HTTP_ENABL
 add_requires("zlib", "brotli")
 
 add_cxflags("-O2 -Wextra -Wno-missing-field-initializers -Wno-ignored-qualifiers")
-add_defines("SIMPLE_HTTP_EXPERIMENT_WEBSOCKET", "SIMPLE_HTTP_USE_BOOST_REGEX")
+add_defines("SIMPLE_HTTP_USE_BOOST_REGEX")
 
 target("simple_http")
     set_kind("static")
@@ -183,6 +183,8 @@ target("readme_examples")
     end)
     add_deps("simple_http")
     add_files("test/readme_examples.cpp")
+    add_packages("glaze")
+    add_defines("SIMPLE_HTTP_ENABLE_OPENAPI")  -- the README OpenAPI sample is compiled here
     set_rundir(".")
 target_end()
 

@@ -805,10 +805,24 @@ class Router {
             }
             pos = end + 1;
         }
-        // The terminal the template ended at always carries at least one
-        // handler (insert_template / insert_entry guarantee it); the walk
-        // above proved the whole path shape, so this is it.
+        // Only a *terminal* node (the walk's last segment lands where a route
+        // actually ends) is a hit; an empty table means the path is a strict
+        // prefix of a longer template and must fall through to 404. The table
+        // of a true terminal is never empty (insert_template fills it).
         term = &trie[node].terminal;
+        if (!term->tbl.any) {
+            bool has_handler = false;
+            for (const auto& slot : term->tbl.by_method) {
+                if (slot) {
+                    has_handler = true;
+                    break;
+                }
+            }
+            if (!has_handler) {
+                term = nullptr;
+                return false;
+            }
+        }
         values = std::move(found);
         return true;
     }

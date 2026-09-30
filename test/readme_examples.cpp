@@ -131,7 +131,51 @@ void readme_ssl_handle_route(simple_http::Server &server) {
                  });
 }
 
-// --- Routing, middleware & proxy (README → Routing, Middleware & Proxy) ------
+// --- OpenAPI & Swagger UI (README → OpenAPI & Swagger UI) -----------------------
+#if defined(SIMPLE_HTTP_ENABLE_OPENAPI)
+namespace openapi_readme {
+
+struct Pet {
+    std::int64_t id{};
+    std::string name;
+    std::string status{"available"};
+    struct glaze_json_schema {
+        glz::schema status{.description = "lifecycle state",
+                           .enumeration = std::vector<std::string_view>{"available", "pending", "sold"}};
+    };
+};
+struct PetParams {
+    std::int64_t id{};
+};
+struct ErrorBody {
+    std::string error;
+};
+
+}  // namespace openapi_readme
+
+void readme_openapi() {
+    simple_http::ServerConfig cfg = {.listen = simple_http::InetAddress{"127.0.0.1", 7795, false},
+                                     .worker_threads = 4};
+    simple_http::Server server{cfg};
+    using namespace openapi_readme;
+    namespace openapi = simple_http::openapi;
+
+    server.openapi().title("petshop").version("1.0.0").server("http://127.0.0.1:7795");
+    server.route<PetParams, openapi::NoBody, Pet>(
+        {simple_http::Method::Get}, "/pets/{id}",
+        [](simple_http::RequestPtr req, simple_http::ResponsePtr res) -> asio::awaitable<void> {
+            const auto p = openapi::path_params<PetParams>(*req);
+            const auto body = glz::write_json(Pet{.id = p->id, .name = "rex"});
+            co_await res->status(200).content_type(simple_http::mime::app_json)
+                .send(body ? *body : std::string{"{}"});
+        },
+        openapi::OperationInfo{.summary = "get a pet", .operation_id = "getPet"},
+        openapi::resp<ErrorBody>(404, "no such pet"));
+
+    server.serve_openapi("/openapi.json");
+    server.serve_swagger_ui("/swagger", "/openapi.json");
+}
+#endif  // SIMPLE_HTTP_ENABLE_OPENAPI
 
 using simple_http::HttpProxyTarget;
 

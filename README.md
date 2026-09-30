@@ -358,6 +358,55 @@ server.ws_route("/chat", [](simple_http::RequestPtr, std::shared_ptr<simple_http
 
 ---
 
+## 📜 OpenAPI & Swagger UI
+
+`route` is the registration point, so an OpenAPI 3.1 document can be *collected*
+from your routes and schemas instead of maintained by hand. Opt in with
+`SIMPLE_HTTP_ENABLE_OPENAPI` (needs the header-only **glaze** on your include
+path); serve it, and browse the API through a CDN-hosted Swagger UI:
+
+```cpp
+#define SIMPLE_HTTP_ENABLE_OPENAPI  // before including simple_http.h
+
+struct Pet {
+    std::int64_t id{};
+    std::string name;
+    std::string status{"available"};
+    struct glaze_json_schema {  // optional field-level metadata
+        glz::schema status{.description = "lifecycle state",
+                           .enumeration = std::vector<std::string_view>{"available", "pending", "sold"}};
+    };
+};
+
+server.openapi().title("petshop").version("1.0.0").server("http://127.0.0.1:7795");
+server.route<PetParams, simple_http::openapi::NoBody, Pet>({Method::Get}, "/pets/{id}",
+    [](simple_http::RequestPtr req, simple_http::ResponsePtr res) -> asio::awaitable<void> {
+        const auto p = simple_http::openapi::path_params<PetParams>(*req);  // typed captures
+        const auto body = glz::write_json(Pet{.id = p->id, .name = "rex"});
+        co_await res->status(200).content_type(simple_http::mime::app_json)
+            .send(body ? *body : std::string{"{}"});
+    },
+    simple_http::openapi::OperationInfo{.summary = "get a pet", .operation_id = "getPet"},
+    simple_http::openapi::resp<ErrorBody>(404, "no such pet"));
+```
+
+- The document's `(method, path)`, request/response **schemas**, **path/query/header
+  parameters**, **security schemes**, and **error responses** are derived from your
+  types — `{name}` segments must match a path-parameter struct's field names, checked
+  at registration.
+- Bodies are **validated**: `openapi::read_body<T>(req, err)` rejects unreadable or
+  malformed bodies with 400 and JSON that misses a required field with 422.
+- Serve it all:
+  ```cpp
+  server.serve_openapi("/openapi.json");                 // the OAS 3.1 document
+  server.serve_swagger_ui("/swagger", "/openapi.json");  // Swagger UI (CDN assets)
+  ```
+  Object schemas are deduplicated into `components.schemas` and referenced by `$ref`.
+- See `test/openapi_demo.cpp` (a rite-of-passage petshop with template routes, headers,
+  security and tricky types) and `test/openapi_verify.py` (41 end-to-end checks).
+
+---
+
 ## 🌐 CORS
 
 `CorsConfig` is the built-in policy. An `OPTIONS` carrying `Origin` **and**

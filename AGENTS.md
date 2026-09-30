@@ -184,10 +184,10 @@ server.start();      // 同步：启动所有监听并阻塞至绑定完成，�
 server.stop();
 ```
 
-路由层是**方法感知**的（`router.h`）：`m_exact` 从 path→Handler 换成 path→`RouteEntry`（方法位图 + handler）。两条隐式规则跟着主流框架走（Flask / axum / Go 1.22 / Spring）：
+路由层是**方法感知**的（`router.h`）：精确路由按 `(method, path)` 存（每 path 一张按方法索引的表，`method_bits` 折叠）；**含 `{name}` 的路径是段 trie**——普通 `route({Method::Get}, "/a/{x}", h)` 不需要任何 OpenAPI 形态即可路由 `/a/5`，handler 用 `req->param("x")` 取捕获（OpenAPI 的 `path_params<T>()` 只是把捕获按类型解析进结构体，是上层增强）。两条隐式规则跟着主流框架走（Flask / axum / Go 1.22 / Spring）：
 
 - **GET 隐含 HEAD**：注册 `{Method::Get}` 自动允许 HEAD，走同一 handler，writer 抑制 body（write 层本就按 HEAD 行为抑制，有回归测试）。
-- **405 + Allow（及自动 OPTIONS）**：path 存在但方法不符 → 405，`Allow` 头列出该 path 全部方法（含自动应答的 OPTIONS）；OPTIONS 本身则自动回 204 + Allow。语义照抄 static 阶段的「resolved first, then rejected」——path 不存在仍是 404，不是 405。405/OPTIONS 应答都 `res->close()` 关闭连接（不值得为一个永远不会被读的请求体做 drain，与 `static_files.h` 的 405 一致）。`Method::Unknown`（扩展方法 token）不可注册，但 `any_methods` 路由会接住它。
+- **405 + Allow（及自动 OPTIONS）**：path 存在但方法不符 → 405，`Allow` 头列出该 path 全部方法（含自动应答的 OPTIONS）；OPTIONS 本身则自动回 204 + Allow。语义照抄 static 阶段的「resolved first, then rejected」——path 不存在仍是 404，不是 405。405/OPTIONS 是**普通 keep-alive 响应**（对齐 Go ServeMux / axum / Spring：返回后连接不断，引擎 drain 未读请求体后继续复用；曾有实现一度关闭连接，已改为主流行为）。`Method::Unknown`（扩展方法 token）不可注册，但 `any_methods` 路由会接住它。
 
 CORS 是策略入口（`handler/cors.h`）：`CorsConfig` 编译成 `Filter` 存进 `m_cors`。
 

@@ -432,6 +432,17 @@ int main() {
         openapi::resp<ErrorBody>(400, "invalid request body"), openapi::resp<ErrorBody>(404, "no such owner"),
         std::move(rate_limited));
 
+    // --- a *plain* route with template captures ---------------------------------
+    // No typed Params, no document entry: the base route() still treats a `{x}`
+    // path as a template and the handler reads the captures with req->param.
+    server.route({Method::Get}, "/echo/{what}/times/{n}",
+                  [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
+                      const auto what = req->param("what").value_or("");
+                      const auto n = req->param("n").value_or("");
+                      co_await res->status(200).content_type(mime::text_plain)
+                          .send(std::string{"what="} + std::string{what} + " n=" + std::string{n});
+                  });
+
     // Serve the collected document and a CDN-backed Swagger UI pointing at it.
     server.serve_openapi("/openapi.json");
     server.serve_swagger_ui("/swagger", "/openapi.json");
