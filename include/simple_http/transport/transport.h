@@ -11,14 +11,14 @@
 // The Transport concept documents the required surface. Concrete transports are
 // defined in tcp_transport.h / tls_transport.h.
 
+#include <openssl/ssl.h>
+
+#include <boost/asio.hpp>
 #include <concepts>
 #include <cstddef>
 #include <optional>
 #include <span>
 #include <utility>
-
-#include <boost/asio.hpp>
-#include <openssl/ssl.h>
 
 #include "../core/types.h"
 
@@ -28,7 +28,7 @@ namespace asio = boost::asio;
 
 // Native TLS handle exposed to TLS-aware handlers (client-cert inspection etc).
 // std::nullopt for plaintext transports.
-using SslHandle = std::optional<SSL*>;
+using SslHandle = std::optional<SSL *>;
 
 using ByteSpan = std::span<std::byte>;
 using ConstByteSpan = std::span<const std::byte>;
@@ -60,4 +60,4 @@ concept TransportLike = requires(T t, ByteSpan mut, ConstByteSpan buf, std::span
     { t.close() } -> std::same_as<void>;
 };
 
-}  // namespace simple_http
+} // namespace simple_http

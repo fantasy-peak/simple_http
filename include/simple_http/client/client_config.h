@@ -13,6 +13,9 @@
 // as the underlying asio error_code; failures the client itself decides on use
 // client_errc below.
 
+#include <boost/asio.hpp>
+#include <boost/asio/ssl.hpp>
+#include <boost/system/error_code.hpp>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -21,10 +24,6 @@
 #include <string_view>
 #include <utility>
 #include <vector>
-
-#include <boost/asio.hpp>
-#include <boost/asio/ssl.hpp>
-#include <boost/system/error_code.hpp>
 
 #include "../core/limits.h"
 #include "../core/types.h"
@@ -93,14 +92,14 @@ struct TlsClientConfig {
     // applies the settings above — so those fields win over anything the hook
     // sets for the same knob. (`verify_host` is ignored unless `verify_peer` is
     // set: without chain verification a name check proves nothing.)
-    std::function<void(asio::ssl::context&)> setup;
+    std::function<void(asio::ssl::context &)> setup;
 };
 
 // Where to connect and how to speak there. One HttpClient can serve many of
 // these; pooled connections are keyed by the whole target.
 struct ClientTarget {
     std::string host{"127.0.0.1"};
-    std::uint16_t port{0};  // 0 = the scheme default (80 for http, 443 for https)
+    std::uint16_t port{0}; // 0 = the scheme default (80 for http, 443 for https)
     bool use_tls{false};
     HttpVersionPolicy version{HttpVersionPolicy::Auto};
     H2cMode h2c{H2cMode::Upgrade};
@@ -119,9 +118,7 @@ struct ClientTarget {
     }
 
     // The name used for SNI and host-name verification.
-    std::string_view sni_host() const {
-        return sni.empty() ? std::string_view{host} : std::string_view{sni};
-    }
+    std::string_view sni_host() const { return sni.empty() ? std::string_view{host} : std::string_view{sni}; }
 
     // "host:port" as it appears in the Host header / :authority. IPv6 literals
     // are bracketed, as the authority grammar requires.
@@ -139,9 +136,7 @@ struct ClientTarget {
         return out;
     }
 
-    bool h2c_enabled() const {
-        return !use_tls && h2c != H2cMode::Off;
-    }
+    bool h2c_enabled() const { return !use_tls && h2c != H2cMode::Off; }
 };
 
 // Policy shared by every connection an HttpClient opens.
@@ -199,32 +194,34 @@ struct ClientConfig {
         resolve;
 
     // Applied to the freshly-connected socket, before TLS starts.
-    std::function<void(asio::ip::tcp::socket&)> socket_setup;
+    std::function<void(asio::ip::tcp::socket &)> socket_setup;
 };
 
 // Failures the client itself decides on. Everything the transport reports stays
 // an asio error_code.
 enum class client_errc : int {
-    bad_url = 1,             // malformed URL (parse_url)
-    unsupported_scheme,      // scheme is neither http nor https
-    protocol_error,          // peer violated the protocol (malformed head/frame)
-    version_not_negotiated,  // the required HTTP version was not available
-    header_too_large,        // head exceeded EngineLimits::max_header_bytes
-    body_too_large,          // body exceeded the caller's cap
-    body_decode_failed,      // the body was compressed but did not decode
-    session_busy,            // HTTP/1.1 session already has an exchange in flight
-    session_closed,          // the session/connection is gone
-    body_not_streaming,      // write() on a request whose body was sent up front
-    too_many_streams,        // the peer's MAX_CONCURRENT_STREAMS is exhausted
-    stream_reset,            // the peer reset the stream (RST_STREAM)
-    stream_refused,          // the peer did not process the request (REFUSED_STREAM, or a GOAWAY covering it)
-    goaway,                  // the peer is draining the connection (GOAWAY)
+    bad_url = 1,            // malformed URL (parse_url)
+    unsupported_scheme,     // scheme is neither http nor https
+    protocol_error,         // peer violated the protocol (malformed head/frame)
+    version_not_negotiated, // the required HTTP version was not available
+    header_too_large,       // head exceeded EngineLimits::max_header_bytes
+    body_too_large,         // body exceeded the caller's cap
+    body_decode_failed,     // the body was compressed but did not decode
+    session_busy,           // HTTP/1.1 session already has an exchange in flight
+    session_closed,         // the session/connection is gone
+    body_not_streaming,     // write() on a request whose body was sent up front
+    too_many_streams,       // the peer's MAX_CONCURRENT_STREAMS is exhausted
+    stream_reset,           // the peer reset the stream (RST_STREAM)
+    stream_refused,         // the peer did not process the request (REFUSED_STREAM, or a
+                            // GOAWAY covering it)
+    goaway,                 // the peer is draining the connection (GOAWAY)
     connect_timeout,
     request_timeout,
-    invalid_spec,  // the caller's RequestSpec contradicts itself (body + stream_body)
+    invalid_spec, // the caller's RequestSpec contradicts itself (body +
+                  // stream_body)
 };
 
-}  // namespace simple_http
+} // namespace simple_http
 
 // Lets `error_code ec = client_errc::bad_url;` work through the library's
 // boost::system::error_code. This must be visible before the first conversion —
@@ -233,79 +230,71 @@ enum class client_errc : int {
 // at the end of the header.
 namespace boost::system {
 
-template <>
-struct is_error_code_enum<simple_http::client_errc> {
+template <> struct is_error_code_enum<simple_http::client_errc> {
     static const bool value = true;
 };
 
-}  // namespace boost::system
+} // namespace boost::system
 
 namespace simple_http {
 
 class ClientErrorCategory : public boost::system::error_category {
   public:
-    const char* name() const noexcept override {
-        return "simple_http.client";
-    }
+    const char *name() const noexcept override { return "simple_http.client"; }
 
     std::string message(int ev) const override {
         switch (static_cast<client_errc>(ev)) {
-            case client_errc::bad_url:
-                return "malformed URL";
-            case client_errc::unsupported_scheme:
-                return "unsupported URL scheme (expected http or https)";
-            case client_errc::protocol_error:
-                return "peer violated the HTTP protocol";
-            case client_errc::version_not_negotiated:
-                return "the required HTTP version was not negotiated";
-            case client_errc::header_too_large:
-                return "response head exceeded the configured limit";
-            case client_errc::body_too_large:
-                return "response body exceeded the configured limit";
-            case client_errc::session_busy:
-                return "HTTP/1.1 session already has an exchange in flight";
-            case client_errc::session_closed:
-                return "the session is closed";
-            case client_errc::body_not_streaming:
-                return "the request body is not streamable here (already sent or sent up front)";
-            case client_errc::too_many_streams:
-                return "the peer's concurrent-stream limit is exhausted";
-            case client_errc::stream_reset:
-                return "the peer reset the stream";
-            case client_errc::stream_refused:
-                return "the peer did not process the request";
-            case client_errc::goaway:
-                return "the peer is draining the connection (GOAWAY)";
-            case client_errc::connect_timeout:
-                return "connection attempt timed out";
-            case client_errc::request_timeout:
-                return "request timed out";
-            case client_errc::invalid_spec:
-                return "the request spec sets both body and stream_body";
-            default:
-                return "unknown client error";
+        case client_errc::bad_url:
+            return "malformed URL";
+        case client_errc::unsupported_scheme:
+            return "unsupported URL scheme (expected http or https)";
+        case client_errc::protocol_error:
+            return "peer violated the HTTP protocol";
+        case client_errc::version_not_negotiated:
+            return "the required HTTP version was not negotiated";
+        case client_errc::header_too_large:
+            return "response head exceeded the configured limit";
+        case client_errc::body_too_large:
+            return "response body exceeded the configured limit";
+        case client_errc::session_busy:
+            return "HTTP/1.1 session already has an exchange in flight";
+        case client_errc::session_closed:
+            return "the session is closed";
+        case client_errc::body_not_streaming:
+            return "the request body is not streamable here (already sent or sent "
+                   "up front)";
+        case client_errc::too_many_streams:
+            return "the peer's concurrent-stream limit is exhausted";
+        case client_errc::stream_reset:
+            return "the peer reset the stream";
+        case client_errc::stream_refused:
+            return "the peer did not process the request";
+        case client_errc::goaway:
+            return "the peer is draining the connection (GOAWAY)";
+        case client_errc::connect_timeout:
+            return "connection attempt timed out";
+        case client_errc::request_timeout:
+            return "request timed out";
+        case client_errc::invalid_spec:
+            return "the request spec sets both body and stream_body";
+        default:
+            return "unknown client error";
         }
     }
 };
 
-inline const boost::system::error_category& client_category() {
+inline const boost::system::error_category &client_category() {
     static const ClientErrorCategory instance;
     return instance;
 }
 
-inline error_code make_error_code(client_errc e) noexcept {
-    return error_code{static_cast<int>(e), client_category()};
-}
+inline error_code make_error_code(client_errc e) noexcept { return error_code{static_cast<int>(e), client_category()}; }
 
 // Whether a failed request may be sent again on a fresh connection without
 // risking a second side effect. The peer provably did not process it: the
 // stream was refused before any response, or a GOAWAY covered it. Everything
 // else — a truncation, a reset after the response started, a timeout — might
 // have been acted on, so retrying is the caller's decision, not ours.
-inline bool is_retryable(const error_code& ec) noexcept {
-    return ec == make_error_code(client_errc::stream_refused);
-}
+inline bool is_retryable(const error_code &ec) noexcept { return ec == make_error_code(client_errc::stream_refused); }
 
-
-
-}  // namespace simple_http
+} // namespace simple_http

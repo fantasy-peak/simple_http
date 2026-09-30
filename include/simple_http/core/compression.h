@@ -23,8 +23,8 @@ struct CompressionConfig {
     // this: a streamed response's length is not known when it starts.
     std::uint64_t min_bytes{1024};
 
-    int gzip_level{6};      // zlib's Z_DEFAULT_COMPRESSION
-    int brotli_quality{5};  // 0..11; 5 is the usual speed/ratio knee
+    int gzip_level{6};     // zlib's Z_DEFAULT_COMPRESSION
+    int brotli_quality{5}; // 0..11; 5 is the usual speed/ratio knee
 
     // Content types to compress. Empty means "use the built-in rule" (see
     // is_compressible_type); non-empty *replaces* that rule, so an application
@@ -53,4 +53,4 @@ struct CompressionConfig {
     bool compress_streamed{true};
 };
 
-}  // namespace simple_http
+} // namespace simple_http

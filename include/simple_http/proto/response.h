@@ -12,12 +12,11 @@
 //   streaming: co_await res.status(200).begin();
 //              co_await res.write("chunk"); ...; co_await res.finish();
 
+#include <boost/asio/awaitable.hpp>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
-
-#include <boost/asio/awaitable.hpp>
 
 #include "../core/http_field.h"
 #include "../core/http_status.h"
@@ -36,11 +35,11 @@ class Response {
     explicit Response(std::shared_ptr<ResponseWriter> writer) : m_writer(std::move(writer)) {}
 
     // --- fluent setters (return *this for chaining) ---
-    Response& status(int code) {
+    Response &status(int code) {
         m_status = code;
         return *this;
     }
-    Response& header(std::string_view name, std::string value) {
+    Response &header(std::string_view name, std::string value) {
         // A field name or value carrying CR/LF/NUL would splice arbitrary bytes
         // into the head — response splitting, and this library's own reverse proxy
         // is exactly the kind of intermediary that turns it into a real attack.
@@ -55,7 +54,7 @@ class Response {
         m_headers.add(std::string{name}, std::move(value));
         return *this;
     }
-    Response& content_type(std::string_view ct) { return header("content-type", std::string{ct}); }
+    Response &content_type(std::string_view ct) { return header("content-type", std::string{ct}); }
 
     // --- one-shot ---
     [[nodiscard]] asio::awaitable<error_code> send(std::string body = {}) {
@@ -95,7 +94,7 @@ class Response {
     [[nodiscard]] asio::awaitable<void> close() { return m_writer->close(); }
     Version version() const { return m_writer->version(); }
 
-    ResponseWriter& writer() { return *m_writer; }
+    ResponseWriter &writer() { return *m_writer; }
 
   private:
     // Fill in Server and Content-Type headers if the handler did not set them.
@@ -117,4 +116,4 @@ class Response {
     bool m_field_rejected{false};
 };
 
-}  // namespace simple_http
+} // namespace simple_http

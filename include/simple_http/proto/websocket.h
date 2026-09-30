@@ -5,7 +5,8 @@
 //
 // Usage (handler receives a shared_ptr<WebSocket>):
 //   // read loop
-//   for (;;) { auto m = co_await ws->read(); if (!m) break; use(m->data, m->text); }
+//   for (;;) { auto m = co_await ws->read(); if (!m) break; use(m->data,
+//   m->text); }
 //   // and, concurrently, from any coroutine:
 //   co_await ws->write_text("hi");
 //   co_await ws->write_binary(bytes);
@@ -17,15 +18,15 @@
 //
 // Concurrency (model A): a connection is pinned to one single-threaded
 // io_context. Every public operation that touches connection state
-// (read/write/close) first hops onto that connection's executor before doing so,
-// which is what makes the handle safe to use from any coroutine or thread —
+// (read/write/close) first hops onto that connection's executor before doing
+// so, which is what makes the handle safe to use from any coroutine or thread —
 // matching the guarantee the HTTP/2 ResponseWriter gives. Two exceptions:
 // is_open() is a synchronous snapshot of a flag (atomic, so reading it from
 // anywhere is race-free, though it can be a moment stale), and the destructor,
 // which cannot hop but posts instead - so the handle may be destroyed from any
-// thread and the teardown simply lands on the executor a moment later. In addition,
-// all writes are serialized through an internal write pump: write_* enqueue a
-// frame and await their own completion while a single pump coroutine
+// thread and the teardown simply lands on the executor a moment later. In
+// addition, all writes are serialized through an internal write pump: write_*
+// enqueue a frame and await their own completion while a single pump coroutine
 // (run_writer, started by the engine) performs the async_writes one at a time.
 // The pump holds a reference to the backend for its entire run, so it may
 // outlive the handle: whenever a write is still in flight the transport (and
@@ -38,6 +39,8 @@
 
 #include <array>
 #include <atomic>
+#include <boost/asio.hpp>
+#include <boost/asio/experimental/channel.hpp>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -48,11 +51,8 @@
 #include <string>
 #include <utility>
 
-#include <boost/asio.hpp>
-#include <boost/asio/experimental/channel.hpp>
-
 #include "../core/types.h"
-#include "../transport/transport.h"  // ConstByteSpan / kMaxWriteSegments
+#include "../transport/transport.h" // ConstByteSpan / kMaxWriteSegments
 #include "ws_frame.h"
 
 namespace simple_http {
@@ -77,7 +77,7 @@ class WsBackend {
     virtual asio::awaitable<std::expected<WsMessage, error_code>> read() = 0;
     virtual asio::awaitable<error_code> write(std::string data, bool text) = 0;
     virtual asio::awaitable<error_code> close() = 0;
-    virtual asio::awaitable<void> run_writer() = 0;  // the serializing write pump
+    virtual asio::awaitable<void> run_writer() = 0; // the serializing write pump
     virtual bool is_open() const = 0;
     // Non-blocking teardown used by ~WebSocket: stops the write pump so that a
     // detached pump coroutine can finish and drop its self-reference. Safe to
@@ -93,7 +93,7 @@ class WsBackend {
 // messages via WsFrameParser and serializes all writes through a write pump.
 template <typename Transport>
 class WsBackendImpl final : public WsBackend, public std::enable_shared_from_this<WsBackendImpl<Transport>> {
-    using Executor = decltype(std::declval<Transport&>().get_executor());
+    using Executor = decltype(std::declval<Transport &>().get_executor());
 
     // One queued outbound frame + a channel to deliver its write result.
     //
@@ -107,11 +107,11 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
     // different executor without a hop, this becomes a data race.
     using ResultChannel = asio::experimental::channel<void(error_code)>;
     struct WriteReq {
-        std::string payload;                   // frame payload: the caller's buffer, moved in
-        char header[10]{};                     // serialized frame header (at most 10 bytes)
+        std::string payload; // frame payload: the caller's buffer, moved in
+        char header[10]{};   // serialized frame header (at most 10 bytes)
         std::size_t header_len{0};
-        std::shared_ptr<ResultChannel> done;   // null for fire-and-forget (auto Pong)
-        bool close_after = false;              // stop the pump once this frame is written
+        std::shared_ptr<ResultChannel> done; // null for fire-and-forget (auto Pong)
+        bool close_after = false;            // stop the pump once this frame is written
     };
     // Queued frames live in our own deque: it is destroyed by ~WsBackendImpl and
     // explicitly cleared on teardown. They are deliberately NOT handed to asio as
@@ -140,21 +140,18 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
   public:
     explicit WsBackendImpl(std::shared_ptr<Transport> transport, std::uint64_t max_payload = 16u * 1024 * 1024,
                            std::chrono::steady_clock::duration idle_timeout = std::chrono::seconds(120))
-        : m_transport(std::move(transport)),
-          m_executor(m_transport->get_executor()),
-          m_parser(max_payload),
-          m_max_payload(max_payload),
-          m_idle_timeout(idle_timeout),
-          m_watchdog_timer(std::make_shared<asio::steady_timer>(m_executor)),
-          m_notify(m_executor, 1) {
+        : m_transport(std::move(transport)), m_executor(m_transport->get_executor()), m_parser(max_payload),
+          m_max_payload(max_payload), m_idle_timeout(idle_timeout),
+          m_watchdog_timer(std::make_shared<asio::steady_timer>(m_executor)), m_notify(m_executor, 1) {
         m_deadline = std::chrono::steady_clock::now() + m_idle_timeout;
     }
 
     // Hands bytes already read past the upgrade request to the parser, so a
-    // client that pipelines its first frame behind the handshake does not lose it.
+    // client that pipelines its first frame behind the handshake does not lose
+    // it.
     void feed(std::string_view bytes) override {
         if (!bytes.empty()) {
-            m_parser.append(reinterpret_cast<const std::byte*>(bytes.data()), bytes.size());
+            m_parser.append(reinterpret_cast<const std::byte *>(bytes.data()), bytes.size());
         }
     }
 
@@ -162,7 +159,7 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
     // answering Ping with Pong / Close with Close. Returns std::unexpected(ec)
     // on close or transport error.
     asio::awaitable<std::expected<WsMessage, error_code>> read() override {
-        co_await hop();  // touch parser/transport only on the connection executor
+        co_await hop(); // touch parser/transport only on the connection executor
 
         std::string message;
         WsOpcode message_type = WsOpcode::Text;
@@ -189,13 +186,12 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
                 // up, and one frame can be split across TCP segments — which is
                 // exactly what Autobahn's 6.4.3/6.4.4 exercise.
                 if (auto in_flight = m_parser.pending_opcode()) {
-                    const bool is_text =
-                        *in_flight == WsOpcode::Text ||
-                        (*in_flight == WsOpcode::Continuation && assembling && message_type == WsOpcode::Text);
+                    const bool is_text = *in_flight == WsOpcode::Text || (*in_flight == WsOpcode::Continuation &&
+                                                                          assembling && message_type == WsOpcode::Text);
                     if (is_text) {
                         auto partial = m_parser.take_partial_payload();
                         if (*in_flight == WsOpcode::Text && partial.first) {
-                            utf8 = Utf8Validator{};  // a new message starts here
+                            utf8 = Utf8Validator{}; // a new message starts here
                         }
                         if (!partial.bytes.empty() && !utf8.feed(partial.bytes)) {
                             co_await close_with(1007);
@@ -203,118 +199,118 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
                         }
                     }
                 }
-                std::array<std::byte, 8192> tmp;  // no init: read_some fills [0,n)
+                std::array<std::byte, 8192> tmp; // no init: read_some fills [0,n)
                 auto [ec, n] = co_await m_transport->async_read_some(std::span<std::byte>{tmp});
                 if (ec) {
                     m_open = false;
                     co_return std::unexpected(ec);
                 }
-                touch_deadline();  // inbound bytes: connection is active
+                touch_deadline(); // inbound bytes: connection is active
                 m_parser.append(tmp.data(), n);
                 continue;
             }
 
             // A complete frame was decoded.
             switch (frame.opcode) {
-                case WsOpcode::Close: {
-                    // §7.4: a Close may carry a status code and a reason, and both
-                    // are checked before anything is echoed back. A 1-octet payload
-                    // cannot hold a code at all, a code outside §7.4.1 is a
-                    // protocol error, and the reason has to be valid UTF-8.
-                    const std::string& payload = frame.payload;
-                    if (payload.size() == 1) {
-                        co_await close_with(1002);
-                        co_return std::unexpected(make_error_code(asio::error::invalid_argument));
-                    }
-                    if (payload.size() >= 2) {
-                        const auto code = static_cast<std::uint16_t>(
-                            (static_cast<unsigned char>(payload[0]) << 8) | static_cast<unsigned char>(payload[1]));
-                        if (!ws_valid_close_code(code)) {
-                            co_await close_with(1002);
-                            co_return std::unexpected(make_error_code(asio::error::invalid_argument));
-                        }
-                        Utf8Validator reason;
-                        if (!reason.feed(std::string_view{payload}.substr(2)) || !reason.complete()) {
-                            co_await close_with(1007);
-                            co_return std::unexpected(make_error_code(asio::error::invalid_argument));
-                        }
-                    }
-                    // Answer with a Close and stop (RFC 6455 §5.5.1). close_with
-                    // puts the reply on the wire before tearing the transport down;
-                    // the engine's own close() is a no-op once m_open is false, so
-                    // this is where the wait has to happen.
-                    co_await close_with(1000);
-                    co_return std::unexpected(make_error_code(asio::error::eof));
+            case WsOpcode::Close: {
+                // §7.4: a Close may carry a status code and a reason, and both
+                // are checked before anything is echoed back. A 1-octet payload
+                // cannot hold a code at all, a code outside §7.4.1 is a
+                // protocol error, and the reason has to be valid UTF-8.
+                const std::string &payload = frame.payload;
+                if (payload.size() == 1) {
+                    co_await close_with(1002);
+                    co_return std::unexpected(make_error_code(asio::error::invalid_argument));
                 }
-
-                case WsOpcode::Ping:
-                    co_await enqueue_control(WsOpcode::Pong, std::move(frame.payload));
-                    continue;
-
-                case WsOpcode::Pong:
-                    continue;  // ignore, keep reading
-
-                case WsOpcode::Text:
-                case WsOpcode::Binary:
-                    if (assembling) {
-                        // A new data frame before the previous message's FIN.
+                if (payload.size() >= 2) {
+                    const auto code = static_cast<std::uint16_t>((static_cast<unsigned char>(payload[0]) << 8) |
+                                                                 static_cast<unsigned char>(payload[1]));
+                    if (!ws_valid_close_code(code)) {
                         co_await close_with(1002);
                         co_return std::unexpected(make_error_code(asio::error::invalid_argument));
                     }
-                    message_type = frame.opcode;
-                    message = std::move(frame.payload);
-                    assembling = true;
-                    if (message_type == WsOpcode::Text) {
-                        if (frame.already_delivered == 0) {
-                            // Nothing was inspected while the frame was arriving;
-                            // start this message from a clean slate.
-                            utf8 = Utf8Validator{};
-                        }
-                        // Whatever the incremental check already saw is skipped,
-                        // so no octet goes through the validator twice.
-                        if (!utf8.feed(std::string_view{message}.substr(frame.already_delivered))) {
-                            co_await close_with(1007);
-                            co_return std::unexpected(make_error_code(asio::error::invalid_argument));
-                        }
-                    }
-                    if (frame.fin) {
-                        if (message_type == WsOpcode::Text && !utf8.complete()) {
-                            // A sequence left half-read: the final codepoint was
-                            // truncated by the end of the message.
-                            co_await close_with(1007);
-                            co_return std::unexpected(make_error_code(asio::error::invalid_argument));
-                        }
-                        co_return WsMessage{std::move(message), message_type == WsOpcode::Text};
-                    }
-                    continue;  // more fragments follow
-
-                case WsOpcode::Continuation:
-                    if (!assembling) {
-                        co_await close_with(1002);
-                        co_return std::unexpected(make_error_code(asio::error::invalid_argument));
-                    }
-                    if (message.size() + frame.payload.size() > m_max_payload) {
-                        // Bound the reassembled message size (a flood of small
-                        // fragments must not exhaust memory). §7.4.1: 1009.
-                        co_await close_with(1009);
-                        co_return std::unexpected(make_error_code(asio::error::message_size));
-                    }
-                    if (message_type == WsOpcode::Text &&
-                        !utf8.feed(std::string_view{frame.payload}.substr(frame.already_delivered))) {
-                        // Fail fast across fragments too — that is the whole point
-                        // of carrying the validator between frames.
+                    Utf8Validator reason;
+                    if (!reason.feed(std::string_view{payload}.substr(2)) || !reason.complete()) {
                         co_await close_with(1007);
                         co_return std::unexpected(make_error_code(asio::error::invalid_argument));
                     }
-                    message.append(frame.payload);
-                    if (frame.fin) {
-                        if (message_type == WsOpcode::Text && !utf8.complete()) {
-                            co_await close_with(1007);
-                            co_return std::unexpected(make_error_code(asio::error::invalid_argument));
-                        }
-                        co_return WsMessage{std::move(message), message_type == WsOpcode::Text};
+                }
+                // Answer with a Close and stop (RFC 6455 §5.5.1). close_with
+                // puts the reply on the wire before tearing the transport down;
+                // the engine's own close() is a no-op once m_open is false, so
+                // this is where the wait has to happen.
+                co_await close_with(1000);
+                co_return std::unexpected(make_error_code(asio::error::eof));
+            }
+
+            case WsOpcode::Ping:
+                co_await enqueue_control(WsOpcode::Pong, std::move(frame.payload));
+                continue;
+
+            case WsOpcode::Pong:
+                continue; // ignore, keep reading
+
+            case WsOpcode::Text:
+            case WsOpcode::Binary:
+                if (assembling) {
+                    // A new data frame before the previous message's FIN.
+                    co_await close_with(1002);
+                    co_return std::unexpected(make_error_code(asio::error::invalid_argument));
+                }
+                message_type = frame.opcode;
+                message = std::move(frame.payload);
+                assembling = true;
+                if (message_type == WsOpcode::Text) {
+                    if (frame.already_delivered == 0) {
+                        // Nothing was inspected while the frame was arriving;
+                        // start this message from a clean slate.
+                        utf8 = Utf8Validator{};
                     }
-                    continue;
+                    // Whatever the incremental check already saw is skipped,
+                    // so no octet goes through the validator twice.
+                    if (!utf8.feed(std::string_view{message}.substr(frame.already_delivered))) {
+                        co_await close_with(1007);
+                        co_return std::unexpected(make_error_code(asio::error::invalid_argument));
+                    }
+                }
+                if (frame.fin) {
+                    if (message_type == WsOpcode::Text && !utf8.complete()) {
+                        // A sequence left half-read: the final codepoint was
+                        // truncated by the end of the message.
+                        co_await close_with(1007);
+                        co_return std::unexpected(make_error_code(asio::error::invalid_argument));
+                    }
+                    co_return WsMessage{std::move(message), message_type == WsOpcode::Text};
+                }
+                continue; // more fragments follow
+
+            case WsOpcode::Continuation:
+                if (!assembling) {
+                    co_await close_with(1002);
+                    co_return std::unexpected(make_error_code(asio::error::invalid_argument));
+                }
+                if (message.size() + frame.payload.size() > m_max_payload) {
+                    // Bound the reassembled message size (a flood of small
+                    // fragments must not exhaust memory). §7.4.1: 1009.
+                    co_await close_with(1009);
+                    co_return std::unexpected(make_error_code(asio::error::message_size));
+                }
+                if (message_type == WsOpcode::Text &&
+                    !utf8.feed(std::string_view{frame.payload}.substr(frame.already_delivered))) {
+                    // Fail fast across fragments too — that is the whole point
+                    // of carrying the validator between frames.
+                    co_await close_with(1007);
+                    co_return std::unexpected(make_error_code(asio::error::invalid_argument));
+                }
+                message.append(frame.payload);
+                if (frame.fin) {
+                    if (message_type == WsOpcode::Text && !utf8.complete()) {
+                        co_await close_with(1007);
+                        co_return std::unexpected(make_error_code(asio::error::invalid_argument));
+                    }
+                    co_return WsMessage{std::move(message), message_type == WsOpcode::Text};
+                }
+                continue;
             }
         }
     }
@@ -328,7 +324,7 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
         }
         auto done = std::make_shared<ResultChannel>(m_executor, 1);
         m_pending.push_back(make_req(text ? WsOpcode::Text : WsOpcode::Binary, std::move(data), done, false));
-        (void)m_notify.try_send(error_code{});  // wake the pump; coalescing is fine
+        (void)m_notify.try_send(error_code{}); // wake the pump; coalescing is fine
         auto [ec] = co_await done->async_receive(asio::as_tuple(asio::use_awaitable));
         co_return ec;
     }
@@ -356,9 +352,10 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
             // Wait for the pump to actually write the Close frame.
             co_await done->async_receive(asio::as_tuple(asio::use_awaitable));
         }
-        m_notify.close();  // stop the write pump if it is still running
+        m_notify.close(); // stop the write pump if it is still running
         fail_pending_writes();
-        if (m_watchdog_timer) m_watchdog_timer->cancel();  // stop the idle watchdog
+        if (m_watchdog_timer)
+            m_watchdog_timer->cancel(); // stop the idle watchdog
         m_transport->close();
         co_return;
     }
@@ -382,15 +379,14 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
 
     // Non-blocking teardown for ~WebSocket: mark the connection closed and close
     // the queue. The pump then leaves the loop (its receive fails) and, as the
-    // last real owner, releases the backend once any in-flight write has finished.
-    // Cancelling the watchdog timer wakes its coroutine immediately; it then sees
-    // the closed state (or a failed weak_ptr lock) and exits without waiting out
-    // the idle timeout.
-    // Callable from any thread. dispatch() gets both cases right: on the
-    // connection's executor the teardown runs inline, so destroying a handle
-    // there behaves exactly as it always did; from anywhere else it is queued
-    // onto that executor - and crucially never run in place, since everything it
-    // touches is state the executor also owns.
+    // last real owner, releases the backend once any in-flight write has
+    // finished. Cancelling the watchdog timer wakes its coroutine immediately; it
+    // then sees the closed state (or a failed weak_ptr lock) and exits without
+    // waiting out the idle timeout. Callable from any thread. dispatch() gets
+    // both cases right: on the connection's executor the teardown runs inline, so
+    // destroying a handle there behaves exactly as it always did; from anywhere
+    // else it is queued onto that executor - and crucially never run in place,
+    // since everything it touches is state the executor also owns.
     //
     // Holding `self` across the dispatch is deliberate: it keeps the backend (and
     // the transport under it) alive until the teardown runs, which is what lets a
@@ -431,9 +427,9 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
             if (self->m_pending.empty()) {
                 auto [qec] = co_await self->m_notify.async_receive(asio::as_tuple(asio::use_awaitable));
                 if (qec) {
-                    break;  // closed -> connection is going away
+                    break; // closed -> connection is going away
                 }
-                continue;  // drain whatever got queued
+                continue; // drain whatever got queued
             }
             WriteReq req = std::move(self->m_pending.front());
             self->m_pending.pop_front();
@@ -442,10 +438,10 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
                 self->m_open = false;
             }
             if (req.done) {
-                (void)req.done->try_send(wec);  // deliver result to the waiter
+                (void)req.done->try_send(wec); // deliver result to the waiter
             }
             if (wec || req.close_after) {
-                break;  // transport error, or a Close frame just went out
+                break; // transport error, or a Close frame just went out
             }
         }
         // Terminal by construction: once this loop is left, no pump will ever run
@@ -462,9 +458,7 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
 
     // Re-enter the connection's executor regardless of the caller's context, so
     // touching m_open / m_parser / m_transport is always single-threaded.
-    asio::awaitable<void> hop() {
-        co_await asio::dispatch(asio::bind_executor(m_executor, asio::use_awaitable));
-    }
+    asio::awaitable<void> hop() { co_await asio::dispatch(asio::bind_executor(m_executor, asio::use_awaitable)); }
 
     // Bound on the outbound queue, so a peer cannot grow it without limit.
     static constexpr std::size_t kMaxPendingFrames = 64;
@@ -490,8 +484,8 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
     // Sends one queued frame: the header (serialized into the request) and the
     // payload (the caller's buffer) as a single scatter-gather write, so no
     // per-frame concatenation buffer is ever allocated.
-    asio::awaitable<error_code> write_all(const WriteReq& req) {
-        touch_deadline();  // outbound bytes: connection is active
+    asio::awaitable<error_code> write_all(const WriteReq &req) {
+        touch_deadline(); // outbound bytes: connection is active
         const std::array<ConstByteSpan, 2> bufs{
             std::as_bytes(std::span<const char>{req.header, req.header_len}),
             std::as_bytes(std::span<const char>{req.payload.data(), req.payload.size()}),
@@ -525,11 +519,11 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
     // completes the wait with operation_aborted and the coroutine exits.
     static asio::awaitable<void> run_watchdog(std::weak_ptr<WsBackendImpl> weak) {
         for (;;) {
-            asio::steady_timer* timer = nullptr;
+            asio::steady_timer *timer = nullptr;
             {
                 auto self = weak.lock();
                 if (!self || !self->m_open) {
-                    co_return;  // connection gone or already closing: stop watching
+                    co_return; // connection gone or already closing: stop watching
                 }
                 timer = self->m_watchdog_timer.get();
                 timer->expires_at(self->m_deadline);
@@ -538,7 +532,7 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
             }
             auto [ec] = co_await timer->async_wait(asio::as_tuple(asio::use_awaitable));
             if (ec == asio::error::operation_aborted) {
-                co_return;  // timer cancelled or backend destroyed: stop watching
+                co_return; // timer cancelled or backend destroyed: stop watching
             }
             auto self = weak.lock();
             if (!self || !self->m_open) {
@@ -563,9 +557,9 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
     std::uint64_t m_max_payload;
     std::chrono::steady_clock::duration m_idle_timeout;
     std::chrono::steady_clock::time_point m_deadline{};
-    std::shared_ptr<asio::steady_timer> m_watchdog_timer;  // cancelled on teardown
-    WriteQueue m_pending;  // queued frames: owned by us, cleared on teardown
-    Notify m_notify;       // pump wake-up signal (carries only a trivial error_code)
+    std::shared_ptr<asio::steady_timer> m_watchdog_timer; // cancelled on teardown
+    WriteQueue m_pending;                                 // queued frames: owned by us, cleared on teardown
+    Notify m_notify;                                      // pump wake-up signal (carries only a trivial error_code)
     // Atomic so is_open() can be read from any thread without racing the
     // executor's writes. Everything else in this class is executor-confined.
     std::atomic<bool> m_open{true};
@@ -594,9 +588,7 @@ class WebSocket {
     // serialized internally.
     asio::awaitable<error_code> write_text(std::string data) { return m_backend->write(std::move(data), true); }
     asio::awaitable<error_code> write_binary(std::string data) { return m_backend->write(std::move(data), false); }
-    asio::awaitable<error_code> write(std::string data, bool text) {
-        return m_backend->write(std::move(data), text);
-    }
+    asio::awaitable<error_code> write(std::string data, bool text) { return m_backend->write(std::move(data), text); }
 
     // Graceful close: sends a Close frame, then tears the connection down.
     asio::awaitable<error_code> close() { return m_backend->close(); }
@@ -615,4 +607,4 @@ class WebSocket {
     std::shared_ptr<WsBackend> m_backend;
 };
 
-}  // namespace simple_http
+} // namespace simple_http

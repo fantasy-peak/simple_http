@@ -2,19 +2,20 @@
 
 // One HTTP/3 request stream's state.
 //
-// The split between this and the old engine's StreamState is that the *protocol*
-// half is gone: nghttp3 owns whether a field section is complete, whether the
-// stream is blocked on QPACK, whether it is writable, and what the peer's
-// flow-control limit is. What is left here is the two queues this layer is
-// uniquely responsible for, and the wake-ups that connect them to the handler
-// coroutine:
+// The split between this and the old engine's StreamState is that the
+// *protocol* half is gone: nghttp3 owns whether a field section is complete,
+// whether the stream is blocked on QPACK, whether it is writable, and what the
+// peer's flow-control limit is. What is left here is the two queues this layer
+// is uniquely responsible for, and the wake-ups that connect them to the
+// handler coroutine:
 //
 //   * **in_q** — body bytes nghttp3 decoded but the handler has not read. They
 //     are credited to the peer only as the handler consumes them, so an
 //     un-reading handler throttles the sender instead of buffering without
 //     bound.
 //
-//   * **out_q** — body bytes the handler produced but QUIC has not acknowledged.
+//   * **out_q** — body bytes the handler produced but QUIC has not
+//   acknowledged.
 //     nghttp3 hands slices out of this queue, and a slice must stay put until
 //     the peer acknowledges it, because QUIC retransmits from the same memory.
 //     That is why `out_ack` — not the queue length — is the watermark: bytes
@@ -24,13 +25,12 @@
 // library uses: a nudge that arrives when the waiter is already runnable is not
 // information, so dropping it is correct.
 
+#include <boost/asio/experimental/channel.hpp>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <memory>
 #include <string>
-
-#include <boost/asio/experimental/channel.hpp>
 
 #include "../../core/types.h"
 #include "../../proto/request.h"
@@ -48,20 +48,21 @@ namespace asio = boost::asio;
 using Channel = asio::experimental::channel<void(error_code)>;
 using Signal = std::shared_ptr<Channel>;
 
-inline void wake(const Signal& signal) noexcept {
-    if (signal) (void)signal->try_send(error_code{});
+inline void wake(const Signal &signal) noexcept {
+    if (signal)
+        (void)signal->try_send(error_code{});
 }
 
-// The largest slice of a response body handed to nghttp3 in one go. nghttp3 puts
-// whatever it is given into a single DATA frame, so this caps frame size — and
-// it also bounds how much of the queue one write loop pass can visit.
+// The largest slice of a response body handed to nghttp3 in one go. nghttp3
+// puts whatever it is given into a single DATA frame, so this caps frame size —
+// and it also bounds how much of the queue one write loop pass can visit.
 inline constexpr std::size_t kMaxBodyPerRead = 32 * 1024;
 
 // Outbound backpressure watermarks, matching the h2 engine's and the previous
 // QUIC stack's. The measured quantity is *unacknowledged* bytes, so this bounds
 // per-stream memory to roughly the high mark however fast the handler produces.
-inline constexpr std::uint64_t kOutHighWatermark = 1u << 20;   // 1 MiB
-inline constexpr std::uint64_t kOutLowWatermark = 256u << 10;  // 256 KiB
+inline constexpr std::uint64_t kOutHighWatermark = 1u << 20;  // 1 MiB
+inline constexpr std::uint64_t kOutLowWatermark = 256u << 10; // 256 KiB
 
 struct H3Stream {
     std::int64_t id{-1};
@@ -112,4 +113,4 @@ struct H3Stream {
     [[nodiscard]] bool stream_ended() const noexcept { return request_complete && end_stream_sent; }
 };
 
-}  // namespace simple_http::h3
+} // namespace simple_http::h3

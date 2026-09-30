@@ -24,6 +24,9 @@
 // Http2ResponseWriter holds a weak_ptr and lock()s it per operation.
 
 #include <array>
+#include <boost/asio.hpp>
+#include <boost/asio/experimental/awaitable_operators.hpp>
+#include <boost/asio/experimental/channel.hpp>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
@@ -34,13 +37,6 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
-
-#include <boost/asio.hpp>
-#include <boost/asio/experimental/awaitable_operators.hpp>
-#include <boost/asio/experimental/channel.hpp>
-
-#include "h2_frame.h"
-#include "hpack_decode.h"
 
 #include "../../core/base64.h"
 #include "../../core/http_method.h"
@@ -53,16 +49,17 @@
 #include "../../proto/request.h"
 #include "../../proto/response.h"
 #include "../../proto/response_writer.h"
-#include "../../transport/transport.h"  // SslHandle, TransportLike
+#include "../../transport/transport.h" // SslHandle, TransportLike
 #include "../dispatcher.h"
+#include "h2_frame.h"
+#include "hpack_decode.h"
 #include "hpack_encoder.h"
 
 namespace simple_http {
 
 namespace asio = boost::asio;
 
-template <TransportLike Transport>
-class Http2Engine;
+template <TransportLike Transport> class Http2Engine;
 
 // Default HTTP/2 flow-control window (RFC 7540 §6.9.2): 65,535 octets.
 inline constexpr std::int32_t kH2InitialWindow = 65535;
@@ -70,32 +67,31 @@ inline constexpr std::int32_t kH2InitialWindow = 65535;
 // The largest flow-control window either endpoint may hold (RFC 9113 §6.9.1).
 // Exceeding it is a FLOW_CONTROL_ERROR, and it is also the bound that keeps the
 // signed window arithmetic from wrapping.
-inline constexpr std::int64_t kH2MaxWindow = 2147483647;  // 2^31 - 1
+inline constexpr std::int64_t kH2MaxWindow = 2147483647; // 2^31 - 1
 // Protocol default max frame size (RFC 7540 §6.5.2): the value a peer uses
 // until it announces its own SETTINGS_MAX_FRAME_SIZE.
 inline constexpr std::size_t kH2MaxFrameSize = 16384;
 
 // Outbound backpressure watermarks for one stream's response queue. A producer
-// (the reverse proxy streaming an upstream body, say) is parked once it has this
-// many bytes queued but not yet framed, and released when the write loop has
-// drained the queue back to the low mark.
+// (the reverse proxy streaming an upstream body, say) is parked once it has
+// this many bytes queued but not yet framed, and released when the write loop
+// has drained the queue back to the low mark.
 //
 // Without this a response body was simply accumulated: the handler ran ahead of
-// the peer's flow-control window at full speed, so a client that stopped reading
-// (window exhausted - congestion, a busy browser main thread, a mid-way RST)
-// left the *entire* response sitting in memory, per stream. Measured with the
-// 19 MiB code-server workbench.js: RSS went 12 MiB -> 30 MiB and stayed there
-// while the client read nothing. The marks bound per-stream memory to roughly
-// the high watermark regardless of response size.
-inline constexpr std::size_t kOutHighWatermark = 1u << 20;   // 1 MiB: park the producer
-inline constexpr std::size_t kOutLowWatermark = 256u << 10;  // 256 KiB: wake it again
+// the peer's flow-control window at full speed, so a client that stopped
+// reading (window exhausted - congestion, a busy browser main thread, a mid-way
+// RST) left the *entire* response sitting in memory, per stream. Measured with
+// the 19 MiB code-server workbench.js: RSS went 12 MiB -> 30 MiB and stayed
+// there while the client read nothing. The marks bound per-stream memory to
+// roughly the high watermark regardless of response size.
+inline constexpr std::size_t kOutHighWatermark = 1u << 20;  // 1 MiB: park the producer
+inline constexpr std::size_t kOutLowWatermark = 256u << 10; // 256 KiB: wake it again
 
 // ResponseWriter for a single HTTP/2 stream. Holds a weak_ptr to the engine so
 // it can be used safely from any thread and after the connection has closed.
-template <TransportLike Transport>
-class Http2ResponseWriter : public ResponseWriter {
+template <TransportLike Transport> class Http2ResponseWriter : public ResponseWriter {
   public:
-    using Executor = decltype(std::declval<Transport&>().get_executor());
+    using Executor = decltype(std::declval<Transport &>().get_executor());
 
     Http2ResponseWriter(std::weak_ptr<Http2Engine<Transport>> engine, std::uint32_t stream_id, Executor exec)
         : m_engine(std::move(engine)), m_stream_id(stream_id), m_executor(exec) {}
@@ -110,7 +106,8 @@ class Http2ResponseWriter : public ResponseWriter {
         // headers still carry the Content-Length a GET would have produced.
         const bool head = eng->method_is_head(m_stream_id);
         eng->submit_headers(m_stream_id, status, headers, /*end_stream=*/head);
-        if (!head) eng->enqueue_body(m_stream_id, std::move(body), /*last=*/true);
+        if (!head)
+            eng->enqueue_body(m_stream_id, std::move(body), /*last=*/true);
         co_return error_code{};
     }
 
@@ -120,7 +117,8 @@ class Http2ResponseWriter : public ResponseWriter {
         if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
             co_return make_error_code(asio::error::not_connected);
         }
-        // Nothing follows the HEADERS frame: END_STREAM ends the stream (RFC 9113 §8.1).
+        // Nothing follows the HEADERS frame: END_STREAM ends the stream (RFC 9113
+        // §8.1).
         eng->submit_headers(m_stream_id, status, headers, /*end_stream=*/true);
         co_return error_code{};
     }
@@ -131,7 +129,8 @@ class Http2ResponseWriter : public ResponseWriter {
         if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
             co_return make_error_code(asio::error::not_connected);
         }
-        eng->submit_headers(m_stream_id, status, headers, /*end_stream=*/eng->method_is_head(m_stream_id));
+        eng->submit_headers(m_stream_id, status, headers,
+                            /*end_stream=*/eng->method_is_head(m_stream_id));
         eng->flush();
         co_return error_code{};
     }
@@ -142,10 +141,12 @@ class Http2ResponseWriter : public ResponseWriter {
         if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
             co_return make_error_code(asio::error::not_connected);
         }
-        if (eng->method_is_head(m_stream_id)) co_return error_code{};  // HEAD: no body
+        if (eng->method_is_head(m_stream_id))
+            co_return error_code{}; // HEAD: no body
         // Backpressure: block while this stream's queue is over the high mark, so
         // a fast producer (reverse proxy) is paced by the peer's window.
-        if (auto ec = co_await eng->await_out_space(m_stream_id); ec) co_return ec;
+        if (auto ec = co_await eng->await_out_space(m_stream_id); ec)
+            co_return ec;
         eng->enqueue_body(m_stream_id, std::move(data), /*last=*/false);
         co_return error_code{};
     }
@@ -156,8 +157,10 @@ class Http2ResponseWriter : public ResponseWriter {
         if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
             co_return make_error_code(asio::error::not_connected);
         }
-        if (eng->method_is_head(m_stream_id)) co_return error_code{};  // HEAD: no body
-        if (auto ec = co_await eng->await_out_space(m_stream_id); ec) co_return ec;
+        if (eng->method_is_head(m_stream_id))
+            co_return error_code{}; // HEAD: no body
+        if (auto ec = co_await eng->await_out_space(m_stream_id); ec)
+            co_return ec;
         eng->enqueue_body(m_stream_id, std::move(data), /*last=*/true);
         co_return error_code{};
     }
@@ -174,7 +177,7 @@ class Http2ResponseWriter : public ResponseWriter {
         co_return eng && eng->alive() && eng->stream_writable(m_stream_id);
     }
     asio::awaitable<void> close() override {
-        co_await hop();  // reset_stream() touches the same table
+        co_await hop(); // reset_stream() touches the same table
         if (auto eng = m_engine.lock()) {
             eng->reset_stream(m_stream_id, codec::H2_CANCEL);
         }
@@ -182,31 +185,26 @@ class Http2ResponseWriter : public ResponseWriter {
     Version version() const override { return Version::Http2; }
 
   private:
-    asio::awaitable<void> hop() const {
-        co_await asio::dispatch(asio::bind_executor(m_executor, asio::use_awaitable));
-    }
+    asio::awaitable<void> hop() const { co_await asio::dispatch(asio::bind_executor(m_executor, asio::use_awaitable)); }
 
     std::weak_ptr<Http2Engine<Transport>> m_engine;
     std::uint32_t m_stream_id;
     Executor m_executor;
 };
 
-template <TransportLike Transport>
-class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> {
+template <TransportLike Transport> class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> {
   public:
-    using Executor = decltype(std::declval<Transport&>().get_executor());
+    using Executor = decltype(std::declval<Transport &>().get_executor());
 
     explicit Http2Engine(std::shared_ptr<Transport> transport, EngineLimits limits = {})
-        : m_transport(std::move(transport)),
-          m_executor(m_transport->get_executor()),
-          m_notify(m_executor, 1),
+        : m_transport(std::move(transport)), m_executor(m_transport->get_executor()), m_notify(m_executor, 1),
           m_limits(limits) {
         // Our advertised (receive) windows start at the configured initial size.
         m_conn_recv_window = m_limits.h2_initial_window;
     }
 
-    Http2Engine(const Http2Engine&) = delete;
-    Http2Engine& operator=(const Http2Engine&) = delete;
+    Http2Engine(const Http2Engine &) = delete;
+    Http2Engine &operator=(const Http2Engine &) = delete;
 
     // Serve the connection until it closes. `dispatch` runs a handler per stream.
     // `prior_knowledge_bytes` (if any) are bytes already consumed during protocol
@@ -222,7 +220,7 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
 
     // Serve an h2c upgrade: the client's base64url HTTP2-Settings seed the peer
     // SETTINGS, and the original HTTP/1.1 request is replayed as stream 1.
-    asio::awaitable<void> run_h2c(Dispatcher dispatch, const std::string& settings_b64, Method method,
+    asio::awaitable<void> run_h2c(Dispatcher dispatch, const std::string &settings_b64, Method method,
                                   std::string target, Headers headers, std::string body) {
         m_dispatch = std::move(dispatch);
         // Apply the client's SETTINGS payload (raw settings frame body).
@@ -239,18 +237,20 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
             co_return;
         }
         apply_settings_payload(settings);
-        if (m_goaway_sent) co_return;  // the h2c HTTP2-Settings were rejected
+        if (m_goaway_sent)
+            co_return; // the h2c HTTP2-Settings were rejected
         queue_settings();
 
         // Seed stream 1 from the initial request and dispatch it.
-        auto& st = ensure_stream(1);
+        auto &st = ensure_stream(1);
         st.request->set_method(method);
         st.request->set_method_token(std::string{to_string(method)});
         st.request->set_target(std::move(target));
         st.request->mutable_headers() = std::move(headers);
-        if (!body.empty()) (void)st.request->body().feed(std::move(body));
+        if (!body.empty())
+            (void)st.request->body().feed(std::move(body));
         (void)st.request->body().finish();
-        m_next_peer_stream_id = 1;  // the upgraded request's id is the highest seen so far
+        m_next_peer_stream_id = 1; // the upgraded request's id is the highest seen so far
         dispatch_stream(1);
 
         co_await serve_loops();
@@ -267,19 +267,21 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
 
     // Serialize a response HEADERS block for `stream_id` into the control-frame
     // output queue. Connection-specific headers illegal in HTTP/2 are dropped.
-    void submit_headers(std::uint32_t stream_id, int status, const Headers& headers, bool end_stream) {
+    void submit_headers(std::uint32_t stream_id, int status, const Headers &headers, bool end_stream) {
         // Never emit a header block on a stream that is gone (reset by the peer)
         // or already ended: RFC 9113 §5.1 makes a frame on a closed stream a
         // connection-level protocol error, so the peer answers with GOAWAY and
         // every other stream on the connection dies with it. DEFENCE IN DEPTH:
         // writers check first, this guards any other caller.
-        if (!stream_writable(stream_id)) return;
+        if (!stream_writable(stream_id))
+            return;
         std::string block;
         codec::hpack_append_status(block, status);
-        for (const auto& [name, value] : headers) {
-            if (name == "connection" || name == "transfer-encoding" || name == "keep-alive" ||
-                name == "upgrade" || name == "proxy-connection") {
-                continue;  // hop-by-hop headers are forbidden in HTTP/2 (RFC 7540 §8.1.2.2)
+        for (const auto &[name, value] : headers) {
+            if (name == "connection" || name == "transfer-encoding" || name == "keep-alive" || name == "upgrade" ||
+                name == "proxy-connection") {
+                continue; // hop-by-hop headers are forbidden in HTTP/2 (RFC 7540
+                          // §8.1.2.2)
             }
             codec::hpack_append_literal(block, name, value);
         }
@@ -292,8 +294,9 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
             codec::hpack_append_literal(block, "alt-svc", alt_svc);
         }
         // A header block larger than the peer's advertised frame size must be split
-        // over HEADERS + CONTINUATION frames (RFC 9113 §6.2/§6.10): a compliant peer
-        // answers a larger frame with FRAME_SIZE_ERROR and closes the connection.
+        // over HEADERS + CONTINUATION frames (RFC 9113 §6.2/§6.10): a compliant
+        // peer answers a larger frame with FRAME_SIZE_ERROR and closes the
+        // connection.
         const std::size_t limit =
             std::max<std::size_t>(1, std::min<std::size_t>(m_peer_max_frame_size, m_limits.h2_max_frame_size));
         std::size_t off = 0;
@@ -303,7 +306,8 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
             const bool last = (off + take == block.size());
             std::uint8_t flags = last ? codec::H2_FLAG_END_HEADERS : 0;
             if (first) {
-                if (end_stream) flags |= codec::H2_FLAG_END_STREAM;
+                if (end_stream)
+                    flags |= codec::H2_FLAG_END_STREAM;
                 append_frame(codec::H2FrameType::Headers, flags, stream_id, std::string_view{block}.substr(off, take));
             } else {
                 append_frame(codec::H2FrameType::Continuation, flags, stream_id,
@@ -337,13 +341,15 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
         auto it = m_streams.find(stream_id);
         // Stream gone (reset/closed) or already ended: queueing would only be
         // dropped by the framing loop, so refuse it here as well.
-        if (it == m_streams.end() || it->second.end_stream_sent) return;
-        Stream& st = it->second;
+        if (it == m_streams.end() || it->second.end_stream_sent)
+            return;
+        Stream &st = it->second;
         if (!data.empty()) {
             st.out_queued += data.size();
             st.out_queue.push_back(std::move(data));
         }
-        if (last) st.out_finished = true;
+        if (last)
+            st.out_finished = true;
         flush();
     }
 
@@ -373,17 +379,19 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
     asio::awaitable<error_code> await_out_space(std::uint32_t stream_id) {
         for (;;) {
             auto it = m_streams.find(stream_id);
-            if (it == m_streams.end()) co_return make_error_code(asio::error::operation_aborted);
-            if (it->second.out_queued <= kOutHighWatermark) co_return error_code{};
+            if (it == m_streams.end())
+                co_return make_error_code(asio::error::operation_aborted);
+            if (it->second.out_queued <= kOutHighWatermark)
+                co_return error_code{};
             if (!it->second.out_space) {
-                it->second.out_space =
-                    std::make_shared<asio::experimental::channel<void(error_code)>>(m_executor, 1);
+                it->second.out_space = std::make_shared<asio::experimental::channel<void(error_code)>>(m_executor, 1);
             }
             // Keep the channel alive across the wait: the stream entry itself may
             // be erased (and the channel closed, waking us) while we are parked.
             auto space = it->second.out_space;
             auto [ec] = co_await space->async_receive(asio::as_tuple(asio::use_awaitable));
-            if (ec) co_return make_error_code(asio::error::operation_aborted);
+            if (ec)
+                co_return make_error_code(asio::error::operation_aborted);
         }
     }
 
@@ -400,14 +408,14 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
     struct Stream {
         std::shared_ptr<Request> request;
         std::shared_ptr<Http2ResponseWriter<Transport>> writer;
-        std::string header_block;  // accumulates HEADERS + CONTINUATION
+        std::string header_block; // accumulates HEADERS + CONTINUATION
 
         // Outbound response body: a queue of chunks the write loop drains into
         // flow-controlled DATA frames. out_offset marks how much of the front
         // chunk has already been framed (so partial sends need no substr copy).
         std::deque<std::string> out_queue;
         std::size_t out_offset = 0;
-        bool out_finished = false;  // handler signalled end-of-body (send/send_last)
+        bool out_finished = false; // handler signalled end-of-body (send/send_last)
 
         // Bytes queued but not yet framed into DATA frames. Drives the producer
         // backpressure in await_out_space() (kOutHighWatermark/kOutLowWatermark).
@@ -417,14 +425,14 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
         // producer is always released rather than stranded.
         std::shared_ptr<asio::experimental::channel<void(error_code)>> out_space;
 
-        std::uint32_t id = 0;                         // this stream's id (for WINDOW_UPDATE etc.)
-        std::int64_t send_window = kH2InitialWindow;  // peer's advertised window for us (send side)
-        std::int64_t recv_window = kH2InitialWindow;  // our window advertised to the peer (recv side)
-        std::int64_t recv_pending = 0;                // consumed bytes awaiting a batched stream WINDOW_UPDATE
-        std::int64_t recv_owed_conn = 0;              // delivered-but-unconsumed body bytes still owing connection credit
+        std::uint32_t id = 0;                        // this stream's id (for WINDOW_UPDATE etc.)
+        std::int64_t send_window = kH2InitialWindow; // peer's advertised window for us (send side)
+        std::int64_t recv_window = kH2InitialWindow; // our window advertised to the peer (recv side)
+        std::int64_t recv_pending = 0;               // consumed bytes awaiting a batched stream WINDOW_UPDATE
+        std::int64_t recv_owed_conn = 0; // delivered-but-unconsumed body bytes still owing connection credit
         bool dispatched = false;
-        bool half_closed_remote = false;  // client sent END_STREAM
-        bool end_stream_sent = false;     // our terminating DATA (END_STREAM) emitted
+        bool half_closed_remote = false; // client sent END_STREAM
+        bool end_stream_sent = false;    // our terminating DATA (END_STREAM) emitted
 
         // The request's declared body length (content-length), or -1 when it
         // declared none, and the body octets seen so far. A body that does not
@@ -443,7 +451,7 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
 
     // --- byte helpers ---
 
-    static void append_u32(std::string& out, std::uint32_t v) {
+    static void append_u32(std::string &out, std::uint32_t v) {
         out.push_back(static_cast<char>((v >> 24) & 0xFF));
         out.push_back(static_cast<char>((v >> 16) & 0xFF));
         out.push_back(static_cast<char>((v >> 8) & 0xFF));
@@ -480,8 +488,8 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
     // acted on; others are accepted and ignored.
     void apply_settings_payload(std::string_view payload) {
         for (std::size_t i = 0; i + 6 <= payload.size(); i += 6) {
-            std::uint16_t id = static_cast<std::uint16_t>(
-                (static_cast<unsigned char>(payload[i]) << 8) | static_cast<unsigned char>(payload[i + 1]));
+            std::uint16_t id = static_cast<std::uint16_t>((static_cast<unsigned char>(payload[i]) << 8) |
+                                                          static_cast<unsigned char>(payload[i + 1]));
             std::uint32_t value = codec::read_u32(payload, i + 2);
             if (id == codec::H2_SETTINGS_INITIAL_WINDOW_SIZE) {
                 // §6.5.2: a window larger than 2^31-1 is a FLOW_CONTROL_ERROR, not
@@ -492,7 +500,8 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
                 }
                 std::int64_t delta = static_cast<std::int64_t>(value) - m_peer_initial_window;
                 m_peer_initial_window = static_cast<std::int32_t>(value);
-                for (auto& [sid, st] : m_streams) st.send_window += delta;
+                for (auto &[sid, st] : m_streams)
+                    st.send_window += delta;
             } else if (id == codec::H2_SETTINGS_ENABLE_PUSH) {
                 // §6.5.2: ENABLE_PUSH is a boolean. This endpoint never pushes, so
                 // the value is not acted on — but a peer sending anything but 0 or
@@ -518,18 +527,17 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
 
     // Whether `id` may open a new client-initiated stream: odd, and higher than
     // any the peer has opened so far (RFC 9113 §5.1.1).
-    bool is_new_client_stream(std::uint32_t id) const {
-        return (id & 1u) == 1u && id > m_next_peer_stream_id;
-    }
+    bool is_new_client_stream(std::uint32_t id) const { return (id & 1u) == 1u && id > m_next_peer_stream_id; }
 
-    // Whether adding `extra` bytes to a header block of `current` bytes would exceed
-    // the bound we accept. Without it, HEADERS without END_HEADERS plus endless
-    // CONTINUATION accumulate without limit (RFC 9113 §10.5.1).
+    // Whether adding `extra` bytes to a header block of `current` bytes would
+    // exceed the bound we accept. Without it, HEADERS without END_HEADERS plus
+    // endless CONTINUATION accumulate without limit (RFC 9113 §10.5.1).
     bool header_block_too_big(std::size_t current, std::size_t extra) const {
         return current + extra > m_limits.max_header_bytes;
     }
 
-    // Whether the request on `stream_id` was a HEAD (its response carries no body).
+    // Whether the request on `stream_id` was a HEAD (its response carries no
+    // body).
     bool method_is_head(std::uint32_t stream_id) const {
         auto it = m_streams.find(stream_id);
         return it != m_streams.end() && it->second.request->method() == Method::Head;
@@ -537,15 +545,15 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
 
     // --- stream table ---
 
-    Stream& ensure_stream(std::uint32_t stream_id) {
+    Stream &ensure_stream(std::uint32_t stream_id) {
         auto [it, inserted] = m_streams.try_emplace(stream_id);
         if (inserted) {
-            Stream& st = it->second;
+            Stream &st = it->second;
             st.id = stream_id;
             st.request = std::make_shared<Request>(Version::Http2, m_executor, m_transport->peer());
             st.writer = std::make_shared<Http2ResponseWriter<Transport>>(this->weak_from_this(), stream_id, m_executor);
             st.send_window = m_peer_initial_window;
-            st.recv_window = m_limits.h2_initial_window;  // our advertised per-stream window
+            st.recv_window = m_limits.h2_initial_window; // our advertised per-stream window
 
             // Consumption-based flow control: when the handler reads body bytes,
             // hop back onto the connection executor and replenish credit for
@@ -555,7 +563,8 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
             auto exec = m_executor;
             st.request->body().set_on_consumed([weak, exec, stream_id](std::size_t n) {
                 asio::post(exec, [weak, stream_id, n]() {
-                    if (auto eng = weak.lock()) eng->on_body_consumed(stream_id, n);
+                    if (auto eng = weak.lock())
+                        eng->on_body_consumed(stream_id, n);
                 });
             });
         }
@@ -568,8 +577,10 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
     // true when the preface was stripped, or when there are not yet enough bytes
     // to tell (caller waits for more).
     bool consume_client_preface() {
-        if (m_preface_consumed) return true;
-        if (m_recv_buf.size() < codec::kH2ClientPreface.size()) return true;  // need more bytes
+        if (m_preface_consumed)
+            return true;
+        if (m_recv_buf.size() < codec::kH2ClientPreface.size())
+            return true; // need more bytes
         if (std::string_view{m_recv_buf}.substr(0, codec::kH2ClientPreface.size()) != codec::kH2ClientPreface) {
             go_away(codec::H2_PROTOCOL_ERROR);
             return false;
@@ -584,21 +595,23 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
     asio::awaitable<void> serve_loops() {
         using namespace asio::experimental::awaitable_operators;
         m_deadline = std::chrono::steady_clock::now() + m_limits.idle_timeout;
-        flush();  // push our initial SETTINGS
+        flush(); // push our initial SETTINGS
         co_await (read_loop() || write_loop() || watchdog());
         m_alive = false;
         // Release every producer still parked on outbound backpressure: the write
         // loop is gone, so nothing will ever drain their queues.
-        for (auto& entry : m_streams) {
-            if (entry.second.out_space) entry.second.out_space->close();
+        for (auto &entry : m_streams) {
+            if (entry.second.out_space)
+                entry.second.out_space->close();
         }
         // Whichever loop finished first cancels the others, and a cancelled
-        // async_write drops its buffer - so the GOAWAY the write loop had just taken
-        // may never reach the wire, leaving the peer with a bare TCP close and no
-        // explanation. Re-serialize it here and write it directly (RFC 9113 §6.8
-        // allows an endpoint to send GOAWAY more than once, so re-sending is safe).
+        // async_write drops its buffer - so the GOAWAY the write loop had just
+        // taken may never reach the wire, leaving the peer with a bare TCP close
+        // and no explanation. Re-serialize it here and write it directly (RFC 9113
+        // §6.8 allows an endpoint to send GOAWAY more than once, so re-sending is
+        // safe).
         if (m_goaway_sent) {
-            m_out.clear();  // queued DATA is moot on a connection error
+            m_out.clear(); // queued DATA is moot on a connection error
             std::string payload;
             append_u32(payload, m_next_peer_stream_id);
             append_u32(payload, m_goaway_error);
@@ -613,17 +626,19 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
 
     // Best-effort flush of the serialized output left behind by the write loop.
     asio::awaitable<void> flush_pending_output() {
-        if (m_out.empty()) co_return;
+        if (m_out.empty())
+            co_return;
         auto bytes = std::as_bytes(std::span<const char>{m_out.data(), m_out.size()});
         auto [ec, n] = co_await m_transport->async_write(bytes);
         (void)n;
         m_out.clear();
-        if (ec) co_return;
+        if (ec)
+            co_return;
         co_return;
     }
 
-    // Deadline for the teardown flush above: never let a non-reading peer keep the
-    // connection (and its coroutine frame) alive.
+    // Deadline for the teardown flush above: never let a non-reading peer keep
+    // the connection (and its coroutine frame) alive.
     asio::awaitable<void> flush_deadline() {
         asio::steady_timer timer{m_executor};
         timer.expires_after(std::chrono::seconds(2));
@@ -633,14 +648,17 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
 
     asio::awaitable<void> read_loop() {
         // Parse any bytes carried over from protocol detection first.
-        if (!parse_available()) co_return;
-        std::array<std::byte, 32 * 1024> buf;  // no init: read_some fills [0,n)
+        if (!parse_available())
+            co_return;
+        std::array<std::byte, 32 * 1024> buf; // no init: read_some fills [0,n)
         for (;;) {
             m_deadline = std::chrono::steady_clock::now() + m_limits.idle_timeout;
             auto [ec, n] = co_await m_transport->async_read_some(std::span<std::byte>{buf});
-            if (ec) break;  // EOF or transport error ends the connection
-            m_recv_buf.append(reinterpret_cast<const char*>(buf.data()), n);
-            if (!parse_available()) break;  // protocol error -> GOAWAY queued, stop
+            if (ec)
+                break; // EOF or transport error ends the connection
+            m_recv_buf.append(reinterpret_cast<const char *>(buf.data()), n);
+            if (!parse_available())
+                break; // protocol error -> GOAWAY queued, stop
             flush();
         }
         co_return;
@@ -648,7 +666,7 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
 
     asio::awaitable<void> write_loop() {
         for (;;) {
-            fill_data_frames();  // frame as much stream DATA as flow control allows
+            fill_data_frames(); // frame as much stream DATA as flow control allows
             while (!m_out.empty()) {
                 std::string chunk;
                 chunk.swap(m_out);
@@ -657,15 +675,18 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
                 // streaming a large response to a slow client).
                 m_deadline = std::chrono::steady_clock::now() + m_limits.idle_timeout;
                 // Composed async_write: whole buffer or error, no partial-write loop.
-                auto [ec, n] = co_await m_transport->async_write(
-                    std::as_bytes(std::span<const char>{chunk.data(), chunk.size()}));
+                auto [ec, n] =
+                    co_await m_transport->async_write(std::as_bytes(std::span<const char>{chunk.data(), chunk.size()}));
                 (void)n;
-                if (ec) co_return;
-                fill_data_frames();  // a handler may have queued more while we wrote
+                if (ec)
+                    co_return;
+                fill_data_frames(); // a handler may have queued more while we wrote
             }
-            if (m_goaway_sent && streams_all_done()) co_return;
+            if (m_goaway_sent && streams_all_done())
+                co_return;
             auto [ec] = co_await m_notify.async_receive(asio::as_tuple(asio::use_awaitable));
-            if (ec) co_return;
+            if (ec)
+                co_return;
         }
     }
 
@@ -674,14 +695,16 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
         for (;;) {
             timer.expires_at(m_deadline);
             co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
-            if (std::chrono::steady_clock::now() >= m_deadline) break;  // idle timeout elapsed
+            if (std::chrono::steady_clock::now() >= m_deadline)
+                break; // idle timeout elapsed
         }
         co_return;
     }
 
     bool streams_all_done() const {
-        for (const auto& [sid, st] : m_streams) {
-            if (!st.end_stream_sent) return false;
+        for (const auto &[sid, st] : m_streams) {
+            if (!st.end_stream_sent)
+                return false;
         }
         return true;
     }
@@ -692,44 +715,50 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
     // false on a connection-fatal protocol error (a GOAWAY has been queued);
     // true if it consumed all it could and wants more bytes.
     bool parse_available() {
-        if (!consume_client_preface()) return false;   // fatal: not the h2 preface
-        if (!m_preface_consumed) return true;           // still waiting for the full preface
+        if (!consume_client_preface())
+            return false; // fatal: not the h2 preface
+        if (!m_preface_consumed)
+            return true; // still waiting for the full preface
         // A stream's body channel filled up: stop here rather than reading ahead,
         // which is the only backpressure available — this loop never suspends, so
         // the consumer coroutine cannot run while it drains. m_recv_buf grows by
         // at most one flow-control window, and on_body_consumed() clears this.
-        if (m_body_paused) return true;
+        if (m_body_paused)
+            return true;
         std::size_t pos = 0;
         while (m_recv_buf.size() - pos >= codec::kH2FrameHeaderSize) {
             // Checked per frame, not just on entry: on_data() sets this mid-loop
             // when the body channel refuses a frame, and without the check here
             // the loop would keep going and overwrite the frame it just parked —
             // losing it, which is precisely what the parking is for.
-            if (m_body_paused) break;
+            if (m_body_paused)
+                break;
             codec::H2FrameHeader hdr;
             codec::parse_frame_header(std::string_view{m_recv_buf}.substr(pos), hdr);
-            // RFC 9113 §4.2: a frame larger than our advertised SETTINGS_MAX_FRAME_SIZE
-            // is a connection error, for every frame type (a compliant peer never sends
-            // one). Bounding it here also bounds how much a single frame can buffer.
+            // RFC 9113 §4.2: a frame larger than our advertised
+            // SETTINGS_MAX_FRAME_SIZE is a connection error, for every frame type (a
+            // compliant peer never sends one). Bounding it here also bounds how much
+            // a single frame can buffer.
             if (hdr.length > m_limits.h2_max_frame_size) {
                 go_away(codec::H2_FRAME_SIZE_ERROR);
                 return false;
             }
             std::size_t frame_end = pos + codec::kH2FrameHeaderSize + hdr.length;
-            if (frame_end > m_recv_buf.size()) break;  // wait for the rest of this frame
+            if (frame_end > m_recv_buf.size())
+                break; // wait for the rest of this frame
 
-            std::string_view payload =
-                std::string_view{m_recv_buf}.substr(pos + codec::kH2FrameHeaderSize, hdr.length);
+            std::string_view payload = std::string_view{m_recv_buf}.substr(pos + codec::kH2FrameHeaderSize, hdr.length);
             if (!handle_frame(hdr, payload)) {
-                return false;  // fatal; GOAWAY already queued by handler
+                return false; // fatal; GOAWAY already queued by handler
             }
             pos = frame_end;
         }
-        if (pos > 0) m_recv_buf.erase(0, pos);
+        if (pos > 0)
+            m_recv_buf.erase(0, pos);
         return true;
     }
 
-    bool handle_frame(const codec::H2FrameHeader& hdr, std::string_view payload) {
+    bool handle_frame(const codec::H2FrameHeader &hdr, std::string_view payload) {
         const auto type = static_cast<codec::H2FrameType>(hdr.type);
 
         // RFC 9113 §6.10: between a HEADERS without END_HEADERS and its closing
@@ -743,46 +772,46 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
         }
 
         switch (type) {
-            case codec::H2FrameType::Headers:
-                return on_headers(hdr, payload);
-            case codec::H2FrameType::Continuation:
-                return on_continuation(hdr, payload);
-            case codec::H2FrameType::Data:
-                return on_data(hdr, payload);
-            case codec::H2FrameType::Settings:
-                return on_settings(hdr, payload);
-            case codec::H2FrameType::WindowUpdate:
-                return on_window_update(hdr, payload);
-            case codec::H2FrameType::RstStream:
-                return on_rst_stream(hdr);
-            case codec::H2FrameType::Ping:
-                return on_ping(hdr, payload);
-            case codec::H2FrameType::Goaway:
-                // §6.8: the stream identifier of a GOAWAY is reserved and must
-                // be zero.
-                if (hdr.stream_id != 0) {
-                    go_away(codec::H2_PROTOCOL_ERROR);
-                    return false;
-                }
-                return true;  // peer is going away; let the read EOF close us
-            case codec::H2FrameType::Priority:
-                return on_priority(hdr, payload);
-            case codec::H2FrameType::PushPromise:
-                // §8.2: only clients receive pushes. A server that is sent one is
-                // talking to a peer that has the direction wrong.
+        case codec::H2FrameType::Headers:
+            return on_headers(hdr, payload);
+        case codec::H2FrameType::Continuation:
+            return on_continuation(hdr, payload);
+        case codec::H2FrameType::Data:
+            return on_data(hdr, payload);
+        case codec::H2FrameType::Settings:
+            return on_settings(hdr, payload);
+        case codec::H2FrameType::WindowUpdate:
+            return on_window_update(hdr, payload);
+        case codec::H2FrameType::RstStream:
+            return on_rst_stream(hdr);
+        case codec::H2FrameType::Ping:
+            return on_ping(hdr, payload);
+        case codec::H2FrameType::Goaway:
+            // §6.8: the stream identifier of a GOAWAY is reserved and must
+            // be zero.
+            if (hdr.stream_id != 0) {
                 go_away(codec::H2_PROTOCOL_ERROR);
                 return false;
-            default:
-                // §5.5: unknown frame types must be ignored. This branch now
-                // means exactly that, and nothing else.
-                return true;
+            }
+            return true; // peer is going away; let the read EOF close us
+        case codec::H2FrameType::Priority:
+            return on_priority(hdr, payload);
+        case codec::H2FrameType::PushPromise:
+            // §8.2: only clients receive pushes. A server that is sent one is
+            // talking to a peer that has the direction wrong.
+            go_away(codec::H2_PROTOCOL_ERROR);
+            return false;
+        default:
+            // §5.5: unknown frame types must be ignored. This branch now
+            // means exactly that, and nothing else.
+            return true;
         }
     }
 
     // RFC 9113 §6.3: the priority scheme is advisory, so the frame may be
     // ignored outright — but its framing is still checked, and §5.3.1 makes a
     // stream that depends on itself a stream error.
-    bool on_priority(const codec::H2FrameHeader& hdr, std::string_view payload) {
+    bool on_priority(const codec::H2FrameHeader &hdr, std::string_view payload) {
         if (hdr.stream_id == 0) {
             go_away(codec::H2_PROTOCOL_ERROR);
             return false;
@@ -796,31 +825,43 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
             reset_stream(hdr.stream_id, codec::H2_PROTOCOL_ERROR);
             return true;
         }
-        return true;  // nothing to reorder: this engine sends one stream at a time
+        return true; // nothing to reorder: this engine sends one stream at a time
     }
 
     // Strips optional padding (RFC 7540 §6.1/§6.2) from a DATA/HEADERS payload,
     // returning the field-block/data slice. `has_priority` handles the 5-octet
     // priority prefix on HEADERS.
-    static std::string_view strip_padding(std::string_view payload, bool padded, bool has_priority, bool& ok) {
+    static std::string_view strip_padding(std::string_view payload, bool padded, bool has_priority, bool &ok) {
         ok = true;
         std::size_t pad_len = 0;
         std::size_t off = 0;
         if (padded) {
-            if (payload.empty()) { ok = false; return {}; }
+            if (payload.empty()) {
+                ok = false;
+                return {};
+            }
             pad_len = static_cast<unsigned char>(payload[0]);
             off = 1;
         }
         if (has_priority) {
-            if (payload.size() < off + 5) { ok = false; return {}; }
-            off += 5;  // 4-octet stream dependency + 1-octet weight
+            if (payload.size() < off + 5) {
+                ok = false;
+                return {};
+            }
+            off += 5; // 4-octet stream dependency + 1-octet weight
         }
-        if (off + pad_len > payload.size()) { ok = false; return {}; }
+        if (off + pad_len > payload.size()) {
+            ok = false;
+            return {};
+        }
         return payload.substr(off, payload.size() - off - pad_len);
     }
 
-    bool on_headers(const codec::H2FrameHeader& hdr, std::string_view payload) {
-        if (hdr.stream_id == 0) { go_away(codec::H2_PROTOCOL_ERROR); return false; }
+    bool on_headers(const codec::H2FrameHeader &hdr, std::string_view payload) {
+        if (hdr.stream_id == 0) {
+            go_away(codec::H2_PROTOCOL_ERROR);
+            return false;
+        }
         // RFC 9113 §5.1.1: a client opens odd-numbered streams, each higher than
         // every stream it has opened before. A HEADERS on anything else - an even
         // (server-initiated) id, or an id that goes backwards - is a connection
@@ -832,9 +873,12 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
             return false;
         }
         bool ok = false;
-        std::string_view block = strip_padding(payload, hdr.has_flag(codec::H2_FLAG_PADDED),
-                                               hdr.has_flag(codec::H2_FLAG_PRIORITY), ok);
-        if (!ok) { go_away(codec::H2_PROTOCOL_ERROR); return false; }
+        std::string_view block =
+            strip_padding(payload, hdr.has_flag(codec::H2_FLAG_PADDED), hdr.has_flag(codec::H2_FLAG_PRIORITY), ok);
+        if (!ok) {
+            go_away(codec::H2_PROTOCOL_ERROR);
+            return false;
+        }
 
         // §5.3.1: a stream cannot depend on itself. The priority prefix was just
         // skipped over, so the dependency it held is re-read here for the check.
@@ -846,10 +890,10 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
             }
         }
 
-        // Refuse streams beyond the concurrency limit we advertise (RFC 9113 §5.1.2):
-        // each accepted stream allocates a Request (with its Body channel), a
-        // ResponseWriter and a handler coroutine, so an unbounded stream count is an
-        // unbounded resource commitment.
+        // Refuse streams beyond the concurrency limit we advertise (RFC 9113
+        // §5.1.2): each accepted stream allocates a Request (with its Body
+        // channel), a ResponseWriter and a handler coroutine, so an unbounded
+        // stream count is an unbounded resource commitment.
         if (m_streams.find(hdr.stream_id) == m_streams.end() &&
             m_streams.size() >= m_limits.h2_max_concurrent_streams) {
             SIMPLE_HTTP_ERROR_LOG("h2: refusing stream {} ({} open, limit {})", hdr.stream_id, m_streams.size(),
@@ -857,27 +901,28 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
             reset_stream(hdr.stream_id, codec::H2_REFUSED_STREAM);
             return true;
         }
-        if (header_block_too_big(m_streams.contains(hdr.stream_id) ? m_streams.at(hdr.stream_id).header_block.size() : 0,
+        if (header_block_too_big(m_streams.contains(hdr.stream_id) ? m_streams.at(hdr.stream_id).header_block.size()
+                                                                   : 0,
                                  block.size())) {
             SIMPLE_HTTP_ERROR_LOG("h2: header block exceeds {} bytes (stream={})", m_limits.max_header_bytes,
                                   hdr.stream_id);
             go_away(codec::H2_ENHANCE_YOUR_CALM);
             return false;
         }
-        Stream& st = ensure_stream(hdr.stream_id);
+        Stream &st = ensure_stream(hdr.stream_id);
         // RFC 9113 §5.1: once the peer has closed its half of the stream, only
         // WINDOW_UPDATE, PRIORITY and RST_STREAM are still in order there — a
         // HEADERS is a STREAM_CLOSED stream error. Checked before the trailing
         // -block rule below so the error code follows the stream state rather
         // than the frame's flags.
         if (st.half_closed_remote) {
-            SIMPLE_HTTP_ERROR_LOG("h2: HEADERS on a half-closed(remote) stream (stream={}); resetting",
-                                  hdr.stream_id);
+            SIMPLE_HTTP_ERROR_LOG("h2: HEADERS on a half-closed(remote) stream (stream={}); resetting", hdr.stream_id);
             reset_stream(hdr.stream_id, codec::H2_STREAM_CLOSED);
             return true;
         }
         st.header_block.append(block);
-        if (hdr.stream_id > m_next_peer_stream_id) m_next_peer_stream_id = hdr.stream_id;
+        if (hdr.stream_id > m_next_peer_stream_id)
+            m_next_peer_stream_id = hdr.stream_id;
 
         // If END_STREAM is set, the client sends no request body.
         bool end_stream = hdr.has_flag(codec::H2_FLAG_END_STREAM);
@@ -888,16 +933,17 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
             // message that never terminates. `dispatched` is read before
             // finish_header_block, which may erase `st`.
             if (st.dispatched && !hdr.has_flag(codec::H2_FLAG_END_STREAM)) {
-                SIMPLE_HTTP_ERROR_LOG("h2: trailing HEADERS without END_STREAM (stream={}); resetting",
-                                      hdr.stream_id);
+                SIMPLE_HTTP_ERROR_LOG("h2: trailing HEADERS without END_STREAM (stream={}); resetting", hdr.stream_id);
                 reset_stream(hdr.stream_id, codec::H2_PROTOCOL_ERROR);
                 return true;
             }
-            if (!finish_header_block(hdr.stream_id, st)) return false;
+            if (!finish_header_block(hdr.stream_id, st))
+                return false;
             // finish_header_block may have reset (and erased) a malformed stream, so
             // `st` must not be used again: re-look it up before dispatching.
             auto it = m_streams.find(hdr.stream_id);
-            if (it == m_streams.end()) return true;
+            if (it == m_streams.end())
+                return true;
             if (end_stream) {
                 it->second.half_closed_remote = true;
                 (void)it->second.request->body().finish();
@@ -908,31 +954,38 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
             // simply sees an immediately-finished body.
             dispatch_stream(hdr.stream_id);
         } else {
-            m_continuation_stream = hdr.stream_id;  // CONTINUATION frames follow
-            if (end_stream) st.half_closed_remote = true;  // remember for on_continuation
+            m_continuation_stream = hdr.stream_id; // CONTINUATION frames follow
+            if (end_stream)
+                st.half_closed_remote = true; // remember for on_continuation
         }
         return true;
     }
 
-    bool on_continuation(const codec::H2FrameHeader& hdr, std::string_view payload) {
+    bool on_continuation(const codec::H2FrameHeader &hdr, std::string_view payload) {
         if (hdr.stream_id == 0 || hdr.stream_id != m_continuation_stream) {
             go_away(codec::H2_PROTOCOL_ERROR);
             return false;
         }
         auto it = m_streams.find(hdr.stream_id);
-        if (it == m_streams.end()) { go_away(codec::H2_PROTOCOL_ERROR); return false; }
+        if (it == m_streams.end()) {
+            go_away(codec::H2_PROTOCOL_ERROR);
+            return false;
+        }
         if (header_block_too_big(it->second.header_block.size(), payload.size())) {
             SIMPLE_HTTP_ERROR_LOG("h2: CONTINUATION header block exceeds {} bytes (stream={})",
                                   m_limits.max_header_bytes, hdr.stream_id);
-            go_away(codec::H2_ENHANCE_YOUR_CALM);  // RFC 9113 §10.5.1 (CONTINUATION flood)
+            go_away(codec::H2_ENHANCE_YOUR_CALM); // RFC 9113 §10.5.1 (CONTINUATION
+                                                  // flood)
             return false;
         }
         it->second.header_block.append(payload);
         if (hdr.has_flag(codec::H2_FLAG_END_HEADERS)) {
             m_continuation_stream = 0;
-            if (!finish_header_block(hdr.stream_id, it->second)) return false;
-            auto it2 = m_streams.find(hdr.stream_id);  // may have been reset+erased
-            if (it2 == m_streams.end()) return true;
+            if (!finish_header_block(hdr.stream_id, it->second))
+                return false;
+            auto it2 = m_streams.find(hdr.stream_id); // may have been reset+erased
+            if (it2 == m_streams.end())
+                return true;
             if (it2->second.half_closed_remote) {
                 (void)it2->second.request->body().finish();
             }
@@ -948,7 +1001,8 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
     // HTTP/1.1 tolerated it, and this layer deliberately does not.
     static bool has_upper_ascii(std::string_view s) noexcept {
         for (char c : s) {
-            if (ascii_lower(c) != c) return true;
+            if (ascii_lower(c) != c)
+                return true;
         }
         return false;
     }
@@ -962,7 +1016,7 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
                name == "transfer-encoding" || name == "upgrade";
     }
 
-    bool finish_header_block(std::uint32_t stream_id, Stream& st) {
+    bool finish_header_block(std::uint32_t stream_id, Stream &st) {
         std::vector<codec::HpackHeader> fields;
         if (!m_decoder.decode(st.header_block, fields)) {
             SIMPLE_HTTP_ERROR_LOG("h2 HPACK decode failed (stream={}, err={})", stream_id, m_decoder.last_error());
@@ -994,16 +1048,17 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
             reset_stream(stream_id, codec::H2_PROTOCOL_ERROR);
         };
 
-        for (auto& f : fields) {
+        for (auto &f : fields) {
             // RFC 9113 §8.2.1: a field name or value must not contain CR, LF or NUL.
-            // HTTP/2 has no line folding, so these bytes survive decoding verbatim and
-            // would let a peer inject request lines/headers into whatever HTTP/1.1
-            // message is built downstream (handlers, reverse proxy). A request is
-            // malformed -> stream error (§8.1.1); the connection stays usable.
+            // HTTP/2 has no line folding, so these bytes survive decoding verbatim
+            // and would let a peer inject request lines/headers into whatever
+            // HTTP/1.1 message is built downstream (handlers, reverse proxy). A
+            // request is malformed -> stream error (§8.1.1); the connection stays
+            // usable.
             if (contains_ctl(f.name) || contains_ctl(f.value)) {
                 SIMPLE_HTTP_ERROR_LOG("h2 field with CR/LF/NUL (stream={}); resetting stream", stream_id);
                 reset_stream(stream_id, codec::H2_PROTOCOL_ERROR);
-                return true;  // stream is gone: the caller must not dispatch it
+                return true; // stream is gone: the caller must not dispatch it
             }
 
             const bool pseudo = !f.name.empty() && f.name[0] == ':';
@@ -1020,7 +1075,7 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
             }
 
             if (pseudo) {
-                bool* seen = nullptr;
+                bool *seen = nullptr;
                 if (f.name == ":method") {
                     seen = &seen_method;
                 } else if (f.name == ":scheme") {
@@ -1118,11 +1173,17 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
         return true;
     }
 
-    bool on_data(const codec::H2FrameHeader& hdr, std::string_view payload) {
-        if (hdr.stream_id == 0) { go_away(codec::H2_PROTOCOL_ERROR); return false; }
+    bool on_data(const codec::H2FrameHeader &hdr, std::string_view payload) {
+        if (hdr.stream_id == 0) {
+            go_away(codec::H2_PROTOCOL_ERROR);
+            return false;
+        }
         bool ok = false;
         std::string_view data = strip_padding(payload, hdr.has_flag(codec::H2_FLAG_PADDED), false, ok);
-        if (!ok) { go_away(codec::H2_PROTOCOL_ERROR); return false; }
+        if (!ok) {
+            go_away(codec::H2_PROTOCOL_ERROR);
+            return false;
+        }
 
         // The whole frame length (payload incl. padding) counts against flow
         // control (RFC 7540 §6.9.1). Debit the connection window first; a peer
@@ -1136,7 +1197,7 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
 
         auto it = m_streams.find(hdr.stream_id);
         if (it != m_streams.end()) {
-            Stream& st = it->second;
+            Stream &st = it->second;
             // §5.1: once the peer has ended its side of the stream it may send no
             // more DATA. Checked ahead of the flow-control accounting so the
             // outcome follows the stream state rather than the window.
@@ -1154,7 +1215,8 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
             // handler, so it is never "consumed" via the Body hook — replenish
             // its credit immediately (both stream and connection level).
             std::int64_t padding = frame_len - static_cast<std::int64_t>(data.size());
-            if (padding > 0) credit_consumed(st, padding);
+            if (padding > 0)
+                credit_consumed(st, padding);
 
             if (!data.empty()) {
                 // §8.1.2.6: a body that overruns its declared content-length is
@@ -1162,9 +1224,9 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
                 // reach the handler — so an unterminated body is caught as well.
                 st.body_received += static_cast<std::int64_t>(data.size());
                 if (st.declared_content_length >= 0 && st.body_received > st.declared_content_length) {
-                    SIMPLE_HTTP_ERROR_LOG(
-                        "h2: request body overruns content-length (stream={}, declared={}, seen={})", hdr.stream_id,
-                        st.declared_content_length, st.body_received);
+                    SIMPLE_HTTP_ERROR_LOG("h2: request body overruns content-length (stream={}, "
+                                          "declared={}, seen={})",
+                                          hdr.stream_id, st.declared_content_length, st.body_received);
                     reset_stream(hdr.stream_id, codec::H2_PROTOCOL_ERROR);
                     return true;
                 }
@@ -1181,7 +1243,7 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
                     st.paused_frame = std::string{data};
                     st.has_paused_frame = true;
                     m_body_paused = true;
-                    return true;  // frame taken; the data lives in paused_frame
+                    return true; // frame taken; the data lives in paused_frame
                 }
             }
             if (hdr.has_flag(codec::H2_FLAG_END_STREAM)) {
@@ -1190,9 +1252,9 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
                 // declared content-length is malformed too. Unlike the overrun
                 // above, this is only knowable here, where the body ends.
                 if (st.declared_content_length >= 0 && st.body_received != st.declared_content_length) {
-                    SIMPLE_HTTP_ERROR_LOG(
-                        "h2: request body short of content-length (stream={}, declared={}, seen={})", hdr.stream_id,
-                        st.declared_content_length, st.body_received);
+                    SIMPLE_HTTP_ERROR_LOG("h2: request body short of content-length (stream={}, "
+                                          "declared={}, seen={})",
+                                          hdr.stream_id, st.declared_content_length, st.body_received);
                     reset_stream(hdr.stream_id, codec::H2_PROTOCOL_ERROR);
                     return true;
                 }
@@ -1220,7 +1282,7 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
         return true;
     }
 
-    bool on_settings(const codec::H2FrameHeader& hdr, std::string_view payload) {
+    bool on_settings(const codec::H2FrameHeader &hdr, std::string_view payload) {
         // §6.5: SETTINGS applies to the connection, so its stream id must be 0.
         if (hdr.stream_id != 0) {
             go_away(codec::H2_PROTOCOL_ERROR);
@@ -1233,19 +1295,20 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
                 go_away(codec::H2_FRAME_SIZE_ERROR);
                 return false;
             }
-            return true;  // our SETTINGS was acked
+            return true; // our SETTINGS was acked
         }
         if (payload.size() % 6 != 0) {
             go_away(codec::H2_FRAME_SIZE_ERROR);
             return false;
         }
         apply_settings_payload(payload);
-        if (m_goaway_sent) return false;  // a rejected setting sent us away: no ACK
-        append_frame(codec::H2FrameType::Settings, codec::H2_FLAG_ACK, 0, {});  // ACK
+        if (m_goaway_sent)
+            return false; // a rejected setting sent us away: no ACK
+        append_frame(codec::H2FrameType::Settings, codec::H2_FLAG_ACK, 0, {}); // ACK
         return true;
     }
 
-    bool on_window_update(const codec::H2FrameHeader& hdr, std::string_view payload) {
+    bool on_window_update(const codec::H2FrameHeader &hdr, std::string_view payload) {
         if (payload.size() != 4) {
             go_away(codec::H2_FRAME_SIZE_ERROR);
             return false;
@@ -1288,7 +1351,7 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
         return true;
     }
 
-    bool on_rst_stream(const codec::H2FrameHeader& hdr) {
+    bool on_rst_stream(const codec::H2FrameHeader &hdr) {
         // §6.4: an RST_STREAM carries a 4-octet error code, on a non-zero stream.
         if (hdr.length != 4) {
             go_away(codec::H2_FRAME_SIZE_ERROR);
@@ -1319,17 +1382,19 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
     // the connection window cannot leak when a stream is torn down early.
     void erase_stream(std::uint32_t stream_id) {
         auto it = m_streams.find(stream_id);
-        if (it == m_streams.end()) return;
+        if (it == m_streams.end())
+            return;
         if (it->second.recv_owed_conn > 0) {
             replenish_conn(it->second.recv_owed_conn);
         }
         // Release a producer parked on backpressure: this stream will never
         // drain now, so it must not be left waiting on a queue that is gone.
-        if (it->second.out_space) it->second.out_space->close();
+        if (it->second.out_space)
+            it->second.out_space->close();
         m_streams.erase(it);
     }
 
-    bool on_ping(const codec::H2FrameHeader& hdr, std::string_view payload) {
+    bool on_ping(const codec::H2FrameHeader &hdr, std::string_view payload) {
         // §6.7: a PING is 8 octets, and applies to the connection.
         if (hdr.stream_id != 0) {
             go_away(codec::H2_PROTOCOL_ERROR);
@@ -1339,8 +1404,10 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
             go_away(codec::H2_FRAME_SIZE_ERROR);
             return false;
         }
-        if (hdr.has_flag(codec::H2_FLAG_ACK)) return true;
-        append_frame(codec::H2FrameType::Ping, codec::H2_FLAG_ACK, 0, payload);  // echo
+        if (hdr.has_flag(codec::H2_FLAG_ACK))
+            return true;
+        append_frame(codec::H2FrameType::Ping, codec::H2_FLAG_ACK, 0,
+                     payload); // echo
         return true;
     }
 
@@ -1366,8 +1433,9 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
     // Credits `n` octets consumed on one stream back to both the stream window
     // and the connection window (batched per level). Called when the handler has
     // read that much body (via the Body consume hook) or for bytes that are never
-    // delivered (padding), so credit is only returned for data no longer buffered.
-    void credit_consumed(Stream& st, std::int64_t n) {
+    // delivered (padding), so credit is only returned for data no longer
+    // buffered.
+    void credit_consumed(Stream &st, std::int64_t n) {
         st.recv_pending += n;
         if (st.recv_pending >= m_limits.h2_initial_window / 2) {
             send_window_update(st.id, static_cast<std::uint32_t>(st.recv_pending));
@@ -1388,7 +1456,8 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
             return;
         }
         it->second.recv_owed_conn -= static_cast<std::int64_t>(n);
-        if (it->second.recv_owed_conn < 0) it->second.recv_owed_conn = 0;  // defensive
+        if (it->second.recv_owed_conn < 0)
+            it->second.recv_owed_conn = 0; // defensive
         credit_consumed(it->second, static_cast<std::int64_t>(n));
         flush();
 
@@ -1402,7 +1471,7 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
                 it->second.paused_frame.clear();
                 m_body_paused = false;
             } else {
-                return;  // still full: stay paused, try again on the next consume
+                return; // still full: stay paused, try again on the next consume
             }
         }
         if (!m_recv_buf.empty()) {
@@ -1419,19 +1488,21 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
     // of stream entries and receive-window credit on long-lived connections).
     void maybe_complete_stream(std::uint32_t stream_id) {
         auto it = m_streams.find(stream_id);
-        if (it == m_streams.end()) return;
+        if (it == m_streams.end())
+            return;
         if (it->second.half_closed_remote && it->second.end_stream_sent) {
             erase_stream(stream_id);
         }
     }
 
     void go_away(std::uint32_t error_code_value) {
-        if (m_goaway_sent) return;
+        if (m_goaway_sent)
+            return;
         // Remember the code so the teardown path can re-serialize the GOAWAY if the
         // write loop was cancelled before it reached the wire.
         m_goaway_error = error_code_value;
         std::string payload;
-        append_u32(payload, m_next_peer_stream_id);  // last stream id we processed
+        append_u32(payload, m_next_peer_stream_id); // last stream id we processed
         append_u32(payload, error_code_value);
         append_frame(codec::H2FrameType::Goaway, 0, 0, payload);
         m_goaway_sent = true;
@@ -1444,9 +1515,10 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
         // HEADERS always precede DATA: submit_headers() runs synchronously on
         // this executor when the handler replies, appending the HEADERS frame to
         // m_out before any body bytes are queued here.
-        std::vector<std::uint32_t> finished;  // streams that just emitted END_STREAM
-        for (auto& [stream_id, st] : m_streams) {
-            if (st.end_stream_sent) continue;
+        std::vector<std::uint32_t> finished; // streams that just emitted END_STREAM
+        for (auto &[stream_id, st] : m_streams) {
+            if (st.end_stream_sent)
+                continue;
 
             // Emit DATA while the connection and stream windows both allow it.
             for (;;) {
@@ -1462,13 +1534,14 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
                 }
 
                 std::int64_t window = std::min<std::int64_t>(m_conn_send_window, st.send_window);
-                if (window <= 0) break;  // blocked on flow control; resume on WINDOW_UPDATE
+                if (window <= 0)
+                    break; // blocked on flow control; resume on WINDOW_UPDATE
 
-                std::string& front = st.out_queue.front();
+                std::string &front = st.out_queue.front();
                 std::size_t available = front.size() - st.out_offset;
-                std::size_t budget = static_cast<std::size_t>(std::min<std::int64_t>(
-                    window,
-                    static_cast<std::int64_t>(std::min<std::uint32_t>(m_peer_max_frame_size, m_limits.h2_max_frame_size))));
+                std::size_t budget = static_cast<std::size_t>(
+                    std::min<std::int64_t>(window, static_cast<std::int64_t>(std::min<std::uint32_t>(
+                                                       m_peer_max_frame_size, m_limits.h2_max_frame_size))));
                 std::size_t take = std::min(available, budget);
                 if (take == 0) {
                     // No progress possible (frame-size limit configured to 0):
@@ -1508,18 +1581,20 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
         }
         // Retire any stream that is now complete in both directions (this may
         // erase entries, so it must happen after the iteration above).
-        for (std::uint32_t sid : finished) maybe_complete_stream(sid);
+        for (std::uint32_t sid : finished)
+            maybe_complete_stream(sid);
     }
 
     // --- handler dispatch ---
 
     void dispatch_stream(std::uint32_t stream_id) {
         auto it = m_streams.find(stream_id);
-        if (it == m_streams.end() || it->second.dispatched) return;
+        if (it == m_streams.end() || it->second.dispatched)
+            return;
         it->second.dispatched = true;
         auto request = it->second.request;
         auto writer = it->second.writer;
-        auto self = this->shared_from_this();  // keep engine alive across suspensions
+        auto self = this->shared_from_this(); // keep engine alive across suspensions
         std::uint32_t sid = stream_id;
         asio::co_spawn(
             m_executor,
@@ -1533,7 +1608,7 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
                                           request->method() == Method::Head));
                 try {
                     co_await self->m_dispatch(request, response, self->m_transport->tls_handle());
-                } catch (const std::exception& e) {
+                } catch (const std::exception &e) {
                     SIMPLE_HTTP_ERROR_LOG("h2 handler(stream={}) threw: {}", sid, e.what());
                     self->reset_stream(sid, codec::H2_INTERNAL_ERROR);
                 } catch (...) {
@@ -1554,31 +1629,31 @@ class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> 
     std::chrono::steady_clock::time_point m_deadline{};
 
     Dispatcher m_dispatch;
-    codec::HpackDecoder m_decoder;                       // connection-scoped (read loop only)
+    codec::HpackDecoder m_decoder; // connection-scoped (read loop only)
     std::unordered_map<std::uint32_t, Stream> m_streams;
 
-    std::string m_recv_buf;  // received bytes awaiting frame parsing
-    std::string m_out;       // serialized frames awaiting transport write
+    std::string m_recv_buf; // received bytes awaiting frame parsing
+    std::string m_out;      // serialized frames awaiting transport write
 
-    std::uint32_t m_goaway_error{0};  // code for the GOAWAY re-emitted on teardown
-    std::int64_t m_conn_send_window = kH2InitialWindow;  // peer's connection-level window for us (send side)
-    std::int64_t m_conn_recv_window = kH2InitialWindow;  // our connection-level window to the peer (recv side)
-    std::int64_t m_conn_recv_pending = 0;                // consumed bytes awaiting a batched connection WINDOW_UPDATE
-    std::int32_t m_peer_initial_window = kH2InitialWindow;  // peer SETTINGS_INITIAL_WINDOW_SIZE
+    std::uint32_t m_goaway_error{0};                       // code for the GOAWAY re-emitted on teardown
+    std::int64_t m_conn_send_window = kH2InitialWindow;    // peer's connection-level window for us (send side)
+    std::int64_t m_conn_recv_window = kH2InitialWindow;    // our connection-level window to the peer (recv side)
+    std::int64_t m_conn_recv_pending = 0;                  // consumed bytes awaiting a batched connection WINDOW_UPDATE
+    std::int32_t m_peer_initial_window = kH2InitialWindow; // peer SETTINGS_INITIAL_WINDOW_SIZE
     std::uint32_t m_peer_max_frame_size = static_cast<std::uint32_t>(kH2MaxFrameSize);
 
-    std::uint32_t m_next_peer_stream_id = 0;  // highest client stream id seen
-    std::uint32_t m_continuation_stream = 0;  // stream awaiting CONTINUATION, or 0
+    std::uint32_t m_next_peer_stream_id = 0; // highest client stream id seen
+    std::uint32_t m_continuation_stream = 0; // stream awaiting CONTINUATION, or 0
 
     bool m_alive = true;
     bool m_goaway_sent = false;
-    bool m_preface_consumed = false;  // client connection preface stripped yet?
+    bool m_preface_consumed = false; // client connection preface stripped yet?
     // Set when a stream's body channel refused a frame; cleared by
     // on_body_consumed() once it has been delivered. Stops parse_available() from
     // reading ahead of a handler that is not draining its body.
     bool m_body_paused = false;
 
     friend class Http2ResponseWriter<Transport>;
-};  // class Http2Engine
+}; // class Http2Engine
 
-}  // namespace simple_http
+} // namespace simple_http

@@ -13,17 +13,18 @@
 //     certificate-verify hook arrive with only the SSL, so the SSL has to carry
 //     the way back. That is `SSL_set_app_data`.
 //
-//   * the `ngtcp2_crypto_ossl_ctx`, which is where the helper keeps per-connection
+//   * the `ngtcp2_crypto_ossl_ctx`, which is where the helper keeps
+//   per-connection
 //     OpenSSL state and which owns the `SSL*` for freeing.
 //
 // Only TLS 1.3 exists here, and only as a server: QUIC forbids anything else
 // (RFC 9001 §4.2), and this library has no HTTP/3 client.
 
-#include <cstdint>
-
 #include <ngtcp2/ngtcp2.h>
 #include <ngtcp2/ngtcp2_crypto_ossl.h>
 #include <openssl/ssl.h>
+
+#include <cstdint>
 
 #include "../core/logging.h"
 #include "../core/types.h"
@@ -41,10 +42,10 @@ class ConnectionCryptoBase {
   public:
     ConnectionCryptoBase() = default;
     virtual ~ConnectionCryptoBase() = default;
-    ConnectionCryptoBase(const ConnectionCryptoBase&) = delete;
-    ConnectionCryptoBase& operator=(const ConnectionCryptoBase&) = delete;
+    ConnectionCryptoBase(const ConnectionCryptoBase &) = delete;
+    ConnectionCryptoBase &operator=(const ConnectionCryptoBase &) = delete;
 
-    [[nodiscard]] virtual ngtcp2_conn* native_conn() noexcept = 0;
+    [[nodiscard]] virtual ngtcp2_conn *native_conn() noexcept = 0;
 };
 
 // The OpenSSL glue for one QUIC connection. Owned by the connection, which must
@@ -62,7 +63,7 @@ class QuicCrypto {
     // needs, and `get_conn` then reverses exactly that adjustment. Storing an
     // unadjusted `void*` and casting it back would work only while this base
     // happens to sit at offset zero.
-    explicit QuicCrypto(ConnectionCryptoBase* owner) {
+    explicit QuicCrypto(ConnectionCryptoBase *owner) {
         // Process-wide setup for the OpenSSL crypto helper. Documented as
         // optional (it exists to avoid a performance regression), but it is what
         // the reference implementation does before creating any context, and it
@@ -83,7 +84,7 @@ class QuicCrypto {
     }
 
     ~QuicCrypto() {
-        if (SSL* ssl = ngtcp2_crypto_ossl_ctx_get_ssl(m_ctx)) {
+        if (SSL *ssl = ngtcp2_crypto_ossl_ctx_get_ssl(m_ctx)) {
             // Clear the back-pointer before the SSL dies: a free is not a
             // callback, but leaving a pointer to a destroyed ref inside a
             // still-reachable SSL object is the kind of thing that only shows up
@@ -94,18 +95,19 @@ class QuicCrypto {
         ngtcp2_crypto_ossl_ctx_del(m_ctx);
     }
 
-    QuicCrypto(const QuicCrypto&) = delete;
-    QuicCrypto& operator=(const QuicCrypto&) = delete;
-    QuicCrypto(QuicCrypto&&) = delete;
-    QuicCrypto& operator=(QuicCrypto&&) = delete;
+    QuicCrypto(const QuicCrypto &) = delete;
+    QuicCrypto &operator=(const QuicCrypto &) = delete;
+    QuicCrypto(QuicCrypto &&) = delete;
+    QuicCrypto &operator=(QuicCrypto &&) = delete;
 
     // Create this connection's SSL from the listener's context and put it in
     // server mode. Returns false if OpenSSL refuses — which at this point means
     // the context itself is unusable, not that the peer did anything.
-    [[nodiscard]] bool init(SSL_CTX* ssl_ctx) {
-        if (m_ctx == nullptr) return false;
+    [[nodiscard]] bool init(SSL_CTX *ssl_ctx) {
+        if (m_ctx == nullptr)
+            return false;
 
-        SSL* ssl = SSL_new(ssl_ctx);
+        SSL *ssl = SSL_new(ssl_ctx);
         if (ssl == nullptr) {
             SIMPLE_HTTP_ERROR_LOG("quic: SSL_new failed");
             return false;
@@ -121,23 +123,23 @@ class QuicCrypto {
         return true;
     }
 
-    [[nodiscard]] SSL* ssl() { return ngtcp2_crypto_ossl_ctx_get_ssl(m_ctx); }
+    [[nodiscard]] SSL *ssl() { return ngtcp2_crypto_ossl_ctx_get_ssl(m_ctx); }
     // What the connection must hand to `ngtcp2_conn_set_tls_native_handle`. The
     // crypto helper retrieves its per-connection state with
     // `ngtcp2_conn_get_tls_native_handle2(conn)` and dereferences it without a
     // null check, so a connection that never sets this crashes inside the first
     // `ngtcp2_conn_read_pkt`.
-    [[nodiscard]] ngtcp2_crypto_ossl_ctx* native_handle() { return m_ctx; }
+    [[nodiscard]] ngtcp2_crypto_ossl_ctx *native_handle() { return m_ctx; }
 
   private:
-    static ngtcp2_conn* get_conn(ngtcp2_crypto_conn_ref* ref) {
+    static ngtcp2_conn *get_conn(ngtcp2_crypto_conn_ref *ref) {
         // `user_data` is the QuicConnection. The connection has to supply
         // `native_conn()` — this class cannot know it.
-        return static_cast<ConnectionCryptoBase*>(ref->user_data)->native_conn();
+        return static_cast<ConnectionCryptoBase *>(ref->user_data)->native_conn();
     }
 
     ngtcp2_crypto_conn_ref m_conn_ref{};
-    ngtcp2_crypto_ossl_ctx* m_ctx{nullptr};
+    ngtcp2_crypto_ossl_ctx *m_ctx{nullptr};
 };
 
-}  // namespace simple_http::quic
+} // namespace simple_http::quic

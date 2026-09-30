@@ -4,16 +4,17 @@
 //
 // The library never writes to a stream itself. It formats a record and hands it
 // to whatever LogSink is installed, so a deployment can route records into
-// spdlog, an in-house library, or nothing at all — without the library depending
-// on, or even naming, any of them.
+// spdlog, an in-house library, or nothing at all — without the library
+// depending on, or even naming, any of them.
 //
-// An adapter for an existing logging library is a small LogSink subclass written
-// on the consumer side. That is deliberate: shipping adapters in the library
-// would put the third-party headers on every consumer's include path and imply a
-// dependency the library does not have. The interface therefore contains no
-// third-party types, and spans no logging API's feature set — it carries the
-// fields every logger needs (level, location, category, message) and nothing
-// more, leaving structured fields, routing and formatting to the backend.
+// An adapter for an existing logging library is a small LogSink subclass
+// written on the consumer side. That is deliberate: shipping adapters in the
+// library would put the third-party headers on every consumer's include path
+// and imply a dependency the library does not have. The interface therefore
+// contains no third-party types, and spans no logging API's feature set — it
+// carries the fields every logger needs (level, location, category, message)
+// and nothing more, leaving structured fields, routing and formatting to the
+// backend.
 //
 // Three properties the design is built around:
 //
@@ -22,7 +23,8 @@
 //     that level — and a logger that already knows its own threshold does not
 //     need it configured twice.
 //
-//   * Installing a sink is safe while other threads log: the swap is atomic, and
+//   * Installing a sink is safe while other threads log: the swap is atomic,
+//   and
 //     a thread already inside a sink keeps that sink alive until it returns.
 //
 //   * Nothing is allocated to log the common case. Messages up to
@@ -59,18 +61,18 @@ enum class LogLevel : std::uint8_t {
 
 inline constexpr std::string_view to_string(LogLevel level) noexcept {
     switch (level) {
-        case LogLevel::Trace:
-            return "trace";
-        case LogLevel::Debug:
-            return "debug";
-        case LogLevel::Info:
-            return "info";
-        case LogLevel::Warn:
-            return "warn";
-        case LogLevel::Error:
-            return "error";
-        case LogLevel::Critical:
-            return "critical";
+    case LogLevel::Trace:
+        return "trace";
+    case LogLevel::Debug:
+        return "debug";
+    case LogLevel::Info:
+        return "info";
+    case LogLevel::Warn:
+        return "warn";
+    case LogLevel::Error:
+        return "error";
+    case LogLevel::Critical:
+        return "critical";
     }
     return "unknown";
 }
@@ -89,7 +91,7 @@ inline constexpr std::string_view basename(std::string_view path) noexcept {
 // it. This is what keeps the facade allocation-free.
 struct LogRecord {
     LogLevel level;
-    std::string_view category;  // module tag; empty when the caller has none
+    std::string_view category; // module tag; empty when the caller has none
     std::source_location where;
     std::string_view message;
 };
@@ -103,7 +105,7 @@ class LogSink {
     virtual bool enabled(LogLevel level) const noexcept = 0;
 
     // `record` is valid only for the duration of this call.
-    virtual void log(const LogRecord& record) = 0;
+    virtual void log(const LogRecord &record) = 0;
 };
 
 namespace detail {
@@ -112,21 +114,21 @@ namespace detail {
 // atomic load and writers a safe swap, with no lock on the logging path; a
 // thread inside a sink holds its own shared_ptr, so a swap cannot pull the sink
 // out from under it.
-inline std::atomic<std::shared_ptr<LogSink>>& sink_slot() noexcept {
+inline std::atomic<std::shared_ptr<LogSink>> &sink_slot() noexcept {
     static std::atomic<std::shared_ptr<LogSink>> slot;
     return slot;
 }
 
-// Messages up to this length are formatted onto the stack; longer ones fall back
-// to a heap buffer. Sized for the usual case of an error plus its context.
+// Messages up to this length are formatted onto the stack; longer ones fall
+// back to a heap buffer. Sized for the usual case of an error plus its context.
 inline constexpr std::size_t kInlineMessageBytes = 512;
 
 template <typename... Args>
-void dispatch(LogLevel level, std::string_view category, std::source_location where,
-              std::format_string<Args...> fmt, Args&&... args) {
+void dispatch(LogLevel level, std::string_view category, std::source_location where, std::format_string<Args...> fmt,
+              Args &&...args) {
     auto sink = sink_slot().load(std::memory_order_acquire);
     if (!sink || !sink->enabled(level)) {
-        return;  // nothing is formatted for a record the sink would drop
+        return; // nothing is formatted for a record the sink would drop
     }
 
     std::array<char, kInlineMessageBytes> inline_buffer{};
@@ -148,13 +150,13 @@ void dispatch(LogLevel level, std::string_view category, std::source_location wh
 // small tools; a deployment usually installs its own.
 class StreamSink final : public LogSink {
   public:
-    StreamSink(LogLevel minimum, std::FILE* stream) : m_minimum(minimum), m_stream(stream) {}
+    StreamSink(LogLevel minimum, std::FILE *stream) : m_minimum(minimum), m_stream(stream) {}
 
     bool enabled(LogLevel level) const noexcept override {
         return static_cast<std::uint8_t>(level) >= static_cast<std::uint8_t>(m_minimum);
     }
 
-    void log(const LogRecord& record) override {
+    void log(const LogRecord &record) override {
         // One string, one fwrite, under a lock: concurrent records must not
         // interleave halfway through a line.
         const std::string line = std::format("[{}] {}:{}: {}\n", to_string(record.level),
@@ -166,11 +168,11 @@ class StreamSink final : public LogSink {
 
   private:
     LogLevel m_minimum;
-    std::FILE* m_stream;
+    std::FILE *m_stream;
     std::mutex m_mutex;
 };
 
-}  // namespace detail
+} // namespace detail
 
 // Installs `sink` (nullptr drops every record). Safe to call at any time, from
 // any thread, while other threads are logging.
@@ -178,32 +180,31 @@ inline void set_log_sink(std::shared_ptr<LogSink> sink) {
     detail::sink_slot().store(std::move(sink), std::memory_order_release);
 }
 
-inline std::shared_ptr<LogSink> log_sink() noexcept {
-    return detail::sink_slot().load(std::memory_order_acquire);
-}
+inline std::shared_ptr<LogSink> log_sink() noexcept { return detail::sink_slot().load(std::memory_order_acquire); }
 
 // Writes to stderr: "<level> <file>:<line>: <message>".
 inline std::shared_ptr<LogSink> make_stderr_sink(LogLevel minimum = LogLevel::Info) {
     return std::make_shared<detail::StreamSink>(minimum, stderr);
 }
 
-// Writes to stdout, for examples and tests that want it on a captureable stream.
+// Writes to stdout, for examples and tests that want it on a captureable
+// stream.
 inline std::shared_ptr<LogSink> make_stdout_sink(LogLevel minimum = LogLevel::Info) {
     return std::make_shared<detail::StreamSink>(minimum, stdout);
 }
 
-// What the macros expand to. Call it directly to name the category, or to supply
-// a location other than the call site. `where` must be std::source_location::
-// current() evaluated at the call site — the type has no public constructor, so
-// a wrapper function cannot capture the caller's position for you, which is the
-// whole reason the macros exist.
+// What the macros expand to. Call it directly to name the category, or to
+// supply a location other than the call site. `where` must be
+// std::source_location:: current() evaluated at the call site — the type has no
+// public constructor, so a wrapper function cannot capture the caller's
+// position for you, which is the whole reason the macros exist.
 template <typename... Args>
-inline void log(LogLevel level, std::string_view category, std::source_location where,
-                std::format_string<Args...> fmt, Args&&... args) {
+inline void log(LogLevel level, std::string_view category, std::source_location where, std::format_string<Args...> fmt,
+                Args &&...args) {
     detail::dispatch(level, category, where, fmt, std::forward<Args>(args)...);
 }
 
-}  // namespace simple_http
+} // namespace simple_http
 
 #ifndef SIMPLE_HTTP_ENABLE_LOG
 #define SIMPLE_HTTP_ENABLE_LOG 1
@@ -218,11 +219,11 @@ inline void log(LogLevel level, std::string_view category, std::source_location 
 
 #if SIMPLE_HTTP_ENABLE_LOG
 // `category` is a string_view; use "" when the call site has no module tag.
-#define SIMPLE_HTTP_LOG_AT(level, category, ...)                                                 \
-    do {                                                                                         \
-        if constexpr (static_cast<int>(level) >= SIMPLE_HTTP_LOG_ACTIVE_LEVEL) {                 \
-            ::simple_http::log(level, category, std::source_location::current(), __VA_ARGS__);   \
-        }                                                                                        \
+#define SIMPLE_HTTP_LOG_AT(level, category, ...)                                                                       \
+    do {                                                                                                               \
+        if constexpr (static_cast<int>(level) >= SIMPLE_HTTP_LOG_ACTIVE_LEVEL) {                                       \
+            ::simple_http::log(level, category, std::source_location::current(), __VA_ARGS__);                         \
+        }                                                                                                              \
     } while (false)
 #else
 #define SIMPLE_HTTP_LOG_AT(level, category, ...) ((void)0)
@@ -237,13 +238,13 @@ inline void log(LogLevel level, std::string_view category, std::source_location 
 
 // Same, tagged with a module name ("h2", "router", …) that an adapter can route
 // on. The library itself logs untagged; a sink decides what to make of that.
-#define SIMPLE_HTTP_TRACE_LOG_CAT(category, ...) \
+#define SIMPLE_HTTP_TRACE_LOG_CAT(category, ...)                                                                       \
     SIMPLE_HTTP_LOG_AT(::simple_http::LogLevel::Trace, category, __VA_ARGS__)
-#define SIMPLE_HTTP_DEBUG_LOG_CAT(category, ...) \
+#define SIMPLE_HTTP_DEBUG_LOG_CAT(category, ...)                                                                       \
     SIMPLE_HTTP_LOG_AT(::simple_http::LogLevel::Debug, category, __VA_ARGS__)
 #define SIMPLE_HTTP_INFO_LOG_CAT(category, ...) SIMPLE_HTTP_LOG_AT(::simple_http::LogLevel::Info, category, __VA_ARGS__)
 #define SIMPLE_HTTP_WARN_LOG_CAT(category, ...) SIMPLE_HTTP_LOG_AT(::simple_http::LogLevel::Warn, category, __VA_ARGS__)
-#define SIMPLE_HTTP_ERROR_LOG_CAT(category, ...) \
+#define SIMPLE_HTTP_ERROR_LOG_CAT(category, ...)                                                                       \
     SIMPLE_HTTP_LOG_AT(::simple_http::LogLevel::Error, category, __VA_ARGS__)
-#define SIMPLE_HTTP_CRITICAL_LOG_CAT(category, ...) \
+#define SIMPLE_HTTP_CRITICAL_LOG_CAT(category, ...)                                                                    \
     SIMPLE_HTTP_LOG_AT(::simple_http::LogLevel::Critical, category, __VA_ARGS__)

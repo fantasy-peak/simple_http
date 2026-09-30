@@ -3,23 +3,27 @@
 // HTTP/1.x engine — beast-free.
 //
 // Http1Engine::run drives one connection: read bytes off the Transport into an
-// H1Parser (engine/h1/h1_parser.h) until a full head is parsed, frame the request
-// body (chunked / Content-Length / none) and feed it into Request::body(), then
-// hand the request to the dispatcher (Router) with the transport's TLS handle.
-// The loop repeats while the connection is keep-alive. Responses go through
-// Http1ResponseWriter, which hand-serializes either a Content-Length reply
-// (one-shot) or a chunked stream directly onto the transport.
+// H1Parser (engine/h1/h1_parser.h) until a full head is parsed, frame the
+// request body (chunked / Content-Length / none) and feed it into
+// Request::body(), then hand the request to the dispatcher (Router) with the
+// transport's TLS handle. The loop repeats while the connection is keep-alive.
+// Responses go through Http1ResponseWriter, which hand-serializes either a
+// Content-Length reply (one-shot) or a chunked stream directly onto the
+// transport.
 //
 // Upgrades: an Upgrade: websocket request (matched by a registered ws route) is
 // handed to the WebSocket layer; an Upgrade: h2c request carrying an
-// HTTP2-Settings header is answered with 101 and handed to Http2Engine::run_h2c,
-// which replays the original request as HTTP/2 stream 1 and continues as h2.
+// HTTP2-Settings header is answered with 101 and handed to
+// Http2Engine::run_h2c, which replays the original request as HTTP/2 stream 1
+// and continues as h2.
 //
 // Thread safety (model A): every write first hops onto the connection executor
 // before touching the transport, so a Response captured by the handler is safe
 // to use from any thread.
 
 #include <array>
+#include <boost/asio.hpp>
+#include <boost/asio/experimental/awaitable_operators.hpp>
 #include <charconv>
 #include <chrono>
 #include <cstddef>
@@ -29,9 +33,6 @@
 #include <span>
 #include <string>
 #include <utility>
-
-#include <boost/asio.hpp>
-#include <boost/asio/experimental/awaitable_operators.hpp>
 
 #include "../../core/http_method.h"
 #include "../../core/http_status.h"
@@ -56,12 +57,12 @@ namespace asio = boost::asio;
 
 // A connection-level idle deadline shared between the engine and the response
 // writer(s) it creates, so that both reads and writes can refresh it and the
-// watchdog reaps a connection only when it is genuinely idle in both directions.
+// watchdog reaps a connection only when it is genuinely idle in both
+// directions.
 using SharedDeadline = std::shared_ptr<std::chrono::steady_clock::time_point>;
 
 // ResponseWriter for HTTP/1.x. Hand-serializes directly onto the transport.
-template <TransportLike Transport>
-class Http1ResponseWriter : public ResponseWriter {
+template <TransportLike Transport> class Http1ResponseWriter : public ResponseWriter {
   public:
     // `deadline` and `idle_timeout` let a write refresh the connection's idle
     // deadline (shared with the engine's read path and watchdog). `alt_svc` is
@@ -70,12 +71,8 @@ class Http1ResponseWriter : public ResponseWriter {
     // where the octets go.
     Http1ResponseWriter(std::shared_ptr<Transport> transport, Version version, SharedDeadline deadline,
                         std::chrono::steady_clock::duration idle_timeout, std::string alt_svc = {})
-        : m_transport(std::move(transport)),
-          m_executor(m_transport->get_executor()),
-          m_version(version),
-          m_deadline(std::move(deadline)),
-          m_idle_timeout(idle_timeout),
-          m_alt_svc(std::move(alt_svc)) {}
+        : m_transport(std::move(transport)), m_executor(m_transport->get_executor()), m_version(version),
+          m_deadline(std::move(deadline)), m_idle_timeout(idle_timeout), m_alt_svc(std::move(alt_svc)) {}
 
     // Set by the engine when the request method was HEAD: the response keeps its
     // headers (so the client learns the entity length) but carries no body
@@ -84,7 +81,8 @@ class Http1ResponseWriter : public ResponseWriter {
 
     asio::awaitable<error_code> send(int status, Headers headers, std::string body) override {
         co_await hop();
-        if (!m_open) co_return make_error_code(asio::error::not_connected);
+        if (!m_open)
+            co_return make_error_code(asio::error::not_connected);
 
         if (status == 204 || status == 304) {
             // Neither a body nor a Content-Length (RFC 9110 §15.3.5/§15.4.5).
@@ -106,47 +104,54 @@ class Http1ResponseWriter : public ResponseWriter {
         append_status_line(head, status);
         append_headers(head, headers);
         head.append("\r\n");
-        if (m_head_request) {  // headers only
+        if (m_head_request) { // headers only
             auto ec = co_await write_raw(head);
-            if (ec) m_open = false;
+            if (ec)
+                m_open = false;
             co_return ec;
         }
 
         const std::array<ConstByteSpan, 2> buffers{as_bytes(head), as_bytes(body)};
         auto ec = co_await write_raw_seq(buffers);
-        if (ec) m_open = false;
+        if (ec)
+            m_open = false;
         co_return ec;
     }
 
     asio::awaitable<error_code> send_bodyless(int status, Headers headers) override {
         co_await hop();
-        if (!m_open) co_return make_error_code(asio::error::not_connected);
+        if (!m_open)
+            co_return make_error_code(asio::error::not_connected);
         std::string out;
         out.reserve(kResponseOverhead + headers_bytes_with_alt_svc(headers));
         append_status_line(out, status);
         append_headers(out, headers);
         out.append("\r\n");
         auto ec = co_await write_raw(out);
-        if (ec) m_open = false;
+        if (ec)
+            m_open = false;
         co_return ec;
     }
 
     asio::awaitable<error_code> send_continue() override {
         co_await hop();
-        if (!m_open) co_return make_error_code(asio::error::not_connected);
+        if (!m_open)
+            co_return make_error_code(asio::error::not_connected);
         auto ec = co_await write_raw("HTTP/1.1 100 Continue\r\n\r\n");
-        if (ec) m_open = false;
+        if (ec)
+            m_open = false;
         co_return ec;
     }
 
     asio::awaitable<error_code> send_headers(int status, Headers headers) override {
         co_await hop();
-        if (!m_open) co_return make_error_code(asio::error::not_connected);
+        if (!m_open)
+            co_return make_error_code(asio::error::not_connected);
 
         // HTTP/1.0 has no chunked framing: such a response is delimited by the
         // connection close, so refuse keep-alive here (append_headers then writes
-        // `connection: close` and the engine closes, since keep_alive_out() is false).
-        // A response to HEAD is delimited by its headers alone.
+        // `connection: close` and the engine closes, since keep_alive_out() is
+        // false). A response to HEAD is delimited by its headers alone.
         if (m_version == Version::Http1 || m_head_request) {
             m_keep_alive_out = false;
         } else {
@@ -159,23 +164,29 @@ class Http1ResponseWriter : public ResponseWriter {
         out.append("\r\n");
 
         auto ec = co_await write_raw(out);
-        if (ec) m_open = false;
+        if (ec)
+            m_open = false;
         co_return ec;
     }
 
     asio::awaitable<error_code> send_chunk(std::string data) override {
-        if (m_head_request) co_return error_code{};  // HEAD: headers only
+        if (m_head_request)
+            co_return error_code{}; // HEAD: headers only
         co_await hop();
-        if (!m_open) co_return make_error_code(asio::error::not_connected);
+        if (!m_open)
+            co_return make_error_code(asio::error::not_connected);
         auto ec = co_await write_chunked(data, /*last=*/false);
-        if (ec) m_open = false;
+        if (ec)
+            m_open = false;
         co_return ec;
     }
 
     asio::awaitable<error_code> send_last(std::string data) override {
-        if (m_head_request) co_return error_code{};  // HEAD: headers only
+        if (m_head_request)
+            co_return error_code{}; // HEAD: headers only
         co_await hop();
-        if (!m_open) co_return make_error_code(asio::error::not_connected);
+        if (!m_open)
+            co_return make_error_code(asio::error::not_connected);
         // An empty final chunk is nothing but the terminator; otherwise the data
         // chunk and the terminator go out together.
         error_code ec;
@@ -184,7 +195,8 @@ class Http1ResponseWriter : public ResponseWriter {
         } else {
             ec = co_await write_chunked(data, /*last=*/true);
         }
-        if (ec) m_open = false;
+        if (ec)
+            m_open = false;
         co_return ec;
     }
 
@@ -213,7 +225,7 @@ class Http1ResponseWriter : public ResponseWriter {
     // Appends the status line ("HTTP/1.1 200 OK\r\n") straight onto `out`.
     // Hand-appended rather than std::format: this runs once per response, and
     // the format-string machinery costs more than the copies it saves.
-    void append_status_line(std::string& out, int status) const {
+    void append_status_line(std::string &out, int status) const {
         out.append(m_version == Version::Http1 ? "HTTP/1.0 " : "HTTP/1.1 ");
         append_int(out, status);
         out.push_back(' ');
@@ -222,7 +234,7 @@ class Http1ResponseWriter : public ResponseWriter {
     }
 
     // Appends a non-negative integer without allocating.
-    static void append_int(std::string& out, int value) {
+    static void append_int(std::string &out, int value) {
         char buf[std::numeric_limits<int>::digits10 + 2];
         auto [end, ec] = std::to_chars(buf, buf + sizeof(buf), value);
         out.append(buf, static_cast<std::size_t>(end - buf));
@@ -230,7 +242,7 @@ class Http1ResponseWriter : public ResponseWriter {
 
     // Framing pieces the scatter-gather writes below share.
     static constexpr std::string_view kCrLf = "\r\n";
-    static constexpr std::string_view kLastChunk = "0\r\n\r\n";  // trailer-less terminator
+    static constexpr std::string_view kLastChunk = "0\r\n\r\n"; // trailer-less terminator
 
     // The same bytes, as the transport's buffer type.
     static ConstByteSpan as_bytes(std::string_view bytes) {
@@ -239,19 +251,20 @@ class Http1ResponseWriter : public ResponseWriter {
 
     // Wire size of the fields as append_headers() writes them, so a response
     // buffer can be sized once instead of growing and recopying.
-    static std::size_t headers_bytes(const Headers& headers) {
+    static std::size_t headers_bytes(const Headers &headers) {
         std::size_t total = 0;
-        for (const auto& [name, value] : headers) {
-            total += name.size() + value.size() + 4;  // ": " + CRLF
+        for (const auto &[name, value] : headers) {
+            total += name.size() + value.size() + 4; // ": " + CRLF
         }
         return total;
     }
 
     // The same, plus the Alt-Svc line append_headers() adds on its own, so the
     // reserve stays an upper bound rather than an estimate that reallocates once.
-    [[nodiscard]] std::size_t headers_bytes_with_alt_svc(const Headers& headers) const {
+    [[nodiscard]] std::size_t headers_bytes_with_alt_svc(const Headers &headers) const {
         std::size_t total = headers_bytes(headers);
-        if (!m_alt_svc.empty()) total += kAltSvcPrefix.size() + m_alt_svc.size() + 2;
+        if (!m_alt_svc.empty())
+            total += kAltSvcPrefix.size() + m_alt_svc.size() + 2;
         return total;
     }
 
@@ -262,10 +275,11 @@ class Http1ResponseWriter : public ResponseWriter {
     static constexpr std::string_view kKeepAliveConnection = "connection: keep-alive\r\n";
     static constexpr std::string_view kCloseConnection = "connection: close\r\n";
 
-    void append_headers(std::string& out, const Headers& headers) const {
+    void append_headers(std::string &out, const Headers &headers) const {
         bool saw_connection = false;
-        for (const auto& [name, value] : headers) {
-            if (name == "connection") saw_connection = true;
+        for (const auto &[name, value] : headers) {
+            if (name == "connection")
+                saw_connection = true;
             out.append(name);
             out.append(": ");
             out.append(value);
@@ -307,7 +321,8 @@ class Http1ResponseWriter : public ResponseWriter {
     asio::awaitable<error_code> write_raw_seq(std::span<const ConstByteSpan> buffers) {
         // Writing is connection activity: refresh the shared idle deadline so the
         // watchdog does not reap a connection busy streaming a response.
-        if (m_deadline) *m_deadline = std::chrono::steady_clock::now() + m_idle_timeout;
+        if (m_deadline)
+            *m_deadline = std::chrono::steady_clock::now() + m_idle_timeout;
         auto [ec, n] = co_await m_transport->async_write_seq(buffers);
         (void)n;
         co_return ec;
@@ -321,23 +336,20 @@ class Http1ResponseWriter : public ResponseWriter {
         co_return co_await write_raw_seq(buffers);
     }
 
-    asio::awaitable<void> hop() const {
-        co_await asio::dispatch(asio::bind_executor(m_executor, asio::use_awaitable));
-    }
+    asio::awaitable<void> hop() const { co_await asio::dispatch(asio::bind_executor(m_executor, asio::use_awaitable)); }
 
     std::shared_ptr<Transport> m_transport;
-    decltype(std::declval<Transport&>().get_executor()) m_executor;
+    decltype(std::declval<Transport &>().get_executor()) m_executor;
     Version m_version;
     bool m_open{true};
     bool m_keep_alive_out{true};
-    bool m_head_request{false};  // response to HEAD: no body (RFC 9110 §9.3.2)
+    bool m_head_request{false}; // response to HEAD: no body (RFC 9110 §9.3.2)
     SharedDeadline m_deadline;  // shared with the engine (read path + watchdog)
     std::chrono::steady_clock::duration m_idle_timeout{};
-    std::string m_alt_svc;  // rendered Alt-Svc value; empty for none
+    std::string m_alt_svc; // rendered Alt-Svc value; empty for none
 };
 
-template <TransportLike Transport>
-class Http1Engine {
+template <TransportLike Transport> class Http1Engine {
   public:
     explicit Http1Engine(std::shared_ptr<Transport> transport, EngineLimits limits = {})
         : m_transport(std::move(transport)), m_executor(m_transport->get_executor()), m_limits(limits) {}
@@ -346,7 +358,7 @@ class Http1Engine {
     // keep-alive. `dispatch` runs the handler for each request. `initial` may
     // contain bytes already read from the transport during protocol detection
     // (e.g. by a preceding peek); they are consumed before reading more.
-    asio::awaitable<void> run(const Dispatcher& dispatch, std::string initial = {}, WsLookup ws_lookup = {},
+    asio::awaitable<void> run(const Dispatcher &dispatch, std::string initial = {}, WsLookup ws_lookup = {},
                               WsProxyLookup ws_proxy_lookup = {}, WsLookup ws_regex_lookup = {}) {
         using namespace asio::experimental::awaitable_operators;
         m_ws_lookup = std::move(ws_lookup);
@@ -377,7 +389,8 @@ class Http1Engine {
                     co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
                 }
             }
-            if (std::chrono::steady_clock::now() >= *m_deadline) break;  // idle timeout elapsed
+            if (std::chrono::steady_clock::now() >= *m_deadline)
+                break; // idle timeout elapsed
         }
         co_return;
     }
@@ -391,7 +404,7 @@ class Http1Engine {
         co_return co_await m_transport->async_read_some(buf);
     }
 
-    asio::awaitable<void> serve_loop(const Dispatcher& dispatch, std::string initial) {
+    asio::awaitable<void> serve_loop(const Dispatcher &dispatch, std::string initial) {
         m_buf = std::move(initial);
         auto exec = m_transport->get_executor();
 
@@ -401,13 +414,13 @@ class Http1Engine {
             auto state = parser.parse_head();
             while (state == H1Parser::State::NeedMore) {
                 if (parser.buffered() > m_limits.max_header_bytes) {
-                    co_await send_error_response(431);  // Request Header Fields Too Large
+                    co_await send_error_response(431); // Request Header Fields Too Large
                     co_return;
                 }
-                std::array<std::byte, 8192> tmp;  // no init: read_some fills [0,n)
+                std::array<std::byte, 8192> tmp; // no init: read_some fills [0,n)
                 auto [ec, n] = co_await read_some(std::span<std::byte>{tmp});
                 if (ec) {
-                    co_return;  // EOF or error before a full head — nothing more to do
+                    co_return; // EOF or error before a full head — nothing more to do
                 }
                 parser.feed(tmp.data(), n);
                 state = parser.parse_head();
@@ -417,7 +430,7 @@ class Http1Engine {
                 co_return;
             }
 
-            const auto& head = parser.head();
+            const auto &head = parser.head();
             Version version = head.version;
             // RFC 9112 §3.2: a request carries exactly one Host. Zero leaves no
             // authority to route on; more than one is ambiguous, and two hops
@@ -455,7 +468,7 @@ class Http1Engine {
                     if (auto handler = m_ws_lookup(ws_path)) {
                         m_buf.assign(parser.remainder());
                         if (co_await try_websocket_upgrade(head, *handler)) {
-                            co_return;  // connection upgraded; run() must not close it
+                            co_return; // connection upgraded; run() must not close it
                         }
                         co_await send_error_response(404);
                         co_return;
@@ -466,10 +479,10 @@ class Http1Engine {
                 // local ws routes.
                 if (m_ws_proxy_lookup) {
                     if (auto target = m_ws_proxy_lookup(ws_path)) {
-                        m_upgraded = true;  // stop the watchdog from closing the transport
-                        co_await run_ws_proxy(m_transport, head, std::string{parser.remainder()},
-                                              std::move(*target), m_limits.idle_timeout);
-                        co_return;  // tunnel finished; run() must not touch the transport
+                        m_upgraded = true; // stop the watchdog from closing the transport
+                        co_await run_ws_proxy(m_transport, head, std::string{parser.remainder()}, std::move(*target),
+                                              m_limits.idle_timeout);
+                        co_return; // tunnel finished; run() must not touch the transport
                     }
                 }
 
@@ -478,7 +491,7 @@ class Http1Engine {
                     if (auto handler = m_ws_regex_lookup(ws_path)) {
                         m_buf.assign(parser.remainder());
                         if (co_await try_websocket_upgrade(head, *handler)) {
-                            co_return;  // connection upgraded; run() must not close it
+                            co_return; // connection upgraded; run() must not close it
                         }
                         co_await send_error_response(404);
                         co_return;
@@ -511,14 +524,14 @@ class Http1Engine {
                 if (!chunked && cl) {
                     std::uint64_t len = 0;
                     switch (parse_uint(*cl, 10, m_limits.max_body_bytes, len)) {
-                        case NumParse::Invalid:
-                            co_await send_error_response(400);  // Bad Request
-                            co_return;
-                        case NumParse::Overflow:
-                            co_await send_error_response(413);  // Payload Too Large
-                            co_return;
-                        case NumParse::Ok:
-                            break;
+                    case NumParse::Invalid:
+                        co_await send_error_response(400); // Bad Request
+                        co_return;
+                    case NumParse::Overflow:
+                        co_await send_error_response(413); // Payload Too Large
+                        co_return;
+                    case NumParse::Ok:
+                        break;
                     }
                 }
             }
@@ -535,10 +548,9 @@ class Http1Engine {
             // (req.body().read()), which pulls/frames bytes off the socket only
             // when asked. A handler that ignores the body triggers no body reads.
             setup_body_framing(head);
-            request->body().set_pull_provider(
-                [this]() -> asio::awaitable<std::expected<ReadResult, error_code>> {
-                    co_return co_await pull_body_chunk();
-                });
+            request->body().set_pull_provider([this]() -> asio::awaitable<std::expected<ReadResult, error_code>> {
+                co_return co_await pull_body_chunk();
+            });
 
             auto writer = std::make_shared<Http1ResponseWriter<Transport>>(
                 m_transport, version, m_deadline, m_limits.idle_timeout, m_limits.alt_svc_value());
@@ -569,13 +581,13 @@ class Http1Engine {
                 break;
             }
         }
-        co_return;  // run() closes the transport when serve_loop returns
+        co_return; // run() closes the transport when serve_loop returns
     }
 
     // Configures body framing for the current request from its head (called once
     // per request, before dispatch). Chunked takes precedence over Content-Length
     // (RFC 7230 §3.3.3); a request with neither has no body.
-    void setup_body_framing(const ParsedHead& head) {
+    void setup_body_framing(const ParsedHead &head) {
         m_body_done = false;
         m_body_remaining = 0;
         m_body_total = 0;
@@ -591,25 +603,27 @@ class Http1Engine {
             (void)parse_uint(*cl, 10, m_limits.max_body_bytes, len);
             m_body_mode = BodyMode::Fixed;
             m_body_remaining = len;
-            if (len == 0) m_body_done = true;
+            if (len == 0)
+                m_body_done = true;
             return;
         }
         m_body_mode = BodyMode::None;
-        m_body_done = true;  // no body
+        m_body_done = true; // no body
     }
 
     // Pull one body chunk on demand (Body::read calls this via the provider).
     // Returns a data chunk, end-of-body, or an error_code.
     asio::awaitable<std::expected<ReadResult, error_code>> pull_body_chunk() {
-        if (m_body_done) co_return ReadResult::end();
+        if (m_body_done)
+            co_return ReadResult::end();
         switch (m_body_mode) {
-            case BodyMode::None:
-                m_body_done = true;
-                co_return ReadResult::end();
-            case BodyMode::Fixed:
-                co_return co_await pull_fixed_chunk();
-            case BodyMode::Chunked:
-                co_return co_await pull_chunked_chunk();
+        case BodyMode::None:
+            m_body_done = true;
+            co_return ReadResult::end();
+        case BodyMode::Fixed:
+            co_return co_await pull_fixed_chunk();
+        case BodyMode::Chunked:
+            co_return co_await pull_chunked_chunk();
         }
         co_return ReadResult::end();
     }
@@ -621,20 +635,20 @@ class Http1Engine {
             co_return ReadResult::end();
         }
         if (m_buf.empty()) {
-            std::array<std::byte, 8192> tmp;  // no init: read_some fills [0,n)
+            std::array<std::byte, 8192> tmp; // no init: read_some fills [0,n)
             auto [ec, n] = co_await read_some(std::span<std::byte>{tmp});
             if (ec) {
                 m_body_done = true;
                 co_return std::unexpected(ec);
             }
-            m_buf.append(reinterpret_cast<const char*>(tmp.data()), n);
+            m_buf.append(reinterpret_cast<const char *>(tmp.data()), n);
         }
-        std::size_t take = static_cast<std::size_t>(
-            std::min<std::uint64_t>(m_body_remaining, m_buf.size()));
+        std::size_t take = static_cast<std::size_t>(std::min<std::uint64_t>(m_body_remaining, m_buf.size()));
         std::string chunk = m_buf.substr(0, take);
         m_buf.erase(0, take);
         m_body_remaining -= take;
-        if (m_body_remaining == 0) m_body_done = true;
+        if (m_body_remaining == 0)
+            m_body_done = true;
         co_return ReadResult::chunk(std::move(chunk));
     }
 
@@ -680,7 +694,7 @@ class Http1Engine {
             co_return std::unexpected(make_error_code(asio::error::eof));
         }
         std::string crlf;
-        if (!co_await read_exact(2, crlf)) {  // trailing CRLF after chunk data
+        if (!co_await read_exact(2, crlf)) { // trailing CRLF after chunk data
             m_body_done = true;
             co_return std::unexpected(make_error_code(asio::error::eof));
         }
@@ -701,7 +715,8 @@ class Http1Engine {
     asio::awaitable<bool> drain_body() {
         while (!m_body_done) {
             auto r = co_await pull_body_chunk();
-            if (!r) co_return false;  // error mid-body: cannot reuse the connection
+            if (!r)
+                co_return false; // error mid-body: cannot reuse the connection
         }
         co_return true;
     }
@@ -710,8 +725,9 @@ class Http1Engine {
     // upper-bound checks. `max` is the largest accepted value; anything larger
     // (or that would overflow) is reported as Overflow rather than wrapping.
     enum class NumParse { Ok, Invalid, Overflow };
-    static NumParse parse_uint(std::string_view s, unsigned base, std::uint64_t max, std::uint64_t& out) {
-        if (s.empty()) return NumParse::Invalid;
+    static NumParse parse_uint(std::string_view s, unsigned base, std::uint64_t max, std::uint64_t &out) {
+        if (s.empty())
+            return NumParse::Invalid;
         std::uint64_t v = 0;
         bool any = false;
         for (char c : s) {
@@ -725,47 +741,53 @@ class Http1Engine {
             } else {
                 return NumParse::Invalid;
             }
-            if (v > (max - d) / base) return NumParse::Overflow;  // would exceed max
+            if (v > (max - d) / base)
+                return NumParse::Overflow; // would exceed max
             v = v * base + d;
             any = true;
         }
-        if (!any) return NumParse::Invalid;
+        if (!any)
+            return NumParse::Invalid;
         out = v;
         return NumParse::Ok;
     }
 
-    static bool connection_keep_alive(const ParsedHead& head, Version version) {
+    static bool connection_keep_alive(const ParsedHead &head, Version version) {
         auto conn = head.headers.get("connection");
         if (conn) {
-            if (icontains(*conn, "close")) return false;
-            if (icontains(*conn, "keep-alive")) return true;
+            if (icontains(*conn, "close"))
+                return false;
+            if (icontains(*conn, "keep-alive"))
+                return true;
         }
-        return version != Version::Http1;  // HTTP/1.1 defaults to keep-alive, 1.0 to close
+        return version != Version::Http1; // HTTP/1.1 defaults to keep-alive, 1.0 to close
     }
 
     // Allocation-free ASCII case-insensitive substring test. Called per request
     // for keep-alive detection and body framing, so it avoids the temporary
     // lowercased copies the previous implementation made.
     static bool icontains(std::string_view haystack, std::string_view needle) {
-        if (needle.empty()) return true;
-        if (needle.size() > haystack.size()) return false;
-        auto lower = [](char c) {
-            return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
-        };
+        if (needle.empty())
+            return true;
+        if (needle.size() > haystack.size())
+            return false;
+        auto lower = [](char c) { return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c; };
         const std::size_t last = haystack.size() - needle.size();
         for (std::size_t i = 0; i <= last; ++i) {
             std::size_t j = 0;
             for (; j < needle.size(); ++j) {
-                if (lower(haystack[i + j]) != lower(needle[j])) break;
+                if (lower(haystack[i + j]) != lower(needle[j]))
+                    break;
             }
-            if (j == needle.size()) return true;
+            if (j == needle.size())
+                return true;
         }
         return false;
     }
 
     // Reads one CRLF- or LF-terminated line from m_buf (topping up from the
     // transport as needed), stripping the terminator. Returns false on EOF.
-    asio::awaitable<bool> read_line(std::string& out) {
+    asio::awaitable<bool> read_line(std::string &out) {
         for (;;) {
             std::size_t nl = m_buf.find('\n');
             if (nl != std::string::npos) {
@@ -782,20 +804,22 @@ class Http1Engine {
                 SIMPLE_HTTP_ERROR_LOG("h1 line longer than {} bytes; closing", m_limits.max_header_bytes);
                 co_return false;
             }
-            std::array<std::byte, 8192> tmp;  // no init: read_some fills [0,n)
+            std::array<std::byte, 8192> tmp; // no init: read_some fills [0,n)
             auto [ec, n] = co_await read_some(std::span<std::byte>{tmp});
-            if (ec) co_return false;
-            m_buf.append(reinterpret_cast<const char*>(tmp.data()), n);
+            if (ec)
+                co_return false;
+            m_buf.append(reinterpret_cast<const char *>(tmp.data()), n);
         }
     }
 
     // Reads exactly `len` bytes from m_buf (topping up from the transport).
-    asio::awaitable<bool> read_exact(std::size_t len, std::string& out) {
+    asio::awaitable<bool> read_exact(std::size_t len, std::string &out) {
         while (m_buf.size() < len) {
-            std::array<std::byte, 8192> tmp;  // no init: read_some fills [0,n)
+            std::array<std::byte, 8192> tmp; // no init: read_some fills [0,n)
             auto [ec, n] = co_await read_some(std::span<std::byte>{tmp});
-            if (ec) co_return false;
-            m_buf.append(reinterpret_cast<const char*>(tmp.data()), n);
+            if (ec)
+                co_return false;
+            m_buf.append(reinterpret_cast<const char *>(tmp.data()), n);
         }
         out.assign(m_buf, 0, len);
         m_buf.erase(0, len);
@@ -803,11 +827,11 @@ class Http1Engine {
     }
 
     // Runs the handler; captures failure so run() can close the connection.
-    asio::awaitable<void> run_handler(const Dispatcher& dispatch, std::shared_ptr<Request> request,
-                                      std::shared_ptr<Response> response, bool& failed) {
+    asio::awaitable<void> run_handler(const Dispatcher &dispatch, std::shared_ptr<Request> request,
+                                      std::shared_ptr<Response> response, bool &failed) {
         try {
             co_await dispatch(std::move(request), std::move(response), m_transport->tls_handle());
-        } catch (const std::exception& e) {
+        } catch (const std::exception &e) {
             SIMPLE_HTTP_ERROR_LOG("h1 handler threw: {}", e.what());
             failed = true;
         } catch (...) {
@@ -818,8 +842,8 @@ class Http1Engine {
     }
 
     asio::awaitable<void> send_error_response(int status) {
-        auto writer = std::make_shared<Http1ResponseWriter<Transport>>(
-            m_transport, Version::Http11, m_deadline, m_limits.idle_timeout, m_limits.alt_svc_value());
+        auto writer = std::make_shared<Http1ResponseWriter<Transport>>(m_transport, Version::Http11, m_deadline,
+                                                                       m_limits.idle_timeout, m_limits.alt_svc_value());
         writer->set_keep_alive(false);
         Headers headers;
         std::string body{reason_phrase(status)};
@@ -828,11 +852,13 @@ class Http1Engine {
 
     // Detects a WebSocket upgrade handshake: a GET carrying
     // `Upgrade: websocket`, `Connection: Upgrade` and a Sec-WebSocket-Key.
-    static bool is_websocket_upgrade(const ParsedHead& head) {
+    static bool is_websocket_upgrade(const ParsedHead &head) {
         auto upgrade = head.headers.get("upgrade");
-        if (!upgrade || !icontains(*upgrade, "websocket")) return false;
+        if (!upgrade || !icontains(*upgrade, "websocket"))
+            return false;
         auto connection = head.headers.get("connection");
-        if (!connection || !icontains(*connection, "upgrade")) return false;
+        if (!connection || !icontains(*connection, "upgrade"))
+            return false;
         return head.headers.get("sec-websocket-key").has_value();
     }
 
@@ -852,7 +878,7 @@ class Http1Engine {
         return target;
     }
 
-    asio::awaitable<bool> try_websocket_upgrade(const ParsedHead& head, const WsHandlerFn& handler) {
+    asio::awaitable<bool> try_websocket_upgrade(const ParsedHead &head, const WsHandlerFn &handler) {
         // Build and send the 101 Switching Protocols handshake response.
         auto key = head.headers.get("sec-websocket-key");
         std::string accept = ws_accept_key(*key);
@@ -862,7 +888,7 @@ class Http1Engine {
         resp.append(accept);
         resp.append("\r\n\r\n");
         if (auto ec = co_await write_all(resp); ec) {
-            co_return false;  // could not send handshake; connection is unusable
+            co_return false; // could not send handshake; connection is unusable
         }
 
         m_upgraded = true;
@@ -876,13 +902,13 @@ class Http1Engine {
         // The backend is shared-owned: the detached write pump keeps a reference
         // to it (and hence to the transport) while a write is in flight, even
         // after this WebSocket handle is gone.
-        auto backend = std::make_shared<WsBackendImpl<Transport>>(m_transport, m_limits.max_body_bytes,
-                                                                  m_limits.idle_timeout);
+        auto backend =
+            std::make_shared<WsBackendImpl<Transport>>(m_transport, m_limits.max_body_bytes, m_limits.idle_timeout);
 
         // Bytes the parser read past the request head (m_buf) are the start of the
         // WebSocket stream - typically the client's first frame, which many clients
-        // pipeline behind the upgrade request. Hand them to the frame parser instead
-        // of dropping them.
+        // pipeline behind the upgrade request. Hand them to the frame parser
+        // instead of dropping them.
         backend->feed(m_buf);
         m_buf.clear();
 
@@ -896,7 +922,7 @@ class Http1Engine {
         // Run the handler to completion.
         try {
             co_await run_ws_handler(handler, request, ws);
-        } catch (const std::exception& e) {
+        } catch (const std::exception &e) {
             SIMPLE_HTTP_ERROR_LOG("ws handler threw: {}", e.what());
         } catch (...) {
             SIMPLE_HTTP_ERROR_LOG("ws handler threw unknown exception");
@@ -909,7 +935,7 @@ class Http1Engine {
         co_return true;
     }
 
-    asio::awaitable<void> run_ws_handler(const WsHandlerFn& handler, std::shared_ptr<Request> request,
+    asio::awaitable<void> run_ws_handler(const WsHandlerFn &handler, std::shared_ptr<Request> request,
                                          std::shared_ptr<WebSocket> ws) {
         co_await handler(std::move(request), std::move(ws));
         co_return;
@@ -918,24 +944,28 @@ class Http1Engine {
     // Detects an h2c cleartext upgrade: Upgrade: h2c, Connection listing both
     // "Upgrade" and "HTTP2-Settings", and the HTTP2-Settings header itself
     // (RFC 7540 §3.2).
-    static bool is_h2c_upgrade(const ParsedHead& head) {
+    static bool is_h2c_upgrade(const ParsedHead &head) {
         auto upgrade = head.headers.get("upgrade");
-        if (!upgrade || !icontains(*upgrade, "h2c")) return false;
+        if (!upgrade || !icontains(*upgrade, "h2c"))
+            return false;
         auto connection = head.headers.get("connection");
-        if (!connection || !icontains(*connection, "upgrade")) return false;
+        if (!connection || !icontains(*connection, "upgrade"))
+            return false;
         return head.headers.get("http2-settings").has_value();
     }
 
     // Performs the h2c upgrade: reads any request body, sends 101, then hands the
     // connection to an Http2Engine that replays this request as stream 1.
-    asio::awaitable<void> do_h2c_upgrade(const Dispatcher& dispatch, const ParsedHead& head) {
+    asio::awaitable<void> do_h2c_upgrade(const Dispatcher &dispatch, const ParsedHead &head) {
         // Drain the (small) upgrade-request body so it can be replayed on stream 1.
         setup_body_framing(head);
         std::string body;
         while (!m_body_done) {
             auto r = co_await pull_body_chunk();
-            if (!r) break;  // body error: proceed with whatever we have
-            if (!r->eof) body.append(r->data);
+            if (!r)
+                break; // body error: proceed with whatever we have
+            if (!r->eof)
+                body.append(r->data);
         }
 
         // 101 Switching Protocols handshake response — entirely constant.
@@ -956,22 +986,19 @@ class Http1Engine {
     // Writes all of `out` to the transport (partial-write loop).
     // Both 101 handshakes are fixed except for the WebSocket accept value, so
     // their constant parts live here instead of being reassembled per upgrade.
-    static constexpr std::string_view kWsHandshakeHead =
-        "HTTP/1.1 101 Switching Protocols\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        "Sec-WebSocket-Accept: ";
-    static constexpr std::string_view kH2cUpgradeResponse =
-        "HTTP/1.1 101 Switching Protocols\r\n"
-        "Connection: Upgrade\r\n"
-        "Upgrade: h2c\r\n\r\n";
+    static constexpr std::string_view kWsHandshakeHead = "HTTP/1.1 101 Switching Protocols\r\n"
+                                                         "Upgrade: websocket\r\n"
+                                                         "Connection: Upgrade\r\n"
+                                                         "Sec-WebSocket-Accept: ";
+    static constexpr std::string_view kH2cUpgradeResponse = "HTTP/1.1 101 Switching Protocols\r\n"
+                                                            "Connection: Upgrade\r\n"
+                                                            "Upgrade: h2c\r\n\r\n";
 
     // Writes all of `out` to the transport. `out` must outlive the await, so
     // callers pass either a local buffer or a string constant.
     asio::awaitable<error_code> write_all(std::string_view out) {
         // Composed async_write: whole buffer or error, no partial-write loop.
-        auto [ec, n] = co_await m_transport->async_write(
-            std::as_bytes(std::span<const char>{out.data(), out.size()}));
+        auto [ec, n] = co_await m_transport->async_write(std::as_bytes(std::span<const char>{out.data(), out.size()}));
         (void)n;
         co_return ec;
     }
@@ -979,20 +1006,23 @@ class Http1Engine {
     // --- pull-mode request-body state (one request at a time; h1 is serial) ---
     enum class BodyMode { None, Fixed, Chunked };
     BodyMode m_body_mode = BodyMode::None;
-    std::uint64_t m_body_remaining = 0;  // Fixed: bytes left to read
-    std::uint64_t m_body_total = 0;      // Chunked: running total (bounded by kMaxBodyBytes)
-    bool m_body_done = false;            // body fully delivered (EOF reached)
+    std::uint64_t m_body_remaining = 0; // Fixed: bytes left to read
+    std::uint64_t m_body_total = 0;     // Chunked: running total (bounded by kMaxBodyBytes)
+    bool m_body_done = false;           // body fully delivered (EOF reached)
 
     std::shared_ptr<Transport> m_transport;
-    decltype(std::declval<Transport&>().get_executor()) m_executor;
+    decltype(std::declval<Transport &>().get_executor()) m_executor;
     EngineLimits m_limits;
-    // Shared so response writers can refresh it on writes too (see SharedDeadline).
+    // Shared so response writers can refresh it on writes too (see
+    // SharedDeadline).
     SharedDeadline m_deadline{std::make_shared<std::chrono::steady_clock::time_point>()};
-    std::string m_buf;  // bytes read past the most recently parsed head
-    WsLookup m_ws_lookup;  // local WebSocket route lookup, exact only (empty if ws disabled)
-    WsProxyLookup m_ws_proxy_lookup;  // WebSocket proxy-route lookup (empty if none)
-    WsLookup m_ws_regex_lookup;  // local WebSocket route lookup, regex only (empty if none)
-    bool m_upgraded{false};  // connection handed off to the WebSocket / proxy layer
+    std::string m_buf;               // bytes read past the most recently parsed head
+    WsLookup m_ws_lookup;            // local WebSocket route lookup, exact only (empty if
+                                     // ws disabled)
+    WsProxyLookup m_ws_proxy_lookup; // WebSocket proxy-route lookup (empty if none)
+    WsLookup m_ws_regex_lookup;      // local WebSocket route lookup, regex only
+                                     // (empty if none)
+    bool m_upgraded{false};          // connection handed off to the WebSocket / proxy layer
 };
 
-}  // namespace simple_http
+} // namespace simple_http

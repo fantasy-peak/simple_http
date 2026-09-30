@@ -10,7 +10,12 @@
 // Every check prints PASS/FAIL and the process exits non-zero if any failed, so
 // it works as a gate as well as a demonstration.
 
+#include <simple_http.h>
+
 #include <atomic>
+#include <boost/asio.hpp>
+#include <boost/asio/experimental/awaitable_operators.hpp>
+#include <boost/asio/experimental/concurrent_channel.hpp>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -21,12 +26,6 @@
 #include <string_view>
 #include <vector>
 
-#include <boost/asio.hpp>
-#include <boost/asio/experimental/concurrent_channel.hpp>
-#include <boost/asio/experimental/awaitable_operators.hpp>
-
-#include <simple_http.h>
-
 namespace asio = boost::asio;
 namespace sh = simple_http;
 
@@ -35,16 +34,14 @@ namespace {
 int g_failed = 0;
 int g_checks = 0;
 
-void check(bool ok, const std::string& what) {
+void check(bool ok, const std::string &what) {
     ++g_checks;
     if (!ok)
         ++g_failed;
     std::printf("%s  %s\n", ok ? "PASS" : "FAIL", what.c_str());
 }
 
-std::string describe(const sh::error_code& ec) {
-    return ec.message();
-}
+std::string describe(const sh::error_code &ec) { return ec.message(); }
 
 // --- a raw HTTP/1.x responder, for what the real server will not do ----------
 //
@@ -53,20 +50,16 @@ std::string describe(const sh::error_code& ec) {
 // is how the stale-pooled-connection and EOF-delimited cases are produced.
 class FakeServer {
   public:
-    FakeServer(asio::io_context& ctx, std::string response, bool close_after = true, bool read_request = true,
+    FakeServer(asio::io_context &ctx, std::string response, bool close_after = true, bool read_request = true,
                bool split_write = false)
         : m_acceptor(ctx, asio::ip::tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0)),
-          m_response(std::move(response)),
-          m_close_after(close_after),
-          m_read_request(read_request),
+          m_response(std::move(response)), m_close_after(close_after), m_read_request(read_request),
           m_split_write(split_write) {
         m_port = m_acceptor.local_endpoint().port();
         accept();
     }
 
-    std::uint16_t port() const {
-        return m_port;
-    }
+    std::uint16_t port() const { return m_port; }
 
     std::atomic<int> connections{0};
 
@@ -75,7 +68,7 @@ class FakeServer {
         // A fresh socket per connection: one shared socket would have the
         // coroutines of different connections read and write the same descriptor.
         auto socket = std::make_shared<asio::ip::tcp::socket>(m_acceptor.get_executor());
-        m_acceptor.async_accept(*socket, [this, socket](const sh::error_code& ec) {
+        m_acceptor.async_accept(*socket, [this, socket](const sh::error_code &ec) {
             if (!ec) {
                 ++connections;
                 asio::co_spawn(socket->get_executor(), serve(socket), asio::detached);
@@ -94,7 +87,7 @@ class FakeServer {
                 auto [ec, n] = co_await socket->async_read_some(asio::buffer(buf), asio::as_tuple(asio::use_awaitable));
                 if (ec)
                     co_return;
-                seen.append(reinterpret_cast<const char*>(buf.data()), n);
+                seen.append(reinterpret_cast<const char *>(buf.data()), n);
                 if (seen.find("\r\n\r\n") != std::string::npos)
                     break;
             }
@@ -108,7 +101,8 @@ class FakeServer {
                 auto [wec, wn] = co_await asio::async_write(*socket, asio::buffer(piece.data(), piece.size()),
                                                             asio::as_tuple(asio::use_awaitable));
                 (void)wn;
-                if (wec) co_return;
+                if (wec)
+                    co_return;
                 timer.expires_after(std::chrono::milliseconds(1));
                 co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
             }
@@ -141,12 +135,13 @@ class FakeServer {
 };
 
 // The raw responders must outlive the suite that uses them: an acceptor still
-// holding a pending accept cannot be destroyed while the test's io_context runs.
+// holding a pending accept cannot be destroyed while the test's io_context
+// runs.
 std::vector<std::shared_ptr<FakeServer>> g_fakes;
 
-FakeServer& make_fake(asio::io_context& ctx, std::string response, bool close_after = true, bool split_write = false) {
-    g_fakes.push_back(std::make_shared<FakeServer>(ctx, std::move(response), close_after, /*read_request=*/true,
-                                                   split_write));
+FakeServer &make_fake(asio::io_context &ctx, std::string response, bool close_after = true, bool split_write = false) {
+    g_fakes.push_back(std::make_shared<FakeServer>(ctx, std::move(response), close_after,
+                                                   /*read_request=*/true, split_write));
     return *g_fakes.back();
 }
 
@@ -163,7 +158,7 @@ sh::ServerConfig server_config(std::uint16_t port, std::optional<sh::TlsConfig> 
 
 // Reads `?key=value` out of a request target (the tests' routes take one
 // numeric parameter each).
-long long query_number(const sh::RequestPtr& req, std::string_view key, long long fallback) {
+long long query_number(const sh::RequestPtr &req, std::string_view key, long long fallback) {
     const std::string q{req->query()};
     const std::string needle = std::string{key} + "=";
     auto pos = q.find(needle);
@@ -176,7 +171,7 @@ long long query_number(const sh::RequestPtr& req, std::string_view key, long lon
     }
 }
 
-void register_routes(sh::Server& server) {
+void register_routes(sh::Server &server) {
     server.route(sh::any_methods, "/world", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
         co_await res->status(200).send(std::string{"hello from "} + std::string{sh::to_string(res->version())});
     });
@@ -192,7 +187,7 @@ void register_routes(sh::Server& server) {
         const std::size_t n = static_cast<std::size_t>(query_number(req, "n", 65536));
         std::string body(n, 'x');
         for (std::size_t i = 0; i < n; i += 4096)
-            body[i] = 'a';  // a pattern to check, cheaply
+            body[i] = 'a'; // a pattern to check, cheaply
         co_await res->status(200).send(std::move(body));
     });
     server.route(sh::any_methods, "/empty", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
@@ -206,8 +201,8 @@ void register_routes(sh::Server& server) {
         co_await res->status(200).send("delayed");
     });
     server.route(sh::any_methods, "/stream", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
-        // A streamed response is chunked on HTTP/1.1, so this route exercises the
-        // chunked decoder both directly and through the reverse proxy.
+        // A streamed response is chunked on HTTP/1.1, so this route exercises
+        // the chunked decoder both directly and through the reverse proxy.
         (void)co_await res->status(200).content_type("text/plain").begin();
         (void)co_await res->write("alpha-");
         (void)co_await res->write("beta-");
@@ -215,22 +210,23 @@ void register_routes(sh::Server& server) {
     });
     server.route(sh::any_methods, "/headers", [](sh::RequestPtr req, sh::ResponsePtr res) -> asio::awaitable<void> {
         std::string out;
-        for (const auto& [name, value] : req->headers()) {
+        for (const auto &[name, value] : req->headers()) {
             out.append(name).append(": ").append(value).append("\n");
         }
         co_await res->status(200).send(std::move(out));
     });
-    server.route(sh::any_methods, "/whoami", [](sh::RequestPtr, sh::ResponsePtr res, sh::SslHandle ssl) -> asio::awaitable<void> {
-        std::string who = "no client certificate";
-        if (ssl)
-            if (X509* cert = SSL_get_peer_certificate(*ssl)) {
-                char name[256] = {};
-                X509_NAME_oneline(X509_get_subject_name(cert), name, sizeof(name));
-                who = name;
-                X509_free(cert);
-            }
-        co_await res->status(200).send(who);
-    });
+    server.route(sh::any_methods, "/whoami",
+                 [](sh::RequestPtr, sh::ResponsePtr res, sh::SslHandle ssl) -> asio::awaitable<void> {
+                     std::string who = "no client certificate";
+                     if (ssl)
+                         if (X509 *cert = SSL_get_peer_certificate(*ssl)) {
+                             char name[256] = {};
+                             X509_NAME_oneline(X509_get_subject_name(cert), name, sizeof(name));
+                             who = name;
+                             X509_free(cert);
+                         }
+                     co_await res->status(200).send(who);
+                 });
     server.fallback([](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
         co_await res->status(404).send("not found");
     });
@@ -238,7 +234,7 @@ void register_routes(sh::Server& server) {
 
 // --- helpers -----------------------------------------------------------------
 
-std::string url(std::uint16_t port, const char* path, bool tls = false) {
+std::string url(std::uint16_t port, const char *path, bool tls = false) {
     return (tls ? "https://127.0.0.1:" : "http://127.0.0.1:") + std::to_string(port) + path;
 }
 
@@ -318,7 +314,7 @@ asio::awaitable<void> suite_protocol_matrix(std::uint16_t plain, std::uint16_t t
     std::printf("\n== protocol matrix ==\n");
 
     struct Case {
-        const char* name;
+        const char *name;
         sh::HttpVersionPolicy policy;
         sh::H2cMode h2c;
         bool use_tls;
@@ -332,7 +328,7 @@ asio::awaitable<void> suite_protocol_matrix(std::uint16_t plain, std::uint16_t t
         {"https + HTTP/2 (ALPN)", sh::HttpVersionPolicy::Http2, sh::H2cMode::Off, true},
     };
 
-    for (const auto& c : cases) {
+    for (const auto &c : cases) {
         auto cfg = base_config();
         cfg.default_version = c.policy;
         cfg.default_h2c = c.h2c;
@@ -367,7 +363,7 @@ asio::awaitable<void> suite_protocol_matrix(std::uint16_t plain, std::uint16_t t
     co_return;
 }
 
-asio::awaitable<void> suite_framing(std::uint16_t plain, asio::io_context& ctx) {
+asio::awaitable<void> suite_framing(std::uint16_t plain, asio::io_context &ctx) {
     std::printf("\n== framing ==\n");
     sh::HttpClient http{base_config()};
 
@@ -394,7 +390,8 @@ asio::awaitable<void> suite_framing(std::uint16_t plain, asio::io_context& ctx) 
         sh::HttpClient h1_http{cfg};
         auto r = co_await h1_http.request(url(plain, "/big?n=1000"), head);
         check(r && r->body.empty() && r->header("content-length").value_or("") == "1000",
-              "HEAD over HTTP/1.1 keeps the Content-Length a GET would have produced");
+              "HEAD over HTTP/1.1 keeps the Content-Length a GET would have "
+              "produced");
     }
 
     auto big = co_await http.get(url(plain, "/big?n=300000"));
@@ -421,13 +418,13 @@ asio::awaitable<void> suite_framing(std::uint16_t plain, asio::io_context& ctx) 
             check(false, "read_head-after-read could not start: " + describe(opened.error()));
         } else {
             auto stream = opened->stream;
-            auto first_chunk = co_await stream->read();  // body first, without the head
+            auto first_chunk = co_await stream->read(); // body first, without the head
             auto head = co_await stream->read_head();
             auto head_again = co_await stream->read_head();
             auto rest = co_await stream->read_all(4096);
             const bool chunk_ok = first_chunk.has_value() && !first_chunk->eof;
-            check(chunk_ok && head && head_again && rest && head->status == 200 &&
-                      head_again->status == 200 && head->headers.get("content-length") == head_again->headers.get("content-length") &&
+            check(chunk_ok && head && head_again && rest && head->status == 200 && head_again->status == 200 &&
+                      head->headers.get("content-length") == head_again->headers.get("content-length") &&
                       stream->status() == 200,
                   "read_head() is idempotent and works after read()");
         }
@@ -449,8 +446,8 @@ asio::awaitable<void> suite_framing(std::uint16_t plain, asio::io_context& ctx) 
         check(empty && empty->status == 204 && empty->bodyless, "204 over HTTP/2 is bodyless");
     }
 
-    // Pool TTL: an idle pooled connection is dropped (and a fresh one dialed) once
-    // its keep-alive window has passed.
+    // Pool TTL: an idle pooled connection is dropped (and a fresh one dialed)
+    // once its keep-alive window has passed.
     {
         auto cfg = base_config();
         cfg.idle_pool_ttl = std::chrono::milliseconds(200);
@@ -458,7 +455,7 @@ asio::awaitable<void> suite_framing(std::uint16_t plain, asio::io_context& ctx) 
         auto first = co_await ttl_http.get(url(plain, "/world"));
         const auto after_first = ttl_http.stats().connections_opened;
         asio::steady_timer timer{co_await asio::this_coro::executor};
-        timer.expires_after(std::chrono::milliseconds(500));  // outlive the pool TTL
+        timer.expires_after(std::chrono::milliseconds(500)); // outlive the pool TTL
         co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
         auto second = co_await ttl_http.get(url(plain, "/world"));
         check(second && ttl_http.stats().connections_opened == after_first + 1,
@@ -470,18 +467,19 @@ asio::awaitable<void> suite_framing(std::uint16_t plain, asio::io_context& ctx) 
         auto cfg = base_config();
         int resolves = 0;
         int setups = 0;
-        cfg.resolve = [&resolves](std::string host,
-                                  std::string port) -> asio::awaitable<std::pair<sh::error_code, std::vector<asio::ip::tcp::endpoint>>> {
+        cfg.resolve = [&resolves](std::string host, std::string port)
+            -> asio::awaitable<std::pair<sh::error_code, std::vector<asio::ip::tcp::endpoint>>> {
             ++resolves;
             asio::ip::tcp::resolver resolver{co_await asio::this_coro::executor};
             auto [ec, results] = co_await resolver.async_resolve(host, port, asio::as_tuple(asio::use_awaitable));
             std::vector<asio::ip::tcp::endpoint> endpoints;
             if (!ec) {
-                for (const auto& entry : results) endpoints.push_back(entry.endpoint());
+                for (const auto &entry : results)
+                    endpoints.push_back(entry.endpoint());
             }
             co_return std::make_pair(ec, std::move(endpoints));
         };
-        cfg.socket_setup = [&setups](asio::ip::tcp::socket& socket) {
+        cfg.socket_setup = [&setups](asio::ip::tcp::socket &socket) {
             ++setups;
             sh::error_code ec;
             socket.set_option(asio::ip::tcp::no_delay(true), ec);
@@ -493,7 +491,7 @@ asio::awaitable<void> suite_framing(std::uint16_t plain, asio::io_context& ctx) 
 
     // 304 is bodyless and its connection stays at a request boundary.
     {
-        FakeServer& fake = make_fake(ctx, "HTTP/1.1 304 Not Modified\r\nETag: \"abc\"\r\n\r\n",
+        FakeServer &fake = make_fake(ctx, "HTTP/1.1 304 Not Modified\r\nETag: \"abc\"\r\n\r\n",
                                      /*close_after=*/false);
         auto cfg = base_config();
         cfg.default_version = sh::HttpVersionPolicy::Http11;
@@ -506,8 +504,7 @@ asio::awaitable<void> suite_framing(std::uint16_t plain, asio::io_context& ctx) 
 
     // An oversized response head is refused instead of buffered.
     {
-        FakeServer& fake = make_fake(ctx,
-                                     "HTTP/1.1 200 OK\r\nx-pad: " + std::string(4096, 'p') + "\r\n\r\n",
+        FakeServer &fake = make_fake(ctx, "HTTP/1.1 200 OK\r\nx-pad: " + std::string(4096, 'p') + "\r\n\r\n",
                                      /*close_after=*/false, /*split_write=*/true);
         auto cfg = base_config();
         cfg.default_version = sh::HttpVersionPolicy::Http11;
@@ -554,10 +551,9 @@ asio::awaitable<void> suite_streaming(std::uint16_t plain) {
             check(false, "finish failed: " + describe(ec));
         auto body = co_await stream->read_all(1024);
         const std::string expected = "received " + std::to_string(sent + 4) + " bytes";
-        check(body && *body == expected,
-              std::string{"streamed upload (1 MiB) over "} +
-                  (mode == sh::H2cMode::Upgrade ? "h2c upgrade" : "h2c prior knowledge") + " -> " +
-                  (body ? *body : describe(body.error())));
+        check(body && *body == expected, std::string{"streamed upload (1 MiB) over "} +
+                                             (mode == sh::H2cMode::Upgrade ? "h2c upgrade" : "h2c prior knowledge") +
+                                             " -> " + (body ? *body : describe(body.error())));
     }
     // An 8 MiB streamed upload: many flow-control rounds, and the response must
     // still match what the handler counted.
@@ -575,7 +571,7 @@ asio::awaitable<void> suite_streaming(std::uint16_t plain) {
             check(false, "8 MiB streamed upload could not start: " + describe(opened.error()));
         } else {
             std::size_t sent = 0;
-            for (int i = 0; i < 128; ++i) {  // 128 x 64 KiB
+            for (int i = 0; i < 128; ++i) { // 128 x 64 KiB
                 std::string chunk(64 * 1024, 'z');
                 sent += chunk.size();
                 if (auto ec = co_await opened->stream->write(std::move(chunk)); ec) {
@@ -583,7 +579,8 @@ asio::awaitable<void> suite_streaming(std::uint16_t plain) {
                     break;
                 }
             }
-            if (auto ec = co_await opened->stream->finish(""); ec) check(false, "8 MiB finish failed: " + describe(ec));
+            if (auto ec = co_await opened->stream->finish(""); ec)
+                check(false, "8 MiB finish failed: " + describe(ec));
             auto body = co_await opened->stream->read_all(1024);
             check(body && *body == "received " + std::to_string(sent) + " bytes",
                   "an 8 MiB streamed upload is framed and counted correctly -> " +
@@ -653,7 +650,9 @@ asio::awaitable<void> suite_h2_multiplex(std::uint16_t plain) {
         for (int i = 0; i < kWide; ++i) {
             asio::co_spawn(
                 ex2,
-                [&, session, i]() -> asio::awaitable<void> {  // i by value: the coroutine outlives the loop body
+                [&, session,
+                 i]() -> asio::awaitable<void> { // i by value: the coroutine
+                                                 // outlives the loop body
                     sh::RequestSpec spec;
                     spec.method = sh::Method::Post;
                     spec.target = "/echo";
@@ -681,7 +680,8 @@ asio::awaitable<void> suite_h2_multiplex(std::uint16_t plain) {
             auto [ec] = co_await done2.async_receive(asio::as_tuple(asio::use_awaitable));
             if (ec) {
                 ++wide_failures;
-                if (first_error.empty()) first_error = describe(ec);
+                if (first_error.empty())
+                    first_error = describe(ec);
             }
         }
         check(wide_failures == 0, "64 concurrent streams on one connection answer independently -> " +
@@ -734,7 +734,7 @@ asio::awaitable<void> suite_errors(std::uint16_t plain) {
 asio::awaitable<void> suite_tls(std::uint16_t tls_port) {
     std::printf("\n== TLS ==\n");
     {
-        auto cfg = base_config();  // CA + client cert + CN verification
+        auto cfg = base_config(); // CA + client cert + CN verification
         sh::HttpClient http{cfg};
         auto r = co_await http.get(url(tls_port, "/whoami", true));
         check(r && r->status == 200 && r->body.find("SimpleHttpClient") != std::string::npos,
@@ -742,7 +742,7 @@ asio::awaitable<void> suite_tls(std::uint16_t tls_port) {
     }
     {
         auto cfg = base_config();
-        cfg.tls.sni_override.clear();  // verify "127.0.0.1" against the certificate
+        cfg.tls.sni_override.clear(); // verify "127.0.0.1" against the certificate
         sh::HttpClient http{cfg};
         auto r = co_await http.get(url(tls_port, "/world", true));
         check(!r, "name verification fails for a certificate issued to another name");
@@ -756,7 +756,8 @@ asio::awaitable<void> suite_tls(std::uint16_t tls_port) {
     }
     {
         auto cfg = base_config();
-        cfg.tls.ca_file = "./test/tls_certificates/client_cert.pem";  // a CA that did not sign the server
+        cfg.tls.ca_file = "./test/tls_certificates/client_cert.pem"; // a CA that did not sign
+                                                                     // the server
         cfg.tls.verify_host = false;
         sh::HttpClient http{cfg};
         auto r = co_await http.get(url(tls_port, "/world", true));
@@ -786,11 +787,11 @@ asio::awaitable<void> suite_tls(std::uint16_t tls_port) {
 }
 
 // Everything a well-behaved server will not do, driven by the raw responder.
-asio::awaitable<void> suite_raw_peer(asio::io_context& ctx) {
+asio::awaitable<void> suite_raw_peer(asio::io_context &ctx) {
     std::printf("\n== raw peer edge cases ==\n");
 
-    {  // an informational response before the real one
-        FakeServer& fake = make_fake(ctx,
+    { // an informational response before the real one
+        FakeServer &fake = make_fake(ctx,
                                      "HTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\n"
                                      "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
                                      /*close_after=*/false);
@@ -798,29 +799,29 @@ asio::awaitable<void> suite_raw_peer(asio::io_context& ctx) {
         auto r = co_await http.get(url(fake.port(), "/x"));
         check(r && r->status == 200 && r->body == "ok", "1xx is skipped, the final head is used");
     }
-    {  // a body delimited by the close
-        FakeServer& fake = make_fake(ctx, "HTTP/1.1 200 OK\r\n\r\nuntil eof");
+    { // a body delimited by the close
+        FakeServer &fake = make_fake(ctx, "HTTP/1.1 200 OK\r\n\r\nuntil eof");
         sh::HttpClient http{base_config()};
         auto r = co_await http.get(url(fake.port(), "/x"));
         check(r && r->body == "until eof", "an EOF-delimited body is read to the end");
     }
-    {  // a truncated Content-Length body
-        FakeServer& fake = make_fake(ctx, "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort");
+    { // a truncated Content-Length body
+        FakeServer &fake = make_fake(ctx, "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort");
         sh::HttpClient http{base_config()};
         auto r = co_await http.get(url(fake.port(), "/x"));
         check(!r, "a truncated body is an error, not a short body: " + describe(r.error()));
     }
-    {  // a malformed status line
-        FakeServer& fake = make_fake(ctx, "NOT-HTTP 200 OK\r\n\r\n");
+    { // a malformed status line
+        FakeServer &fake = make_fake(ctx, "NOT-HTTP 200 OK\r\n\r\n");
         sh::HttpClient http{base_config()};
         auto r = co_await http.get(url(fake.port(), "/x"));
         check(!r && r.error() == sh::client_errc::protocol_error, "a malformed status line is a protocol error");
     }
-    {  // a chunked response, with an extension and trailers (what a dynamic
-       // backend such as code-server sends): every byte must come back intact.
-       // Regression: the size line used to be read through a view into the read
-       // buffer that the consume step then shifted, so any chunked body failed.
-        FakeServer& fake = make_fake(ctx,
+    { // a chunked response, with an extension and trailers (what a dynamic
+        // backend such as code-server sends): every byte must come back intact.
+        // Regression: the size line used to be read through a view into the read
+        // buffer that the consume step then shifted, so any chunked body failed.
+        FakeServer &fake = make_fake(ctx,
                                      "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
                                      "5;ext=1\r\nhello\r\n"
                                      "6\r\n world\r\n"
@@ -829,25 +830,26 @@ asio::awaitable<void> suite_raw_peer(asio::io_context& ctx) {
         sh::HttpClient http{base_config()};
         auto r = co_await http.get(url(fake.port(), "/chunked"));
         check(r && r->status == 200 && r->body == "hello world",
-              "a chunked response decodes (with an extension and trailers) -> " +
-                  (r ? r->body : describe(r.error())));
+              "a chunked response decodes (with an extension and trailers) -> " + (r ? r->body : describe(r.error())));
     }
-    {  // a chunked body cut short
-        FakeServer& fake = make_fake(ctx, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel",
+    { // a chunked body cut short
+        FakeServer &fake = make_fake(ctx, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel",
                                      /*close_after=*/true);
         sh::HttpClient http{base_config()};
         auto r = co_await http.get(url(fake.port(), "/chunked-truncated"));
         check(!r, "a truncated chunked body is an error: " + describe(r.error()));
     }
-    {  // a malformed chunk-size line
-        FakeServer& fake = make_fake(ctx, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nhello\r\n0\r\n\r\n",
+    { // a malformed chunk-size line
+        FakeServer &fake = make_fake(ctx,
+                                     "HTTP/1.1 200 OK\r\nTransfer-Encoding: "
+                                     "chunked\r\n\r\nzz\r\nhello\r\n0\r\n\r\n",
                                      /*close_after=*/true);
         sh::HttpClient http{base_config()};
         auto r = co_await http.get(url(fake.port(), "/chunked-bad"));
         check(!r && r.error() == sh::client_errc::protocol_error, "a malformed chunk size is a protocol error");
     }
-    {  // a stale pooled connection: the peer closes while the session sits idle
-        FakeServer& fake = make_fake(ctx, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    { // a stale pooled connection: the peer closes while the session sits idle
+        FakeServer &fake = make_fake(ctx, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
         sh::HttpClient http{base_config()};
         auto first = co_await http.get(url(fake.port(), "/x"));
         check(first && first->body == "ok", "first request to the raw peer answered");
@@ -856,10 +858,12 @@ asio::awaitable<void> suite_raw_peer(asio::io_context& ctx) {
         auto second = co_await http.get(url(fake.port(), "/x"));
         check(second && second->body == "ok", "a stale pooled connection is retried on a fresh one");
     }
-    {  // a peer that ignores `Upgrade: h2c` answers with an ordinary response
-        FakeServer& fake = make_fake(ctx, "HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nno h2c!", /*close_after=*/false);
+    { // a peer that ignores `Upgrade: h2c` answers with an ordinary response
+        FakeServer &fake = make_fake(ctx, "HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nno h2c!",
+                                     /*close_after=*/false);
         auto cfg = base_config();
-        cfg.default_version = sh::HttpVersionPolicy::Auto;  // upgrade is attempted, and may be declined
+        cfg.default_version = sh::HttpVersionPolicy::Auto; // upgrade is attempted,
+                                                           // and may be declined
         sh::HttpClient http{cfg};
         auto r = co_await http.get(url(fake.port(), "/x"));
         check(r && r->status == 200 && r->body == "no h2c!" && r->version == sh::Version::Http11,
@@ -868,7 +872,7 @@ asio::awaitable<void> suite_raw_peer(asio::io_context& ctx) {
                      : describe(r.error())));
 
         auto cfg2 = base_config();
-        cfg2.default_version = sh::HttpVersionPolicy::Http2;  // ... but a pinned HTTP/2 policy may not
+        cfg2.default_version = sh::HttpVersionPolicy::Http2; // ... but a pinned HTTP/2 policy may not
         sh::HttpClient strict{cfg2};
         auto r2 = co_await strict.get(url(fake.port(), "/x"));
         check(!r2 && r2.error() == sh::client_errc::version_not_negotiated,
@@ -896,7 +900,7 @@ asio::awaitable<void> suite_compression(std::uint16_t comp_port, std::uint16_t p
     std::printf("\n== response compression ==\n");
 
     struct Mode {
-        const char* label;
+        const char *label;
         sh::HttpVersionPolicy policy;
         sh::H2cMode h2c;
     };
@@ -907,7 +911,7 @@ asio::awaitable<void> suite_compression(std::uint16_t comp_port, std::uint16_t p
 
     const std::string want = big_expected(8192);
 
-    for (const Mode& mode : modes) {
+    for (const Mode &mode : modes) {
         auto cfg = base_config();
         cfg.default_version = mode.policy;
         cfg.default_h2c = mode.h2c;
@@ -1017,7 +1021,7 @@ asio::awaitable<void> suite_compression(std::uint16_t comp_port, std::uint16_t p
     }
 
     // --- the client side: with auto_decompress on, callers see decoded bytes ---
-    for (const Mode& mode : modes) {
+    for (const Mode &mode : modes) {
         auto cfg = base_config();
         cfg.default_version = mode.policy;
         cfg.default_h2c = mode.h2c;
@@ -1089,8 +1093,7 @@ asio::awaitable<void> suite_spec_validation(std::uint16_t plain_port) {
         co_return;
     }
 
-    sh::RequestSpec contradictory{
-        .method = sh::Method::Post, .target = "/echo", .body = "x", .stream_body = true};
+    sh::RequestSpec contradictory{.method = sh::Method::Post, .target = "/echo", .body = "x", .stream_body = true};
     auto stream = co_await (*session)->open_stream(contradictory);
     check(!stream && stream.error() == sh::client_errc::invalid_spec,
           "a spec with both body and stream_body is refused -> " + describe(stream.error()));
@@ -1102,9 +1105,9 @@ asio::awaitable<void> suite_spec_validation(std::uint16_t plain_port) {
     check(static_cast<bool>(ok_stream), "an up-front body alone is accepted");
 
     // RequestSpec::close is documented as keeping the connection out of the pool.
-    // HTTP/1.1 sends `Connection: close` for it; HTTP/2 has no such header and has
-    // to remember the intent — it used not to read the field at all, and pooled
-    // the session regardless.
+    // HTTP/1.1 sends `Connection: close` for it; HTTP/2 has no such header and
+    // has to remember the intent — it used not to read the field at all, and
+    // pooled the session regardless.
     {
         auto s = co_await http.connect(url(plain_port, "/world", false));
         if (s) {
@@ -1154,7 +1157,7 @@ asio::awaitable<void> suite_spec_validation(std::uint16_t plain_port) {
     co_return;
 }
 
-asio::awaitable<void> run_all_suites(asio::io_context& ctx, std::uint16_t plain, std::uint16_t tls_port,
+asio::awaitable<void> run_all_suites(asio::io_context &ctx, std::uint16_t plain, std::uint16_t tls_port,
                                      std::uint16_t comp_port) {
     co_await suite_protocol_matrix(plain, tls_port);
     co_await suite_framing(plain, ctx);
@@ -1169,7 +1172,7 @@ asio::awaitable<void> run_all_suites(asio::io_context& ctx, std::uint16_t plain,
     co_return;
 }
 
-}  // namespace
+} // namespace
 
 int main() {
     sh::set_log_sink(sh::make_stdout_sink(sh::LogLevel::Error));
@@ -1191,12 +1194,12 @@ int main() {
     proxy_cfg.tls.ca_file = "./test/tls_certificates/ca_cert.pem";
     proxy_cfg.tls.cert_chain_file = "./test/tls_certificates/client_cert.pem";
     proxy_cfg.tls.private_key_file = "./test/tls_certificates/client_key.pem";
-    proxy_cfg.tls.verify_host = false;  // the test certificate has no SAN
+    proxy_cfg.tls.verify_host = false; // the test certificate has no SAN
     register_routes(plain);
     sh::TlsConfig tls_cfg;
     tls_cfg.cert_chain_file = "./test/tls_certificates/server_cert.pem";
     tls_cfg.private_key_file = "./test/tls_certificates/server_key.pem";
-    tls_cfg.mutual = true;  // mutual TLS: the client must present its certificate
+    tls_cfg.mutual = true; // mutual TLS: the client must present its certificate
     tls_cfg.ca_file = std::string{"./test/tls_certificates/ca_cert.pem"};
     sh::Server secure{server_config(kTlsPort, tls_cfg)};
     register_routes(secure);
@@ -1204,7 +1207,7 @@ int main() {
     // byte-for-byte body assertions of every other suite valid.
     sh::ServerConfig comp_cfg = server_config(kCompPort, std::nullopt);
     comp_cfg.limits.compression.enabled = true;
-    comp_cfg.limits.compression.min_bytes = 64;  // /world is 19 B: it must stay as-is
+    comp_cfg.limits.compression.min_bytes = 64; // /world is 19 B: it must stay as-is
     sh::Server compressed{comp_cfg};
     register_routes(compressed);
     // Reverse-proxy routes: one to the plaintext listener (the historical
@@ -1233,16 +1236,16 @@ int main() {
     asio::io_context ctx;
     bool finished = false;
     asio::co_spawn(ctx, run_all_suites(ctx, plain_port, tls_port, comp_port),
-                   [&finished](const std::exception_ptr& ep) {
-        try {
-            if (ep)
-                std::rethrow_exception(ep);
-        } catch (const std::exception& e) {
-            std::printf("FAIL  suite threw: %s\n", e.what());
-            ++g_failed;
-        }
-        finished = true;
-    });
+                   [&finished](const std::exception_ptr &ep) {
+                       try {
+                           if (ep)
+                               std::rethrow_exception(ep);
+                       } catch (const std::exception &e) {
+                           std::printf("FAIL  suite threw: %s\n", e.what());
+                           ++g_failed;
+                       }
+                       finished = true;
+                   });
 
     // Poll rather than run(): idle pooled connections and the raw responders'
     // pending accepts keep the context busy, so run() would never return.
@@ -1254,7 +1257,7 @@ int main() {
         std::printf("FAIL  the suite did not finish within 120s\n");
         ++g_failed;
     }
-    g_fakes.clear();  // drop the pending accepts before stopping
+    g_fakes.clear(); // drop the pending accepts before stopping
     ctx.stop();
 
     plain.stop();

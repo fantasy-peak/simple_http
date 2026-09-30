@@ -1,7 +1,6 @@
 // core/: the protocol-agnostic primitives every other layer builds on.
 
 #include <catch2/catch_test_macros.hpp>
-
 #include <string>
 #include <vector>
 
@@ -15,10 +14,10 @@ TEST_CASE("core/types: control-byte detection", "[core]") {
     using simple_http::contains_ctl;
     CHECK_FALSE(contains_ctl(""));
     CHECK_FALSE(contains_ctl("plain text"));
-    CHECK_FALSE(contains_ctl("a\tb"));  // tab is legal in a field value
+    CHECK_FALSE(contains_ctl("a\tb")); // tab is legal in a field value
     CHECK(contains_ctl("a\rb"));
     CHECK(contains_ctl("a\nb"));
-    CHECK(contains_ctl(std::string_view{"a\0b", 3}));  // NUL is not a terminator here
+    CHECK(contains_ctl(std::string_view{"a\0b", 3})); // NUL is not a terminator here
 }
 
 TEST_CASE("core/types: names and versions", "[core]") {
@@ -33,7 +32,8 @@ TEST_CASE("core/http_method: canonical tokens only", "[core]") {
     CHECK(method_from_string("POST") == Method::Post);
     CHECK(method_from_string("DELETE") == Method::Delete);
     CHECK(method_from_string("PATCH") == Method::Patch);
-    // Methods are case-sensitive (RFC 9110 §9.1), so a lowercased one is not known.
+    // Methods are case-sensitive (RFC 9110 §9.1), so a lowercased one is not
+    // known.
     CHECK(method_from_string("get") == Method::Unknown);
     CHECK(method_from_string("") == Method::Unknown);
     CHECK(method_from_string("PROPFIND") == Method::Unknown);
@@ -117,9 +117,9 @@ TEST_CASE("core/limits: defaults are protocol-legal", "[core]") {
 }
 
 TEST_CASE("core/logging: level filter, formatting and source location", "[core]") {
-    ScopedLog capture{LogLevel::Info};  // note: `log` is also the library's logging function
+    ScopedLog capture{LogLevel::Info}; // note: `log` is also the library's logging function
 
-    SIMPLE_HTTP_DEBUG_LOG("dropped {}", 1);  // below the sink's threshold
+    SIMPLE_HTTP_DEBUG_LOG("dropped {}", 1); // below the sink's threshold
     CHECK(capture.records.empty());
 
     // The recorded location is the real call site. std::source_location has no
@@ -142,11 +142,11 @@ TEST_CASE("core/logging: level filter, formatting and source location", "[core]"
 }
 
 TEST_CASE("core/compression: server-sent events are never compressed", "[core]") {
-    // A compressed SSE stream delivers nothing until the codec has buffered enough
-    // to emit a block, and the streaming path has no flush to force it — an
-    // EventSource fed that way looks stalled, not slow.
+    // A compressed SSE stream delivers nothing until the codec has buffered
+    // enough to emit a block, and the streaming path has no flush to force it —
+    // an EventSource fed that way looks stalled, not slow.
     CHECK_FALSE(default_compressible_type("text/event-stream"));
-    CHECK_FALSE(default_compressible_type("TEXT/EVENT-STREAM"));  // media types are case-insensitive
+    CHECK_FALSE(default_compressible_type("TEXT/EVENT-STREAM")); // media types are case-insensitive
     // The rest of the text/* rule is untouched.
     CHECK(default_compressible_type("text/plain"));
     CHECK(default_compressible_type("text/html"));
@@ -156,9 +156,9 @@ TEST_CASE("core/compression: server-sent events are never compressed", "[core]")
 TEST_CASE("core/method: idempotence decides whether a request may be replayed", "[core]") {
     // RFC 9110 §9.2.2. The client's retry path consults this: replaying a request
     // whose outcome is unknown is only safe when a duplicate has the same effect
-    // as the original. POST and PATCH are the ones that matter — a retry of either
-    // can double a side effect, and the replay path used to ignore the method
-    // entirely.
+    // as the original. POST and PATCH are the ones that matter — a retry of
+    // either can double a side effect, and the replay path used to ignore the
+    // method entirely.
     CHECK(is_idempotent(Method::Get));
     CHECK(is_idempotent(Method::Head));
     CHECK(is_idempotent(Method::Put));
@@ -175,14 +175,16 @@ TEST_CASE("core/io_pool: round-robin, main context and clean shutdown", "[core]"
     CHECK_THROWS_AS(IoCtxPool{0}, std::runtime_error);
 
     IoCtxPool pool{2};
-    pool.add_main_context();  // the acceptor context: created last, returned by main_context()
-    auto* first = pool.next_ptr().get();
-    auto* second = pool.next_ptr().get();
-    auto* third = pool.next_ptr().get();
+    pool.add_main_context(); // the acceptor context: created last, returned by
+                             // main_context()
+    auto *first = pool.next_ptr().get();
+    auto *second = pool.next_ptr().get();
+    auto *third = pool.next_ptr().get();
     CHECK(first != second);
-    CHECK(first == third);  // the cursor wraps over the worker contexts
-    // The acceptor context is created last and must never be handed out as a worker.
-    auto* main_ctx = pool.main_context().get();
+    CHECK(first == third); // the cursor wraps over the worker contexts
+    // The acceptor context is created last and must never be handed out as a
+    // worker.
+    auto *main_ctx = pool.main_context().get();
     CHECK(main_ctx != first);
     for (int i = 0; i < 6; ++i)
         CHECK(pool.next_ptr().get() != main_ctx);

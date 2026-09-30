@@ -103,6 +103,11 @@ include/
       client_pool.h        空闲连接池（每个 HttpClient 一个，按 executor/origin 分区）
       http_client.h        HttpClient 门面：connect/open_stream + get/post/request
       client.h             聚合头
+    openapi/               OpenAPI 3.1 文档 + Swagger UI（#ifdef SIMPLE_HTTP_ENABLE_OPENAPI）
+      openapi_doc.h        OAS 3.1 文档模型 + 手写 JSON 渲染器 + components/schemas 去重
+                           （glaze-free：只有发射逻辑，schema 以 raw JSON 接入）
+      openapi.h            glaze 反射→内联 schema、openapi::query<T>/resp<T>/response_header<T>、
+                           path_params<T>（axum Path 提取器）、read_body<TReq>（400/422 校验）
 ```
 
 其它目录：
@@ -251,6 +256,46 @@ WebSocket 实现要点（`ws_frame.h` + `websocket.h`）：
 完整用法参考 `test/server.cpp`，其中演示了一次性响应、双向流式、TLS 客户端证书
 检查、大 body、延迟响应、异常处理、HTTP/2 全双工、WebSocket 回显等。
 
+### OpenAPI（`openapi/` 层，`SIMPLE_HTTP_ENABLE_OPENAPI`）
+
+宏门控 + **glaze**（下游自备，header-only；`glaze_json_schema` 注解提供字段级
+description/enum）。typed 路由在注册时把 `(方法, path)`、body schema、参数、安全、
+错误响应收进一份 OAS 3.1 文档，serve 出去给 CDN 版 swagger-ui 浏览：
+
+```cpp
+server.openapi().title("petshop").version("1.0.0").server("http://127.0.0.1:7795")
+    .security_scheme("bearer", openapi::bearer());   // Authorize 按钮的来源
+
+// 无请求体：<Res> 一参；带 body：<Req, Res> 两参
+server.route<Pet>({Method::Get}, "/pets/{id}", handler,
+    openapi::OperationInfo{.summary = "get a pet", .tag = "pet", .operation_id = "getPet"},
+    openapi::query<std::string>("q", {.description = "..."}),   // query/path/header 参数
+    openapi::resp<ErrorBody>(404, "no such pet"));              // 任意多个错误响应
+// Params 单一声源：模板 {name} 必须等于结构体字段名（注册时校验，不符即跳过）
+server.route<OrderItemParams, openapi::NoBody, Order>({Method::Get},
+    "/orders/{order_id}/items/{item_id}", handler);
+// 运行时取参：req->param("id")（string_view）或按类型解析进结构体
+auto p = openapi::path_params<OrderItemParams>(*req);   // 缺/坏 → nullopt, handler 定 404
+// 请求体校验：严格读（error_on_missing_keys）失败再宽松读——400 畸形 / 422 缺必填
+auto in = co_await openapi::read_body<CreateUserReq>(*req, err);
+
+server.serve_openapi("/openapi.json");    // 启动同时对账：文档说过但路由没服务的 → warning
+server.serve_swagger_ui("/swagger", "/openapi.json");   // CDN 页，离线换 static_files
+```
+
+要点：
+- **schema 是手写的、swagger 安全的**：glaze 反射给名字/类型，输出内联 JSON Schema；
+  **不用** `glz::write_json_schema`（它吐 `$defs` + `#/$defs` 引用，写进 OAS 中段会让
+  swagger-ui 解析崩溃，抓过一次）。重复的对象类型会收拢进 `components.schemas` 并以
+  `$ref` 引用（文档根级，swagger 可解析）。
+- **路径模板 = 段 trie**（`router.h`）：`{name}` 匹配恰好一个非空段，正则在之后。
+  模板之间共享匿名 param 边、名字挂在终点（`/owners/{owner}/pets/{pet_id}` 与
+  `/owners/{owner_id}/pets` 可共存），同形路由的名字必须一致否则跳过。
+- **405/405 保持连接**：method 不符回 405 + `Allow`（并集，含自动 OPTIONS），
+  连接**不断**（对齐 Go ServeMux / axum；HTTP/1.1 下引擎 drain body 后继续 keep-alive）。
+- 完整用法参考 `test/openapi_demo.cpp`（含四个刁钻用例：混合标量类型、布尔严格、
+  字面量压模板、正文+参数+安全叠加）+ `test/openapi_verify.py` 的 41 项断言。
+
 ### 客户端（`client/` 层）
 
 与 handler 一样是协程，但方向相反：内部分**会话层**（连接 + 流）与**便捷层**
@@ -338,6 +383,14 @@ INTERFACE 目标安装，供下游 `find_package`）。日常开发用 xmake。
   xmake-repo 的 ngtcp2 是 `-DENABLE_OPENSSL=OFF` 构建的，**不产 crypto helper**，没有它
   就没有 TLS。`nghttp3` 用上游包即可。**不要链 `/opt/h3/lib` 的预编译库**——那是对系统
   OpenSSL 3.5.5 编的，本仓库用 openssl3 3.6.3，混链是 ABI 风险。
+- `SIMPLE_HTTP_ENABLE_OPENAPI`（默认未定义）：编入 OpenAPI 3.1 文档生成 + Swagger UI
+  服务（`openapi/` 层与 `Router::route<Params, Second, Res>` / `serve_openapi` 等 API）。
+  需要下游自己把 **glaze** 放到 include 路径（header-only）；主库 target 不依赖它，镜子
+  压缩的 opt-in 先例——只在本仓库的 `openapi_demo` 与 `unittest` target 启用。schema
+  用 glaze 反射与 `glaze_json_schema` 注解生成，但**输出是手写内联、无 `$ref`/`$defs`**
+  （`$defs` 写进 OAS 中段会让 swagger-ui 解析崩溃，抓过一次），对象类型收拢进
+  `components/schemas` 再以 `$ref` 引用（文档根级，swagger 可解析）。宏未定义时这些
+  API 与字段**不存在**。
 
 常用命令：
 
@@ -376,6 +429,14 @@ xmake build server && xmake run python-tests    # 第三方客户端驱动服务
   长度/流控越界）、h2c 升级、WebSocket 握手与分片/Ping/Close、TLS 的 mTLS 与 TLS1.3 要求。
 - **`test/client.cpp`**：客户端整合自检（协议矩阵、流式、64 路并发、连接池、TLS 校验、
   反代、错误注入）。
+- **`test/openapi_demo.cpp` + `test/openapi_verify.py`**：OpenAPI 功能的端到端演示与
+  验证。demo 是一个带模板路由（`/pets/{id}`、双捕获 `/orders/{order_id}/items/{item_id}`）、
+  Params 单一声源、请求/响应头、安全、400/422 校验的真实 API，只编译于
+  `SIMPLE_HTTP_ENABLE_OPENAPI`；verify 用 httpx 发真实请求断言文档结构、路径参数按类型
+  解析（string/double/bool 精确往返）、405 keep-alive（裸 socket 同连接连发两请求）、
+  与 swagger-ui 可渲染（`$ref` 指向 components 无解析错误）。运行：
+  `xmake build openapi_demo && test/python/.venv/bin/python test/openapi_verify.py`；
+  浏览器打开 `http://127.0.0.1:7795/swagger`。
 
 三套都是 C++、零 Python 依赖，也不用手工起服务（各自在进程内起监听）。`test/` 下另有
 `manual_http1_keepalive.py`：一个可选的**手工**交叉验证（用第三方 `requests` 客户端打示例
@@ -555,9 +616,9 @@ sudo tc qdisc del dev loopback0 root
 
 ## 代码风格
 
-- `.clang-format`：基于 Google 风格改造，`ColumnLimit: 120`，`IndentWidth: 4`，
-  指针/引用左对齐（`int* p` / `int& r`），大括号换行（class/function/struct 后
-  换行），`namespace` 不缩进并加尾注释。提交前请 clang-format。
+- `.clang-format`：LLVM 基线（`BasedOnStyle: LLVM`）+ 两个覆盖：`IndentWidth: 4`、
+  `ColumnLimit: 120`。要按当前 clang-format 版本展开全部选项
+  `clang-format --style=file --dump-config`。提交前请 clang-format。
 - 编译告警按错误处理：`set_warnings("all", "error")`，不要留 warning。
 - 遵守分层：上层（proto/handler/net）不得出现协议版本分支，版本差异只放进
   `engine/` 和对应的 `ResponseWriter` 实现。

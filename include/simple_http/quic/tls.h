@@ -10,14 +10,14 @@
 // genuinely ours — which certificates to load, which protocols to advertise —
 // and that is a policy decision no library can make for us.
 
+#include <openssl/ssl.h>
+
 #include <array>
+#include <boost/asio/ssl.hpp>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-
-#include <boost/asio/ssl.hpp>
-#include <openssl/ssl.h>
 
 #include "../core/logging.h"
 #include "../core/types.h"
@@ -49,20 +49,18 @@ inline constexpr std::array<unsigned char, 3> kHttp3AlpnWire{0x02, 'h', '3'};
 // OpenSSL API would be a second copy of the same policy, free to drift.
 class QuicTlsContext {
   public:
-    explicit QuicTlsContext(const TlsConfig& cfg) : m_ctx(asio::ssl::context::tlsv13_server) {
-        configure(cfg);
-    }
+    explicit QuicTlsContext(const TlsConfig &cfg) : m_ctx(asio::ssl::context::tlsv13_server) { configure(cfg); }
 
-    [[nodiscard]] asio::ssl::context& context() { return m_ctx; }
-    [[nodiscard]] SSL_CTX* native_handle() { return m_ctx.native_handle(); }
+    [[nodiscard]] asio::ssl::context &context() { return m_ctx; }
+    [[nodiscard]] SSL_CTX *native_handle() { return m_ctx.native_handle(); }
 
   private:
-    static bool is_regular_file(const std::filesystem::path& path) {
+    static bool is_regular_file(const std::filesystem::path &path) {
         std::error_code ec;
         return std::filesystem::is_regular_file(path, ec) && !ec;
     }
 
-    void configure(const TlsConfig& cfg) {
+    void configure(const TlsConfig &cfg) {
         if (!is_regular_file(cfg.cert_chain_file)) {
             throw std::runtime_error("QUIC TLS certificate not found: " + cfg.cert_chain_file);
         }
@@ -90,9 +88,11 @@ class QuicTlsContext {
 
         error_code ec;
         m_ctx.use_certificate_chain_file(cfg.cert_chain_file, ec);
-        if (ec) throw std::runtime_error("QUIC use_certificate_chain_file: " + ec.message());
+        if (ec)
+            throw std::runtime_error("QUIC use_certificate_chain_file: " + ec.message());
         m_ctx.use_private_key_file(cfg.private_key_file, asio::ssl::context::pem, ec);
-        if (ec) throw std::runtime_error("QUIC use_private_key_file: " + ec.message());
+        if (ec)
+            throw std::runtime_error("QUIC use_private_key_file: " + ec.message());
 
         // A QUIC *server must* have an alpn_select_cb: the QUIC-TLS layer refuses
         // to configure without one (ssl/quic/quic_tls.c), because a QUIC
@@ -100,14 +100,14 @@ class QuicTlsContext {
         SSL_CTX_set_alpn_select_cb(m_ctx.native_handle(), &QuicTlsContext::select_alpn, nullptr);
     }
 
-    static int select_alpn(SSL*, const unsigned char** out, unsigned char* outlen, const unsigned char* in,
-                           unsigned int inlen, void*) {
+    static int select_alpn(SSL *, const unsigned char **out, unsigned char *outlen, const unsigned char *in,
+                           unsigned int inlen, void *) {
         // SSL_select_next_proto does the offer/selection matching, including the
         // no-overlap case. The failure is returned as a fatal alert rather than
         // NOACK: a client that offers only http/1.1 has asked for something this
         // listener cannot do, and saying so is better than a connection that
         // silently has no protocol.
-        if (SSL_select_next_proto(const_cast<unsigned char**>(out), outlen, kHttp3AlpnWire.data(),
+        if (SSL_select_next_proto(const_cast<unsigned char **>(out), outlen, kHttp3AlpnWire.data(),
                                   static_cast<unsigned int>(kHttp3AlpnWire.size()), in,
                                   inlen) != OPENSSL_NPN_NEGOTIATED) {
             return SSL_TLSEXT_ERR_ALERT_FATAL;
@@ -118,4 +118,4 @@ class QuicTlsContext {
     asio::ssl::context m_ctx;
 };
 
-}  // namespace simple_http::quic
+} // namespace simple_http::quic

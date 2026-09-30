@@ -17,7 +17,7 @@
 #include <vector>
 
 #include "../core/http_method.h"
-#include "../core/http_status.h"  // reason_phrase for the default response descriptions
+#include "../core/http_status.h" // reason_phrase for the default response descriptions
 
 namespace simple_http {
 namespace openapi {
@@ -26,7 +26,7 @@ namespace openapi {
 // value type's inline schema (see openapi.h::response_header<T>).
 struct ResponseHeader {
     std::string description;
-    std::string schema;  // raw JSON; empty = no schema declared
+    std::string schema; // raw JSON; empty = no schema declared
 };
 
 // Free-text metadata for one operation, mirroring the fields of utoipa's
@@ -71,7 +71,7 @@ struct Param {
     ParamIn in{ParamIn::Query};
     bool required{false};
     std::string description;
-    std::string schema;  // raw JSON
+    std::string schema; // raw JSON
 };
 
 // A security scheme entry for components.securitySchemes. Factories in
@@ -80,7 +80,7 @@ struct SecurityScheme {
     std::string type;       // "http" | "apiKey"
     std::string scheme;     // "bearer" (http only)
     std::string in;         // "query" | "header" | "cookie" (apiKey only)
-    std::string param_name;  // the header/query/cookie name (apiKey only)
+    std::string param_name; // the header/query/cookie name (apiKey only)
 };
 
 // A declared response: the status, a description for the document, and the body
@@ -91,7 +91,7 @@ struct Response {
     int status{200};
     std::string description;
     std::string content_type{"application/json"};
-    std::string schema;  // raw JSON; empty = no body declared
+    std::string schema; // raw JSON; empty = no body declared
     std::vector<std::pair<std::string, ResponseHeader>> headers;
 };
 
@@ -137,9 +137,7 @@ class JsonOut {
         m_out += ']';
         m_stack.pop_back();
     }
-    std::string take() && {
-        return std::move(m_out);
-    }
+    std::string take() && { return std::move(m_out); }
 
   private:
     // A value right after a key needs no separator; an array element does.
@@ -176,23 +174,24 @@ class JsonOut {
         m_out += '"';
     }
     std::string m_out;
-    std::vector<bool> m_stack;  // per container: whether it already holds a member
+    std::vector<bool> m_stack; // per container: whether it already holds a member
     bool m_after_key{false};
 };
 
 // The OAS 3.0 document collected from typed routes. Immutable once rendered:
-// the typed route overloads append operations, and render_json() reads them all.
+// the typed route overloads append operations, and render_json() reads them
+// all.
 class OpenApiSpec {
   public:
-    OpenApiSpec& title(std::string v) {
+    OpenApiSpec &title(std::string v) {
         m_title = std::move(v);
         return *this;
     }
-    OpenApiSpec& version(std::string v) {
+    OpenApiSpec &version(std::string v) {
         m_version = std::move(v);
         return *this;
     }
-    OpenApiSpec& server(std::string url) {
+    OpenApiSpec &server(std::string url) {
         m_server = std::move(url);
         return *this;
     }
@@ -202,27 +201,55 @@ class OpenApiSpec {
     // body. `info.success_status` is the success response's status, the success
     // body is `response_schema`, `extras` are the declared error responses and
     // `params` the operation's parameters (utoipa's params(...)).
-    void add_operation(const std::vector<Method>& methods, std::string path, OperationInfo info,
-                       std::string request_schema, std::string response_schema,
-                       std::vector<Param> params = {}, std::vector<Response> extras = {}) {
-        auto& ops = m_paths[std::move(path)];
-        ops.push_back(Operation{methods, std::move(info), std::move(request_schema),
-                                std::move(response_schema), std::move(params), std::move(extras)});
+    void add_operation(const std::vector<Method> &methods, std::string path, OperationInfo info,
+                       std::string request_schema, std::string response_schema, std::vector<Param> params = {},
+                       std::vector<Response> extras = {}) {
+        auto &ops = m_paths[std::move(path)];
+        ops.push_back(Operation{methods, std::move(info), std::move(request_schema), std::move(response_schema),
+                                std::move(params), std::move(extras)});
     }
 
     // A components.securitySchemes entry — utoipa's
     // ComponentsBuilder::security_scheme(name, scheme). Operations reference it
     // by name via OperationInfo::security.
-    OpenApiSpec& security_scheme(std::string name, SecurityScheme scheme) {
+    OpenApiSpec &security_scheme(std::string name, SecurityScheme scheme) {
         m_security_schemes[std::move(name)] = std::move(scheme);
         return *this;
     }
 
-    // Renders the whole document as compact JSON (OAS 3.1.0 — the version
-    // whose schema dialect is JSON Schema 2020-12, which is what glaze emits,
-    // $defs/$ref included). Paths are sorted for determinism; operations keep
-    // registration order.
+    // The operations collected so far, as (path, methods) pairs — the router
+    // reads them for its startup reconciliation (see Router::verify_openapi).
+    std::vector<std::pair<std::string, std::vector<Method>>> operations() const {
+        std::vector<std::pair<std::string, std::vector<Method>>> out;
+        for (const auto &[path, ops] : m_paths) {
+            for (const auto &op : ops) {
+                out.emplace_back(path, op.methods);
+            }
+        }
+        return out;
+    }
+
+    // Renders the whole document as compact JSON (OAS 3.1.0). Object schemas
+    // are hoisted into components.schemas with synthetic names and referenced
+    // by $ref (swagger resolves #/components/schemas/... from the document
+    // root); scalars stay inline. Paths are sorted for determinism; operations
+    // keep registration order.
     std::string render_json() const {
+        // Pass 1: collect the object schemas that repeat.
+        std::map<std::string, std::string> component_names; // schema JSON -> "schema_N"
+        std::size_t component_count = 0;
+        auto hoist = [&](const std::string &schema) {
+            if (schema.find("\"properties\"") != std::string::npos &&
+                component_names.find(schema) == component_names.end()) {
+                component_names[schema] = "schema_" + std::to_string(component_count++);
+            }
+        };
+        for (const auto &[path, ops] : m_paths) {
+            for (const auto &op : ops) {
+                hoist(op.request_schema);
+                hoist(op.response_schema);
+            }
+        }
         JsonOut j;
         j.begin_object();
         j.key("openapi");
@@ -243,43 +270,54 @@ class OpenApiSpec {
             j.end_object();
             j.end_array();
         }
-        if (!m_security_schemes.empty()) {
+        if (!m_security_schemes.empty() || !component_names.empty()) {
             j.key("components");
             j.begin_object();
-            j.key("securitySchemes");
-            j.begin_object();
-            for (const auto& [name, scheme] : m_security_schemes) {
-                j.key(name);
+            if (!m_security_schemes.empty()) {
+                j.key("securitySchemes");
                 j.begin_object();
-                j.key("type");
-                j.str(scheme.type);
-                if (!scheme.scheme.empty()) {
-                    j.key("scheme");
-                    j.str(scheme.scheme);
+                for (const auto &[name, scheme] : m_security_schemes) {
+                    j.key(name);
+                    j.begin_object();
+                    j.key("type");
+                    j.str(scheme.type);
+                    if (!scheme.scheme.empty()) {
+                        j.key("scheme");
+                        j.str(scheme.scheme);
+                    }
+                    if (!scheme.in.empty()) {
+                        j.key("in");
+                        j.str(scheme.in);
+                    }
+                    if (!scheme.param_name.empty()) {
+                        j.key("name");
+                        j.str(scheme.param_name);
+                    }
+                    j.end_object();
                 }
-                if (!scheme.in.empty()) {
-                    j.key("in");
-                    j.str(scheme.in);
-                }
-                if (!scheme.param_name.empty()) {
-                    j.key("name");
-                    j.str(scheme.param_name);
+                j.end_object();
+            }
+            if (!component_names.empty()) {
+                j.key("schemas");
+                j.begin_object();
+                for (const auto &[schema, name] : component_names) {
+                    j.key(name);
+                    j.raw(schema);
                 }
                 j.end_object();
             }
             j.end_object();
-            j.end_object();
         }
         j.key("paths");
         j.begin_object();
-        for (const auto& [path, ops] : m_paths) {
+        for (const auto &[path, ops] : m_paths) {
             j.key(path);
             j.begin_object();
-            for (const auto& op : ops) {
+            for (const auto &op : ops) {
                 for (Method m : op.methods) {
                     const std::string_view method = method_name_lower(m);
                     if (method.empty()) {
-                        continue;  // Method::Unknown is not an operation
+                        continue; // Method::Unknown is not an operation
                     }
                     j.key(method);
                     j.begin_object();
@@ -308,7 +346,7 @@ class OpenApiSpec {
                     if (!op.info.security.empty()) {
                         j.key("security");
                         j.begin_array();
-                        for (const auto& scheme : op.info.security) {
+                        for (const auto &scheme : op.info.security) {
                             j.begin_object();
                             j.key(scheme);
                             j.begin_array();
@@ -317,11 +355,12 @@ class OpenApiSpec {
                         }
                         j.end_array();
                     }
-                    // utoipa's params(...): each parameter renders name/in/required/schema.
+                    // utoipa's params(...): each parameter renders
+                    // name/in/required/schema.
                     if (!op.params.empty()) {
                         j.key("parameters");
                         j.begin_array();
-                        for (const auto& param : op.params) {
+                        for (const auto &param : op.params) {
                             j.begin_object();
                             j.key("name");
                             j.str(param.name);
@@ -353,7 +392,7 @@ class OpenApiSpec {
                         j.key(op.info.request_content_type);
                         j.begin_object();
                         j.key("schema");
-                        j.raw(op.request_schema);
+                        emit_schema_ref(j, op.request_schema, component_names);
                         j.end_object();
                         j.end_object();
                         j.end_object();
@@ -362,13 +401,14 @@ class OpenApiSpec {
                     j.begin_object();
                     // The success response: the declared status + the Res schema.
                     render_response(j, op.info.success_status, reason_phrase(op.info.success_status),
-                                    op.info.response_content_type, op.response_schema, op.info.response_headers);
+                                    op.info.response_content_type, op.response_schema, op.info.response_headers,
+                                    component_names);
                     // The declared error responses: one entry per resp<T>().
-                    for (const auto& extra : op.extras) {
+                    for (const auto &extra : op.extras) {
                         render_response(j, extra.status,
                                         extra.description.empty() ? reason_phrase(extra.status)
                                                                   : std::string_view{extra.description},
-                                        extra.content_type, extra.schema, extra.headers);
+                                        extra.content_type, extra.schema, extra.headers, component_names);
                     }
                     j.end_object();
                     j.end_object();
@@ -385,22 +425,22 @@ class OpenApiSpec {
     struct Operation {
         std::vector<Method> methods;
         OperationInfo info;
-        std::string request_schema;   // raw JSON; empty = no request body
-        std::string response_schema;  // raw JSON; empty = no success body declared
+        std::string request_schema;  // raw JSON; empty = no request body
+        std::string response_schema; // raw JSON; empty = no success body declared
         std::vector<Param> params;
-        std::vector<Response> extras;  // declared error / other responses
+        std::vector<Response> extras; // declared error / other responses
     };
 
     static constexpr std::string_view param_in_string(ParamIn in) noexcept {
         switch (in) {
-            case ParamIn::Query:
-                return "query";
-            case ParamIn::Path:
-                return "path";
-            case ParamIn::Header:
-                return "header";
-            case ParamIn::Cookie:
-                return "cookie";
+        case ParamIn::Query:
+            return "query";
+        case ParamIn::Path:
+            return "path";
+        case ParamIn::Header:
+            return "header";
+        case ParamIn::Cookie:
+            return "cookie";
         }
         return "query";
     }
@@ -411,9 +451,10 @@ class OpenApiSpec {
 
     // One OAS Response member: status → { description, content if a schema was
     // declared, headers if any were }.
-    static void render_response(JsonOut& j, int status, std::string_view description,
-                                std::string_view content_type, const std::string& schema,
-                                const std::vector<std::pair<std::string, ResponseHeader>>& headers) {
+    static void render_response(JsonOut &j, int status, std::string_view description, std::string_view content_type,
+                                const std::string &schema,
+                                const std::vector<std::pair<std::string, ResponseHeader>> &headers,
+                                const std::map<std::string, std::string> &component_names) {
         j.key(std::to_string(status));
         j.begin_object();
         j.key("description");
@@ -424,7 +465,7 @@ class OpenApiSpec {
             j.key(content_type);
             j.begin_object();
             j.key("schema");
-            j.raw(schema);
+            emit_schema_ref(j, schema, component_names);
             j.end_object();
             j.end_object();
         }
@@ -432,13 +473,28 @@ class OpenApiSpec {
         j.end_object();
     }
 
-    static void render_headers(JsonOut& j, const std::vector<std::pair<std::string, ResponseHeader>>& headers) {
+    // Emits a schema as $ref to a hoisted component when it repeats, else as
+    // the raw inline schema (see render_json).
+    static void emit_schema_ref(JsonOut &j, const std::string &schema,
+                                const std::map<std::string, std::string> &component_names) {
+        const auto it = component_names.find(schema);
+        if (it == component_names.end()) {
+            j.raw(schema);
+        } else {
+            j.begin_object();
+            j.key("$ref");
+            j.str("#/components/schemas/" + it->second);
+            j.end_object();
+        }
+    }
+
+    static void render_headers(JsonOut &j, const std::vector<std::pair<std::string, ResponseHeader>> &headers) {
         if (headers.empty()) {
             return;
         }
         j.key("headers");
         j.begin_object();
-        for (const auto& [name, h] : headers) {
+        for (const auto &[name, h] : headers) {
             j.key(name);
             j.begin_object();
             if (!h.description.empty()) {
@@ -456,27 +512,27 @@ class OpenApiSpec {
 
     static constexpr std::string_view method_name_lower(Method m) noexcept {
         switch (m) {
-            case Method::Get:
-                return "get";
-            case Method::Head:
-                return "head";
-            case Method::Post:
-                return "post";
-            case Method::Put:
-                return "put";
-            case Method::Delete:
-                return "delete";
-            case Method::Options:
-                return "options";
-            case Method::Patch:
-                return "patch";
-            case Method::Connect:
-                return "connect";
-            case Method::Trace:
-                return "trace";
-            case Method::Unknown:
-            default:
-                return {};
+        case Method::Get:
+            return "get";
+        case Method::Head:
+            return "head";
+        case Method::Post:
+            return "post";
+        case Method::Put:
+            return "put";
+        case Method::Delete:
+            return "delete";
+        case Method::Options:
+            return "options";
+        case Method::Patch:
+            return "patch";
+        case Method::Connect:
+            return "connect";
+        case Method::Trace:
+            return "trace";
+        case Method::Unknown:
+        default:
+            return {};
         }
     }
 
@@ -491,12 +547,16 @@ class OpenApiSpec {
 // and points it at `spec_url`. Zero bundled assets; swap in a local
 // static_files site when an offline deployment needs them.
 inline std::string swagger_ui_html(std::string_view spec_url) {
-    return std::string{"<!DOCTYPE html><html><head><meta charset=\"utf-8\"/><title>API</title>"
-                       "<link rel=\"stylesheet\" href=\"https://unpkg.com/swagger-ui-dist@5/swagger-ui.css\"/>"
+    return std::string{"<!DOCTYPE html><html><head><meta "
+                       "charset=\"utf-8\"/><title>API</title>"
+                       "<link rel=\"stylesheet\" "
+                       "href=\"https://unpkg.com/swagger-ui-dist@5/swagger-ui.css\"/>"
                        "</head><body><div id=\"swagger-ui\"></div>"
-                       "<script src=\"https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js\"></script>"
-                       "<script>SwaggerUIBundle({url: \""}
-        + std::string{spec_url} + std::string{"\", dom_id: \"#swagger-ui\"});</script></body></html>"};
+                       "<script "
+                       "src=\"https://unpkg.com/swagger-ui-dist@5/"
+                       "swagger-ui-bundle.js\"></script>"
+                       "<script>SwaggerUIBundle({url: \""} +
+           std::string{spec_url} + std::string{"\", dom_id: \"#swagger-ui\"});</script></body></html>"};
 }
 
 // The path parameters a `{name}` template implies, in path order — utoipa
@@ -511,8 +571,8 @@ inline std::vector<Param> template_path_params(std::string_view path) {
         const std::string_view seg =
             path.substr(pos, end == std::string_view::npos ? std::string_view::npos : end - pos);
         if (seg.size() >= 2 && seg.front() == '{' && seg.back() == '}') {
-            out.push_back(Param{std::string{seg.substr(1, seg.size() - 2)}, ParamIn::Path, true, {},
-                                R"({"type":"string"})"});
+            out.push_back(
+                Param{std::string{seg.substr(1, seg.size() - 2)}, ParamIn::Path, true, {}, R"({"type":"string"})"});
         }
         if (end == std::string_view::npos) {
             break;
@@ -526,7 +586,7 @@ inline std::vector<Param> template_path_params(std::string_view path) {
 // template to a Params struct whose field names are the same set.
 inline std::vector<std::string> template_param_names(std::string_view path) {
     std::vector<std::string> out;
-    for (const Param& p : template_path_params(path)) {
+    for (const Param &p : template_path_params(path)) {
         out.push_back(p.name);
     }
     return out;
@@ -535,10 +595,10 @@ inline std::vector<std::string> template_param_names(std::string_view path) {
 // Appends the template-derived path parameters the caller has not already
 // declared; a declared one wins, so openapi::path<T>("id") overrides the
 // default string schema.
-inline void merge_path_params(std::vector<Param>& params, std::string_view path) {
-    for (auto& p : template_path_params(path)) {
+inline void merge_path_params(std::vector<Param> &params, std::string_view path) {
+    for (auto &p : template_path_params(path)) {
         bool declared = false;
-        for (const auto& q : params) {
+        for (const auto &q : params) {
             if (q.name == p.name && q.in == p.in) {
                 declared = true;
                 break;
@@ -550,5 +610,5 @@ inline void merge_path_params(std::vector<Param>& params, std::string_view path)
     }
 }
 
-}  // namespace openapi
-}  // namespace simple_http
+} // namespace openapi
+} // namespace simple_http

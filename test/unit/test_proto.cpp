@@ -1,7 +1,6 @@
 // proto/: the version-agnostic HTTP model — Headers, Body, Request, Response.
 
 #include <catch2/catch_test_macros.hpp>
-
 #include <memory>
 #include <string>
 
@@ -19,23 +18,23 @@ TEST_CASE("proto/headers: lookup is case-insensitive, storage is lowercased", "[
     h.add("X-Trace", "abc");
 
     CHECK(h.size() == 2);
-    CHECK(h.fields()[0].first == "content-type");  // lowercased on the way in
+    CHECK(h.fields()[0].first == "content-type"); // lowercased on the way in
     CHECK(h.get("content-type") == "text/plain");
     CHECK(h.get("CONTENT-TYPE") == "text/plain");
     CHECK(h.get("Content-Type") == "text/plain");
     CHECK(h.contains("x-trace"));
     CHECK_FALSE(h.contains("x-missing"));
-    CHECK_FALSE(h.get("content").has_value());  // no prefix matching
+    CHECK_FALSE(h.get("content").has_value()); // no prefix matching
 }
 
 TEST_CASE("proto/headers: order, duplicates and clearing", "[proto]") {
     Headers h;
     h.add_lower("a", "1");
     h.add_lower("b", "2");
-    h.add_lower("a", "3");  // a duplicate field: the first one wins on lookup
+    h.add_lower("a", "3"); // a duplicate field: the first one wins on lookup
 
     std::string seen;
-    for (const auto& [name, value] : h)
+    for (const auto &[name, value] : h)
         seen += name + "=" + value + ";";
     CHECK(seen == "a=1;b=2;a=3;");
     CHECK(h.get("a") == "1");
@@ -45,22 +44,22 @@ TEST_CASE("proto/headers: order, duplicates and clearing", "[proto]") {
     CHECK(h.size() == 0);
 }
 
-// The comparison Headers uses internally is not public (it relies on the class's
-// "names are stored folded" invariant), so what is tested here is the observable
-// behaviour: lookup folds case, rejects different lengths and does not alias a
-// high-bit byte to an ASCII letter.
+// The comparison Headers uses internally is not public (it relies on the
+// class's "names are stored folded" invariant), so what is tested here is the
+// observable behaviour: lookup folds case, rejects different lengths and does
+// not alias a high-bit byte to an ASCII letter.
 TEST_CASE("proto/headers: lookup folds ASCII case and nothing else", "[proto]") {
     Headers h;
     h.add("Content-Length", "12");
     CHECK(h.get("content-length").has_value());
     CHECK(h.get("CONTENT-LENGTH").has_value());
-    CHECK_FALSE(h.get("content-lengths").has_value());  // different length
-    CHECK_FALSE(h.get("content_lengt").has_value());    // same length, different byte
+    CHECK_FALSE(h.get("content-lengths").has_value()); // different length
+    CHECK_FALSE(h.get("content_lengt").has_value());   // same length, different byte
 
     Headers high;
-    high.add("\xC3\xA9", "v");  // é in UTF-8, two high-bit bytes
+    high.add("\xC3\xA9", "v"); // é in UTF-8, two high-bit bytes
     CHECK(high.get("\xC3\xA9").has_value());
-    CHECK_FALSE(high.get("\xC3").has_value());  // a truncated sequence is not a match
+    CHECK_FALSE(high.get("\xC3").has_value()); // a truncated sequence is not a match
 }
 
 // --- Body --------------------------------------------------------------------
@@ -114,7 +113,7 @@ TEST_CASE("proto/body: read_all concatenates, fail() surfaces the error", "[prot
     {
         asio::io_context ctx;
         Body body{ctx.get_executor()};
-        body.finish();  // an empty body reads as an empty string
+        body.finish(); // an empty body reads as an empty string
         auto all = run_on(ctx, body.read_all());
         REQUIRE(all.has_value());
         REQUIRE(all->has_value());
@@ -131,14 +130,16 @@ TEST_CASE("proto/body: read_all concatenates, fail() surfaces the error", "[prot
     }
 }
 
-TEST_CASE("proto/body: the channel is bounded and the consume hook skips empty chunks", "[proto]") {
+TEST_CASE("proto/body: the channel is bounded and the consume hook skips empty "
+          "chunks",
+          "[proto]") {
     asio::io_context ctx;
     Body body{ctx.get_executor(), /*capacity=*/3};
 
     REQUIRE(body.feed("1"));
     REQUIRE(body.feed("2"));
-    REQUIRE(body.feed(""));       // an empty frame is delivered like any other…
-    CHECK_FALSE(body.feed("3"));  // …and a full channel refuses: the producer must pace itself
+    REQUIRE(body.feed(""));      // an empty frame is delivered like any other…
+    CHECK_FALSE(body.feed("3")); // …and a full channel refuses: the producer must pace itself
 
     std::size_t consumed = 0;
     body.set_on_consumed([&](std::size_t n) { consumed += n; });
@@ -147,7 +148,7 @@ TEST_CASE("proto/body: the channel is bounded and the consume hook skips empty c
     REQUIRE(first.has_value());
     REQUIRE(first->has_value());
     CHECK((*first)->data == "1");
-    CHECK(consumed == 1);  // only non-empty chunks are reported as consumed
+    CHECK(consumed == 1); // only non-empty chunks are reported as consumed
 
     auto second = run_on(ctx, body.read());
     REQUIRE(second.has_value());
@@ -159,23 +160,23 @@ TEST_CASE("proto/body: the channel is bounded and the consume hook skips empty c
     REQUIRE(third->has_value());
     CHECK((*third)->data.empty());
     CHECK_FALSE((*third)->eof);
-    CHECK(consumed == 2);  // the empty frame added nothing
+    CHECK(consumed == 2); // the empty frame added nothing
 }
 
 // finish() and fail() carry the terminator the consumer is *waiting* for, so
-// unlike feed() they must not be droppable. When the channel is full the terminal
-// frame cannot be queued, and before this was handled the reader simply never woke
-// again — a silent hang, not a truncation. (On HTTP/2 the producer-side overflow
-// is worse still: the bytes are already debited against the connection window, so
-// a dropped frame strands the connection as well.)
+// unlike feed() they must not be droppable. When the channel is full the
+// terminal frame cannot be queued, and before this was handled the reader
+// simply never woke again — a silent hang, not a truncation. (On HTTP/2 the
+// producer-side overflow is worse still: the bytes are already debited against
+// the connection window, so a dropped frame strands the connection as well.)
 TEST_CASE("proto/body: the terminator survives a full channel", "[proto]") {
     {
         asio::io_context ctx;
         Body body{ctx.get_executor(), /*capacity=*/1};
 
         REQUIRE(body.feed("x"));
-        CHECK_FALSE(body.feed("y"));  // full: the producer learns it and keeps the frame
-        body.finish();                // no room — must still be delivered
+        CHECK_FALSE(body.feed("y")); // full: the producer learns it and keeps the frame
+        body.finish();               // no room — must still be delivered
 
         auto first = run_on(ctx, body.read());
         REQUIRE(first.has_value());
@@ -259,11 +260,11 @@ TEST_CASE("proto/request: target splitting and method tokens", "[proto]") {
     CHECK(req.path() == "/odd");
     CHECK(req.query().empty());
 
-    req.set_target("/q?a?b");  // only the first '?' separates
+    req.set_target("/q?a?b"); // only the first '?' separates
     CHECK(req.path() == "/q");
     CHECK(req.query() == "a?b");
 
-    req.set_method_token("PROPFIND");  // an extension method survives as a token
+    req.set_method_token("PROPFIND"); // an extension method survives as a token
     CHECK(req.method() == Method::Unknown);
     CHECK(req.method_token() == "PROPFIND");
     req.set_method_token("POST");
@@ -281,7 +282,7 @@ TEST_CASE("proto/response: defaults are filled in but never override", "[proto]"
         REQUIRE(run_on(ctx, res.status(201).send("created")));
         CHECK(writer->last_status == 201);
         CHECK(writer->last_body == "created");
-        CHECK(writer->header("content-type") == "text/plain");  // default
+        CHECK(writer->header("content-type") == "text/plain"); // default
         CHECK(writer->header("server") == std::string{server_version});
     }
     {
@@ -289,7 +290,7 @@ TEST_CASE("proto/response: defaults are filled in but never override", "[proto]"
         Response res{w2};
         REQUIRE(run_on(ctx, res.status(200).content_type("application/json").header("server", "mine").send("{}")));
         CHECK(w2->header("content-type") == "application/json");
-        CHECK(w2->header("server") == "mine");  // explicit values win
+        CHECK(w2->header("server") == "mine"); // explicit values win
     }
 }
 
@@ -309,7 +310,7 @@ TEST_CASE("proto/response: bodyless, streaming and state forwarding", "[proto]")
     CHECK(writer->sent_bodyless);
     CHECK(writer->last_status == 204);
     CHECK(writer->last_body.empty());
-    CHECK(writer->header("server") == std::string{server_version});  // defaults apply here too
+    CHECK(writer->header("server") == std::string{server_version}); // defaults apply here too
 
     REQUIRE(run_on(ctx, res.status(200).begin()));
     CHECK(writer->begun);

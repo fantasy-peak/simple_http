@@ -24,18 +24,19 @@ struct EngineLimits {
     std::chrono::seconds idle_timeout{120};
 
     // --- HTTP/1.x ---
-    // Maximum size of a request head (request line + all header fields). Exceeding
-    // it is answered with 431 Request Header Fields Too Large.
+    // Maximum size of a request head (request line + all header fields).
+    // Exceeding it is answered with 431 Request Header Fields Too Large.
     std::size_t max_header_bytes{64 * 1024};
-    // Maximum request body size (Content-Length or accumulated chunked). Exceeding
-    // it (or a Content-Length that overflows) is answered with 413 Payload Too Large.
+    // Maximum request body size (Content-Length or accumulated chunked).
+    // Exceeding it (or a Content-Length that overflows) is answered with 413
+    // Payload Too Large.
     std::size_t max_body_bytes{64ull * 1024 * 1024};
 
     // --- HTTP/2 ---
     // SETTINGS_MAX_CONCURRENT_STREAMS advertised to the peer.
     std::uint32_t h2_max_concurrent_streams{200};
-    // Largest DATA payload we emit per frame, and our advertised SETTINGS_MAX_FRAME_SIZE
-    // (RFC 7540 §6.5.2 floor is 16384).
+    // Largest DATA payload we emit per frame, and our advertised
+    // SETTINGS_MAX_FRAME_SIZE (RFC 7540 §6.5.2 floor is 16384).
     std::uint32_t h2_max_frame_size{16384};
     // Our advertised initial receive window (SETTINGS_INITIAL_WINDOW_SIZE), per
     // stream and connection. Larger trades memory for throughput on fast links.
@@ -64,7 +65,8 @@ struct EngineLimits {
     // configuration. The macro is read here and nowhere else, so a build that
     // cannot serve HTTP/3 has nothing to render.
     [[nodiscard]] std::string render_alt_svc(std::uint16_t quic_port) const {
-        if (!h3_alt_svc || quic_port == 0) return {};
+        if (!h3_alt_svc || quic_port == 0)
+            return {};
         return std::format("h3=\":{}\"; ma={}", quic_port, h3_alt_svc_max_age);
     }
 
@@ -81,7 +83,7 @@ struct EngineLimits {
     // that differs from the one the connection arrived on it is real
     // information, and on the listener's own port it is harmless — so all three
     // engines ask.
-    [[nodiscard]] const std::string& alt_svc_value() const {
+    [[nodiscard]] const std::string &alt_svc_value() const {
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
         return alt_svc;
 #else
@@ -97,4 +99,4 @@ struct EngineLimits {
     CompressionConfig compression{};
 };
 
-}  // namespace simple_http
+} // namespace simple_http

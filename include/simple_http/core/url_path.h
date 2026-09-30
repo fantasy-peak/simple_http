@@ -4,8 +4,8 @@
 // RFC 3986 §3.3), plus the segment-aware prefix test that goes with the result.
 //
 // The point of this file is the *shape* of what it returns: a canonical lookup
-// key, a pure string, never a filesystem path. A caller can compare it against a
-// precomputed table of known names, and a request whose path normalizes to
+// key, a pure string, never a filesystem path. A caller can compare it against
+// a precomputed table of known names, and a request whose path normalizes to
 // somewhere outside that table is simply "not found" — never a stat() on a
 // location the peer chose. That is what makes directory traversal, symlink
 // escape and TOCTOU structural impossibilities for the layers above rather than
@@ -21,8 +21,8 @@
 //     feeds is safe too; refusing ".." has a much smaller proof surface.
 //
 // under_prefix() lives here rather than with the callers because it is half of
-// the same contract: it is only correct against keys this file produced. A plain
-// starts_with would let "/apixyz" match a reserved "/api".
+// the same contract: it is only correct against keys this file produced. A
+// plain starts_with would let "/apixyz" match a reserved "/api".
 
 #include <cstddef>
 #include <optional>
@@ -36,9 +36,9 @@ namespace simple_http {
 // branches on it beyond that.
 enum class PathError {
     None,
-    Malformed,  // not an origin-form path, a control byte, or a bad escape
-    Traversal,  // a ".." segment survived decoding
-    TooLong,    // length/segment-count bound exceeded
+    Malformed, // not an origin-form path, a control byte, or a bad escape
+    Traversal, // a ".." segment survived decoding
+    TooLong,   // length/segment-count bound exceeded
 };
 
 // Bounds, deliberately independent of EngineLimits::max_header_bytes: on HTTP/2
@@ -54,13 +54,16 @@ inline constexpr std::size_t kMaxSegments = 32;
 namespace detail {
 
 inline int hex_digit(char c) noexcept {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
     return -1;
 }
 
-}  // namespace detail
+} // namespace detail
 
 // Decodes a request path and reduces it to a canonical lookup key.
 //
@@ -73,11 +76,11 @@ inline int hex_digit(char c) noexcept {
 // The rejection list is what makes that argument hold: a percent-encoded
 // separator is refused outright, so no escape can create a segment boundary
 // after the ".." test has already been applied to the raw text.
-inline std::optional<std::string> decode_and_normalize(std::string_view raw, PathError& err) {
+inline std::optional<std::string> decode_and_normalize(std::string_view raw, PathError &err) {
     err = PathError::None;
 
     if (raw.empty() || raw.front() != '/') {
-        err = PathError::Malformed;  // also rejects absolute-form "GET http://host/x"
+        err = PathError::Malformed; // also rejects absolute-form "GET http://host/x"
         return std::nullopt;
     }
     if (raw.size() > kMaxPathBytes) {
@@ -92,7 +95,7 @@ inline std::optional<std::string> decode_and_normalize(std::string_view raw, Pat
     auto push_segment = [&]() -> bool {
         if (cur.empty() || cur == ".") {
             cur.clear();
-            return true;  // collapse "//" and "/./"
+            return true; // collapse "//" and "/./"
         }
         if (cur == "..") {
             err = PathError::Traversal;
@@ -117,13 +120,14 @@ inline std::optional<std::string> decode_and_normalize(std::string_view raw, Pat
             return std::nullopt;
         }
         if (c == '\\') {
-            err = PathError::Malformed;  // backslash confusion; never a separator here
+            err = PathError::Malformed; // backslash confusion; never a separator here
             return std::nullopt;
         }
 
         if (c != '%') {
             if (c == '/') {
-                if (!push_segment()) return std::nullopt;
+                if (!push_segment())
+                    return std::nullopt;
             } else {
                 cur.push_back(static_cast<char>(c));
             }
@@ -153,11 +157,13 @@ inline std::optional<std::string> decode_and_normalize(std::string_view raw, Pat
         }
         cur.push_back(static_cast<char>(d));
     }
-    if (!push_segment()) return std::nullopt;
+    if (!push_segment())
+        return std::nullopt;
 
     std::string out{"/"};
     for (std::size_t i = 0; i < segments.size(); ++i) {
-        if (i != 0) out.push_back('/');
+        if (i != 0)
+            out.push_back('/');
         out += segments[i];
     }
     return out;
@@ -174,12 +180,17 @@ inline std::optional<std::string> decode_and_normalize(std::string_view raw, Pat
 // Both operands are expected to be keys from decode_and_normalize; a trailing
 // slash on `path` would not be one.
 inline bool under_prefix(std::string_view path, std::string_view prefix) noexcept {
-    if (prefix.empty()) return false;
-    if (path == prefix) return true;
-    if (path.size() <= prefix.size()) return false;
-    if (path.compare(0, prefix.size(), prefix) != 0) return false;
-    if (prefix.back() == '/') return true;
+    if (prefix.empty())
+        return false;
+    if (path == prefix)
+        return true;
+    if (path.size() <= prefix.size())
+        return false;
+    if (path.compare(0, prefix.size(), prefix) != 0)
+        return false;
+    if (prefix.back() == '/')
+        return true;
     return path[prefix.size()] == '/';
 }
 
-}  // namespace simple_http
+} // namespace simple_http

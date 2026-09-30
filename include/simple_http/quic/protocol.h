@@ -45,7 +45,7 @@ inline constexpr std::uint32_t kStreamDataFin = 0x01;
 // until the connection reports them acknowledged (or the stream is gone),
 // because QUIC retransmits from the same memory.
 struct ByteVec {
-    const std::uint8_t* base{nullptr};
+    const std::uint8_t *base{nullptr};
     std::size_t len{0};
 };
 
@@ -68,8 +68,8 @@ class Protocol {
   public:
     Protocol() = default;
     virtual ~Protocol() = default;
-    Protocol(const Protocol&) = delete;
-    Protocol& operator=(const Protocol&) = delete;
+    Protocol(const Protocol &) = delete;
+    Protocol &operator=(const Protocol &) = delete;
 
     // --- write side: driven by the connection's send loop -------------------
 
@@ -135,4 +135,4 @@ class Protocol {
     virtual void on_connection_closed() noexcept = 0;
 };
 
-}  // namespace simple_http::quic
+} // namespace simple_http::quic

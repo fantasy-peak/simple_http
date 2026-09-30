@@ -25,7 +25,7 @@
 #include <vector>
 
 #ifndef _WIN32
-#include <sys/stat.h>  // mkfifo
+#include <sys/stat.h> // mkfifo
 #endif
 
 namespace simple_http::test {
@@ -42,13 +42,13 @@ class StaticFixture {
 
     ~StaticFixture() {
         std::error_code ec;
-        std::filesystem::remove_all(m_root, ec);  // best-effort
+        std::filesystem::remove_all(m_root, ec); // best-effort
     }
 
-    StaticFixture(const StaticFixture&) = delete;
-    StaticFixture& operator=(const StaticFixture&) = delete;
+    StaticFixture(const StaticFixture &) = delete;
+    StaticFixture &operator=(const StaticFixture &) = delete;
 
-    const std::filesystem::path& root() const { return m_root; }
+    const std::filesystem::path &root() const { return m_root; }
     std::string root_string() const { return m_root.string(); }
 
     // Writes `content` to `rel` under the root, creating parents.
@@ -63,7 +63,7 @@ class StaticFixture {
 
 #ifndef _WIN32
     // A symlink pointing anywhere — the escape the scanner must refuse to follow.
-    void symlink(std::string_view rel, const std::filesystem::path& target) {
+    void symlink(std::string_view rel, const std::filesystem::path &target) {
         std::filesystem::create_symlink(target, m_root / rel);
     }
 
@@ -96,4 +96,4 @@ class StaticFixture {
     std::filesystem::path m_root;
 };
 
-}  // namespace simple_http::test
+} // namespace simple_http::test

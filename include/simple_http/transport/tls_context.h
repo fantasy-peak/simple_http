@@ -4,9 +4,12 @@
 //
 // Responsibilities: load the server certificate chain and private key, optional
 // mutual-TLS peer verification, TLS protocol floor, and ALPN advertisement
-// (h2 + http/1.1; h3 lives on the QUIC listener's own context). A user hook may customize the
-// ssl::context before certificates are applied.
+// (h2 + http/1.1; h3 lives on the QUIC listener's own context). A user hook may
+// customize the ssl::context before certificates are applied.
 
+#include <openssl/ssl.h>
+
+#include <boost/asio/ssl.hpp>
 #include <cstdint>
 #include <filesystem>
 #include <format>
@@ -16,22 +19,19 @@
 #include <string>
 #include <vector>
 
-#include <boost/asio/ssl.hpp>
-#include <openssl/ssl.h>
-
 #include "../core/logging.h"
-#include "../core/types.h"  // error_code: used below, and this header must stand alone
+#include "../core/types.h" // error_code: used below, and this header must stand alone
 
 namespace simple_http {
 
 namespace asio = boost::asio;
 
 struct TlsConfig {
-    std::string cert_chain_file;                    // server certificate chain (PEM)
-    std::string private_key_file;                   // server private key (PEM)
-    bool mutual = false;                            // require & verify a client certificate
-    std::optional<std::string> ca_file;             // CA bundle for mutual TLS (else system defaults)
-    std::function<void(asio::ssl::context&)> setup; // optional customization hook
+    std::string cert_chain_file;                     // server certificate chain (PEM)
+    std::string private_key_file;                    // server private key (PEM)
+    bool mutual = false;                             // require & verify a client certificate
+    std::optional<std::string> ca_file;              // CA bundle for mutual TLS (else system defaults)
+    std::function<void(asio::ssl::context &)> setup; // optional customization hook
 };
 
 // The ALPN protocol list a TCP-TLS listener advertises, in TLS wire format
@@ -41,27 +41,24 @@ struct TlsConfig {
 // and a client that selected it here would have negotiated a protocol this
 // connection cannot speak. HTTP/3 has its own ALPN list and its own context
 // (quic/tls.h).
-inline const std::vector<unsigned char>& alpn_wire_list() {
-    static const std::vector<unsigned char> list{0x02, 'h', '2', 0x08, 'h', 't', 't', 'p', '/',
-                                                 '1',  '.', '1'};
+inline const std::vector<unsigned char> &alpn_wire_list() {
+    static const std::vector<unsigned char> list{0x02, 'h', '2', 0x08, 'h', 't', 't', 'p', '/', '1', '.', '1'};
     return list;
 }
 
 class TlsContext {
   public:
-    explicit TlsContext(const TlsConfig& cfg) : m_ctx(asio::ssl::context::tlsv13_server) {
-        configure(cfg);
-    }
+    explicit TlsContext(const TlsConfig &cfg) : m_ctx(asio::ssl::context::tlsv13_server) { configure(cfg); }
 
-    asio::ssl::context& context() { return m_ctx; }
+    asio::ssl::context &context() { return m_ctx; }
 
   private:
-    static bool is_regular_file(const std::filesystem::path& path) {
+    static bool is_regular_file(const std::filesystem::path &path) {
         std::error_code ec;
         return std::filesystem::is_regular_file(path, ec) && !ec;
     }
 
-    void configure(const TlsConfig& cfg) {
+    void configure(const TlsConfig &cfg) {
         if (!is_regular_file(cfg.cert_chain_file)) {
             throw std::runtime_error(std::format("TLS certificate not found: {}", cfg.cert_chain_file));
         }
@@ -111,10 +108,10 @@ class TlsContext {
     void install_alpn() {
         SSL_CTX_set_alpn_select_cb(
             m_ctx.native_handle(),
-            [](SSL*, const unsigned char** out, unsigned char* outlen, const unsigned char* in, unsigned int inlen,
-               void*) -> int {
-                const auto& list = alpn_wire_list();
-                if (SSL_select_next_proto(const_cast<unsigned char**>(out), outlen, list.data(),
+            [](SSL *, const unsigned char **out, unsigned char *outlen, const unsigned char *in, unsigned int inlen,
+               void *) -> int {
+                const auto &list = alpn_wire_list();
+                if (SSL_select_next_proto(const_cast<unsigned char **>(out), outlen, list.data(),
                                           static_cast<unsigned int>(list.size()), in,
                                           inlen) != OPENSSL_NPN_NEGOTIATED) {
                     return SSL_TLSEXT_ERR_NOACK;
@@ -127,4 +124,4 @@ class TlsContext {
     asio::ssl::context m_ctx;
 };
 
-}  // namespace simple_http
+} // namespace simple_http

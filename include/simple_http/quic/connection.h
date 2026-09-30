@@ -28,8 +28,13 @@
 // are the exception to "no re-entrancy": they must not call back into ngtcp2,
 // must not throw, and must not block — see `protocol.h`.
 
+#include <ngtcp2/ngtcp2.h>
+#include <openssl/rand.h>
+
 #include <algorithm>
 #include <array>
+#include <boost/asio.hpp>
+#include <boost/asio/experimental/concurrent_channel.hpp>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -45,12 +50,6 @@
 #include <utility>
 #include <vector>
 
-#include <openssl/rand.h>
-
-#include <boost/asio.hpp>
-#include <boost/asio/experimental/concurrent_channel.hpp>
-#include <ngtcp2/ngtcp2.h>
-
 #if defined(__linux__)
 // The GSO knobs (SOL_UDP, UDP_SEGMENT) come from the libc <netinet/udp.h>,
 // which exported UDP_SEGMENT since glibc 2.36. It has to be pulled in before
@@ -64,7 +63,7 @@
 
 #include "../core/logging.h"
 #include "../core/types.h"
-#include "../transport/transport.h"  // SslHandle
+#include "../transport/transport.h" // SslHandle
 #include "ngtcp2_config.h"
 #include "ngtcp2_crypto.h"
 #include "protocol.h"
@@ -88,7 +87,7 @@ struct SendItem {
 
 // The connection hands finished datagrams to the endpoint, which owns the
 // socket.
-using DatagramSink = std::function<void(SendItem&&)>;
+using DatagramSink = std::function<void(SendItem &&)>;
 
 // What the endpoint learned from the client's first Initial, before a
 // connection existed to hold it.
@@ -138,7 +137,8 @@ inline constexpr std::size_t kPacketsPerFlush = 8;
 inline constexpr std::size_t kPacketsPerFlush = 1;
 #endif
 
-// What `ngtcp2_conn_get_expiry2` returns when the connection has no timer armed.
+// What `ngtcp2_conn_get_expiry2` returns when the connection has no timer
+// armed.
 inline constexpr ngtcp2_tstamp kNoExpiry = std::numeric_limits<ngtcp2_tstamp>::max();
 
 // Bound on stream data held before the protocol engine exists. It can only be
@@ -155,16 +155,15 @@ struct PendingStreamData {
 };
 
 template <typename Executor>
-class QuicConnection : public std::enable_shared_from_this<QuicConnection<Executor>>,
-                       public ConnectionCryptoBase {
+class QuicConnection : public std::enable_shared_from_this<QuicConnection<Executor>>, public ConnectionCryptoBase {
   public:
     using executor_type = Executor;
     using Timer = asio::steady_timer;
     using Channel = asio::experimental::concurrent_channel<void(error_code)>;
 
-    QuicConnection(Executor exec, SSL_CTX* ssl_ctx, QuicConnectionConfig config, QuicBootstrap bootstrap,
-                   std::vector<std::uint32_t> versions, asio::ip::udp::endpoint local,
-                   asio::ip::udp::endpoint remote, DatagramSink sink)
+    QuicConnection(Executor exec, SSL_CTX *ssl_ctx, QuicConnectionConfig config, QuicBootstrap bootstrap,
+                   std::vector<std::uint32_t> versions, asio::ip::udp::endpoint local, asio::ip::udp::endpoint remote,
+                   DatagramSink sink)
         : m_executor(exec), m_timer(exec), m_wake(exec, 1), m_closed_signal(exec, 1), m_config(config),
           m_bootstrap(bootstrap), m_versions(std::move(versions)), m_local(std::move(local)),
           m_remote(std::move(remote)), m_sink(std::move(sink)), m_crypto(this) {
@@ -175,11 +174,12 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
     }
 
     ~QuicConnection() override {
-        if (m_conn) ngtcp2_conn_del(m_conn);
+        if (m_conn)
+            ngtcp2_conn_del(m_conn);
     }
 
-    QuicConnection(const QuicConnection&) = delete;
-    QuicConnection& operator=(const QuicConnection&) = delete;
+    QuicConnection(const QuicConnection &) = delete;
+    QuicConnection &operator=(const QuicConnection &) = delete;
 
     [[nodiscard]] Executor get_executor() const { return m_executor; }
     [[nodiscard]] bool closed() const noexcept { return m_closed; }
@@ -194,8 +194,8 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
     }
 
     [[nodiscard]] SslHandle tls_handle() const {
-        auto* self = const_cast<QuicConnection*>(this);
-        SSL* ssl = self->m_crypto.ssl();
+        auto *self = const_cast<QuicConnection *>(this);
+        SSL *ssl = self->m_crypto.ssl();
         return ssl != nullptr ? SslHandle{ssl} : SslHandle{};
     }
 
@@ -229,7 +229,8 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
     // flow-control window shrinks a little on every connection.
     void set_protocol(std::shared_ptr<Protocol> protocol) {
         m_protocol = protocol;
-        if (protocol == nullptr) return;
+        if (protocol == nullptr)
+            return;
 
         if (m_tx_keys_pending) {
             m_tx_keys_pending = false;
@@ -238,12 +239,13 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
         if (!m_pending_stream_data.empty()) {
             std::vector<PendingStreamData> pending = std::move(m_pending_stream_data);
             m_pending_stream_data.clear();
-            for (const PendingStreamData& event : pending) {
+            for (const PendingStreamData &event : pending) {
                 protocol->on_stream_data(event.flags, event.stream_id,
                                          std::span<const std::uint8_t>{event.data.data(), event.data.size()});
             }
         }
-        if (m_closed) protocol->on_connection_closed();
+        if (m_closed)
+            protocol->on_connection_closed();
         poke();
     }
 
@@ -253,9 +255,11 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
     // A timestamp ngtcp2 understands. ngtcp2 measures in nanoseconds from an
     // arbitrary epoch, and every call that takes one must use the same clock —
     // mixing in a different origin would compute an RTT of decades.
-    [[nodiscard]] ngtcp2_tstamp now() const noexcept { return ngtcp2_tstamp(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                                               std::chrono::steady_clock::now().time_since_epoch())
-                                                                               .count()); }
+    [[nodiscard]] ngtcp2_tstamp now() const noexcept {
+        return ngtcp2_tstamp(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+    }
 
     // How many unidirectional streams we may still open. The HTTP/3 engine
     // needs three (control + the two QPACK streams) and asks before trying.
@@ -266,8 +270,9 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
     // Our advertised `initial_max_streams_bidi`, which nghttp3 needs to know so
     // its own accounting matches our transport parameters.
     [[nodiscard]] std::uint64_t local_max_streams_bidi() const noexcept {
-        if (m_conn == nullptr) return 0;
-        const auto* params = ngtcp2_conn_get_local_transport_params2(m_conn);
+        if (m_conn == nullptr)
+            return 0;
+        const auto *params = ngtcp2_conn_get_local_transport_params2(m_conn);
         return params != nullptr ? params->initial_max_streams_bidi : 0;
     }
 
@@ -313,7 +318,7 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
     void shutdown(std::uint64_t app_error_code) noexcept { close(app_error_code, {}); }
 
     // ngtcp2's connection, for the crypto helper's `get_conn`.
-    [[nodiscard]] ngtcp2_conn* native_conn() noexcept override { return m_conn; }
+    [[nodiscard]] ngtcp2_conn *native_conn() noexcept override { return m_conn; }
 
   private:
     // --- ngtcp2 callbacks ----------------------------------------------------
@@ -324,29 +329,29 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
     // "continue". They must not throw — a C library has no way to see a C++
     // exception. `noexcept` here is load-bearing, not decoration.
 
-    static QuicConnection* from(void* user_data) noexcept { return static_cast<QuicConnection*>(user_data); }
+    static QuicConnection *from(void *user_data) noexcept { return static_cast<QuicConnection *>(user_data); }
 
-    static int cb_recv_stream_data(ngtcp2_conn*, std::uint32_t flags, std::int64_t stream_id, std::uint64_t, const std::uint8_t* data,
-                                   std::size_t datalen, void* user_data, void*) noexcept;
-    static int cb_acked_stream_data_offset(ngtcp2_conn*, std::int64_t stream_id, std::uint64_t, std::uint64_t datalen, void* user_data,
-                                           void*) noexcept;
-    static int cb_stream_close(ngtcp2_conn*, std::uint32_t flags, std::int64_t stream_id, std::uint64_t app_error_code,
-                               void* user_data, void*) noexcept;
-    static int cb_stream_reset(ngtcp2_conn*, std::int64_t stream_id, std::uint64_t final_size, std::uint64_t app_error_code,
-                               void* user_data, void*) noexcept;
-    static int cb_stream_stop_sending(ngtcp2_conn*, std::int64_t stream_id, std::uint64_t app_error_code, void* user_data,
-                                      void*) noexcept;
-    static int cb_extend_max_stream_data(ngtcp2_conn*, std::int64_t stream_id, std::uint64_t max_data, void* user_data,
-                                         void*) noexcept;
-    static int cb_extend_max_remote_streams_bidi(ngtcp2_conn*, std::uint64_t max_streams, void* user_data) noexcept;
-    static int cb_recv_tx_key(ngtcp2_conn*, ngtcp2_encryption_level level, void* user_data) noexcept;
-    static int cb_get_new_connection_id(ngtcp2_conn*, ngtcp2_cid* cid, ngtcp2_stateless_reset_token* token, std::size_t cidlen,
-                                        void* user_data) noexcept;
-    static int cb_remove_connection_id(ngtcp2_conn*, const ngtcp2_cid* cid, void* user_data) noexcept;
-    static void cb_rand(std::uint8_t* dest, std::size_t destlen, const ngtcp2_rand_ctx*) noexcept;
-    static int cb_handshake_completed(ngtcp2_conn*, void* user_data) noexcept;
-    static ngtcp2_ssize cb_write_pkt(ngtcp2_conn*, ngtcp2_path* path, ngtcp2_pkt_info* pi, std::uint8_t* dest, std::size_t destlen,
-                                     ngtcp2_tstamp ts, void* user_data) noexcept;
+    static int cb_recv_stream_data(ngtcp2_conn *, std::uint32_t flags, std::int64_t stream_id, std::uint64_t,
+                                   const std::uint8_t *data, std::size_t datalen, void *user_data, void *) noexcept;
+    static int cb_acked_stream_data_offset(ngtcp2_conn *, std::int64_t stream_id, std::uint64_t, std::uint64_t datalen,
+                                           void *user_data, void *) noexcept;
+    static int cb_stream_close(ngtcp2_conn *, std::uint32_t flags, std::int64_t stream_id, std::uint64_t app_error_code,
+                               void *user_data, void *) noexcept;
+    static int cb_stream_reset(ngtcp2_conn *, std::int64_t stream_id, std::uint64_t final_size,
+                               std::uint64_t app_error_code, void *user_data, void *) noexcept;
+    static int cb_stream_stop_sending(ngtcp2_conn *, std::int64_t stream_id, std::uint64_t app_error_code,
+                                      void *user_data, void *) noexcept;
+    static int cb_extend_max_stream_data(ngtcp2_conn *, std::int64_t stream_id, std::uint64_t max_data, void *user_data,
+                                         void *) noexcept;
+    static int cb_extend_max_remote_streams_bidi(ngtcp2_conn *, std::uint64_t max_streams, void *user_data) noexcept;
+    static int cb_recv_tx_key(ngtcp2_conn *, ngtcp2_encryption_level level, void *user_data) noexcept;
+    static int cb_get_new_connection_id(ngtcp2_conn *, ngtcp2_cid *cid, ngtcp2_stateless_reset_token *token,
+                                        std::size_t cidlen, void *user_data) noexcept;
+    static int cb_remove_connection_id(ngtcp2_conn *, const ngtcp2_cid *cid, void *user_data) noexcept;
+    static void cb_rand(std::uint8_t *dest, std::size_t destlen, const ngtcp2_rand_ctx *) noexcept;
+    static int cb_handshake_completed(ngtcp2_conn *, void *user_data) noexcept;
+    static ngtcp2_ssize cb_write_pkt(ngtcp2_conn *, ngtcp2_path *path, ngtcp2_pkt_info *pi, std::uint8_t *dest,
+                                     std::size_t destlen, ngtcp2_tstamp ts, void *user_data) noexcept;
 
     // The endpoint needs to hear about CIDs ngtcp2 hands out mid-connection, so
     // that datagrams addressed to a new CID still find this connection.
@@ -373,7 +378,7 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
     [[nodiscard]] bool flush_writes();
     // Produce one packet's worth of stream data for ngtcp2. Called from inside
     // ngtcp2's write loop, so: no allocation, no throw, no re-entry.
-    ngtcp2_ssize write_pkt(ngtcp2_path* path, ngtcp2_pkt_info* pi, std::uint8_t* dest, std::size_t destlen,
+    ngtcp2_ssize write_pkt(ngtcp2_path *path, ngtcp2_pkt_info *pi, std::uint8_t *dest, std::size_t destlen,
                            ngtcp2_tstamp ts) noexcept;
     // ngtcp2's timer expired — or, since any wake-up runs this, might have.
     void handle_expiry_due();
@@ -402,7 +407,7 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
     DatagramSink m_sink;
 
     QuicCrypto m_crypto;
-    ngtcp2_conn* m_conn{nullptr};
+    ngtcp2_conn *m_conn{nullptr};
     ngtcp2_ccerr m_last_error{};
     ngtcp2_cid m_scid{};
 
@@ -447,9 +452,9 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
 // Definition
 // ---------------------------------------------------------------------------
 
-template <typename Executor>
-bool QuicConnection<Executor>::init() {
-    if (m_init_failed) return false;
+template <typename Executor> bool QuicConnection<Executor>::init() {
+    if (m_init_failed)
+        return false;
 
     // Our Source Connection ID: the name the client will use from now on. It is
     // ours to choose and must not be predictable (RFC 9000 §7.3), so it comes
@@ -469,9 +474,9 @@ bool QuicConnection<Executor>::init() {
     // lives. It copies the addresses into the connection, so a local storage
     // object is enough.
     ngtcp2_path_storage ps;
-    ngtcp2_path_storage_init(&ps, reinterpret_cast<const ngtcp2_sockaddr*>(m_local.data()),
+    ngtcp2_path_storage_init(&ps, reinterpret_cast<const ngtcp2_sockaddr *>(m_local.data()),
                              static_cast<ngtcp2_socklen>(m_local.size()),
-                             reinterpret_cast<const ngtcp2_sockaddr*>(m_remote.data()),
+                             reinterpret_cast<const ngtcp2_sockaddr *>(m_remote.data()),
                              static_cast<ngtcp2_socklen>(m_remote.size()), nullptr);
 
     auto params = make_ngtcp2_params(m_config, now());
@@ -546,21 +551,21 @@ bool QuicConnection<Executor>::init() {
         const std::size_t count = ngtcp2_conn_get_scid2(m_conn, nullptr);
         std::vector<ngtcp2_cid> cids(count);
         ngtcp2_conn_get_scid2(m_conn, cids.data());
-        for (const ngtcp2_cid& cid : cids) {
+        for (const ngtcp2_cid &cid : cids) {
             m_on_new_cid(std::span<const std::uint8_t>{cid.data, cid.datalen}, {});
         }
     }
     return true;
 }
 
-template <typename Executor>
-void QuicConnection<Executor>::on_datagram(std::span<const std::uint8_t> datagram) {
-    if (m_closed || m_conn == nullptr) return;
+template <typename Executor> void QuicConnection<Executor>::on_datagram(std::span<const std::uint8_t> datagram) {
+    if (m_closed || m_conn == nullptr)
+        return;
 
     ngtcp2_path_storage ps;
-    ngtcp2_path_storage_init(&ps, reinterpret_cast<const ngtcp2_sockaddr*>(m_local.data()),
+    ngtcp2_path_storage_init(&ps, reinterpret_cast<const ngtcp2_sockaddr *>(m_local.data()),
                              static_cast<ngtcp2_socklen>(m_local.size()),
-                             reinterpret_cast<const ngtcp2_sockaddr*>(m_remote.data()),
+                             reinterpret_cast<const ngtcp2_sockaddr *>(m_remote.data()),
                              static_cast<ngtcp2_socklen>(m_remote.size()), nullptr);
     ngtcp2_pkt_info pi{};
 
@@ -585,46 +590,51 @@ void QuicConnection<Executor>::on_datagram(std::span<const std::uint8_t> datagra
     poke();
 }
 
-template <typename Executor>
-asio::awaitable<void> QuicConnection<Executor>::run() {
+template <typename Executor> asio::awaitable<void> QuicConnection<Executor>::run() {
     if (m_conn == nullptr) {
         close_now();
         co_return;
     }
     // The first flight (ServerHello and friends) is queued by the handshake,
     // which the crypto helper already drove when the client's Initial was read.
-    if (!flush_writes()) co_return;
+    if (!flush_writes())
+        co_return;
 
     while (!m_closed) {
         arm_timer();
         co_await wait_for_event();
-        if (m_closed) break;
+        if (m_closed)
+            break;
         handle_expiry_due();
-        if (m_closed) break;
-        if (!flush_writes()) break;
+        if (m_closed)
+            break;
+        if (!flush_writes())
+            break;
     }
     co_return;
 }
 
-template <typename Executor>
-asio::awaitable<void> QuicConnection<Executor>::await_closed() {
-    if (m_closed) co_return;
+template <typename Executor> asio::awaitable<void> QuicConnection<Executor>::await_closed() {
+    if (m_closed)
+        co_return;
     co_await m_closed_signal.async_receive(asio::as_tuple(asio::use_awaitable));
     co_return;
 }
 
-template <typename Executor>
-std::optional<std::int64_t> QuicConnection<Executor>::open_uni_stream() {
-    if (m_closed || m_conn == nullptr) return std::nullopt;
+template <typename Executor> std::optional<std::int64_t> QuicConnection<Executor>::open_uni_stream() {
+    if (m_closed || m_conn == nullptr)
+        return std::nullopt;
     std::int64_t stream_id = -1;
     const int rv = ngtcp2_conn_open_uni_stream(m_conn, &stream_id, nullptr);
-    if (rv != 0) return std::nullopt;
+    if (rv != 0)
+        return std::nullopt;
     return stream_id;
 }
 
 template <typename Executor>
 void QuicConnection<Executor>::extend_stream_offset(std::int64_t stream_id, std::uint64_t count) noexcept {
-    if (m_closed || m_conn == nullptr || count == 0) return;
+    if (m_closed || m_conn == nullptr || count == 0)
+        return;
     // ngtcp2 queues a MAX_STREAM_DATA (and MAX_DATA) frame rather than sending
     // one immediately, so this cannot fail for want of window and cannot
     // re-enter the write path.
@@ -632,16 +642,17 @@ void QuicConnection<Executor>::extend_stream_offset(std::int64_t stream_id, std:
     poke();
 }
 
-template <typename Executor>
-void QuicConnection<Executor>::extend_connection_offset(std::uint64_t count) noexcept {
-    if (m_closed || m_conn == nullptr || count == 0) return;
+template <typename Executor> void QuicConnection<Executor>::extend_connection_offset(std::uint64_t count) noexcept {
+    if (m_closed || m_conn == nullptr || count == 0)
+        return;
     ngtcp2_conn_extend_max_offset(m_conn, count);
     poke();
 }
 
 template <typename Executor>
 void QuicConnection<Executor>::shutdown_stream_read(std::int64_t stream_id, std::uint64_t app_error_code) noexcept {
-    if (m_closed || m_conn == nullptr) return;
+    if (m_closed || m_conn == nullptr)
+        return;
     if (ngtcp2_conn_shutdown_stream_read(m_conn, 0, stream_id, app_error_code) != 0) {
         // The stream is usually already gone — the peer reset it, or the
         // connection is closing. Nothing left to do either way.
@@ -652,22 +663,26 @@ void QuicConnection<Executor>::shutdown_stream_read(std::int64_t stream_id, std:
 
 template <typename Executor>
 void QuicConnection<Executor>::reset_stream(std::int64_t stream_id, std::uint64_t app_error_code) noexcept {
-    if (m_closed || m_conn == nullptr) return;
-    if (ngtcp2_conn_shutdown_stream(m_conn, 0, stream_id, app_error_code) != 0) return;
+    if (m_closed || m_conn == nullptr)
+        return;
+    if (ngtcp2_conn_shutdown_stream(m_conn, 0, stream_id, app_error_code) != 0)
+        return;
     poke();
 }
 
-template <typename Executor>
-void QuicConnection<Executor>::extend_max_streams_bidi(std::uint64_t count) noexcept {
-    if (m_closed || m_conn == nullptr || count == 0) return;
+template <typename Executor> void QuicConnection<Executor>::extend_max_streams_bidi(std::uint64_t count) noexcept {
+    if (m_closed || m_conn == nullptr || count == 0)
+        return;
     ngtcp2_conn_extend_max_streams_bidi(m_conn, count);
     poke();
 }
 
 template <typename Executor>
 void QuicConnection<Executor>::shutdown_stream_write(std::int64_t stream_id, std::uint64_t app_error_code) noexcept {
-    if (m_closed || m_conn == nullptr) return;
-    if (ngtcp2_conn_shutdown_stream_write(m_conn, 0, stream_id, app_error_code) != 0) return;
+    if (m_closed || m_conn == nullptr)
+        return;
+    if (ngtcp2_conn_shutdown_stream_write(m_conn, 0, stream_id, app_error_code) != 0)
+        return;
     poke();
 }
 
@@ -680,15 +695,14 @@ void QuicConnection<Executor>::close(std::uint64_t app_error_code, std::string_v
     // An application close carries the HTTP/3 error code; ngtcp2 frames it as
     // CONNECTION_CLOSE with error code 0x1d (RFC 9000 §19.19).
     ngtcp2_ccerr_set_application_error(&m_last_error, app_error_code,
-                                       reinterpret_cast<const std::uint8_t*>(reason.data()), reason.size());
+                                       reinterpret_cast<const std::uint8_t *>(reason.data()), reason.size());
     m_has_error = true;
     close_now();
 }
 
 // --- the send path ---------------------------------------------------------
 
-template <typename Executor>
-void QuicConnection<Executor>::poke() noexcept {
+template <typename Executor> void QuicConnection<Executor>::poke() noexcept {
     // Coalescing on purpose: a wake that arrives while one is already queued
     // adds no information. `try_send` posts rather than inlining the wake-up,
     // which matters because `poke` is called from ngtcp2 callbacks.
@@ -698,9 +712,9 @@ void QuicConnection<Executor>::poke() noexcept {
     (void)m_timer.cancel();
 }
 
-template <typename Executor>
-void QuicConnection<Executor>::arm_timer() {
-    if (m_conn == nullptr) return;
+template <typename Executor> void QuicConnection<Executor>::arm_timer() {
+    if (m_conn == nullptr)
+        return;
     // asio allows one outstanding wait per timer; the previous arm is either a
     // no-op cancel (already fired) or a live wait that must go before re-arming.
     (void)m_timer.cancel();
@@ -714,20 +728,21 @@ void QuicConnection<Executor>::arm_timer() {
     // into it is how the timer is observed at all (see wait_for_event). A
     // cancellation (poke) lands here too with operation_aborted and is dropped —
     // the loop re-derives what to do from the connection's state either way.
-    m_timer.async_wait([this](const error_code& ec) {
+    m_timer.async_wait([this](const error_code &ec) {
         if (!ec && !m_closed) {
             (void)m_wake.try_send(error_code{});
         }
     });
 }
 
-template <typename Executor>
-void QuicConnection<Executor>::handle_expiry_due() {
-    if (m_conn == nullptr) return;
+template <typename Executor> void QuicConnection<Executor>::handle_expiry_due() {
+    if (m_conn == nullptr)
+        return;
     const ngtcp2_tstamp expiry = ngtcp2_conn_get_expiry2(m_conn);
     // Any wake-up runs this, so the common case is that the timer has not
     // actually expired and there is nothing to do.
-    if (expiry == kNoExpiry || now() < expiry) return;
+    if (expiry == kNoExpiry || now() < expiry)
+        return;
 
     const int rv = ngtcp2_conn_handle_expiry(m_conn, now());
     if (rv == NGTCP2_ERR_IDLE_CLOSE) {
@@ -745,7 +760,7 @@ void QuicConnection<Executor>::handle_expiry_due() {
 }
 
 template <typename Executor>
-ngtcp2_ssize QuicConnection<Executor>::write_pkt(ngtcp2_path* path, ngtcp2_pkt_info* pi, std::uint8_t* dest,
+ngtcp2_ssize QuicConnection<Executor>::write_pkt(ngtcp2_path *path, ngtcp2_pkt_info *pi, std::uint8_t *dest,
                                                  std::size_t destlen, ngtcp2_tstamp ts) noexcept {
     // ngtcp2's write loop, as documented: after NGTCP2_ERR_WRITE_MORE the same
     // call must be repeated with the *same* conn/path/pi/dest/destlen/ts, and
@@ -768,7 +783,7 @@ ngtcp2_ssize QuicConnection<Executor>::write_pkt(ngtcp2_path* path, ngtcp2_pkt_i
                 fin = sd.fin;
                 veccnt = std::min(sd.vec.size(), m_vec_scratch.size());
                 for (std::size_t i = 0; i < veccnt; ++i) {
-                    m_vec_scratch[i].base = const_cast<std::uint8_t*>(sd.vec[i].base);
+                    m_vec_scratch[i].base = const_cast<std::uint8_t *>(sd.vec[i].base);
                     m_vec_scratch[i].len = sd.vec[i].len;
                 }
             }
@@ -782,7 +797,8 @@ ngtcp2_ssize QuicConnection<Executor>::write_pkt(ngtcp2_path* path, ngtcp2_pkt_i
         }
 
         std::uint32_t flags = NGTCP2_WRITE_STREAM_FLAG_MORE;
-        if (fin != 0) flags |= NGTCP2_WRITE_STREAM_FLAG_FIN;
+        if (fin != 0)
+            flags |= NGTCP2_WRITE_STREAM_FLAG_FIN;
         if constexpr (kPacketsPerFlush > 1) {
             // Pad 1-RTT ack-eliciting packets to the path MTU: ngtcp2 only
             // aggregates (`write_aggregate_pkt2`) when the first packet in the
@@ -794,28 +810,28 @@ ngtcp2_ssize QuicConnection<Executor>::write_pkt(ngtcp2_path* path, ngtcp2_pkt_i
         }
 
         ngtcp2_ssize datalen = -1;
-        const ngtcp2_ssize nwrite = ngtcp2_conn_writev_stream(m_conn, path, pi, dest, destlen, &datalen, flags, stream_id,
-                                                              m_vec_scratch.data(), veccnt, ts);
+        const ngtcp2_ssize nwrite = ngtcp2_conn_writev_stream(m_conn, path, pi, dest, destlen, &datalen, flags,
+                                                              stream_id, m_vec_scratch.data(), veccnt, ts);
         if (nwrite < 0) {
             switch (nwrite) {
-                case NGTCP2_ERR_STREAM_DATA_BLOCKED:
-                    // The peer's stream window is full. nghttp3 has to stop
-                    // offering this stream until MAX_STREAM_DATA arrives.
-                    proto->on_stream_blocked(stream_id);
-                    continue;
-                case NGTCP2_ERR_STREAM_SHUT_WR:
-                    // The stream is gone from the sending side — the peer reset
-                    // it, or we did. nghttp3 has to stop writing to it.
-                    proto->on_stream_shut_wr(stream_id);
-                    continue;
-                case NGTCP2_ERR_WRITE_MORE:
-                    // Accepted into a packet that is already being built. The
-                    // offset has to advance by exactly what ngtcp2 took, or the
-                    // same bytes are offered again forever.
-                    proto->on_stream_data_written(stream_id, static_cast<std::size_t>(datalen));
-                    continue;
-                default:
-                    break;
+            case NGTCP2_ERR_STREAM_DATA_BLOCKED:
+                // The peer's stream window is full. nghttp3 has to stop
+                // offering this stream until MAX_STREAM_DATA arrives.
+                proto->on_stream_blocked(stream_id);
+                continue;
+            case NGTCP2_ERR_STREAM_SHUT_WR:
+                // The stream is gone from the sending side — the peer reset
+                // it, or we did. nghttp3 has to stop writing to it.
+                proto->on_stream_shut_wr(stream_id);
+                continue;
+            case NGTCP2_ERR_WRITE_MORE:
+                // Accepted into a packet that is already being built. The
+                // offset has to advance by exactly what ngtcp2 took, or the
+                // same bytes are offered again forever.
+                proto->on_stream_data_written(stream_id, static_cast<std::size_t>(datalen));
+                continue;
+            default:
+                break;
             }
             ngtcp2_ccerr_set_liberr(&m_last_error, static_cast<int>(nwrite), nullptr, 0);
             m_has_error = true;
@@ -828,9 +844,9 @@ ngtcp2_ssize QuicConnection<Executor>::write_pkt(ngtcp2_path* path, ngtcp2_pkt_i
     }
 }
 
-template <typename Executor>
-bool QuicConnection<Executor>::flush_writes() {
-    if (m_closed || m_conn == nullptr) return false;
+template <typename Executor> bool QuicConnection<Executor>::flush_writes() {
+    if (m_closed || m_conn == nullptr)
+        return false;
 
     for (;;) {
         // The aggregate buffer: up to kPacketsPerFlush full datagrams, one GSO
@@ -845,8 +861,9 @@ bool QuicConnection<Executor>::flush_writes() {
         std::size_t gso_size = 0;
         const ngtcp2_tstamp ts = now();
 
-        const ngtcp2_ssize n = ngtcp2_conn_write_aggregate_pkt2(m_conn, &ps.path, &pi, buf.data(), buf.size(), &gso_size,
-                                                                &QuicConnection::cb_write_pkt, kPacketsPerFlush, ts);
+        const ngtcp2_ssize n =
+            ngtcp2_conn_write_aggregate_pkt2(m_conn, &ps.path, &pi, buf.data(), buf.size(), &gso_size,
+                                             &QuicConnection::cb_write_pkt, kPacketsPerFlush, ts);
         if (n < 0) {
             // NGTCP2_ERR_CALLBACK_FAILURE means one of our callbacks already set
             // `m_last_error`; anything else — a TLS alert included — is
@@ -871,9 +888,9 @@ bool QuicConnection<Executor>::flush_writes() {
     }
 }
 
-template <typename Executor>
-void QuicConnection<Executor>::close_now() {
-    if (m_closed) return;
+template <typename Executor> void QuicConnection<Executor>::close_now() {
+    if (m_closed)
+        return;
     m_closed = true;
 
     if (m_conn != nullptr && !m_close_sent) {
@@ -882,8 +899,8 @@ void QuicConnection<Executor>::close_now() {
         ngtcp2_path_storage ps;
         ngtcp2_path_storage_zero(&ps);
         ngtcp2_pkt_info pi{};
-        const ngtcp2_ssize n = ngtcp2_conn_write_connection_close(m_conn, &ps.path, &pi, buf.data(), buf.size(),
-                                                                  &m_last_error, now());
+        const ngtcp2_ssize n =
+            ngtcp2_conn_write_connection_close(m_conn, &ps.path, &pi, buf.data(), buf.size(), &m_last_error, now());
         if (n > 0) {
             // The terminal packet is built into a stack buffer; the sink wants
             // ownership, so hand it a copy — this is once per connection, not
@@ -896,16 +913,17 @@ void QuicConnection<Executor>::close_now() {
     }
 
     // Release the engine and anyone waiting: nothing will feed them again.
-    if (auto proto = protocol()) proto->on_connection_closed();
+    if (auto proto = protocol())
+        proto->on_connection_closed();
     (void)m_closed_signal.try_send(error_code{});
     (void)m_wake.try_send(error_code{});
     // Drop the arming handler so it cannot fire into the loop afterwards.
     (void)m_timer.cancel();
 }
 
-template <typename Executor>
-void QuicConnection<Executor>::fail(int liberr) {
-    if (m_closed) return;
+template <typename Executor> void QuicConnection<Executor>::fail(int liberr) {
+    if (m_closed)
+        return;
     // A callback may already have recorded something more specific than
     // `liberr` says — an HTTP/3 or QPACK error code, say. That one wins.
     if (!m_has_error) {
@@ -924,8 +942,7 @@ void QuicConnection<Executor>::fail(int liberr) {
     close_now();
 }
 
-template <typename Executor>
-asio::awaitable<void> QuicConnection<Executor>::wait_for_event() {
+template <typename Executor> asio::awaitable<void> QuicConnection<Executor>::wait_for_event() {
     // Not a race between the timer and the channel any more: the timer's
     // completion handler *posts into this channel* (arm_timer), so a single
     // receive observes both a wake and a real expiry. That removes asio's
@@ -942,10 +959,10 @@ asio::awaitable<void> QuicConnection<Executor>::wait_for_event() {
 // forwarders below only touch the engine's own state and post wake-ups.
 
 template <typename Executor>
-int QuicConnection<Executor>::cb_recv_stream_data(ngtcp2_conn*, std::uint32_t flags, std::int64_t stream_id, std::uint64_t,
-                                                  const std::uint8_t* data, std::size_t datalen, void* user_data,
-                                                  void*) noexcept {
-    auto* self = from(user_data);
+int QuicConnection<Executor>::cb_recv_stream_data(ngtcp2_conn *, std::uint32_t flags, std::int64_t stream_id,
+                                                  std::uint64_t, const std::uint8_t *data, std::size_t datalen,
+                                                  void *user_data, void *) noexcept {
+    auto *self = from(user_data);
     // ngtcp2's flags are not the engine's vocabulary; the one bit that crosses
     // the seam is translated here so `engine/h3/` needs no ngtcp2 header.
     const std::uint32_t translated = (flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0 ? quic::kStreamDataFin : 0u;
@@ -965,17 +982,18 @@ int QuicConnection<Executor>::cb_recv_stream_data(ngtcp2_conn*, std::uint32_t fl
 }
 
 template <typename Executor>
-int QuicConnection<Executor>::cb_acked_stream_data_offset(ngtcp2_conn*, std::int64_t stream_id, std::uint64_t, std::uint64_t datalen,
-                                                          void* user_data, void*) noexcept {
-    auto* self = from(user_data);
-    if (auto proto = self->protocol()) proto->on_acked_stream_data(stream_id, datalen);
+int QuicConnection<Executor>::cb_acked_stream_data_offset(ngtcp2_conn *, std::int64_t stream_id, std::uint64_t,
+                                                          std::uint64_t datalen, void *user_data, void *) noexcept {
+    auto *self = from(user_data);
+    if (auto proto = self->protocol())
+        proto->on_acked_stream_data(stream_id, datalen);
     return 0;
 }
 
 template <typename Executor>
-int QuicConnection<Executor>::cb_stream_close(ngtcp2_conn* conn, std::uint32_t flags, std::int64_t stream_id,
-                                              std::uint64_t app_error_code, void* user_data, void*) noexcept {
-    auto* self = from(user_data);
+int QuicConnection<Executor>::cb_stream_close(ngtcp2_conn *conn, std::uint32_t flags, std::int64_t stream_id,
+                                              std::uint64_t app_error_code, void *user_data, void *) noexcept {
+    auto *self = from(user_data);
     // Hand the stream slot back. `ngtcp2_is_bidi_stream` and bit 0 together
     // spell "the client opened this one" — this is a server, so streams we
     // initiate are the other parity, and crediting those would be crediting
@@ -994,44 +1012,50 @@ int QuicConnection<Executor>::cb_stream_close(ngtcp2_conn* conn, std::uint32_t f
 }
 
 template <typename Executor>
-int QuicConnection<Executor>::cb_stream_reset(ngtcp2_conn*, std::int64_t stream_id, std::uint64_t, std::uint64_t app_error_code,
-                                              void* user_data, void*) noexcept {
-    auto* self = from(user_data);
-    if (auto proto = self->protocol()) proto->on_stream_reset(stream_id, app_error_code);
+int QuicConnection<Executor>::cb_stream_reset(ngtcp2_conn *, std::int64_t stream_id, std::uint64_t,
+                                              std::uint64_t app_error_code, void *user_data, void *) noexcept {
+    auto *self = from(user_data);
+    if (auto proto = self->protocol())
+        proto->on_stream_reset(stream_id, app_error_code);
     return 0;
 }
 
 template <typename Executor>
-int QuicConnection<Executor>::cb_stream_stop_sending(ngtcp2_conn*, std::int64_t stream_id, std::uint64_t app_error_code,
-                                                     void* user_data, void*) noexcept {
-    auto* self = from(user_data);
-    if (auto proto = self->protocol()) proto->on_stream_stop_sending(stream_id, app_error_code);
+int QuicConnection<Executor>::cb_stream_stop_sending(ngtcp2_conn *, std::int64_t stream_id,
+                                                     std::uint64_t app_error_code, void *user_data, void *) noexcept {
+    auto *self = from(user_data);
+    if (auto proto = self->protocol())
+        proto->on_stream_stop_sending(stream_id, app_error_code);
     return 0;
 }
 
 template <typename Executor>
-int QuicConnection<Executor>::cb_extend_max_stream_data(ngtcp2_conn*, std::int64_t stream_id, std::uint64_t max_data,
-                                                        void* user_data, void*) noexcept {
-    auto* self = from(user_data);
-    if (auto proto = self->protocol()) proto->on_extend_max_stream_data(stream_id, max_data);
+int QuicConnection<Executor>::cb_extend_max_stream_data(ngtcp2_conn *, std::int64_t stream_id, std::uint64_t max_data,
+                                                        void *user_data, void *) noexcept {
+    auto *self = from(user_data);
+    if (auto proto = self->protocol())
+        proto->on_extend_max_stream_data(stream_id, max_data);
     self->poke();
     return 0;
 }
 
 template <typename Executor>
-int QuicConnection<Executor>::cb_extend_max_remote_streams_bidi(ngtcp2_conn*, std::uint64_t max_streams, void* user_data) noexcept {
-    auto* self = from(user_data);
-    if (auto proto = self->protocol()) proto->on_extend_max_remote_streams_bidi(max_streams);
+int QuicConnection<Executor>::cb_extend_max_remote_streams_bidi(ngtcp2_conn *, std::uint64_t max_streams,
+                                                                void *user_data) noexcept {
+    auto *self = from(user_data);
+    if (auto proto = self->protocol())
+        proto->on_extend_max_remote_streams_bidi(max_streams);
     return 0;
 }
 
 template <typename Executor>
-int QuicConnection<Executor>::cb_recv_tx_key(ngtcp2_conn*, ngtcp2_encryption_level level, void* user_data) noexcept {
+int QuicConnection<Executor>::cb_recv_tx_key(ngtcp2_conn *, ngtcp2_encryption_level level, void *user_data) noexcept {
     // Only the application (1-RTT) keys matter: the HTTP/3 control and QPACK
     // streams cannot be opened before them, and opening them earlier would be
     // sending application data at the wrong encryption level.
-    if (level != NGTCP2_ENCRYPTION_LEVEL_1RTT) return 0;
-    auto* self = from(user_data);
+    if (level != NGTCP2_ENCRYPTION_LEVEL_1RTT)
+        return 0;
+    auto *self = from(user_data);
     if (auto proto = self->protocol()) {
         proto->on_tx_keys_ready();
     } else {
@@ -1042,20 +1066,23 @@ int QuicConnection<Executor>::cb_recv_tx_key(ngtcp2_conn*, ngtcp2_encryption_lev
 }
 
 template <typename Executor>
-int QuicConnection<Executor>::cb_handshake_completed(ngtcp2_conn*, void* user_data) noexcept {
+int QuicConnection<Executor>::cb_handshake_completed(ngtcp2_conn *, void *user_data) noexcept {
     from(user_data)->poke();
     return 0;
 }
 
 template <typename Executor>
-int QuicConnection<Executor>::cb_get_new_connection_id(ngtcp2_conn*, ngtcp2_cid* cid, ngtcp2_stateless_reset_token* token,
-                                                       std::size_t cidlen, void* user_data) noexcept {
-    auto* self = from(user_data);
+int QuicConnection<Executor>::cb_get_new_connection_id(ngtcp2_conn *, ngtcp2_cid *cid,
+                                                       ngtcp2_stateless_reset_token *token, std::size_t cidlen,
+                                                       void *user_data) noexcept {
+    auto *self = from(user_data);
     // ngtcp2 asks for a fresh connection ID; we mint the bytes and tell the
     // endpoint so that a datagram addressed to it still finds this connection.
-    if (RAND_bytes(cid->data, static_cast<int>(cidlen)) != 1) return NGTCP2_ERR_CALLBACK_FAILURE;
+    if (RAND_bytes(cid->data, static_cast<int>(cidlen)) != 1)
+        return NGTCP2_ERR_CALLBACK_FAILURE;
     cid->datalen = cidlen;
-    if (RAND_bytes(token->data, sizeof(token->data)) != 1) return NGTCP2_ERR_CALLBACK_FAILURE;
+    if (RAND_bytes(token->data, sizeof(token->data)) != 1)
+        return NGTCP2_ERR_CALLBACK_FAILURE;
     if (self->m_on_new_cid) {
         self->m_on_new_cid(std::span<const std::uint8_t>{cid->data, cid->datalen},
                            std::span<const std::uint8_t>{token->data, sizeof(token->data)});
@@ -1064,8 +1091,8 @@ int QuicConnection<Executor>::cb_get_new_connection_id(ngtcp2_conn*, ngtcp2_cid*
 }
 
 template <typename Executor>
-int QuicConnection<Executor>::cb_remove_connection_id(ngtcp2_conn*, const ngtcp2_cid* cid, void* user_data) noexcept {
-    auto* self = from(user_data);
+int QuicConnection<Executor>::cb_remove_connection_id(ngtcp2_conn *, const ngtcp2_cid *cid, void *user_data) noexcept {
+    auto *self = from(user_data);
     if (self->m_on_retire_cid) {
         self->m_on_retire_cid(std::span<const std::uint8_t>{cid->data, cid->datalen});
     }
@@ -1073,7 +1100,7 @@ int QuicConnection<Executor>::cb_remove_connection_id(ngtcp2_conn*, const ngtcp2
 }
 
 template <typename Executor>
-void QuicConnection<Executor>::cb_rand(std::uint8_t* dest, std::size_t destlen, const ngtcp2_rand_ctx*) noexcept {
+void QuicConnection<Executor>::cb_rand(std::uint8_t *dest, std::size_t destlen, const ngtcp2_rand_ctx *) noexcept {
     // ngtcp2 uses this for the random it needs in its own protocol machinery.
     // Failure here is unrecoverable — there is no return value to report it
     // with — so the process is in no state to continue if the CSPRNG is gone.
@@ -1083,9 +1110,10 @@ void QuicConnection<Executor>::cb_rand(std::uint8_t* dest, std::size_t destlen, 
 }
 
 template <typename Executor>
-ngtcp2_ssize QuicConnection<Executor>::cb_write_pkt(ngtcp2_conn*, ngtcp2_path* path, ngtcp2_pkt_info* pi, std::uint8_t* dest,
-                                                    std::size_t destlen, ngtcp2_tstamp ts, void* user_data) noexcept {
+ngtcp2_ssize QuicConnection<Executor>::cb_write_pkt(ngtcp2_conn *, ngtcp2_path *path, ngtcp2_pkt_info *pi,
+                                                    std::uint8_t *dest, std::size_t destlen, ngtcp2_tstamp ts,
+                                                    void *user_data) noexcept {
     return from(user_data)->write_pkt(path, pi, dest, destlen, ts);
 }
 
-}  // namespace simple_http::quic
+} // namespace simple_http::quic

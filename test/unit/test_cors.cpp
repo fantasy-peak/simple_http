@@ -1,8 +1,7 @@
-// handler/cors.h: the built-in CORS policy — preflight handling, origin matching,
-// the Vary rule, and the bounds on what gets echoed back.
+// handler/cors.h: the built-in CORS policy — preflight handling, origin
+// matching, the Vary rule, and the bounds on what gets echoed back.
 
 #include <catch2/catch_test_macros.hpp>
-
 #include <chrono>
 #include <memory>
 #include <string>
@@ -15,7 +14,7 @@ using namespace simple_http::test;
 
 namespace {
 
-RequestPtr make_request(asio::io_context& ctx, std::string path, Method method = Method::Get) {
+RequestPtr make_request(asio::io_context &ctx, std::string path, Method method = Method::Get) {
     auto req = std::make_shared<Request>(Version::Http11, ctx.get_executor(), asio::ip::tcp::endpoint{});
     req->set_target(std::move(path));
     req->set_method(method);
@@ -23,9 +22,9 @@ RequestPtr make_request(asio::io_context& ctx, std::string path, Method method =
     return req;
 }
 
-// A handler that records that it ran, so "the preflight never reached a route" is
-// observable rather than inferred from the status.
-Handler flag_handler(bool& ran, std::string body = "real") {
+// A handler that records that it ran, so "the preflight never reached a route"
+// is observable rather than inferred from the status.
+Handler flag_handler(bool &ran, std::string body = "real") {
     return make_handler([&ran, body = std::move(body)](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
         ran = true;
         co_await res->status(200).send(body);
@@ -34,26 +33,26 @@ Handler flag_handler(bool& ran, std::string body = "real") {
 
 // Dispatches one request and hands back the fake writer, so a case reads as
 // request -> assertions on the recorded status, body and headers.
-std::shared_ptr<FakeResponseWriter> dispatch(asio::io_context& ctx, Router& router, RequestPtr req) {
+std::shared_ptr<FakeResponseWriter> dispatch(asio::io_context &ctx, Router &router, RequestPtr req) {
     auto writer = std::make_shared<FakeResponseWriter>();
     auto res = std::make_shared<Response>(writer);
     REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
     return writer;
 }
 
-void add_origin(const RequestPtr& req, std::string origin = "https://app.example") {
+void add_origin(const RequestPtr &req, std::string origin = "https://app.example") {
     req->mutable_headers().add_lower("origin", std::move(origin));
 }
 
-// Origin plus Access-Control-Request-Method is what makes a request a preflight;
-// OPTIONS alone is not.
-void make_preflight(const RequestPtr& req, std::string method = "POST") {
+// Origin plus Access-Control-Request-Method is what makes a request a
+// preflight; OPTIONS alone is not.
+void make_preflight(const RequestPtr &req, std::string method = "POST") {
     req->set_method(Method::Options);
     add_origin(req);
     req->mutable_headers().add_lower("access-control-request-method", std::move(method));
 }
 
-}  // namespace
+} // namespace
 
 // --- preflight --------------------------------------------------------------
 
@@ -69,7 +68,7 @@ TEST_CASE("cors: a preflight is answered 204 and never reaches the route", "[cor
     auto writer = dispatch(ctx, router, req);
 
     CHECK(writer->last_status == status::no_content);
-    CHECK(writer->sent_bodyless);  // no framing: a body on keep-alive would desync
+    CHECK(writer->sent_bodyless); // no framing: a body on keep-alive would desync
     CHECK(writer->last_body.empty());
     CHECK(writer->header(field::access_control_allow_origin) == "*");
     CHECK(writer->header(field::access_control_allow_methods) == "POST");
@@ -99,10 +98,10 @@ TEST_CASE("cors: a plain OPTIONS is not a preflight", "[cors]") {
 
     asio::io_context ctx;
     auto req = make_request(ctx, "/api", Method::Options);
-    add_origin(req);  // Origin, but no Access-Control-Request-Method
+    add_origin(req); // Origin, but no Access-Control-Request-Method
     auto writer = dispatch(ctx, router, req);
 
-    CHECK(writer->last_status == status::ok);  // the route ran
+    CHECK(writer->last_status == status::ok); // the route ran
     CHECK(ran);
     CHECK_FALSE(writer->sent_bodyless);
     // It is still an ordinary cross-origin request, so the headers are added.
@@ -195,7 +194,7 @@ TEST_CASE("cors: several allowed origins each mirror the one that matched", "[co
     asio::io_context ctx;
     {
         auto req = make_request(ctx, "/api");
-        add_origin(req, "https://b.example");  // the second entry, not the first
+        add_origin(req, "https://b.example"); // the second entry, not the first
         auto writer = dispatch(ctx, router, req);
         // Still mirrored, never "*": with a list, the answer depends on which
         // origin asked, so a shared cache has to be told.
@@ -204,7 +203,7 @@ TEST_CASE("cors: several allowed origins each mirror the one that matched", "[co
     }
     {
         auto req = make_request(ctx, "/api");
-        add_origin(req, "https://c.example");  // on neither list
+        add_origin(req, "https://c.example"); // on neither list
         CHECK_FALSE(dispatch(ctx, router, req)->has_header(field::access_control_allow_origin));
     }
 }
@@ -282,7 +281,7 @@ TEST_CASE("cors: allow_methods is sent verbatim when configured", "[cors]") {
 
     asio::io_context ctx;
     auto req = make_request(ctx, "/api");
-    make_preflight(req, "DELETE");  // ignored: the configured list wins
+    make_preflight(req, "DELETE"); // ignored: the configured list wins
     auto writer = dispatch(ctx, router, req);
 
     CHECK(writer->header(field::access_control_allow_methods) == "GET, POST");
@@ -302,14 +301,14 @@ TEST_CASE("cors: the echoed request-method is validated", "[cors]") {
         Router router;
         router.cors(CorsConfig{});
         auto req = make_request(ctx, "/api");
-        make_preflight(req, "BAD METHOD");  // a space is not a tchar
+        make_preflight(req, "BAD METHOD"); // a space is not a tchar
         CHECK_FALSE(dispatch(ctx, router, req)->has_header(field::access_control_allow_methods));
     }
     {
         Router router;
         router.cors(CorsConfig{});
         auto req = make_request(ctx, "/api");
-        make_preflight(req, std::string(64, 'A'));  // over the 32-byte echo cap
+        make_preflight(req, std::string(64, 'A')); // over the 32-byte echo cap
         CHECK_FALSE(dispatch(ctx, router, req)->has_header(field::access_control_allow_methods));
     }
 }

@@ -2,11 +2,10 @@
 // quality.
 //
 // The properties worth pinning here are the two that a substring search gets
-// wrong: an explicit q=0 is a *refusal* rather than an absence, and identity has
-// a default that only "*;q=0" overrides.
+// wrong: an explicit q=0 is a *refusal* rather than an absence, and identity
+// has a default that only "*;q=0" overrides.
 
 #include <catch2/catch_test_macros.hpp>
-
 #include <string_view>
 
 #include "simple_http.h"
@@ -24,7 +23,7 @@ TEST_CASE("accept_encoding: an absent header accepts everything by default", "[a
     CHECK(ae.identity == -1.0);
 
     CHECK(identity_q(ae) == 1.0);
-    CHECK(coding_q(ae.br, ae) == -1.0);  // nothing to say about brotli
+    CHECK(coding_q(ae.br, ae) == -1.0); // nothing to say about brotli
 }
 
 TEST_CASE("accept_encoding: a listed coding is accepted at q=1 by default", "[accept_encoding]") {

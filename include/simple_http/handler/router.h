@@ -10,9 +10,10 @@
 // method does not match is answered 405 with an Allow header — or an automatic
 // 204 OPTIONS — while a path nothing services continues to the 404. Optional
 // `before` and `cors` filters run first and may short-circuit. The Router's
-// dispatch(shared_ptr<Request>, shared_ptr<Response>, SslHandle) matches the engine's
-// Dispatcher type, so the same router serves every protocol version.
+// dispatch(shared_ptr<Request>, shared_ptr<Response>, SslHandle) matches the
+// engine's Dispatcher type, so the same router serves every protocol version.
 
+#include <boost/asio/awaitable.hpp>
 #include <cstdint>
 #include <initializer_list>
 #include <limits>
@@ -24,21 +25,19 @@
 #include <utility>
 #include <vector>
 
-#include <boost/asio/awaitable.hpp>
-
-#include "../client/http_client.h"  // HttpClient (reverse-proxy upstreams)
+#include "../client/http_client.h" // HttpClient (reverse-proxy upstreams)
 #include "../core/http_field.h"
 #include "../core/http_method.h"
 #include "../core/http_status.h"
 #include "../core/logging.h"
-#include "../engine/dispatcher.h"  // WsProxyTarget, HttpProxyTarget
-#include "cors.h"  // CorsConfig (built-in CORS -> a Filter)
+#include "../engine/dispatcher.h" // WsProxyTarget, HttpProxyTarget
+#include "cors.h"                 // CorsConfig (built-in CORS -> a Filter)
 #include "handler.h"
 #include "http_proxy.h"
-#include "static_files.h"  // the static stage (m_static)
+#include "static_files.h" // the static stage (m_static)
 
 #ifdef SIMPLE_HTTP_ENABLE_OPENAPI
-#include "../openapi/openapi.h"  // glaze-backed JSON Schemas for route<Req, Res>
+#include "../openapi/openapi.h" // glaze-backed JSON Schemas for route<Req, Res>
 #endif
 
 #ifdef SIMPLE_HTTP_USE_BOOST_REGEX
@@ -84,7 +83,7 @@ struct RouteEntry {
 // same tier, after the literal map.
 struct TemplateRoute {
     std::vector<std::optional<std::string>> segments;
-    std::vector<std::string> param_names;  // one per nullopt segment
+    std::vector<std::string> param_names; // one per nullopt segment
 };
 
 class Router {
@@ -101,10 +100,10 @@ class Router {
     // only: a session in the middle of a request is not in the pool and is left
     // alone.
     void close_proxy_client() {
-        for (const auto& [_, route] : m_http_proxy_exact) {
+        for (const auto &[_, route] : m_http_proxy_exact) {
             route.client->close_idle();
         }
-        for (const auto& [_, route] : m_http_proxy_regex) {
+        for (const auto &[_, route] : m_http_proxy_regex) {
             route.client->close_idle();
         }
     }
@@ -114,11 +113,10 @@ class Router {
     // braced literal (`{Method::Get, Method::Post}`), `any_methods`, or — the
     // config-file case — the std::vector<Method> a parser filled, passed
     // straight through: `route(parsed_methods, "/x", h)`.
-    template <typename F>
-    Router& route(std::vector<Method> methods, std::string path, F&& handler) {
+    template <typename F> Router &route(std::vector<Method> methods, std::string path, F &&handler) {
         auto entry = make_route_entry(methods, make_handler(std::forward<F>(handler)));
         if (!entry) {
-            return *this;  // Method::Unknown rejected — see make_route_entry
+            return *this; // Method::Unknown rejected — see make_route_entry
         }
         // A path holding `{name}` segments is a template route: matched
         // segment-wise with captures published onto the Request. Still exact
@@ -139,16 +137,15 @@ class Router {
         return *this;
     }
 
-    template <typename F>
-    Router& route_regex(std::vector<Method> methods, const std::string& pattern, F&& handler) {
+    template <typename F> Router &route_regex(std::vector<Method> methods, const std::string &pattern, F &&handler) {
         auto entry = make_route_entry(methods, make_handler(std::forward<F>(handler)));
         if (!entry) {
-            return *this;  // Method::Unknown rejected — see make_route_entry
+            return *this; // Method::Unknown rejected — see make_route_entry
         }
         try {
             m_regex.emplace_back(RegexRoute{simple_http_regex::regex{pattern}, literal_prefix(pattern)},
                                  std::move(*entry));
-        } catch (const std::exception& e) {
+        } catch (const std::exception &e) {
             SIMPLE_HTTP_ERROR_LOG("invalid route regex [{}]: {}", pattern, e.what());
         }
         return *this;
@@ -165,9 +162,9 @@ class Router {
     // status, then any number of openapi::resp<T>(status, description) for the
     // error responses the handler may answer.
     template <typename Res, typename F, typename... Extras>
-    Router& route(std::vector<Method> methods, std::string path, F&& handler, openapi::OperationInfo info = {},
-                  Extras&&... extras) {
-        route(methods, path, std::forward<F>(handler));  // the normal registration
+    Router &route(std::vector<Method> methods, std::string path, F &&handler, openapi::OperationInfo info = {},
+                  Extras &&...extras) {
+        route(methods, path, std::forward<F>(handler)); // the normal registration
         std::vector<openapi::Param> params;
         std::vector<openapi::Response> responses;
         openapi::collect_annotation(params, responses, std::forward<Extras>(extras)...);
@@ -177,9 +174,9 @@ class Router {
         return *this;
     }
     template <typename Req, typename Res, typename F, typename... Extras>
-    Router& route(std::vector<Method> methods, std::string path, F&& handler, openapi::OperationInfo info = {},
-                  Extras&&... extras) {
-        route(methods, path, std::forward<F>(handler));  // the normal registration
+    Router &route(std::vector<Method> methods, std::string path, F &&handler, openapi::OperationInfo info = {},
+                  Extras &&...extras) {
+        route(methods, path, std::forward<F>(handler)); // the normal registration
         std::vector<openapi::Param> params;
         std::vector<openapi::Response> responses;
         openapi::collect_annotation(params, responses, std::forward<Extras>(extras)...);
@@ -197,22 +194,23 @@ class Router {
     // parsed values with openapi::path_params<Params>(req). `Second` is the
     // request-body type or openapi::NoBody.
     template <typename Params, typename Second, typename Res, typename F, typename... Extras>
-    Router& route(std::vector<Method> methods, std::string path, F&& handler, openapi::OperationInfo info = {},
-                  Extras&&... extras) {
+    Router &route(std::vector<Method> methods, std::string path, F &&handler, openapi::OperationInfo info = {},
+                  Extras &&...extras) {
         if (!openapi::params_match_template<Params>(openapi::template_param_names(path))) {
             SIMPLE_HTTP_ERROR_LOG("route [{}]: template {{name}}s do not match the Params fields; "
-                                  "registration skipped", path);
+                                  "registration skipped",
+                                  path);
             return *this;
         }
-        route(methods, path, std::forward<F>(handler));  // the normal registration
+        route(methods, path, std::forward<F>(handler)); // the normal registration
         std::vector<openapi::Param> params;
         std::vector<openapi::Response> responses;
         openapi::collect_annotation(params, responses, std::forward<Extras>(extras)...);
         // The path parameters come from the Params struct; a user-declared
         // annotation for the same name only refines it.
-        for (auto& p : openapi::path_params_schema<Params>()) {
+        for (auto &p : openapi::path_params_schema<Params>()) {
             bool declared = false;
-            for (const auto& q : params) {
+            for (const auto &q : params) {
                 if (q.name == p.name && q.in == p.in) {
                     declared = true;
                     break;
@@ -229,35 +227,49 @@ class Router {
                 return openapi::schema_json<Second>();
             }
         }();
-        m_openapi->add_operation(methods, std::move(path), std::move(info), request_schema,
-                                 openapi::schema_json<Res>(), std::move(params), std::move(responses));
+        m_openapi->add_operation(methods, std::move(path), std::move(info), request_schema, openapi::schema_json<Res>(),
+                                 std::move(params), std::move(responses));
         return *this;
     }
 
     // The document being collected, for its info fields: server.openapi()
     //     .title("petshop").version("1.0.0").server("https://api.example");
-    openapi::OpenApiSpec& openapi() {
-        return *m_openapi;
+    openapi::OpenApiSpec &openapi() { return *m_openapi; }
+
+    // Cross-checks the document against the route tables and logs every
+    // operation the doc claims but the router does not serve — a registration
+    // that was skipped (invalid template, Params mismatch, method conflict)
+    // while its doc entry went through is exactly the divergence that finds.
+    void verify_openapi() const {
+        for (const auto &[path, methods] : m_openapi->operations()) {
+            for (Method m : methods) {
+                if (!serves_route(m, path)) {
+                    SIMPLE_HTTP_WARN_LOG("openapi: documented {} {} is not served by the router", to_string(m), path);
+                }
+            }
+        }
     }
 
     // Serves the collected document at `path` (register under /openapi.json or
     // wherever fits). Render runs per request, so routes added after this call
-    // still appear in the document.
-    Router& serve_openapi(std::string path = "/openapi.json") {
+    // still appear in the document. Also runs the startup reconciliation, so a
+    // documented-but-unserved operation is a warning, not a silent lie.
+    Router &serve_openapi(std::string path = "/openapi.json") {
+        verify_openapi();
         auto spec = m_openapi;
-        route(any_methods, std::move(path),
-              [spec](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-                  co_await res->status(status::ok).content_type(mime::app_json).send(spec->render_json());
-              });
+        route(any_methods, std::move(path), [spec](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+            co_await res->status(status::ok).content_type(mime::app_json).send(spec->render_json());
+        });
         return *this;
     }
     // Serves a CDN-backed Swagger UI page that loads the document from
     // `spec_url` (usually the path passed to serve_openapi). See
     // openapi::swagger_ui_html for the offline alternative.
-    Router& serve_swagger_ui(std::string path = "/swagger", std::string spec_url = "/openapi.json") {
+    Router &serve_swagger_ui(std::string path = "/swagger", std::string spec_url = "/openapi.json") {
         route(any_methods, std::move(path),
               [spec_url = std::move(spec_url)](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-                  co_await res->status(status::ok).content_type("text/html; charset=utf-8")
+                  co_await res->status(status::ok)
+                      .content_type("text/html; charset=utf-8")
                       .send(openapi::swagger_ui_html(spec_url));
               });
         return *this;
@@ -273,7 +285,7 @@ class Router {
     // A disabled site (empty root) is ignored rather than registered, with the
     // reason logged: "why is my site serving 404s" should not be a silent
     // configuration mistake.
-    Router& static_files(std::shared_ptr<StaticFiles> site) {
+    Router &static_files(std::shared_ptr<StaticFiles> site) {
         if (!site || !site->enabled()) {
             SIMPLE_HTTP_INFO_LOG("static files: ignoring a disabled site");
             return *this;
@@ -282,69 +294,70 @@ class Router {
         return *this;
     }
 
-    template <typename F>
-    Router& fallback(F&& handler) {
+    template <typename F> Router &fallback(F &&handler) {
         m_fallback = make_handler(std::forward<F>(handler));
         return *this;
     }
 
-    Router& before(Filter filter) {
+    Router &before(Filter filter) {
         m_before = std::move(filter);
         return *this;
     }
     // CORS: a policy in, and the filter it compiles to is what dispatch runs. See
-    // handler/cors.h — including why a preflight never reaches a route. A policy the
-    // config cannot express goes in a before() filter instead, which can start from
-    // make_cors_filter() if it only wants to narrow the built-in behaviour.
-    Router& cors(CorsConfig config) {
+    // handler/cors.h — including why a preflight never reaches a route. A policy
+    // the config cannot express goes in a before() filter instead, which can
+    // start from make_cors_filter() if it only wants to narrow the built-in
+    // behaviour.
+    Router &cors(CorsConfig config) {
         m_cors = make_cors_filter(std::move(config));
         return *this;
     }
 
     // --- WebSocket route registration ---
-    Router& ws_route(std::string path, WsHandler handler) {
+    Router &ws_route(std::string path, WsHandler handler) {
         m_ws_exact.emplace(std::move(path), std::move(handler));
         return *this;
     }
 
-    Router& ws_route_regex(const std::string& pattern, WsHandler handler) {
+    Router &ws_route_regex(const std::string &pattern, WsHandler handler) {
         try {
-            m_ws_regex.emplace_back(RegexRoute{simple_http_regex::regex{pattern}, literal_prefix(pattern)}, std::move(handler));
-        } catch (const std::exception& e) {
+            m_ws_regex.emplace_back(RegexRoute{simple_http_regex::regex{pattern}, literal_prefix(pattern)},
+                                    std::move(handler));
+        } catch (const std::exception &e) {
             SIMPLE_HTTP_ERROR_LOG("invalid ws route regex [{}]: {}", pattern, e.what());
         }
         return *this;
     }
 
     // --- WebSocket proxy-route registration (byte-level pass-through) ---
-    Router& ws_proxy(std::string path, WsProxyTarget target) {
+    Router &ws_proxy(std::string path, WsProxyTarget target) {
         m_ws_proxy_exact.emplace(std::move(path), std::move(target));
         return *this;
     }
 
-    Router& ws_proxy_regex(const std::string& pattern, WsProxyTarget target) {
+    Router &ws_proxy_regex(const std::string &pattern, WsProxyTarget target) {
         try {
-            m_ws_proxy_regex.emplace_back(RegexRoute{simple_http_regex::regex{pattern}, literal_prefix(pattern)}, std::move(target));
-        } catch (const std::exception& e) {
+            m_ws_proxy_regex.emplace_back(RegexRoute{simple_http_regex::regex{pattern}, literal_prefix(pattern)},
+                                          std::move(target));
+        } catch (const std::exception &e) {
             SIMPLE_HTTP_ERROR_LOG("invalid ws proxy regex [{}]: {}", pattern, e.what());
         }
         return *this;
     }
 
     // --- HTTP reverse-proxy route registration (request-level) ---
-    Router& http_proxy(std::string path, HttpProxyTarget target, ClientConfig client_cfg = {}) {
-        m_http_proxy_exact.emplace(std::move(path),
-                                   HttpProxyRoute{std::move(target),
-                                                  std::make_shared<HttpClient>(std::move(client_cfg))});
+    Router &http_proxy(std::string path, HttpProxyTarget target, ClientConfig client_cfg = {}) {
+        m_http_proxy_exact.emplace(
+            std::move(path), HttpProxyRoute{std::move(target), std::make_shared<HttpClient>(std::move(client_cfg))});
         return *this;
     }
 
-    Router& http_proxy_regex(const std::string& pattern, HttpProxyTarget target, ClientConfig client_cfg = {}) {
+    Router &http_proxy_regex(const std::string &pattern, HttpProxyTarget target, ClientConfig client_cfg = {}) {
         try {
             m_http_proxy_regex.emplace_back(
                 RegexRoute{simple_http_regex::regex{pattern}, literal_prefix(pattern)},
                 HttpProxyRoute{std::move(target), std::make_shared<HttpClient>(std::move(client_cfg))});
-        } catch (const std::exception& e) {
+        } catch (const std::exception &e) {
             SIMPLE_HTTP_ERROR_LOG("invalid http proxy regex [{}]: {}", pattern, e.what());
         }
         return *this;
@@ -352,7 +365,7 @@ class Router {
 
     // Local WebSocket handler for an exact path (nginx `location = /path`):
     // the h1 engine consults this before a proxy route for the same path.
-    const WsHandler* find_ws_exact(std::string_view path) const {
+    const WsHandler *find_ws_exact(std::string_view path) const {
         if (auto it = m_ws_exact.find(path); it != m_ws_exact.end()) {
             return &it->second;
         }
@@ -361,13 +374,15 @@ class Router {
 
     // Local WebSocket handler via the regex routes, consulted after the proxy
     // lookup. Same literal-prefix fast path as the other regex walks.
-    const WsHandler* find_ws_regex(std::string_view path) const {
+    const WsHandler *find_ws_regex(std::string_view path) const {
         if (m_ws_regex.empty()) {
-            return nullptr;  // nothing to match, and no string to build for it
+            return nullptr; // nothing to match, and no string to build for it
         }
-        for (const auto& [route, handler] : m_ws_regex) {
-            if (!route.literal_prefix.empty() && !path.starts_with(route.literal_prefix)) continue;
-            const std::string p{path};  // regex_match needs std::string; built only when a prefix may match
+        for (const auto &[route, handler] : m_ws_regex) {
+            if (!route.literal_prefix.empty() && !path.starts_with(route.literal_prefix))
+                continue;
+            const std::string p{path}; // regex_match needs std::string; built only
+                                       // when a prefix may match
             if (simple_http_regex::regex_match(p, route.pattern)) {
                 return &handler;
             }
@@ -379,8 +394,9 @@ class Router {
     // find_ws_regex separately (in nginx order a proxy route sits between
     // them); this form is kept for callers that only ask "is there a local ws
     // handler at all".
-    const WsHandler* find_ws(std::string_view path) const {
-        if (const WsHandler* h = find_ws_exact(path)) return h;
+    const WsHandler *find_ws(std::string_view path) const {
+        if (const WsHandler *h = find_ws_exact(path))
+            return h;
         return find_ws_regex(path);
     }
 
@@ -393,14 +409,16 @@ class Router {
     // rewrite_path is the final path to send to the backend.
     std::optional<WsProxyTarget> find_ws_proxy(std::string_view path) const {
         if (auto it = m_ws_proxy_exact.find(path); it != m_ws_proxy_exact.end()) {
-            return it->second;  // exact route: rewrite_path used verbatim
+            return it->second; // exact route: rewrite_path used verbatim
         }
         if (m_ws_proxy_regex.empty()) {
             return std::nullopt;
         }
-        for (const auto& [route, target] : m_ws_proxy_regex) {
-            if (!route.literal_prefix.empty() && !path.starts_with(route.literal_prefix)) continue;
-            const std::string p{path};  // regex_match needs std::string; built only when a prefix may match
+        for (const auto &[route, target] : m_ws_proxy_regex) {
+            if (!route.literal_prefix.empty() && !path.starts_with(route.literal_prefix))
+                continue;
+            const std::string p{path}; // regex_match needs std::string; built only
+                                       // when a prefix may match
             simple_http_regex::smatch m;
             if (simple_http_regex::regex_match(p, m, route.pattern)) {
                 WsProxyTarget out = target;
@@ -425,9 +443,11 @@ class Router {
         if (m_http_proxy_regex.empty()) {
             return std::nullopt;
         }
-        for (const auto& [route, proxy] : m_http_proxy_regex) {
-            if (!route.literal_prefix.empty() && !path.starts_with(route.literal_prefix)) continue;
-            const std::string p{path};  // regex_match needs std::string; built only when a prefix may match
+        for (const auto &[route, proxy] : m_http_proxy_regex) {
+            if (!route.literal_prefix.empty() && !path.starts_with(route.literal_prefix))
+                continue;
+            const std::string p{path}; // regex_match needs std::string; built only
+                                       // when a prefix may match
             simple_http_regex::smatch m;
             if (simple_http_regex::regex_match(p, m, route.pattern)) {
                 HttpProxyRoute out = proxy;
@@ -471,8 +491,8 @@ class Router {
         // rejected second): 405 + Allow, or the automatic OPTIONS reply — a
         // path that nothing services continues below and ends in the 404.
         if (auto it = m_exact.find(path); it != m_exact.end()) {
-            const MethodTable& tbl = it->second;
-            if (const RouteEntry* hit = lookup(tbl, method)) {
+            const MethodTable &tbl = it->second;
+            if (const RouteEntry *hit = lookup(tbl, method)) {
                 co_await invoke_handler(hit->handler, std::move(req), std::move(res), ssl);
                 co_return;
             }
@@ -490,10 +510,10 @@ class Router {
         // specific match wins, like Go's httprouter). A hit publishes its
         // captures onto the Request before the handler runs; method miss is a
         // 405, the same as an exact route.
-        const TrieTerminal* term = nullptr;
+        const TrieTerminal *term = nullptr;
         std::vector<std::string_view> values;
         if (match_template(m_trie, path, term, values)) {
-            if (const RouteEntry* hit = lookup(term->tbl, method)) {
+            if (const RouteEntry *hit = lookup(term->tbl, method)) {
                 for (std::size_t i = 0; i < values.size(); ++i) {
                     req->set_param(term->param_names[i], values[i]);
                 }
@@ -520,12 +540,14 @@ class Router {
         }
 
         if (!m_regex.empty()) {
-            const std::string owned_path{path};  // regex_match needs a string
+            const std::string owned_path{path}; // regex_match needs a string
             bool method_mismatch = false;
             std::uint16_t mismatch_bits = 0;
-            for (const auto& [route, entry] : m_regex) {
-                if (!route.literal_prefix.empty() && !path.starts_with(route.literal_prefix)) continue;
-                if (!simple_http_regex::regex_match(owned_path, route.pattern)) continue;
+            for (const auto &[route, entry] : m_regex) {
+                if (!route.literal_prefix.empty() && !path.starts_with(route.literal_prefix))
+                    continue;
+                if (!simple_http_regex::regex_match(owned_path, route.pattern))
+                    continue;
                 if (method_allowed(entry, method)) {
                     co_await invoke_handler(entry.handler, std::move(req), std::move(res), ssl);
                     co_return;
@@ -551,8 +573,9 @@ class Router {
         // endpoint, and it is also why a site's try_serve may return "not mine"
         // at any point without the request being dropped: whatever comes next in
         // this function still runs, and the built-in 404 is the last of them.
-        for (const auto& site : m_static) {
-            if (co_await site->try_serve(req, res)) co_return;
+        for (const auto &site : m_static) {
+            if (co_await site->try_serve(req, res))
+                co_return;
         }
 
         if (m_fallback) {
@@ -581,7 +604,7 @@ class Router {
                 if (name.empty()) {
                     return std::nullopt;
                 }
-                for (const auto& prior : seen) {
+                for (const auto &prior : seen) {
                     if (prior == name) {
                         return std::nullopt;
                     }
@@ -606,18 +629,19 @@ class Router {
         return out;
     }
 
-    // A path's handlers, keyed by HTTP method: one slot per Method (indexed by the
-// enum), plus an any-method slot for a route registered with `any_methods`.
-// GET's implied HEAD is expanded into the HEAD slot at registration, so an
-// explicit HEAD registration simply overrides it. This is the "store by
-// (method, path)" shape: dispatch reads the exact slot, no scanning.
-struct MethodTable {
-    static constexpr std::size_t kSlots = 10;  // Method::Get .. Method::Unknown
-    std::array<std::optional<RouteEntry>, kSlots> by_method;
-    std::optional<RouteEntry> any;
-};
+    // A path's handlers, keyed by HTTP method: one slot per Method (indexed by
+    // the
+    // enum), plus an any-method slot for a route registered with `any_methods`.
+    // GET's implied HEAD is expanded into the HEAD slot at registration, so an
+    // explicit HEAD registration simply overrides it. This is the "store by
+    // (method, path)" shape: dispatch reads the exact slot, no scanning.
+    struct MethodTable {
+        static constexpr std::size_t kSlots = 10; // Method::Get .. Method::Unknown
+        std::array<std::optional<RouteEntry>, kSlots> by_method;
+        std::optional<RouteEntry> any;
+    };
 
-// The handlers shared by every template that ends at a trie node, plus the
+    // The handlers shared by every template that ends at a trie node, plus the
     // path-order of their {name}s. The param edges themselves are anonymous —
     // they are shared by every route that has a capture at that position, so
     // two templates like /owners/{owner}/pets/{pet_id} and
@@ -644,7 +668,7 @@ struct MethodTable {
     // the any-method slot, and a GET registration also fills the implied HEAD
     // slot unless HEAD was registered explicitly. A slot already holding a
     // handler keeps it — first registration wins, test_router.cpp pins that.
-    static void insert_entry(MethodTable& tbl, const RouteEntry& entry, const std::vector<Method>& methods) {
+    static void insert_entry(MethodTable &tbl, const RouteEntry &entry, const std::vector<Method> &methods) {
         if (methods.empty()) {
             if (tbl.any) {
                 SIMPLE_HTTP_INFO_LOG("any-method route already registered; the first handler stays");
@@ -657,17 +681,18 @@ struct MethodTable {
             if (m == Method::Unknown) {
                 continue;
             }
-            auto& slot = tbl.by_method[static_cast<std::size_t>(m)];
+            auto &slot = tbl.by_method[static_cast<std::size_t>(m)];
             if (slot) {
-                SIMPLE_HTTP_INFO_LOG("route already registered for this method; the first handler stays");
+                SIMPLE_HTTP_INFO_LOG("route already registered for this method; the first handler "
+                                     "stays");
             } else {
                 slot = entry;
             }
         }
         if ((entry.method_bits & method_bit(Method::Get)) != 0) {
-            auto& head = tbl.by_method[static_cast<std::size_t>(Method::Head)];
+            auto &head = tbl.by_method[static_cast<std::size_t>(Method::Head)];
             if (!head) {
-                head = entry;  // GET implies HEAD, unless HEAD is registered explicitly
+                head = entry; // GET implies HEAD, unless HEAD is registered explicitly
             }
         }
     }
@@ -675,9 +700,9 @@ struct MethodTable {
     // The union of the methods a path actually serves, for the Allow header.
     // (An `any` slot means every method is served, so this is only consulted on
     // the 405/OPTIONS path, where `any` cannot be present.)
-    static std::uint16_t method_allow_bits(const MethodTable& tbl) {
+    static std::uint16_t method_allow_bits(const MethodTable &tbl) {
         std::uint16_t bits = 0;
-        for (const auto& slot : tbl.by_method) {
+        for (const auto &slot : tbl.by_method) {
             if (slot) {
                 bits |= slot->method_bits;
             }
@@ -688,12 +713,26 @@ struct MethodTable {
     // The handler for `method` on a path's method-keyed table: the exact slot,
     // or the any-method slot, or null. Every registration expands into slots,
     // so this is a plain indexed read — no scanning.
-    static const RouteEntry* lookup(const MethodTable& tbl, Method m) {
+    static const RouteEntry *lookup(const MethodTable &tbl, Method m) {
         const std::size_t idx = static_cast<std::size_t>(m);
         if (idx < MethodTable::kSlots && tbl.by_method[idx]) {
             return &*tbl.by_method[idx];
         }
         return tbl.any ? &*tbl.any : nullptr;
+    }
+
+    // Whether the router serves `m` on `path`: an exact-route slot, a template
+    // terminal slot, or neither. Used by verify_openapi.
+    bool serves_route(Method m, std::string_view path) const {
+        if (auto it = m_exact.find(path); it != m_exact.end()) {
+            return lookup(it->second, m) != nullptr;
+        }
+        const TrieTerminal *term = nullptr;
+        std::vector<std::string_view> values;
+        if (match_template(m_trie, path, term, values)) {
+            return lookup(term->tbl, m) != nullptr;
+        }
+        return false;
     }
 
     // Inserts a template route into the trie. A literal segment becomes a
@@ -706,7 +745,7 @@ struct MethodTable {
             m_trie.push_back(TrieNode{});
         }
         std::size_t node = 0;
-        for (const auto& seg : tmpl.segments) {
+        for (const auto &seg : tmpl.segments) {
             if (seg.has_value()) {
                 auto [it, fresh] = m_trie[node].literals.emplace(*seg, TrieNode::npos);
                 if (fresh) {
@@ -722,7 +761,7 @@ struct MethodTable {
                 node = m_trie[node].param_child;
             }
         }
-        auto& term = m_trie[node].terminal;
+        auto &term = m_trie[node].terminal;
         if (term.param_names.empty()) {
             term.param_names = std::move(tmpl.param_names);
         } else if (term.param_names != tmpl.param_names) {
@@ -739,8 +778,8 @@ struct MethodTable {
     // order (views into the request path, valid for the request's lifetime);
     // the terminal's param_names pair them up. Returns false when no template
     // matches or the shape differs.
-    bool match_template(const std::vector<TrieNode>& trie, std::string_view path, const TrieTerminal*& term,
-                        std::vector<std::string_view>& values) const {
+    bool match_template(const std::vector<TrieNode> &trie, std::string_view path, const TrieTerminal *&term,
+                        std::vector<std::string_view> &values) const {
         if (trie.empty()) {
             return false;
         }
@@ -748,7 +787,7 @@ struct MethodTable {
         std::size_t node = 0;
         std::size_t pos = 0;
         for (;;) {
-            const TrieNode& n = trie[node];
+            const TrieNode &n = trie[node];
             const std::size_t end = path.find('/', pos);
             const std::string_view part =
                 path.substr(pos, end == std::string_view::npos ? std::string_view::npos : end - pos);
@@ -756,8 +795,8 @@ struct MethodTable {
             if (lit != n.literals.end()) {
                 node = lit->second;
             } else if (n.param_child != TrieNode::npos && !part.empty()) {
-                found.push_back(part);  // anonymous edge: the value only; the
-                node = n.param_child;   // terminal remaps it to this route's names
+                found.push_back(part); // anonymous edge: the value only; the
+                node = n.param_child;  // terminal remaps it to this route's names
             } else {
                 return false;
             }
@@ -774,9 +813,9 @@ struct MethodTable {
         return true;
     }
 
-    // The empty method set (see `any_methods`) means "any method", and GET implies
-    // HEAD — the two implicit rules shared with Flask / axum / Go 1.22.
-    static std::optional<RouteEntry> make_route_entry(const std::vector<Method>& methods, Handler handler) {
+    // The empty method set (see `any_methods`) means "any method", and GET
+    // implies HEAD — the two implicit rules shared with Flask / axum / Go 1.22.
+    static std::optional<RouteEntry> make_route_entry(const std::vector<Method> &methods, Handler handler) {
         std::uint16_t bits = 0;
         for (Method m : methods) {
             if (m == Method::Unknown) {
@@ -786,7 +825,7 @@ struct MethodTable {
             bits |= method_bit(m);
         }
         if (bits == 0) {
-            bits = RouteEntry::all_bits;  // any_methods — every method, Unknown included
+            bits = RouteEntry::all_bits; // any_methods — every method, Unknown included
         } else if ((bits & method_bit(Method::Get)) != 0) {
             // A GET route also serves HEAD; the response writer strips the body
             // (regression-tested: "HEAD and 204 carry no body").
@@ -795,7 +834,7 @@ struct MethodTable {
         return RouteEntry{bits, std::move(handler)};
     }
 
-    static bool method_allowed(const RouteEntry& entry, Method m) noexcept {
+    static bool method_allowed(const RouteEntry &entry, Method m) noexcept {
         return (entry.method_bits & method_bit(m)) != 0;
     }
 
@@ -806,10 +845,12 @@ struct MethodTable {
     static std::string allow_value(std::uint16_t bits) {
         bits |= method_bit(Method::Options);
         std::string out;
-        for (Method m : {Method::Get, Method::Head, Method::Post, Method::Put, Method::Delete,
-                         Method::Options, Method::Patch, Method::Connect, Method::Trace}) {
-            if ((bits & method_bit(m)) == 0) continue;
-            if (!out.empty()) out += ", ";
+        for (Method m : {Method::Get, Method::Head, Method::Post, Method::Put, Method::Delete, Method::Options,
+                         Method::Patch, Method::Connect, Method::Trace}) {
+            if ((bits & method_bit(m)) == 0)
+                continue;
+            if (!out.empty())
+                out += ", ";
             out += to_string(m);
         }
         return out;
@@ -837,7 +878,7 @@ struct MethodTable {
     // Expands a rewrite template against a regex match: $0 = whole match,
     // $1..$9 = capture groups (empty if the group did not participate), $$ = a
     // literal '$'. A lone '$' or '$' before a non-digit/non-'$' is kept verbatim.
-    static std::string expand_rewrite(const std::string& tmpl, const simple_http_regex::smatch& m) {
+    static std::string expand_rewrite(const std::string &tmpl, const simple_http_regex::smatch &m) {
         std::string out;
         out.reserve(tmpl.size());
         for (std::size_t i = 0; i < tmpl.size(); ++i) {
@@ -846,7 +887,7 @@ struct MethodTable {
                 continue;
             }
             if (i + 1 >= tmpl.size()) {
-                out.push_back('$');  // trailing '$'
+                out.push_back('$'); // trailing '$'
                 break;
             }
             char c = tmpl[i + 1];
@@ -860,7 +901,7 @@ struct MethodTable {
                 }
                 ++i;
             } else {
-                out.push_back('$');  // not a placeholder; keep the '$'
+                out.push_back('$'); // not a placeholder; keep the '$'
             }
         }
         return out;
@@ -868,7 +909,8 @@ struct MethodTable {
 
     struct RegexRoute {
         simple_http_regex::regex pattern;
-        std::string literal_prefix;  // leading literal bytes; empty = pattern starts with a metachar
+        std::string literal_prefix; // leading literal bytes; empty = pattern
+                                    // starts with a metachar
     };
 
     // Leading literal characters of a regex source — everything before the first
@@ -883,23 +925,23 @@ struct MethodTable {
         out.reserve(pattern.size());
         for (char c : pattern) {
             switch (c) {
-                case '\\':
-                case '^':
-                case '$':
-                case '.':
-                case '[':
-                case ']':
-                case '*':
-                case '+':
-                case '?':
-                case '(':
-                case ')':
-                case '{':
-                case '}':
-                case '|':
-                    return out;  // metacharacter ends the literal run
-                default:
-                    out.push_back(c);
+            case '\\':
+            case '^':
+            case '$':
+            case '.':
+            case '[':
+            case ']':
+            case '*':
+            case '+':
+            case '?':
+            case '(':
+            case ')':
+            case '{':
+            case '}':
+            case '|':
+                return out; // metacharacter ends the literal run
+            default:
+                out.push_back(c);
             }
         }
         return out;
@@ -911,10 +953,10 @@ struct MethodTable {
     };
 
     // A path's handlers, keyed by HTTP method: one slot per Method (indexed by
-// the enum value), plus an any-method slot for `any_methods`. GET's implied
-// HEAD is expanded into the HEAD slot here, so an explicit HEAD registration
-// simply overrides it. This is the "store by (method, path)" shape.
-std::unordered_map<std::string, MethodTable, string_hash, std::equal_to<>> m_exact;
+    // the enum value), plus an any-method slot for `any_methods`. GET's implied
+    // HEAD is expanded into the HEAD slot here, so an explicit HEAD registration
+    // simply overrides it. This is the "store by (method, path)" shape.
+    std::unordered_map<std::string, MethodTable, string_hash, std::equal_to<>> m_exact;
     // Path-template routes, indexed in a segment trie (see TrieNode); each
     // terminal holds the same per-method table. Literal templates stay in
     // `m_exact`; only paths containing `{name}` land here.
@@ -944,4 +986,4 @@ std::unordered_map<std::string, MethodTable, string_hash, std::equal_to<>> m_exa
     std::vector<std::pair<RegexRoute, HttpProxyRoute>> m_http_proxy_regex;
 };
 
-}  // namespace simple_http
+} // namespace simple_http

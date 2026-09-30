@@ -27,12 +27,15 @@
 // A policy that cannot be met is an error, not a silent downgrade:
 // version_not_negotiated.
 //
-// Concurrency: every operation runs on the caller's executor (sessions are bound
-// to it, model A), so this class holds no executor of its own — but one
-// HttpClient may be shared across threads, since the pool is locked and sessions
-// only ever hop onto their own executor.
+// Concurrency: every operation runs on the caller's executor (sessions are
+// bound to it, model A), so this class holds no executor of its own — but one
+// HttpClient may be shared across threads, since the pool is locked and
+// sessions only ever hop onto their own executor.
 
 #include <atomic>
+#include <boost/asio.hpp>
+#include <boost/asio/experimental/awaitable_operators.hpp>
+#include <boost/asio/ssl.hpp>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -43,10 +46,6 @@
 #include <string_view>
 #include <utility>
 #include <vector>
-
-#include <boost/asio.hpp>
-#include <boost/asio/experimental/awaitable_operators.hpp>
-#include <boost/asio/ssl.hpp>
 
 #include "../core/limits.h"
 #include "../core/logging.h"
@@ -75,14 +74,10 @@ struct ClientResponse {
     // True when nothing followed the head (HEAD, 204/304).
     bool bodyless{false};
 
-    std::optional<std::string_view> header(std::string_view name) const {
-        return headers.get(name);
-    }
+    std::optional<std::string_view> header(std::string_view name) const { return headers.get(name); }
 
     // 2xx.
-    bool ok() const {
-        return status >= 200 && status < 300;
-    }
+    bool ok() const { return status >= 200 && status < 300; }
 };
 
 // Per-request knobs for the convenience level.
@@ -110,8 +105,8 @@ struct OpenedStream {
 
 // Connection counters, for diagnostics and for tests that assert reuse.
 struct ClientStats {
-    std::size_t connections_opened{0};  // fresh TCP/TLS connections dialed
-    std::size_t connections_reused{0};  // sessions taken from the pool
+    std::size_t connections_opened{0}; // fresh TCP/TLS connections dialed
+    std::size_t connections_reused{0}; // sessions taken from the pool
 };
 
 // Whether a failure came from the transport rather than from a decision the
@@ -120,7 +115,7 @@ struct ClientStats {
 // worth replaying: the peer was idle and closed under us, so nothing can have
 // been acted on — which is not true of a request a live connection dropped
 // mid-flight.
-inline bool transport_failure(const error_code& ec) {
+inline bool transport_failure(const error_code &ec) {
     return ec.category() != client_category() || ec == make_error_code(client_errc::session_closed);
 }
 
@@ -139,7 +134,7 @@ asio::awaitable<std::expected<T, error_code>> await_with_deadline(asio::awaitabl
         co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
     };
     auto outcome = co_await (std::move(op) || deadline_op());
-    if (auto* value = std::get_if<T>(&outcome))
+    if (auto *value = std::get_if<T>(&outcome))
         co_return std::move(*value);
     co_return std::unexpected{make_error_code(client_errc::request_timeout)};
 }
@@ -152,33 +147,21 @@ class HttpClient {
     explicit HttpClient(ClientConfig config = {})
         : m_config(std::move(config)),
           m_pool(std::make_shared<ClientPool>(m_config.max_idle_per_target, m_config.idle_pool_ttl)),
-          m_ssl_context(make_client_ssl_context(m_config.tls)) {
-    }
+          m_ssl_context(make_client_ssl_context(m_config.tls)) {}
 
-    HttpClient(const HttpClient&) = delete;
-    HttpClient& operator=(const HttpClient&) = delete;
+    HttpClient(const HttpClient &) = delete;
+    HttpClient &operator=(const HttpClient &) = delete;
 
-    ClientConfig& config() {
-        return m_config;
-    }
+    ClientConfig &config() { return m_config; }
 
-    const ClientConfig& config() const {
-        return m_config;
-    }
+    const ClientConfig &config() const { return m_config; }
 
-    ClientStats stats() const {
-        return ClientStats{m_opened.load(std::memory_order_relaxed), m_pool->reused_count()};
-    }
+    ClientStats stats() const { return ClientStats{m_opened.load(std::memory_order_relaxed), m_pool->reused_count()}; }
 
-    std::size_t idle_connections() const {
-        return m_pool->idle_count();
-    }
+    std::size_t idle_connections() const { return m_pool->idle_count(); }
 
     // Closes every idle pooled connection (in-flight ones are untouched).
-    void close_idle() {
-        m_pool->clear();
-    }
-
+    void close_idle() { m_pool->clear(); }
 
     // A session plus where it came from.
     struct Acquired {
@@ -212,7 +195,8 @@ class HttpClient {
     // origin's "/". The returned OpenedStream says whether the connection came
     // from the pool.
     asio::awaitable<std::expected<OpenedStream, error_code>> open_stream(ClientTarget target, RequestSpec spec) {
-        co_return co_await start_exchange(std::move(target), std::move(spec), /*url_target=*/{});
+        co_return co_await start_exchange(std::move(target), std::move(spec),
+                                          /*url_target=*/{});
     }
 
     // Same, with the target taken from a URL (including its path and query when
@@ -227,14 +211,12 @@ class HttpClient {
 
     // --- convenience level ---
 
-    asio::awaitable<std::expected<ClientResponse, error_code>> request(ClientTarget target,
-                                                                       RequestSpec spec,
+    asio::awaitable<std::expected<ClientResponse, error_code>> request(ClientTarget target, RequestSpec spec,
                                                                        RequestOptions options = {}) {
         co_return co_await do_request(std::move(target), std::move(spec), {}, options);
     }
 
-    asio::awaitable<std::expected<ClientResponse, error_code>> request(std::string_view url,
-                                                                       RequestSpec spec,
+    asio::awaitable<std::expected<ClientResponse, error_code>> request(std::string_view url, RequestSpec spec,
                                                                        RequestOptions options = {}) {
         auto parsed = parse_url(url);
         if (!parsed)
@@ -249,10 +231,8 @@ class HttpClient {
         co_return co_await request(url, std::move(spec), options);
     }
 
-    asio::awaitable<std::expected<ClientResponse, error_code>> post(std::string_view url,
-                                                                    std::string body,
-                                                                    std::string content_type = "text/plain",
-                                                                    RequestOptions options = {}) {
+    asio::awaitable<std::expected<ClientResponse, error_code>>
+    post(std::string_view url, std::string body, std::string content_type = "text/plain", RequestOptions options = {}) {
         RequestSpec spec;
         spec.method = Method::Post;
         spec.headers.add("content-type", std::move(content_type));
@@ -260,10 +240,8 @@ class HttpClient {
         co_return co_await request(url, std::move(spec), options);
     }
 
-    asio::awaitable<std::expected<ClientResponse, error_code>> put(std::string_view url,
-                                                                   std::string body,
-                                                                   std::string content_type = "text/plain",
-                                                                   RequestOptions options = {}) {
+    asio::awaitable<std::expected<ClientResponse, error_code>>
+    put(std::string_view url, std::string body, std::string content_type = "text/plain", RequestOptions options = {}) {
         RequestSpec spec;
         spec.method = Method::Put;
         spec.headers.add("content-type", std::move(content_type));
@@ -272,15 +250,13 @@ class HttpClient {
     }
 
     // HEAD: the response carries the headers a GET would produce and no body.
-    asio::awaitable<std::expected<ClientResponse, error_code>> head(std::string_view url,
-                                                                    RequestOptions options = {}) {
+    asio::awaitable<std::expected<ClientResponse, error_code>> head(std::string_view url, RequestOptions options = {}) {
         RequestSpec spec;
         spec.method = Method::Head;
         co_return co_await request(url, std::move(spec), options);
     }
 
-    asio::awaitable<std::expected<ClientResponse, error_code>> del(std::string_view url,
-                                                                   RequestOptions options = {}) {
+    asio::awaitable<std::expected<ClientResponse, error_code>> del(std::string_view url, RequestOptions options = {}) {
         RequestSpec spec;
         spec.method = Method::Delete;
         co_return co_await request(url, std::move(spec), options);
@@ -289,17 +265,15 @@ class HttpClient {
   private:
     // The ClientTarget a URL describes, with the client-wide defaults for the
     // knobs a URL cannot express.
-    ClientTarget target_from_url(const Url& url) const {
+    ClientTarget target_from_url(const Url &url) const {
         ClientTarget target = url.to_target();
         target.version = m_config.default_version;
         target.h2c = m_config.default_h2c;
         return target;
     }
 
-    asio::awaitable<std::expected<ClientResponse, error_code>> do_request(ClientTarget target,
-                                                                          RequestSpec spec,
-                                                                          std::string url_target,
-                                                                          RequestOptions options) {
+    asio::awaitable<std::expected<ClientResponse, error_code>>
+    do_request(ClientTarget target, RequestSpec spec, std::string url_target, RequestOptions options) {
         if (spec.target.empty())
             spec.target = url_target.empty() ? "/" : url_target;
         const std::size_t cap = options.max_body_bytes != 0 ? options.max_body_bytes : m_config.limits.max_body_bytes;
@@ -307,17 +281,19 @@ class HttpClient {
             options.timeout.count() != 0 ? options.timeout : m_config.request_timeout;
 
         for (int attempt = 0; attempt < 2; ++attempt) {
-            auto opened = co_await start_exchange(target, spec, url_target, /*fresh_only=*/attempt > 0);
+            auto opened = co_await start_exchange(target, spec, url_target,
+                                                  /*fresh_only=*/attempt > 0);
             if (!opened)
                 co_return std::unexpected{opened.error()};
-            auto& stream = opened->stream;
+            auto &stream = opened->stream;
 
             auto response = co_await read_exchange(stream, cap, limit);
             if (response)
                 co_return std::move(*response);
 
             const error_code ec = response.error();
-            (void)co_await stream->cancel();  // h2: reset the stream, keeping the connection; h1: close it
+            (void)co_await stream->cancel(); // h2: reset the stream, keeping the
+                                             // connection; h1: close it
 
             // Replay only when a duplicate cannot cause a second side effect. The
             // old rule — "the pooled connection died before answering, so it was
@@ -332,9 +308,9 @@ class HttpClient {
             // from the caller and cannot be sent again.
             if (attempt == 0 && opened->pooled && !spec.stream_body &&
                 (is_retryable(ec) || is_idempotent(spec.method))) {
-                SIMPLE_HTTP_ERROR_LOG("client: pooled connection to {} died before answering ({}), retrying",
-                                      target.authority(),
-                                      ec.message());
+                SIMPLE_HTTP_ERROR_LOG("client: pooled connection to {} died before answering ({}), "
+                                      "retrying",
+                                      target.authority(), ec.message());
                 continue;
             }
             co_return std::unexpected{ec};
@@ -344,9 +320,8 @@ class HttpClient {
 
     // Reads the response of one exchange: head, then whole body, both under the
     // request budget.
-    asio::awaitable<std::expected<ClientResponse, error_code>> read_exchange(std::shared_ptr<ClientStream> stream,
-                                                                             std::size_t cap,
-                                                                             std::chrono::milliseconds limit) {
+    asio::awaitable<std::expected<ClientResponse, error_code>>
+    read_exchange(std::shared_ptr<ClientStream> stream, std::size_t cap, std::chrono::milliseconds limit) {
         // Both expected layers matter: the outer one is the deadline, the inner
         // is the exchange itself.
         auto head = co_await await_with_deadline(stream->read_head(), limit);
@@ -358,13 +333,14 @@ class HttpClient {
             auto chunk = co_await await_with_deadline(stream->read(), limit);
             if (!chunk || !*chunk)
                 co_return std::unexpected{chunk ? (*chunk).error() : chunk.error()};
-            if ((*chunk)->eof) break;
+            if ((*chunk)->eof)
+                break;
             if (cap != 0 && body.size() + (*chunk)->data.size() > cap)
                 co_return std::unexpected{make_error_code(client_errc::body_too_large)};
             body.append((*chunk)->data);
         }
-        co_return ClientResponse{
-            (*head)->status, (*head)->version, std::move((*head)->headers), std::move(body), (*head)->bodyless};
+        co_return ClientResponse{(*head)->status, (*head)->version, std::move((*head)->headers), std::move(body),
+                                 (*head)->bodyless};
     }
 
     // Opens a stream on a connection to `target`: a pooled session if one is
@@ -372,10 +348,8 @@ class HttpClient {
     // stale (the peer closed it while it sat idle) costs one retry on a fresh
     // connection — the same rule the server's reverse proxy uses, and safe here
     // because nothing has been written yet when it fails.
-    asio::awaitable<std::expected<OpenedStream, error_code>> start_exchange(ClientTarget target,
-                                                                      RequestSpec spec,
-                                                                      std::string url_target,
-                                                                      bool fresh_only = false) {
+    asio::awaitable<std::expected<OpenedStream, error_code>>
+    start_exchange(ClientTarget target, RequestSpec spec, std::string url_target, bool fresh_only = false) {
         if (spec.target.empty())
             spec.target = url_target.empty() ? "/" : url_target;
 
@@ -397,8 +371,7 @@ class HttpClient {
 
             auto usable = co_await negotiate_and_open(acquired->session, target, spec);
             if (usable)
-                co_return OpenedStream{maybe_decompressing_stream(*usable, m_config.auto_decompress),
-                                       acquired->pooled};
+                co_return OpenedStream{maybe_decompressing_stream(*usable, m_config.auto_decompress), acquired->pooled};
 
             // A pooled connection that had gone away fails as a transport error
             // on the first write or read; that is worth one try on a fresh
@@ -406,9 +379,9 @@ class HttpClient {
             // speak, a malformed reply) is reported as it is.
             const error_code ec = usable.error();
             if (acquired->pooled && transport_failure(ec)) {
-                SIMPLE_HTTP_ERROR_LOG("client: {} dropped a pooled connection ({}), retrying on a fresh one",
-                                      target.authority(),
-                                      ec.message());
+                SIMPLE_HTTP_ERROR_LOG("client: {} dropped a pooled connection ({}), retrying on a fresh "
+                                      "one",
+                                      target.authority(), ec.message());
                 acquired->session->close();
                 continue;
             }
@@ -418,10 +391,8 @@ class HttpClient {
     }
 
     // Opens a stream, performing the h2c upgrade when the target asks for it.
-    asio::awaitable<std::expected<std::shared_ptr<ClientStream>, error_code>> negotiate_and_open(
-        const std::shared_ptr<ClientSession>& session,
-        const ClientTarget& target,
-        RequestSpec spec) {
+    asio::awaitable<std::expected<std::shared_ptr<ClientStream>, error_code>>
+    negotiate_and_open(const std::shared_ptr<ClientSession> &session, const ClientTarget &target, RequestSpec spec) {
         const bool want_upgrade = !target.use_tls && target.h2c == H2cMode::Upgrade &&
                                   target.version != HttpVersionPolicy::Http11 && !spec.stream_body;
         if (want_upgrade) {
@@ -444,8 +415,7 @@ class HttpClient {
     // Takes a session for `target` from the pool, or dials a new one. The
     // `pooled` flag travels with it: only a pooled connection's failure is safe
     // to replay.
-    asio::awaitable<std::expected<Acquired, error_code>> acquire(ClientTarget target,
-                                                                 asio::any_io_executor ex,
+    asio::awaitable<std::expected<Acquired, error_code>> acquire(ClientTarget target, asio::any_io_executor ex,
                                                                  bool allow_pool) {
         const PoolKey key = make_key(target, ex);
         if (allow_pool) {
@@ -458,9 +428,9 @@ class HttpClient {
         co_return Acquired{std::move(*session), false};
     }
 
-    PoolKey make_key(const ClientTarget& target, const asio::any_io_executor& ex) const {
+    PoolKey make_key(const ClientTarget &target, const asio::any_io_executor &ex) const {
         PoolKey key;
-        key.executor = static_cast<const void*>(&ex.context());
+        key.executor = static_cast<const void *>(&ex.context());
         key.origin = (target.use_tls ? "https://" : "http://") + target.authority();
         key.version_policy = static_cast<int>(target.version);
         key.tag = target.pool_tag;
@@ -470,9 +440,8 @@ class HttpClient {
     // Dials (resolving, connecting, handshaking, negotiating) and starts the
     // session. The new session is not pooled until its first exchange completes —
     // that is, until it is known to be at a request boundary.
-    asio::awaitable<std::expected<std::shared_ptr<ClientSession>, error_code>> dial(ClientTarget target,
-                                                                                    asio::any_io_executor ex,
-                                                                                    PoolKey key) {
+    asio::awaitable<std::expected<std::shared_ptr<ClientSession>, error_code>>
+    dial(ClientTarget target, asio::any_io_executor ex, PoolKey key) {
         error_code ec;
         auto endpoints = co_await resolve(target, ex);
         if (!endpoints)
@@ -494,11 +463,9 @@ class HttpClient {
         co_return co_await start_plain_session(std::move(target), std::move(socket), peer, std::move(key));
     }
 
-    asio::awaitable<std::expected<std::shared_ptr<ClientSession>, error_code>> start_plain_session(
-        ClientTarget target,
-        std::shared_ptr<asio::ip::tcp::socket> socket,
-        asio::ip::tcp::endpoint peer,
-        PoolKey key) {
+    asio::awaitable<std::expected<std::shared_ptr<ClientSession>, error_code>>
+    start_plain_session(ClientTarget target, std::shared_ptr<asio::ip::tcp::socket> socket,
+                        asio::ip::tcp::endpoint peer, PoolKey key) {
         auto transport = std::make_shared<TcpStreamTransport>(std::move(socket), peer);
         // Plaintext h2c has two shapes, and which one applies is H2cMode's call:
         // PriorKnowledge speaks h2 from the first byte, while Upgrade stays
@@ -508,9 +475,7 @@ class HttpClient {
         const bool speak_h2_at_once =
             target.h2c == H2cMode::PriorKnowledge && target.version != HttpVersionPolicy::Http11;
         if (speak_h2_at_once) {
-            auto session = std::make_shared<Http2ClientSession<TcpStreamTransport>>(transport,
-                                                                                    target,
-                                                                                    m_config.limits,
+            auto session = std::make_shared<Http2ClientSession<TcpStreamTransport>>(transport, target, m_config.limits,
                                                                                     m_config.idle_timeout);
             wire_session(session, key);
             if (auto ec = co_await session->start(); ec) {
@@ -519,19 +484,15 @@ class HttpClient {
             }
             co_return session;
         }
-        auto session = std::make_shared<Http1ClientSession<TcpStreamTransport>>(transport,
-                                                                                target.authority(),
-                                                                                m_config.limits,
-                                                                                m_config.idle_timeout);
+        auto session = std::make_shared<Http1ClientSession<TcpStreamTransport>>(transport, target.authority(),
+                                                                                m_config.limits, m_config.idle_timeout);
         wire_h1_session(session, target, key);
         co_return session;
     }
 
-    asio::awaitable<std::expected<std::shared_ptr<ClientSession>, error_code>> start_tls_session(
-        ClientTarget target,
-        std::shared_ptr<asio::ip::tcp::socket> socket,
-        asio::ip::tcp::endpoint peer,
-        PoolKey key) {
+    asio::awaitable<std::expected<std::shared_ptr<ClientSession>, error_code>>
+    start_tls_session(ClientTarget target, std::shared_ptr<asio::ip::tcp::socket> socket, asio::ip::tcp::endpoint peer,
+                      PoolKey key) {
         auto stream = std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(std::move(*socket), *m_ssl_context);
         auto transport = std::make_shared<TlsStreamTransport>(stream, peer);
 
@@ -561,9 +522,7 @@ class HttpClient {
             co_return std::unexpected{make_error_code(client_errc::version_not_negotiated)};
         }
         if (alpn == "h2") {
-            auto session = std::make_shared<Http2ClientSession<TlsStreamTransport>>(transport,
-                                                                                    target,
-                                                                                    m_config.limits,
+            auto session = std::make_shared<Http2ClientSession<TlsStreamTransport>>(transport, target, m_config.limits,
                                                                                     m_config.idle_timeout);
             wire_session(session, key);
             if (auto ec = co_await session->start(); ec) {
@@ -573,18 +532,15 @@ class HttpClient {
             co_return session;
         }
         // "http/1.1", or no ALPN at all (an older peer): HTTP/1.1.
-        auto session = std::make_shared<Http1ClientSession<TlsStreamTransport>>(transport,
-                                                                                target.authority(),
-                                                                                m_config.limits,
-                                                                                m_config.idle_timeout);
+        auto session = std::make_shared<Http1ClientSession<TlsStreamTransport>>(transport, target.authority(),
+                                                                                m_config.limits, m_config.idle_timeout);
         wire_h1_session(session, target, key);
         co_return session;
     }
 
     // Gives a session its pool identity: when it goes idle and reusable, it goes
     // back to the pool (the pool arms the idle timer that eventually closes it).
-    template <typename Session>
-    void wire_session(std::shared_ptr<Session> session, const PoolKey& key) {
+    template <typename Session> void wire_session(std::shared_ptr<Session> session, const PoolKey &key) {
         auto pool = m_pool;
         // Weak: the pool holds the strong reference, and a callback holding it
         // too would close a cycle the session could never escape.
@@ -600,23 +556,20 @@ class HttpClient {
     // successful upgrade hands the connection to an HTTP/2 session that is
     // started with the upgrading request as stream 1 (RFC 9113 §3.2).
     template <typename Session>
-    void wire_h1_session(std::shared_ptr<Session> session, const ClientTarget& target, const PoolKey& key) {
+    void wire_h1_session(std::shared_ptr<Session> session, const ClientTarget &target, const PoolKey &key) {
         wire_session(session, key);
         using Transport = std::decay_t<decltype(*session->transport())>;
         auto config = m_config;
         auto pool = m_pool;
         std::weak_ptr<Session> weak_h1 = session;
         session->set_h2_upgrade_factory(
-            [config, pool, target, key, weak_h1](std::shared_ptr<Transport> transport,
-                                                 RequestSpec seed,
+            [config, pool, target, key, weak_h1](std::shared_ptr<Transport> transport, RequestSpec seed,
                                                  std::string initial)
-                -> asio::awaitable<
-                    std::expected<std::pair<std::shared_ptr<ClientSession>, std::shared_ptr<ClientStream>>,
-                                  error_code>> {
-                (void)seed;  // the peer already has the request: only stream 1 is recorded
-                auto h2 = std::make_shared<Http2ClientSession<Transport>>(transport,
-                                                                          target,
-                                                                          config.limits,
+                -> asio::awaitable<std::expected<
+                    std::pair<std::shared_ptr<ClientSession>, std::shared_ptr<ClientStream>>, error_code>> {
+                (void)seed; // the peer already has the request: only stream 1 is
+                            // recorded
+                auto h2 = std::make_shared<Http2ClientSession<Transport>>(transport, target, config.limits,
                                                                           config.idle_timeout);
                 if (auto h1 = weak_h1.lock()) {
                     // The pooled handle is the h1 session (it fronts the HTTP/2
@@ -636,9 +589,8 @@ class HttpClient {
             });
     }
 
-    asio::awaitable<std::expected<std::vector<asio::ip::tcp::endpoint>, error_code>> resolve(
-        const ClientTarget& target,
-        const asio::any_io_executor& ex) {
+    asio::awaitable<std::expected<std::vector<asio::ip::tcp::endpoint>, error_code>>
+    resolve(const ClientTarget &target, const asio::any_io_executor &ex) {
         if (m_config.resolve) {
             auto [ec, endpoints] = co_await m_config.resolve(target.host, std::to_string(target.effective_port()));
             if (ec)
@@ -648,21 +600,19 @@ class HttpClient {
             co_return endpoints;
         }
         auto resolver = std::make_shared<asio::ip::tcp::resolver>(ex);
-        auto [ec, results] = co_await resolver->async_resolve(target.host,
-                                                              std::to_string(target.effective_port()),
+        auto [ec, results] = co_await resolver->async_resolve(target.host, std::to_string(target.effective_port()),
                                                               asio::as_tuple(asio::use_awaitable));
         if (ec)
             co_return std::unexpected{ec};
         std::vector<asio::ip::tcp::endpoint> endpoints;
         endpoints.reserve(results.size());
-        for (const auto& entry : results)
+        for (const auto &entry : results)
             endpoints.push_back(entry.endpoint());
         co_return endpoints;
     }
 
-    asio::awaitable<error_code> connect_with_deadline(const std::string& authority,
-                                                      asio::ip::tcp::socket& socket,
-                                                      const std::vector<asio::ip::tcp::endpoint>& endpoints) {
+    asio::awaitable<error_code> connect_with_deadline(const std::string &authority, asio::ip::tcp::socket &socket,
+                                                      const std::vector<asio::ip::tcp::endpoint> &endpoints) {
         using namespace asio::experimental::awaitable_operators;
         auto connect_op = [&socket, &endpoints]() -> asio::awaitable<std::tuple<error_code, asio::ip::tcp::endpoint>> {
             co_return co_await asio::async_connect(socket, endpoints, asio::as_tuple(asio::use_awaitable));
@@ -678,17 +628,16 @@ class HttpClient {
             co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
         };
         auto outcome = co_await (connect_op() || deadline_op());
-        if (auto* result = std::get_if<std::tuple<error_code, asio::ip::tcp::endpoint>>(&outcome)) {
+        if (auto *result = std::get_if<std::tuple<error_code, asio::ip::tcp::endpoint>>(&outcome)) {
             co_return std::get<0>(*result);
         }
-        SIMPLE_HTTP_ERROR_LOG("client: connecting to {} timed out after {}ms",
-                              authority,
+        SIMPLE_HTTP_ERROR_LOG("client: connecting to {} timed out after {}ms", authority,
                               m_config.connect_timeout.count());
-        (void)authority;  // only reported through the log, which may be compiled out
+        (void)authority; // only reported through the log, which may be compiled out
         co_return make_error_code(client_errc::connect_timeout);
     }
 
-    void apply_socket_options(asio::ip::tcp::socket& socket) {
+    void apply_socket_options(asio::ip::tcp::socket &socket) {
         error_code ec;
         if (m_config.tcp_nodelay)
             socket.set_option(asio::ip::tcp::no_delay(true), ec);
@@ -697,7 +646,7 @@ class HttpClient {
         if (m_config.socket_setup) {
             try {
                 m_config.socket_setup(socket);
-            } catch (const std::exception& e) {
+            } catch (const std::exception &e) {
                 SIMPLE_HTTP_ERROR_LOG("client: socket_setup threw: {}", e.what());
             }
         }
@@ -705,8 +654,8 @@ class HttpClient {
 
     ClientConfig m_config;
     std::shared_ptr<ClientPool> m_pool;
-    std::shared_ptr<asio::ssl::context> m_ssl_context;  // outlives every stream using it
-    std::atomic<std::size_t> m_opened{0};  // an HttpClient may be shared across threads
+    std::shared_ptr<asio::ssl::context> m_ssl_context; // outlives every stream using it
+    std::atomic<std::size_t> m_opened{0};              // an HttpClient may be shared across threads
 };
 
-}  // namespace simple_http
+} // namespace simple_http

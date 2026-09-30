@@ -3,7 +3,6 @@
 // mismatch corrupts every later header — hence the regression cases below.
 
 #include <catch2/catch_test_macros.hpp>
-
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -34,7 +33,7 @@ std::string bytes_of(std::initializer_list<int> values) {
     return out;
 }
 
-}  // namespace
+} // namespace
 
 // --- frames ------------------------------------------------------------------
 
@@ -59,8 +58,8 @@ TEST_CASE("h2/frame: length and stream id bounds", "[h2]") {
         serialize_frame_header(out, 0xFFFFFF, static_cast<std::uint8_t>(H2FrameType::Goaway), 0, 0x7FFFFFFF);
         H2FrameHeader hdr;
         REQUIRE(parse_frame_header(out, hdr));
-        CHECK(hdr.length == 0xFFFFFF);       // the 24-bit maximum
-        CHECK(hdr.stream_id == 0x7FFFFFFF);  // the 31-bit maximum
+        CHECK(hdr.length == 0xFFFFFF);      // the 24-bit maximum
+        CHECK(hdr.stream_id == 0x7FFFFFFF); // the 31-bit maximum
     }
     {
         // The reserved bit (0x80 of the first stream-id octet) must be cleared.
@@ -72,7 +71,8 @@ TEST_CASE("h2/frame: length and stream id bounds", "[h2]") {
     }
     {
         H2FrameHeader hdr;
-        CHECK_FALSE(parse_frame_header(bytes_of({0x00, 0x00, 0x01}), hdr));  // shorter than a header
+        CHECK_FALSE(parse_frame_header(bytes_of({0x00, 0x00, 0x01}),
+                                       hdr)); // shorter than a header
         CHECK_FALSE(parse_frame_header("", hdr));
     }
 }
@@ -97,7 +97,8 @@ TEST_CASE("h2/frame: big-endian integers and constants", "[h2]") {
 // --- HPACK encoding ----------------------------------------------------------
 
 TEST_CASE("h2/hpack: integer encoding with the prefix rule", "[h2]") {
-    // 7-bit prefix: values below 127 fit inline, 127 and above use continuation bytes.
+    // 7-bit prefix: values below 127 fit inline, 127 and above use continuation
+    // bytes.
     auto encode7 = [](std::uint64_t value) {
         std::string out;
         hpack_append_integer(out, 0x80, 7, value);
@@ -106,21 +107,21 @@ TEST_CASE("h2/hpack: integer encoding with the prefix rule", "[h2]") {
     CHECK(hex_of(encode7(0)) == "80");
     CHECK(hex_of(encode7(2)) == "82");
     CHECK(hex_of(encode7(126)) == "fe");
-    CHECK(hex_of(encode7(127)) == "ff00");  // exactly the prefix maximum: one continuation byte
+    CHECK(hex_of(encode7(127)) == "ff00"); // exactly the prefix maximum: one continuation byte
     CHECK(hex_of(encode7(128)) == "ff01");
-    CHECK(hex_of(encode7(1337)) == "ffba09");  // 1337 - 127 = 1210 = 0b10010111010
-    CHECK(hex_of(encode7(255)) == "ff8001");   // 128 -> 0x80|0, then 1
+    CHECK(hex_of(encode7(1337)) == "ffba09"); // 1337 - 127 = 1210 = 0b10010111010
+    CHECK(hex_of(encode7(255)) == "ff8001");  // 128 -> 0x80|0, then 1
 
     // 5-bit prefix (as a dynamic table size update uses).
     std::string out;
     hpack_append_integer(out, 0x20, 5, 4096);
-    CHECK(out.front() == static_cast<char>(0x3F));  // 0x20 | 31: the prefix is saturated
+    CHECK(out.front() == static_cast<char>(0x3F)); // 0x20 | 31: the prefix is saturated
 }
 
 TEST_CASE("h2/hpack: string encoding is Huffman and never expands ASCII", "[h2]") {
     std::string out;
     hpack_append_string(out, "www.example.com");
-    CHECK(static_cast<unsigned char>(out[0]) == (0x80 | 12));  // H bit set, 12 octets (RFC 7541 C.4.1)
+    CHECK(static_cast<unsigned char>(out[0]) == (0x80 | 12)); // H bit set, 12 octets (RFC 7541 C.4.1)
     CHECK(hex_of(out.substr(1)) == "f1e3c2e5f23a6ba0ab90f4ff");
     CHECK(out.size() <= 1 + std::string_view{"www.example.com"}.size());
 
@@ -134,29 +135,29 @@ TEST_CASE("h2/hpack: string encoding is Huffman and never expands ASCII", "[h2]"
     std::string long_out;
     hpack_append_string(long_out, long_value);
     CHECK((static_cast<unsigned char>(long_out[0]) & 0x80) != 0);
-    CHECK((static_cast<unsigned char>(long_out[0]) & 0x7F) == 0x7F);  // saturated prefix
+    CHECK((static_cast<unsigned char>(long_out[0]) & 0x7F) == 0x7F); // saturated prefix
 }
 
 TEST_CASE("h2/hpack: literals, indexed fields and :status shortcuts", "[h2]") {
-    CHECK(hex_of(bytes_of({0x00})) == "00");  // sanity for the hex helper
+    CHECK(hex_of(bytes_of({0x00})) == "00"); // sanity for the hex helper
 
     std::string indexed;
-    hpack_append_indexed(indexed, 2);  // static table: :method GET
+    hpack_append_indexed(indexed, 2); // static table: :method GET
     CHECK(hex_of(indexed) == "82");
 
     std::string named;
-    hpack_append_literal_indexed_name(named, 1, "example.com");  // :authority
+    hpack_append_literal_indexed_name(named, 1, "example.com"); // :authority
     CHECK((static_cast<unsigned char>(named[0]) & 0xF0) == 0x00);
     CHECK((static_cast<unsigned char>(named[0]) & 0x0F) == 1);
 
     std::string status;
     hpack_append_status(status, 200);
-    CHECK(hex_of(status) == "88");  // one byte from the static table
+    CHECK(hex_of(status) == "88"); // one byte from the static table
     hpack_append_status(status, 204);
     CHECK(hex_of(status) == "8889");
 
     std::string uncommon;
-    hpack_append_status(uncommon, 418);  // not in the table: a literal
+    hpack_append_status(uncommon, 418); // not in the table: a literal
     CHECK(uncommon.size() > 1);
     std::vector<HpackHeader> decoded;
     HpackDecoder decoder;
@@ -172,13 +173,13 @@ TEST_CASE("h2/hpack: static table references", "[h2]") {
     HpackDecoder decoder;
     std::vector<HpackHeader> fields;
 
-    REQUIRE(decoder.decode(bytes_of({0x82}), fields));  // index 2: :method GET
+    REQUIRE(decoder.decode(bytes_of({0x82}), fields)); // index 2: :method GET
     REQUIRE(fields.size() == 1);
     CHECK(fields[0].name == ":method");
     CHECK(fields[0].value == "GET");
 
     fields.clear();
-    REQUIRE(decoder.decode(bytes_of({0x86}), fields));  // index 6: :scheme http
+    REQUIRE(decoder.decode(bytes_of({0x86}), fields)); // index 6: :scheme http
     REQUIRE(fields.size() == 1);
     CHECK(fields[0].name == ":scheme");
     CHECK(fields[0].value == "http");
@@ -194,7 +195,7 @@ TEST_CASE("h2/hpack: literal fields, with and without indexing", "[h2]") {
     REQUIRE(fields.size() == 1);
     CHECK(fields[0].name == "x-custom");
     CHECK(fields[0].value == "value with spaces");
-    CHECK(decoder.dynamic_table_size() == 0);  // "without indexing" must not touch the table
+    CHECK(decoder.dynamic_table_size() == 0); // "without indexing" must not touch the table
 
     // Incremental indexing: 0x40 | index 0, then name and value.
     std::string indexed;
@@ -220,7 +221,7 @@ TEST_CASE("h2/hpack: dynamic table entries resolve by index 62+", "[h2]") {
     REQUIRE(decoder.decode(insert, fields));
 
     std::string reference;
-    hpack_append_indexed(reference, 62);  // the first dynamic entry
+    hpack_append_indexed(reference, 62); // the first dynamic entry
     fields.clear();
     REQUIRE(decoder.decode(reference, fields));
     REQUIRE(fields.size() == 1);
@@ -244,14 +245,15 @@ TEST_CASE("h2/hpack: an entry larger than the table empties it and is not insert
     std::string oversized;
     oversized.push_back('\x40');
     hpack_append_string(oversized, "x-big");
-    hpack_append_string(oversized, std::string(5000, 'a'));  // > the 4096-byte default table
+    hpack_append_string(oversized, std::string(5000, 'a')); // > the 4096-byte default table
     fields.clear();
-    REQUIRE(decoder.decode(oversized, fields));  // the field itself is delivered…
+    REQUIRE(decoder.decode(oversized, fields)); // the field itself is delivered…
     CHECK(fields[0].name == "x-big");
-    CHECK(decoder.dynamic_table_size() == 0);  // …but the table was emptied and left empty
+    CHECK(decoder.dynamic_table_size() == 0); // …but the table was emptied and left empty
 
     std::string stale;
-    hpack_append_indexed(stale, 62);  // the entry that used to be index 62 is gone
+    hpack_append_indexed(stale,
+                         62); // the entry that used to be index 62 is gone
     fields.clear();
     CHECK_FALSE(decoder.decode(stale, fields));
     CHECK(decoder.last_error() != 0);
@@ -291,11 +293,11 @@ TEST_CASE("h2/hpack: dynamic table size updates", "[h2]") {
         REQUIRE(decoder.decode(insert, fields));
         REQUIRE(decoder.dynamic_table_size() > 0);
 
-        std::string shrink;                        // RFC 7541 §6.3
-        hpack_append_integer(shrink, 0x20, 5, 0);  // set the table size to zero
+        std::string shrink;                       // RFC 7541 §6.3
+        hpack_append_integer(shrink, 0x20, 5, 0); // set the table size to zero
         fields.clear();
         REQUIRE(decoder.decode(shrink, fields));
-        CHECK(decoder.dynamic_table_size() == 0);  // evicted immediately
+        CHECK(decoder.dynamic_table_size() == 0); // evicted immediately
 
         std::string stale;
         hpack_append_indexed(stale, 62);
@@ -321,7 +323,7 @@ TEST_CASE("h2/hpack: malformed blocks are rejected, not guessed", "[h2]") {
         // A string length that runs past the end of the block.
         std::string truncated;
         truncated.push_back('\x00');
-        truncated.push_back(static_cast<char>(0x80 | 10));  // says ten bytes follow
+        truncated.push_back(static_cast<char>(0x80 | 10)); // says ten bytes follow
         truncated.append("abc");
         CHECK_FALSE(decoder.decode(truncated, fields));
         CHECK(decoder.last_error() != 0);
@@ -342,15 +344,12 @@ TEST_CASE("h2/hpack: malformed blocks are rejected, not guessed", "[h2]") {
 
 TEST_CASE("h2/hpack: encode/decode round trip", "[h2]") {
     const std::vector<std::pair<std::string, std::string>> original = {
-        {"content-type", "application/json"},
-        {"x-empty", ""},
-        {"x-long", std::string(200, 'z')},
-        {"x-mixed", "MiXeD case / symbols !@#$%^&*()"},
-        {":status", "200"},
+        {"content-type", "application/json"},           {"x-empty", ""},    {"x-long", std::string(200, 'z')},
+        {"x-mixed", "MiXeD case / symbols !@#$%^&*()"}, {":status", "200"},
     };
 
     std::string block;
-    for (const auto& [name, value] : original)
+    for (const auto &[name, value] : original)
         hpack_append_literal(block, name, value);
 
     HpackDecoder decoder;
@@ -370,18 +369,14 @@ TEST_CASE("h2/huffman: RFC 7541 vectors and round trips", "[h2]") {
         // RFC 7541 Appendix C.4.1.
         std::string encoded;
         const std::string value = "www.example.com";
-        CHECK(http_huffman_encode(reinterpret_cast<unsigned char*>(const_cast<char*>(value.data())),
-                                  static_cast<unsigned int>(value.size()),
-                                  encoded) == HUFFMAN_OK);
+        CHECK(http_huffman_encode(reinterpret_cast<unsigned char *>(const_cast<char *>(value.data())),
+                                  static_cast<unsigned int>(value.size()), encoded) == HUFFMAN_OK);
         CHECK(hex_of(encoded) == "f1e3c2e5f23a6ba0ab90f4ff");
 
         unsigned char state = 0;
         std::string decoded;
-        CHECK(http_huffman_decode(&state,
-                                  reinterpret_cast<unsigned char*>(const_cast<char*>(encoded.data())),
-                                  encoded.size(),
-                                  decoded,
-                                  1) == HUFFMAN_OK);
+        CHECK(http_huffman_decode(&state, reinterpret_cast<unsigned char *>(const_cast<char *>(encoded.data())),
+                                  encoded.size(), decoded, 1) == HUFFMAN_OK);
         CHECK(decoded == value);
     }
     {
@@ -390,16 +385,14 @@ TEST_CASE("h2/huffman: RFC 7541 vectors and round trips", "[h2]") {
         for (int c = 0x20; c <= 0x7E; ++c)
             value.push_back(static_cast<char>(c));
         std::string encoded;
-        REQUIRE(http_huffman_encode(reinterpret_cast<unsigned char*>(value.data()),
-                                    static_cast<unsigned int>(value.size()),
-                                    encoded) == HUFFMAN_OK);
-        CHECK(encoded.size() <= value.size());  // the table never expands ASCII
+        REQUIRE(http_huffman_encode(reinterpret_cast<unsigned char *>(value.data()),
+                                    static_cast<unsigned int>(value.size()), encoded) == HUFFMAN_OK);
+        CHECK(encoded.size() <= value.size()); // the table never expands ASCII
 
         unsigned char state = 0;
         std::string decoded;
-        REQUIRE(
-            http_huffman_decode(&state, reinterpret_cast<unsigned char*>(encoded.data()), encoded.size(), decoded, 1) ==
-            HUFFMAN_OK);
+        REQUIRE(http_huffman_decode(&state, reinterpret_cast<unsigned char *>(encoded.data()), encoded.size(), decoded,
+                                    1) == HUFFMAN_OK);
         CHECK(decoded == value);
     }
 }

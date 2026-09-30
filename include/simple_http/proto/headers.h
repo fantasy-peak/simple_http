@@ -11,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-#include "../core/types.h"  // ascii_lower / iequals_ci: used below, and this header must stand alone
+#include "../core/types.h" // ascii_lower / iequals_ci: used below, and this header must stand alone
 
 namespace simple_http {
 
@@ -37,7 +37,7 @@ class Headers {
     // allocating a temporary lowercased copy (called on the request hot path).
     std::optional<std::string_view> get(std::string_view name) const {
         auto it = std::find_if(m_fields.begin(), m_fields.end(),
-                               [&](const value_type& f) { return iequals_ascii(f.first, name); });
+                               [&](const value_type &f) { return iequals_ascii(f.first, name); });
         if (it == m_fields.end()) {
             return std::nullopt;
         }
@@ -51,7 +51,7 @@ class Headers {
     // least one" — a second copy is a smuggling vector, not a repeatable field.
     std::size_t count(std::string_view name) const {
         return static_cast<std::size_t>(std::count_if(
-            m_fields.begin(), m_fields.end(), [&](const value_type& f) { return iequals_ascii(f.first, name); }));
+            m_fields.begin(), m_fields.end(), [&](const value_type &f) { return iequals_ascii(f.first, name); }));
     }
 
     // Removes every field matching `name` (case-insensitively), returning true
@@ -60,7 +60,7 @@ class Headers {
     // ambiguous on the response side.
     bool erase(std::string_view name) {
         auto it = std::remove_if(m_fields.begin(), m_fields.end(),
-                                 [&](const value_type& f) { return iequals_ascii(f.first, name); });
+                                 [&](const value_type &f) { return iequals_ascii(f.first, name); });
         if (it == m_fields.end()) {
             return false;
         }
@@ -75,7 +75,7 @@ class Headers {
     auto begin() const { return m_fields.begin(); }
     auto end() const { return m_fields.end(); }
 
-    const std::vector<value_type>& fields() const { return m_fields; }
+    const std::vector<value_type> &fields() const { return m_fields; }
 
   private:
     // Allocation-free ASCII case-insensitive equality, lowercasing only `rhs`.
@@ -98,7 +98,7 @@ class Headers {
         return true;
     }
 
-    static void to_lower(std::string& s) {
+    static void to_lower(std::string &s) {
         std::transform(s.begin(), s.end(), s.begin(),
                        [](unsigned char c) { return ascii_lower(static_cast<char>(c)); });
     }
@@ -106,4 +106,4 @@ class Headers {
     std::vector<value_type> m_fields;
 };
 
-}  // namespace simple_http
+} // namespace simple_http

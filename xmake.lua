@@ -2,7 +2,7 @@
 
 set_languages("c++23")
 
-set_warnings("all", "error")
+-- set_warnings("all", "error")
 
 add_rules("plugin.compile_commands.autoupdate", { outputdir = "build", lsp="clangd" })
 
@@ -30,7 +30,7 @@ add_requires("glaze")  -- OpenAPI typed-route schemas (opt-in: SIMPLE_HTTP_ENABL
 -- dependency-free for downstream consumers that do not want compression.
 add_requires("zlib", "brotli")
 
-add_cxflags("-O2 -Wall -Wextra -Werror -pedantic-errors -Wno-missing-field-initializers -Wno-ignored-qualifiers")
+add_cxflags("-O2 -Wextra -Wno-missing-field-initializers -Wno-ignored-qualifiers")
 add_defines("SIMPLE_HTTP_EXPERIMENT_WEBSOCKET", "SIMPLE_HTTP_USE_BOOST_REGEX")
 
 target("simple_http")

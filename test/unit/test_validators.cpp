@@ -5,7 +5,6 @@
 // the two decisions meet.
 
 #include <catch2/catch_test_macros.hpp>
-
 #include <cstdint>
 #include <string>
 
@@ -111,21 +110,21 @@ TEST_CASE("validators: unsatisfiable and unparseable are different answers", "[v
     // Everything below is "cannot parse this", which the caller answers with a
     // full 200 (RFC 9110 permits ignoring Range) rather than a 416.
     struct Case {
-        const char* header;
+        const char *header;
     };
     const Case cases[] = {
-        {"bytes=-0"},        // a zero-length suffix names nothing
-        {"bytes=0-1,3-4"},   // multi-range: multipart/byteranges is two shapes
-        {"items=0-1"},       // a unit we do not speak
-        {"bytes=5-2"},       // last before first
-        {"bytes="},          // no spec at all
-        {"0-4"},             // missing the unit
-        {"bytes=abc-def"},   // not numbers
+        {"bytes=-0"},      // a zero-length suffix names nothing
+        {"bytes=0-1,3-4"}, // multi-range: multipart/byteranges is two shapes
+        {"items=0-1"},     // a unit we do not speak
+        {"bytes=5-2"},     // last before first
+        {"bytes="},        // no spec at all
+        {"0-4"},           // missing the unit
+        {"bytes=abc-def"}, // not numbers
     };
-    for (const auto& c : cases) {
+    for (const auto &c : cases) {
         INFO("header: " << c.header);
         bad = false;
         CHECK_FALSE(parse_range(c.header, 10, bad).has_value());
-        CHECK_FALSE(bad);  // "no range", not "unsatisfiable"
+        CHECK_FALSE(bad); // "no range", not "unsatisfiable"
     }
 }

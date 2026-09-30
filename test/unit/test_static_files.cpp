@@ -1,21 +1,20 @@
 // handler/static_files.h + core/static_table.h: the static file stage.
 //
-// The tests split in two. The first half drives the table directly and is mostly
-// about the security property — "the request path never touches the filesystem"
-// is what makes traversal, symlink escape and TOCTOU structural rather than
-// checked, so it is tested by trying to break it rather than by asserting the
-// checks exist. The second half drives real requests through FakeResponseWriter
-// and is about the wire, where several header values are set by hand for reasons
-// that are easy to lose.
+// The tests split in two. The first half drives the table directly and is
+// mostly about the security property — "the request path never touches the
+// filesystem" is what makes traversal, symlink escape and TOCTOU structural
+// rather than checked, so it is tested by trying to break it rather than by
+// asserting the checks exist. The second half drives real requests through
+// FakeResponseWriter and is about the wire, where several header values are set
+// by hand for reasons that are easy to lose.
 
 #include <catch2/catch_test_macros.hpp>
-
 #include <filesystem>
 #include <memory>
 #include <string>
 
-#include "simple_http.h"
 #include "../static_fixture.h"
+#include "simple_http.h"
 #include "test_support.h"
 
 using namespace simple_http;
@@ -23,7 +22,7 @@ using namespace simple_http::test;
 
 namespace {
 
-RequestPtr make_request(asio::io_context& ctx, std::string path, Method method = Method::Get) {
+RequestPtr make_request(asio::io_context &ctx, std::string path, Method method = Method::Get) {
     auto req = std::make_shared<Request>(Version::Http11, ctx.get_executor(), asio::ip::tcp::endpoint{});
     req->set_target(std::move(path));
     req->set_method(method);
@@ -33,19 +32,20 @@ RequestPtr make_request(asio::io_context& ctx, std::string path, Method method =
     return req;
 }
 
-void add_header(const RequestPtr& req, std::string name, std::string value) {
+void add_header(const RequestPtr &req, std::string name, std::string value) {
     req->mutable_headers().add(std::move(name), std::move(value));
 }
 
 // A site over the fixture's standard tree, already loaded.
-StaticFilesConfig standard_config(const StaticFixture& fx) {
+StaticFilesConfig standard_config(const StaticFixture &fx) {
     StaticFilesConfig cfg;
     cfg.table.root = fx.root_string();
     return cfg;
 }
 
-std::shared_ptr<StaticFiles> load_standard(const StaticFixture& fx, StaticFilesConfig cfg = {}) {
-    if (cfg.table.root.empty()) cfg.table.root = fx.root_string();
+std::shared_ptr<StaticFiles> load_standard(const StaticFixture &fx, StaticFilesConfig cfg = {}) {
+    if (cfg.table.root.empty())
+        cfg.table.root = fx.root_string();
     auto site = std::make_shared<StaticFiles>(std::move(cfg));
     std::string error;
     REQUIRE(site->load(error));
@@ -53,13 +53,14 @@ std::shared_ptr<StaticFiles> load_standard(const StaticFixture& fx, StaticFilesC
     return site;
 }
 
-// The result of one request: the recorded writer, and whether the site claimed it.
+// The result of one request: the recorded writer, and whether the site claimed
+// it.
 struct Served {
     std::shared_ptr<FakeResponseWriter> writer;
     bool handled = false;
 };
 
-Served serve(const StaticFiles& site, asio::io_context& ctx, const RequestPtr& req) {
+Served serve(const StaticFiles &site, asio::io_context &ctx, const RequestPtr &req) {
     auto writer = std::make_shared<FakeResponseWriter>();
     auto res = std::make_shared<Response>(writer);
     auto handled = run_on(ctx, site.try_serve(req, res));
@@ -67,12 +68,12 @@ Served serve(const StaticFiles& site, asio::io_context& ctx, const RequestPtr& r
     return Served{writer, *handled};
 }
 
-Served get(const StaticFiles& site, asio::io_context& ctx, std::string path) {
+Served get(const StaticFiles &site, asio::io_context &ctx, std::string path) {
     auto req = make_request(ctx, std::move(path));
     return serve(site, ctx, req);
 }
 
-}  // namespace
+} // namespace
 
 // ---------------------------------------------------------------------------
 // The table: what got in, and what cannot
@@ -109,7 +110,7 @@ TEST_CASE("static: no hostile input can produce a key", "[static]") {
     // every adversary-shaped input, either decoding refuses it or the resulting
     // key is simply absent. There is no third outcome, which is what "structural
     // rather than checked" means.
-    const char* hostile[] = {
+    const char *hostile[] = {
         "/../../etc/passwd",
         "/a/../../b",
         "/%2e%2e%2fetc%2fpasswd",
@@ -119,7 +120,7 @@ TEST_CASE("static: no hostile input can produce a key", "[static]") {
         "/%2e%2e",
         "/a/%2e%2e/%2e%2e/etc/passwd",
     };
-    for (const char* raw : hostile) {
+    for (const char *raw : hostile) {
         INFO("raw: " << raw);
         PathError err{};
         auto key = decode_and_normalize(raw, err);
@@ -131,8 +132,8 @@ TEST_CASE("static: no hostile input can produce a key", "[static]") {
     }
 
     // And the table itself carries no key that could ever be a traversal.
-    for (const char* base : {"/", "/blog", "/assets"}) {
-        for (const char* leaf : {"a", "b", "index.html", "app.js"}) {
+    for (const char *base : {"/", "/blog", "/assets"}) {
+        for (const char *leaf : {"a", "b", "index.html", "app.js"}) {
             const std::string key = std::string{base} + (std::string{base} == "/" ? "" : "/") + leaf;
             CHECK(key.find("..") == std::string::npos);
             CHECK(key.find('\\') == std::string::npos);
@@ -200,9 +201,9 @@ TEST_CASE("static: a file that vanishes after the scan is a miss, not an empty 2
     // path answers instead of the server inventing an empty 200.
     auto gone = get(*site, ctx, "/big.bin");
     CHECK_FALSE(gone.handled);
-    CHECK(gone.writer->last_status == 0);  // nothing written at all
+    CHECK(gone.writer->last_status == 0); // nothing written at all
 
-    std::filesystem::rename(moved, fx.root());  // so the fixture's cleanup is a no-op, not an error
+    std::filesystem::rename(moved, fx.root()); // so the fixture's cleanup is a no-op, not an error
 }
 
 TEST_CASE("static: must_not_contain refuses a root that would publish it", "[static]") {
@@ -263,12 +264,12 @@ TEST_CASE("static: reserved prefixes step aside even when a file exists", "[stat
     CHECK(site->find("/assets/chunk-abc123.js") != nullptr);
 
     auto blocked = get(*site, ctx, "/assets/chunk-abc123.js");
-    CHECK_FALSE(blocked.handled);  // nothing written: the caller's 404 takes over
+    CHECK_FALSE(blocked.handled); // nothing written: the caller's 404 takes over
     CHECK(blocked.writer->last_status == 0);
 
     // Segment-aware: a path that merely shares the characters is not reserved.
     CHECK(site->reserved("/assets/chunk-abc123.js"));
-    CHECK(site->reserved("/blog/post.html"));  // the prefix ends in '/'
+    CHECK(site->reserved("/blog/post.html")); // the prefix ends in '/'
     CHECK_FALSE(site->reserved("/assetsevil"));
     CHECK_FALSE(site->reserved("/blogx"));
 }
@@ -306,17 +307,17 @@ TEST_CASE("static: preload respects both the per-file cap and the budget", "[sta
         cfg.table.preload_max_file_bytes = 32;
         auto site = load_standard(fx, cfg);
 
-        const auto& stats = site->stats();
+        const auto &stats = site->stats();
         CHECK(stats.preloaded > 0);
         CHECK(stats.preloaded_bytes <= cfg.table.preload_budget_bytes);
 
         // big.bin's identity representation is not in memory...
-        const StaticEntry* big = site->find("/big.bin");
+        const StaticEntry *big = site->find("/big.bin");
         REQUIRE(big != nullptr);
         CHECK(big->identity.body == nullptr);
 
         // ...while a small one is.
-        const StaticEntry* small = site->find("/blog/post.html");
+        const StaticEntry *small = site->find("/blog/post.html");
         REQUIRE(small != nullptr);
         CHECK(small->identity.body != nullptr);
     }
@@ -328,7 +329,7 @@ TEST_CASE("static: preload respects both the per-file cap and the budget", "[sta
         cfg.table.preload_max_file_bytes = 0;
         auto site = load_standard(fx, cfg);
         CHECK(site->stats().preloaded == 1);
-        const StaticEntry* too_big = site->find("/big.bin");
+        const StaticEntry *too_big = site->find("/big.bin");
         REQUIRE(too_big != nullptr);
         CHECK(too_big->identity.body == nullptr);
 
@@ -345,11 +346,11 @@ TEST_CASE("static: an empty root disables the site rather than failing", "[stati
     fx.make_standard_tree();
 
     StaticFilesConfig cfg;
-    cfg.table.root = "";  // the switch back to a plain proxy
+    cfg.table.root = ""; // the switch back to a plain proxy
     auto site = std::make_shared<StaticFiles>(std::move(cfg));
 
     std::string error;
-    CHECK(site->load(error));  // not an error: disabled
+    CHECK(site->load(error)); // not an error: disabled
     CHECK(error.empty());
     CHECK_FALSE(site->enabled());
 
@@ -445,7 +446,7 @@ TEST_CASE("static: a conditional hit is a 304 with no length", "[static]") {
     auto site = load_standard(fx);
 
     asio::io_context ctx;
-    const StaticEntry* entry = site->find("/app.js");
+    const StaticEntry *entry = site->find("/app.js");
     REQUIRE(entry != nullptr);
     const std::string etag = entry->identity.etag;
 
@@ -500,7 +501,7 @@ TEST_CASE("static: a range is a 206 over the identity representation", "[static]
 
     CHECK(r.handled);
     CHECK(r.writer->last_status == 206);
-    CHECK(r.writer->last_body == "console");  // bytes 0-6 inclusive
+    CHECK(r.writer->last_body == "console"); // bytes 0-6 inclusive
     CHECK(r.writer->header("content-range") == "bytes 0-6/19");
     CHECK(r.writer->header("content-length") == "7");
     CHECK_FALSE(r.writer->has_header("content-encoding"));
@@ -535,10 +536,10 @@ TEST_CASE("static: a malformed path is answered here, with the connection closed
     auto site = load_standard(fx);
 
     asio::io_context ctx;
-    for (const char* raw : {"/%2e%2e/etc/passwd", "/a%2fb", "/a\\b"}) {
+    for (const char *raw : {"/%2e%2e/etc/passwd", "/a%2fb", "/a\\b"}) {
         INFO("raw: " << raw);
         auto r = get(*site, ctx, raw);
-        CHECK(r.handled);  // answered, not passed on
+        CHECK(r.handled); // answered, not passed on
         CHECK(r.writer->last_status == 400);
         CHECK(r.writer->header("cache-control") == "no-store");
         CHECK_FALSE(r.writer->open);
@@ -575,9 +576,10 @@ TEST_CASE("static: pre-compressed siblings are negotiated, never re-compressed",
     auto site = load_standard(fx);
 
     asio::io_context ctx;
-    auto fetch = [&](const char* accept) {
+    auto fetch = [&](const char *accept) {
         auto req = make_request(ctx, "/app.js");
-        if (accept != nullptr) add_header(req, "accept-encoding", accept);
+        if (accept != nullptr)
+            add_header(req, "accept-encoding", accept);
         return serve(*site, ctx, req);
     };
 
@@ -588,8 +590,7 @@ TEST_CASE("static: pre-compressed siblings are negotiated, never re-compressed",
         CHECK(r.writer->header("content-encoding") == "br");
         CHECK(r.writer->last_body == "BROTLI:console.log('app');");
         // The length is set by hand so HTTP/1.1 and HTTP/2 emit the same bytes.
-        CHECK(r.writer->header("content-length") ==
-              std::to_string(std::string{"BROTLI:console.log('app');"}.size()));
+        CHECK(r.writer->header("content-length") == std::to_string(std::string{"BROTLI:console.log('app');"}.size()));
     }
     {
         // br refused explicitly: gzip is still acceptable.
@@ -629,7 +630,7 @@ TEST_CASE("static: the 404 page is served when there is one", "[static]") {
 
 TEST_CASE("static: the 404 is plain text when the site has no page", "[static]") {
     StaticFixture fx;
-    fx.write("index.html", "hi");  // deliberately no 404.html
+    fx.write("index.html", "hi"); // deliberately no 404.html
     auto site = load_standard(fx);
 
     asio::io_context ctx;
@@ -657,14 +658,15 @@ TEST_CASE("static: no response ever carries a header twice", "[static]") {
     // Response::header() and content_type() both *append*, and this module has
     // six different exit paths each setting five to eight headers. A duplicate is
     // the failure mode that a single path would not show.
-    auto check_once = [](const std::shared_ptr<FakeResponseWriter>& w, const char* what) {
+    auto check_once = [](const std::shared_ptr<FakeResponseWriter> &w, const char *what) {
         INFO("response kind: " << what);
-        for (const auto& [name, value] : w->last_headers) {
+        for (const auto &[name, value] : w->last_headers) {
             (void)value;
             std::size_t count = 0;
-            for (const auto& [other, ignored] : w->last_headers) {
+            for (const auto &[other, ignored] : w->last_headers) {
                 (void)ignored;
-                if (other == name) ++count;
+                if (other == name)
+                    ++count;
             }
             CHECK(count == 1);
         }
@@ -681,7 +683,7 @@ TEST_CASE("static: no response ever carries a header twice", "[static]") {
     }
     {
         auto req = make_request(ctx, "/app.js");
-        const StaticEntry* entry = site->find("/app.js");
+        const StaticEntry *entry = site->find("/app.js");
         add_header(req, "if-none-match", entry->identity.etag);
         auto r = serve(*site, ctx, req);
         REQUIRE(r.writer->last_status == 304);
@@ -727,11 +729,11 @@ TEST_CASE("static: no response ever carries a header twice", "[static]") {
 TEST_CASE("static: SPA fallback is off unless a target is configured", "[static]") {
     StaticFixture fx;
     fx.make_standard_tree();
-    auto site = load_standard(fx);  // no spa_fallback
+    auto site = load_standard(fx); // no spa_fallback
 
     asio::io_context ctx;
     auto r = get(*site, ctx, "/spa/deep/link");
-    CHECK_FALSE(r.handled);  // a miss, exactly as before
+    CHECK_FALSE(r.handled); // a miss, exactly as before
     CHECK(r.writer->last_status == 0);
 }
 

@@ -10,10 +10,11 @@
 // engine/h2 headers, so both roles share one implementation of each.
 //
 // The structure mirrors the server engine — read_loop / write_loop / watchdog
-// racing under awaitable_operators, with all connection state owned by the single
-// connection executor:
+// racing under awaitable_operators, with all connection state owned by the
+// single connection executor:
 //   * read_loop   transport bytes -> frame parser -> per-stream inbox
-//   * write_loop  control frames + per-stream DATA (flow-controlled) -> transport
+//   * write_loop  control frames + per-stream DATA (flow-controlled) ->
+//   transport
 //   * watchdog    closes the connection after idle_timeout of nothing at all
 //
 // What differs is where the data goes. A server engine *pushes* a request body
@@ -33,6 +34,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <boost/asio.hpp>
+#include <boost/asio/experimental/awaitable_operators.hpp>
+#include <boost/asio/experimental/concurrent_channel.hpp>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -46,10 +50,6 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
-
-#include <boost/asio.hpp>
-#include <boost/asio/experimental/awaitable_operators.hpp>
-#include <boost/asio/experimental/concurrent_channel.hpp>
 
 #include "../core/base64.h"
 #include "../core/http_method.h"
@@ -75,17 +75,17 @@ namespace asio = boost::asio;
 inline constexpr std::int32_t kClientInitialWindow = 65535;
 inline constexpr std::size_t kClientMaxFrameSize = 16384;
 
-// Outbound backpressure watermarks for one stream's request-body queue: a writer
-// is parked once it has this much queued but unframed, and released when the
-// write loop has drained the queue back to the low mark. Without it a writer
-// outruns the peer's flow-control window at full speed and queues the whole body
-// in memory (the lesson the server engine learned for responses).
-inline constexpr std::size_t kClientOutHighWatermark = 1u << 20;   // 1 MiB
-inline constexpr std::size_t kClientOutLowWatermark = 256u << 10;  // 256 KiB
+// Outbound backpressure watermarks for one stream's request-body queue: a
+// writer is parked once it has this much queued but unframed, and released when
+// the write loop has drained the queue back to the low mark. Without it a
+// writer outruns the peer's flow-control window at full speed and queues the
+// whole body in memory (the lesson the server engine learned for responses).
+inline constexpr std::size_t kClientOutHighWatermark = 1u << 20;  // 1 MiB
+inline constexpr std::size_t kClientOutLowWatermark = 256u << 10; // 256 KiB
 
 // The SETTINGS payload we advertise, raw (6 bytes per entry, for the SETTINGS
 // frame) and base64url (for an h2c upgrade's HTTP2-Settings header).
-inline std::string h2_settings_payload(const EngineLimits& limits) {
+inline std::string h2_settings_payload(const EngineLimits &limits) {
     std::string payload;
     auto add = [&](std::uint16_t id, std::uint32_t value) {
         payload.push_back(static_cast<char>((id >> 8) & 0xFF));
@@ -98,16 +98,15 @@ inline std::string h2_settings_payload(const EngineLimits& limits) {
     add(codec::H2_SETTINGS_MAX_CONCURRENT_STREAMS, limits.h2_max_concurrent_streams);
     add(codec::H2_SETTINGS_INITIAL_WINDOW_SIZE, static_cast<std::uint32_t>(limits.h2_initial_window));
     add(codec::H2_SETTINGS_MAX_FRAME_SIZE, limits.h2_max_frame_size);
-    add(codec::H2_SETTINGS_ENABLE_PUSH, 0);  // server push is not supported here
+    add(codec::H2_SETTINGS_ENABLE_PUSH, 0); // server push is not supported here
     return payload;
 }
 
-inline std::string h2_settings_base64url(const EngineLimits& limits) {
+inline std::string h2_settings_base64url(const EngineLimits &limits) {
     return base64_url_encode(h2_settings_payload(limits));
 }
 
-template <TransportLike Transport>
-class Http2ClientSession;
+template <TransportLike Transport> class Http2ClientSession;
 
 // How a stream ended, shared between the session (which sets it) and the stream
 // handle (which reports it). It has to live on the handle, not in the session's
@@ -116,19 +115,17 @@ class Http2ClientSession;
 // closed session.
 enum class StreamState : int {
     Open = 0,
-    Eof,         // the response body ended normally
-    Reset,       // the peer reset the stream (RST_STREAM)
-    Disconnect,  // the connection went away mid-stream
-    Failed,      // a specific error_code (in StreamOutcome::ec)
+    Eof,        // the response body ended normally
+    Reset,      // the peer reset the stream (RST_STREAM)
+    Disconnect, // the connection went away mid-stream
+    Failed,     // a specific error_code (in StreamOutcome::ec)
 };
 
 struct StreamOutcome {
     std::atomic<int> state{static_cast<int>(StreamState::Open)};
     error_code ec;
 
-    StreamState get() const {
-        return static_cast<StreamState>(state.load(std::memory_order_acquire));
-    }
+    StreamState get() const { return static_cast<StreamState>(state.load(std::memory_order_acquire)); }
 
     void set(StreamState s, error_code e = {}) {
         ec = std::move(e);
@@ -137,72 +134,70 @@ struct StreamOutcome {
 
     // The error a failed stream reports; Open/Eof/Rst/Disconnect have their own
     // event or error at the call site.
-    error_code to_error() const {
-        return ec ? ec : make_error_code(client_errc::session_closed);
-    }
+    error_code to_error() const { return ec ? ec : make_error_code(client_errc::session_closed); }
 };
 
 // Maps a terminal stream state to what the caller sees: a clean end-of-body, or
 // the error that ended it. A reset and a vanished connection are failures — the
 // body the caller got is a truncation, not a body.
-inline std::expected<ReadResult, error_code> outcome_result(const StreamOutcome& outcome) {
+inline std::expected<ReadResult, error_code> outcome_result(const StreamOutcome &outcome) {
     switch (outcome.get()) {
-        case StreamState::Eof:
-            return ReadResult::end();
-        case StreamState::Reset:
-            return std::unexpected{make_error_code(client_errc::stream_reset)};
-        case StreamState::Disconnect:
-            return std::unexpected{make_error_code(asio::error::connection_reset)};
-        case StreamState::Failed:
-            return std::unexpected{outcome.to_error()};
-        case StreamState::Open:
-        default:
-            return std::unexpected{make_error_code(client_errc::session_closed)};
+    case StreamState::Eof:
+        return ReadResult::end();
+    case StreamState::Reset:
+        return std::unexpected{make_error_code(client_errc::stream_reset)};
+    case StreamState::Disconnect:
+        return std::unexpected{make_error_code(asio::error::connection_reset)};
+    case StreamState::Failed:
+        return std::unexpected{outcome.to_error()};
+    case StreamState::Open:
+    default:
+        return std::unexpected{make_error_code(client_errc::session_closed)};
     }
 }
 
 // The error form, for the paths that only need to know why a stream ended (a
-// clean end-of-body is then reported as a protocol error: no head ever arrived).
-inline error_code outcome_error(const StreamOutcome& outcome) {
+// clean end-of-body is then reported as a protocol error: no head ever
+// arrived).
+inline error_code outcome_error(const StreamOutcome &outcome) {
     switch (outcome.get()) {
-        case StreamState::Reset:
-            return make_error_code(client_errc::stream_reset);
-        case StreamState::Disconnect:
-            return make_error_code(asio::error::connection_reset);
-        case StreamState::Failed:
-            return outcome.to_error();
-        case StreamState::Eof:
-            return make_error_code(client_errc::protocol_error);
-        case StreamState::Open:
-        default:
-            return make_error_code(client_errc::session_closed);
+    case StreamState::Reset:
+        return make_error_code(client_errc::stream_reset);
+    case StreamState::Disconnect:
+        return make_error_code(asio::error::connection_reset);
+    case StreamState::Failed:
+        return outcome.to_error();
+    case StreamState::Eof:
+        return make_error_code(client_errc::protocol_error);
+    case StreamState::Open:
+    default:
+        return make_error_code(client_errc::session_closed);
     }
 }
 
 // One HTTP/2 stream, from the caller's side. Holds the id, the shared outcome
-// and a weak reference to the session: a stream kept past the connection's death
-// reports that instead of touching a dead transport.
-template <TransportLike Transport>
-class Http2ClientStream final : public ClientStream {
+// and a weak reference to the session: a stream kept past the connection's
+// death reports that instead of touching a dead transport.
+template <TransportLike Transport> class Http2ClientStream final : public ClientStream {
   public:
-    Http2ClientStream(std::shared_ptr<Http2ClientSession<Transport>> session,
-                      std::uint32_t id,
+    Http2ClientStream(std::shared_ptr<Http2ClientSession<Transport>> session, std::uint32_t id,
                       std::shared_ptr<StreamOutcome> outcome)
-        : m_session(std::move(session)), m_id(id), m_outcome(std::move(outcome)) {
-    }
+        : m_session(std::move(session)), m_id(id), m_outcome(std::move(outcome)) {}
 
     asio::awaitable<error_code> write(std::string data) override {
         // Terminal state first: the session may have dropped its table entry
         // already, so the outcome is the only truthful source.
         if (m_outcome->get() != StreamState::Open)
             co_return m_outcome->to_error();
-        co_return co_await m_session->stream_write(m_id, std::move(data), /*last=*/false);
+        co_return co_await m_session->stream_write(m_id, std::move(data),
+                                                   /*last=*/false);
     }
 
     asio::awaitable<error_code> finish(std::string data) override {
         if (m_outcome->get() != StreamState::Open)
             co_return m_outcome->to_error();
-        co_return co_await m_session->stream_write(m_id, std::move(data), /*last=*/true);
+        co_return co_await m_session->stream_write(m_id, std::move(data),
+                                                   /*last=*/true);
     }
 
     asio::awaitable<std::expected<ReadResult, error_code>> read() override {
@@ -211,17 +206,11 @@ class Http2ClientStream final : public ClientStream {
         co_return co_await m_session->stream_read(m_id);
     }
 
-    bool finished() const override {
-        return m_outcome->get() != StreamState::Open;
-    }
+    bool finished() const override { return m_outcome->get() != StreamState::Open; }
 
-    Version version() const override {
-        return Version::Http2;
-    }
+    Version version() const override { return Version::Http2; }
 
-    std::uint32_t id() const override {
-        return m_id;
-    }
+    std::uint32_t id() const override { return m_id; }
 
     asio::awaitable<void> cancel() override {
         co_await asio::dispatch(asio::bind_executor(m_session->get_executor(), asio::use_awaitable));
@@ -229,11 +218,9 @@ class Http2ClientStream final : public ClientStream {
     }
 
   private:
-    friend class Http2ClientSession<Transport>;  // publishes the parsed head here
+    friend class Http2ClientSession<Transport>; // publishes the parsed head here
 
-    asio::awaitable<error_code> await_head() override {
-        co_return co_await m_session->await_stream_head(m_id);
-    }
+    asio::awaitable<error_code> await_head() override { co_return co_await m_session->await_stream_head(m_id); }
 
     // Strong: the caller's stream keeps the connection alive. The session refers
     // back to its streams weakly, so there is no cycle.
@@ -246,23 +233,16 @@ template <TransportLike Transport>
 class Http2ClientSession final : public ClientSession,
                                  public std::enable_shared_from_this<Http2ClientSession<Transport>> {
   public:
-    using Executor = decltype(std::declval<Transport&>().get_executor());
+    using Executor = decltype(std::declval<Transport &>().get_executor());
 
     // The executor this session is pinned to. Streams dispatch onto it before
     // touching session state, exactly as they do on the HTTP/1.1 side.
     Executor get_executor() { return m_executor; }
 
-    Http2ClientSession(std::shared_ptr<Transport> transport,
-                       ClientTarget target,
-                       EngineLimits limits,
+    Http2ClientSession(std::shared_ptr<Transport> transport, ClientTarget target, EngineLimits limits,
                        std::chrono::milliseconds idle_timeout)
-        : m_transport(std::move(transport)),
-          m_executor(m_transport->get_executor()),
-          m_target(std::move(target)),
-          m_limits(limits),
-          m_idle_timeout(idle_timeout),
-          m_notify(m_executor, 1),
-          m_idle_timer(m_executor) {
+        : m_transport(std::move(transport)), m_executor(m_transport->get_executor()), m_target(std::move(target)),
+          m_limits(limits), m_idle_timeout(idle_timeout), m_notify(m_executor, 1), m_idle_timer(m_executor) {
         // What we advertise bounds what the peer may index into, so the decoder
         // is set to the same value. We advertise nothing, i.e. the 4096 default.
         m_decoder.set_max_table_size(4096);
@@ -283,9 +263,8 @@ class Http2ClientSession final : public ClientSession,
     // `initial` carries whatever the peer already sent after its 101 — the h2
     // connection preface and SETTINGS, typically, or even the response itself.
     // Dropping those bytes costs a round trip at best and hangs at worst.
-    asio::awaitable<std::expected<std::shared_ptr<ClientStream>, error_code>> start_with_stream(
-        RequestSpec seed,
-        std::string initial = {}) {
+    asio::awaitable<std::expected<std::shared_ptr<ClientStream>, error_code>>
+    start_with_stream(RequestSpec seed, std::string initial = {}) {
         auto result = co_await start_impl(std::move(seed), std::move(initial));
         if (!result)
             co_return std::unexpected{result.error()};
@@ -316,7 +295,7 @@ class Http2ClientSession final : public ClientSession,
         if (m_peer_max_concurrent_streams != 0 && m_streams.size() >= m_peer_max_concurrent_streams) {
             co_return std::unexpected{make_error_code(client_errc::too_many_streams)};
         }
-        if (m_next_stream_id > 0x7FFFFFFFu) {  // client stream ids are odd and 31-bit
+        if (m_next_stream_id > 0x7FFFFFFFu) { // client stream ids are odd and 31-bit
             co_return std::unexpected{make_error_code(client_errc::too_many_streams)};
         }
 
@@ -326,7 +305,7 @@ class Http2ClientSession final : public ClientSession,
 
         auto [it, inserted] = m_streams.try_emplace(id);
         (void)inserted;
-        Stream& st = it->second;
+        Stream &st = it->second;
         init_stream(st, id);
 
         std::string block;
@@ -341,7 +320,7 @@ class Http2ClientSession final : public ClientSession,
             st.out_queue.push_back(spec.body);
         }
         if (!body_expected || !spec.stream_body)
-            st.out_finished = true;  // whole body already queued
+            st.out_finished = true; // whole body already queued
         if (!body_expected)
             st.local_end = true;
         auto handle = std::make_shared<Http2ClientStream<Transport>>(this->shared_from_this(), id, st.outcome);
@@ -353,9 +332,7 @@ class Http2ClientSession final : public ClientSession,
         co_return handle;
     }
 
-    bool alive() const override {
-        return m_alive;
-    }
+    bool alive() const override { return m_alive; }
 
     bool reusable() const override {
         // A request that asked to close (`RequestSpec::close`) keeps the session
@@ -364,13 +341,9 @@ class Http2ClientSession final : public ClientSession,
         return m_alive && !m_goaway_received && m_streams.empty() && !m_close_requested;
     }
 
-    Version version() const override {
-        return Version::Http2;
-    }
+    Version version() const override { return Version::Http2; }
 
-    std::string_view authority() const override {
-        return m_authority;
-    }
+    std::string_view authority() const override { return m_authority; }
 
     void close() override {
         asio::post(m_executor, [self = this->shared_from_this()] {
@@ -385,9 +358,9 @@ class Http2ClientSession final : public ClientSession,
         m_pooled = true;
         m_idle_armed = true;
         m_idle_timer.expires_after(ttl);
-        m_idle_timer.async_wait([self = this->shared_from_this()](const error_code& ec) {
+        m_idle_timer.async_wait([self = this->shared_from_this()](const error_code &ec) {
             if (ec || !self->m_idle_armed)
-                return;  // cancelled by disarm() or a re-arm
+                return; // cancelled by disarm() or a re-arm
             self->m_idle_armed = false;
             SIMPLE_HTTP_ERROR_LOG("h2 client: closing idle pooled connection to {}", self->m_authority);
             self->m_alive = false;
@@ -406,9 +379,7 @@ class Http2ClientSession final : public ClientSession,
     // Invoked (on this session's executor) when the session has finished
     // everything in flight and is reusable again — the facade returns it to the
     // pool from here.
-    void set_on_idle(std::function<void()> cb) {
-        m_on_idle = std::move(cb);
-    }
+    void set_on_idle(std::function<void()> cb) { m_on_idle = std::move(cb); }
 
     void notify_idle() {
         if (m_pooled || !m_on_idle || !reusable())
@@ -417,17 +388,11 @@ class Http2ClientSession final : public ClientSession,
     }
 
     // --- introspection (tests / diagnostics) ---
-    std::size_t active_streams() const {
-        return m_streams.size();
-    }
+    std::size_t active_streams() const { return m_streams.size(); }
 
-    std::uint32_t last_stream_id() const {
-        return m_last_stream_id;
-    }
+    std::uint32_t last_stream_id() const { return m_last_stream_id; }
 
-    bool draining() const {
-        return m_goaway_received || m_goaway_sent;
-    }
+    bool draining() const { return m_goaway_received || m_goaway_sent; }
 
     // --- stream operations (called by Http2ClientStream) ---
 
@@ -437,9 +402,9 @@ class Http2ClientSession final : public ClientSession,
             auto it = m_streams.find(id);
             if (it == m_streams.end())
                 co_return make_error_code(client_errc::session_closed);
-            Stream& st = it->second;
+            Stream &st = it->second;
             if (st.write_error)
-                co_return st.write_error;  // a failed write poisons the stream
+                co_return st.write_error; // a failed write poisons the stream
             if (st.reset || st.failed)
                 co_return st.error ? st.error : make_error_code(client_errc::stream_reset);
             if (st.local_end || st.out_finished)
@@ -477,7 +442,8 @@ class Http2ClientSession final : public ClientSession,
 
     // Waits for the response head without consuming body bytes: what read_head()
     // needs, and what read() calls first when the caller goes straight to the
-    // body. The head itself is published to the caller's handle when it is parsed.
+    // body. The head itself is published to the caller's handle when it is
+    // parsed.
     asio::awaitable<error_code> await_stream_head(std::uint32_t id) {
         co_await hop();
         for (;;) {
@@ -487,13 +453,13 @@ class Http2ClientSession final : public ClientSession,
                 // was parsed, so reaching here means there never was one.
                 co_return make_error_code(client_errc::protocol_error);
             }
-            Stream& st = it->second;
+            Stream &st = it->second;
             if (st.head_seen)
                 co_return error_code{};
             if (st.failed || st.reset)
                 co_return outcome_error(*st.outcome);
             if (st.remote_end)
-                co_return make_error_code(client_errc::protocol_error);  // END_STREAM, no HEADERS
+                co_return make_error_code(client_errc::protocol_error); // END_STREAM, no HEADERS
 
             if (!st.in_notify) {
                 st.in_notify =
@@ -529,7 +495,7 @@ class Http2ClientSession final : public ClientSession,
             if (it == m_streams.end()) {
                 co_return std::unexpected{make_error_code(client_errc::session_closed)};
             }
-            Stream& st = it->second;
+            Stream &st = it->second;
             if (!st.in_queue.empty()) {
                 std::string data = std::move(st.in_queue.front());
                 st.in_queue.pop_front();
@@ -574,7 +540,7 @@ class Http2ClientSession final : public ClientSession,
         auto it = m_streams.find(id);
         if (it == m_streams.end())
             return true;
-        const Stream& st = it->second;
+        const Stream &st = it->second;
         return st.remote_end || st.failed || st.reset;
     }
 
@@ -603,39 +569,39 @@ class Http2ClientSession final : public ClientSession,
 
         // --- inbound (response) ---
         ResponseHead head;
-        bool head_seen{false};  // a final header block was decoded (and published to the handle)
-        bool block_end_stream{false};  // the HEADERS frame that started the block carried END_STREAM
+        bool head_seen{false};        // a final header block was decoded (and published
+                                      // to the handle)
+        bool block_end_stream{false}; // the HEADERS frame that started the block carried END_STREAM
         std::deque<std::string> in_queue;
         std::size_t in_bytes{0};
         std::shared_ptr<asio::experimental::concurrent_channel<void(error_code)>> in_notify;
-        std::string header_block;  // accumulating HEADERS + CONTINUATION
-        bool remote_end{false};    // the peer sent END_STREAM
-        bool reset{false};         // RST_STREAM seen (or sent)
-        bool failed{false};        // the stream cannot deliver more
+        std::string header_block; // accumulating HEADERS + CONTINUATION
+        bool remote_end{false};   // the peer sent END_STREAM
+        bool reset{false};        // RST_STREAM seen (or sent)
+        bool failed{false};       // the stream cannot deliver more
         error_code error;
 
         // --- outbound (request body) ---
         std::deque<std::string> out_queue;
         std::size_t out_offset{0};
         std::size_t out_queued{0};
-        bool out_finished{false};  // the caller finished the body
-        bool local_end{false};     // our END_STREAM has been framed
+        bool out_finished{false}; // the caller finished the body
+        bool local_end{false};    // our END_STREAM has been framed
         error_code write_error;
         std::shared_ptr<asio::experimental::concurrent_channel<void(error_code)>> out_space;
         std::int64_t send_window{kClientInitialWindow};
 
         // --- flow control ---
-        std::int64_t recv_owed_conn{0};  // delivered but unconsumed: owes connection credit
-        std::int64_t recv_pending{0};    // consumed: awaiting a batched WINDOW_UPDATE
+        std::int64_t recv_owed_conn{0}; // delivered but unconsumed: owes connection credit
+        std::int64_t recv_pending{0};   // consumed: awaiting a batched WINDOW_UPDATE
     };
 
     // --- setup ---
 
     // Returns the seeded stream's handle (or null when there is no seed), so the
     // caller — not a weak reference — keeps it alive.
-    asio::awaitable<std::expected<std::shared_ptr<ClientStream>, error_code>> start_impl(
-        std::optional<RequestSpec> seed,
-        std::string carried_over) {
+    asio::awaitable<std::expected<std::shared_ptr<ClientStream>, error_code>>
+    start_impl(std::optional<RequestSpec> seed, std::string carried_over) {
         m_authority = m_target.authority();
         m_recv_buf = std::move(carried_over);
         // The prefacing bytes go out as one write: the 24-octet client preface
@@ -666,7 +632,7 @@ class Http2ClientSession final : public ClientSession,
         if (seed) {
             auto [it, inserted] = m_streams.try_emplace(1);
             (void)inserted;
-            Stream& st = it->second;
+            Stream &st = it->second;
             init_stream(st, 1);
             // The handle must be owned by *someone*: the session keeps only a weak
             // reference (a strong one would be a cycle), so the caller gets it.
@@ -676,7 +642,7 @@ class Http2ClientSession final : public ClientSession,
             st.local_end = true;
             st.out_finished = true;
             m_last_stream_id = 1;
-            m_next_stream_id = 3;  // the upgraded request took stream 1
+            m_next_stream_id = 3; // the upgraded request took stream 1
         }
 
         m_alive = true;
@@ -686,13 +652,12 @@ class Http2ClientSession final : public ClientSession,
         // handle (an idle pooled session has no other owner) must not leave them
         // running against a destroyed object.
         asio::co_spawn(
-            m_executor,
-            [self = this->shared_from_this()]() -> asio::awaitable<void> { co_await self->run_loops(); },
+            m_executor, [self = this->shared_from_this()]() -> asio::awaitable<void> { co_await self->run_loops(); },
             asio::detached);
         co_return seeded;
     }
 
-    void init_stream(Stream& st, std::uint32_t id) {
+    void init_stream(Stream &st, std::uint32_t id) {
         st.id = id;
         st.outcome = std::make_shared<StreamOutcome>();
         st.send_window = m_peer_initial_window;
@@ -700,13 +665,13 @@ class Http2ClientSession final : public ClientSession,
 
     // Encodes a request head as HPACK, with the static table carrying what it can
     // (the pseudo-headers of a plain GET cost one byte each).
-    error_code encode_request_head(const RequestSpec& spec, std::string& block) {
+    error_code encode_request_head(const RequestSpec &spec, std::string &block) {
         const std::string_view method = to_string(spec.method);
         if (method.empty())
             return make_error_code(client_errc::protocol_error);
         const std::string_view target = spec.target.empty() ? std::string_view{"/"} : std::string_view{spec.target};
         if (target.front() != '/' || contains_ctl(target)) {
-            return make_error_code(client_errc::protocol_error);  // :path must be origin-form
+            return make_error_code(client_errc::protocol_error); // :path must be origin-form
         }
 
         // RFC 7541 Appendix A: 2 = :method GET, 3 = :method POST, 4 = :path /,
@@ -727,7 +692,7 @@ class Http2ClientSession final : public ClientSession,
         }
 
         bool saw_agent = false;
-        for (const auto& [name, value] : spec.headers) {
+        for (const auto &[name, value] : spec.headers) {
             if (name.empty() || name.front() == ':' || is_connection_specific(name))
                 continue;
             if (contains_ctl(name) || contains_ctl(value)) {
@@ -736,7 +701,8 @@ class Http2ClientSession final : public ClientSession,
             }
             if (name == "user-agent")
                 saw_agent = true;
-            codec::hpack_append_literal(block, name, value);  // Headers keeps names lowercased
+            codec::hpack_append_literal(block, name,
+                                        value); // Headers keeps names lowercased
         }
         if (!saw_agent)
             codec::hpack_append_literal(block, "user-agent", client_version);
@@ -762,7 +728,7 @@ class Http2ClientSession final : public ClientSession,
         m_alive = false;
         // Release every writer parked on backpressure: the write loop is gone, so
         // nothing will ever drain their queues.
-        for (auto& [id, st] : m_streams) {
+        for (auto &[id, st] : m_streams) {
             if (st.out_space)
                 st.out_space->close();
             st.outcome->set(StreamState::Disconnect, make_error_code(asio::error::eof));
@@ -781,15 +747,15 @@ class Http2ClientSession final : public ClientSession,
         // before anything new arrives.
         if (!m_recv_buf.empty() && !parse_available())
             co_return;
-        std::array<std::byte, 32 * 1024> buf;  // no init: read_some fills [0,n)
+        std::array<std::byte, 32 * 1024> buf; // no init: read_some fills [0,n)
         for (;;) {
             auto [ec, n] = co_await m_transport->async_read_some(std::span<std::byte>{buf});
             if (ec)
-                co_return;  // EOF or a transport error ends the connection
+                co_return; // EOF or a transport error ends the connection
             m_deadline = std::chrono::steady_clock::now() + m_idle_timeout;
-            m_recv_buf.append(reinterpret_cast<const char*>(buf.data()), n);
+            m_recv_buf.append(reinterpret_cast<const char *>(buf.data()), n);
             if (!parse_available())
-                co_return;  // connection-fatal: GOAWAY queued
+                co_return; // connection-fatal: GOAWAY queued
             flush();
         }
     }
@@ -797,7 +763,7 @@ class Http2ClientSession final : public ClientSession,
     asio::awaitable<void> write_loop() {
         std::string chunk;
         for (;;) {
-            fill_data_frames();  // frame as much queued DATA as flow control allows
+            fill_data_frames(); // frame as much queued DATA as flow control allows
             while (!m_out.empty()) {
                 chunk.clear();
                 chunk.swap(m_out);
@@ -807,7 +773,7 @@ class Http2ClientSession final : public ClientSession,
                 (void)n;
                 if (ec)
                     co_return;
-                fill_data_frames();  // a writer may have queued more while we wrote
+                fill_data_frames(); // a writer may have queued more while we wrote
             }
             if (m_goaway_sent && m_streams.empty())
                 co_return;
@@ -823,42 +789,35 @@ class Http2ClientSession final : public ClientSession,
             timer.expires_at(m_deadline);
             co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
             if (std::chrono::steady_clock::now() >= m_deadline)
-                break;  // idle timeout elapsed
+                break; // idle timeout elapsed
         }
         SIMPLE_HTTP_ERROR_LOG("h2 client: {} idle for {}ms", m_authority, m_idle_timeout.count());
         co_return;
     }
 
-    void flush() {
-        (void)m_notify.try_send(error_code{});
-    }
+    void flush() { (void)m_notify.try_send(error_code{}); }
 
-    asio::awaitable<void> hop() {
-        co_await asio::dispatch(asio::bind_executor(m_executor, asio::use_awaitable));
-    }
+    asio::awaitable<void> hop() { co_await asio::dispatch(asio::bind_executor(m_executor, asio::use_awaitable)); }
 
     // --- frame output ---
 
-    static void append_u32(std::string& out, std::uint32_t v) {
+    static void append_u32(std::string &out, std::uint32_t v) {
         out.push_back(static_cast<char>((v >> 24) & 0xFF));
         out.push_back(static_cast<char>((v >> 16) & 0xFF));
         out.push_back(static_cast<char>((v >> 8) & 0xFF));
         out.push_back(static_cast<char>(v & 0xFF));
     }
 
-    static void append_frame(std::string& out,
-                             codec::H2FrameType type,
-                             std::uint8_t flags,
-                             std::uint32_t stream_id,
+    static void append_frame(std::string &out, codec::H2FrameType type, std::uint8_t flags, std::uint32_t stream_id,
                              std::string_view payload) {
-        codec::serialize_frame_header(
-            out, static_cast<std::uint32_t>(payload.size()), static_cast<std::uint8_t>(type), flags, stream_id);
+        codec::serialize_frame_header(out, static_cast<std::uint32_t>(payload.size()), static_cast<std::uint8_t>(type),
+                                      flags, stream_id);
         out.append(payload);
     }
 
     // Splits a header block into HEADERS + CONTINUATION frames, honouring the
     // peer's advertised frame size (a larger frame is a FRAME_SIZE_ERROR there).
-    void submit_headers(std::uint32_t id, const std::string& block, bool end_stream) {
+    void submit_headers(std::uint32_t id, const std::string &block, bool end_stream) {
         const std::size_t limit =
             std::max<std::size_t>(1, std::min<std::size_t>(m_peer_max_frame_size, m_limits.h2_max_frame_size));
         std::size_t off = 0;
@@ -869,10 +828,7 @@ class Http2ClientSession final : public ClientSession,
             std::uint8_t flags = last ? codec::H2_FLAG_END_HEADERS : 0;
             if (first && end_stream)
                 flags |= codec::H2_FLAG_END_STREAM;
-            append_frame(m_out,
-                         first ? codec::H2FrameType::Headers : codec::H2FrameType::Continuation,
-                         flags,
-                         id,
+            append_frame(m_out, first ? codec::H2FrameType::Headers : codec::H2FrameType::Continuation, flags, id,
                          std::string_view{block}.substr(off, take));
             first = false;
             off += take;
@@ -921,7 +877,7 @@ class Http2ClientSession final : public ClientSession,
             }
             const std::size_t frame_end = pos + codec::kH2FrameHeaderSize + hdr.length;
             if (frame_end > m_recv_buf.size())
-                break;  // wait for the rest
+                break; // wait for the rest
             std::string_view payload = std::string_view{m_recv_buf}.substr(pos + codec::kH2FrameHeaderSize, hdr.length);
             if (!handle_frame(hdr, payload))
                 return false;
@@ -932,37 +888,37 @@ class Http2ClientSession final : public ClientSession,
         return true;
     }
 
-    bool handle_frame(const codec::H2FrameHeader& hdr, std::string_view payload) {
+    bool handle_frame(const codec::H2FrameHeader &hdr, std::string_view payload) {
         switch (static_cast<codec::H2FrameType>(hdr.type)) {
-            case codec::H2FrameType::Headers:
-                return on_headers(hdr, payload);
-            case codec::H2FrameType::Continuation:
-                return on_continuation(hdr, payload);
-            case codec::H2FrameType::Data:
-                return on_data(hdr, payload);
-            case codec::H2FrameType::Settings:
-                return on_settings(hdr, payload);
-            case codec::H2FrameType::WindowUpdate:
-                return on_window_update(hdr, payload);
-            case codec::H2FrameType::RstStream:
-                return on_rst_stream(hdr, payload);
-            case codec::H2FrameType::Ping:
-                return on_ping(hdr, payload);
-            case codec::H2FrameType::Goaway:
-                return on_goaway(hdr, payload);
-            case codec::H2FrameType::PushPromise:
-                // We advertise SETTINGS_ENABLE_PUSH=0, which makes a push a
-                // connection error (RFC 9113 §6.6) rather than something to skip.
-                SIMPLE_HTTP_ERROR_LOG("h2 client: PUSH_PROMISE while push is disabled");
-                go_away(codec::H2_PROTOCOL_ERROR);
-                return false;
-            case codec::H2FrameType::Priority:
-            default:
-                return true;  // ignored / unknown frame types are skipped
+        case codec::H2FrameType::Headers:
+            return on_headers(hdr, payload);
+        case codec::H2FrameType::Continuation:
+            return on_continuation(hdr, payload);
+        case codec::H2FrameType::Data:
+            return on_data(hdr, payload);
+        case codec::H2FrameType::Settings:
+            return on_settings(hdr, payload);
+        case codec::H2FrameType::WindowUpdate:
+            return on_window_update(hdr, payload);
+        case codec::H2FrameType::RstStream:
+            return on_rst_stream(hdr, payload);
+        case codec::H2FrameType::Ping:
+            return on_ping(hdr, payload);
+        case codec::H2FrameType::Goaway:
+            return on_goaway(hdr, payload);
+        case codec::H2FrameType::PushPromise:
+            // We advertise SETTINGS_ENABLE_PUSH=0, which makes a push a
+            // connection error (RFC 9113 §6.6) rather than something to skip.
+            SIMPLE_HTTP_ERROR_LOG("h2 client: PUSH_PROMISE while push is disabled");
+            go_away(codec::H2_PROTOCOL_ERROR);
+            return false;
+        case codec::H2FrameType::Priority:
+        default:
+            return true; // ignored / unknown frame types are skipped
         }
     }
 
-    static std::string_view strip_padding(std::string_view payload, bool padded, bool has_priority, bool& ok) {
+    static std::string_view strip_padding(std::string_view payload, bool padded, bool has_priority, bool &ok) {
         ok = true;
         std::size_t pad_len = 0;
         std::size_t off = 0;
@@ -992,7 +948,7 @@ class Http2ClientSession final : public ClientSession,
     // necessarily a peer error: it may have raced our RST_STREAM. Tolerate it for
     // odd ids below the next one we would use, crediting back the connection
     // window its payload consumed; anything else is a protocol error.
-    bool tolerate_unknown_stream(const codec::H2FrameHeader& hdr, std::int64_t credited_already) {
+    bool tolerate_unknown_stream(const codec::H2FrameHeader &hdr, std::int64_t credited_already) {
         const std::uint32_t id = hdr.stream_id;
         if (id == 0 || (id & 1u) == 0 || id >= m_next_stream_id) {
             SIMPLE_HTTP_ERROR_LOG("h2 client: frame type {} for unexpected stream {}", hdr.type, id);
@@ -1005,7 +961,7 @@ class Http2ClientSession final : public ClientSession,
         return true;
     }
 
-    bool on_headers(const codec::H2FrameHeader& hdr, std::string_view payload) {
+    bool on_headers(const codec::H2FrameHeader &hdr, std::string_view payload) {
         if (hdr.stream_id == 0) {
             go_away(codec::H2_PROTOCOL_ERROR);
             return false;
@@ -1028,9 +984,9 @@ class Http2ClientSession final : public ClientSession,
             }
             return tolerate_unknown_stream(hdr, 0);
         }
-        Stream& st = it->second;
+        Stream &st = it->second;
         if (st.remote_end || st.failed || st.reset)
-            return true;  // already over: ignore stragglers
+            return true; // already over: ignore stragglers
 
         if (st.header_block.empty()) {
             // END_STREAM is only defined on the frame that starts a block.
@@ -1038,19 +994,18 @@ class Http2ClientSession final : public ClientSession,
         }
         st.header_block.append(block);
         if (st.header_block.size() > m_limits.max_header_bytes) {
-            SIMPLE_HTTP_ERROR_LOG("h2 client: header block on stream {} exceeds {} bytes",
-                                  hdr.stream_id,
+            SIMPLE_HTTP_ERROR_LOG("h2 client: header block on stream {} exceeds {} bytes", hdr.stream_id,
                                   m_limits.max_header_bytes);
             go_away(codec::H2_ENHANCE_YOUR_CALM);
             return false;
         }
         if (hdr.has_flag(codec::H2_FLAG_END_HEADERS))
             return finish_header_block(hdr.stream_id);
-        m_continuation_stream = hdr.stream_id;  // CONTINUATION frames follow
+        m_continuation_stream = hdr.stream_id; // CONTINUATION frames follow
         return true;
     }
 
-    bool on_continuation(const codec::H2FrameHeader& hdr, std::string_view payload) {
+    bool on_continuation(const codec::H2FrameHeader &hdr, std::string_view payload) {
         if (hdr.stream_id == 0 || hdr.stream_id != m_continuation_stream) {
             go_away(codec::H2_PROTOCOL_ERROR);
             return false;
@@ -1060,10 +1015,10 @@ class Http2ClientSession final : public ClientSession,
             go_away(codec::H2_PROTOCOL_ERROR);
             return false;
         }
-        Stream& st = it->second;
+        Stream &st = it->second;
         st.header_block.append(payload);
         if (st.header_block.size() > m_limits.max_header_bytes) {
-            go_away(codec::H2_ENHANCE_YOUR_CALM);  // RFC 9113 §10.5.1: CONTINUATION flood
+            go_away(codec::H2_ENHANCE_YOUR_CALM); // RFC 9113 §10.5.1: CONTINUATION flood
             return false;
         }
         if (hdr.has_flag(codec::H2_FLAG_END_HEADERS)) {
@@ -1081,12 +1036,13 @@ class Http2ClientSession final : public ClientSession,
         auto it = m_streams.find(id);
         if (it == m_streams.end())
             return true;
-        Stream& st = it->second;
+        Stream &st = it->second;
 
         std::vector<codec::HpackHeader> fields;
         if (!m_decoder.decode(st.header_block, fields)) {
             SIMPLE_HTTP_ERROR_LOG("h2 client: HPACK decode failed on stream {} (err={})", id, m_decoder.last_error());
-            go_away(codec::H2_COMPRESSION_ERROR);  // the shared table is out of sync: fatal
+            go_away(codec::H2_COMPRESSION_ERROR); // the shared table is out of sync:
+                                                  // fatal
             return false;
         }
         st.header_block.clear();
@@ -1095,8 +1051,8 @@ class Http2ClientSession final : public ClientSession,
         Headers headers;
         int status = 0;
         bool saw_status = false;
-        for (auto& f : fields) {
-            if (contains_ctl(f.name) || contains_ctl(f.value)) {  // §8.2.1
+        for (auto &f : fields) {
+            if (contains_ctl(f.name) || contains_ctl(f.value)) { // §8.2.1
                 reset_stream(id, codec::H2_PROTOCOL_ERROR);
                 return true;
             }
@@ -1115,13 +1071,13 @@ class Http2ClientSession final : public ClientSession,
                 }
                 continue;
             }
-            for (char c : f.name) {  // uppercase field names are malformed (§8.2.1)
+            for (char c : f.name) { // uppercase field names are malformed (§8.2.1)
                 if (c >= 'A' && c <= 'Z') {
                     reset_stream(id, codec::H2_PROTOCOL_ERROR);
                     return true;
                 }
             }
-            if (is_connection_specific(f.name) || (f.name == "te" && f.value != "trailers")) {  // §8.2.2
+            if (is_connection_specific(f.name) || (f.name == "te" && f.value != "trailers")) { // §8.2.2
                 reset_stream(id, codec::H2_PROTOCOL_ERROR);
                 return true;
             }
@@ -1156,7 +1112,8 @@ class Http2ClientSession final : public ClientSession,
         // Publish the finished head to the caller's handle: read_head() then
         // works even after the stream has been retired (the session's entry is
         // gone by then, so the handle's own cache is what answers).
-        if (auto handle = st.handle.lock()) handle->set_head(st.head);
+        if (auto handle = st.handle.lock())
+            handle->set_head(st.head);
         if (end_stream)
             st.remote_end = true;
         // The outcome stays Open until the application has actually seen the head
@@ -1177,7 +1134,7 @@ class Http2ClientSession final : public ClientSession,
         return (status >= 100 && status <= 599) ? status : 0;
     }
 
-    bool on_data(const codec::H2FrameHeader& hdr, std::string_view payload) {
+    bool on_data(const codec::H2FrameHeader &hdr, std::string_view payload) {
         if (hdr.stream_id == 0) {
             go_away(codec::H2_PROTOCOL_ERROR);
             return false;
@@ -1202,7 +1159,7 @@ class Http2ClientSession final : public ClientSession,
         auto it = m_streams.find(hdr.stream_id);
         if (it == m_streams.end())
             return tolerate_unknown_stream(hdr, frame_len);
-        Stream& st = it->second;
+        Stream &st = it->second;
         if (st.remote_end || st.failed || st.reset || !st.head_seen) {
             // After END_STREAM (or on an unknown/closed stream) the bytes are not
             // ours to deliver: hand the connection credit straight back.
@@ -1214,7 +1171,7 @@ class Http2ClientSession final : public ClientSession,
 
         const std::int64_t padding = frame_len - static_cast<std::int64_t>(data.size());
         if (padding > 0)
-            credit_consumed(st, padding);  // never delivered, so credit it now
+            credit_consumed(st, padding); // never delivered, so credit it now
         if (!data.empty()) {
             st.recv_owed_conn += static_cast<std::int64_t>(data.size());
             st.in_bytes += data.size();
@@ -1226,9 +1183,9 @@ class Http2ClientSession final : public ClientSession,
         return true;
     }
 
-    bool on_settings(const codec::H2FrameHeader& hdr, std::string_view payload) {
+    bool on_settings(const codec::H2FrameHeader &hdr, std::string_view payload) {
         if (hdr.has_flag(codec::H2_FLAG_ACK))
-            return true;  // our SETTINGS was acked
+            return true; // our SETTINGS was acked
         if (hdr.stream_id != 0 || payload.size() % 6 != 0) {
             go_away(codec::H2_FRAME_SIZE_ERROR);
             return false;
@@ -1238,35 +1195,35 @@ class Http2ClientSession final : public ClientSession,
                                                                 static_cast<unsigned char>(payload[i + 1]));
             const std::uint32_t value = codec::read_u32(payload, i + 2);
             switch (id) {
-                case codec::H2_SETTINGS_INITIAL_WINDOW_SIZE: {
-                    if (value > 0x7FFFFFFFu) {  // RFC 9113 §6.5.2
-                        go_away(codec::H2_FLOW_CONTROL_ERROR);
-                        return false;
-                    }
-                    // Applies retroactively to every open stream's send window.
-                    const std::int64_t delta = static_cast<std::int64_t>(value) - m_peer_initial_window;
-                    m_peer_initial_window = static_cast<std::int32_t>(value);
-                    for (auto& [sid, st] : m_streams)
-                        st.send_window += delta;
-                    break;
+            case codec::H2_SETTINGS_INITIAL_WINDOW_SIZE: {
+                if (value > 0x7FFFFFFFu) { // RFC 9113 §6.5.2
+                    go_away(codec::H2_FLOW_CONTROL_ERROR);
+                    return false;
                 }
-                case codec::H2_SETTINGS_MAX_FRAME_SIZE:
-                    if (value < 16384u || value > 16777215u) {
-                        go_away(codec::H2_PROTOCOL_ERROR);
-                        return false;
-                    }
-                    m_peer_max_frame_size = value;
-                    break;
-                case codec::H2_SETTINGS_MAX_CONCURRENT_STREAMS:
-                    m_peer_max_concurrent_streams = value;
-                    break;
-                case codec::H2_SETTINGS_HEADER_TABLE_SIZE:
-                    // This bounds the table *our encoder* may use. We never index
-                    // (every field is a literal), so there is nothing to resize;
-                    // our decoder's table is governed by what we advertise.
-                    break;
-                default:
-                    break;  // accepted and ignored
+                // Applies retroactively to every open stream's send window.
+                const std::int64_t delta = static_cast<std::int64_t>(value) - m_peer_initial_window;
+                m_peer_initial_window = static_cast<std::int32_t>(value);
+                for (auto &[sid, st] : m_streams)
+                    st.send_window += delta;
+                break;
+            }
+            case codec::H2_SETTINGS_MAX_FRAME_SIZE:
+                if (value < 16384u || value > 16777215u) {
+                    go_away(codec::H2_PROTOCOL_ERROR);
+                    return false;
+                }
+                m_peer_max_frame_size = value;
+                break;
+            case codec::H2_SETTINGS_MAX_CONCURRENT_STREAMS:
+                m_peer_max_concurrent_streams = value;
+                break;
+            case codec::H2_SETTINGS_HEADER_TABLE_SIZE:
+                // This bounds the table *our encoder* may use. We never index
+                // (every field is a literal), so there is nothing to resize;
+                // our decoder's table is governed by what we advertise.
+                break;
+            default:
+                break; // accepted and ignored
             }
         }
         std::string ack;
@@ -1275,7 +1232,7 @@ class Http2ClientSession final : public ClientSession,
         return true;
     }
 
-    bool on_window_update(const codec::H2FrameHeader& hdr, std::string_view payload) {
+    bool on_window_update(const codec::H2FrameHeader &hdr, std::string_view payload) {
         if (payload.size() != 4) {
             go_away(codec::H2_FRAME_SIZE_ERROR);
             return false;
@@ -1307,11 +1264,11 @@ class Http2ClientSession final : public ClientSession,
                 }
             }
         }
-        fill_data_frames();  // a window opened: more DATA may be frameable now
+        fill_data_frames(); // a window opened: more DATA may be frameable now
         return true;
     }
 
-    bool on_rst_stream(const codec::H2FrameHeader& hdr, std::string_view payload) {
+    bool on_rst_stream(const codec::H2FrameHeader &hdr, std::string_view payload) {
         if (hdr.stream_id == 0 || payload.size() != 4) {
             go_away(hdr.stream_id == 0 ? codec::H2_PROTOCOL_ERROR : codec::H2_FRAME_SIZE_ERROR);
             return false;
@@ -1321,14 +1278,13 @@ class Http2ClientSession final : public ClientSession,
             return tolerate_unknown_stream(hdr, 0);
         const std::uint32_t error = codec::read_u32(payload, 0);
         it->second.reset = true;
-        it_finish(it,
-                  StreamState::Reset,
+        it_finish(it, StreamState::Reset,
                   error == codec::H2_REFUSED_STREAM ? make_error_code(client_errc::stream_refused)
                                                     : make_error_code(client_errc::stream_reset));
         return true;
     }
 
-    bool on_goaway(const codec::H2FrameHeader& hdr, std::string_view payload) {
+    bool on_goaway(const codec::H2FrameHeader &hdr, std::string_view payload) {
         if (hdr.stream_id != 0 || payload.size() < 8) {
             go_away(codec::H2_PROTOCOL_ERROR);
             return false;
@@ -1339,9 +1295,7 @@ class Http2ClientSession final : public ClientSession,
         // Read for the record (and the log, which may be compiled out): the code
         // itself does not change what we do beyond draining the connection.
         (void)error;
-        SIMPLE_HTTP_ERROR_LOG("h2 client: GOAWAY from {} (last_stream_id={}, error={})",
-                              m_authority,
-                              last_stream_id,
+        SIMPLE_HTTP_ERROR_LOG("h2 client: GOAWAY from {} (last_stream_id={}, error={})", m_authority, last_stream_id,
                               error);
         // Streams above last_stream_id were never processed, so they may safely be
         // retried elsewhere; the rest still get their responses.
@@ -1358,7 +1312,7 @@ class Http2ClientSession final : public ClientSession,
         return true;
     }
 
-    bool on_ping(const codec::H2FrameHeader& hdr, std::string_view payload) {
+    bool on_ping(const codec::H2FrameHeader &hdr, std::string_view payload) {
         if (hdr.has_flag(codec::H2_FLAG_ACK))
             return true;
         if (payload.size() != 8) {
@@ -1366,7 +1320,8 @@ class Http2ClientSession final : public ClientSession,
             return false;
         }
         std::string ack;
-        append_frame(ack, codec::H2FrameType::Ping, codec::H2_FLAG_ACK, 0, payload);  // echo
+        append_frame(ack, codec::H2FrameType::Ping, codec::H2_FLAG_ACK, 0,
+                     payload); // echo
         m_out.append(ack);
         return true;
     }
@@ -1384,7 +1339,7 @@ class Http2ClientSession final : public ClientSession,
         }
     }
 
-    void credit_consumed(Stream& st, std::int64_t n) {
+    void credit_consumed(Stream &st, std::int64_t n) {
         st.recv_pending += n;
         if (st.recv_pending >= m_limits.h2_initial_window / 2) {
             send_window_update(st.id, static_cast<std::uint32_t>(st.recv_pending));
@@ -1393,7 +1348,7 @@ class Http2ClientSession final : public ClientSession,
         replenish_conn(n);
     }
 
-    void wake(Stream& st) {
+    void wake(Stream &st) {
         if (st.in_notify)
             (void)st.in_notify->try_send(error_code{});
     }
@@ -1403,7 +1358,7 @@ class Http2ClientSession final : public ClientSession,
     // Records a stream's terminal state on its outcome (so the handle keeps
     // answering) and wakes a reader parked on it.
     void it_finish(std::unordered_map<std::uint32_t, Stream>::iterator it, StreamState state, error_code ec = {}) {
-        Stream& st = it->second;
+        Stream &st = it->second;
         st.failed = st.failed || state == StreamState::Failed;
         st.outcome->set(state, ec);
         // Erase before waking. The wake can resume a reader inline on this
@@ -1432,7 +1387,7 @@ class Http2ClientSession final : public ClientSession,
     // still owed for delivered-but-unconsumed bytes (otherwise the connection
     // window would leak over a long-lived connection).
     void erase_stream(std::unordered_map<std::uint32_t, Stream>::iterator it) {
-        Stream& st = it->second;
+        Stream &st = it->second;
         if (st.recv_owed_conn > 0) {
             replenish_conn(st.recv_owed_conn);
             st.recv_owed_conn = 0;
@@ -1452,7 +1407,7 @@ class Http2ClientSession final : public ClientSession,
         // this loop is walking. Collecting the channels and signalling them once
         // the walk is over keeps the traversal safe.
         std::vector<std::shared_ptr<asio::experimental::concurrent_channel<void(error_code)>>> notifies;
-        for (auto& [id, st] : m_streams) {
+        for (auto &[id, st] : m_streams) {
             st.failed = true;
             st.error = make_error_code(code);
             st.outcome->set(StreamState::Failed, st.error);
@@ -1461,7 +1416,7 @@ class Http2ClientSession final : public ClientSession,
             if (st.in_notify)
                 notifies.push_back(st.in_notify);
         }
-        for (auto& notify : notifies) {
+        for (auto &notify : notifies) {
             (void)notify->try_send(error_code{});
         }
     }
@@ -1478,7 +1433,7 @@ class Http2ClientSession final : public ClientSession,
             auto it = m_streams.find(id);
             if (it == m_streams.end())
                 co_return make_error_code(client_errc::session_closed);
-            Stream& st = it->second;
+            Stream &st = it->second;
             if (st.failed || st.reset) {
                 co_return st.error ? st.error : make_error_code(client_errc::stream_reset);
             }
@@ -1501,7 +1456,7 @@ class Http2ClientSession final : public ClientSession,
 
     void fill_data_frames() {
         std::vector<std::uint32_t> finished;
-        for (auto& [id, st] : m_streams) {
+        for (auto &[id, st] : m_streams) {
             if (st.local_end || st.reset || st.failed)
                 continue;
             for (;;) {
@@ -1517,24 +1472,20 @@ class Http2ClientSession final : public ClientSession,
                 }
                 const std::int64_t window = std::min<std::int64_t>(m_conn_send_window, st.send_window);
                 if (window <= 0)
-                    break;  // blocked on flow control until WINDOW_UPDATE
+                    break; // blocked on flow control until WINDOW_UPDATE
 
-                std::string& front = st.out_queue.front();
+                std::string &front = st.out_queue.front();
                 const std::size_t available = front.size() - st.out_offset;
                 const std::size_t budget = static_cast<std::size_t>(
-                    std::min<std::int64_t>(window,
-                                           static_cast<std::int64_t>(std::min<std::uint32_t>(
-                                               m_peer_max_frame_size, m_limits.h2_max_frame_size))));
+                    std::min<std::int64_t>(window, static_cast<std::int64_t>(std::min<std::uint32_t>(
+                                                       m_peer_max_frame_size, m_limits.h2_max_frame_size))));
                 const std::size_t take = std::min(available, budget);
                 if (take == 0)
-                    break;  // nothing can advance: stop rather than spin
+                    break; // nothing can advance: stop rather than spin
 
                 const bool front_done = (st.out_offset + take >= front.size());
                 const bool last = front_done && st.out_queue.size() == 1 && st.out_finished;
-                append_frame(m_out,
-                             codec::H2FrameType::Data,
-                             last ? codec::H2_FLAG_END_STREAM : 0,
-                             id,
+                append_frame(m_out, codec::H2FrameType::Data, last ? codec::H2_FLAG_END_STREAM : 0, id,
                              std::string_view{front.data() + st.out_offset, take});
                 st.out_offset += take;
                 m_conn_send_window -= static_cast<std::int64_t>(take);
@@ -1581,13 +1532,13 @@ class Http2ClientSession final : public ClientSession,
     std::function<void()> m_on_idle;
     std::chrono::steady_clock::time_point m_deadline{};
 
-    codec::HpackDecoder m_decoder;  // connection-scoped: the dynamic table is shared
+    codec::HpackDecoder m_decoder; // connection-scoped: the dynamic table is shared
     std::unordered_map<std::uint32_t, Stream> m_streams;
 
     std::string m_recv_buf;
     std::string m_out;
 
-    std::uint32_t m_next_stream_id{1};  // client-initiated ids are odd
+    std::uint32_t m_next_stream_id{1}; // client-initiated ids are odd
     std::uint32_t m_last_stream_id{0};
     std::uint32_t m_continuation_stream{0};
 
@@ -1596,7 +1547,7 @@ class Http2ClientSession final : public ClientSession,
     std::int64_t m_conn_recv_pending{0};
     std::int32_t m_peer_initial_window{kClientInitialWindow};
     std::uint32_t m_peer_max_frame_size{static_cast<std::uint32_t>(kClientMaxFrameSize)};
-    std::uint32_t m_peer_max_concurrent_streams{0};  // 0 = no limit announced yet
+    std::uint32_t m_peer_max_concurrent_streams{0}; // 0 = no limit announced yet
 
     bool m_alive{false};
     // Set by a stream whose RequestSpec::close asked for the connection to end
@@ -1606,4 +1557,4 @@ class Http2ClientSession final : public ClientSession,
     bool m_goaway_received{false};
 };
 
-}  // namespace simple_http
+} // namespace simple_http

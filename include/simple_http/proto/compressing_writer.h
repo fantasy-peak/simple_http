@@ -1,13 +1,13 @@
 #pragma once
 
-// CompressingResponseWriter: wraps an engine's ResponseWriter and compresses the
-// body when the client asked for it and the response is worth compressing.
+// CompressingResponseWriter: wraps an engine's ResponseWriter and compresses
+// the body when the client asked for it and the response is worth compressing.
 //
 // It is installed at the two places a Response is built (h1_engine.h and
 // h2_engine.h), so every handler - including the reverse proxy - gets
 // compression without knowing about it. It is opt-in through
-// CompressionConfig::enabled; when that is off, maybe_compress_writer returns the
-// inner writer untouched and no code path here runs.
+// CompressionConfig::enabled; when that is off, maybe_compress_writer returns
+// the inner writer untouched and no code path here runs.
 //
 // Two protocol details drive most of this file:
 //
@@ -29,12 +29,11 @@
 // compression, so an upstream that already compressed is passed through
 // byte-for-byte and one that did not gets compressed here.
 
+#include <boost/asio.hpp>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
-
-#include <boost/asio.hpp>
 
 #include "../core/compression.h"
 #include "../core/content_encoding.h"
@@ -49,11 +48,8 @@ class CompressingResponseWriter final : public ResponseWriter {
   public:
     CompressingResponseWriter(std::shared_ptr<ResponseWriter> inner, asio::any_io_executor executor,
                               CompressionConfig config, std::string encoding, bool head_request)
-        : m_inner(std::move(inner)),
-          m_executor(std::move(executor)),
-          m_config(std::move(config)),
-          m_encoding(std::move(encoding)),
-          m_head_request(head_request) {}
+        : m_inner(std::move(inner)), m_executor(std::move(executor)), m_config(std::move(config)),
+          m_encoding(std::move(encoding)), m_head_request(head_request) {}
 
     // --- one-shot: the only path that knows the full length ---
 
@@ -81,7 +77,7 @@ class CompressingResponseWriter final : public ResponseWriter {
             co_return co_await m_inner->send_headers(status, std::move(headers));
         }
         m_encoder = make_encoder(m_encoding, m_config);
-        if (!m_encoder) {  // codec unavailable: fall back for the whole response
+        if (!m_encoder) { // codec unavailable: fall back for the whole response
             m_state = State::Passthrough;
             co_return co_await m_inner->send_headers(status, std::move(headers));
         }
@@ -97,13 +93,14 @@ class CompressingResponseWriter final : public ResponseWriter {
         co_await hop();
         if (m_done || m_state != State::Compressing) {
             if (data.empty()) {
-                co_return error_code{};  // see the header comment: never forward an empty chunk
+                co_return error_code{}; // see the header comment: never forward an
+                                        // empty chunk
             }
             co_return co_await m_inner->send_chunk(std::move(data));
         }
         std::string out = m_encoder->write(data);
         if (out.empty()) {
-            co_return error_code{};  // buffered by the codec; nothing to send yet
+            co_return error_code{}; // buffered by the codec; nothing to send yet
         }
         co_return co_await m_inner->send_chunk(std::move(out));
     }
@@ -161,9 +158,7 @@ class CompressingResponseWriter final : public ResponseWriter {
     // Re-enter the connection's executor before touching any state here, so the
     // decorator keeps the same "safe to write from any thread" promise the inner
     // writer makes by hopping itself.
-    asio::awaitable<void> hop() {
-        co_await asio::dispatch(asio::bind_executor(m_executor, asio::use_awaitable));
-    }
+    asio::awaitable<void> hop() { co_await asio::dispatch(asio::bind_executor(m_executor, asio::use_awaitable)); }
 
     bool is_http1() const {
         const Version v = m_inner->version();
@@ -171,15 +166,16 @@ class CompressingResponseWriter final : public ResponseWriter {
     }
 
     // Everything that can be decided without looking at the body.
-    bool eligible(int status, const Headers& headers) const {
+    bool eligible(int status, const Headers &headers) const {
         if (m_head_request) {
-            return false;  // headers only: the body never exists
+            return false; // headers only: the body never exists
         }
         if (status == 204 || status == 304 || status == 206) {
-            return false;  // no body, or a byte range that must stay addressable
+            return false; // no body, or a byte range that must stay addressable
         }
         if (headers.contains("content-encoding")) {
-            return false;  // already encoded (this is what passes a pre-compressed upstream through)
+            return false; // already encoded (this is what passes a pre-compressed
+                          // upstream through)
         }
         if (headers.contains("content-range")) {
             return false;
@@ -196,14 +192,14 @@ class CompressingResponseWriter final : public ResponseWriter {
     // HTTP/1.x computes the length itself (send()) or frames with chunked
     // (send_headers), so it must never see ours. HTTP/2 does neither, so a
     // one-shot response there needs the compressed length spelled out.
-    void apply_length(Headers& headers, std::size_t compressed_size, bool one_shot) const {
+    void apply_length(Headers &headers, std::size_t compressed_size, bool one_shot) const {
         headers.erase("content-length");
         if (one_shot && !is_http1()) {
             headers.add_lower("content-length", std::to_string(compressed_size));
         }
     }
 
-    void decorate(Headers& headers) const {
+    void decorate(Headers &headers) const {
         headers.erase("content-encoding");
         headers.add_lower("content-encoding", m_encoding);
         if (m_config.vary) {
@@ -217,7 +213,7 @@ class CompressingResponseWriter final : public ResponseWriter {
     // Adds Accept-Encoding to Vary, merging with whatever is already there: an
     // upstream may have sent `Vary: Origin`, and overwriting it would break its
     // caching. `Vary: *` already covers everything.
-    static void merge_vary(Headers& headers) {
+    static void merge_vary(Headers &headers) {
         auto existing = headers.get("vary");
         if (!existing) {
             headers.add_lower("vary", "Accept-Encoding");
@@ -235,7 +231,7 @@ class CompressingResponseWriter final : public ResponseWriter {
     // A compressed body is a different representation, so the strong validator
     // no longer identifies it. Demoting to weak keeps If-None-Match working
     // under the weaker comparison instead of answering with a wrong ETag.
-    static void weaken_etag(Headers& headers) {
+    static void weaken_etag(Headers &headers) {
         auto etag = headers.get("etag");
         if (!etag || etag->empty() || *etag == "*" || starts_with_ci(*etag, "W/")) {
             return;
@@ -251,7 +247,7 @@ class CompressingResponseWriter final : public ResponseWriter {
     // response of incompressible bytes can grow - which leaves the caller to
     // send it unchanged. `headers` must not be touched by the caller in that
     // case, so this only mutates them once the win is certain.
-    std::optional<std::string> encode_all(Headers& headers, std::string_view body) {
+    std::optional<std::string> encode_all(Headers &headers, std::string_view body) {
         auto encoder = make_encoder(m_encoding, m_config);
         if (!encoder) {
             return std::nullopt;
@@ -276,14 +272,13 @@ class CompressingResponseWriter final : public ResponseWriter {
     bool m_done{false};
 };
 
-// The engine-side entry point. Returns `inner` unchanged when compression is off,
-// no codec is compiled in, or the client accepts none of what we produce - in
-// which case not a single extra object is allocated.
+// The engine-side entry point. Returns `inner` unchanged when compression is
+// off, no codec is compiled in, or the client accepts none of what we produce -
+// in which case not a single extra object is allocated.
 inline std::shared_ptr<ResponseWriter> maybe_compress_writer(std::shared_ptr<ResponseWriter> inner,
                                                              asio::any_io_executor executor,
-                                                             const CompressionConfig& config,
-                                                             std::string_view accept_encoding,
-                                                             bool head_request) {
+                                                             const CompressionConfig &config,
+                                                             std::string_view accept_encoding, bool head_request) {
     auto encoding = negotiate_encoding(accept_encoding, config);
     if (!encoding) {
         return inner;
@@ -292,4 +287,4 @@ inline std::shared_ptr<ResponseWriter> maybe_compress_writer(std::shared_ptr<Res
                                                        std::move(*encoding), head_request);
 }
 
-}  // namespace simple_http
+} // namespace simple_http

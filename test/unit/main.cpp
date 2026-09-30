@@ -2,6 +2,4 @@
 // the test target does not depend on how the package's main target is named.
 #include <catch2/catch_session.hpp>
 
-int main(int argc, char** argv) {
-    return Catch::Session().run(argc, argv);
-}
+int main(int argc, char **argv) { return Catch::Session().run(argc, argv); }

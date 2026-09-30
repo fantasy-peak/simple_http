@@ -3,9 +3,10 @@
 // Dispatcher: the callback an engine invokes once a request is ready.
 //
 // It is the seam between the engine layer (which produces Request/Response) and
-// the handler layer (Router, which implements a Dispatcher). Defined here so the
-// engines depend only on this narrow type, not on the whole handler layer.
+// the handler layer (Router, which implements a Dispatcher). Defined here so
+// the engines depend only on this narrow type, not on the whole handler layer.
 
+#include <boost/asio/awaitable.hpp>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -13,19 +14,16 @@
 #include <string>
 #include <string_view>
 
-#include <boost/asio/awaitable.hpp>
-
 #include "../proto/request.h"
 #include "../proto/response.h"
 #include "../proto/websocket.h"
-#include "../transport/transport.h"  // SslHandle
+#include "../transport/transport.h" // SslHandle
 
 namespace simple_http {
 
 namespace asio = boost::asio;
 
-using Dispatcher =
-    std::function<asio::awaitable<void>(std::shared_ptr<Request>, std::shared_ptr<Response>, SslHandle)>;
+using Dispatcher = std::function<asio::awaitable<void>(std::shared_ptr<Request>, std::shared_ptr<Response>, SslHandle)>;
 
 // The WebSocket handler shape (mirrors handler layer's WsHandler).
 using WsHandlerFn = std::function<asio::awaitable<void>(std::shared_ptr<Request>, std::shared_ptr<WebSocket>)>;
@@ -60,9 +58,9 @@ using WsProxyLookup = std::function<std::optional<WsProxyTarget>(std::string_vie
 // A backend a plain HTTP request should be reverse-proxied to (request-level
 // proxy). Unlike WsProxyTarget this is per-request: for each matching request
 // the proxy takes an upstream connection to host:port (from the client layer's
-// pool), forwards the request (with the standard X-Forwarded-* headers added and
-// hop-by-hop headers stripped), then streams the backend's response back to the
-// client. rewrite_path works like WsProxyTarget's: a substitution template
+// pool), forwards the request (with the standard X-Forwarded-* headers added
+// and hop-by-hop headers stripped), then streams the backend's response back to
+// the client. rewrite_path works like WsProxyTarget's: a substitution template
 // ($0/$1..$9/$$) for regex routes, or a verbatim replacement for exact routes;
 // empty keeps the original target.
 struct HttpProxyTarget {
@@ -84,4 +82,4 @@ struct HttpProxyTarget {
 // one (nginx order).
 using HttpProxyLookup = std::function<std::optional<HttpProxyTarget>(std::string_view path)>;
 
-}  // namespace simple_http
+} // namespace simple_http

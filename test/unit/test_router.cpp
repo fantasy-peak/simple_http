@@ -2,12 +2,11 @@
 // their $1-style rewrite expansion) and dispatch.
 
 #include <catch2/catch_test_macros.hpp>
-
 #include <memory>
 #include <string>
 
-#include "simple_http.h"
 #include "../static_fixture.h"
+#include "simple_http.h"
 #include "test_support.h"
 
 using namespace simple_http;
@@ -15,7 +14,7 @@ using namespace simple_http::test;
 
 namespace {
 
-RequestPtr make_request(asio::io_context& ctx, std::string path, Method method = Method::Get) {
+RequestPtr make_request(asio::io_context &ctx, std::string path, Method method = Method::Get) {
     auto req = std::make_shared<Request>(Version::Http11, ctx.get_executor(), asio::ip::tcp::endpoint{});
     req->set_target(std::move(path));
     req->set_method(method);
@@ -25,14 +24,15 @@ RequestPtr make_request(asio::io_context& ctx, std::string path, Method method =
     return req;
 }
 
-// A handler that answers with a fixed body, so dispatch's routing is observable.
+// A handler that answers with a fixed body, so dispatch's routing is
+// observable.
 Handler body_handler(std::string body) {
     return make_handler([body = std::move(body)](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
         co_await res->status(200).send(body);
     });
 }
 
-}  // namespace
+} // namespace
 
 TEST_CASE("router: exact, regex and fallback matching", "[router]") {
     Router router;
@@ -41,7 +41,7 @@ TEST_CASE("router: exact, regex and fallback matching", "[router]") {
     router.fallback(body_handler("fallback"));
 
     asio::io_context ctx;
-    auto dispatch = [&](const std::string& path) {
+    auto dispatch = [&](const std::string &path) {
         auto writer = std::make_shared<FakeResponseWriter>();
         auto req = make_request(ctx, path);
         auto res = std::make_shared<Response>(writer);
@@ -76,7 +76,7 @@ TEST_CASE("router: before filters short-circuit and see the request", "[router]"
         before_called = true;
         if (req->path() == "/blocked") {
             co_await res->status(403).send("denied");
-            co_return false;  // handled here; the route must not run
+            co_return false; // handled here; the route must not run
         }
         co_return true;
     });
@@ -113,7 +113,7 @@ TEST_CASE("router: reverse-proxy routes are found and rewritten", "[router]") {
     HttpProxyTarget templated;
     templated.host = "10.0.0.9";
     templated.port = 9090;
-    templated.rewrite_path = "/v2/$1/$2/$$/$9";  // $0 whole match, $1..$9 groups, $$ a literal '$'
+    templated.rewrite_path = "/v2/$1/$2/$$/$9"; // $0 whole match, $1..$9 groups, $$ a literal '$'
     router.http_proxy_regex(R"(/api/(\w+)/(\d+))", templated);
 
     {
@@ -132,7 +132,7 @@ TEST_CASE("router: reverse-proxy routes are found and rewritten", "[router]") {
         // $9 is past the last group: expanded to nothing, and $$ is a literal '$'.
         CHECK(found->target.rewrite_path == "/v2/users/42/$/");
     }
-    CHECK_FALSE(router.find_http_proxy("/api/users").has_value());  // the regex needs both groups
+    CHECK_FALSE(router.find_http_proxy("/api/users").has_value()); // the regex needs both groups
     CHECK_FALSE(router.find_http_proxy("/other").has_value());
 
     // Nginx-style precedence: a local exact route wins over a proxy route for
@@ -157,7 +157,7 @@ TEST_CASE("router: reverse-proxy routes are found and rewritten", "[router]") {
         REQUIRE(run_on(ctx, dead_backend.dispatch(req, res, std::nullopt), std::chrono::seconds(2)));
         CHECK(writer->last_status == 502);
         CHECK(writer->last_body == "Bad Gateway");
-        CHECK_FALSE(capture.records.empty());  // the failed upstream is logged
+        CHECK_FALSE(capture.records.empty()); // the failed upstream is logged
     }
     {
         // Local exact route registered alongside the same-path proxy: the local
@@ -172,7 +172,7 @@ TEST_CASE("router: reverse-proxy routes are found and rewritten", "[router]") {
         REQUIRE(run_on(ctx, both.dispatch(req, res, std::nullopt), std::chrono::seconds(2)));
         CHECK(writer->last_status == 200);
         CHECK(writer->last_body == "local");
-        CHECK(capture.records.empty());  // the proxy was never consulted
+        CHECK(capture.records.empty()); // the proxy was never consulted
     }
 }
 
@@ -205,7 +205,8 @@ TEST_CASE("router: websocket proxy routes and their rewrite", "[router]") {
 TEST_CASE("router: invalid regexes are dropped, not thrown", "[router]") {
     ScopedLog capture;
     Router router;
-    router.route_regex({Method::Get}, "(/broken", body_handler("never"));  // unbalanced group
+    router.route_regex({Method::Get}, "(/broken",
+                       body_handler("never")); // unbalanced group
     router.http_proxy_regex("([", HttpProxyTarget{});
 
     CHECK_FALSE(router.find_http_proxy("/broken").has_value());
@@ -213,14 +214,16 @@ TEST_CASE("router: invalid regexes are dropped, not thrown", "[router]") {
     auto writer = std::make_shared<FakeResponseWriter>();
     auto req = make_request(ctx, "/broken");
     auto res = std::make_shared<Response>(writer);
-    REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));  // no route: the built-in 404
+    REQUIRE(run_on(ctx, router.dispatch(req, res,
+                                        std::nullopt))); // no route: the built-in 404
     CHECK(writer->last_status == 404);
 }
 
 TEST_CASE("router: a registered handler is found by path, first registration wins", "[router]") {
     Router router;
     router.route({Method::Get}, "/dup", body_handler("first"));
-    router.route({Method::Get}, "/dup", body_handler("second"));  // emplace keeps the first
+    router.route({Method::Get}, "/dup",
+                 body_handler("second")); // emplace keeps the first
 
     asio::io_context ctx;
     auto writer = std::make_shared<FakeResponseWriter>();
@@ -256,7 +259,7 @@ TEST_CASE("router: the static stage sits between the routes and the fallback", "
     router.fallback(body_handler("from the fallback"));
 
     asio::io_context ctx;
-    auto dispatch = [&](const std::string& path) {
+    auto dispatch = [&](const std::string &path) {
         auto writer = std::make_shared<FakeResponseWriter>();
         auto req = make_request(ctx, path);
         auto res = std::make_shared<Response>(writer);
@@ -300,18 +303,18 @@ TEST_CASE("router: a declining static stage cannot leave a request unanswered", 
     auto res = std::make_shared<Response>(writer);
     REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
 
-    CHECK(writer->last_status == 404);  // written by the router, not left hanging
+    CHECK(writer->last_status == 404); // written by the router, not left hanging
 }
 
 TEST_CASE("router: registering a disabled site is a no-op, not a silent 404 machine", "[router]") {
-    StaticFilesConfig cfg;  // empty root: disabled
+    StaticFilesConfig cfg; // empty root: disabled
     auto site = std::make_shared<StaticFiles>(std::move(cfg));
     std::string error;
     REQUIRE(site->load(error));
     REQUIRE_FALSE(site->enabled());
 
     Router router;
-    router.static_files(site);  // ignored
+    router.static_files(site); // ignored
     router.route({Method::Get}, "/", body_handler("route still works"));
 
     asio::io_context ctx;
@@ -326,7 +329,7 @@ TEST_CASE("router: registering a disabled site is a no-op, not a silent 404 mach
 // --- method-aware routing ----------------------------------------------------
 
 // Dispatches one request on its own router state and returns the writer.
-auto method_dispatch = [](Router& router, asio::io_context& ctx, const std::string& path, Method m) {
+auto method_dispatch = [](Router &router, asio::io_context &ctx, const std::string &path, Method m) {
     auto writer = std::make_shared<FakeResponseWriter>();
     auto req = make_request(ctx, path, m);
     auto res = std::make_shared<Response>(writer);
@@ -357,7 +360,8 @@ TEST_CASE("router: methods are part of the route; a mismatch is a 405 with Allow
     }
     // An extension method token lands on the same 405 path.
     CHECK(method_dispatch(router, ctx, "/postonly", Method::Unknown)->last_status == status::method_not_allowed);
-    // A path nothing services is a 404, not a 405 (resolved first, rejected second).
+    // A path nothing services is a 404, not a 405 (resolved first, rejected
+    // second).
     CHECK(method_dispatch(router, ctx, "/nothing", Method::Get)->last_status == status::not_found);
 }
 
@@ -378,16 +382,19 @@ TEST_CASE("router: GET implies HEAD, auto-OPTIONS answers Allow", "[router]") {
     }
 }
 
-TEST_CASE("router: an any-method route serves every method, extension tokens included", "[router]") {
+TEST_CASE("router: an any-method route serves every method, extension tokens "
+          "included",
+          "[router]") {
     Router router;
     router.route(any_methods, "/open", body_handler("open"));
 
     asio::io_context ctx;
     CHECK(method_dispatch(router, ctx, "/open", Method::Get)->last_body == "open");
     CHECK(method_dispatch(router, ctx, "/open", Method::Post)->last_body == "open");
-    // OPTIONS reaches the handler; it is not auto-answered for an any-method route.
+    // OPTIONS reaches the handler; it is not auto-answered for an any-method
+    // route.
     CHECK(method_dispatch(router, ctx, "/open", Method::Options)->last_body == "open");
-    CHECK(method_dispatch(router, ctx, "/open", Method::Unknown)->last_body == "open");  // e.g. PROPFIND
+    CHECK(method_dispatch(router, ctx, "/open", Method::Unknown)->last_body == "open"); // e.g. PROPFIND
 }
 
 TEST_CASE("router: methods may come from a runtime container (config file case)", "[router]") {

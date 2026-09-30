@@ -12,14 +12,13 @@
 // concrete socket type leaks into the detection logic.
 
 #include <array>
+#include <boost/asio.hpp>
 #include <chrono>
 #include <cstddef>
 #include <memory>
 #include <span>
 #include <string>
 #include <string_view>
-
-#include <boost/asio.hpp>
 
 #include "../core/limits.h"
 #include "../engine/dispatcher.h"
@@ -38,25 +37,26 @@ inline constexpr std::string_view h2_preface_prefix = "PRI * HTTP/2.0";
 //
 // Both is the sniffing default; the two single-protocol values exist because
 // sniffing cannot answer a peer that opens with neither. A malformed HTTP/2
-// preface and an HTTP/1.x request line are the same bytes until you have decided
-// which protocol you are speaking, so one of the two readings is always wrong —
-// and the two conformance suites want opposite ones.
+// preface and an HTTP/1.x request line are the same bytes until you have
+// decided which protocol you are speaking, so one of the two readings is always
+// wrong — and the two conformance suites want opposite ones.
 enum class PlaintextProtocols {
-    Http1,  // parse every connection as HTTP/1.x
-    Http2,  // require the HTTP/2 connection preface on every connection
-    Both,   // sniff (the default)
+    Http1, // parse every connection as HTTP/1.x
+    Http2, // require the HTTP/2 connection preface on every connection
+    Both,  // sniff (the default)
 };
 
 // Serve a plaintext transport: detect prior-knowledge h2, else HTTP/1.x.
 //
-// HTTP/2 prior knowledge is recognised by the start of the client preface, so we
-// read exactly that many bytes and compare. Reading exactly (rather than once)
-// matters: a single async_read_some may return fewer bytes - a TCP segment can
-// split the preface - and a partial match must not be read as "not h2". A
-// well-formed HTTP/1.x request line is longer than the prefix, so this never
-// delays HTTP/1.x handling. The read is bounded by the idle timeout, otherwise a
-// client that sends a few bytes and stalls would hold the connection open (the
-// engines' own watchdogs only start once a protocol has been chosen).
+// HTTP/2 prior knowledge is recognised by the start of the client preface, so
+// we read exactly that many bytes and compare. Reading exactly (rather than
+// once) matters: a single async_read_some may return fewer bytes - a TCP
+// segment can split the preface - and a partial match must not be read as "not
+// h2". A well-formed HTTP/1.x request line is longer than the prefix, so this
+// never delays HTTP/1.x handling. The read is bounded by the idle timeout,
+// otherwise a client that sends a few bytes and stalls would hold the
+// connection open (the engines' own watchdogs only start once a protocol has
+// been chosen).
 template <typename Transport>
 inline asio::awaitable<void> serve_plaintext(std::shared_ptr<Transport> transport, Dispatcher dispatch,
                                              WsLookup ws_lookup = {}, EngineLimits limits = {},
@@ -76,8 +76,7 @@ inline asio::awaitable<void> serve_plaintext(std::shared_ptr<Transport> transpor
     }
     if (protocols == PlaintextProtocols::Http1) {
         Http1Engine<Transport> engine{transport, limits};
-        co_await engine.run(dispatch, {}, std::move(ws_lookup), std::move(ws_proxy_lookup),
-                            std::move(ws_regex_lookup));
+        co_await engine.run(dispatch, {}, std::move(ws_lookup), std::move(ws_proxy_lookup), std::move(ws_regex_lookup));
         co_return;
     }
 
@@ -88,7 +87,7 @@ inline asio::awaitable<void> serve_plaintext(std::shared_ptr<Transport> transpor
         auto [ec, got] = co_await transport->async_read(std::span<std::byte>{head});
         n = got;
         if (ec && got == 0) {
-            co_return;  // EOF/error before a single byte: nothing to classify
+            co_return; // EOF/error before a single byte: nothing to classify
         }
         co_return;
     };
@@ -113,7 +112,7 @@ inline asio::awaitable<void> serve_plaintext(std::shared_ptr<Transport> transpor
         co_return;
     }
 
-    std::string_view header{reinterpret_cast<const char*>(head.data()), n};
+    std::string_view header{reinterpret_cast<const char *>(head.data()), n};
     if (n == h2_preface_prefix.size() && header == h2_preface_prefix) {
         // HTTP/2 prior-knowledge: replay the consumed prefix into the engine, which
         // reads the rest of the 24-octet preface itself (RFC 7540 §3.5). The
@@ -168,10 +167,9 @@ inline asio::awaitable<void> serve_tls(std::shared_ptr<TlsTransportT> transport,
         co_await engine->run(std::move(dispatch));
     } else {
         Http1Engine<TlsTransportT> engine{transport, limits};
-        co_await engine.run(dispatch, {}, std::move(ws_lookup), std::move(ws_proxy_lookup),
-                            std::move(ws_regex_lookup));
+        co_await engine.run(dispatch, {}, std::move(ws_lookup), std::move(ws_proxy_lookup), std::move(ws_regex_lookup));
     }
     co_return;
 }
 
-}  // namespace simple_http
+} // namespace simple_http

@@ -3,8 +3,8 @@
 // DecompressingClientStream: a ClientStream decorator that decodes the response
 // body when it arrives with a Content-Encoding this build can handle.
 //
-// Decoding happens in read(), not in the convenience layer, so every caller sees
-// the original bytes - and, usefully, so do the size caps: read_all()
+// Decoding happens in read(), not in the convenience layer, so every caller
+// sees the original bytes - and, usefully, so do the size caps: read_all()
 // (client_stream.h) and the aggregate in HttpClient::read_exchange both bound
 // what read() returns, which is now the *decoded* size. A compression bomb
 // cannot slip past them by being small on the wire.
@@ -14,14 +14,13 @@
 // longer describes what follows, so it goes too. The rewrite is published with
 // set_head() so the non-virtual head()/status()/read_head() report it.
 
+#include <boost/asio.hpp>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
-
-#include <boost/asio.hpp>
 
 #include "../core/content_encoding.h"
 #include "../core/types.h"
@@ -129,15 +128,15 @@ class DecompressingClientStream final : public ClientStream {
   private:
     std::shared_ptr<ClientStream> m_inner;
     std::unique_ptr<ContentDecoder> m_decoder;
-    std::string m_tail;         // decoded bytes still owed to the caller
-    bool m_inner_eof{false};    // the inner stream has reported end-of-body
+    std::string m_tail;      // decoded bytes still owed to the caller
+    bool m_inner_eof{false}; // the inner stream has reported end-of-body
 };
 
 // Joins the configured encodings, keeping only those this build can actually
 // decode: never advertise something we would then have to pass through raw.
-inline std::string accept_encoding_value(const std::vector<std::string>& wanted) {
+inline std::string accept_encoding_value(const std::vector<std::string> &wanted) {
     std::string out;
-    for (const std::string& encoding : wanted) {
+    for (const std::string &encoding : wanted) {
         if (!make_decoder(encoding)) {
             continue;
         }
@@ -159,4 +158,4 @@ inline std::shared_ptr<ClientStream> maybe_decompressing_stream(std::shared_ptr<
     return std::make_shared<DecompressingClientStream>(std::move(stream));
 }
 
-}  // namespace simple_http
+} // namespace simple_http

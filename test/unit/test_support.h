@@ -2,12 +2,13 @@
 
 // Shared test doubles and helpers for the unit tests.
 //
-// Everything here is in-memory: no sockets, no threads, and no global state left
-// behind. Coroutine-based APIs are driven through run()/run_on(), which pump a
-// private io_context with a deadline, so a hung coroutine fails a test instead of
-// hanging the suite.
+// Everything here is in-memory: no sockets, no threads, and no global state
+// left behind. Coroutine-based APIs are driven through run()/run_on(), which
+// pump a private io_context with a deadline, so a hung coroutine fails a test
+// instead of hanging the suite.
 
 #include <atomic>
+#include <boost/asio.hpp>
 #include <chrono>
 #include <cstring>
 #include <expected>
@@ -19,8 +20,6 @@
 #include <utility>
 #include <vector>
 
-#include <boost/asio.hpp>
-
 #include "simple_http.h"
 
 namespace simple_http::test {
@@ -29,22 +28,23 @@ namespace asio = boost::asio;
 
 // --- running awaitables ------------------------------------------------------
 
-// Runs an awaitable on `ctx`, giving up after `timeout`. Returns nullopt when it
-// did not finish in time (which a test asserts against, rather than hanging).
+// Runs an awaitable on `ctx`, giving up after `timeout`. Returns nullopt when
+// it did not finish in time (which a test asserts against, rather than
+// hanging).
 template <typename T>
-std::optional<T> run_on(asio::io_context& ctx,
-                        asio::awaitable<T> op,
+std::optional<T> run_on(asio::io_context &ctx, asio::awaitable<T> op,
                         std::chrono::milliseconds timeout = std::chrono::seconds(5)) {
     // A context that ran out of work is left stopped; each pump needs a restart
     // (so a test can await several coroutines on one context).
     ctx.restart();
     std::optional<T> result;
-    asio::co_spawn(ctx, std::move(op), [&result](const std::exception_ptr& ep, T value) {
+    asio::co_spawn(ctx, std::move(op), [&result](const std::exception_ptr &ep, T value) {
         try {
             if (ep)
                 std::rethrow_exception(ep);
-        } catch (const std::exception& e) {
-            std::fprintf(stderr, "run_on: coroutine threw: %s\n", e.what());  // visible in the report
+        } catch (const std::exception &e) {
+            std::fprintf(stderr, "run_on: coroutine threw: %s\n",
+                         e.what()); // visible in the report
             return;
         } catch (...) {
             std::fprintf(stderr, "run_on: coroutine threw an unknown exception\n");
@@ -57,16 +57,15 @@ std::optional<T> run_on(asio::io_context& ctx,
 }
 
 // Same, for a void awaitable: returns whether it completed.
-inline bool run_on(asio::io_context& ctx,
-                   asio::awaitable<void> op,
+inline bool run_on(asio::io_context &ctx, asio::awaitable<void> op,
                    std::chrono::milliseconds timeout = std::chrono::seconds(5)) {
     ctx.restart();
     bool done = false;
-    asio::co_spawn(ctx, std::move(op), [&done](const std::exception_ptr& ep) {
+    asio::co_spawn(ctx, std::move(op), [&done](const std::exception_ptr &ep) {
         try {
             if (ep)
                 std::rethrow_exception(ep);
-        } catch (const std::exception& e) {
+        } catch (const std::exception &e) {
             std::fprintf(stderr, "run_on: coroutine threw: %s\n", e.what());
             return;
         } catch (...) {
@@ -84,16 +83,15 @@ inline bool run_on(asio::io_context& ctx,
 // plain run_for would sit out the whole timeout). Returns as soon as the
 // coroutine finishes; the deadline bounds the wait.
 template <typename T>
-std::optional<T> run_until(asio::io_context& ctx,
-                           asio::awaitable<T> op,
+std::optional<T> run_until(asio::io_context &ctx, asio::awaitable<T> op,
                            std::chrono::milliseconds timeout = std::chrono::seconds(2)) {
     std::optional<T> result;
     bool finished = false;
-    asio::co_spawn(ctx, std::move(op), [&](const std::exception_ptr& ep, T value) {
+    asio::co_spawn(ctx, std::move(op), [&](const std::exception_ptr &ep, T value) {
         try {
             if (ep)
                 std::rethrow_exception(ep);
-        } catch (const std::exception& e) {
+        } catch (const std::exception &e) {
             std::fprintf(stderr, "run_until: coroutine threw: %s\n", e.what());
             finished = true;
             return;
@@ -109,15 +107,14 @@ std::optional<T> run_until(asio::io_context& ctx,
     return result;
 }
 
-inline bool run_until(asio::io_context& ctx,
-                      asio::awaitable<void> op,
+inline bool run_until(asio::io_context &ctx, asio::awaitable<void> op,
                       std::chrono::milliseconds timeout = std::chrono::seconds(2)) {
     bool finished = false;
-    asio::co_spawn(ctx, std::move(op), [&finished](const std::exception_ptr& ep) {
+    asio::co_spawn(ctx, std::move(op), [&finished](const std::exception_ptr &ep) {
         try {
             if (ep)
                 std::rethrow_exception(ep);
-        } catch (const std::exception& e) {
+        } catch (const std::exception &e) {
             std::fprintf(stderr, "run_until: coroutine threw: %s\n", e.what());
         }
         finished = true;
@@ -132,7 +129,7 @@ inline bool run_until(asio::io_context& ctx,
 
 // Pumps the context for a bounded slice, letting detached work (a write pump)
 // make progress without waiting on it to finish.
-inline void drain(asio::io_context& ctx, std::chrono::milliseconds slice = std::chrono::milliseconds(50)) {
+inline void drain(asio::io_context &ctx, std::chrono::milliseconds slice = std::chrono::milliseconds(50)) {
     ctx.restart();
     ctx.run_for(slice);
 }
@@ -149,44 +146,36 @@ inline bool run(asio::awaitable<void> op, std::chrono::milliseconds timeout = st
     return run_on(ctx, std::move(op), timeout);
 }
 
-// Turns an awaitable-producing lambda into a value (Catch2 macros cannot be used
-// inside a coroutine, so tests do their awaiting in `run(...)` and assert after).
+// Turns an awaitable-producing lambda into a value (Catch2 macros cannot be
+// used inside a coroutine, so tests do their awaiting in `run(...)` and assert
+// after).
 template <typename F>
 concept AwaitableFactory = requires(F f) { f(); };
 
 // --- a scripted byte stream --------------------------------------------------
 
-// Satisfies the transport concept with preloaded input and recorded output, so the
-// WebSocket backend (and anything else driven by a transport) can be tested
-// without a socket. Reads hand out the queued chunks in order and report EOF once
-// they run out; writes are appended to `written`.
+// Satisfies the transport concept with preloaded input and recorded output, so
+// the WebSocket backend (and anything else driven by a transport) can be tested
+// without a socket. Reads hand out the queued chunks in order and report EOF
+// once they run out; writes are appended to `written`.
 class MockTransport {
   public:
-    explicit MockTransport(asio::any_io_executor ex) : m_executor(std::move(ex)) {
-    }
+    explicit MockTransport(asio::any_io_executor ex) : m_executor(std::move(ex)) {}
 
     // Queues bytes for the next reads.
-    void push(std::string bytes) {
-        m_in.push_back(std::move(bytes));
-    }
+    void push(std::string bytes) { m_in.push_back(std::move(bytes)); }
 
     // Everything written so far, concatenated, and chunk by chunk.
-    const std::string& written() const {
-        return m_written;
-    }
+    const std::string &written() const { return m_written; }
 
-    const std::vector<std::string>& writes() const {
-        return m_writes;
-    }
+    const std::vector<std::string> &writes() const { return m_writes; }
 
-    bool closed() const {
-        return m_closed;
-    }
+    bool closed() const { return m_closed; }
 
     asio::awaitable<IoResult> async_read_some(ByteSpan buffer) {
         if (m_in.empty())
             co_return IoResult{make_error_code(asio::error::eof), 0};
-        std::string& front = m_in.front();
+        std::string &front = m_in.front();
         const std::size_t take = std::min(front.size(), buffer.size());
         std::memcpy(buffer.data(), front.data(), take);
         front.erase(0, take);
@@ -207,36 +196,28 @@ class MockTransport {
     }
 
     asio::awaitable<IoResult> async_write(ConstByteSpan buffer) {
-        m_writes.emplace_back(reinterpret_cast<const char*>(buffer.data()), buffer.size());
+        m_writes.emplace_back(reinterpret_cast<const char *>(buffer.data()), buffer.size());
         m_written.append(m_writes.back());
         co_return IoResult{error_code{}, buffer.size()};
     }
 
     asio::awaitable<IoResult> async_write_seq(std::span<const ConstByteSpan> buffers) {
         std::string chunk;
-        for (const auto& buffer : buffers) {
-            chunk.append(reinterpret_cast<const char*>(buffer.data()), buffer.size());
+        for (const auto &buffer : buffers) {
+            chunk.append(reinterpret_cast<const char *>(buffer.data()), buffer.size());
         }
         m_writes.push_back(chunk);
         m_written.append(chunk);
         co_return IoResult{error_code{}, chunk.size()};
     }
 
-    auto get_executor() {
-        return m_executor;
-    }
+    auto get_executor() { return m_executor; }
 
-    asio::ip::tcp::endpoint peer() const {
-        return {};
-    }
+    asio::ip::tcp::endpoint peer() const { return {}; }
 
-    SslHandle tls_handle() const {
-        return std::nullopt;
-    }
+    SslHandle tls_handle() const { return std::nullopt; }
 
-    void close() {
-        m_closed = true;
-    }
+    void close() { m_closed = true; }
 
   private:
     asio::any_io_executor m_executor;
@@ -248,8 +229,8 @@ class MockTransport {
 
 // --- a response writer that records instead of writing -----------------------
 
-// Implements the ResponseWriter seam so Response (and anything that replies) can
-// be exercised without a connection. Records the last call's arguments.
+// Implements the ResponseWriter seam so Response (and anything that replies)
+// can be exercised without a connection. Records the last call's arguments.
 class FakeResponseWriter : public ResponseWriter {
   public:
     asio::awaitable<error_code> send(int status, Headers headers, std::string body) override {
@@ -300,9 +281,7 @@ class FakeResponseWriter : public ResponseWriter {
         co_return;
     }
 
-    Version version() const override {
-        return ver;
-    }
+    Version version() const override { return ver; }
 
     // recorded state
     int calls{0};
@@ -317,9 +296,7 @@ class FakeResponseWriter : public ResponseWriter {
     bool open{true};
     Version ver{Version::Http11};
 
-    bool has_header(std::string_view name) const {
-        return last_headers.contains(name);
-    }
+    bool has_header(std::string_view name) const { return last_headers.contains(name); }
 
     std::string header(std::string_view name) const {
         auto value = last_headers.get(name);
@@ -327,10 +304,11 @@ class FakeResponseWriter : public ResponseWriter {
     }
 };
 
-// --- the library's log sink ---------------------------------------------------
+// --- the library's log sink
+// ---------------------------------------------------
 
-// The installed sink is process-wide; swap it for the duration of a scope and put
-// it back, so one test's capture cannot leak into another. `minimum` is the
+// The installed sink is process-wide; swap it for the duration of a scope and
+// put it back, so one test's capture cannot leak into another. `minimum` is the
 // threshold the capture reports through LogSink::enabled, which is how a test
 // exercises level filtering now that the sink owns that decision.
 class ScopedLog {
@@ -342,8 +320,8 @@ class ScopedLog {
 
     ~ScopedLog() { set_log_sink(std::move(m_previous)); }
 
-    ScopedLog(const ScopedLog&) = delete;
-    ScopedLog& operator=(const ScopedLog&) = delete;
+    ScopedLog(const ScopedLog &) = delete;
+    ScopedLog &operator=(const ScopedLog &) = delete;
 
     struct Record {
         LogLevel level;
@@ -359,19 +337,19 @@ class ScopedLog {
     // strings for the duration of the call.
     class Capture final : public LogSink {
       public:
-        explicit Capture(ScopedLog* owner) : m_owner(owner) {}
+        explicit Capture(ScopedLog *owner) : m_owner(owner) {}
 
         bool enabled(LogLevel level) const noexcept override {
             return static_cast<int>(level) >= static_cast<int>(m_owner->m_minimum);
         }
 
-        void log(const LogRecord& record) override {
+        void log(const LogRecord &record) override {
             m_owner->records.push_back(Record{record.level, std::string{record.where.file_name()},
                                               static_cast<int>(record.where.line()), std::string{record.message}});
         }
 
       private:
-        ScopedLog* m_owner;
+        ScopedLog *m_owner;
     };
 
     LogLevel m_minimum;
@@ -380,11 +358,9 @@ class ScopedLog {
 
 // --- WebSocket frame helpers -------------------------------------------------
 
-// A client-frame header (masked, FIN set) followed by the masked payload: what a
-// browser sends, so the server-side parser sees real traffic.
-inline std::string ws_client_frame(WsOpcode opcode,
-                                   std::string_view payload,
-                                   bool fin = true,
+// A client-frame header (masked, FIN set) followed by the masked payload: what
+// a browser sends, so the server-side parser sees real traffic.
+inline std::string ws_client_frame(WsOpcode opcode, std::string_view payload, bool fin = true,
                                    const unsigned char (&mask)[4] = {0x37, 0xfa, 0x21, 0x3d}) {
     std::string out;
     out.push_back(static_cast<char>((fin ? 0x80 : 0x00) | static_cast<unsigned char>(opcode)));
@@ -400,11 +376,11 @@ inline std::string ws_client_frame(WsOpcode opcode,
             out.push_back(static_cast<char>((payload.size() >> shift) & 0xFF));
         }
     }
-    out.append(reinterpret_cast<const char*>(mask), 4);
+    out.append(reinterpret_cast<const char *>(mask), 4);
     std::string masked{payload};
     ws_unmask(masked.data(), masked.size(), mask);
     out.append(masked);
     return out;
 }
 
-}  // namespace simple_http::test
+} // namespace simple_http::test

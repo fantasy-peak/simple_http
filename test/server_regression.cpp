@@ -1,30 +1,28 @@
 // Server regression suite: the bytes a well-behaved client will not send.
 //
 // Every case here drives an in-process server over a raw TCP socket — malformed
-// request lines, framing conflicts, oversized heads and bodies, HTTP/2 frames in
-// the wrong state, WebSocket protocol violations — and asserts what comes back.
-// The library's own client is deliberately well-behaved, so it cannot produce
-// these; a socket can.
+// request lines, framing conflicts, oversized heads and bodies, HTTP/2 frames
+// in the wrong state, WebSocket protocol violations — and asserts what comes
+// back. The library's own client is deliberately well-behaved, so it cannot
+// produce these; a socket can.
 //
 //   xmake build regression && xmake run regression
 
-#include <catch2/catch_test_macros.hpp>
-
 #include <array>
+#include <boost/asio.hpp>
+#include <catch2/catch_test_macros.hpp>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <memory>
-#include <stdexcept>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
-
-#include <boost/asio.hpp>
 
 #include "simple_http.h"
 
@@ -58,13 +56,13 @@ sh::ServerConfig make_config(std::uint16_t port, std::optional<sh::TlsConfig> tl
 // too: built once, alive for the whole binary. The tree is small and fixed so
 // every case can state its expectation in bytes rather than in derivations.
 
-const std::filesystem::path& static_root() {
+const std::filesystem::path &static_root() {
     static const std::filesystem::path root = [] {
         const auto dir = std::filesystem::temp_directory_path() / "simple_http_regression_static";
         std::error_code ec;
         std::filesystem::remove_all(dir, ec);
         std::filesystem::create_directories(dir);
-        auto write = [&](const char* rel, std::string_view body) {
+        auto write = [&](const char *rel, std::string_view body) {
             std::filesystem::create_directories(dir / std::filesystem::path{rel}.parent_path());
             std::ofstream out(dir / rel, std::ios::binary);
             out.write(body.data(), static_cast<std::streamsize>(body.size()));
@@ -94,7 +92,7 @@ std::shared_ptr<sh::StaticFiles> static_site() {
     return site;
 }
 
-void register_routes(sh::Server& server) {
+void register_routes(sh::Server &server) {
     // Registered first but consulted last among the routes: the static stage sits
     // between the regex routes and the fallback, so every route below still wins.
     server.static_files(static_site());
@@ -146,10 +144,9 @@ void register_routes(sh::Server& server) {
                  [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
                      co_await res->status(200).send("postonly");
                  });
-    server.route({sh::Method::Put, sh::Method::Delete}, "/method/multi",
-                 [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
-                     co_await res->status(200).send("multi");
-                 });
+    server.route(
+        {sh::Method::Put, sh::Method::Delete}, "/method/multi",
+        [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> { co_await res->status(200).send("multi"); });
     server.ws_route("/chat", [](sh::RequestPtr, std::shared_ptr<sh::WebSocket> ws) -> asio::awaitable<void> {
         for (;;) {
             auto message = co_await ws->read();
@@ -166,9 +163,9 @@ void register_routes(sh::Server& server) {
 }
 
 // One plaintext and one mutual-TLS listener, started once for the whole suite.
-// Server is neither copyable nor movable, so it lives behind a unique_ptr (whose
-// destructor stops it at exit).
-sh::Server& plain_server() {
+// Server is neither copyable nor movable, so it lives behind a unique_ptr
+// (whose destructor stops it at exit).
+sh::Server &plain_server() {
     static std::unique_ptr<sh::Server> server = [] {
         auto s = std::make_unique<sh::Server>(make_config(kPlainPort, std::nullopt));
         register_routes(*s);
@@ -178,7 +175,7 @@ sh::Server& plain_server() {
     return *server;
 }
 
-sh::Server& tls_server() {
+sh::Server &tls_server() {
     static std::unique_ptr<sh::Server> server = [] {
         sh::TlsConfig tls;
         tls.cert_chain_file = "./test/tls_certificates/server_cert.pem";
@@ -195,24 +192,23 @@ sh::Server& tls_server() {
 
 // --- a raw peer --------------------------------------------------------------
 
-// A TCP peer that sends exactly the bytes it is given and accumulates everything
-// it receives, with the test pumping the shared io_context. Reads run as one
-// detached coroutine per client (like the server's own engines do).
+// A TCP peer that sends exactly the bytes it is given and accumulates
+// everything it receives, with the test pumping the shared io_context. Reads
+// run as one detached coroutine per client (like the server's own engines do).
 class RawClient {
   public:
-    // The read coroutine outlives the RawClient itself (a test may drop the client
-    // while a read is pending), so everything it touches lives in a shared state.
+    // The read coroutine outlives the RawClient itself (a test may drop the
+    // client while a read is pending), so everything it touches lives in a shared
+    // state.
     struct State {
-        explicit State(asio::io_context& ctx) : socket(std::make_shared<asio::ip::tcp::socket>(ctx)) {
-        }
+        explicit State(asio::io_context &ctx) : socket(std::make_shared<asio::ip::tcp::socket>(ctx)) {}
 
         std::shared_ptr<asio::ip::tcp::socket> socket;
         std::string received;
         bool eof{false};
     };
 
-    explicit RawClient(asio::io_context& ctx) : m_state(std::make_shared<State>(ctx)), m_ctx(ctx) {
-    }
+    explicit RawClient(asio::io_context &ctx) : m_state(std::make_shared<State>(ctx)), m_ctx(ctx) {}
 
     bool connect(std::uint16_t port) {
         sh::error_code ec;
@@ -229,8 +225,7 @@ class RawClient {
     }
 
     // Runs the context until `done()` holds or the budget runs out.
-    template <typename Pred>
-    bool pump_until(Pred done, std::chrono::milliseconds timeout) {
+    template <typename Pred> bool pump_until(Pred done, std::chrono::milliseconds timeout) {
         const auto deadline = std::chrono::steady_clock::now() + timeout;
         while (!done() && std::chrono::steady_clock::now() < deadline) {
             m_ctx.restart();
@@ -256,13 +251,9 @@ class RawClient {
         m_ctx.run_for(slice);
     }
 
-    const std::string& received() const {
-        return m_state->received;
-    }
+    const std::string &received() const { return m_state->received; }
 
-    bool eof() const {
-        return m_state->eof;
-    }
+    bool eof() const { return m_state->eof; }
 
     void close() {
         sh::error_code ec;
@@ -284,14 +275,14 @@ class RawClient {
                         state->eof = true;
                         co_return;
                     }
-                    state->received.append(reinterpret_cast<const char*>(buf.data()), n);
+                    state->received.append(reinterpret_cast<const char *>(buf.data()), n);
                 }
             },
             asio::detached);
     }
 
     std::shared_ptr<State> m_state;
-    asio::io_context& m_ctx;
+    asio::io_context &m_ctx;
 };
 
 // --- small HTTP/1.x assertions ----------------------------------------------
@@ -310,7 +301,7 @@ bool head_has(std::string_view response, std::string_view field) {
     const std::string_view head = response.substr(0, head_end);
     auto lowered = [](std::string_view in) {
         std::string out{in};
-        for (auto& c : out)
+        for (auto &c : out)
             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         return out;
     };
@@ -324,7 +315,7 @@ std::optional<std::string> head_value(std::string_view response, std::string_vie
     const std::string_view head = response.substr(0, head_end);
     auto lowered = [](std::string_view in) {
         std::string out{in};
-        for (auto& c : out)
+        for (auto &c : out)
             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         return out;
     };
@@ -332,7 +323,8 @@ std::optional<std::string> head_value(std::string_view response, std::string_vie
     std::size_t pos = 0;
     while (pos < head.size()) {
         auto eol = head.find("\r\n", pos);
-        if (eol == std::string_view::npos) eol = head.size();
+        if (eol == std::string_view::npos)
+            eol = head.size();
         const std::string_view line = head.substr(pos, eol - pos);
         const auto colon = line.find(':');
         if (colon != std::string_view::npos && lowered(line.substr(0, colon)) == wanted) {
@@ -354,9 +346,7 @@ std::string_view after_head(std::string_view response) {
     return response.substr(head_end + 4);
 }
 
-std::string body_of(std::string_view response) {
-    return std::string{after_head(response)};
-}
+std::string body_of(std::string_view response) { return std::string{after_head(response)}; }
 
 // For diagnostics: what actually arrived, with the unprintable bytes escaped.
 std::string printable(std::string_view bytes) {
@@ -375,20 +365,16 @@ std::string printable(std::string_view bytes) {
 
 // --- small HTTP/2 helpers ----------------------------------------------------
 
-std::string h2_frame(sh::codec::H2FrameType type,
-                     std::uint8_t flags,
-                     std::uint32_t stream_id,
+std::string h2_frame(sh::codec::H2FrameType type, std::uint8_t flags, std::uint32_t stream_id,
                      std::string_view payload) {
     std::string out;
-    sh::codec::serialize_frame_header(
-        out, static_cast<std::uint32_t>(payload.size()), static_cast<std::uint8_t>(type), flags, stream_id);
+    sh::codec::serialize_frame_header(out, static_cast<std::uint32_t>(payload.size()), static_cast<std::uint8_t>(type),
+                                      flags, stream_id);
     out.append(payload);
     return out;
 }
 
-std::string h2_request_headers(std::string_view method,
-                               std::string_view path,
-                               std::uint32_t stream_id = 1,
+std::string h2_request_headers(std::string_view method, std::string_view path, std::uint32_t stream_id = 1,
                                bool end_stream = true) {
     std::string block;
     sh::codec::hpack_append_literal(block, ":method", method);
@@ -422,8 +408,8 @@ std::vector<H2Frame> parse_frames(std::string_view bytes) {
     return frames;
 }
 
-std::optional<H2Frame> find_frame(const std::vector<H2Frame>& frames, sh::codec::H2FrameType type) {
-    for (const auto& frame : frames) {
+std::optional<H2Frame> find_frame(const std::vector<H2Frame> &frames, sh::codec::H2FrameType type) {
+    for (const auto &frame : frames) {
         if (frame.header.type == static_cast<std::uint8_t>(type))
             return frame;
     }
@@ -439,8 +425,8 @@ std::vector<sh::codec::HpackHeader> decode_headers(std::string_view block) {
     return fields;
 }
 
-std::string header_value(const std::vector<sh::codec::HpackHeader>& fields, std::string_view name) {
-    for (const auto& field : fields) {
+std::string header_value(const std::vector<sh::codec::HpackHeader> &fields, std::string_view name) {
+    for (const auto &field : fields) {
         if (field.name == name)
             return field.value;
     }
@@ -453,7 +439,7 @@ std::string h2_preface_and_settings() {
     return out;
 }
 
-}  // namespace
+} // namespace
 
 // --- HTTP/1.x ----------------------------------------------------------------
 
@@ -461,21 +447,21 @@ TEST_CASE("regression/h1: malformed request heads are rejected with 400", "[regr
     plain_server();
     asio::io_context ctx;
 
-    const std::array<std::pair<std::string_view, const char*>, 4> cases = {{
+    const std::array<std::pair<std::string_view, const char *>, 4> cases = {{
         {"GET/ HTTP/1.1\r\nHost: x\r\n\r\n", "no space after the method"},
         {"GET / HTTP/2.0\r\n\r\n", "an unknown version"},
         {"GET / HTTP/1.1\r\nHost: x\r\nBroken\r\n\r\n", "a header line without a colon"},
         {"GET / HTTP/1.1\r\nHost: x\r\n folded\r\n\r\n", "an obs-fold continuation"},
     }};
 
-    for (const auto& [request, what] : cases) {
+    for (const auto &[request, what] : cases) {
         RawClient client{ctx};
         REQUIRE(client.connect(kPlainPort));
         client.send(request);
         REQUIRE(client.wait_head());
         INFO("case: " << what);
         CHECK(status_of(client.received()) == 400);
-        CHECK(client.wait_eof());  // a malformed request closes the connection
+        CHECK(client.wait_eof()); // a malformed request closes the connection
         client.close();
     }
 }
@@ -520,9 +506,9 @@ TEST_CASE("regression/h1: Content-Length with Transfer-Encoding frames as chunke
     // RFC 9112 §6.3: when both are present, Transfer-Encoding wins (and the
     // Content-Length must not be believed — otherwise a smuggled message slips
     // past a front-end that framed it differently).
-    client.send(
-        "POST /echo HTTP/1.1\r\nHost: x\r\ncontent-length: 5\r\ntransfer-encoding: chunked\r\n\r\n"
-        "4\r\nabcd\r\n0\r\n\r\n");
+    client.send("POST /echo HTTP/1.1\r\nHost: x\r\ncontent-length: "
+                "5\r\ntransfer-encoding: chunked\r\n\r\n"
+                "4\r\nabcd\r\n0\r\n\r\n");
     REQUIRE(client.wait_for("len="));
     CHECK(status_of(client.received()) == 200);
     CHECK(body_of(client.received()) == "len=4:abcd");
@@ -537,7 +523,8 @@ TEST_CASE("regression/h1: a malformed chunk size is answered then dropped", "[re
 
     // The handler is dispatched as soon as the head is parsed, so it answers
     // 200; the broken body then ends the connection instead of hanging.
-    client.send("POST /echo HTTP/1.1\r\nHost: x\r\ntransfer-encoding: chunked\r\n\r\nzz\r\nbody\r\n0\r\n\r\n");
+    client.send("POST /echo HTTP/1.1\r\nHost: x\r\ntransfer-encoding: "
+                "chunked\r\n\r\nzz\r\nbody\r\n0\r\n\r\n");
     REQUIRE(client.wait_head());
     CHECK(client.wait_eof());
     client.close();
@@ -549,9 +536,8 @@ TEST_CASE("regression/h1: chunked trailers are consumed", "[regression][h1]") {
     RawClient client{ctx};
     REQUIRE(client.connect(kPlainPort));
 
-    client.send(
-        "POST /echo HTTP/1.1\r\nHost: x\r\ntransfer-encoding: chunked\r\n\r\n"
-        "3\r\nabc\r\n0\r\nx-trailer: yes\r\n\r\n");
+    client.send("POST /echo HTTP/1.1\r\nHost: x\r\ntransfer-encoding: chunked\r\n\r\n"
+                "3\r\nabc\r\n0\r\nx-trailer: yes\r\n\r\n");
     REQUIRE(client.wait_for("len="));
     CHECK(body_of(client.received()) == "len=3:abc");
     client.close();
@@ -563,18 +549,21 @@ TEST_CASE("regression/h1: pipelined requests are answered in order", "[regressio
     RawClient client{ctx};
     REQUIRE(client.connect(kPlainPort));
 
-    client.send(
-        "GET /echo HTTP/1.1\r\nHost: x\r\ncontent-length: 1\r\n\r\nA"  // a body exercies the pipelining boundary
-        "GET /world HTTP/1.1\r\nHost: x\r\n\r\n");
+    client.send("GET /echo HTTP/1.1\r\nHost: x\r\ncontent-length: 1\r\n\r\nA" // a body
+                                                                              // exercies
+                                                                              // the
+                                                                              // pipelining
+                                                                              // boundary
+                "GET /world HTTP/1.1\r\nHost: x\r\n\r\n");
     REQUIRE(client.pump_until(
         [&] {
-            const auto& r = client.received();
+            const auto &r = client.received();
             return r.find("len=1:A") != std::string::npos && r.find("hello") != std::string::npos;
         },
         std::chrono::seconds(5)));
 
-    const auto& received = client.received();
-    CHECK(received.find("len=1:A") < received.find("hello"));  // first request answered first
+    const auto &received = client.received();
+    CHECK(received.find("len=1:A") < received.find("hello")); // first request answered first
     client.close();
 }
 
@@ -587,9 +576,11 @@ TEST_CASE("regression/h1: HEAD and 204 carry no body", "[regression][h1]") {
         client.send("HEAD /big HTTP/1.1\r\nHost: x\r\n\r\n");
         REQUIRE(client.wait_head());
         CHECK(status_of(client.received()) == 200);
-        CHECK(head_has(client.received(), "content-length: 9000"));  // what a GET would produce…
-        CHECK(body_of(client.received()).empty());                   // …but no body follows the head
-        client.send("GET /world HTTP/1.1\r\nHost: x\r\n\r\n");                  // and the connection stays usable
+        CHECK(head_has(client.received(),
+                       "content-length: 9000"));               // what a GET would produce…
+        CHECK(body_of(client.received()).empty());             // …but no body follows the head
+        client.send("GET /world HTTP/1.1\r\nHost: x\r\n\r\n"); // and the connection
+                                                               // stays usable
         REQUIRE(client.wait_for("hello"));
         client.close();
     }
@@ -627,7 +618,8 @@ TEST_CASE("regression/h1: an idle connection is closed by the watchdog", "[regre
 
     client.send("GET /world HTTP/1.1\r\nHost: x\r\n\r\n");
     REQUIRE(client.wait_for("hello"));
-    // limits.idle_timeout is 2s in this suite: a silent connection must be reaped.
+    // limits.idle_timeout is 2s in this suite: a silent connection must be
+    // reaped.
     CHECK(client.wait_eof(std::chrono::seconds(6)));
     client.close();
 }
@@ -640,7 +632,8 @@ TEST_CASE("regression/h1: Expect: 100-continue is not answered by default", "[re
 
     // The engine does not send 100 Continue on its own (a handler may, via
     // send_continue()). A client that sends the body anyway must be served.
-    client.send("POST /echo HTTP/1.1\r\nHost: x\r\nexpect: 100-continue\r\ncontent-length: 2\r\n\r\n");
+    client.send("POST /echo HTTP/1.1\r\nHost: x\r\nexpect: "
+                "100-continue\r\ncontent-length: 2\r\n\r\n");
     client.pump(std::chrono::milliseconds(100));
     CHECK(client.received().find("100 Continue") == std::string::npos);
 
@@ -666,7 +659,7 @@ TEST_CASE("regression/h2: the preface, SETTINGS and a request", "[regression][h2
         [&] {
             const auto frames = parse_frames(client.received());
             bool acked = false;
-            for (const auto& frame : frames) {
+            for (const auto &frame : frames) {
                 if (frame.header.type == static_cast<std::uint8_t>(sh::codec::H2FrameType::Settings) &&
                     (frame.header.flags & sh::codec::H2_FLAG_ACK) != 0) {
                     acked = true;
@@ -678,7 +671,7 @@ TEST_CASE("regression/h2: the preface, SETTINGS and a request", "[regression][h2
 
     const auto frames = parse_frames(client.received());
     bool acked = false;
-    for (const auto& frame : frames) {
+    for (const auto &frame : frames) {
         if (frame.header.type == static_cast<std::uint8_t>(sh::codec::H2FrameType::Settings) &&
             (frame.header.flags & sh::codec::H2_FLAG_ACK) != 0) {
             acked = true;
@@ -710,7 +703,7 @@ TEST_CASE("regression/h2: PING is echoed", "[regression][h2]") {
     client.send(h2_frame(sh::codec::H2FrameType::Ping, 0, 0, payload));
     REQUIRE(client.pump_until(
         [&] {
-            for (const auto& frame : parse_frames(client.received())) {
+            for (const auto &frame : parse_frames(client.received())) {
                 if (frame.header.type == static_cast<std::uint8_t>(sh::codec::H2FrameType::Ping) &&
                     (frame.header.flags & sh::codec::H2_FLAG_ACK) != 0) {
                     return true;
@@ -722,7 +715,7 @@ TEST_CASE("regression/h2: PING is echoed", "[regression][h2]") {
 
     const auto ping = find_frame(parse_frames(client.received()), sh::codec::H2FrameType::Ping);
     REQUIRE(ping.has_value());
-    CHECK(ping->payload == payload);  // echoed verbatim
+    CHECK(ping->payload == payload); // echoed verbatim
     client.close();
 }
 
@@ -785,8 +778,8 @@ TEST_CASE("regression/h2: protocol violations end the connection with GOAWAY", "
         RawClient client{ctx};
         REQUIRE(client.connect(kPlainPort));
         client.send(h2_preface_and_settings());
-        client.send(h2_frame(
-            sh::codec::H2FrameType::Headers, sh::codec::H2_FLAG_END_HEADERS | sh::codec::H2_FLAG_END_STREAM, 1, block));
+        client.send(h2_frame(sh::codec::H2FrameType::Headers,
+                             sh::codec::H2_FLAG_END_HEADERS | sh::codec::H2_FLAG_END_STREAM, 1, block));
         client.pump_until(
             [&] {
                 return find_frame(parse_frames(client.received()), sh::codec::H2FrameType::RstStream).has_value() ||
@@ -794,7 +787,7 @@ TEST_CASE("regression/h2: protocol violations end the connection with GOAWAY", "
             },
             std::chrono::seconds(3));
         const auto reset = find_frame(parse_frames(client.received()), sh::codec::H2FrameType::RstStream);
-        REQUIRE(reset.has_value());  // stream error, not a connection error
+        REQUIRE(reset.has_value()); // stream error, not a connection error
         CHECK(sh::codec::read_u32(reset->payload, 0) == sh::codec::H2_PROTOCOL_ERROR);
     }
 }
@@ -809,8 +802,10 @@ TEST_CASE("regression/h2: an unconsumed body past the window is fatal", "[regres
     // /slow never reads the body, so nothing replenishes the window. The stream
     // and connection windows are both 65535 (SETTINGS_INITIAL_WINDOW_SIZE and the
     // protocol default), so a single flooded stream trips the connection limit:
-    // GOAWAY(FLOW_CONTROL_ERROR). A peer cannot enlarge our receive window for us.
-    client.send(h2_request_headers("POST", "/slow", /*stream_id=*/1, /*end_stream=*/false));
+    // GOAWAY(FLOW_CONTROL_ERROR). A peer cannot enlarge our receive window for
+    // us.
+    client.send(h2_request_headers("POST", "/slow", /*stream_id=*/1,
+                                   /*end_stream=*/false));
     const std::string chunk(8000, 'x');
     for (int i = 0; i < 10 && !client.eof(); ++i) {
         client.send(h2_frame(sh::codec::H2FrameType::Data, 0, 1, chunk));
@@ -836,8 +831,10 @@ TEST_CASE("regression/h2: a connection-level flow-control overrun is fatal", "[r
 
     // Two streams with unconsumed bodies, each staying under its own window but
     // together overrunning the connection's shared 65535 octets.
-    client.send(h2_request_headers("POST", "/slow", /*stream_id=*/1, /*end_stream=*/false));
-    client.send(h2_request_headers("POST", "/slow", /*stream_id=*/3, /*end_stream=*/false));
+    client.send(h2_request_headers("POST", "/slow", /*stream_id=*/1,
+                                   /*end_stream=*/false));
+    client.send(h2_request_headers("POST", "/slow", /*stream_id=*/3,
+                                   /*end_stream=*/false));
     const std::string chunk(8000, 'x');
     for (int i = 0; i < 5; ++i) {
         client.send(h2_frame(sh::codec::H2FrameType::Data, 0, 1, chunk));
@@ -864,10 +861,10 @@ TEST_CASE("regression/h2: an h2c upgrade replays the request as stream 1", "[reg
     // RFC 9113 §3.2: the HTTP/1.1 request that carries the upgrade becomes
     // stream 1 of the new connection.
     const std::string settings = sh::base64_url_encode(std::string(0, '\0'));
-    client.send(
-        "GET /world HTTP/1.1\r\nhost: 127.0.0.1\r\nconnection: Upgrade, HTTP2-Settings\r\n"
-        "upgrade: h2c\r\nhttp2-settings: " +
-        settings + "\r\n\r\n");
+    client.send("GET /world HTTP/1.1\r\nhost: 127.0.0.1\r\nconnection: Upgrade, "
+                "HTTP2-Settings\r\n"
+                "upgrade: h2c\r\nhttp2-settings: " +
+                settings + "\r\n\r\n");
     REQUIRE(client.wait_for("101"));
     CHECK(status_of(client.received()) == 101);
     CHECK(head_has(client.received(), "upgrade: h2c"));
@@ -877,7 +874,7 @@ TEST_CASE("regression/h2: an h2c upgrade replays the request as stream 1", "[reg
     const auto frames = parse_frames(after_switch);
     const auto headers = find_frame(frames, sh::codec::H2FrameType::Headers);
     REQUIRE(headers.has_value());
-    CHECK(headers->header.stream_id == 1);  // the upgraded request's own stream
+    CHECK(headers->header.stream_id == 1); // the upgraded request's own stream
     const auto fields = decode_headers(headers->payload);
     CHECK(header_value(fields, ":status") == "200");
 
@@ -889,7 +886,7 @@ TEST_CASE("regression/h2: an h2c upgrade replays the request as stream 1", "[reg
     REQUIRE(client.pump_until(
         [&] {
             const auto all = parse_frames(client.received().substr(switch_end));
-            for (const auto& frame : all) {
+            for (const auto &frame : all) {
                 if (frame.header.type == static_cast<std::uint8_t>(sh::codec::H2FrameType::Headers) &&
                     frame.header.stream_id >= 3) {
                     return true;
@@ -909,9 +906,10 @@ TEST_CASE("regression/ws: the handshake and the accept key", "[regression][ws]")
     RawClient client{ctx};
     REQUIRE(client.connect(kPlainPort));
 
-    client.send(
-        "GET /chat HTTP/1.1\r\nhost: 127.0.0.1\r\nconnection: Upgrade\r\nupgrade: websocket\r\n"
-        "sec-websocket-version: 13\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n");
+    client.send("GET /chat HTTP/1.1\r\nhost: 127.0.0.1\r\nconnection: "
+                "Upgrade\r\nupgrade: websocket\r\n"
+                "sec-websocket-version: 13\r\nsec-websocket-key: "
+                "dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n");
     REQUIRE(client.wait_head());
     CHECK(status_of(client.received()) == 101);
     CHECK(head_has(client.received(), "upgrade: websocket"));
@@ -924,11 +922,12 @@ TEST_CASE("regression/ws: echo, fragmentation, Ping and Close", "[regression/ws]
     plain_server();
     asio::io_context ctx;
 
-    auto handshake = [&](RawClient& client) {
+    auto handshake = [&](RawClient &client) {
         REQUIRE(client.connect(kPlainPort));
-        client.send(
-            "GET /chat HTTP/1.1\r\nhost: 127.0.0.1\r\nconnection: Upgrade\r\nupgrade: websocket\r\n"
-            "sec-websocket-version: 13\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n");
+        client.send("GET /chat HTTP/1.1\r\nhost: 127.0.0.1\r\nconnection: "
+                    "Upgrade\r\nupgrade: websocket\r\n"
+                    "sec-websocket-version: 13\r\nsec-websocket-key: "
+                    "dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n");
         REQUIRE(client.wait_head());
         REQUIRE(status_of(client.received()) == 101);
     };
@@ -938,7 +937,7 @@ TEST_CASE("regression/ws: echo, fragmentation, Ping and Close", "[regression/ws]
         std::string frame;
         frame.push_back(static_cast<char>((fin ? 0x80 : 0x00) | static_cast<unsigned char>(opcode)));
         frame.push_back(static_cast<char>(0x80 | static_cast<unsigned char>(payload.size())));
-        frame.append(reinterpret_cast<const char*>(mask), 4);
+        frame.append(reinterpret_cast<const char *>(mask), 4);
         std::string masked{payload};
         sh::ws_unmask(masked.data(), masked.size(), mask);
         frame.append(masked);
@@ -955,7 +954,7 @@ TEST_CASE("regression/ws: echo, fragmentation, Ping and Close", "[regression/ws]
         const std::string_view frame = after_head(client.received());
         REQUIRE(frame.size() >= 2);
         CHECK(static_cast<unsigned char>(frame[0]) == 0x81);
-        CHECK(static_cast<unsigned char>(frame[1]) == 8);  // no mask bit
+        CHECK(static_cast<unsigned char>(frame[1]) == 8); // no mask bit
         CHECK(frame.substr(2, 8) == "hello ws");
         client.close();
     }
@@ -977,7 +976,7 @@ TEST_CASE("regression/ws: echo, fragmentation, Ping and Close", "[regression/ws]
                                   std::chrono::seconds(3)));
         const std::string_view frame = after_head(client.received());
         REQUIRE(frame.size() >= 2);
-        CHECK(static_cast<unsigned char>(frame[0]) == 0x8A);  // FIN | Pong
+        CHECK(static_cast<unsigned char>(frame[0]) == 0x8A); // FIN | Pong
         client.close();
     }
     SECTION("a Close is answered with a Close") {
@@ -989,7 +988,7 @@ TEST_CASE("regression/ws: echo, fragmentation, Ping and Close", "[regression/ws]
         REQUIRE(delivered);
         const std::string_view frame = after_head(client.received());
         REQUIRE(frame.size() >= 4);
-        CHECK(static_cast<unsigned char>(frame[0]) == 0x88);  // FIN | Close
+        CHECK(static_cast<unsigned char>(frame[0]) == 0x88); // FIN | Close
         client.close();
     }
 }
@@ -1009,27 +1008,28 @@ TEST_CASE("regression/tls: mutual TLS requires a client certificate", "[regressi
     stream->next_layer().connect(asio::ip::tcp::endpoint(asio::ip::make_address("127.0.0.1"), kTlsPort), ec);
     REQUIRE_FALSE(ec);
     stream->async_handshake(asio::ssl::stream_base::client,
-                            [&](const sh::error_code& handshake_ec) { ec = handshake_ec; });
+                            [&](const sh::error_code &handshake_ec) { ec = handshake_ec; });
     ctx.restart();
     ctx.run_for(std::chrono::seconds(10));
 
-    // TLS 1.3 lets the client finish its side before the peer's verdict arrives, so
-    // the rejection surfaces on the first application I/O (an alert, or a close).
+    // TLS 1.3 lets the client finish its side before the peer's verdict arrives,
+    // so the rejection surfaces on the first application I/O (an alert, or a
+    // close).
     if (!ec) {
         std::string probe = "GET /world HTTP/1.1\r\nHost: x\r\n\r\n";
         stream->async_write_some(asio::buffer(probe),
-                                 [&](const sh::error_code& write_ec, std::size_t) { ec = write_ec; });
+                                 [&](const sh::error_code &write_ec, std::size_t) { ec = write_ec; });
         ctx.restart();
         ctx.run_for(std::chrono::seconds(10));
     }
     if (!ec) {
         // Reading forces the peer's verdict (an alert, or a bare close) to land.
         std::array<char, 64> buf{};
-        stream->async_read_some(asio::buffer(buf), [&](const sh::error_code& read_ec, std::size_t) { ec = read_ec; });
+        stream->async_read_some(asio::buffer(buf), [&](const sh::error_code &read_ec, std::size_t) { ec = read_ec; });
         ctx.restart();
         ctx.run_for(std::chrono::seconds(10));
     }
-    CHECK(ec);  // the server demanded a certificate we did not have
+    CHECK(ec); // the server demanded a certificate we did not have
     sh::error_code ignored;
     stream->next_layer().close(ignored);
 }
@@ -1050,10 +1050,10 @@ TEST_CASE("regression/tls: a TLS 1.2-only client is refused", "[regression][tls]
     stream->next_layer().connect(asio::ip::tcp::endpoint(asio::ip::make_address("127.0.0.1"), kTlsPort), ec);
     REQUIRE_FALSE(ec);
     stream->async_handshake(asio::ssl::stream_base::client,
-                            [&](const sh::error_code& handshake_ec) { ec = handshake_ec; });
+                            [&](const sh::error_code &handshake_ec) { ec = handshake_ec; });
     ctx.restart();
     ctx.run_for(std::chrono::seconds(10));
-    CHECK(ec);  // no version overlap
+    CHECK(ec); // no version overlap
     sh::error_code ignored;
     stream->next_layer().close(ignored);
 }
@@ -1067,10 +1067,9 @@ TEST_CASE("regression/tls: a TLS 1.2-only client is refused", "[regression][tls]
 // the one behind `port()` would ever be reached), and the accept loops must
 // actually run.
 
-TEST_CASE("regression/server: reuse_port binds one acceptor per worker on one port",
-          "[regression][server]") {
+TEST_CASE("regression/server: reuse_port binds one acceptor per worker on one port", "[regression][server]") {
     sh::ServerConfig cfg;
-    cfg.listen = sh::InetAddress{"127.0.0.1", 0, false};  // 0: the probe picks the port
+    cfg.listen = sh::InetAddress{"127.0.0.1", 0, false}; // 0: the probe picks the port
     cfg.worker_threads = 4;
     cfg.reuse_port = true;
     sh::Server server{cfg};
@@ -1098,10 +1097,10 @@ TEST_CASE("regression/server: reuse_port binds one acceptor per worker on one po
         REQUIRE(clients.back()->connect(port));
         clients.back()->send("GET /world HTTP/1.1\r\nHost: x\r\n\r\n");
     }
-    for (auto& client : clients) {
+    for (auto &client : clients) {
         CHECK(client->wait_for("hello"));
     }
-    for (auto& client : clients) {
+    for (auto &client : clients) {
         client->close();
     }
 }
@@ -1117,7 +1116,7 @@ TEST_CASE("regression/server: reuse_port with a single worker still serves", "[r
     sh::Server server{cfg};
     register_routes(server);
     REQUIRE(server.start());
-    CHECK(server.acceptor_count() == 1);  // nothing to fan out to
+    CHECK(server.acceptor_count() == 1); // nothing to fan out to
 
     asio::io_context ctx;
     RawClient client{ctx};
@@ -1149,9 +1148,9 @@ TEST_CASE("regression/server: an IPv6 listener serves IPv4 clients", "[regressio
 }
 
 // A customization hook must not be able to turn client-certificate verification
-// off by accident. It is applied *before* the security policy, not instead of it:
-// the hook used to replace the whole policy branch, so a caller adding a cipher
-// list silently got verify_none with cfg.mutual == true.
+// off by accident. It is applied *before* the security policy, not instead of
+// it: the hook used to replace the whole policy branch, so a caller adding a
+// cipher list silently got verify_none with cfg.mutual == true.
 TEST_CASE("regression/tls: a setup hook does not disable mutual TLS", "[regression][tls]") {
     sh::ServerConfig cfg = make_config(
         0, sh::TlsConfig{
@@ -1160,7 +1159,7 @@ TEST_CASE("regression/tls: a setup hook does not disable mutual TLS", "[regressi
                .mutual = true,
                .ca_file = "./test/tls_certificates/ca_cert.pem",
                // Something innocuous — the kind of thing this hook exists for.
-               .setup = [](asio::ssl::context& ctx) { ctx.set_options(asio::ssl::context::default_workarounds); },
+               .setup = [](asio::ssl::context &ctx) { ctx.set_options(asio::ssl::context::default_workarounds); },
            });
     sh::Server server{cfg};
     register_routes(server);
@@ -1183,22 +1182,26 @@ TEST_CASE("regression/tls: a setup hook does not disable mutual TLS", "[regressi
         std::string seen;
         sh::error_code ec;
         stream->next_layer().connect(asio::ip::tcp::endpoint(asio::ip::make_address("127.0.0.1"), server.port()), ec);
-        if (ec) return false;
-        stream->async_handshake(asio::ssl::stream_base::client, [&](const sh::error_code& e) { ec = e; });
+        if (ec)
+            return false;
+        stream->async_handshake(asio::ssl::stream_base::client, [&](const sh::error_code &e) { ec = e; });
         ctx.restart();
         ctx.run_for(std::chrono::seconds(5));
-        if (ec) return false;
+        if (ec)
+            return false;
 
         const std::string request = "GET /world HTTP/1.1\r\nHost: x\r\n\r\n";
-        asio::async_write(*stream, asio::buffer(request), [&](const sh::error_code& e, std::size_t) { ec = e; });
+        asio::async_write(*stream, asio::buffer(request), [&](const sh::error_code &e, std::size_t) { ec = e; });
         ctx.restart();
         ctx.run_for(std::chrono::seconds(5));
-        if (ec) return false;
+        if (ec)
+            return false;
 
         std::array<char, 512> buf{};
-        stream->async_read_some(asio::buffer(buf), [&](const sh::error_code& e, std::size_t n) {
+        stream->async_read_some(asio::buffer(buf), [&](const sh::error_code &e, std::size_t n) {
             ec = e;
-            if (!e) seen.assign(buf.data(), n);
+            if (!e)
+                seen.assign(buf.data(), n);
         });
         ctx.restart();
         ctx.run_for(std::chrono::seconds(5));
@@ -1226,20 +1229,20 @@ TEST_CASE("regression/h1: a handler's own Content-Length is replaced, not duplic
     client.send("GET /clash HTTP/1.1\r\nHost: x\r\n\r\n");
     REQUIRE(client.wait_head());
 
-    const std::string& head = client.received();
+    const std::string &head = client.received();
     std::size_t count = 0;
     for (auto at = head.find("content-length"); at != std::string::npos; at = head.find("content-length", at + 1)) {
         ++count;
     }
     CHECK(count == 1);
-    CHECK(head.find("content-length: 2\r\n") != std::string::npos);  // "hi", not the handler's 999
+    CHECK(head.find("content-length: 2\r\n") != std::string::npos); // "hi", not the handler's 999
     client.close();
 }
 
-// A response field carrying CR/LF is response splitting: it splices a field of the
-// handler's choosing into the head. HTTP/2 already refuses the stream for it; the
-// HTTP/1.1 writer used to write it verbatim, so the same handler was safe on one
-// protocol and exploitable on the other.
+// A response field carrying CR/LF is response splitting: it splices a field of
+// the handler's choosing into the head. HTTP/2 already refuses the stream for
+// it; the HTTP/1.1 writer used to write it verbatim, so the same handler was
+// safe on one protocol and exploitable on the other.
 TEST_CASE("regression/h1: a response field with CR/LF is refused, not spliced", "[regression][h1]") {
     plain_server();
     asio::io_context ctx;
@@ -1262,7 +1265,8 @@ TEST_CASE("regression/h1: a chunk trailer that is not CRLF is not accepted", "[r
     asio::io_context ctx;
     RawClient client{ctx};
     REQUIRE(client.connect(kPlainPort));
-    client.send("POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloXY");
+    client.send("POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: "
+                "chunked\r\n\r\n5\r\nhelloXY");
     REQUIRE(client.wait_head());
     // /echo reports what it could read, so this is what separates the two
     // behaviours: treating "XY" as the trailer yields "len=5:hello", while
@@ -1279,9 +1283,11 @@ TEST_CASE("regression/h1: a chunk trailer that is not CRLF is not accepted", "[r
 }
 
 // "Disabled" has to mean "no deadline", not "close immediately". Racing a no-op
-// deadline against the detection read made `a || b` complete at once, cancelling
-// the read before a byte arrived — so every connection was accepted and dropped.
-TEST_CASE("regression/server: idle_timeout = 0 disables the deadline instead of closing at once",
+// deadline against the detection read made `a || b` complete at once,
+// cancelling the read before a byte arrived — so every connection was accepted
+// and dropped.
+TEST_CASE("regression/server: idle_timeout = 0 disables the deadline instead of "
+          "closing at once",
           "[regression][server]") {
     auto cfg = make_config(0, std::nullopt);
     cfg.limits.idle_timeout = std::chrono::seconds(0);
@@ -1327,7 +1333,8 @@ TEST_CASE("regression/server: a UNIX-domain listener serves over its socket file
     std::array<char, 4096> buf{};
     while (response.find("hello") == std::string::npos) {
         const auto n = socket.read_some(asio::buffer(buf), ec);
-        if (ec || n == 0) break;
+        if (ec || n == 0)
+            break;
         response.append(buf.data(), n);
     }
     CHECK(response.find("200 OK") != std::string::npos);
@@ -1346,8 +1353,8 @@ TEST_CASE("regression/server: a UNIX-domain listener serves over its socket file
 }
 
 // TLS over a UNIX-domain socket. The transport is templated on the socket type,
-// so this is nominally the same handshake as over TCP — but "should work" is not
-// "does work", and nothing else in the suite drives an encrypted AF_UNIX
+// so this is nominally the same handshake as over TCP — but "should work" is
+// not "does work", and nothing else in the suite drives an encrypted AF_UNIX
 // connection (the plaintext UNIX case above is the only other one).
 TEST_CASE("regression/server: TLS over a UNIX-domain socket", "[regression][server][tls]") {
     const std::string path = "/tmp/simple_http_regression_tls.sock";
@@ -1378,7 +1385,7 @@ TEST_CASE("regression/server: TLS over a UNIX-domain socket", "[regression][serv
     stream->next_layer().connect(asio::local::stream_protocol::endpoint{path}, ec);
     REQUIRE_FALSE(ec);
 
-    stream->async_handshake(asio::ssl::stream_base::client, [&](const sh::error_code& e) { ec = e; });
+    stream->async_handshake(asio::ssl::stream_base::client, [&](const sh::error_code &e) { ec = e; });
     ctx.restart();
     ctx.run_for(std::chrono::seconds(10));
     REQUIRE_FALSE(ec);
@@ -1391,7 +1398,8 @@ TEST_CASE("regression/server: TLS over a UNIX-domain socket", "[regression][serv
     std::array<char, 4096> buf{};
     while (response.find("hello") == std::string::npos) {
         const auto n = stream->read_some(asio::buffer(buf), ec);
-        if (ec || n == 0) break;
+        if (ec || n == 0)
+            break;
         response.append(buf.data(), n);
     }
     CHECK(response.find("200 OK") != std::string::npos);
@@ -1403,12 +1411,12 @@ TEST_CASE("regression/server: TLS over a UNIX-domain socket", "[regression][serv
 
 // --- static files over a real socket -----------------------------------------
 //
-// The unit tests drive the same component through FakeResponseWriter, which sees
-// headers as a collection. These see them as bytes on the wire, which is where
-// the two things that component sets by hand actually matter: a length on a HEAD
-// or a 416 (or the response is delimited by connection close instead), and the
-// fact that HTTP/2 forwards our header block untouched while HTTP/1.1 recomputes
-// the length from the body.
+// The unit tests drive the same component through FakeResponseWriter, which
+// sees headers as a collection. These see them as bytes on the wire, which is
+// where the two things that component sets by hand actually matter: a length on
+// a HEAD or a 416 (or the response is delimited by connection close instead),
+// and the fact that HTTP/2 forwards our header block untouched while HTTP/1.1
+// recomputes the length from the body.
 
 TEST_CASE("regression/static: a GET is the file, byte for byte", "[regression][static]") {
     plain_server();
@@ -1485,8 +1493,8 @@ TEST_CASE("regression/static: a range comes back as 206 with the right slice", "
     client.send("GET /app.js HTTP/1.1\r\nHost: x\r\nRange: bytes=0-4\r\n\r\n");
     REQUIRE(client.wait_head());
     CHECK(status_of(client.received()) == 206);
-    CHECK(head_has(client.received(), "content-range: bytes 0-4/" +
-                                           std::to_string(std::string{"console.log('app');"}.size())));
+    CHECK(head_has(client.received(),
+                   "content-range: bytes 0-4/" + std::to_string(std::string{"console.log('app');"}.size())));
     CHECK(body_of(client.received()) == "conso");
     CHECK(*head_value(client.received(), "content-length") == "5");
 
@@ -1536,7 +1544,7 @@ TEST_CASE("regression/static: a conditional request is a 304 with no body", "[re
     second.send("GET /app.js HTTP/1.1\r\nHost: x\r\nIf-None-Match: " + *etag + "\r\n\r\n");
     REQUIRE(second.wait_head());
     CHECK(status_of(second.received()) == 304);
-    CHECK_FALSE(head_has(second.received(), "content-length:"));  // RFC 9110 §15.4.5
+    CHECK_FALSE(head_has(second.received(), "content-length:")); // RFC 9110 §15.4.5
 
     second.pump(std::chrono::milliseconds(150));
     CHECK(body_of(second.received()).empty());
@@ -1544,7 +1552,9 @@ TEST_CASE("regression/static: a conditional request is a 304 with no body", "[re
     second.close();
 }
 
-TEST_CASE("regression/static: an encoded traversal is refused and the connection closed", "[regression][static]") {
+TEST_CASE("regression/static: an encoded traversal is refused and the connection "
+          "closed",
+          "[regression][static]") {
     plain_server();
     asio::io_context ctx;
     RawClient client{ctx};
@@ -1555,7 +1565,7 @@ TEST_CASE("regression/static: an encoded traversal is refused and the connection
     client.send("GET /%2e%2e/etc/passwd HTTP/1.1\r\nHost: x\r\n\r\n");
     REQUIRE(client.wait_head());
     CHECK(status_of(client.received()) == 400);
-    CHECK(client.wait_eof());  // a malformed target says the peer is not a browser
+    CHECK(client.wait_eof()); // a malformed target says the peer is not a browser
 
     client.close();
 }
@@ -1613,8 +1623,9 @@ TEST_CASE("regression/method: GET serves HEAD with an empty body", "[regression]
     client.send("HEAD /method/getonly HTTP/1.1\r\nHost: x\r\n\r\n");
     REQUIRE(client.wait_head());
     CHECK(status_of(client.received()) == 200);
-    CHECK(head_has(client.received(), "content-length: 7"));  // what a GET would produce…
-    CHECK(body_of(client.received()).empty());                // …but no body follows the head
+    CHECK(head_has(client.received(),
+                   "content-length: 7"));      // what a GET would produce…
+    CHECK(body_of(client.received()).empty()); // …but no body follows the head
 
     client.close();
 }
@@ -1675,14 +1686,15 @@ TEST_CASE("regression/static: the same responses over h2c", "[regression][static
     REQUIRE(client.connect(kPlainPort));
     client.send(h2_preface_and_settings());
 
-    auto send_get = [&](const std::string& path, std::uint32_t stream_id,
-                        const std::vector<std::pair<std::string, std::string>>& extra) {
+    auto send_get = [&](const std::string &path, std::uint32_t stream_id,
+                        const std::vector<std::pair<std::string, std::string>> &extra) {
         std::string block;
         sh::codec::hpack_append_literal(block, ":method", "GET");
         sh::codec::hpack_append_literal(block, ":scheme", "http");
         sh::codec::hpack_append_literal(block, ":authority", "127.0.0.1");
         sh::codec::hpack_append_literal(block, ":path", path);
-        for (const auto& [name, value] : extra) sh::codec::hpack_append_literal(block, name, value);
+        for (const auto &[name, value] : extra)
+            sh::codec::hpack_append_literal(block, name, value);
         client.send(h2_frame(sh::codec::H2FrameType::Headers,
                              sh::codec::H2_FLAG_END_HEADERS | sh::codec::H2_FLAG_END_STREAM, stream_id, block));
     };
@@ -1692,7 +1704,7 @@ TEST_CASE("regression/static: the same responses over h2c", "[regression][static
     REQUIRE(client.pump_until(
         [&] {
             auto frames = parse_frames(client.received());
-            for (const auto& f : frames) {
+            for (const auto &f : frames) {
                 if (f.header.type == static_cast<std::uint8_t>(sh::codec::H2FrameType::Data) &&
                     f.header.stream_id == 1 && f.payload == "BR:console.log('app');") {
                     return true;
@@ -1706,14 +1718,15 @@ TEST_CASE("regression/static: the same responses over h2c", "[regression][static
     std::string etag_block;
     {
         auto frames = parse_frames(client.received());
-        for (const auto& f : frames) {
-            if (f.header.type == static_cast<std::uint8_t>(sh::codec::H2FrameType::Headers)) break;
+        for (const auto &f : frames) {
+            if (f.header.type == static_cast<std::uint8_t>(sh::codec::H2FrameType::Headers))
+                break;
         }
     }
     send_get("/app.js", 3, {});
     REQUIRE(client.pump_until(
         [&] {
-            for (const auto& f : parse_frames(client.received())) {
+            for (const auto &f : parse_frames(client.received())) {
                 if (f.header.stream_id == 3 &&
                     f.header.type == static_cast<std::uint8_t>(sh::codec::H2FrameType::Data)) {
                     return true;
@@ -1727,10 +1740,9 @@ TEST_CASE("regression/static: the same responses over h2c", "[regression][static
     send_get("/app.js", 5, {{"range", "bytes=0-4"}});
     REQUIRE(client.pump_until(
         [&] {
-            for (const auto& f : parse_frames(client.received())) {
+            for (const auto &f : parse_frames(client.received())) {
                 if (f.header.stream_id == 5 &&
-                    f.header.type == static_cast<std::uint8_t>(sh::codec::H2FrameType::Data) &&
-                    f.payload == "conso") {
+                    f.header.type == static_cast<std::uint8_t>(sh::codec::H2FrameType::Data) && f.payload == "conso") {
                     return true;
                 }
             }

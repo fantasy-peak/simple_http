@@ -3,29 +3,31 @@
 // Handler type system.
 //
 // A route handler is a coroutine in one of two interchangeable forms, selected
-// automatically at compile time by arity (the Request and Response are shared so
-// a handler may hand them to coroutines that outlive it):
+// automatically at compile time by arity (the Request and Response are shared
+// so a handler may hand them to coroutines that outlive it):
 //
-//   no TLS : awaitable<void>(std::shared_ptr<Request>, std::shared_ptr<Response>)
-//   TLS    : awaitable<void>(std::shared_ptr<Request>, std::shared_ptr<Response>, SslHandle)
+//   no TLS : awaitable<void>(std::shared_ptr<Request>,
+//   std::shared_ptr<Response>) TLS    :
+//   awaitable<void>(std::shared_ptr<Request>, std::shared_ptr<Response>,
+//   SslHandle)
 //
-// Handlers are coroutines and may suspend freely (timers, async I/O, streaming).
-// They run on the connection executor; the Response's write operations are
-// awaitable and hop back onto that executor, so a Response captured by the
-// handler is safe to use from any thread or across suspension points.
+// Handlers are coroutines and may suspend freely (timers, async I/O,
+// streaming). They run on the connection executor; the Response's write
+// operations are awaitable and hop back onto that executor, so a Response
+// captured by the handler is safe to use from any thread or across suspension
+// points.
 
+#include <boost/asio/awaitable.hpp>
 #include <concepts>
 #include <functional>
 #include <memory>
 #include <utility>
 #include <variant>
 
-#include <boost/asio/awaitable.hpp>
-
 #include "../proto/request.h"
 #include "../proto/response.h"
 #include "../proto/websocket.h"
-#include "../transport/transport.h"  // SslHandle
+#include "../transport/transport.h" // SslHandle
 
 namespace simple_http {
 
@@ -59,12 +61,11 @@ concept Coro = requires(F f, RequestPtr rq, ResponsePtr rs) {
     { f(rq, rs) } -> std::same_as<asio::awaitable<void>>;
 };
 
-}  // namespace detail
+} // namespace detail
 
 // Wraps a handler coroutine into a Handler variant, chosen by arity. An
 // already-built Handler passes through.
-template <typename F>
-Handler make_handler(F&& fn) {
+template <typename F> Handler make_handler(F &&fn) {
     using D = std::decay_t<F>;
     if constexpr (std::is_same_v<D, Handler>) {
         return std::forward<F>(fn);
@@ -73,23 +74,22 @@ Handler make_handler(F&& fn) {
     } else if constexpr (detail::Coro<D>) {
         return Handler{std::in_place_type<CoroHandler>, std::forward<F>(fn)};
     } else {
-        static_assert(sizeof(F) == 0,
-                      "handler must be a coroutine callable as "
-                      "(std::shared_ptr<Request>, std::shared_ptr<Response>) or "
-                      "(std::shared_ptr<Request>, std::shared_ptr<Response>, SslHandle) "
-                      "returning asio::awaitable<void>");
+        static_assert(sizeof(F) == 0, "handler must be a coroutine callable as "
+                                      "(std::shared_ptr<Request>, std::shared_ptr<Response>) or "
+                                      "(std::shared_ptr<Request>, std::shared_ptr<Response>, SslHandle) "
+                                      "returning asio::awaitable<void>");
     }
 }
 
 // Invokes a Handler: both forms are coroutines and are awaited. The Request and
 // Response are shared so a handler may hand them to coroutines that outlive it.
 //
-// A handler that throws becomes a 500. Without this the exception unwinds out of
-// the engine's dispatch loop and the connection is dropped mid-request: the
+// A handler that throws becomes a 500. Without this the exception unwinds out
+// of the engine's dispatch loop and the connection is dropped mid-request: the
 // client sees a protocol error rather than a server error, and a keep-alive
 // connection dies with it. (Found by driving the server with httpx, which
 // reports it as "Server disconnected without sending a response".)
-inline asio::awaitable<void> invoke_handler(const Handler& handler, RequestPtr req, ResponsePtr res, SslHandle ssl) {
+inline asio::awaitable<void> invoke_handler(const Handler &handler, RequestPtr req, ResponsePtr res, SslHandle ssl) {
     // Kept back because `res` is moved into the handler; both point at the same
     // Response, so this is the same object the handler was given.
     const ResponsePtr fallback = res;
@@ -103,7 +103,7 @@ inline asio::awaitable<void> invoke_handler(const Handler& handler, RequestPtr r
         } else {
             co_await std::get<CoroSslHandler>(handler)(std::move(req), std::move(res), ssl);
         }
-    } catch (const std::exception& e) {
+    } catch (const std::exception &e) {
         threw = true;
         why = e.what();
     } catch (...) {
@@ -123,4 +123,4 @@ inline asio::awaitable<void> invoke_handler(const Handler& handler, RequestPtr r
     co_return;
 }
 
-}  // namespace simple_http
+} // namespace simple_http

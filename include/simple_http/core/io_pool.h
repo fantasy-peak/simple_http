@@ -8,6 +8,7 @@
 // listener is fanned out with SO_REUSEPORT).
 
 #include <atomic>
+#include <boost/asio.hpp>
 #include <cassert>
 #include <chrono>
 #include <condition_variable>
@@ -17,8 +18,6 @@
 #include <stdexcept>
 #include <thread>
 #include <vector>
-
-#include <boost/asio.hpp>
 
 namespace simple_http {
 
@@ -43,7 +42,7 @@ class IoCtxPool final {
 
     void start() {
         m_running = m_io_contexts.size();
-        for (auto& context : m_io_contexts) {
+        for (auto &context : m_io_contexts) {
             m_threads.emplace_back([this, ctx = context] {
                 ctx->run();
                 // This context has nothing left to do; stop() waits on this
@@ -85,12 +84,12 @@ class IoCtxPool final {
             const bool drained = m_idle_cv.wait_for(lock, kDrainGrace, [this] { return m_running == 0; });
             if (!drained) {
                 lock.unlock();
-                for (auto& context : m_io_contexts) {
+                for (auto &context : m_io_contexts) {
                     context->stop();
                 }
             }
         }
-        for (auto& thread : m_threads) {
+        for (auto &thread : m_threads) {
             if (thread.joinable()) {
                 thread.join();
             }
@@ -98,20 +97,18 @@ class IoCtxPool final {
     }
 
     // Round-robin selection of the next worker io_context.
-    asio::io_context& next() { return *next_ptr(); }
+    asio::io_context &next() { return *next_ptr(); }
 
     // The same, as the shared_ptr. A *const* reference: handing out a mutable one
     // let any caller rebind a pooled context, which left "the main context is
     // never handed out as a worker" a comment rather than a guarantee.
-    const std::shared_ptr<asio::io_context>& next_ptr() {
+    const std::shared_ptr<asio::io_context> &next_ptr() {
         std::size_t index = m_cursor.fetch_add(1, std::memory_order_relaxed);
         return m_io_contexts[index % m_pool_size];
     }
 
     // The context reserved for acceptors (added via add_main_context()).
-    std::shared_ptr<asio::io_context>& main_context() {
-        return m_io_contexts.back();
-    }
+    std::shared_ptr<asio::io_context> &main_context() { return m_io_contexts.back(); }
 
     // The worker contexts only: a main context, if one was added, is not
     // counted here and is never reachable through at().
@@ -120,14 +117,12 @@ class IoCtxPool final {
     // Bounds-checked, as the name implies. An out-of-range index used to read
     // past the end — or, for index == pool_size, hand back the main context,
     // which is precisely the one this accessor exists to keep away from workers.
-    const std::shared_ptr<asio::io_context>& at(std::size_t index) {
+    const std::shared_ptr<asio::io_context> &at(std::size_t index) {
         assert(index < m_pool_size);
         return m_io_contexts[index];
     }
 
-    void add_main_context() {
-        create();
-    }
+    void add_main_context() { create(); }
 
   private:
     void create() {
@@ -148,4 +143,4 @@ class IoCtxPool final {
     std::size_t m_pool_size;
 };
 
-}  // namespace simple_http
+} // namespace simple_http

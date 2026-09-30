@@ -2,7 +2,6 @@
 // (reassembly, Ping→Pong, Close→Close), driven over a mock transport.
 
 #include <catch2/catch_test_macros.hpp>
-
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -17,11 +16,11 @@ namespace {
 
 // A client-to-server frame: mask bit set, a 4-byte key, payload XORed with it.
 //
-// WsFrameParser only ever sees this direction, and now rejects an unmasked frame
-// (RFC 6455 §5.1). The ws_encode_* helpers produce the *other* direction — server
-// frames, never masked — so feeding their output to the parser was testing a
-// combination the wire cannot produce. What the two directions share (the length
-// encoding, the opcode) is what these cases are actually about.
+// WsFrameParser only ever sees this direction, and now rejects an unmasked
+// frame (RFC 6455 §5.1). The ws_encode_* helpers produce the *other* direction
+// — server frames, never masked — so feeding their output to the parser was
+// testing a combination the wire cannot produce. What the two directions share
+// (the length encoding, the opcode) is what these cases are actually about.
 std::string client_frame(WsOpcode opcode, std::string_view payload) {
     static constexpr unsigned char kMask[4] = {0x11, 0x22, 0x33, 0x44};
     const std::size_t n = payload.size();
@@ -39,7 +38,7 @@ std::string client_frame(WsOpcode opcode, std::string_view payload) {
             frame.push_back(static_cast<char>((n >> (8 * i)) & 0xFF));
         }
     }
-    frame.append(reinterpret_cast<const char*>(kMask), 4);
+    frame.append(reinterpret_cast<const char *>(kMask), 4);
     for (std::size_t i = 0; i < n; ++i) {
         frame.push_back(static_cast<char>(static_cast<unsigned char>(payload[i]) ^ kMask[i % 4]));
     }
@@ -56,7 +55,7 @@ std::string hex_of(std::string_view bytes) {
     return out;
 }
 
-}  // namespace
+} // namespace
 
 // --- handshake ---------------------------------------------------------------
 
@@ -85,7 +84,7 @@ TEST_CASE("ws/mask: unmasking in place, byte for byte", "[ws]") {
         }
         CHECK(masked == expected);
 
-        ws_unmask(masked.data(), masked.size(), key);  // and back
+        ws_unmask(masked.data(), masked.size(), key); // and back
         CHECK(masked == data);
     }
 
@@ -97,7 +96,8 @@ TEST_CASE("ws/mask: unmasking in place, byte for byte", "[ws]") {
     CHECK(copy == plain);
 
     const unsigned char ones[4] = {0xFF, 0xFF, 0xFF, 0xFF};
-    ws_unmask(copy.data(), copy.size(), ones);  // XOR with all ones flips every bit
+    ws_unmask(copy.data(), copy.size(),
+              ones); // XOR with all ones flips every bit
     for (std::size_t i = 0; i < copy.size(); ++i) {
         CHECK(static_cast<unsigned char>(copy[i]) == (static_cast<unsigned char>(plain[i]) ^ 0xFF));
     }
@@ -120,11 +120,11 @@ TEST_CASE("ws/encode: length framing boundaries", "[ws]") {
         return std::string{buf, n};
     };
 
-    CHECK(hex_of(header_for(0)) == "8200");  // FIN|binary, 7-bit length 0
+    CHECK(hex_of(header_for(0)) == "8200"); // FIN|binary, 7-bit length 0
     CHECK(hex_of(header_for(125)) == "827d");
-    CHECK(hex_of(header_for(126)) == "827e007e");  // 16-bit form
+    CHECK(hex_of(header_for(126)) == "827e007e"); // 16-bit form
     CHECK(hex_of(header_for(0xFFFF)) == "827effff");
-    CHECK(hex_of(header_for(0x10000)) == "827f0000000000010000");  // 64-bit form
+    CHECK(hex_of(header_for(0x10000)) == "827f0000000000010000"); // 64-bit form
 
     // Control opcodes share the framing.
     char buf[10] = {};
@@ -152,7 +152,7 @@ TEST_CASE("ws/encode: frames round-trip through the parser", "[ws]") {
     WsFrame out;
     REQUIRE(parser.next(out) == WsFrameParser::Status::Frame);
     CHECK(out.opcode == WsOpcode::Close);
-    CHECK(out.payload == ws_close_payload(1001));  // the two helpers agree
+    CHECK(out.payload == ws_close_payload(1001)); // the two helpers agree
     CHECK(hex_of(ws_close_payload(1000)) == "03e8");
     CHECK(hex_of(ws_close_payload(1001)) == "03e9");
 }
@@ -202,7 +202,7 @@ TEST_CASE("ws/parser: client frames arrive masked", "[ws]") {
     WsFrame out;
     REQUIRE(parser.next(out) == WsFrameParser::Status::Frame);
     CHECK(out.opcode == WsOpcode::Text);
-    CHECK(out.payload == "masked hello");  // the parser unmasks for us
+    CHECK(out.payload == "masked hello"); // the parser unmasks for us
 }
 
 TEST_CASE("ws/parser: protocol violations are errors, not data", "[ws]") {
@@ -234,7 +234,7 @@ TEST_CASE("ws/parser: protocol violations are errors, not data", "[ws]") {
         std::string header;
         char buf[10] = {};
         header.append(buf, ws_encode_header(buf, WsOpcode::Binary, 1024));
-        parser.append(header);  // length only, no payload
+        parser.append(header); // length only, no payload
         WsFrame out;
         CHECK(parser.next(out) == WsFrameParser::Status::Error);
     }
@@ -248,7 +248,8 @@ TEST_CASE("ws/backend: messages, fragmentation, Ping and Close", "[ws]") {
     auto backend =
         std::make_shared<WsBackendImpl<MockTransport>>(transport, /*max_payload=*/4096, std::chrono::seconds(5));
     auto ws = std::make_shared<WebSocket>(backend);
-    asio::co_spawn(ctx, ws->run_writer(), asio::detached);  // the pump the handle writes through
+    asio::co_spawn(ctx, ws->run_writer(),
+                   asio::detached); // the pump the handle writes through
     drain(ctx);
 
     SECTION("a single masked text frame is delivered as one message") {
@@ -290,7 +291,7 @@ TEST_CASE("ws/backend: messages, fragmentation, Ping and Close", "[ws]") {
         drain(ctx);
         const std::string written = transport->written();
         REQUIRE(written.size() >= 2);
-        CHECK(static_cast<unsigned char>(written[0]) == 0x8A);  // FIN | Pong
+        CHECK(static_cast<unsigned char>(written[0]) == 0x8A); // FIN | Pong
         CHECK(written.find("ping-payload") != std::string::npos);
     }
 
@@ -304,7 +305,7 @@ TEST_CASE("ws/backend: messages, fragmentation, Ping and Close", "[ws]") {
         drain(ctx);
         const std::string written = transport->written();
         REQUIRE(!written.empty());
-        CHECK(static_cast<unsigned char>(written[0]) == 0x88);  // FIN | Close
+        CHECK(static_cast<unsigned char>(written[0]) == 0x88); // FIN | Close
     }
 
     SECTION("a data frame before the previous message finished is an error") {
@@ -338,8 +339,8 @@ TEST_CASE("ws/backend: messages, fragmentation, Ping and Close", "[ws]") {
         drain(ctx);
         const std::string written = transport->written();
         REQUIRE(written.size() >= 5);
-        CHECK(static_cast<unsigned char>(written[0]) == 0x81);  // FIN | Text
-        CHECK(static_cast<unsigned char>(written[1]) == 3);     // server frames are never masked
+        CHECK(static_cast<unsigned char>(written[0]) == 0x81); // FIN | Text
+        CHECK(static_cast<unsigned char>(written[1]) == 3);    // server frames are never masked
         CHECK(written.substr(2) == "out");
     }
 }
@@ -359,10 +360,10 @@ TEST_CASE("ws: incremental UTF-8 validation", "[ws][utf8]") {
     CHECK(valid(octets(100, 'a') + " " + octets(100, '\t')));
 
     // Valid multi-byte sequences.
-    CHECK(valid(octets("\xC3\xA9")));                        // é
-    CHECK(valid(octets("\xE2\x82\xAC")));                   // €
-    CHECK(valid(octets("\xF0\x90\x8D\x88")));               // U+10348
-    CHECK(valid("a" + octets("\xE2\x82\xAC") + "b"));       // UTF-8 around ASCII
+    CHECK(valid(octets("\xC3\xA9")));                 // é
+    CHECK(valid(octets("\xE2\x82\xAC")));             // €
+    CHECK(valid(octets("\xF0\x90\x8D\x88")));         // U+10348
+    CHECK(valid("a" + octets("\xE2\x82\xAC") + "b")); // UTF-8 around ASCII
 
     // A sequence split across feed() calls carries its state between them.
     Utf8Validator frag;
@@ -383,21 +384,21 @@ TEST_CASE("ws: incremental UTF-8 validation", "[ws][utf8]") {
     // Rejected: stray continuation / overlong lead bytes at a boundary.
     CHECK_FALSE(valid(octets("\x80")));
     CHECK_FALSE(valid(octets("\xBF")));
-    CHECK_FALSE(valid(octets("\xC0\xAF")));                       // overlong 2-byte
-    CHECK_FALSE(valid("x\xC1\x81"));                              // overlong mid-string
+    CHECK_FALSE(valid(octets("\xC0\xAF"))); // overlong 2-byte
+    CHECK_FALSE(valid("x\xC1\x81"));        // overlong mid-string
 
     // Rejected: overlong 3-byte, surrogates, and beyond U+10FFFF.
-    CHECK_FALSE(valid(octets("\xE0\x80\x80")));                   // overlong €-shaped
-    CHECK_FALSE(valid(octets("\xED\xA0\x80")));                   // U+D800 surrogate
-    CHECK_FALSE(valid(octets("\xED\xBF\xBF")));                   // U+DFFF surrogate
-    CHECK_FALSE(valid(octets("\xF0\x80\x80\x80")));               // overlong 4-byte
-    CHECK_FALSE(valid(octets("\xF4\x90\x80\x80")));               // U+110000
-    CHECK_FALSE(valid(octets("\xF5\x80\x80\x80")));               // invalid lead
+    CHECK_FALSE(valid(octets("\xE0\x80\x80")));     // overlong €-shaped
+    CHECK_FALSE(valid(octets("\xED\xA0\x80")));     // U+D800 surrogate
+    CHECK_FALSE(valid(octets("\xED\xBF\xBF")));     // U+DFFF surrogate
+    CHECK_FALSE(valid(octets("\xF0\x80\x80\x80"))); // overlong 4-byte
+    CHECK_FALSE(valid(octets("\xF4\x90\x80\x80"))); // U+110000
+    CHECK_FALSE(valid(octets("\xF5\x80\x80\x80"))); // invalid lead
 
     // Rejected: continuation bytes out of the allowed window.
-    CHECK_FALSE(valid("\xC3" + octets("\x40")));                  // continuation < 0x80
-    CHECK_FALSE(valid("\xF0" + octets("\x8F\x80\x80")));          // first continuation < 0x90
-    CHECK_FALSE(valid("\xE2" + octets("\xBF\x40")));              // last continuation < 0x80
+    CHECK_FALSE(valid("\xC3" + octets("\x40")));         // continuation < 0x80
+    CHECK_FALSE(valid("\xF0" + octets("\x8F\x80\x80"))); // first continuation < 0x90
+    CHECK_FALSE(valid("\xE2" + octets("\xBF\x40")));     // last continuation < 0x80
 
     // Truncated sequences: feed() stays pending until complete() is asked.
     Utf8Validator truncated;

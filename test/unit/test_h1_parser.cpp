@@ -2,7 +2,6 @@
 // and the client's HTTP/1.1 session.
 
 #include <catch2/catch_test_macros.hpp>
-
 #include <string>
 
 #include "simple_http.h"
@@ -15,10 +14,11 @@ using namespace simple_http::test;
 
 TEST_CASE("h1/parser: a plain request head", "[h1]") {
     H1Parser parser;
-    parser.feed("GET /a/b?c=d HTTP/1.1\r\nHost: example.com\r\nX-Trace: abc\r\n\r\nbody-bytes");
+    parser.feed("GET /a/b?c=d HTTP/1.1\r\nHost: example.com\r\nX-Trace: "
+                "abc\r\n\r\nbody-bytes");
 
     REQUIRE(parser.parse_head() == H1Parser::State::Done);
-    const auto& head = parser.head();
+    const auto &head = parser.head();
     CHECK(head.method == Method::Get);
     CHECK(head.method_token == "GET");
     CHECK(head.target == "/a/b?c=d");
@@ -35,7 +35,7 @@ TEST_CASE("h1/parser: incomplete input keeps asking for more", "[h1]") {
     H1Parser parser;
     parser.feed("GET / HTTP/1.1\r\nHost: x");
     CHECK(parser.parse_head() == H1Parser::State::NeedMore);
-    CHECK(parser.buffered() == 23);  // "GET / HTTP/1.1\r\nHost: x"
+    CHECK(parser.buffered() == 23); // "GET / HTTP/1.1\r\nHost: x"
 
     parser.feed("\r\n\r\n");
     CHECK(parser.parse_head() == H1Parser::State::Done);
@@ -78,7 +78,7 @@ TEST_CASE("h1/parser: versions and extension methods", "[h1]") {
     }
     {
         H1Parser parser;
-        parser.feed("PROPFIND /dav HTTP/1.1\r\n\r\n");  // an extension method
+        parser.feed("PROPFIND /dav HTTP/1.1\r\n\r\n"); // an extension method
         REQUIRE(parser.parse_head() == H1Parser::State::Done);
         CHECK(parser.head().method == Method::Unknown);
         CHECK(parser.head().method_token == "PROPFIND");
@@ -94,19 +94,19 @@ TEST_CASE("h1/parser: versions and extension methods", "[h1]") {
 TEST_CASE("h1/parser: malformed heads are rejected with a reason code", "[h1]") {
     {
         H1Parser parser;
-        parser.feed("GET/ HTTP/1.1\r\n\r\n");  // no space after the method
+        parser.feed("GET/ HTTP/1.1\r\n\r\n"); // no space after the method
         CHECK(parser.parse_head() == H1Parser::State::Error);
         CHECK(parser.error() == 40001);
     }
     {
         H1Parser parser;
-        parser.feed("GET  HTTP/1.1\r\n\r\n");  // empty target
+        parser.feed("GET  HTTP/1.1\r\n\r\n"); // empty target
         CHECK(parser.parse_head() == H1Parser::State::Error);
         CHECK(parser.error() == 40002);
     }
     {
         H1Parser parser;
-        parser.feed("GET / HTTP/1.1\r\nHost example.com\r\n\r\n");  // missing ':'
+        parser.feed("GET / HTTP/1.1\r\nHost example.com\r\n\r\n"); // missing ':'
         CHECK(parser.parse_head() == H1Parser::State::Error);
         CHECK(parser.error() == 40003);
     }
@@ -114,11 +114,12 @@ TEST_CASE("h1/parser: malformed heads are rejected with a reason code", "[h1]") 
         H1Parser parser;
         parser.feed("GET / HTTP/1.1\r\n" + std::string(201, 'a') + ": v\r\n\r\n");
         CHECK(parser.parse_head() == H1Parser::State::Error);
-        CHECK(parser.error() == 40004);  // field names are bounded
+        CHECK(parser.error() == 40004); // field names are bounded
     }
     {
         H1Parser parser;
-        // obs-fold (a continuation line) has no ':' of its own: rejected, not spliced.
+        // obs-fold (a continuation line) has no ':' of its own: rejected, not
+        // spliced.
         parser.feed("GET / HTTP/1.1\r\nHost: x\r\n  folded\r\n\r\n");
         CHECK(parser.parse_head() == H1Parser::State::Error);
         CHECK(parser.error() == 40003);
@@ -186,12 +187,12 @@ TEST_CASE("h1/response parser: reason phrase is optional, versions and codes", "
 TEST_CASE("h1/response parser: malformed heads", "[h1]") {
     {
         H1ResponseParser parser;
-        parser.feed("HTTP/2 200 OK\r\n\r\n");  // not an HTTP/1.x version
+        parser.feed("HTTP/2 200 OK\r\n\r\n"); // not an HTTP/1.x version
         CHECK(parser.parse_head() == H1ResponseParser::State::Error);
     }
     {
         H1ResponseParser parser;
-        parser.feed("HTTP/1.1 20 OK\r\n\r\n");  // two-digit status
+        parser.feed("HTTP/1.1 20 OK\r\n\r\n"); // two-digit status
         CHECK(parser.parse_head() == H1ResponseParser::State::Error);
     }
     {
@@ -201,7 +202,7 @@ TEST_CASE("h1/response parser: malformed heads", "[h1]") {
     }
     {
         H1ResponseParser parser;
-        parser.feed("HTTP/1.1 999 OK\r\n\r\n");  // out of range
+        parser.feed("HTTP/1.1 999 OK\r\n\r\n"); // out of range
         CHECK(parser.parse_head() == H1ResponseParser::State::Error);
     }
     {
@@ -234,13 +235,14 @@ TEST_CASE("h1/response parser: incremental input and bare LF", "[h1]") {
 
 TEST_CASE("h1/response parser: reset_after_head skips an informational response", "[h1]") {
     H1ResponseParser parser;
-    parser.feed("HTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    parser.feed("HTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\nHTTP/1.1 200 "
+                "OK\r\nContent-Length: 2\r\n\r\nok");
 
     REQUIRE(parser.parse_head() == H1ResponseParser::State::Done);
     CHECK(parser.head().status == 103);
     CHECK(parser.head().headers.get("link") == "</a>");
 
-    parser.reset_after_head();  // what the client does before the final head
+    parser.reset_after_head(); // what the client does before the final head
     REQUIRE(parser.parse_head() == H1ResponseParser::State::Done);
     CHECK(parser.head().status == 200);
     CHECK(parser.head().headers.get("content-length") == "2");
@@ -264,20 +266,24 @@ TEST_CASE("ws proxy: the replayed upgrade request keeps its shape", "[h1]") {
     CHECK(rebuilt.ends_with("\r\n\r\n"));
 
     const std::string rewritten = rebuild_request_head(head, "/chat");
-    CHECK(rewritten.starts_with("GET /chat HTTP/1.1\r\n"));  // the override replaces the target
+    CHECK(rewritten.starts_with("GET /chat HTTP/1.1\r\n")); // the override replaces the target
 
     ParsedHead http10 = head;
     http10.version = Version::Http1;
     CHECK(rebuild_request_head(http10).starts_with("GET /chat?reconnectionToken=abc HTTP/1.0\r\n"));
 }
 
-TEST_CASE("h1/parser: forbidden field-value bytes, SWAR fast path matches the naive check", "[h1]") {
+TEST_CASE("h1/parser: forbidden field-value bytes, SWAR fast path matches the naive "
+          "check",
+          "[h1]") {
     namespace hd = h1_detail;
     auto naive = [](std::string_view v) {
         for (char ch : v) {
             auto c = static_cast<unsigned char>(ch);
-            if (c == '\t') continue;
-            if (c < 0x20 || c == 0x7F) return true;
+            if (c == '\t')
+                continue;
+            if (c < 0x20 || c == 0x7F)
+                return true;
         }
         return false;
     };
@@ -304,8 +310,8 @@ TEST_CASE("h1/parser: forbidden field-value bytes, SWAR fast path matches the na
         for (int tail : tails) {
             std::string s(static_cast<std::size_t>(len), 'A');
             if (len > 0) {
-                s[0] = static_cast<char>(tail);        // head
-                s.back() = static_cast<char>(tail);    // tail
+                s[0] = static_cast<char>(tail);     // head
+                s.back() = static_cast<char>(tail); // tail
             }
             CHECK(hd::has_forbidden_field_value_byte(s) == naive(s));
         }

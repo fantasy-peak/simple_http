@@ -2,13 +2,12 @@
 // the segment-aware prefix test that the key is designed to be used with.
 //
 // This is the security-relevant half of the static-file design, so the cases
-// below are mostly adversary-shaped. The property under test is not "these known
-// bad inputs are rejected" but "no input can produce a key that escapes" — which
-// is why the hostile list is checked as a whole rather than one assertion per
-// string.
+// below are mostly adversary-shaped. The property under test is not "these
+// known bad inputs are rejected" but "no input can produce a key that escapes"
+// — which is why the hostile list is checked as a whole rather than one
+// assertion per string.
 
 #include <catch2/catch_test_macros.hpp>
-
 #include <string>
 #include <string_view>
 
@@ -19,9 +18,9 @@ using namespace simple_http;
 namespace {
 
 // Decodes and returns the key, or an empty optional with `err` filled in.
-std::optional<std::string> decode(std::string_view raw, PathError& err) { return decode_and_normalize(raw, err); }
+std::optional<std::string> decode(std::string_view raw, PathError &err) { return decode_and_normalize(raw, err); }
 
-}  // namespace
+} // namespace
 
 TEST_CASE("url_path: normalization folds the forms that mean the same file", "[url_path]") {
     PathError err{};
@@ -34,11 +33,11 @@ TEST_CASE("url_path: normalization folds the forms that mean the same file", "[u
     CHECK(ok("/") == "/");
     CHECK(ok("/a") == "/a");
     CHECK(ok("/a/b") == "/a/b");
-    CHECK(ok("/a/b/") == "/a/b");      // trailing slash is not a different resource
-    CHECK(ok("//a//b") == "/a/b");     // empty segments collapse
-    CHECK(ok("/a/./b") == "/a/b");     // "." segments collapse
-    // ".." is NOT folded here: a surviving one is refused outright rather than
-    // resolved, which is the next test case.
+    CHECK(ok("/a/b/") == "/a/b");  // trailing slash is not a different resource
+    CHECK(ok("//a//b") == "/a/b"); // empty segments collapse
+    CHECK(ok("/a/./b") == "/a/b"); // "." segments collapse
+                                   // ".." is NOT folded here: a surviving one is refused outright rather than
+                                   // resolved, which is the next test case.
 }
 
 TEST_CASE("url_path: a surviving .. is a traversal, wherever it hides", "[url_path]") {
@@ -67,15 +66,13 @@ TEST_CASE("url_path: an escaped separator is refused, not decoded", "[url_path]"
         PathError expected;
     };
     const Case cases[] = {
-        {"/..%2fb", PathError::Malformed},
-        {"/%2f", PathError::Malformed},
-        {"/a%2Fb", PathError::Malformed},
-        {"/a%5cb", PathError::Malformed},   // escaped backslash
-        {"/a%00b", PathError::Malformed},   // escaped NUL
-        {"/a%09b", PathError::Malformed},   // escaped tab
-        {"/a%1fb", PathError::Malformed},   // escaped control byte
+        {"/..%2fb", PathError::Malformed}, {"/%2f", PathError::Malformed},
+        {"/a%2Fb", PathError::Malformed},  {"/a%5cb", PathError::Malformed}, // escaped backslash
+        {"/a%00b", PathError::Malformed},                                    // escaped NUL
+        {"/a%09b", PathError::Malformed},                                    // escaped tab
+        {"/a%1fb", PathError::Malformed},                                    // escaped control byte
     };
-    for (const auto& c : cases) {
+    for (const auto &c : cases) {
         INFO("raw: " << c.raw);
         auto out = decode(c.raw, err);
         CHECK_FALSE(out.has_value());
@@ -122,9 +119,9 @@ TEST_CASE("url_path: high bytes pass through unexamined", "[url_path]") {
 
     auto overlong = decode("/%c0%ae%c0%ae", err);
     REQUIRE(overlong.has_value());
-    CHECK(*overlong == "/\xc0\xae\xc0\xae");  // a key, not a traversal
+    CHECK(*overlong == "/\xc0\xae\xc0\xae"); // a key, not a traversal
 
-    auto percent = decode("/a%25b", err);  // an escaped '%' is just a '%'
+    auto percent = decode("/a%25b", err); // an escaped '%' is just a '%'
     REQUIRE(percent.has_value());
     CHECK(*percent == "/a%b");
 }
@@ -140,13 +137,15 @@ TEST_CASE("url_path: the bounds are enforced before anything is built", "[url_pa
     CHECK(err == PathError::TooLong);
 
     std::string many;
-    for (std::size_t i = 0; i <= kMaxSegments; ++i) many += "/a";
+    for (std::size_t i = 0; i <= kMaxSegments; ++i)
+        many += "/a";
     CHECK_FALSE(decode(many, err).has_value());
     CHECK(err == PathError::TooLong);
 
     // Exactly at the segment limit is still fine.
     std::string at_limit;
-    for (std::size_t i = 0; i < kMaxSegments; ++i) at_limit += "/a";
+    for (std::size_t i = 0; i < kMaxSegments; ++i)
+        at_limit += "/a";
     CHECK(decode(at_limit, err).has_value());
 }
 

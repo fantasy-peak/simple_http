@@ -1,30 +1,30 @@
 #pragma once
 
-// Client-side TLS for the outbound HTTP client: the ssl::context builder and the
-// client handshake.
+// Client-side TLS for the outbound HTTP client: the ssl::context builder and
+// the client handshake.
 //
 // The byte stream itself is the server's TlsStreamTransport — a TLS connection
 // is symmetric once the handshake is done, and the transport's async_read/
-// async_write/alpn_selected/tls_handle are all role-agnostic. Only the handshake
-// differs (asio::ssl::stream_base::client instead of ::server, plus SNI, ALPN
-// and host-name verification on our side), so that is all this header adds; the
-// server's own handshake() is left untouched.
+// async_write/alpn_selected/tls_handle are all role-agnostic. Only the
+// handshake differs (asio::ssl::stream_base::client instead of ::server, plus
+// SNI, ALPN and host-name verification on our side), so that is all this header
+// adds; the server's own handshake() is left untouched.
 //
 // Configuration errors (unreadable CA file, unloadable client certificate) are
 // reported by throwing std::runtime_error, matching the server's TlsContext —
 // they are programming/configuration faults, not per-request failures.
 
+#include <openssl/ssl.h>
+#include <openssl/x509v3.h>
+
+#include <boost/asio.hpp>
+#include <boost/asio/ssl.hpp>
 #include <format>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
-
-#include <boost/asio.hpp>
-#include <boost/asio/ssl.hpp>
-#include <openssl/ssl.h>
-#include <openssl/x509v3.h>
 
 #include "../core/logging.h"
 #include "../transport/tls_transport.h"
@@ -45,26 +45,26 @@ inline bool is_ip_literal(std::string_view host) {
 
 // The ALPN protocol list to offer, in TLS wire format (length-prefixed).
 // TlsClientConfig::alpn overrides the policy-derived default.
-inline std::vector<unsigned char> alpn_wire_list(const ClientTarget& target, const TlsClientConfig& cfg) {
+inline std::vector<unsigned char> alpn_wire_list(const ClientTarget &target, const TlsClientConfig &cfg) {
     std::vector<std::string> protos = cfg.alpn;
     if (protos.empty()) {
         switch (target.version) {
-            case HttpVersionPolicy::Http11:
-                protos.emplace_back("http/1.1");
-                break;
-            case HttpVersionPolicy::Http2:
-                protos.emplace_back("h2");
-                break;
-            case HttpVersionPolicy::Auto:
-            default:
-                // h2 first: the server picks the first protocol it supports.
-                protos.emplace_back("h2");
-                protos.emplace_back("http/1.1");
-                break;
+        case HttpVersionPolicy::Http11:
+            protos.emplace_back("http/1.1");
+            break;
+        case HttpVersionPolicy::Http2:
+            protos.emplace_back("h2");
+            break;
+        case HttpVersionPolicy::Auto:
+        default:
+            // h2 first: the server picks the first protocol it supports.
+            protos.emplace_back("h2");
+            protos.emplace_back("http/1.1");
+            break;
         }
     }
     std::vector<unsigned char> wire;
-    for (const auto& proto : protos) {
+    for (const auto &proto : protos) {
         if (proto.empty() || proto.size() > 255) {
             throw std::runtime_error(std::format("TLS ALPN protocol name out of range: '{}'", proto));
         }
@@ -76,11 +76,11 @@ inline std::vector<unsigned char> alpn_wire_list(const ClientTarget& target, con
 
 // Builds and configures the client-side ssl::context: verification, CA bundle,
 // optional client certificate (mTLS) and the TLS floor.
-inline std::shared_ptr<asio::ssl::context> make_client_ssl_context(const TlsClientConfig& cfg) {
+inline std::shared_ptr<asio::ssl::context> make_client_ssl_context(const TlsClientConfig &cfg) {
     auto ctx = std::make_shared<asio::ssl::context>(asio::ssl::context::tls_client);
 
     if (cfg.setup) {
-        cfg.setup(*ctx);  // user customizations first; the fields below still apply
+        cfg.setup(*ctx); // user customizations first; the fields below still apply
     }
 
     std::uint64_t options =
@@ -100,7 +100,7 @@ inline std::shared_ptr<asio::ssl::context> make_client_ssl_context(const TlsClie
             }
         } else {
             error_code ec;
-            ctx->set_default_verify_paths(ec);  // best effort: no store means the handshake fails later
+            ctx->set_default_verify_paths(ec); // best effort: no store means the handshake fails later
             if (ec) {
                 SIMPLE_HTTP_ERROR_LOG("client TLS: no default verify paths: {}", ec.message());
             }
@@ -138,8 +138,8 @@ struct ClientTlsHandshake {
 // (optionally) host-name verification are set here, then asio's client
 // handshake runs. Returns the transport's error_code; a verification failure
 // arrives as its own error (e.g. asio::error::certificate_verify_failed).
-inline asio::awaitable<error_code> tls_client_handshake(TlsStreamTransport& transport, const ClientTlsHandshake& hs) {
-    SSL* ssl = transport.stream().native_handle();
+inline asio::awaitable<error_code> tls_client_handshake(TlsStreamTransport &transport, const ClientTlsHandshake &hs) {
+    SSL *ssl = transport.stream().native_handle();
 
     // SNI: what the peer should match its certificate against.
     if (!hs.sni.empty() && !is_ip_literal(hs.sni)) {
@@ -147,7 +147,7 @@ inline asio::awaitable<error_code> tls_client_handshake(TlsStreamTransport& tran
     }
 
     if (hs.verify_host) {
-        X509_VERIFY_PARAM* param = SSL_get0_param(ssl);
+        X509_VERIFY_PARAM *param = SSL_get0_param(ssl);
         X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
         if (is_ip_literal(hs.sni)) {
             if (X509_VERIFY_PARAM_set1_ip_asc(param, std::string{hs.sni}.c_str()) != 1) {
@@ -172,4 +172,4 @@ inline asio::awaitable<error_code> tls_client_handshake(TlsStreamTransport& tran
     co_return ec;
 }
 
-}  // namespace simple_http
+} // namespace simple_http

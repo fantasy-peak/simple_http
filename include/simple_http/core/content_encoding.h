@@ -140,13 +140,13 @@ class ContentDecoder {
 
 namespace detail {
 
-inline std::string zlib_run(z_stream& zs, bool& ok, std::string_view data, int flush) {
-    zs.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(data.data()));
+inline std::string zlib_run(z_stream &zs, bool &ok, std::string_view data, int flush) {
+    zs.next_in = reinterpret_cast<Bytef *>(const_cast<char *>(data.data()));
     zs.avail_in = static_cast<uInt>(data.size());
     std::string out;
     for (;;) {
         char buf[16 * 1024];
-        zs.next_out = reinterpret_cast<Bytef*>(buf);
+        zs.next_out = reinterpret_cast<Bytef *>(buf);
         zs.avail_out = sizeof(buf);
         const int rc = ::deflate(&zs, flush);
         out.append(buf, sizeof(buf) - zs.avail_out);
@@ -173,21 +173,20 @@ inline std::string zlib_run(z_stream& zs, bool& ok, std::string_view data, int f
     return out;
 }
 
-inline std::string brotli_run(BrotliEncoderState* st, bool& ok, std::string_view data,
-                              BrotliEncoderOperation op) {
+inline std::string brotli_run(BrotliEncoderState *st, bool &ok, std::string_view data, BrotliEncoderOperation op) {
     std::size_t avail_in = data.size();
-    const std::uint8_t* next_in = reinterpret_cast<const std::uint8_t*>(data.data());
+    const std::uint8_t *next_in = reinterpret_cast<const std::uint8_t *>(data.data());
     std::string out;
     for (;;) {
         std::uint8_t buf[16 * 1024];
         std::size_t avail_out = sizeof(buf);
-        std::uint8_t* next_out = buf;
+        std::uint8_t *next_out = buf;
         std::size_t total_out = 0;
         if (!::BrotliEncoderCompressStream(st, op, &avail_in, &next_in, &avail_out, &next_out, &total_out)) {
             ok = false;
             break;
         }
-        out.append(reinterpret_cast<const char*>(buf), sizeof(buf) - avail_out);
+        out.append(reinterpret_cast<const char *>(buf), sizeof(buf) - avail_out);
         if (op == BROTLI_OPERATION_FINISH) {
             if (::BrotliEncoderIsFinished(st)) {
                 break;
@@ -258,7 +257,7 @@ class BrotliEncoderImpl final : public ContentEncoder {
     }
 
   private:
-    BrotliEncoderState* m_st{nullptr};
+    BrotliEncoderState *m_st{nullptr};
     bool m_ok{true};
 };
 
@@ -273,7 +272,7 @@ class GzipDecoder final : public ContentDecoder {
         }
     }
     ~GzipDecoder() override {
-        if (m_zs.state != nullptr) {  // only set once inflateInit2 succeeded
+        if (m_zs.state != nullptr) { // only set once inflateInit2 succeeded
             ::inflateEnd(&m_zs);
         }
     }
@@ -296,12 +295,12 @@ class GzipDecoder final : public ContentDecoder {
         if (m_failed) {
             return {};
         }
-        m_zs.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(data.data()));
+        m_zs.next_in = reinterpret_cast<Bytef *>(const_cast<char *>(data.data()));
         m_zs.avail_in = static_cast<uInt>(data.size());
         std::string out;
         for (;;) {
             char buf[16 * 1024];
-            m_zs.next_out = reinterpret_cast<Bytef*>(buf);
+            m_zs.next_out = reinterpret_cast<Bytef *>(buf);
             m_zs.avail_out = sizeof(buf);
             const int rc = ::inflate(&m_zs, Z_NO_FLUSH);
             out.append(buf, sizeof(buf) - m_zs.avail_out);
@@ -311,12 +310,12 @@ class GzipDecoder final : public ContentDecoder {
             }
             if (rc == Z_OK) {
                 if (m_zs.avail_in == 0 && m_zs.avail_out != 0) {
-                    break;  // consumed everything it could; more input will come
+                    break; // consumed everything it could; more input will come
                 }
-                continue;  // output buffer filled: there is more to collect
+                continue; // output buffer filled: there is more to collect
             }
             if (rc == Z_BUF_ERROR) {
-                break;  // not enough input to make progress - not an error
+                break; // not enough input to make progress - not an error
             }
             m_failed = true;
             break;
@@ -348,15 +347,15 @@ class BrotliDecoderImpl final : public ContentDecoder {
             return {};
         }
         std::size_t avail_in = data.size();
-        const std::uint8_t* next_in = reinterpret_cast<const std::uint8_t*>(data.data());
+        const std::uint8_t *next_in = reinterpret_cast<const std::uint8_t *>(data.data());
         std::string out;
         for (;;) {
             std::uint8_t buf[16 * 1024];
             std::size_t avail_out = sizeof(buf);
-            std::uint8_t* next_out = buf;
+            std::uint8_t *next_out = buf;
             const BrotliDecoderResult rc =
                 ::BrotliDecoderDecompressStream(m_st, &avail_in, &next_in, &avail_out, &next_out, nullptr);
-            out.append(reinterpret_cast<const char*>(buf), sizeof(buf) - avail_out);
+            out.append(reinterpret_cast<const char *>(buf), sizeof(buf) - avail_out);
             if (rc == BROTLI_DECODER_RESULT_SUCCESS) {
                 m_stream_end = true;
                 break;
@@ -367,7 +366,7 @@ class BrotliDecoderImpl final : public ContentDecoder {
             if (rc == BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT) {
                 break;
             }
-            m_failed = true;  // ERROR
+            m_failed = true; // ERROR
             break;
         }
         return out;
@@ -383,18 +382,18 @@ class BrotliDecoderImpl final : public ContentDecoder {
     bool failed() const override { return m_failed; }
 
   private:
-    BrotliDecoderState* m_st{nullptr};
+    BrotliDecoderState *m_st{nullptr};
     bool m_stream_end{false};
     bool m_failed{false};
 };
 
-}  // namespace detail
+} // namespace detail
 
-#endif  // SIMPLE_HTTP_ENABLE_COMPRESSION
+#endif // SIMPLE_HTTP_ENABLE_COMPRESSION
 
 // Returns nullptr when `encoding` is unknown or no codec is compiled in.
 [[nodiscard]] inline std::unique_ptr<ContentEncoder> make_encoder(std::string_view encoding,
-                                                                 const CompressionConfig& config) {
+                                                                  const CompressionConfig &config) {
 #ifdef SIMPLE_HTTP_ENABLE_COMPRESSION
     if (encoding == kEncodingGzip) {
         return std::make_unique<detail::GzipEncoder>(config.gzip_level);
@@ -427,8 +426,7 @@ class BrotliDecoderImpl final : public ContentDecoder {
 
 // Compresses a whole buffer with one call. Falls back to a copy when the
 // encoding is unavailable, so callers never have to check.
-inline std::string compress_all(std::string_view encoding, std::string_view in,
-                                const CompressionConfig& config) {
+inline std::string compress_all(std::string_view encoding, std::string_view in, const CompressionConfig &config) {
     auto encoder = make_encoder(encoding, config);
     if (!encoder) {
         return std::string{in};
@@ -464,7 +462,7 @@ inline std::string decompress_all(std::string_view encoding, std::string_view in
 // Ties go to brotli: at equal quality it produces a smaller body, and the extra
 // CPU is the caller's choice (they enabled compression).
 inline std::optional<std::string> negotiate_encoding(std::string_view accept_encoding,
-                                                     const CompressionConfig& config) {
+                                                     const CompressionConfig &config) {
     if (!config.enabled || accept_encoding.empty()) {
         return std::nullopt;
     }
@@ -472,13 +470,13 @@ inline std::optional<std::string> negotiate_encoding(std::string_view accept_enc
     // -1 means "not mentioned"; the `*` entry fills the gaps.
     double q_brotli = -1.0;
     double q_gzip = -1.0;
-    double q_any = 0.0;  // per RFC 9110, an absent `*` means "not acceptable"
+    double q_any = 0.0; // per RFC 9110, an absent `*` means "not acceptable"
 
     std::size_t pos = 0;
     while (pos <= accept_encoding.size()) {
         const auto comma = accept_encoding.find(',', pos);
-        std::string_view token = accept_encoding.substr(
-            pos, comma == std::string_view::npos ? std::string_view::npos : comma - pos);
+        std::string_view token =
+            accept_encoding.substr(pos, comma == std::string_view::npos ? std::string_view::npos : comma - pos);
         pos = (comma == std::string_view::npos) ? accept_encoding.size() + 1 : comma + 1;
 
         token = trim_ascii(token);
@@ -546,10 +544,10 @@ inline bool default_compressible_type(std::string_view essence) {
         return true;
     }
     if (iequals_ci(essence, "image/svg+xml")) {
-        return true;  // XML, despite the image/ prefix
+        return true; // XML, despite the image/ prefix
     }
-    if (starts_with_ci(essence, "image/") || starts_with_ci(essence, "video/") ||
-        starts_with_ci(essence, "audio/") || starts_with_ci(essence, "font/")) {
+    if (starts_with_ci(essence, "image/") || starts_with_ci(essence, "video/") || starts_with_ci(essence, "audio/") ||
+        starts_with_ci(essence, "font/")) {
         return false;
     }
     if (ends_with_ci(essence, "+json") || ends_with_ci(essence, "+xml")) {
@@ -562,13 +560,13 @@ inline bool default_compressible_type(std::string_view essence) {
 }
 
 // A non-empty config.types replaces the built-in rule entirely.
-inline bool is_compressible_type(std::string_view content_type, const CompressionConfig& config) {
+inline bool is_compressible_type(std::string_view content_type, const CompressionConfig &config) {
     const std::string_view essence = mime_essence(content_type);
     if (essence.empty()) {
         return false;
     }
     if (!config.types.empty()) {
-        for (const std::string& allowed : config.types) {
+        for (const std::string &allowed : config.types) {
             if (iequals_ci(allowed, essence)) {
                 return true;
             }
@@ -578,4 +576,4 @@ inline bool is_compressible_type(std::string_view content_type, const Compressio
     return default_compressible_type(essence);
 }
 
-}  // namespace simple_http
+} // namespace simple_http

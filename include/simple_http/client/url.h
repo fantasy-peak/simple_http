@@ -20,16 +20,14 @@
 namespace simple_http {
 
 struct Url {
-    std::string scheme;     // "http" or "https"
-    std::string host;       // host name, IPv4 or bare IPv6 literal (no brackets)
-    std::uint16_t port{0};  // explicit port; 0 = the scheme's default
+    std::string scheme;    // "http" or "https"
+    std::string host;      // host name, IPv4 or bare IPv6 literal (no brackets)
+    std::uint16_t port{0}; // explicit port; 0 = the scheme's default
     // Path + query, in origin-form, always at least "/" and never containing a
     // fragment. This is what goes on the request line (HTTP/1.1) or into :path.
     std::string target{"/"};
 
-    bool use_tls() const {
-        return scheme == "https";
-    }
+    bool use_tls() const { return scheme == "https"; }
 
     std::uint16_t effective_port() const {
         if (port != 0)
@@ -84,14 +82,14 @@ inline bool url_scheme_char(char c) {
 
 inline std::string url_lower(std::string_view s) {
     std::string out{s};
-    for (auto& c : out) {
+    for (auto &c : out) {
         if (c >= 'A' && c <= 'Z')
             c = static_cast<char>(c - 'A' + 'a');
     }
     return out;
 }
 
-inline bool url_valid_port(std::string_view s, std::uint16_t& out) {
+inline bool url_valid_port(std::string_view s, std::uint16_t &out) {
     if (s.empty() || s.size() > 5)
         return false;
     unsigned v = 0;
@@ -106,7 +104,7 @@ inline bool url_valid_port(std::string_view s, std::uint16_t& out) {
     return true;
 }
 
-}  // namespace detail
+} // namespace detail
 
 // Parses an absolute http:// or https:// URL. On failure the returned
 // error_code is client_errc::unsupported_scheme (a well-formed URL for another
@@ -182,7 +180,7 @@ inline std::expected<Url, error_code> parse_url(std::string_view url) {
     if (tail.empty()) {
         out.target = "/";
     } else if (tail.front() == '?') {
-        out.target = "/" + std::string{tail};  // "http://h?q" -> "/?q"
+        out.target = "/" + std::string{tail}; // "http://h?q" -> "/?q"
     } else {
         out.target = std::string{tail};
     }
@@ -195,4 +193,4 @@ inline std::expected<Url, error_code> parse_url(std::string_view url) {
     return out;
 }
 
-}  // namespace simple_http
+} // namespace simple_http

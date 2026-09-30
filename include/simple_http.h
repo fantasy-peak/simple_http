@@ -17,47 +17,49 @@
 // grows layer by layer; see the task list for progress.
 
 // --- core layer ---
-#include "simple_http/core/version.h"
-#include "simple_http/core/types.h"
-#include "simple_http/core/http_field.h"
-#include "simple_http/core/http_status.h"
-#include "simple_http/core/logging.h"
-#include "simple_http/core/mime.h"
+#include "simple_http/core/accept_encoding.h" // reuses types.h; must not redefine content_encoding.h names
 #include "simple_http/core/base64.h"
 #include "simple_http/core/compression.h"
-#include "simple_http/core/content_encoding.h"  // codecs need SIMPLE_HTTP_ENABLE_COMPRESSION
+#include "simple_http/core/content_encoding.h" // codecs need SIMPLE_HTTP_ENABLE_COMPRESSION
 #include "simple_http/core/http_date.h"
-#include "simple_http/core/url_path.h"
-#include "simple_http/core/accept_encoding.h"  // reuses types.h; must not redefine content_encoding.h names
-#include "simple_http/core/validators.h"
-#include "simple_http/core/static_table.h"
+#include "simple_http/core/http_field.h"
+#include "simple_http/core/http_status.h"
 #include "simple_http/core/io_pool.h"
+#include "simple_http/core/logging.h"
+#include "simple_http/core/mime.h"
+#include "simple_http/core/static_table.h"
+#include "simple_http/core/types.h"
+#include "simple_http/core/url_path.h"
+#include "simple_http/core/validators.h"
+#include "simple_http/core/version.h"
 
 // --- proto layer (version-agnostic HTTP request/response model) ---
-#include "simple_http/proto/headers.h"
 #include "simple_http/proto/body.h"
+#include "simple_http/proto/compressing_writer.h" // opt-in via CompressionConfig::enabled
+#include "simple_http/proto/headers.h"
 #include "simple_http/proto/request.h"
-#include "simple_http/proto/response_writer.h"
 #include "simple_http/proto/response.h"
-#include "simple_http/proto/compressing_writer.h"  // opt-in via CompressionConfig::enabled
+#include "simple_http/proto/response_writer.h"
 
-// --- transport layer (byte-stream abstraction over TCP plain/TLS; QUIC later) ---
-#include "simple_http/transport/transport.h"
+// --- transport layer (byte-stream abstraction over TCP plain/TLS; QUIC later)
+// ---
 #include "simple_http/transport/tcp_transport.h"
 #include "simple_http/transport/tls_context.h"
 #include "simple_http/transport/tls_transport.h"
+#include "simple_http/transport/transport.h"
 
-// --- engine layer (per-version protocol engines implementing ResponseWriter) ---
+// --- engine layer (per-version protocol engines implementing ResponseWriter)
+// ---
 #include "simple_http/engine/h1/h1_engine.h"
 #include "simple_http/engine/h2/h2_engine.h"
-#include "simple_http/engine/h3/h3_engine.h"  // no-op unless SIMPLE_HTTP_ENABLE_HTTP3
+#include "simple_http/engine/h3/h3_engine.h" // no-op unless SIMPLE_HTTP_ENABLE_HTTP3
 
 // --- handler layer (handler type system + router/dispatch) ---
 #include "simple_http/engine/dispatcher.h"
+#include "simple_http/handler/cors.h" // CorsConfig (public: exported for server.cors)
 #include "simple_http/handler/handler.h"
-#include "simple_http/handler/cors.h"  // CorsConfig (public: exported for server.cors)
-#include "simple_http/handler/static_files.h"
 #include "simple_http/handler/router.h"
+#include "simple_http/handler/static_files.h"
 
 #ifdef SIMPLE_HTTP_ENABLE_OPENAPI
 // --- openapi layer (typed routes → OAS 3.0 doc + CDN Swagger UI; opt-in) ---

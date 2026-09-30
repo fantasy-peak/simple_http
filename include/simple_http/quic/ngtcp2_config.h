@@ -2,8 +2,8 @@
 
 // `QuicConnectionConfig` → ngtcp2 settings and transport parameters.
 //
-// The struct is the user-visible knob set (`ServerConfig::quic_options`), and it
-// predates ngtcp2; this file is the translation, and the place where the two
+// The struct is the user-visible knob set (`ServerConfig::quic_options`), and
+// it predates ngtcp2; this file is the translation, and the place where the two
 // vocabularies disagree is written down rather than discovered later.
 //
 // Three of the knobs have no ngtcp2 counterpart at all. They are kept in the
@@ -11,10 +11,10 @@
 // inert one is only a semantic downgrade — and marked here so that nobody
 // spends an afternoon looking for where they went.
 
+#include <ngtcp2/ngtcp2.h>
+
 #include <cstddef>
 #include <cstdint>
-
-#include <ngtcp2/ngtcp2.h>
 
 namespace simple_http::quic {
 
@@ -74,7 +74,7 @@ struct Ngtcp2Params {
 // place that knows whether a Retry was issued (RFC 9000 §7.3 requires the
 // server to echo both back, and §7.4.1 lets the client detect a forgery when
 // they disagree).
-inline Ngtcp2Params make_ngtcp2_params(const QuicConnectionConfig& cfg, ngtcp2_tstamp ts) {
+inline Ngtcp2Params make_ngtcp2_params(const QuicConnectionConfig &cfg, ngtcp2_tstamp ts) {
     Ngtcp2Params out;
 
     ngtcp2_settings_default(&out.settings);
@@ -135,4 +135,4 @@ inline Ngtcp2Params make_ngtcp2_params(const QuicConnectionConfig& cfg, ngtcp2_t
     return out;
 }
 
-}  // namespace simple_http::quic
+} // namespace simple_http::quic

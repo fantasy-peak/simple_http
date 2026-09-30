@@ -65,6 +65,6 @@ inline constexpr std::string_view vary = "vary";
 inline constexpr std::string_view via = "via";
 inline constexpr std::string_view www_authenticate = "www-authenticate";
 
-}  // namespace field
+} // namespace field
 
-}  // namespace simple_http
+} // namespace simple_http

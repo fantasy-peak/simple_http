@@ -4,7 +4,6 @@
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
-
 #include <string>
 
 #include "simple_http.h"
@@ -20,24 +19,24 @@ CompressionConfig compression_on() {
 }
 
 // Negotiation result as a string, so the assertions read as one line.
-std::string pick(std::string_view accept_encoding, const CompressionConfig& config) {
+std::string pick(std::string_view accept_encoding, const CompressionConfig &config) {
     return negotiate_encoding(accept_encoding, config).value_or("<none>");
 }
 
-}  // namespace
+} // namespace
 
 TEST_CASE("content_encoding: negotiation honouring q-values", "[compression]") {
     const CompressionConfig config = compression_on();
 
     CHECK(pick("gzip", config) == "gzip");
     CHECK(pick("br", config) == "br");
-    CHECK(pick("GZIP", config) == "gzip");  // case-insensitive
-    CHECK(pick("gzip, br", config) == "br");  // tie goes to brotli
+    CHECK(pick("GZIP", config) == "gzip");   // case-insensitive
+    CHECK(pick("gzip, br", config) == "br"); // tie goes to brotli
     CHECK(pick("br, gzip", config) == "br");
 
     CHECK(pick("br;q=0.5, gzip;q=0.9", config) == "gzip");
     CHECK(pick("br;q=0.9, gzip;q=0.5", config) == "br");
-    CHECK(pick(" br ; gzip ", config) == "br");  // surrounding whitespace
+    CHECK(pick(" br ; gzip ", config) == "br"); // surrounding whitespace
 }
 
 TEST_CASE("content_encoding: negotiation refuses what the client refuses", "[compression]") {
@@ -45,19 +44,19 @@ TEST_CASE("content_encoding: negotiation refuses what the client refuses", "[com
 
     CHECK(pick("", config) == "<none>");
     CHECK(pick("identity", config) == "<none>");
-    CHECK(pick("deflate", config) == "<none>");  // valid, but not one we produce
+    CHECK(pick("deflate", config) == "<none>"); // valid, but not one we produce
     CHECK(pick("gzip;q=0", config) == "<none>");
     CHECK(pick("br;q=0, gzip;q=0", config) == "<none>");
     CHECK(pick("*;q=0", config) == "<none>");
-    CHECK(pick("gzip;q=0.001", config) == "gzip");  // a hair above zero still counts
+    CHECK(pick("gzip;q=0.001", config) == "gzip"); // a hair above zero still counts
 }
 
 TEST_CASE("content_encoding: the wildcard covers the unmentioned", "[compression]") {
     const CompressionConfig config = compression_on();
 
     CHECK(pick("*", config) == "br");
-    CHECK(pick("*;q=0, gzip", config) == "gzip");  // explicit beats the wildcard
-    CHECK(pick("gzip;q=0, *", config) == "br");    // gzip stays refused, brotli is covered
+    CHECK(pick("*;q=0, gzip", config) == "gzip"); // explicit beats the wildcard
+    CHECK(pick("gzip;q=0, *", config) == "br");   // gzip stays refused, brotli is covered
     CHECK(pick("gzip;q=0.4, *", config) == "br");
 }
 
@@ -71,10 +70,12 @@ TEST_CASE("content_encoding: which types are worth compressing", "[compression]"
     const CompressionConfig config = compression_on();
 
     CHECK(is_compressible_type("text/html", config));
-    CHECK(is_compressible_type("text/plain; charset=utf-8", config));  // parameters stripped
+    CHECK(is_compressible_type("text/plain; charset=utf-8",
+                               config)); // parameters stripped
     CHECK(is_compressible_type("APPLICATION/JSON", config));
-    CHECK(is_compressible_type("application/ld+json", config));  // +json suffix
-    CHECK(is_compressible_type("image/svg+xml", config));        // svg is text, not a bitmap
+    CHECK(is_compressible_type("application/ld+json", config)); // +json suffix
+    CHECK(is_compressible_type("image/svg+xml",
+                               config)); // svg is text, not a bitmap
 
     CHECK_FALSE(is_compressible_type("image/png", config));
     CHECK_FALSE(is_compressible_type("video/mp4", config));
@@ -90,7 +91,7 @@ TEST_CASE("content_encoding: an explicit type list replaces the built-in rule", 
     config.types = {"application/octet-stream"};
 
     CHECK(is_compressible_type("application/octet-stream", config));
-    CHECK_FALSE(is_compressible_type("text/html", config));  // no longer implicit
+    CHECK_FALSE(is_compressible_type("text/html", config)); // no longer implicit
 }
 
 TEST_CASE("content_encoding: q-value and mime parsing", "[compression]") {
@@ -98,7 +99,7 @@ TEST_CASE("content_encoding: q-value and mime parsing", "[compression]") {
     CHECK(parse_qvalue("0") == 0.0);
     CHECK(parse_qvalue("0.8") == Catch::Approx(0.8));
     CHECK(parse_qvalue(".5") == Catch::Approx(0.5));
-    CHECK(parse_qvalue("bogus") == 0.0);  // unparseable reads as "not acceptable"
+    CHECK(parse_qvalue("bogus") == 0.0); // unparseable reads as "not acceptable"
 
     CHECK(mime_essence("text/html; charset=utf-8") == "text/html");
     CHECK(mime_essence("text/html") == "text/html");
@@ -120,7 +121,7 @@ std::string repetitive_body() {
     return body;
 }
 
-}  // namespace
+} // namespace
 
 TEST_CASE("content_encoding: round-trips shrink and restore", "[compression]") {
     const CompressionConfig config = compression_on();
@@ -194,7 +195,7 @@ TEST_CASE("content_encoding: a truncated stream reports failure", "[compression]
         auto decoder = make_decoder(encoding);
         REQUIRE(decoder != nullptr);
         (void)decoder->write(std::string_view{full}.substr(0, full.size() - 4));
-        (void)decoder->finish();  // the stream never reached its end marker
+        (void)decoder->finish(); // the stream never reached its end marker
         CHECK(decoder->failed());
     }
 }
@@ -225,4 +226,4 @@ TEST_CASE("content_encoding: unknown encodings and codecs", "[compression]") {
     CHECK(decompress_all("deflate", "payload") == "payload");
 }
 
-#endif  // SIMPLE_HTTP_ENABLE_COMPRESSION
+#endif // SIMPLE_HTTP_ENABLE_COMPRESSION

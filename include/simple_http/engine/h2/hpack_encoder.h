@@ -3,11 +3,11 @@
 // HPACK response header-block encoder (RFC 7541), framework-free.
 //
 // This is a fresh, minimal encoder built on the two primitives that are
-// byte-for-byte correct: the Huffman codec (`codec::http_huffman_encode`) and the
-// HPACK static table (`codec::http2_header_static_table`). It does not reuse the
-// ported `make_http2_headers_item*` builders that used to live beside that table
-// — their varint continuation-byte math was wrong for values >= 127 and they
-// double-emitted the length prefix — and those have since been deleted
+// byte-for-byte correct: the Huffman codec (`codec::http_huffman_encode`) and
+// the HPACK static table (`codec::http2_header_static_table`). It does not
+// reuse the ported `make_http2_headers_item*` builders that used to live beside
+// that table — their varint continuation-byte math was wrong for values >= 127
+// and they double-emitted the length prefix — and those have since been deleted
 // (hpack_static_table.h is all that remains of that file).
 //
 // Strategy: every header field is encoded as "Literal Header Field without
@@ -31,7 +31,7 @@ namespace simple_http::codec {
 // Appends an HPACK integer (RFC 7541 §5.1) with the given prefix bits and
 // leading pattern already set in `prefix_byte` (e.g. 0x00 for "without
 // indexing", with the low `prefix_bits` bits left at 0 for the value).
-inline void hpack_append_integer(std::string& out, unsigned char prefix_byte, unsigned int prefix_bits,
+inline void hpack_append_integer(std::string &out, unsigned char prefix_byte, unsigned int prefix_bits,
                                  uint64_t value) {
     const uint64_t max_prefix = (1ull << prefix_bits) - 1ull;
     if (value < max_prefix) {
@@ -50,9 +50,9 @@ inline void hpack_append_integer(std::string& out, unsigned char prefix_byte, un
 // Appends an HPACK string literal (RFC 7541 §5.2), always Huffman-coded (the
 // Huffman table never expands ASCII header text, so this is never larger than
 // the raw encoding and is simpler to always take).
-inline void hpack_append_string(std::string& out, std::string_view value) {
+inline void hpack_append_string(std::string &out, std::string_view value) {
     std::string huff;
-    http_huffman_encode(reinterpret_cast<unsigned char*>(const_cast<char*>(value.data())),
+    http_huffman_encode(reinterpret_cast<unsigned char *>(const_cast<char *>(value.data())),
                         static_cast<unsigned int>(value.size()), huff);
     hpack_append_integer(out, 0x80, 7, huff.size());
     out.append(huff);
@@ -61,42 +61,55 @@ inline void hpack_append_string(std::string& out, std::string_view value) {
 // Appends one header field as "Literal Header Field without Indexing"
 // (RFC 7541 §6.2.2: 0000 0000 prefix byte since the name is given as a
 // literal, not a table index), with both name and value Huffman-coded.
-inline void hpack_append_literal(std::string& out, std::string_view name, std::string_view value) {
-    out.push_back('\x00');  // index=0 (literal name follows), "without indexing" pattern
+inline void hpack_append_literal(std::string &out, std::string_view name, std::string_view value) {
+    out.push_back('\x00'); // index=0 (literal name follows), "without indexing" pattern
     hpack_append_string(out, name);
     hpack_append_string(out, value);
 }
 
 // Appends an indexed header field (RFC 7541 §6.1): one byte for any entry in
-// the static table whose exact name *and* value we are sending (e.g. index 2 for
+// the static table whose exact name *and* value we are sending (e.g. index 2
+// for
 // `:method: GET`).
-inline void hpack_append_indexed(std::string& out, uint64_t index) {
-    hpack_append_integer(out, 0x80, 7, index);
-}
+inline void hpack_append_indexed(std::string &out, uint64_t index) { hpack_append_integer(out, 0x80, 7, index); }
 
 // Appends a literal field whose *name* comes from the table (RFC 7541 §6.2.2,
 // index prefix 4 bits): the name costs one byte instead of a Huffman-coded
 // string, which is what makes a request head mostly table references.
-inline void hpack_append_literal_indexed_name(std::string& out, uint64_t name_index, std::string_view value) {
+inline void hpack_append_literal_indexed_name(std::string &out, uint64_t name_index, std::string_view value) {
     hpack_append_integer(out, 0x00, 4, name_index);
     hpack_append_string(out, value);
 }
 
 // Appends `:status` using the static-table index when the code is one of the
 // entries HPACK reserves (RFC 7541 Appendix A), else falls back to a literal.
-inline void hpack_append_status(std::string& out, int status) {
+inline void hpack_append_status(std::string &out, int status) {
     switch (status) {
-        case 200: out.push_back(static_cast<char>(0x88)); return;
-        case 204: out.push_back(static_cast<char>(0x89)); return;
-        case 206: out.push_back(static_cast<char>(0x8A)); return;
-        case 304: out.push_back(static_cast<char>(0x8B)); return;
-        case 400: out.push_back(static_cast<char>(0x8C)); return;
-        case 404: out.push_back(static_cast<char>(0x8D)); return;
-        case 500: out.push_back(static_cast<char>(0x8E)); return;
-        default:
-            hpack_append_literal(out, ":status", std::to_string(status));
-            return;
+    case 200:
+        out.push_back(static_cast<char>(0x88));
+        return;
+    case 204:
+        out.push_back(static_cast<char>(0x89));
+        return;
+    case 206:
+        out.push_back(static_cast<char>(0x8A));
+        return;
+    case 304:
+        out.push_back(static_cast<char>(0x8B));
+        return;
+    case 400:
+        out.push_back(static_cast<char>(0x8C));
+        return;
+    case 404:
+        out.push_back(static_cast<char>(0x8D));
+        return;
+    case 500:
+        out.push_back(static_cast<char>(0x8E));
+        return;
+    default:
+        hpack_append_literal(out, ":status", std::to_string(status));
+        return;
     }
 }
 
-}  // namespace simple_http::codec
+} // namespace simple_http::codec

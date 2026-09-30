@@ -11,11 +11,13 @@
 //   * encode_frame / *   : server->client frame serialization (text/binary/
 //                          close/ping/pong), 7/16/64-bit length framing.
 //
-// Messages stay in memory (nothing spills to a temp file): their size is bounded
-// by the engine's limits instead.
+// Messages stay in memory (nothing spills to a temp file): their size is
+// bounded by the engine's limits instead.
 //
 // It depends only on the standard library, OpenSSL (SHA1 for the handshake) and
 // simple_http core base64 — no Beast, no Asio.
+
+#include <openssl/sha.h>
 
 #include <algorithm>
 #include <cstddef>
@@ -25,8 +27,6 @@
 #include <string>
 #include <string_view>
 #include <vector>
-
-#include <openssl/sha.h>
 
 #include "../core/base64.h"
 
@@ -53,8 +53,8 @@ inline std::string ws_accept_key(std::string_view client_key) {
     material.append(ws_handshake_guid);
 
     unsigned char digest[SHA_DIGEST_LENGTH];
-    SHA1(reinterpret_cast<const unsigned char*>(material.data()), material.size(), digest);
-    return base64_encode(std::string_view{reinterpret_cast<const char*>(digest), SHA_DIGEST_LENGTH});
+    SHA1(reinterpret_cast<const unsigned char *>(material.data()), material.size(), digest);
+    return base64_encode(std::string_view{reinterpret_cast<const char *>(digest), SHA_DIGEST_LENGTH});
 }
 
 // One fully decoded WebSocket frame (payload already unmasked).
@@ -77,7 +77,7 @@ struct WsFrame {
 // 64-bit key can be XORed against each word. The trailing 0..7 bytes fall back
 // to the byte-wise form. memcpy is used for the word loads/stores so no
 // alignment or strict-aliasing assumptions are made.
-inline void ws_unmask(char* data, std::size_t len, const unsigned char (&key)[4]) {
+inline void ws_unmask(char *data, std::size_t len, const unsigned char (&key)[4]) {
     // Build the 8-byte key: key repeated twice, matching offsets 0..7.
     unsigned char key8[8] = {key[0], key[1], key[2], key[3], key[0], key[1], key[2], key[3]};
     std::uint64_t mask64;
@@ -106,15 +106,15 @@ class WsFrameParser {
   public:
     // Result of a next() call.
     enum class Status {
-        Frame,       // a complete frame is available in `out`
-        NeedMore,    // not enough bytes buffered yet; feed more and retry
-        Error,       // protocol violation (e.g. reserved opcode, oversize)
+        Frame,    // a complete frame is available in `out`
+        NeedMore, // not enough bytes buffered yet; feed more and retry
+        Error,    // protocol violation (e.g. reserved opcode, oversize)
     };
 
     // Payload octets of the in-flight frame, as far as they have arrived.
     struct PartialPayload {
-        std::string bytes;   // unmasked octets not yet delivered; may be empty
-        bool first = false;  // true on the frame's first delivery
+        std::string bytes;  // unmasked octets not yet delivered; may be empty
+        bool first = false; // true on the frame's first delivery
     };
 
     // Payload size cap; frames larger than this are rejected. The engine sets
@@ -122,16 +122,15 @@ class WsFrameParser {
     explicit WsFrameParser(std::uint64_t max_payload = 16u * 1024 * 1024) : m_max_payload(max_payload) {}
 
     void append(std::string_view bytes) { m_buf.append(bytes); }
-    void append(const std::byte* data, std::size_t n) {
-        m_buf.append(reinterpret_cast<const char*>(data), n);
-    }
-    void append(const char* data, std::size_t n) { m_buf.append(data, n); }
+    void append(const std::byte *data, std::size_t n) { m_buf.append(reinterpret_cast<const char *>(data), n); }
+    void append(const char *data, std::size_t n) { m_buf.append(data, n); }
 
     // Attempts to decode the next complete frame from the buffer.
-    Status next(WsFrame& out) {
-        const auto* data = reinterpret_cast<const unsigned char*>(m_buf.data());
+    Status next(WsFrame &out) {
+        const auto *data = reinterpret_cast<const unsigned char *>(m_buf.data());
         std::size_t size = m_buf.size();
-        if (size < 2) return Status::NeedMore;
+        if (size < 2)
+            return Status::NeedMore;
 
         bool fin = (data[0] >> 7) & 0x01;
         std::uint8_t opcode = data[0] & 0x0F;
@@ -139,19 +138,20 @@ class WsFrameParser {
         // RFC 6455 §5.2: RSV1-3 must be zero unless an extension that defines
         // them was negotiated. No extension is ever accepted here, so a set bit is
         // a protocol error rather than something to mask off and carry on.
-        if ((data[0] & 0x70) != 0) return Status::Error;
+        if ((data[0] & 0x70) != 0)
+            return Status::Error;
 
         // Validate the opcode: only the defined ones are accepted.
         switch (opcode) {
-            case 0x0:
-            case 0x1:
-            case 0x2:
-            case 0x8:
-            case 0x9:
-            case 0xA:
-                break;
-            default:
-                return Status::Error;
+        case 0x0:
+        case 0x1:
+        case 0x2:
+        case 0x8:
+        case 0x9:
+        case 0xA:
+            break;
+        default:
+            return Status::Error;
         }
 
         // Control frames (Close/Ping/Pong) must not be fragmented and their
@@ -166,18 +166,20 @@ class WsFrameParser {
         std::size_t pos = 2;
 
         if (is_control && len7 > 125) {
-            return Status::Error;  // control frame payload capped at 125 octets
+            return Status::Error; // control frame payload capped at 125 octets
         }
 
         std::uint64_t payload_len = 0;
         if (len7 < 126) {
             payload_len = len7;
         } else if (len7 == 126) {
-            if (size < pos + 2) return Status::NeedMore;
+            if (size < pos + 2)
+                return Status::NeedMore;
             payload_len = (static_cast<std::uint64_t>(data[pos]) << 8) | data[pos + 1];
             pos += 2;
-        } else {  // len7 == 127
-            if (size < pos + 8) return Status::NeedMore;
+        } else { // len7 == 127
+            if (size < pos + 8)
+                return Status::NeedMore;
             payload_len = 0;
             for (int i = 0; i < 8; ++i) {
                 payload_len = (payload_len << 8) | data[pos + i];
@@ -185,18 +187,21 @@ class WsFrameParser {
             pos += 8;
         }
 
-        if (payload_len > m_max_payload) return Status::Error;
+        if (payload_len > m_max_payload)
+            return Status::Error;
 
         // RFC 6455 §5.1: every frame a client sends MUST be masked. This parser
         // only ever sees client-to-server frames (WsBackendImpl is its only user),
         // so an unmasked one is a protocol error and not a permissiveness to
         // tolerate — the mask is what stops a cache-poisoning intermediary from
         // replaying a client's bytes verbatim into another connection.
-        if (!mask) return Status::Error;
+        if (!mask)
+            return Status::Error;
 
         unsigned char mask_key[4] = {0, 0, 0, 0};
         {
-            if (size < pos + 4) return Status::NeedMore;
+            if (size < pos + 4)
+                return Status::NeedMore;
             mask_key[0] = data[pos];
             mask_key[1] = data[pos + 1];
             mask_key[2] = data[pos + 2];
@@ -213,13 +218,15 @@ class WsFrameParser {
         m_partial_off = 0;
         std::memcpy(m_partial_key, mask_key, sizeof(m_partial_key));
 
-        if (size < pos + payload_len) return Status::NeedMore;
+        if (size < pos + payload_len)
+            return Status::NeedMore;
 
         out.fin = fin;
         out.opcode = static_cast<WsOpcode>(opcode);
-        out.payload.assign(reinterpret_cast<const char*>(data + pos), static_cast<std::size_t>(payload_len));
+        out.payload.assign(reinterpret_cast<const char *>(data + pos), static_cast<std::size_t>(payload_len));
         out.already_delivered = m_partial_off;
-        ws_unmask(out.payload.data(), out.payload.size(), mask_key);  // every frame past the check above is masked
+        ws_unmask(out.payload.data(), out.payload.size(),
+                  mask_key); // every frame past the check above is masked
 
         m_partial_active = false;
         m_buf.erase(0, pos + static_cast<std::size_t>(payload_len));
@@ -234,11 +241,13 @@ class WsFrameParser {
     // delivered twice; `first` marks the frame's first delivery.
     PartialPayload take_partial_payload() {
         PartialPayload out;
-        if (!m_partial_active) return out;
+        if (!m_partial_active)
+            return out;
         const std::size_t arrived = m_buf.size() > m_partial_start ? m_buf.size() - m_partial_start : 0;
         const std::size_t have = std::min(arrived, m_partial_len);
         out.first = m_partial_off == 0;
-        if (have <= m_partial_off) return out;
+        if (have <= m_partial_off)
+            return out;
         out.bytes.assign(m_buf, m_partial_start + m_partial_off, have - m_partial_off);
         // Payload octet i is masked with key[i % 4], and this chunk starts at
         // octet m_partial_off, so the key has to be rotated into phase.
@@ -254,7 +263,8 @@ class WsFrameParser {
     // The opcode of the frame being accumulated, if one is in flight. Lets the
     // caller decide whether the arriving octets are worth inspecting at all.
     std::optional<WsOpcode> pending_opcode() const {
-        if (!m_partial_active) return std::nullopt;
+        if (!m_partial_active)
+            return std::nullopt;
         return m_partial_opcode;
     }
 
@@ -265,19 +275,20 @@ class WsFrameParser {
     // In-flight frame bookkeeping for take_partial_payload().
     bool m_partial_active = false;
     WsOpcode m_partial_opcode = WsOpcode::Text;
-    std::size_t m_partial_start = 0;  // the payload's offset within m_buf
-    std::size_t m_partial_len = 0;    // the frame's declared payload length
-    std::size_t m_partial_off = 0;    // octets already delivered
+    std::size_t m_partial_start = 0; // the payload's offset within m_buf
+    std::size_t m_partial_len = 0;   // the frame's declared payload length
+    std::size_t m_partial_off = 0;   // octets already delivered
     unsigned char m_partial_key[4] = {0, 0, 0, 0};
 };
 
-// Serializes a server->client frame header (never masked) into a caller-provided
-// buffer, which must hold at least 10 bytes; returns the header length. Writing
-// the header into a stack buffer lets a frame go out as "header + payload" in one
-// scatter-gather write, with no per-frame buffer to concatenate into.
-inline std::size_t ws_encode_header(char* out, WsOpcode opcode, std::uint64_t len) {
+// Serializes a server->client frame header (never masked) into a
+// caller-provided buffer, which must hold at least 10 bytes; returns the header
+// length. Writing the header into a stack buffer lets a frame go out as "header
+// + payload" in one scatter-gather write, with no per-frame buffer to
+// concatenate into.
+inline std::size_t ws_encode_header(char *out, WsOpcode opcode, std::uint64_t len) {
     std::size_t n = 0;
-    out[n++] = static_cast<char>(0x80 | static_cast<std::uint8_t>(opcode));  // FIN=1 + opcode
+    out[n++] = static_cast<char>(0x80 | static_cast<std::uint8_t>(opcode)); // FIN=1 + opcode
 
     if (len <= 125) {
         out[n++] = static_cast<char>(len);
@@ -294,7 +305,7 @@ inline std::size_t ws_encode_header(char* out, WsOpcode opcode, std::uint64_t le
     return n;
 }
 
-inline void ws_append_header(std::string& out, WsOpcode opcode, std::uint64_t len) {
+inline void ws_append_header(std::string &out, WsOpcode opcode, std::uint64_t len) {
     char buf[10];
     out.append(buf, ws_encode_header(buf, opcode, len));
 }
@@ -314,24 +325,25 @@ inline std::string ws_encode_pong(std::string_view payload) { return ws_encode_f
 inline std::string ws_encode_ping(std::string_view payload) { return ws_encode_frame(WsOpcode::Ping, payload); }
 
 // Whether `code` is one a peer is allowed to put on the wire (RFC 6455 §7.4.1).
-// 1004 is reserved, 1005/1006 exist only to be *reported* locally, and 1012-2999
-// were unassigned — a Close carrying any of them is a protocol error, not a
-// close to echo back.
+// 1004 is reserved, 1005/1006 exist only to be *reported* locally, and
+// 1012-2999 were unassigned — a Close carrying any of them is a protocol error,
+// not a close to echo back.
 inline bool ws_valid_close_code(std::uint16_t code) {
-    if (code >= 3000 && code <= 4999) return true;
+    if (code >= 3000 && code <= 4999)
+        return true;
     switch (code) {
-        case 1000:
-        case 1001:
-        case 1002:
-        case 1003:
-        case 1007:
-        case 1008:
-        case 1009:
-        case 1010:
-        case 1011:
-            return true;
-        default:
-            return false;
+    case 1000:
+    case 1001:
+    case 1002:
+    case 1003:
+    case 1007:
+    case 1008:
+    case 1009:
+    case 1010:
+    case 1011:
+        return true;
+    default:
+        return false;
     }
 }
 
@@ -350,7 +362,7 @@ class Utf8Validator {
   public:
     // Feeds octets; false the moment the stream stops being valid UTF-8.
     bool feed(std::string_view bytes) {
-        const auto* p = reinterpret_cast<const unsigned char*>(bytes.data());
+        const auto *p = reinterpret_cast<const unsigned char *>(bytes.data());
         const std::size_t n = bytes.size();
         std::size_t i = 0;
         while (i < n) {
@@ -366,11 +378,14 @@ class Utf8Validator {
                 while (i + 8 <= n) {
                     std::uint64_t word{};
                     std::memcpy(&word, p + i, 8);
-                    if ((word & std::uint64_t{0x8080808080808080ULL}) != 0) break;  // some octet >= 0x80
+                    if ((word & std::uint64_t{0x8080808080808080ULL}) != 0)
+                        break; // some octet >= 0x80
                     i += 8;
                 }
-                while (i < n && p[i] < 0x80) ++i;
-                if (i == n) break;
+                while (i < n && p[i] < 0x80)
+                    ++i;
+                if (i == n)
+                    break;
             }
             const auto b = p[i];
             if (m_need == 0) {
@@ -378,27 +393,28 @@ class Utf8Validator {
                 if (b >= 0xC2 && b <= 0xDF) {
                     start(1, 0x80, 0xBF);
                 } else if (b == 0xE0) {
-                    start(2, 0xA0, 0xBF);  // excludes overlong
+                    start(2, 0xA0, 0xBF); // excludes overlong
                 } else if (b >= 0xE1 && b <= 0xEC) {
                     start(2, 0x80, 0xBF);
                 } else if (b == 0xED) {
-                    start(2, 0x80, 0x9F);  // excludes U+D800-DFFF
+                    start(2, 0x80, 0x9F); // excludes U+D800-DFFF
                 } else if (b >= 0xEE && b <= 0xEF) {
                     start(2, 0x80, 0xBF);
                 } else if (b == 0xF0) {
-                    start(3, 0x90, 0xBF);  // excludes overlong
+                    start(3, 0x90, 0xBF); // excludes overlong
                 } else if (b >= 0xF1 && b <= 0xF3) {
                     start(3, 0x80, 0xBF);
                 } else if (b == 0xF4) {
-                    start(3, 0x80, 0x8F);  // excludes past U+10FFFF
+                    start(3, 0x80, 0x8F); // excludes past U+10FFFF
                 } else {
-                    return false;  // 0x80-0xC1 (stray continuation/overlong), 0xF5-0xFF
+                    return false; // 0x80-0xC1 (stray continuation/overlong), 0xF5-0xFF
                 }
                 ++i;
                 continue;
             }
-            if (b < m_lower || b > m_upper) return false;
-            m_lower = 0x80;  // later continuation octets take the ordinary range
+            if (b < m_lower || b > m_upper)
+                return false;
+            m_lower = 0x80; // later continuation octets take the ordinary range
             m_upper = 0xBF;
             --m_need;
             ++i;
@@ -438,4 +454,4 @@ inline std::string ws_encode_close(std::uint16_t code = 1000) {
     return ws_encode_frame(WsOpcode::Close, payload);
 }
 
-}  // namespace simple_http
+} // namespace simple_http

@@ -27,8 +27,13 @@
 // advertised must keep routing here, because the client may switch to any of
 // them at any time.
 
+#include <ngtcp2/ngtcp2.h>
+#include <ngtcp2/ngtcp2_crypto.h>
+#include <openssl/rand.h>
+
 #include <algorithm>
 #include <array>
+#include <boost/asio.hpp>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
@@ -43,21 +48,15 @@
 #include <utility>
 #include <vector>
 
-#include <openssl/rand.h>
-
-#include <boost/asio.hpp>
-#include <ngtcp2/ngtcp2.h>
-#include <ngtcp2/ngtcp2_crypto.h>
-
 #if defined(__linux__)
 // The GSO send path (sendmsg + UDP_SEGMENT) and the batched receive path
 // (recvmmsg) both need the raw-syscall headers; SOL_UDP and UDP_SEGMENT come
 // from the libc <netinet/udp.h> (glibc ≥ 2.36). On platforms without them the
 // endpoint falls back to plain sendto/recvfrom — the feature checks below
 // (`UDP_SEGMENT`, `SOL_UDP`) decide which half compiles.
-#include <netinet/udp.h>  // SOL_UDP, UDP_SEGMENT
-#include <sys/socket.h>   // sendmsg, recvmmsg, sockaddr_storage
-#include <sys/uio.h>      // iovec
+#include <netinet/udp.h> // SOL_UDP, UDP_SEGMENT
+#include <sys/socket.h>  // sendmsg, recvmmsg, sockaddr_storage
+#include <sys/uio.h>     // iovec
 #endif
 
 #include "../core/logging.h"
@@ -94,13 +93,14 @@ inline constexpr std::size_t kRecvScratch = kRecvBatch * kMaxDatagram;
 // share of a sustained-load profile. A CID is at most `NGTCP2_MAX_CIDLEN`
 // bytes (20), so the key is a fixed block plus its length.
 struct CidKey {
-    bool operator==(const CidKey& other) const noexcept {
-        if (len != other.len) return false;
+    bool operator==(const CidKey &other) const noexcept {
+        if (len != other.len)
+            return false;
         return std::equal(bytes.begin(), bytes.begin() + len, other.bytes.begin());
     }
 
     struct Hash {
-        std::size_t operator()(const CidKey& k) const noexcept {
+        std::size_t operator()(const CidKey &k) const noexcept {
             // FNV-1a over the meaningful bytes only.
             std::size_t h = 14695981039346656037ull;
             for (std::size_t i = 0; i < k.len; ++i) {
@@ -128,8 +128,7 @@ struct QuicEndpointConfig {
     std::vector<std::uint32_t> supported_versions{kQuicVersion1};
 };
 
-template <typename Executor>
-class QuicEndpoint {
+template <typename Executor> class QuicEndpoint {
   public:
     using Connection = QuicConnection<Executor>;
 
@@ -138,7 +137,7 @@ class QuicEndpoint {
     // any knowledge of HTTP.
     using ServeFn = std::function<asio::awaitable<void>(std::shared_ptr<Connection>)>;
 
-    QuicEndpoint(Executor exec, SSL_CTX* ssl_ctx, QuicEndpointConfig config, ServeFn serve)
+    QuicEndpoint(Executor exec, SSL_CTX *ssl_ctx, QuicEndpointConfig config, ServeFn serve)
         : m_executor(std::move(exec)), m_socket(m_executor), m_ssl_ctx(ssl_ctx), m_config(std::move(config)),
           m_serve(std::move(serve)) {
         if (RAND_bytes(m_secret.data(), static_cast<int>(m_secret.size())) != 1) {
@@ -146,13 +145,14 @@ class QuicEndpoint {
         }
     }
 
-    QuicEndpoint(const QuicEndpoint&) = delete;
-    QuicEndpoint& operator=(const QuicEndpoint&) = delete;
+    QuicEndpoint(const QuicEndpoint &) = delete;
+    QuicEndpoint &operator=(const QuicEndpoint &) = delete;
 
     // Bind the socket. Returns false and reports why on failure.
-    bool open(const asio::ip::udp::endpoint& endpoint, bool reuse_port, error_code& ec) {
+    bool open(const asio::ip::udp::endpoint &endpoint, bool reuse_port, error_code &ec) {
         m_socket.open(endpoint.protocol(), ec);
-        if (ec) return false;
+        if (ec)
+            return false;
         // Load-bearing, not decoration: the receive and send paths touch the
         // native handle directly (recvmmsg / sendmsg), and asio leaves a socket
         // *blocking* until the first async op switches it. A blocking recvmmsg
@@ -176,7 +176,8 @@ class QuicEndpoint {
         m_socket.set_option(asio::socket_base::receive_buffer_size(8 * 1024 * 1024), ec);
         ec.clear();
         m_socket.bind(endpoint, ec);
-        if (ec) return false;
+        if (ec)
+            return false;
         return true;
     }
 
@@ -188,7 +189,8 @@ class QuicEndpoint {
 
     // Start reading. Returns immediately; the receive loop runs until close().
     void start() {
-        if (m_started) return;
+        if (m_started)
+            return;
         m_started = true;
         asio::co_spawn(m_executor, receive_loop(), asio::detached);
         asio::co_spawn(m_executor, send_loop(), asio::detached);
@@ -197,7 +199,8 @@ class QuicEndpoint {
     // Stop listening. Connections are left alone; use shutdown_connections()
     // first to wind them down.
     void close() {
-        if (m_closed) return;
+        if (m_closed)
+            return;
         m_closed = true;
         error_code ec;
         (void)m_socket.close(ec);
@@ -211,8 +214,9 @@ class QuicEndpoint {
     void shutdown_connections() {
         // The CID table holds weak references, so each entry has to be promoted
         // — and a connection may legitimately be gone already.
-        for (auto& [id, weak] : m_by_cid) {
-            if (auto conn = weak.lock()) conn->close(0, "server stopping");
+        for (auto &[id, weak] : m_by_cid) {
+            if (auto conn = weak.lock())
+                conn->close(0, "server stopping");
         }
     }
 
@@ -242,13 +246,16 @@ class QuicEndpoint {
             // Readiness first, then drain with recvmmsg until the socket is
             // empty: one event-loop wake-up serves a whole batch of datagrams
             // instead of one syscall per packet.
-            auto [ec] = co_await m_socket.async_wait(asio::ip::udp::socket::wait_read, asio::as_tuple(asio::use_awaitable));
+            auto [ec] =
+                co_await m_socket.async_wait(asio::ip::udp::socket::wait_read, asio::as_tuple(asio::use_awaitable));
             if (ec) {
-                if (ec == asio::error::operation_aborted) co_return;
+                if (ec == asio::error::operation_aborted)
+                    co_return;
                 continue;
             }
             for (;;) {
-                const int n = static_cast<int>(::recvmmsg(m_socket.native_handle(), msgs.data(), kRecvBatch, 0, nullptr));
+                const int n =
+                    static_cast<int>(::recvmmsg(m_socket.native_handle(), msgs.data(), kRecvBatch, 0, nullptr));
                 if (n <= 0) {
                     // EAGAIN/EWOULDBLOCK = drained; EINTR = try again next turn.
                     // A connection-refused here means a previous send drew an
@@ -256,7 +263,8 @@ class QuicEndpoint {
                     break;
                 }
                 for (int i = 0; i < n; ++i) {
-                    if (msgs[i].msg_len == 0) continue;
+                    if (msgs[i].msg_len == 0)
+                        continue;
                     from[i].resize(msgs[i].msg_hdr.msg_namelen);
                     handle_datagram(
                         std::span<const std::uint8_t>{scratch.data() + static_cast<std::size_t>(i) * kMaxDatagram,
@@ -269,36 +277,38 @@ class QuicEndpoint {
         std::vector<std::uint8_t> buffer(kMaxDatagram);
         for (;;) {
             asio::ip::udp::endpoint remote;
-            auto [ec, n] = co_await m_socket.async_receive_from(asio::buffer(buffer), remote,
-                                                               asio::as_tuple(asio::use_awaitable));
+            auto [ec, n] =
+                co_await m_socket.async_receive_from(asio::buffer(buffer), remote, asio::as_tuple(asio::use_awaitable));
             if (ec) {
-                if (ec == asio::error::operation_aborted) co_return;
+                if (ec == asio::error::operation_aborted)
+                    co_return;
                 // A connection-refused on a UDP socket means a previous send
                 // drew an ICMP port-unreachable. Not fatal, and there is nothing
                 // to reply to.
                 continue;
             }
-            if (n == 0) continue;
+            if (n == 0)
+                continue;
             handle_datagram(std::span<const std::uint8_t>{buffer.data(), n}, remote);
         }
 #endif
     }
 
-    void handle_datagram(std::span<const std::uint8_t> data, const asio::ip::udp::endpoint& remote) {
+    void handle_datagram(std::span<const std::uint8_t> data, const asio::ip::udp::endpoint &remote) {
         ngtcp2_version_cid vc{};
         const std::size_t scid_len = m_config.connection.connection_id_length;
         switch (const int rv = ngtcp2_pkt_decode_version_cid(&vc, data.data(), data.size(), scid_len)) {
-            case 0:
-                break;
-            case NGTCP2_ERR_VERSION_NEGOTIATION:
-                // The client offered a version we do not speak. Tell it what we
-                // do speak, and drop the packet: there is no connection yet and
-                // creating one for a version we cannot complete would be worse
-                // than saying so.
-                send_version_negotiation(vc, remote);
-                return;
-            default:
-                return;
+        case 0:
+            break;
+        case NGTCP2_ERR_VERSION_NEGOTIATION:
+            // The client offered a version we do not speak. Tell it what we
+            // do speak, and drop the packet: there is no connection yet and
+            // creating one for a version we cannot complete would be worse
+            // than saying so.
+            send_version_negotiation(vc, remote);
+            return;
+        default:
+            return;
         }
 
         const CidKey key = cid_key(vc.dcid, vc.dcidlen);
@@ -344,10 +354,11 @@ class QuicEndpoint {
             ngtcp2_cid_init(&retry_scid, vc.scid, vc.scidlen);
             const int vrv = ngtcp2_crypto_verify_retry_token2(
                 &odcid, hd.token, hd.tokenlen, m_secret.data(), m_secret.size(), hd.version,
-                reinterpret_cast<const ngtcp2_sockaddr*>(remote.data()), static_cast<ngtcp2_socklen>(remote.size()),
-                &retry_scid, kRetryTokenTimeout, std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                   std::chrono::steady_clock::now().time_since_epoch())
-                                                   .count());
+                reinterpret_cast<const ngtcp2_sockaddr *>(remote.data()), static_cast<ngtcp2_socklen>(remote.size()),
+                &retry_scid, kRetryTokenTimeout,
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count());
             if (vrv != 0) {
                 // The token is unreadable, expired, or was issued for a
                 // different address. Ask again rather than guessing.
@@ -384,11 +395,12 @@ class QuicEndpoint {
         auto self = this;
         error_code local_ec;
         auto local = m_socket.local_endpoint(local_ec);
-        if (local_ec) local = asio::ip::udp::endpoint{};
+        if (local_ec)
+            local = asio::ip::udp::endpoint{};
 
         auto conn = std::make_shared<Connection>(m_executor, m_ssl_ctx, m_config.connection, bootstrap,
                                                  m_config.supported_versions, local, remote,
-                                                 [self](SendItem&& item) { self->queue_datagram(std::move(item)); });
+                                                 [self](SendItem &&item) { self->queue_datagram(std::move(item)); });
         if (conn->init_failed()) {
             SIMPLE_HTTP_ERROR_LOG("quic: could not set up TLS for a new connection");
             return;
@@ -398,9 +410,8 @@ class QuicEndpoint {
         // unreachable — and its packets look exactly like those of a connection
         // that never existed.
         conn->set_cid_callbacks(
-            [self, weak = std::weak_ptr<Connection>(conn)](std::span<const std::uint8_t> cid, std::span<const std::uint8_t>) {
-                self->associate_cid(cid, weak);
-            },
+            [self, weak = std::weak_ptr<Connection>(conn)](
+                std::span<const std::uint8_t> cid, std::span<const std::uint8_t>) { self->associate_cid(cid, weak); },
             [self](std::span<const std::uint8_t> cid) { self->dissociate_cid(cid); });
 
         if (!conn->init()) {
@@ -428,20 +439,22 @@ class QuicEndpoint {
 
     // --- CID table ---------------------------------------------------------
 
-    static CidKey cid_key(const std::uint8_t* data, std::size_t len) {
+    static CidKey cid_key(const std::uint8_t *data, std::size_t len) {
         CidKey key;
         key.len = static_cast<std::uint8_t>(std::min<std::size_t>(len, key.bytes.size()));
         std::copy_n(data, key.len, key.bytes.begin());
         return key;
     }
 
-    void associate_cid(std::span<const std::uint8_t> cid, const std::weak_ptr<Connection>& conn) {
-        if (cid.empty()) return;
+    void associate_cid(std::span<const std::uint8_t> cid, const std::weak_ptr<Connection> &conn) {
+        if (cid.empty())
+            return;
         m_by_cid[cid_key(cid.data(), cid.size())] = conn;
     }
 
     void dissociate_cid(std::span<const std::uint8_t> cid) {
-        if (cid.empty()) return;
+        if (cid.empty())
+            return;
         m_by_cid.erase(cid_key(cid.data(), cid.size()));
     }
 
@@ -450,15 +463,16 @@ class QuicEndpoint {
     // These build their datagram in a stack buffer, so the payload is copied
     // into the queued item — the cheap move path below is for the connection's
     // persistent send buffers; these are one-per-connection events at most.
-    void queue_datagram_copy(std::span<const std::uint8_t> data, const asio::ip::udp::endpoint& to) {
-        if (m_closed) return;
+    void queue_datagram_copy(std::span<const std::uint8_t> data, const asio::ip::udp::endpoint &to) {
+        if (m_closed)
+            return;
         SendItem item;
         item.data.assign(data.begin(), data.end());
         item.to = to;
         queue_datagram(std::move(item));
     }
 
-    void send_version_negotiation(const ngtcp2_version_cid& vc, const asio::ip::udp::endpoint& remote) {
+    void send_version_negotiation(const ngtcp2_version_cid &vc, const asio::ip::udp::endpoint &remote) {
         std::array<std::uint8_t, kMaxDatagram> buf{};
         // The server must swap the connection IDs in its answer (§6.1): the
         // client checks that its own SCID came back as the DCID, which is what
@@ -466,36 +480,40 @@ class QuicEndpoint {
         const ngtcp2_ssize n = ngtcp2_pkt_write_version_negotiation(
             buf.data(), buf.size(), static_cast<std::uint8_t>(random_byte()), vc.scid, vc.scidlen, vc.dcid, vc.dcidlen,
             m_config.supported_versions.data(), m_config.supported_versions.size());
-        if (n > 0) queue_datagram_copy(std::span<const std::uint8_t>{buf.data(), static_cast<std::size_t>(n)}, remote);
+        if (n > 0)
+            queue_datagram_copy(std::span<const std::uint8_t>{buf.data(), static_cast<std::size_t>(n)}, remote);
     }
 
-    void send_retry(const ngtcp2_pkt_hd& hd, const ngtcp2_version_cid& vc, const asio::ip::udp::endpoint& remote) {
+    void send_retry(const ngtcp2_pkt_hd &hd, const ngtcp2_version_cid &vc, const asio::ip::udp::endpoint &remote) {
         std::array<std::uint8_t, kMaxDatagram> buf{};
         std::array<std::uint8_t, NGTCP2_CRYPTO_MAX_RETRY_TOKENLEN2> token{};
         // The Retry's own Source Connection ID, which the client will echo as
         // its DCID. Validating against it is what binds the token to the Retry.
         ngtcp2_cid retry_scid{};
         retry_scid.datalen = std::min<std::size_t>(m_config.connection.connection_id_length, NGTCP2_MAX_CIDLEN);
-        if (RAND_bytes(retry_scid.data, static_cast<int>(retry_scid.datalen)) != 1) return;
+        if (RAND_bytes(retry_scid.data, static_cast<int>(retry_scid.datalen)) != 1)
+            return;
 
         ngtcp2_cid odcid{};
         ngtcp2_cid_init(&odcid, vc.dcid, vc.dcidlen);
 
         const ngtcp2_ssize tokenlen = ngtcp2_crypto_generate_retry_token2(
             token.data(), m_secret.data(), m_secret.size(), hd.version,
-            reinterpret_cast<const ngtcp2_sockaddr*>(remote.data()), static_cast<ngtcp2_socklen>(remote.size()),
-            &retry_scid, &odcid, std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                     std::chrono::steady_clock::now().time_since_epoch())
-                                     .count());
-        if (tokenlen < 0) return;
+            reinterpret_cast<const ngtcp2_sockaddr *>(remote.data()), static_cast<ngtcp2_socklen>(remote.size()),
+            &retry_scid, &odcid,
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+        if (tokenlen < 0)
+            return;
 
-        const ngtcp2_ssize n = ngtcp2_crypto_write_retry(buf.data(), buf.size(), hd.version, &hd.scid, &retry_scid, &hd.dcid,
-                                                         token.data(), static_cast<std::size_t>(tokenlen));
-        if (n > 0) queue_datagram_copy(std::span<const std::uint8_t>{buf.data(), static_cast<std::size_t>(n)}, remote);
+        const ngtcp2_ssize n = ngtcp2_crypto_write_retry(buf.data(), buf.size(), hd.version, &hd.scid, &retry_scid,
+                                                         &hd.dcid, token.data(), static_cast<std::size_t>(tokenlen));
+        if (n > 0)
+            queue_datagram_copy(std::span<const std::uint8_t>{buf.data(), static_cast<std::size_t>(n)}, remote);
     }
 
-    void send_stateless_reset(std::size_t /*packet_len*/, const ngtcp2_version_cid& vc,
-                              const asio::ip::udp::endpoint& remote) {
+    void send_stateless_reset(std::size_t /*packet_len*/, const ngtcp2_version_cid &vc,
+                              const asio::ip::udp::endpoint &remote) {
         std::array<std::uint8_t, kMaxDatagram> buf{};
         std::array<std::uint8_t, NGTCP2_STATELESS_RESET_TOKENLEN> token{};
         ngtcp2_cid cid{};
@@ -508,14 +526,18 @@ class QuicEndpoint {
             return;
         }
         std::array<std::uint8_t, NGTCP2_STATELESS_RESET_TOKENLEN> rand{};
-        if (RAND_bytes(rand.data(), static_cast<int>(rand.size())) != 1) return;
-        const ngtcp2_ssize n = ngtcp2_pkt_write_stateless_reset(buf.data(), buf.size(), token.data(), rand.data(), rand.size());
-        if (n > 0) queue_datagram_copy(std::span<const std::uint8_t>{buf.data(), static_cast<std::size_t>(n)}, remote);
+        if (RAND_bytes(rand.data(), static_cast<int>(rand.size())) != 1)
+            return;
+        const ngtcp2_ssize n =
+            ngtcp2_pkt_write_stateless_reset(buf.data(), buf.size(), token.data(), rand.data(), rand.size());
+        if (n > 0)
+            queue_datagram_copy(std::span<const std::uint8_t>{buf.data(), static_cast<std::size_t>(n)}, remote);
     }
 
     static std::uint8_t random_byte() {
         std::uint8_t b = 0;
-        if (RAND_bytes(&b, 1) != 1) return 0;
+        if (RAND_bytes(&b, 1) != 1)
+            return 0;
         return b;
     }
 
@@ -529,8 +551,9 @@ class QuicEndpoint {
     // moved in and out — the per-packet copy this used to do was a measurable
     // share of a sustained-load profile.
 
-    void queue_datagram(SendItem&& item) {
-        if (m_closed) return;
+    void queue_datagram(SendItem &&item) {
+        if (m_closed)
+            return;
         m_send_queue.emplace_back(std::move(item));
         (void)m_send_wake.try_send(error_code{});
     }
@@ -539,12 +562,13 @@ class QuicEndpoint {
     // segment — several QUIC packets the kernel splits into separate datagrams
     // (UDP_SEGMENT). Returns the number of bytes handed to the kernel, or -1
     // with errno set.
-    static int raw_send(int fd, const SendItem& item) {
-        if (item.to.size() > sizeof(sockaddr_storage)) return -1;
+    static int raw_send(int fd, const SendItem &item) {
+        if (item.to.size() > sizeof(sockaddr_storage))
+            return -1;
         sockaddr_storage ss{};
         std::memcpy(&ss, item.to.data(), item.to.size());
 #if defined(__linux__) && defined(SOL_UDP) && defined(UDP_SEGMENT)
-        iovec iov{const_cast<std::uint8_t*>(item.data.data()), item.data.size()};
+        iovec iov{const_cast<std::uint8_t *>(item.data.data()), item.data.size()};
         msghdr mh{};
         mh.msg_name = &ss;
         mh.msg_namelen = item.to.size();
@@ -563,10 +587,10 @@ class QuicEndpoint {
         // slot. The `asm` barrier is belt-and-braces against the same class of
         // -O2 store elision (GCC 16 trunk) and costs nothing.
         struct cmsg_gso {
-            std::size_t cmsg_len;  // cmsghdr: 8-byte len, 4-byte level, 4-byte type
+            std::size_t cmsg_len; // cmsghdr: 8-byte len, 4-byte level, 4-byte type
             int cmsg_level;
             int cmsg_type;
-            std::uint16_t seg;     // the GSO segment size
+            std::uint16_t seg; // the GSO segment size
         } c{};
         if (item.gso_size > 0) {
             c.cmsg_len = CMSG_LEN(sizeof(std::uint16_t));
@@ -581,7 +605,7 @@ class QuicEndpoint {
         return static_cast<int>(::sendmsg(fd, &mh, 0));
 #else
         return static_cast<int>(::sendto(fd, item.data.data(), item.data.size(), 0,
-                                         reinterpret_cast<const sockaddr*>(&ss), item.to.size()));
+                                         reinterpret_cast<const sockaddr *>(&ss), item.to.size()));
 #endif
     }
 
@@ -618,7 +642,7 @@ class QuicEndpoint {
 
     Executor m_executor;
     asio::ip::udp::socket m_socket;
-    SSL_CTX* m_ssl_ctx;
+    SSL_CTX *m_ssl_ctx;
     QuicEndpointConfig m_config;
     ServeFn m_serve;
 
@@ -633,4 +657,4 @@ class QuicEndpoint {
     bool m_closed{false};
 };
 
-}  // namespace simple_http::quic
+} // namespace simple_http::quic

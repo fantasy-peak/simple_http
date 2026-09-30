@@ -10,7 +10,8 @@
 //
 //   * directory traversal -- ".." cannot be expressed in a normalized key, and
 //     even if it could, no such key exists;
-//   * symlink escape -- symlinks are skipped during the scan and never followed;
+//   * symlink escape -- symlinks are skipped during the scan and never
+//   followed;
 //   * TOCTOU -- no stat()/open() happens on a request-chosen path;
 //   * FIFO/device hangs -- only regular files are ever admitted to the table.
 //
@@ -18,11 +19,11 @@
 // scan's stat() results, so a 304 is answered without opening the file.
 //
 // The alternatives are worse in ways that are easy to miss. Sanitizing and then
-// stat()ing still stats a path the peer chose, and leaves a window between check
-// and use. Joining and then testing containment is what the `%2e%2e%2f` family
-// is built to defeat; url_path.h refuses an escaped separator instead. Following
-// symlinks and then checking where they landed reopens the escape if the link is
-// replaced afterwards.
+// stat()ing still stats a path the peer chose, and leaves a window between
+// check and use. Joining and then testing containment is what the `%2e%2e%2f`
+// family is built to defeat; url_path.h refuses an escaped separator instead.
+// Following symlinks and then checking where they landed reopens the escape if
+// the link is replaced afterwards.
 //
 // This header is protocol-agnostic on purpose: no Request, no Response, no
 // Asio. Selecting a representation and answering a request live in
@@ -39,16 +40,17 @@
 #include <unordered_map>
 #include <vector>
 
-#include "accept_encoding.h"  // AcceptEncoding, coding_q, identity_q
+#include "accept_encoding.h" // AcceptEncoding, coding_q, identity_q
 #include "logging.h"
-#include "mime.h"      // by_extension
-#include "url_path.h"  // under_prefix
+#include "mime.h"     // by_extension
+#include "url_path.h" // under_prefix
 #include "validators.h"
 
 namespace simple_http {
 
 // What a document root is scanned with. Every field is a deployment choice; the
-// defaults are conservative rather than convenient (see the two that are empty).
+// defaults are conservative rather than convenient (see the two that are
+// empty).
 struct StaticTableConfig {
     // The document root. Empty disables the whole component: the serving stage
     // steps aside and every request falls through to whatever else is routed,
@@ -103,7 +105,7 @@ struct StaticRepresentation {
 struct StaticEntry {
     std::string content_type;
     std::int64_t mtime{0};
-    bool immutable{false};  // under a content-hashed prefix: cache forever
+    bool immutable{false}; // under a content-hashed prefix: cache forever
 
     StaticRepresentation identity;
     std::optional<StaticRepresentation> br;
@@ -118,13 +120,14 @@ namespace detail {
 // Compares path *components*, never a string prefix: "/srv/web/dist-evil"
 // starts with the characters of "/srv/web/dist" and would pass a starts_with
 // check while being a completely different directory.
-inline bool path_is_under(const std::string& root, const std::string& candidate) {
+inline bool path_is_under(const std::string &root, const std::string &candidate) {
     const std::filesystem::path r{root};
     const std::filesystem::path c{candidate};
     auto ri = r.begin();
     auto ci = c.begin();
     for (; ri != r.end(); ++ri, ++ci) {
-        if (ci == c.end() || *ri != *ci) return false;
+        if (ci == c.end() || *ri != *ci)
+            return false;
     }
     return true;
 }
@@ -135,23 +138,23 @@ inline bool path_is_under(const std::string& root, const std::string& candidate)
 // epoch, so casting its duration straight to seconds produces a meaningless
 // number (observed: a plausible-looking but wildly wrong year, which then also
 // poisons the ETag). clock_cast is the portable conversion between clocks.
-inline std::int64_t file_time_to_unix(const std::filesystem::file_time_type& t) {
+inline std::int64_t file_time_to_unix(const std::filesystem::file_time_type &t) {
     const auto sys = std::chrono::clock_cast<std::chrono::system_clock>(t);
-    return static_cast<std::int64_t>(
-        std::chrono::duration_cast<std::chrono::seconds>(sys.time_since_epoch()).count());
+    return static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::seconds>(sys.time_since_epoch()).count());
 }
 
-// Picks the best acceptable encoding. Ties go to brotli (it is checked first and
-// the comparison is strict), and identity only wins when it is strictly
-// preferred — so a plain `Accept-Encoding: gzip, deflate, br` still gets brotli.
+// Picks the best acceptable encoding. Ties go to brotli (it is checked first
+// and the comparison is strict), and identity only wins when it is strictly
+// preferred — so a plain `Accept-Encoding: gzip, deflate, br` still gets
+// brotli.
 //
 // Returns nullptr when nothing at all is acceptable, which is a 406.
-inline const StaticRepresentation* choose_representation(const StaticEntry& entry, const AcceptEncoding& ae) {
+inline const StaticRepresentation *choose_representation(const StaticEntry &entry, const AcceptEncoding &ae) {
     const double q_br = coding_q(ae.br, ae);
     const double q_gz = coding_q(ae.gzip, ae);
     const double q_id = identity_q(ae);
 
-    const StaticRepresentation* best = nullptr;
+    const StaticRepresentation *best = nullptr;
     double best_q = 0.0;
     if (entry.br && q_br > best_q) {
         best = &*entry.br;
@@ -168,9 +171,11 @@ inline const StaticRepresentation* choose_representation(const StaticEntry& entr
     return best;
 }
 
-inline std::string_view content_encoding_of(const StaticEntry& entry, const StaticRepresentation& rep) {
-    if (entry.br && &*entry.br == &rep) return "br";
-    if (entry.gz && &*entry.gz == &rep) return "gzip";
+inline std::string_view content_encoding_of(const StaticEntry &entry, const StaticRepresentation &rep) {
+    if (entry.br && &*entry.br == &rep)
+        return "br";
+    if (entry.gz && &*entry.gz == &rep)
+        return "gzip";
     return {};
 }
 
@@ -178,12 +183,10 @@ inline std::string_view content_encoding_of(const StaticEntry& entry, const Stat
 // std::string key. Same technique as handler/router.h.
 struct StringHash {
     using is_transparent = void;
-    std::size_t operator()(std::string_view sv) const noexcept {
-        return std::hash<std::string_view>{}(sv);
-    }
+    std::size_t operator()(std::string_view sv) const noexcept { return std::hash<std::string_view>{}(sv); }
 };
 
-}  // namespace detail
+} // namespace detail
 
 class StaticTable {
   public:
@@ -207,30 +210,30 @@ class StaticTable {
     // attaches pre-compressed siblings to entries the first pass created, and
     // that relies on no reader existing yet. This is not a hot-reload API — the
     // table is built once and read for the life of the process.
-    bool load(std::string& error);
+    bool load(std::string &error);
 
     bool enabled() const noexcept { return !m_root.empty(); }
-    const Stats& stats() const noexcept { return m_stats; }
-    const std::string& root() const noexcept { return m_root; }  // canonical, for logging only
+    const Stats &stats() const noexcept { return m_stats; }
+    const std::string &root() const noexcept { return m_root; } // canonical, for logging only
 
     // Read-only view. The table is built entirely inside load() and never
     // mutated afterwards, so handing out const pointers is sound and lets every
     // worker thread look up concurrently without a lock.
-    const StaticEntry* find(std::string_view key) const {
+    const StaticEntry *find(std::string_view key) const {
         auto it = m_table.find(key);
         return it == m_table.end() ? nullptr : it->second.get();
     }
 
     // The site's 404 page, or nullptr when none was built.
-    const StaticEntry* not_found_entry() const noexcept { return m_not_found.get(); }
+    const StaticEntry *not_found_entry() const noexcept { return m_not_found.get(); }
 
-    std::string cache_control_for(const StaticEntry& entry) const;
+    std::string cache_control_for(const StaticEntry &entry) const;
 
     // A representation's bytes, from the preloaded copy when there is one and
     // from disk otherwise. nullopt means the file has gone missing since the
     // scan — a miss, not an empty body. Public because the serving half lives in
     // another layer and needs exactly this.
-    std::optional<std::string> read_body(const StaticRepresentation& rep) const;
+    std::optional<std::string> read_body(const StaticRepresentation &rep) const;
 
   private:
     // Non-const so load() can attach pre-compressed siblings; every read path
@@ -238,7 +241,7 @@ class StaticTable {
     using EntryPtr = std::shared_ptr<StaticEntry>;
 
     StaticTableConfig m_config;
-    std::string m_root;  // canonical, for logging only
+    std::string m_root; // canonical, for logging only
 
     std::uint64_t m_preload_max{0};
     std::uint64_t m_preload_budget{0};
@@ -254,7 +257,7 @@ class StaticTable {
     Stats m_stats{};
 };
 
-inline bool StaticTable::load(std::string& error) {
+inline bool StaticTable::load(std::string &error) {
     m_root.clear();
     m_table.clear();
     m_not_found.reset();
@@ -262,7 +265,8 @@ inline bool StaticTable::load(std::string& error) {
     m_preload_max = m_config.preload_max_file_bytes;
     m_preload_budget = m_config.preload_budget_bytes;
 
-    if (m_config.root.empty()) return true;  // disabled
+    if (m_config.root.empty())
+        return true; // disabled
 
     std::error_code ec;
     const std::filesystem::path root = std::filesystem::canonical(m_config.root, ec);
@@ -275,11 +279,13 @@ inline bool StaticTable::load(std::string& error) {
     // Before anything expensive: a file that must never be downloadable cannot
     // be allowed to sit inside the document root. Running this ahead of the walk
     // is what keeps a `root: "."` mistake from first reading the whole tree.
-    for (const auto& protected_path : m_config.must_not_contain) {
-        if (protected_path.empty()) continue;
+    for (const auto &protected_path : m_config.must_not_contain) {
+        if (protected_path.empty())
+            continue;
         std::error_code pec;
         const auto resolved = std::filesystem::canonical(protected_path, pec);
-        if (pec) continue;  // cannot resolve it: not something we can be serving
+        if (pec)
+            continue; // cannot resolve it: not something we can be serving
         if (detail::path_is_under(m_root, resolved.string())) {
             error = "static root " + m_root + " contains " + resolved.string() + ", which must never be served";
             m_root.clear();
@@ -292,38 +298,41 @@ inline bool StaticTable::load(std::string& error) {
     // outside it could otherwise become reachable, and there is no way to tell a
     // benign link from a planted one at scan time.
     std::vector<std::string> rels;
-    std::filesystem::recursive_directory_iterator it(
-        root, std::filesystem::directory_options::skip_permission_denied, ec);
+    std::filesystem::recursive_directory_iterator it(root, std::filesystem::directory_options::skip_permission_denied,
+                                                     ec);
     if (ec) {
         error = "cannot walk static root: " + ec.message();
         return false;
     }
-    for (const auto& dir_entry : it) {
+    for (const auto &dir_entry : it) {
         std::error_code se;
         if (dir_entry.is_symlink(se)) {
             ++m_stats.skipped_symlinks;
-            if (dir_entry.is_directory(se)) it.disable_recursion_pending();
+            if (dir_entry.is_directory(se))
+                it.disable_recursion_pending();
             continue;
         }
         if (!dir_entry.is_regular_file(se)) {
-            ++m_stats.skipped_other;  // directories, FIFOs, sockets, devices
+            ++m_stats.skipped_other; // directories, FIFOs, sockets, devices
             continue;
         }
         std::error_code re;
         auto rel = std::filesystem::relative(dir_entry.path(), root, re);
-        if (re) continue;
+        if (re)
+            continue;
         rels.push_back(rel.generic_string());
     }
-    std::sort(rels.begin(), rels.end());  // deterministic keys and preload order
+    std::sort(rels.begin(), rels.end()); // deterministic keys and preload order
 
     auto is_precompressed = [](std::string_view rel) { return rel.ends_with(".br") || rel.ends_with(".gz"); };
 
-    auto make_representation = [&](const std::string& rel, std::uint64_t& budget) -> StaticRepresentation {
+    auto make_representation = [&](const std::string &rel, std::uint64_t &budget) -> StaticRepresentation {
         StaticRepresentation rep;
         rep.disk_path = (root / rel).string();
         std::error_code se;
         rep.size = static_cast<std::uint64_t>(std::filesystem::file_size(rep.disk_path, se));
-        if (se) rep.size = 0;
+        if (se)
+            rep.size = 0;
         const auto mtime = std::filesystem::last_write_time(rep.disk_path, se);
         const std::int64_t mtime_s = se ? 0 : detail::file_time_to_unix(mtime);
 
@@ -355,8 +364,9 @@ inline bool StaticTable::load(std::string& error) {
     std::uint64_t budget = m_preload_budget;
 
     // Pass 1: the base files.
-    for (const auto& rel : rels) {
-        if (is_precompressed(rel)) continue;
+    for (const auto &rel : rels) {
+        if (is_precompressed(rel))
+            continue;
 
         auto entry = std::make_shared<StaticEntry>();
         entry->identity = make_representation(rel, budget);
@@ -367,7 +377,7 @@ inline bool StaticTable::load(std::string& error) {
         entry->mtime = se ? 0 : detail::file_time_to_unix(mtime);
 
         const std::string url = "/" + rel;
-        for (const auto& p : m_config.immutable_prefixes) {
+        for (const auto &p : m_config.immutable_prefixes) {
             if (under_prefix(url, p)) {
                 entry->immutable = true;
                 break;
@@ -375,11 +385,11 @@ inline bool StaticTable::load(std::string& error) {
         }
 
         EntryPtr shared = entry;
-        auto insert_keys = [&](const std::string& key) {
+        auto insert_keys = [&](const std::string &key) {
             auto [pos, inserted] = m_table.emplace(key, shared);
             if (!inserted) {
-                SIMPLE_HTTP_WARN_LOG("static: key collision on {} ({} vs {})", key,
-                                     pos->second->identity.disk_path, entry->identity.disk_path);
+                SIMPLE_HTTP_WARN_LOG("static: key collision on {} ({} vs {})", key, pos->second->identity.disk_path,
+                                     entry->identity.disk_path);
             } else {
                 ++m_stats.keys;
             }
@@ -393,7 +403,8 @@ inline bool StaticTable::load(std::string& error) {
             rel.compare(rel.size() - m_config.index_file.size(), m_config.index_file.size(), m_config.index_file) ==
                 0) {
             std::string dir = rel.substr(0, rel.size() - m_config.index_file.size());
-            while (!dir.empty() && dir.back() == '/') dir.pop_back();
+            while (!dir.empty() && dir.back() == '/')
+                dir.pop_back();
             insert_keys(dir.empty() ? "/" : "/" + dir);
         } else if (rel.ends_with(".html")) {
             // No 301 from /blog/foo to /blog/foo.html: a redirect is an
@@ -410,7 +421,7 @@ inline bool StaticTable::load(std::string& error) {
 
     // Pass 2: attach pre-compressed siblings. After pass 1 because the walk
     // order is unspecified and "a.js.br" may come before "a.js".
-    for (const auto& rel : rels) {
+    for (const auto &rel : rels) {
         std::string base;
         bool is_br = false;
         if (rel.ends_with(".br")) {
@@ -447,14 +458,15 @@ inline bool StaticTable::load(std::string& error) {
         }
     }
 
-    SIMPLE_HTTP_INFO_LOG("static table loaded: root={} files={} keys={} preloaded={} ({} KiB) br={} gz={} "
+    SIMPLE_HTTP_INFO_LOG("static table loaded: root={} files={} keys={} preloaded={} ({} KiB) "
+                         "br={} gz={} "
                          "skipped(symlink={} other={})",
                          m_root, m_stats.files, m_stats.keys, m_stats.preloaded, m_stats.preloaded_bytes / 1024,
                          m_stats.brotli, m_stats.gzip, m_stats.skipped_symlinks, m_stats.skipped_other);
     return true;
 }
 
-inline std::string StaticTable::cache_control_for(const StaticEntry& entry) const {
+inline std::string StaticTable::cache_control_for(const StaticEntry &entry) const {
     if (entry.immutable) {
         // Content-hashed: the bytes behind this URL can never change.
         return "public, max-age=31536000, immutable";
@@ -472,15 +484,18 @@ inline std::string StaticTable::cache_control_for(const StaticEntry& entry) cons
     return "public, max-age=86400";
 }
 
-inline std::optional<std::string> StaticTable::read_body(const StaticRepresentation& rep) const {
-    if (rep.body) return *rep.body;  // preloaded: copy only
+inline std::optional<std::string> StaticTable::read_body(const StaticRepresentation &rep) const {
+    if (rep.body)
+        return *rep.body; // preloaded: copy only
     std::ifstream in(rep.disk_path, std::ios::binary);
-    if (!in) return std::nullopt;
+    if (!in)
+        return std::nullopt;
     std::string out;
     out.resize(static_cast<std::size_t>(rep.size));
     in.read(out.data(), static_cast<std::streamsize>(rep.size));
-    if (in.gcount() != static_cast<std::streamsize>(rep.size)) return std::nullopt;
+    if (in.gcount() != static_cast<std::streamsize>(rep.size))
+        return std::nullopt;
     return out;
 }
 
-}  // namespace simple_http
+} // namespace simple_http

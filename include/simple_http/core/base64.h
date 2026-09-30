@@ -26,13 +26,12 @@ namespace detail {
 
 // Shared encoder core: both public alphabets emit 4 characters per 3 input
 // bytes and differ only in the alphabet and whether the tail is '='-padded.
-inline std::string base64_encode_alphabet(const char* alphabet, std::string_view in, bool padded) {
+inline std::string base64_encode_alphabet(const char *alphabet, std::string_view in, bool padded) {
     std::string out;
     out.reserve(padded ? ((in.size() + 2) / 3) * 4 : (in.size() * 4 + 2) / 3);
     std::size_t i = 0;
     for (; i + 3 <= in.size(); i += 3) {
-        std::uint32_t n = (static_cast<unsigned char>(in[i]) << 16) |
-                          (static_cast<unsigned char>(in[i + 1]) << 8) |
+        std::uint32_t n = (static_cast<unsigned char>(in[i]) << 16) | (static_cast<unsigned char>(in[i + 1]) << 8) |
                           static_cast<unsigned char>(in[i + 2]);
         out.push_back(alphabet[(n >> 18) & 0x3F]);
         out.push_back(alphabet[(n >> 12) & 0x3F]);
@@ -49,8 +48,7 @@ inline std::string base64_encode_alphabet(const char* alphabet, std::string_view
             out.push_back('=');
         }
     } else if (rem == 2) {
-        std::uint32_t n = (static_cast<unsigned char>(in[i]) << 16) |
-                          (static_cast<unsigned char>(in[i + 1]) << 8);
+        std::uint32_t n = (static_cast<unsigned char>(in[i]) << 16) | (static_cast<unsigned char>(in[i + 1]) << 8);
         out.push_back(alphabet[(n >> 18) & 0x3F]);
         out.push_back(alphabet[(n >> 12) & 0x3F]);
         out.push_back(alphabet[(n >> 6) & 0x3F]);
@@ -61,7 +59,7 @@ inline std::string base64_encode_alphabet(const char* alphabet, std::string_view
     return out;
 }
 
-}  // namespace detail
+} // namespace detail
 
 inline std::string base64_url_encode(std::string_view in) {
     return detail::base64_encode_alphabet(base64_url_alphabet, in, false);
@@ -74,7 +72,8 @@ inline std::string base64_encode(std::string_view in) {
 }
 
 // Decodes standard base64url, stopping at the first character outside the
-// alphabet (see the test that pins that: a stray '=' or space ends the payload).
+// alphabet (see the test that pins that: a stray '=' or space ends the
+// payload).
 inline std::string base64_url_decode(std::string_view in) {
     // Character -> 6-bit value, or -1. Constant-initialized at compile time:
     // this used to be a 1 KiB array filled on every call, and then a
@@ -110,4 +109,4 @@ inline std::string base64_url_decode(std::string_view in) {
     return out;
 }
 
-}  // namespace simple_http
+} // namespace simple_http

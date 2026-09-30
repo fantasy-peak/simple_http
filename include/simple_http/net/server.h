@@ -12,22 +12,21 @@
 // round-robins the pool, or one acceptor per worker context (SO_REUSEPORT).
 
 #include <atomic>
+#include <boost/asio.hpp>
+#include <boost/asio/local/stream_protocol.hpp>
+#include <boost/asio/ssl.hpp>
 #include <cstddef>
-#include <mutex>
 #include <filesystem>
-#include <future>
 #include <functional>
+#include <future>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
-
-#include <boost/asio.hpp>
-#include <boost/asio/local/stream_protocol.hpp>
-#include <boost/asio/ssl.hpp>
 
 #include "../core/io_pool.h"
 #include "../core/limits.h"
@@ -53,7 +52,7 @@ namespace asio = boost::asio;
 struct InetAddress {
     std::string host{"0.0.0.0"};
     std::uint16_t port{8080};
-    bool v6{false};  // IPV6_V6ONLY
+    bool v6{false}; // IPV6_V6ONLY
 };
 
 // A UNIX-domain socket at a filesystem path.
@@ -64,13 +63,13 @@ struct UnixAddress {
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
 // A UDP endpoint for QUIC. The fields mirror InetAddress, and that is the whole
 // difference: QUIC is another *transport*, not another address family. It is a
-// separate field rather than another alternative in `Listen` because the two are
-// not exclusive — HTTP/2 over TCP and HTTP/3 over QUIC share a port number by
-// convention and are served together, exactly as nginx's `listen ... ssl` and
-// `listen ... quic` are.
+// separate field rather than another alternative in `Listen` because the two
+// are not exclusive — HTTP/2 over TCP and HTTP/3 over QUIC share a port number
+// by convention and are served together, exactly as nginx's `listen ... ssl`
+// and `listen ... quic` are.
 //
-// QUIC always has TLS, so ServerConfig::tls is required alongside it; without it
-// start() fails, rather than running an unencrypted QUIC, which the protocol
+// QUIC always has TLS, so ServerConfig::tls is required alongside it; without
+// it start() fails, rather than running an unencrypted QUIC, which the protocol
 // does not define.
 struct QuicAddress {
     std::string host{"0.0.0.0"};
@@ -114,10 +113,11 @@ struct ServerConfig {
     PlaintextProtocols plaintext_protocols{PlaintextProtocols::Both};
     // All protocol-engine tunables (timeouts, size caps, HTTP/2 windows/streams).
     EngineLimits limits{};
-    // Optional per-accepted-socket hook (TCP_NODELAY / keepalive / buffer sizes …).
-    // Invoked right after accept, before the transport or TLS handshake touches the
-    // socket. Use the error_code overloads of set_option to avoid throwing.
-    std::function<void(asio::ip::tcp::socket&)> socket_setup;
+    // Optional per-accepted-socket hook (TCP_NODELAY / keepalive / buffer sizes
+    // …). Invoked right after accept, before the transport or TLS handshake
+    // touches the socket. Use the error_code overloads of set_option to avoid
+    // throwing.
+    std::function<void(asio::ip::tcp::socket &)> socket_setup;
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
     // The QUIC listener, for HTTP/3. Independent of `listen`: both may be set,
     // which is the usual deployment — one port number, two transports, and the
@@ -159,44 +159,41 @@ class Server {
 
     ~Server() { stop(); }
 
-    Server(const Server&) = delete;
-    Server& operator=(const Server&) = delete;
+    Server(const Server &) = delete;
+    Server &operator=(const Server &) = delete;
 
     // --- route registration (fluent, forwarded to the Router) ---
     // Methods come first: a route is a (method, path) pair. Braced literal,
     // `any_methods`, or the std::vector<Method> a config file parser filled —
     // see router.h.
-    template <typename F>
-    Server& route(std::vector<Method> methods, std::string path, F&& handler) {
+    template <typename F> Server &route(std::vector<Method> methods, std::string path, F &&handler) {
         m_router->route(std::move(methods), std::move(path), std::forward<F>(handler));
         return *this;
     }
-    template <typename F>
-    Server& route_regex(std::vector<Method> methods, const std::string& pattern, F&& handler) {
+    template <typename F> Server &route_regex(std::vector<Method> methods, const std::string &pattern, F &&handler) {
         m_router->route_regex(std::move(methods), pattern, std::forward<F>(handler));
         return *this;
     }
-    template <typename F>
-    Server& fallback(F&& handler) {
+    template <typename F> Server &fallback(F &&handler) {
         m_router->fallback(std::forward<F>(handler));
         return *this;
     }
-    Server& before(Filter f) {
+    Server &before(Filter f) {
         m_router->before(std::move(f));
         return *this;
     }
     // CORS — see handler/cors.h for the policy and the preflight rule.
-    Server& cors(CorsConfig config) {
+    Server &cors(CorsConfig config) {
         m_router->cors(std::move(config));
         return *this;
     }
 
     // --- WebSocket route registration ---
-    Server& ws_route(std::string path, WsHandler handler) {
+    Server &ws_route(std::string path, WsHandler handler) {
         m_router->ws_route(std::move(path), std::move(handler));
         return *this;
     }
-    Server& ws_route_regex(const std::string& pattern, WsHandler handler) {
+    Server &ws_route_regex(const std::string &pattern, WsHandler handler) {
         m_router->ws_route_regex(pattern, std::move(handler));
         return *this;
     }
@@ -205,12 +202,11 @@ class Server {
     // An Upgrade: websocket request on `path` is spliced verbatim to the backend
     // TCP endpoint host:port. Frames, fragmentation, masking and control frames
     // all pass through untouched.
-    Server& ws_proxy(std::string path, std::string host, std::uint16_t port, std::string rewrite_path = {}) {
-        m_router->ws_proxy(std::move(path),
-                           WsProxyTarget{std::move(host), port, std::move(rewrite_path)});
+    Server &ws_proxy(std::string path, std::string host, std::uint16_t port, std::string rewrite_path = {}) {
+        m_router->ws_proxy(std::move(path), WsProxyTarget{std::move(host), port, std::move(rewrite_path)});
         return *this;
     }
-    Server& ws_proxy_regex(const std::string& pattern, std::string host, std::uint16_t port,
+    Server &ws_proxy_regex(const std::string &pattern, std::string host, std::uint16_t port,
                            std::string rewrite_path = {}) {
         m_router->ws_proxy_regex(pattern, WsProxyTarget{std::move(host), port, std::move(rewrite_path)});
         return *this;
@@ -227,10 +223,10 @@ class Server {
     // and client certificates for an HTTPS backend, timeouts, pool sizing,
     // defaults suit public backends — and each route builds its own client, so
     // different backends carry different policies and pools.
-    Server& http_proxy(std::string path, std::string host, std::uint16_t port, std::string rewrite_path = {}) {
+    Server &http_proxy(std::string path, std::string host, std::uint16_t port, std::string rewrite_path = {}) {
         return http_proxy(std::move(path), HttpProxyTarget{std::move(host), port, std::move(rewrite_path)});
     }
-    Server& http_proxy_regex(const std::string& pattern, std::string host, std::uint16_t port,
+    Server &http_proxy_regex(const std::string &pattern, std::string host, std::uint16_t port,
                              std::string rewrite_path = {}) {
         return http_proxy_regex(pattern, HttpProxyTarget{std::move(host), port, std::move(rewrite_path)});
     }
@@ -238,7 +234,7 @@ class Server {
     // Registers a site built from a document root. The site becomes a dispatch
     // stage rather than a route, so it is consulted after every real route and
     // before the fallback — see Router::static_files for why that matters.
-    Server& static_files(std::shared_ptr<StaticFiles> site) {
+    Server &static_files(std::shared_ptr<StaticFiles> site) {
         m_router->static_files(std::move(site));
         return *this;
     }
@@ -248,15 +244,15 @@ class Server {
     // Typed routes collect request/response schemas into the document; the
     // handler signature and dispatch are unchanged. See Router::route.
     template <typename Res, typename F, typename... Extras>
-    Server& route(std::vector<Method> methods, std::string path, F&& handler, openapi::OperationInfo info = {},
-                  Extras&&... extras) {
-        m_router->template route<Res>(std::move(methods), std::move(path), std::forward<F>(handler),
-                                      std::move(info), std::forward<Extras>(extras)...);
+    Server &route(std::vector<Method> methods, std::string path, F &&handler, openapi::OperationInfo info = {},
+                  Extras &&...extras) {
+        m_router->template route<Res>(std::move(methods), std::move(path), std::forward<F>(handler), std::move(info),
+                                      std::forward<Extras>(extras)...);
         return *this;
     }
     template <typename Req, typename Res, typename F, typename... Extras>
-    Server& route(std::vector<Method> methods, std::string path, F&& handler, openapi::OperationInfo info = {},
-                  Extras&&... extras) {
+    Server &route(std::vector<Method> methods, std::string path, F &&handler, openapi::OperationInfo info = {},
+                  Extras &&...extras) {
         m_router->template route<Req, Res>(std::move(methods), std::move(path), std::forward<F>(handler),
                                            std::move(info), std::forward<Extras>(extras)...);
         return *this;
@@ -264,35 +260,32 @@ class Server {
     // Params-typed route: Params is the path-parameter struct whose field names
     // must match the template's {name}s — see Router::route.
     template <typename Params, typename Second, typename Res, typename F, typename... Extras>
-    Server& route(std::vector<Method> methods, std::string path, F&& handler, openapi::OperationInfo info = {},
-                  Extras&&... extras) {
-        m_router->template route<Params, Second, Res>(std::move(methods), std::move(path),
-                                                      std::forward<F>(handler), std::move(info),
-                                                      std::forward<Extras>(extras)...);
+    Server &route(std::vector<Method> methods, std::string path, F &&handler, openapi::OperationInfo info = {},
+                  Extras &&...extras) {
+        m_router->template route<Params, Second, Res>(std::move(methods), std::move(path), std::forward<F>(handler),
+                                                      std::move(info), std::forward<Extras>(extras)...);
         return *this;
     }
     // The document collected by `route<Res>` / `route<Req, Res>`. Configure its
     // info fields, then serve document and UI:
     //     server.openapi().title("petshop").version("1.0.0").server("...");
     //     server.serve_openapi("/openapi.json").serve_swagger_ui("/swagger");
-    openapi::OpenApiSpec& openapi() {
-        return m_router->openapi();
-    }
-    Server& serve_openapi(std::string path = "/openapi.json") {
+    openapi::OpenApiSpec &openapi() { return m_router->openapi(); }
+    Server &serve_openapi(std::string path = "/openapi.json") {
         m_router->serve_openapi(std::move(path));
         return *this;
     }
-    Server& serve_swagger_ui(std::string path = "/swagger", std::string spec_url = "/openapi.json") {
+    Server &serve_swagger_ui(std::string path = "/swagger", std::string spec_url = "/openapi.json") {
         m_router->serve_swagger_ui(std::move(path), std::move(spec_url));
         return *this;
     }
 #endif
 
-    Server& http_proxy(std::string path, HttpProxyTarget target, ClientConfig client_cfg = {}) {
+    Server &http_proxy(std::string path, HttpProxyTarget target, ClientConfig client_cfg = {}) {
         m_router->http_proxy(std::move(path), std::move(target), std::move(client_cfg));
         return *this;
     }
-    Server& http_proxy_regex(const std::string& pattern, HttpProxyTarget target, ClientConfig client_cfg = {}) {
+    Server &http_proxy_regex(const std::string &pattern, HttpProxyTarget target, ClientConfig client_cfg = {}) {
         m_router->http_proxy_regex(pattern, std::move(target), std::move(client_cfg));
         return *this;
     }
@@ -305,7 +298,8 @@ class Server {
     bool start() { return start_listeners(); }
 
     void stop() {
-        if (m_stopped.exchange(true)) return;
+        if (m_stopped.exchange(true))
+            return;
 
         // Close each acceptor on its own context — async_accept is running there
         // and acceptor::close is not thread-safe — and wait for those closes to
@@ -320,7 +314,7 @@ class Server {
         std::atomic<std::size_t> remaining{m_acceptors.size()};
         std::promise<void> all_closed;
         auto closed = all_closed.get_future();
-        for (auto& listener : m_acceptors) {
+        for (auto &listener : m_acceptors) {
             auto acceptor = listener.acceptor;
             auto mark_done = [&remaining, &all_closed] {
                 if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
@@ -332,7 +326,7 @@ class Server {
                 // closing from this thread is safe, and a posted close would
                 // never execute at all.
                 std::visit(
-                    [](const auto& socket) {
+                    [](const auto &socket) {
                         error_code ec;
                         socket->close(ec);
                     },
@@ -342,7 +336,7 @@ class Server {
             }
             asio::post(*listener.ctx, [acceptor, mark_done] {
                 std::visit(
-                    [](const auto& socket) {
+                    [](const auto &socket) {
                         error_code ec;
                         socket->close(ec);
                     },
@@ -359,7 +353,7 @@ class Server {
         // arrived on, so closing the listener first would leave the peer with a
         // port that merely stopped answering — it would wait for its own
         // timeout instead of being told. The sockets go after the drain, below.
-        for (auto& quic : m_quic) {
+        for (auto &quic : m_quic) {
             quic->shutdown_connections();
         }
 #endif
@@ -374,7 +368,7 @@ class Server {
         m_router->close_proxy_client();
         m_pool->stop();
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
-        for (auto& quic : m_quic) {
+        for (auto &quic : m_quic) {
             quic->close();
         }
         m_quic.clear();
@@ -393,11 +387,13 @@ class Server {
     // Zero for a UNIX-domain socket, which has no port to report.
     std::uint16_t port() const {
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
-        if (m_acceptors.empty()) return m_quic.empty() ? 0 : m_quic.front()->port();
+        if (m_acceptors.empty())
+            return m_quic.empty() ? 0 : m_quic.front()->port();
 #endif
-        if (m_acceptors.empty()) return 0;
+        if (m_acceptors.empty())
+            return 0;
         return std::visit(
-            [](const auto& acceptor) {
+            [](const auto &acceptor) {
                 using Acceptor = std::remove_reference_t<decltype(*acceptor)>;
                 if constexpr (std::is_same_v<Acceptor, asio::ip::tcp::acceptor>) {
                     error_code ec;
@@ -431,8 +427,8 @@ class Server {
     // socket types are unrelated, but nothing above this line has to care. The
     // variant holds one alternative on a platform without AF_UNIX, and every
     // std::visit over it still compiles.
-    using AnyAcceptor = std::variant<std::shared_ptr<asio::ip::tcp::acceptor>,
-                                     std::shared_ptr<asio::local::stream_protocol::acceptor>>;
+    using AnyAcceptor =
+        std::variant<std::shared_ptr<asio::ip::tcp::acceptor>, std::shared_ptr<asio::local::stream_protocol::acceptor>>;
 
     struct Listener {
         AnyAcceptor acceptor;
@@ -452,8 +448,8 @@ class Server {
         return [router](std::string_view path) -> std::optional<WsHandlerFn> {
             // Exact local ws routes only; the h1 engine consults this before
             // the byte-level proxy lookup (nginx order).
-            if (const WsHandler* h = router->find_ws_exact(path)) {
-                return *h;  // copy the handler for the engine to run
+            if (const WsHandler *h = router->find_ws_exact(path)) {
+                return *h; // copy the handler for the engine to run
             }
             return std::nullopt;
         };
@@ -462,7 +458,7 @@ class Server {
     WsLookup make_ws_regex_lookup() {
         auto router = m_router;
         return [router](std::string_view path) -> std::optional<WsHandlerFn> {
-            if (const WsHandler* h = router->find_ws_regex(path)) {
+            if (const WsHandler *h = router->find_ws_regex(path)) {
                 return *h;
             }
             return std::nullopt;
@@ -472,7 +468,7 @@ class Server {
     WsProxyLookup make_ws_proxy_lookup() {
         auto router = m_router;
         return [router](std::string_view path) -> std::optional<WsProxyTarget> {
-            return router->find_ws_proxy(path);  // already expands capture groups
+            return router->find_ws_proxy(path); // already expands capture groups
         };
     }
 
@@ -486,20 +482,24 @@ class Server {
 
     // Bind one listening socket on `ctx`. Returns nullptr and sets `ec` on
     // failure. Does not register the acceptor.
-    std::shared_ptr<asio::ip::tcp::acceptor> bind_acceptor(asio::io_context& ctx, const std::string& host,
-                                                           std::uint16_t port, bool v6_only, error_code& ec) {
+    std::shared_ptr<asio::ip::tcp::acceptor> bind_acceptor(asio::io_context &ctx, const std::string &host,
+                                                           std::uint16_t port, bool v6_only, error_code &ec) {
         auto addr = asio::ip::make_address(host, ec);
-        if (ec) return nullptr;
+        if (ec)
+            return nullptr;
         asio::ip::tcp::endpoint ep{addr, port};
         auto acceptor = std::make_shared<asio::ip::tcp::acceptor>(ctx);
         acceptor->open(ep.protocol(), ec);
-        if (ec) return nullptr;
+        if (ec)
+            return nullptr;
         if (v6_only) {
             acceptor->set_option(asio::ip::v6_only(true), ec);
-            if (ec) return nullptr;
+            if (ec)
+                return nullptr;
         }
         acceptor->set_option(asio::ip::tcp::acceptor::reuse_address(true), ec);
-        if (ec) return nullptr;
+        if (ec)
+            return nullptr;
         if (m_config.reuse_port) {
             // Must precede bind(), and every socket in the group must set it:
             // one that doesn't cannot share the port. A failure here is how a
@@ -508,16 +508,19 @@ class Server {
             // would leave the fan-out half-bound and half-serving.
 #ifdef SO_REUSEPORT
             acceptor->set_option(asio::detail::socket_option::boolean<SOL_SOCKET, SO_REUSEPORT>(true), ec);
-            if (ec) return nullptr;
+            if (ec)
+                return nullptr;
 #else
             ec = asio::error::operation_not_supported;
             return nullptr;
 #endif
         }
         acceptor->bind(ep, ec);
-        if (ec) return nullptr;
+        if (ec)
+            return nullptr;
         acceptor->listen(asio::socket_base::max_listen_connections, ec);
-        if (ec) return nullptr;
+        if (ec)
+            return nullptr;
         return acceptor;
     }
 
@@ -530,10 +533,11 @@ class Server {
     // for both families, so serving IPv4 alone beats refusing to serve at all.
     // A `v6 = true` host asked for IPv6 only, and quietly opening IPv4 instead
     // would hand out reachability nobody asked for — so that one fails loudly.
-    std::shared_ptr<asio::ip::tcp::acceptor> probe_acceptor(const InetAddress& address, error_code& ec) {
+    std::shared_ptr<asio::ip::tcp::acceptor> probe_acceptor(const InetAddress &address, error_code &ec) {
         auto ctx = acceptor_context();
         auto acceptor = bind_acceptor(*ctx, address.host, address.port, address.v6, ec);
-        if (acceptor || address.v6 || !is_ipv6_host(address.host)) return acceptor;
+        if (acceptor || address.v6 || !is_ipv6_host(address.host))
+            return acceptor;
         SIMPLE_HTTP_ERROR_LOG("bind({}:{}): {}; retrying on 0.0.0.0", address.host, address.port, ec.message());
         error_code ipv4_ec;
         auto fallback = bind_acceptor(*ctx, "0.0.0.0", address.port, false, ipv4_ec);
@@ -548,10 +552,10 @@ class Server {
     // accepts on its own thread. Returns false — undoing its own binds, and
     // leaving the probe's acceptor in place as the single acceptor — when a
     // bind fails.
-    bool fan_out(const std::string& host, std::uint16_t port, bool v6_only) {
-        const std::size_t bound = m_acceptors.size();  // just the probe's
+    bool fan_out(const std::string &host, std::uint16_t port, bool v6_only) {
+        const std::size_t bound = m_acceptors.size(); // just the probe's
         for (std::size_t i = bound; i < m_pool->size(); ++i) {
-            auto& ctx = m_pool->at(i);
+            auto &ctx = m_pool->at(i);
             error_code ec;
             auto acceptor = bind_acceptor(*ctx, host, port, v6_only, ec);
             if (!acceptor) {
@@ -559,7 +563,7 @@ class Server {
                 while (m_acceptors.size() > bound) {
                     const auto acceptor = m_acceptors.back().acceptor;
                     std::visit(
-                        [](const auto& socket) {
+                        [](const auto &socket) {
                             error_code ec;
                             socket->close(ec);
                         },
@@ -580,7 +584,7 @@ class Server {
     bool start_listeners() {
         bool ok = true;
         if (m_config.listen) {
-            ok = std::visit([this](const auto& address) { return start_listener(address); }, *m_config.listen);
+            ok = std::visit([this](const auto &address) { return start_listener(address); }, *m_config.listen);
         }
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
         // A failed TCP bind does not stop the QUIC listener from being tried —
@@ -593,7 +597,7 @@ class Server {
         return ok;
     }
 
-    bool start_listener(const InetAddress& address) {
+    bool start_listener(const InetAddress &address) {
         error_code ec;
         auto acceptor = probe_acceptor(address, ec);
         if (!acceptor) {
@@ -625,7 +629,7 @@ class Server {
     // reports it, nothing extra has to be linked, and a platform without it
     // simply cannot be asked to bind a path. Hence no macro — the one thing a
     // consumer could have got wrong is now impossible to get wrong.
-    bool start_listener(const UnixAddress& address) {
+    bool start_listener(const UnixAddress &address) {
 #ifndef BOOST_ASIO_HAS_LOCAL_SOCKETS
         SIMPLE_HTTP_ERROR_LOG("UNIX-domain sockets are unavailable on this platform: {}", address.path);
         return false;
@@ -637,7 +641,7 @@ class Server {
         // servers starting at once can unlink each other's) is the one they all
         // accept.
         std::error_code ignored;
-        std::filesystem::remove(address.path, ignored);  // best-effort
+        std::filesystem::remove(address.path, ignored); // best-effort
 
         auto ctx = acceptor_context();
         asio::local::stream_protocol::endpoint endpoint{address.path};
@@ -645,8 +649,10 @@ class Server {
 
         error_code ec;
         acceptor->open(endpoint.protocol(), ec);
-        if (!ec) acceptor->bind(endpoint, ec);
-        if (!ec) acceptor->listen(asio::socket_base::max_listen_connections, ec);
+        if (!ec)
+            acceptor->bind(endpoint, ec);
+        if (!ec)
+            acceptor->listen(asio::socket_base::max_listen_connections, ec);
         if (ec) {
             SIMPLE_HTTP_ERROR_LOG("bind(unix:{}): {}", address.path, ec.message());
             return false;
@@ -666,17 +672,16 @@ class Server {
     // Bind a QUIC listener. QUIC has no accept: the endpoint demuxes by
     // connection ID and hands each connection to `make_h3_serve`, which is the
     // only place this file names the HTTP/3 engine.
-    bool start_listener(const QuicAddress& address) {
+    bool start_listener(const QuicAddress &address) {
         if (!m_config.tls) {
             // Not a fallback to something else: QUIC has no plaintext mode, and
             // serving HTTP/3 without TLS is not a thing that exists.
-            SIMPLE_HTTP_ERROR_LOG("QUIC listener on {}:{} needs ServerConfig::tls", address.host,
-                                  address.port);
+            SIMPLE_HTTP_ERROR_LOG("QUIC listener on {}:{} needs ServerConfig::tls", address.host, address.port);
             return false;
         }
         try {
             m_quic_tls.emplace(*m_config.tls);
-        } catch (const std::exception& e) {
+        } catch (const std::exception &e) {
             SIMPLE_HTTP_ERROR_LOG("QUIC TLS setup: {}", e.what());
             return false;
         }
@@ -698,15 +703,15 @@ class Server {
         // sockets; within one it can.)
         const std::size_t sockets = m_config.reuse_port ? m_pool->size() : 1;
         for (std::size_t i = 0; i < sockets; ++i) {
-            const std::shared_ptr<asio::io_context>& ctx =
-                m_config.reuse_port ? m_pool->at(i) : acceptor_context();
+            const std::shared_ptr<asio::io_context> &ctx = m_config.reuse_port ? m_pool->at(i) : acceptor_context();
             auto quic = std::make_shared<QuicEndpointType>(ctx->get_executor(), m_quic_tls->native_handle(),
                                                            m_config.quic_options, make_h3_serve());
             if (!quic->open(endpoint, m_config.reuse_port, ec)) {
                 SIMPLE_HTTP_ERROR_LOG("QUIC bind({}:{}) [{}]: {}", address.host, address.port, i, ec.message());
                 // Undo the sockets already bound, leaving the listener down
                 // rather than half-serving on a port the caller thinks failed.
-                for (auto& bound : m_quic) bound->close();
+                for (auto &bound : m_quic)
+                    bound->close();
                 m_quic.clear();
                 return false;
             }
@@ -758,7 +763,7 @@ class Server {
     // Register a connection, keeping its entry alive for as long as the returned
     // handle is. Held by the connection's completion handler, so the entry
     // expires exactly when the connection is over.
-    std::shared_ptr<LiveConnection> track_connection(const std::shared_ptr<asio::io_context>& ctx,
+    std::shared_ptr<LiveConnection> track_connection(const std::shared_ptr<asio::io_context> &ctx,
                                                      std::function<void()> shutdown) {
         auto live = std::make_shared<LiveConnection>();
         live->ctx = ctx;
@@ -768,7 +773,7 @@ class Server {
         // connections, so a long-lived server does not accumulate a weak_ptr per
         // connection it has ever served.
         if (m_live.size() > 64) {
-            std::erase_if(m_live, [](const std::weak_ptr<LiveConnection>& entry) { return entry.expired(); });
+            std::erase_if(m_live, [](const std::weak_ptr<LiveConnection> &entry) { return entry.expired(); });
         }
         m_live.push_back(live);
         return live;
@@ -781,14 +786,14 @@ class Server {
         std::vector<std::shared_ptr<LiveConnection>> live;
         {
             std::lock_guard lock(m_live_mutex);
-            for (auto& entry : m_live) {
+            for (auto &entry : m_live) {
                 if (auto handle = entry.lock()) {
                     live.push_back(std::move(handle));
                 }
             }
             m_live.clear();
         }
-        for (auto& handle : live) {
+        for (auto &handle : live) {
             asio::post(*handle->ctx, [handle] { handle->shutdown(); });
         }
     }
@@ -798,15 +803,16 @@ class Server {
     // protocol hands the socket type back rather than making it a second
     // parameter to thread through by hand.
     void spawn_accept_loops(bool partitioned) {
-        for (auto& listener : m_acceptors) {
+        for (auto &listener : m_acceptors) {
             std::visit(
-                [&](const auto& acceptor) {
+                [&](const auto &acceptor) {
                     using Acceptor = std::remove_reference_t<decltype(*acceptor)>;
                     using Socket = typename Acceptor::protocol_type::socket;
                     // Pinned only when the fan-out really happened: re-dispatching
                     // a connection the kernel already assigned to this socket
                     // would give back the affinity the fan-out bought.
-                    asio::co_spawn(*listener.ctx, accept_loop<Acceptor, Socket>(acceptor, partitioned ? listener.ctx : nullptr),
+                    asio::co_spawn(*listener.ctx,
+                                   accept_loop<Acceptor, Socket>(acceptor, partitioned ? listener.ctx : nullptr),
                                    asio::detached);
                 },
                 listener.acceptor);
@@ -827,12 +833,13 @@ class Server {
             // Pinned: the kernel already picked this socket, so keep the
             // connection here. Otherwise round-robin the pool, which spreads
             // long-lived connections more evenly than the kernel's hash does.
-            const std::shared_ptr<asio::io_context>& ctx_ptr = pinned ? pinned : m_pool->next_ptr();
-            asio::io_context& ctx = *ctx_ptr;
+            const std::shared_ptr<asio::io_context> &ctx_ptr = pinned ? pinned : m_pool->next_ptr();
+            asio::io_context &ctx = *ctx_ptr;
             Socket socket{ctx};
             auto [ec] = co_await acceptor->async_accept(socket, asio::as_tuple(asio::use_awaitable));
             if (ec) {
-                if (ec == asio::error::operation_aborted) break;
+                if (ec == asio::error::operation_aborted)
+                    break;
                 // Never retry in silence: a persistent accept error — EMFILE and
                 // ENOBUFS are both reachable, since this loop opens a socket per
                 // connection — would otherwise spin a core with no diagnostic at
@@ -848,12 +855,12 @@ class Server {
             if constexpr (std::is_same_v<Socket, asio::ip::tcp::socket>) {
                 if (m_config.tcp_nodelay) {
                     error_code ne;
-                    socket.set_option(asio::ip::tcp::no_delay(true), ne);  // best-effort
+                    socket.set_option(asio::ip::tcp::no_delay(true), ne); // best-effort
                 }
                 if (m_config.socket_setup) {
                     try {
                         m_config.socket_setup(socket);
-                    } catch (const std::exception& e) {
+                    } catch (const std::exception &e) {
                         SIMPLE_HTTP_ERROR_LOG("socket_setup threw: {}", e.what());
                     }
                 }
@@ -867,8 +874,9 @@ class Server {
                 auto live = track_connection(ctx_ptr, [transport] { transport->close(); });
                 // The handler is not `detached`: it holds the registry handle, so
                 // the entry lives exactly as long as the connection does.
-                asio::co_spawn(ctx, serve_tls(transport, dispatch, ws_lookup, m_config.limits, ws_proxy_lookup, ws_regex_lookup),
-                               [live](std::exception_ptr) {});
+                asio::co_spawn(
+                    ctx, serve_tls(transport, dispatch, ws_lookup, m_config.limits, ws_proxy_lookup, ws_regex_lookup),
+                    [live](std::exception_ptr) {});
             } else {
                 auto sock_ptr = std::make_shared<Socket>(std::move(socket));
                 auto transport = std::make_shared<TcpTransport<Socket>>(std::move(sock_ptr), peer);
@@ -882,17 +890,17 @@ class Server {
         co_return;
     }
 
-    static std::string local_address(const asio::ip::tcp::acceptor& acceptor) {
+    static std::string local_address(const asio::ip::tcp::acceptor &acceptor) {
         error_code ec;
         return acceptor.local_endpoint(ec).address().to_string();
     }
 
-    static std::uint16_t local_port(const asio::ip::tcp::acceptor& acceptor) {
+    static std::uint16_t local_port(const asio::ip::tcp::acceptor &acceptor) {
         error_code ec;
         return acceptor.local_endpoint(ec).port();
     }
 
-    static bool is_ipv6_host(const std::string& host) {
+    static bool is_ipv6_host(const std::string &host) {
         error_code ec;
         auto addr = asio::ip::make_address(host, ec);
         return !ec && addr.is_v6();
@@ -919,4 +927,4 @@ class Server {
     std::atomic<bool> m_stopped{false};
 };
 
-}  // namespace simple_http
+} // namespace simple_http

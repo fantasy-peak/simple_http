@@ -3,7 +3,6 @@
 // what reached the engine, and with which headers - is observable.
 
 #include <catch2/catch_test_macros.hpp>
-
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -51,14 +50,13 @@ Headers text_headers() {
 }
 
 // Runs one writer call and asserts it reported success.
-template <typename T>
-void ok(asio::io_context& ctx, asio::awaitable<T> op) {
+template <typename T> void ok(asio::io_context &ctx, asio::awaitable<T> op) {
     auto result = run_on(ctx, std::move(op));
     REQUIRE(result.has_value());
     CHECK_FALSE(static_cast<bool>(*result));
 }
 
-}  // namespace
+} // namespace
 
 TEST_CASE("compressing_writer: off means the writer is not wrapped", "[compression]") {
     asio::io_context ctx;
@@ -116,7 +114,7 @@ TEST_CASE("compressing_writer: Content-Length follows the protocol", "[compressi
 TEST_CASE("compressing_writer: headers that forbid or predate compression", "[compression]") {
     const std::string body = big_text();
 
-    const auto run_case = [&](Headers headers, int status, bool head, const char* label) {
+    const auto run_case = [&](Headers headers, int status, bool head, const char *label) {
         asio::io_context ctx;
         auto inner = std::make_shared<FakeResponseWriter>();
         CompressingResponseWriter writer(inner, ctx.get_executor(), enabled(), "gzip", head);
@@ -124,7 +122,7 @@ TEST_CASE("compressing_writer: headers that forbid or predate compression", "[co
 
         INFO(label);
         CHECK_FALSE(inner->has_header("content-encoding"));
-        CHECK(inner->last_body == body);  // untouched
+        CHECK(inner->last_body == body); // untouched
     };
 
     SECTION("already encoded by someone else") {
@@ -139,13 +137,11 @@ TEST_CASE("compressing_writer: headers that forbid or predate compression", "[co
         const std::string already = "pretend this is brotli on the wire";
         ok(ctx, writer.send(200, std::move(h), already));
 
-        CHECK(inner->header("content-encoding") == "br");  // preserved, not double-encoded
+        CHECK(inner->header("content-encoding") == "br"); // preserved, not double-encoded
         CHECK(inner->last_body == already);
-        CHECK_FALSE(inner->has_header("vary"));  // nothing was negotiated, so no Vary
+        CHECK_FALSE(inner->has_header("vary")); // nothing was negotiated, so no Vary
     }
-    SECTION("a byte range must stay addressable") {
-        run_case(text_headers(), 206, false, "206");
-    }
+    SECTION("a byte range must stay addressable") { run_case(text_headers(), 206, false, "206"); }
     SECTION("Content-Range header") {
         Headers h = text_headers();
         h.add("content-range", "bytes 0-99/1000");
@@ -156,17 +152,13 @@ TEST_CASE("compressing_writer: headers that forbid or predate compression", "[co
         h.add("cache-control", "public, no-transform");
         run_case(std::move(h), 200, false, "no-transform");
     }
-    SECTION("HEAD") {
-        run_case(text_headers(), 200, true, "head");
-    }
+    SECTION("HEAD") { run_case(text_headers(), 200, true, "head"); }
     SECTION("a type that is already entropy-coded") {
         Headers h;
         h.add("content-type", "image/png");
         run_case(std::move(h), 200, false, "image/png");
     }
-    SECTION("no content-type at all") {
-        run_case(Headers{}, 200, false, "no content-type");
-    }
+    SECTION("no content-type at all") { run_case(Headers{}, 200, false, "no content-type"); }
 }
 
 TEST_CASE("compressing_writer: small and incompressible bodies pass through", "[compression]") {
@@ -215,7 +207,7 @@ TEST_CASE("compressing_writer: Vary and ETag are maintained", "[compression]") {
 TEST_CASE("compressing_writer: streaming", "[compression]") {
     asio::io_context ctx;
     auto inner = std::make_shared<FakeResponseWriter>();
-    inner->ver = Version::Http2;  // so the length rule is exercised the strict way
+    inner->ver = Version::Http2; // so the length rule is exercised the strict way
     CompressingResponseWriter writer(inner, ctx.get_executor(), enabled(), "gzip", false);
     ok(ctx, writer.send_headers(200, text_headers()));
 
@@ -231,7 +223,7 @@ TEST_CASE("compressing_writer: streaming", "[compression]") {
     CHECK_FALSE(inner->has_header("content-length"));
 
     std::string streamed;
-    for (const std::string& chunk : inner->chunks) {
+    for (const std::string &chunk : inner->chunks) {
         // An empty chunk would make HTTP/1.x emit its chunked terminator early.
         CHECK_FALSE(chunk.empty());
         streamed += chunk;
@@ -239,7 +231,9 @@ TEST_CASE("compressing_writer: streaming", "[compression]") {
     CHECK(decompress_all("gzip", streamed) == part1 + part2);
 }
 
-TEST_CASE("compressing_writer: a codec that buffers emits nothing, not an empty chunk", "[compression]") {
+TEST_CASE("compressing_writer: a codec that buffers emits nothing, not an empty "
+          "chunk",
+          "[compression]") {
     asio::io_context ctx;
     auto inner = std::make_shared<FakeResponseWriter>();
     CompressingResponseWriter writer(inner, ctx.get_executor(), enabled(), "gzip", false);
@@ -254,7 +248,7 @@ TEST_CASE("compressing_writer: a codec that buffers emits nothing, not an empty 
     ok(ctx, writer.send_last({}));
 
     std::string streamed;
-    for (const std::string& chunk : inner->chunks) {
+    for (const std::string &chunk : inner->chunks) {
         CHECK_FALSE(chunk.empty());
         streamed += chunk;
     }
