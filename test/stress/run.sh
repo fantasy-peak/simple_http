@@ -13,9 +13,23 @@
 #     永远 Blocked，请求无限期挂起——`-n 10 -c 1 -m 1` 只成 1 个、卡满 30 秒，
 #     而 h1/h2 在同一台机器上一切正常。修在 quic/connection.h 的 peer_stream_retired。
 #
-# 用法：
-#   test/stress/run.sh              # 全部跑
-#   test/stress/run.sh h3           # 只跑指定的（h1 / h2 / h3）
+# 用法（统一入口，平时只执行这一个脚本）：
+#   test/stress/run.sh [cpp|rust|both] [h1|h2|h3|ws]...
+#     cpp  = 压 simple_http（C++），端口 7788-7792
+#     rust = 压 rust_http_server，       端口 7888-7892
+#     both = 两个都压（默认）
+#     不带档位参数 = 四档全跑。
+#   例：test/stress/run.sh both h3        # 两实现都只跑 h3 档
+#
+# 脚本开头会**无条件清理所有遗留测试服务**（C++ release/debug server、rust_http_server、
+# server_dbg），并验证 TCP+UDP 端口释放后才启动被测服务器——否则 SO_REUSEPORT 会把
+# 新服务器与残留进程哈希分流，QUIC 连接表被劈开（症状：20 万请求 ~800 failed）。
+#
+# 内建「改动后必跑顺序」：目标含 cpp 时先执行 test/conformance/run.sh（符合性），
+# 全绿才继续压力测试；`RUN_CONFORMANCE=0` 可跳过。平时改完代码跑本脚本一条龙即可。
+#
+# 工具矩阵（能用 k6 的都用 k6）：h1/ws 负载走 k6，复用门线与 h2c/h3 负载走 h2load
+# （k6 不支持 h2c/h3，且自动重连表达不了单连接门线）。python 兜底已移除。
 #
 # 端口与 conformance 一致，别改：
 #   h1 → 7791  纯 h1       h2 → 7790  纯 h2c       h3 → 7792  udp（双传输端点的 QUIC 侧）
@@ -26,13 +40,65 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-CACHE="${ROOT}/.cache/stress"
-# 默认用 debug 构建：这个套件看的是「连接还活不活得下去」，断言开着的价值高于跑得快。
-SERVER_BIN="${SERVER_BIN:-${ROOT}/build/linux/x86_64/release/server}"
+# 允许调用方用环境变量覆盖被测服务器二进制（兼容原 SERVER_BIN=... 用法）。
+SERVER_BIN_ENV="${SERVER_BIN:-}"
 
-PORT_H1=7791
-PORT_H2C=7790
-PORT_H3=7792
+# --- 目标实现配置（cpp / rust，由参数选定）--------------------------------
+RUST_ROOT="${RUST_ROOT:-/root/github/rust_http_server}"
+TARGET=""
+CACHE=""
+SERVER_BIN=""
+PORT_WS=""; PORT_H2C=""; PORT_H1=""; PORT_H3=""
+BUILD_SERVER=""
+
+# ===== 测试参数配置（可随时改，改完直接跑）=====================================
+# 请求/响应体规格（需求方指定）：请求 POST 1 KiB body，响应三档 2k/10k/20k。
+# 复用门线用最小的那一档代表负载形态。
+RESP_TIERS="2048 10240 20480"      # 响应体三档（字节）
+# 负载档（h2load + k6）：
+LOAD_THREADS=4                     # h2load -t：发压进程数
+LOAD_REQUESTS=300000               # 每个负载档的总请求数
+LOAD_CLIENTS=200                   # 客户端数/连接数（h2load -c；k6 的 VUS）
+LOAD_STREAMS=20                    # 每连接并发流数（h2load -m；k6 h1 档不适用）
+# WebSocket 档（打 /echo1k：请求 WS_MSG_SIZE 字节，服务端固定回 WS_RESP_SIZE 字节）：
+WS_MSG_VUS=100                     # ws 客户端数（k6 VUS）
+WS_MSG_ITERS=600                   # ws 连接数（k6 iterations，总消息数 = ITERS × WANT）
+WS_MSG_WANT=2000                   # 每连接发送帧数
+WS_MSG_SIZE=512                    # ws 请求包字节
+WS_RESP_SIZE=1024                  # ws 响应包字节（两端 /echo1k 固定回这么多）
+# 改动后必跑顺序（内建）：先符合性（simple_http 的 test/conformance/run.sh，仅当
+# 目标含 cpp 时），全绿才继续压力测试；关掉则跳过符合性。
+RUN_CONFORMANCE=1
+# ====================================================================
+
+select_target() {
+    case "$1" in
+        cpp)
+            TARGET=cpp
+            CACHE="${ROOT}/.cache/stress"
+            SERVER_BIN="${SERVER_BIN_ENV:-${ROOT}/build/linux/x86_64/release/server}"
+            PORT_WS=7788; PORT_H2C=7790; PORT_H1=7791; PORT_H3=7792
+            BUILD_SERVER="xmake build server"
+            REQ_BODY="${CACHE}/req1024.bin"
+            ;;
+        rust)
+            TARGET=rust
+            CACHE="${RUST_ROOT}/.cache/stress"
+            SERVER_BIN="${SERVER_BIN_ENV:-${RUST_ROOT}/target/release/rust_http_server}"
+            PORT_WS=7888; PORT_H2C=7890; PORT_H1=7891; PORT_H3=7892
+            BUILD_SERVER="cargo build --release --manifest-path ${RUST_ROOT}/Cargo.toml"
+            REQ_BODY="${CACHE}/req1024.bin"
+            ;;
+        *)
+            say "内部错误：未知目标 $1"
+            return 1
+            ;;
+    esac
+}
+
+# ws 驱动：k6 是**唯一**驱动（python websockets 兜底已按需求移除）。k6 同时是
+# h1 负载档的驱动（见 run_load_k6），所以 k6 是必装工具而不是可选项。
+WS_DRIVER_ACTUAL="k6"
 
 # 复用门线：一条连接上连发 200 个请求，必须 200/200。数字写死是有意的——这个用例
 # 就是为「同一条连接的第 2 个请求」设计的，它失败必是连接生命周期出了问题，而不是
@@ -70,6 +136,15 @@ require_h2load() {
     return 1
 }
 
+require_ws_driver() {
+    if command -v k6 >/dev/null 2>&1; then
+        return 0
+    fi
+    warn "缺 k6（WebSocket 与 h1 负载的唯一驱动）"
+    say  "      k6: 见 https://github.com/grafana/k6/releases（单二进制）"
+    return 1
+}
+
 # h2load 支持 HTTP/3 才算环境齐备。自编的配方（ngtcp2 生态，OpenSSL 3.5 起带原生 QUIC API）：
 #
 #   nghttp3 v1.18.0 / ngtcp2 v1.25.0 → /opt/h3，再编 nghttp2 v1.70.0：
@@ -96,15 +171,15 @@ probe_h3_support() {
 start_server() {
     if [[ ! -x "$SERVER_BIN" ]]; then
         head_ "构建 server"
-        ( cd "$ROOT" && xmake build server ) || { bad "xmake build server 失败"; return 1; }
+        ( cd "$ROOT" && eval "$BUILD_SERVER" ) || { bad "构建 server 失败：$BUILD_SERVER"; return 1; }
     fi
-    head_ "启动示例服务器（:7788 嗅探 / :7789 mTLS / :7790 h2c / :7791 h1 / :7792 双传输）"
+    head_ "启动被测服务器（目标 $TARGET，端口 ws=$PORT_WS h2c=$PORT_H2C h1=$PORT_H1 h3=$PORT_H3）"
     # 必须在仓库根目录起：证书路径是相对路径。
     ( cd "$ROOT" && exec "$SERVER_BIN" >"${CACHE}/server.log" 2>&1 ) &
     SERVER_PID=$!
 
     local port ready i
-    for port in "$PORT_H1" "$PORT_H2C" "$PORT_H3"; do
+    for port in "$PORT_H1" "$PORT_H2C" "$PORT_H3" "$PORT_WS"; do
         ready=0
         for i in $(seq 1 50); do
             if (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then ready=1; break; fi
@@ -145,7 +220,7 @@ h2load_p99()     { printf '%s\n' "$1" | grep -E '^(request     :|time for reques
 run_reuse() {
     local name="$1" port="$2"; shift 2
     local out counts succ failed errored
-    out="$("$H2LOAD" "$@" -n "$REUSE_N" -c 1 -m 1 "http://127.0.0.1:${port}/world" 2>&1)" || true
+    out="$("$H2LOAD" "$@" -d "$REQ_BODY" -n "$REUSE_N" -c 1 -m 1 "http://127.0.0.1:${port}/world?n=${RESP_TIERS%% *}" 2>&1)" || true
     counts="$(h2load_counts "$out")"
     read -r succ failed errored <<<"$counts"
     if [[ -z "${succ:-}" ]]; then
@@ -165,7 +240,7 @@ run_reuse() {
 run_reuse_h3() {
     local name="$1" port="$2"
     local out counts succ failed errored
-    out="$("$H2LOAD" --alpn-list=h3 -n "$REUSE_N" -c 1 -m 1 "https://127.0.0.1:${port}/world" 2>&1)" || true
+    out="$("$H2LOAD" --alpn-list=h3 -d "$REQ_BODY" -n "$REUSE_N" -c 1 -m 1 "https://127.0.0.1:${port}/world?n=${RESP_TIERS%% *}" 2>&1)" || true
     counts="$(h2load_counts "$out")"
     read -r succ failed errored <<<"$counts"
     if [[ -z "${succ:-}" ]]; then
@@ -184,16 +259,22 @@ run_reuse_h3() {
 # 写死一个数会在别的机器上误报；真正确定性的是「失败数为 0」，那是门线。
 run_load() {
     local label="$1" port="$2"; shift 2
-    local out
-    out="$("$H2LOAD" "$@" -t 4 -n 200000 -c 200 -m 20 "http://127.0.0.1:${port}/world" 2>&1)" || true
-    report_load "$label" "$out"
+    local n out
+    for n in $RESP_TIERS; do
+        out="$("$H2LOAD" "$@" -d "$REQ_BODY" -t "$LOAD_THREADS" -n "$LOAD_REQUESTS" -c "$LOAD_CLIENTS" -m "$LOAD_STREAMS" \
+            "http://127.0.0.1:${port}/world?n=${n}" 2>&1)" || true
+        report_load "${label}@${n}B" "$out"
+    done
 }
 
 run_load_h3() {
     local label="$1" port="$2"
-    local out
-    out="$("$H2LOAD" --alpn-list=h3 -t 4 -n 200000 -c 200 -m 20 "https://127.0.0.1:${port}/world" 2>&1)" || true
-    report_load "$label" "$out"
+    local n out
+    for n in $RESP_TIERS; do
+        out="$("$H2LOAD" --alpn-list=h3 -d "$REQ_BODY" -t "$LOAD_THREADS" -n "$LOAD_REQUESTS" -c "$LOAD_CLIENTS" -m "$LOAD_STREAMS" \
+            "https://127.0.0.1:${port}/world?n=${n}" 2>&1)" || true
+        report_load "${label}@${n}B" "$out"
+    done
 }
 
 report_load() {
@@ -213,10 +294,34 @@ report_load() {
     ok "${label} 负载：${succ} 个请求全成"
 }
 
+# HTTP/1.1 档用 k6 驱动（需求方要求能用 k6 的都用 k6）。k6 不支持 h2c/h3，
+# 那两档仍走 h2load；复用门线也保留 h2load——k6 在连接断开时会自动重连，
+# 表达不了「一条连接必须 200/200」的语义。
+run_load_k6() {
+    local label="$1" port="$2"
+    local n out rps errors
+    for n in $RESP_TIERS; do
+        out="$(K6_URL="http://127.0.0.1:${port}/world?n=${n}" K6_VUS="$LOAD_CLIENTS" K6_ITERATIONS="$LOAD_REQUESTS" \
+            k6 run --quiet "$ROOT/test/stress/k6_h1.js" 2>&1)" || true
+        rps="$(printf '%s\n' "$out" | grep -a 'http_reqs' | sed -n 's/.* \([0-9.]*\)\/s.*/\1/p' | tail -n 1)"
+        errors="$(printf '%s\n' "$out" | grep -a '^errors' | sed -n 's/.*: \([0-9]*\).*/\1/p' | tail -n 1)"
+        if [[ -z "${rps:-}" ]]; then
+            bad "${label}@${n}B：没解析到 k6 结果"
+            printf '%s\n' "$out" | tail -n 6 | sed 's/^/      /'
+            continue
+        fi
+        if [[ "${errors:-0}" != "0" ]]; then
+            bad "${label}@${n}B：k6 errors ${errors}"
+            continue
+        fi
+        ok "${label}@${n}B：${rps} req/s，0 错误"
+    done
+}
+
 run_h1() {
     head_ "HTTP/1.1（:${PORT_H1}，纯 h1）"
     run_reuse h1 "$PORT_H1" --h1
-    run_load  h1 "$PORT_H1" --h1
+    run_load_k6 h1 "$PORT_H1"
 }
 
 run_h2() {
@@ -232,11 +337,38 @@ run_h3() {
     run_load_h3  h3 "$PORT_H3"
 }
 
+# WebSocket 档：门线是「回显数==发送数 且 0 失败」。驱动固定 k6（python 兜底已移除）。
+run_ws() {
+    head_ "WebSocket echo1k（ws://127.0.0.1:${PORT_WS}/echo1k，请求 ${WS_MSG_SIZE}B → 响应 ${WS_RESP_SIZE}B，驱动 k6）"
+    local out sent recv failed msgs
+    out="$(WS_URL="ws://127.0.0.1:${PORT_WS}/echo1k" VUS="$WS_MSG_VUS" ITERS="$WS_MSG_ITERS" WANT="$WS_MSG_WANT" \
+        SIZE="$WS_MSG_SIZE" k6 run --quiet "$ROOT/test/stress/k6_ws.js" 2>&1)"
+    # "ws_messages...........: <count> <rate>/s"
+    recv="$(printf '%s\n' "$out" | grep -a 'ws_messages' | tail -n 1 | sed -n 's/^.*ws_messages[. ]*: \([0-9]*\).*/\1/p')"
+    msgs="$(printf '%s\n' "$out" | grep -a 'ws_messages' | tail -n 1 | sed -n 's/^.*: [0-9]* \([0-9.]*\)\/s.*/\1/p')"
+    sent=$(( WS_MSG_ITERS * WS_MSG_WANT ))
+    failed=$(( recv == sent ? 0 : 1 ))
+    if [[ -z "${recv:-}" ]]; then
+        bad "ws 回显：没解析到结果"
+        printf '%s\n' "$out" | tail -n 5 | sed 's/^/      /'
+        return 1
+    fi
+    say "  ws echo k6：${msgs} msgs/s"
+    if [[ "$recv" != "$sent" || "$failed" != "0" ]]; then
+        bad "ws 回显：recv ${recv}/${sent}"
+        return 1
+    fi
+    ok "ws 回显：${recv}/${sent} 条全成，0 失败"
+}
+
 # --- 主流程 --------------------------------------------------------------
 
 usage() {
-    say "用法：$(basename "$0") [h1|h2|h3]..."
-    say "      不带参数 = 三档全跑。"
+    say "用法：$(basename "$0") [cpp|rust|both] [h1|h2|h3|ws]..."
+    say "      cpp  = simple_http（C++，端口 7788-7792）"
+    say "      rust = rust_http_server（端口 7888-7892）"
+    say "      both = 两个都跑（默认）"
+    say "      不带档位参数 = 四档全跑。例：run.sh both h3"
 }
 
 want() {
@@ -246,37 +378,98 @@ want() {
     return 1
 }
 
+# 强制清理（REQUIREMENTS.md 第 0 条铁律落到脚本里）：无论本次跑哪个目标，先把两个
+# 实现 + conformance（debug）的遗留测试服务全部杀干净，并验证 TCP/UDP 端口释放。
+# 不清理的后果：SO_REUSEPORT 让残留进程与新服务器同挂一个 UDP 端口、QUIC 连接被
+# 哈希劈给两个进程（实测 20 万请求 ~800 failed）；7789 无 reuse_port 则直接 EADDRINUSE。
+kill_all_test_servers() {
+    head_ "清理遗留测试服务（强制，改动后必跑）"
+    local pat='[r]elease/server|[d]ebug/server|[r]ust_http_server|[s]erver_dbg'
+    local pids
+    pids="$(ps ax -o pid,cmd | grep -E "$pat" | grep -v grep | awk '{print $1}')"
+    if [[ -z "$pids" ]]; then
+        ok "无遗留测试服务"
+    else
+        say "  发现遗留进程，先 SIGTERM（优雅退出是异步的，等 3 秒）再 SIGKILL 兜底：$(echo "$pids" | tr '\n' ' ')"
+        kill $pids 2>/dev/null
+        sleep 3
+        for again in $(ps ax -o pid,cmd | grep -E "$pat" | grep -v grep | awk '{print $1}'); do
+            kill -9 "$again" 2>/dev/null
+        done
+        sleep 1
+    fi
+    local busy
+    busy="$(ss -uln -tln 2>/dev/null | grep -E ':(778|788)[0-9]' || true)"
+    if [[ -n "$busy" ]]; then
+        bad "端口仍被占用（TCP/UDP 7788-7792 或 7888-7892）："
+        printf '%s\n' "$busy" | sed 's/^/      /'
+        return 1
+    fi
+    ok "进程与端口均已释放"
+}
+
+run_target_suites() {
+    local target="$1"
+    select_target "$target" || return 1
+    mkdir -p "$CACHE"
+    # 需求方指定的请求体：POST 1 KiB。h2load -d 与 k6_h1.js 共用。
+    head -c 1024 /dev/zero | tr '\0' 'x' > "$REQ_BODY"
+
+    head_ "环境自检（目标 $target）"
+    ENV_OK=1
+    require_h2load || ENV_OK=0
+    require_ws_driver || ENV_OK=0
+    [[ "$ENV_OK" == "1" ]] && ok "齐备"
+    if [[ "$ENV_OK" != "1" ]]; then
+        say ""
+        say "环境不全，未开始测试。按上面的提示准备后重跑。"
+        return 1
+    fi
+    # 自编的 h2load 装到别处时，用 H2LOAD=... 指过来（配合 LD_LIBRARY_PATH）。
+    H2LOAD="${H2LOAD:-/opt/h3/bin/h2load}"
+
+    start_server || return 1
+
+    want h1 && run_h1
+    want h2 && run_h2
+    want h3 && run_h3
+    want ws && run_ws
+
+    stop_server
+}
+
+# 解析参数：目标（cpp/rust/both）+ 档位（h1/h2/h3/ws）
+TARGETS=()
 for arg in "$@"; do
     case "$arg" in
         -h|--help) usage; exit 0 ;;
-        h1|h2|h3) SUITES+=("$arg") ;;
+        cpp|rust) TARGETS+=("$arg") ;;
+        both|all) TARGETS=(cpp rust) ;;
+        h1|h2|h3|ws) SUITES+=("$arg") ;;
         *) say "未知参数：$arg"; usage; exit 2 ;;
     esac
 done
+[[ ${#TARGETS[@]} -eq 0 ]] && TARGETS=(cpp rust)   # 默认 both
 
-mkdir -p "$CACHE"
+kill_all_test_servers || exit 1
 
-head_ "环境自检"
-ENV_OK=1
-require_h2load || ENV_OK=0
-[[ "$ENV_OK" == "1" ]] && ok "齐备"
-if [[ "$ENV_OK" != "1" ]]; then
-    say ""
-    say "环境不全，未开始测试。按上面的提示准备后重跑。"
-    exit 1
+# 改动后必跑顺序：先符合性，再压力。符合性只测 C++ 实现，故目标含 cpp 时才跑。
+if [[ "$RUN_CONFORMANCE" == "1" ]] && [[ " ${TARGETS[*]} " == *" cpp "* ]]; then
+    head_ "符合性测试（改动后必过，源：simple_http/test/conformance/run.sh）"
+    local conf_rc
+    ( cd "$ROOT" && test/conformance/run.sh ) 2>&1 | tee "${CACHE}/conformance.last.log"
+    conf_rc=${PIPESTATUS[0]}
+    if [[ "$conf_rc" != "0" ]]; then
+        bad "符合性未达到基线（退出码 $conf_rc，详情见 ${CACHE}/conformance.last.log）；跳过可设 RUN_CONFORMANCE=0"
+        exit 1
+    fi
+    ok "符合性通过（退出码 0）"
 fi
 
-# 自编的 h2load 装到别处时，用 H2LOAD=... 指过来（配合 LD_LIBRARY_PATH 指向它的
-# 依赖，若它不是静态链接的）。
-H2LOAD="${H2LOAD:-$(command -v h2load)}"
-
-start_server || exit 1
-
-want h1 && run_h1
-want h2 && run_h2
-want h3 && run_h3
-
-stop_server
+for t in "${TARGETS[@]}"; do
+    head_ ">>>>>> 目标实现：$t <<<<<<"
+    run_target_suites "$t"
+done
 
 head_ "汇总"
 if [[ "$FAILURES" == "0" ]]; then

@@ -37,6 +37,17 @@ struct QuicConnectionConfig {
     std::uint64_t active_connection_id_limit{4};
     std::uint64_t ack_delay_exponent{3};
     std::uint64_t max_ack_delay_ms{25};
+    // Minimum number of received ACK-eliciting packets before ngtcp2 sends an
+    // immediate acknowledgement; below it the ACK waits for the ack timer.
+    // ngtcp2's own default is 2, but 1 is the shipped default here: delay
+    // inflates the remote's observed RTT (measured on this host: smoothed RTT
+    // 35-93 ms instead of 0.4 ms), which stalls the peer's cwnd growth as soon
+    // as requests carry payload (POST 512B: 10.3k → 17.5k req/s at ack_thresh
+    // 2 → 1). The cost is one extra ~31 B ACK packet per data packet, which is
+    // nothing versus an RTT sample that trails the real RTT by an order of
+    // magnitude, and ACKing early is always RFC-compliant (≤ the advertised
+    // max_ack_delay).
+    std::uint64_t ack_thresh{1};
 
     std::size_t connection_id_length{8};
     // Inert under ngtcp2 (see ngtcp2_config.h): CRYPTO_BUFFER_EXCEEDED is
@@ -69,6 +80,7 @@ inline Ngtcp2Params make_ngtcp2_params(const QuicConnectionConfig& cfg, ngtcp2_t
     ngtcp2_settings_default(&out.settings);
     out.settings.initial_ts = ts;
     out.settings.max_tx_udp_payload_size = cfg.max_udp_payload_size;
+    out.settings.ack_thresh = static_cast<std::size_t>(cfg.ack_thresh);
 
     // Today's stack treats `max_udp_payload_size` as a hard ceiling, and so does
     // this: ngtcp2 would otherwise probe for a larger path MTU and start sending

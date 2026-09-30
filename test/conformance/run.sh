@@ -27,7 +27,7 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CACHE="${ROOT}/.cache/conformance"
-SERVER_BIN="${ROOT}/build/linux/x86_64/debug/server"
+SERVER_BIN="${ROOT}/build/linux/x86_64/release/server"
 
 H2SPEC_URL="https://github.com/summerwind/h2spec/releases/download/v2.6.0/h2spec_linux_amd64.tar.gz"
 H1SPEC_URL="https://raw.githubusercontent.com/uNetworking/h1spec/main/http_test.ts"

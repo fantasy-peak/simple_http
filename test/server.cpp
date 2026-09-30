@@ -55,6 +55,14 @@ void register_routes(ServerT& server) {
     // One-shot response. Body size configurable via ?n= (default 1 KiB) so the
     // stress suite can compare 1k / 10k / 50k response packages.
     server.route("/world", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
+        // Drain the request body. The body-size comparison POSTs a 512 B payload
+        // (h2load -d); left unread it would corrupt keep-alive HTTP/1.1 framing.
+        // GET sends an empty body, so read_all() returns immediately.
+        auto body = co_await req->body().read_all();
+        if (!body) {
+            co_await res->status(400).send("read error");
+            co_return;
+        }
         std::size_t n = query_uint(req->query(), "n", 1024);
         co_await res->status(200).send(std::string(n, 'a'));
     });
@@ -314,6 +322,20 @@ void register_routes(ServerT& server) {
             auto msg = co_await ws->read();
             if (!msg) break;
             if (auto ec = co_await ws->write(msg->data, msg->text)) break;
+        }
+        co_return;
+    });
+
+    // Benchmark echo: answer every message with a fixed WS_RESP_SIZE (1 KiB)
+    // payload regardless of what was sent. This is the stress-suite workload
+    // shape (request 512 B → response 1 KiB); /echo above stays verbatim for
+    // Autobahn, which requires exact echo.
+    server.ws_route("/echo1k", [](std::shared_ptr<Request>, std::shared_ptr<WebSocket> ws) -> asio::awaitable<void> {
+        std::string resp(1024, 'a');
+        for (;;) {
+            auto msg = co_await ws->read();
+            if (!msg) break;
+            if (auto ec = co_await ws->write(resp, msg->text)) break;
         }
         co_return;
     });

@@ -460,8 +460,10 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
             m_conn->close(m_oversize_stream == stream_id ? kH3ExcessiveLoad : code, "http3");
             return;
         }
-        // Framing bytes are consumed by nghttp3 itself; the DATA payload is
-        // credited by `on_data`, since only the handler knows when it is read.
+        // Framing bytes are consumed by nghttp3 itself and credited here; the
+        // DATA payload is credited later, by the Body consume hook installed in
+        // ensure_stream(), as the handler reads it (nghttp3's recv_data
+        // contract: app credits the payload itself).
         m_conn->extend_stream_offset(stream_id, static_cast<std::uint64_t>(nconsumed));
         m_conn->extend_connection_offset(static_cast<std::uint64_t>(nconsumed));
 
@@ -861,6 +863,21 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         auto stream = std::make_shared<Stream>();
         stream->id = stream_id;
         stream->request = std::make_shared<Request>(Version::Http3, m_executor, m_conn->peer());
+        // Credit inbound request-body bytes back to QUIC flow control as the
+        // handler consumes them. nghttp3's recv_data contract requires the app
+        // to do this ("increase flow control credit by datalen"), and
+        // read_stream2's return value explicitly excludes the DATA payload — so
+        // without this hook the connection receive window (initial_max_data,
+        // default 1 MiB) is spent exactly once: when the cumulative body bytes
+        // reach 1 MiB the peer can never send again. Measured on this host:
+        // POST 1 KiB body failed ~800 of 200000 requests, precisely at
+        // (1 MiB / 1 KiB) requests x 200 connections.
+        stream->request->body().set_on_consumed([weak = this->weak_from_this(), stream_id](std::size_t n) {
+            if (auto eng = weak.lock()) {
+                eng->m_conn->extend_stream_offset(stream_id, n);
+                eng->m_conn->extend_connection_offset(n);
+            }
+        });
         auto [inserted, _] = m_streams.emplace(stream_id, stream);
         return inserted->second;
     }

@@ -371,11 +371,46 @@ xmake build server && xmake run python-tests    # 第三方客户端驱动服务
 服务器，需 `pip install requests` + `xmake run server`），不属于自动套件；`server.cpp` 是示例
 服务器，`tls_certificates/` 是测试证书，`server.cpp.test` 是旧快照（未参与构建）。
 
+### 压力测试统一入口（改动后必跑的一条龙）
+
+协议层/传输层的改动落地后，**只执行这一个脚本**即完成「清理 → 符合性 → 压力」全流程：
+
+```sh
+test/stress/run.sh [cpp|rust|both] [h1|h2|h3|ws]...
+# 例：test/stress/run.sh both          # cpp + rust 四档全跑（默认 both）
+#     test/stress/run.sh cpp h3        # 只跑 cpp 的 h3 档
+```
+
+脚本内建，顺序固定：
+
+1. **强制清理**：杀光遗留测试服务（simple_http 的 release/debug server、rust_http_server、
+   server_dbg），SIGTERM 后 SIGKILL 兜底，并验证 TCP/UDP `7788-7792` / `7888-7892` 端口释放。
+   不清理的坑：`7792` UDP 有 SO_REUSEPORT，残留进程会把新服务器的 QUIC 连接表按包的哈希
+   劈成两半——实测 20 万请求 ~800 failed，`ss` 还看不出异常。
+2. **符合性测试**：目标含 `cpp` 时先跑 `test/conformance/run.sh`（基线：h2spec 146/146、
+   h1spec 33/33、h3spec 47/49、Autobahn FAILED 0 / NON-STRICT 0），逐套件通过数照打并给出
+   「✓ 符合性通过（退出码 0）」明文判定；未达基线即中止，不进压力档。
+   `RUN_CONFORMANCE=0` 可跳过（配置块里改）。
+3. **压力测试**（四档；C++ 与 Rust 必须同一工具才可比）：
+   | 档 | 工具 | 说明 |
+   |---|---|---|
+   | h1 / ws 负载 | **k6** | h1 打 `/world?n=`（POST 1KB）；ws 打 `/echo1k`（请求 512B → 响应 1KB，k6_ws.js） |
+   | h2c / h3 负载 | **h2load**（`/opt/h3/bin/h2load`，系统自带无 QUIC 不可用） | k6 不支持 h2c 与 h3 |
+   | 复用门线（全协议） | h2load | 一条连接串行 200 请求必须 200/200；k6 断线自动重连，表达不了该语义 |
+   - 规格：**请求 POST 1KB body，响应三档 2k/10k/20k**（`?n=`），每档 20 万请求，
+     **失败数必须为 0**（k6 档 `errors=0`）；失败不是方差，是事故。
+4. **头部「测试参数配置」可随时改**：`LOAD_CLIENTS`（客户端数）、`LOAD_STREAMS`（每连接
+   并发流数）、`LOAD_REQUESTS`、`RESP_TIERS`、`WS_MSG_SIZE`/`WS_RESP_SIZE`/`WS_MSG_VUS` 等。
+
+`rust_http_server` 仓库的 `test/stress/run.sh` 已改为 shim，等价于 `run.sh rust ...`；
+C++ 与 Rust 的对比由 `run.sh both` 一次给出（同一窗口、两端同工具、全部门线绿才算达标）。
+
 ### 外部一致性套件（每次改动后必跑）
 
 三套跨实现的一致性套件，独立于 simple_http 自己的客户端——和 `test/python/` 同一个理由，
 但更权威：它们是各自协议的参考级套件，只在服务端真的错的地方分歧。**任何触及协议层的改动
-做完后都要跑一次**：
+做完后都要跑一次**（已由统一入口 `test/stress/run.sh` 在目标含 cpp 时自动先跑本套件，
+也可按需单独执行下面的命令）：
 
 ```sh
 test/conformance/run.sh          # 三套依次跑；非零退出码 = 有套件未达标或环境不全
