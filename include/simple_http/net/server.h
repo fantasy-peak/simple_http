@@ -114,10 +114,6 @@ struct ServerConfig {
     PlaintextProtocols plaintext_protocols{PlaintextProtocols::Both};
     // All protocol-engine tunables (timeouts, size caps, HTTP/2 windows/streams).
     EngineLimits limits{};
-    // Policy for the client that reverse-proxy routes (`http_proxy*`) use: TLS
-    // trust and client certificates for HTTPS backends, timeouts, pool sizing.
-    // Defaults suit public backends (system CA, verification on).
-    ClientConfig proxy_client{};
     // Optional per-accepted-socket hook (TCP_NODELAY / keepalive / buffer sizes …).
     // Invoked right after accept, before the transport or TLS handshake touches the
     // socket. Use the error_code overloads of set_option to avoid throwing.
@@ -139,7 +135,7 @@ class Server {
     explicit Server(ServerConfig config)
         : m_config(std::move(config)),
           m_pool(std::make_shared<IoCtxPool>(m_config.worker_threads == 0 ? 1 : m_config.worker_threads)),
-          m_router(std::make_shared<Router>(m_config.proxy_client)) {
+          m_router(std::make_shared<Router>()) {
         if (m_config.tls) {
             m_tls.emplace(*m_config.tls);
         }
@@ -167,14 +163,17 @@ class Server {
     Server& operator=(const Server&) = delete;
 
     // --- route registration (fluent, forwarded to the Router) ---
+    // Methods come first: a route is a (method, path) pair. Braced literal,
+    // `any_methods`, or the std::vector<Method> a config file parser filled —
+    // see router.h.
     template <typename F>
-    Server& route(std::string path, F&& handler) {
-        m_router->route(std::move(path), std::forward<F>(handler));
+    Server& route(std::vector<Method> methods, std::string path, F&& handler) {
+        m_router->route(std::move(methods), std::move(path), std::forward<F>(handler));
         return *this;
     }
     template <typename F>
-    Server& route_regex(const std::string& pattern, F&& handler) {
-        m_router->route_regex(pattern, std::forward<F>(handler));
+    Server& route_regex(std::vector<Method> methods, const std::string& pattern, F&& handler) {
+        m_router->route_regex(std::move(methods), pattern, std::forward<F>(handler));
         return *this;
     }
     template <typename F>
@@ -223,9 +222,11 @@ class Server {
     // the backend's response streamed back. The frontend may be HTTP/1.x, h2c or
     // HTTP/2 — the re-framing is version-agnostic. rewrite_path rewrites the
     // request target; for the regex form it is a substitution template ($1..$9
-    // capture groups). The short form proxies to a plaintext HTTP/1.1 backend;
-    // pass an HttpProxyTarget to reach a TLS (ALPN picks h2 when the backend
-    // offers it) or h2c backend instead.
+    // capture groups). The short form proxies to a plaintext HTTP/1.1 backend.
+    // The optional ClientConfig is the route's own outbound policy — TLS trust
+    // and client certificates for an HTTPS backend, timeouts, pool sizing,
+    // defaults suit public backends — and each route builds its own client, so
+    // different backends carry different policies and pools.
     Server& http_proxy(std::string path, std::string host, std::uint16_t port, std::string rewrite_path = {}) {
         return http_proxy(std::move(path), HttpProxyTarget{std::move(host), port, std::move(rewrite_path)});
     }
@@ -242,12 +243,12 @@ class Server {
         return *this;
     }
 
-    Server& http_proxy(std::string path, HttpProxyTarget target) {
-        m_router->http_proxy(std::move(path), std::move(target));
+    Server& http_proxy(std::string path, HttpProxyTarget target, ClientConfig client_cfg = {}) {
+        m_router->http_proxy(std::move(path), std::move(target), std::move(client_cfg));
         return *this;
     }
-    Server& http_proxy_regex(const std::string& pattern, HttpProxyTarget target) {
-        m_router->http_proxy_regex(pattern, std::move(target));
+    Server& http_proxy_regex(const std::string& pattern, HttpProxyTarget target, ClientConfig client_cfg = {}) {
+        m_router->http_proxy_regex(pattern, std::move(target), std::move(client_cfg));
         return *this;
     }
 

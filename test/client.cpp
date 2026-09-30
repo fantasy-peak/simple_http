@@ -177,35 +177,35 @@ long long query_number(const sh::RequestPtr& req, std::string_view key, long lon
 }
 
 void register_routes(sh::Server& server) {
-    server.route("/world", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+    server.route(sh::any_methods, "/world", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
         co_await res->status(200).send(std::string{"hello from "} + std::string{sh::to_string(res->version())});
     });
-    server.route("/echo", [](sh::RequestPtr req, sh::ResponsePtr res) -> asio::awaitable<void> {
+    server.route(sh::any_methods, "/echo", [](sh::RequestPtr req, sh::ResponsePtr res) -> asio::awaitable<void> {
         auto body = co_await req->body().read_all();
         co_await res->status(200).send(body ? *body : std::string{});
     });
-    server.route("/drain", [](sh::RequestPtr req, sh::ResponsePtr res) -> asio::awaitable<void> {
+    server.route(sh::any_methods, "/drain", [](sh::RequestPtr req, sh::ResponsePtr res) -> asio::awaitable<void> {
         auto body = co_await req->body().read_all();
         co_await res->status(200).send("received " + std::to_string(body ? body->size() : 0) + " bytes");
     });
-    server.route("/big", [](sh::RequestPtr req, sh::ResponsePtr res) -> asio::awaitable<void> {
+    server.route(sh::any_methods, "/big", [](sh::RequestPtr req, sh::ResponsePtr res) -> asio::awaitable<void> {
         const std::size_t n = static_cast<std::size_t>(query_number(req, "n", 65536));
         std::string body(n, 'x');
         for (std::size_t i = 0; i < n; i += 4096)
             body[i] = 'a';  // a pattern to check, cheaply
         co_await res->status(200).send(std::move(body));
     });
-    server.route("/empty", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+    server.route(sh::any_methods, "/empty", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
         co_await res->status(204).send_bodyless();
     });
-    server.route("/delay", [](sh::RequestPtr req, sh::ResponsePtr res) -> asio::awaitable<void> {
+    server.route(sh::any_methods, "/delay", [](sh::RequestPtr req, sh::ResponsePtr res) -> asio::awaitable<void> {
         const auto ms = static_cast<int>(query_number(req, "ms", 200));
         asio::steady_timer timer{co_await asio::this_coro::executor};
         timer.expires_after(std::chrono::milliseconds(ms));
         co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
         co_await res->status(200).send("delayed");
     });
-    server.route("/stream", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+    server.route(sh::any_methods, "/stream", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
         // A streamed response is chunked on HTTP/1.1, so this route exercises the
         // chunked decoder both directly and through the reverse proxy.
         (void)co_await res->status(200).content_type("text/plain").begin();
@@ -213,14 +213,14 @@ void register_routes(sh::Server& server) {
         (void)co_await res->write("beta-");
         (void)co_await res->finish("gamma");
     });
-    server.route("/headers", [](sh::RequestPtr req, sh::ResponsePtr res) -> asio::awaitable<void> {
+    server.route(sh::any_methods, "/headers", [](sh::RequestPtr req, sh::ResponsePtr res) -> asio::awaitable<void> {
         std::string out;
         for (const auto& [name, value] : req->headers()) {
             out.append(name).append(": ").append(value).append("\n");
         }
         co_await res->status(200).send(std::move(out));
     });
-    server.route("/whoami", [](sh::RequestPtr, sh::ResponsePtr res, sh::SslHandle ssl) -> asio::awaitable<void> {
+    server.route(sh::any_methods, "/whoami", [](sh::RequestPtr, sh::ResponsePtr res, sh::SslHandle ssl) -> asio::awaitable<void> {
         std::string who = "no client certificate";
         if (ssl)
             if (X509* cert = SSL_get_peer_certificate(*ssl)) {
@@ -1182,13 +1182,16 @@ int main() {
     constexpr std::uint16_t kTlsPort = 27911;
     constexpr std::uint16_t kCompPort = 27912;
     sh::ServerConfig plain_cfg = server_config(kPlainPort, std::nullopt);
-    // The proxy's client role must trust the test CA (and present the client
-    // certificate) to reach this process's own mTLS listener.
-    plain_cfg.proxy_client.tls.ca_file = "./test/tls_certificates/ca_cert.pem";
-    plain_cfg.proxy_client.tls.cert_chain_file = "./test/tls_certificates/client_cert.pem";
-    plain_cfg.proxy_client.tls.private_key_file = "./test/tls_certificates/client_key.pem";
-    plain_cfg.proxy_client.tls.verify_host = false;  // the test certificate has no SAN
     sh::Server plain{plain_cfg};
+    // The proxy's client role must trust the test CA (and present the client
+    // certificate) to reach this process's own mTLS listener. The policy is
+    // attached to the route whose backend is that listener — each proxy route
+    // owns its client, so the plaintext-backend route keeps the public default.
+    sh::ClientConfig proxy_cfg;
+    proxy_cfg.tls.ca_file = "./test/tls_certificates/ca_cert.pem";
+    proxy_cfg.tls.cert_chain_file = "./test/tls_certificates/client_cert.pem";
+    proxy_cfg.tls.private_key_file = "./test/tls_certificates/client_key.pem";
+    proxy_cfg.tls.verify_host = false;  // the test certificate has no SAN
     register_routes(plain);
     sh::TlsConfig tls_cfg;
     tls_cfg.cert_chain_file = "./test/tls_certificates/server_cert.pem";
@@ -1214,7 +1217,7 @@ int main() {
         backend.port = kTlsPort;
         backend.rewrite_path = "/$1";
         backend.tls = true;
-        plain.http_proxy_regex("/rptls/(.*)", std::move(backend));
+        plain.http_proxy_regex("/rptls/(.*)", std::move(backend), std::move(proxy_cfg));
     }
 
     if (!plain.start() || !secure.start() || !compressed.start()) {

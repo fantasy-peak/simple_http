@@ -32,7 +32,7 @@ void readme_server() {
     simple_http::ServerConfig cfg = readme_server_config();
     simple_http::Server server{cfg};
 
-    server.route("/hello", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+    server.route({simple_http::Method::Get}, "/hello", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
         co_await res->status(200).content_type(simple_http::mime::text_plain).send("Hello World!");
     });
 
@@ -116,7 +116,7 @@ simple_http::ServerConfig readme_tls_config() {
 }
 
 void readme_ssl_handle_route(simple_http::Server& server) {
-    server.route("/whoami", [](RequestPtr, ResponsePtr res, simple_http::SslHandle ssl) -> asio::awaitable<void> {
+    server.route({simple_http::Method::Get}, "/whoami", [](RequestPtr, ResponsePtr res, simple_http::SslHandle ssl) -> asio::awaitable<void> {
         if (!ssl) {
             co_await res->status(400).send("plaintext");
             co_return;
@@ -132,10 +132,10 @@ void readme_ssl_handle_route(simple_http::Server& server) {
 using simple_http::HttpProxyTarget;
 
 void readme_routing(simple_http::Server& server) {
-    server.route("/world", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+    server.route({simple_http::Method::Get}, "/world", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
         co_await res->status(200).send("world");
     });
-    server.route_regex("^/api/(.*)$", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+    server.route_regex({simple_http::Method::Get}, "^/api/(.*)$", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
         co_await res->status(200).send("api");
     });
     server.fallback([](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {

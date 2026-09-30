@@ -99,42 +99,57 @@ void register_routes(sh::Server& server) {
     // between the regex routes and the fallback, so every route below still wins.
     server.static_files(static_site());
 
-    server.route("/world", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+    server.route(sh::any_methods, "/world", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
         co_await res->status(200).content_type("text/plain").send("hello");
     });
     // Echoes the body length and its bytes, so framing is observable.
-    server.route("/echo", [](sh::RequestPtr req, sh::ResponsePtr res) -> asio::awaitable<void> {
+    server.route(sh::any_methods, "/echo", [](sh::RequestPtr req, sh::ResponsePtr res) -> asio::awaitable<void> {
         auto body = co_await req->body().read_all();
         co_await res->status(200).send("len=" + std::to_string(body ? body->size() : 0) + ":" + (body ? *body : ""));
     });
-    server.route("/empty", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+    server.route(sh::any_methods, "/empty", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
         co_await res->status(204).send_bodyless();
     });
-    server.route("/stream", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+    server.route(sh::any_methods, "/stream", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
         (void)co_await res->status(200).content_type("text/plain").begin();
         (void)co_await res->write("one-");
         (void)co_await res->finish("two");
     });
-    server.route("/big", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+    server.route(sh::any_methods, "/big", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
         co_await res->status(200).send(std::string(9000, 'x'));
     });
     // Answers late and never reads the body: the stream stays open with an
     // unconsumed body, so nothing replenishes the flow-control window.
-    server.route("/slow", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+    server.route(sh::any_methods, "/slow", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
         asio::steady_timer timer{co_await asio::this_coro::executor};
         timer.expires_after(std::chrono::milliseconds(1500));
         co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
         co_await res->status(200).send("late");
     });
     // A field carrying CR/LF is response splitting; the response must not go out.
-    server.route("/inject", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+    server.route(sh::any_methods, "/inject", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
         (void)co_await res->status(200).header("x-bad", "a\r\ninjected: 1").send("hi");
     });
     // A handler that sets its own Content-Length: the writer owns that field and
     // must replace it, not append a second one.
-    server.route("/clash", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+    server.route(sh::any_methods, "/clash", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
         co_await res->status(200).header("content-length", "999").send("hi");
     });
+    // Method-aware routes: these pin the router's 405 / Allow / auto-OPTIONS
+    // behaviour over real sockets, just like the static stage's 405 test does —
+    // but for routes. GET implies HEAD here, so HEAD /getonly is a 200.
+    server.route({sh::Method::Get}, "/method/getonly",
+                 [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+                     co_await res->status(200).send("getonly");
+                 });
+    server.route({sh::Method::Post}, "/method/postonly",
+                 [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+                     co_await res->status(200).send("postonly");
+                 });
+    server.route({sh::Method::Put, sh::Method::Delete}, "/method/multi",
+                 [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+                     co_await res->status(200).send("multi");
+                 });
     server.ws_route("/chat", [](sh::RequestPtr, std::shared_ptr<sh::WebSocket> ws) -> asio::awaitable<void> {
         for (;;) {
             auto message = co_await ws->read();
@@ -1555,6 +1570,77 @@ TEST_CASE("regression/static: a POST to an existing file is a 405", "[regression
     REQUIRE(client.wait_head());
     CHECK(status_of(client.received()) == 405);
     CHECK(head_has(client.received(), "allow: GET, HEAD"));
+
+    client.close();
+}
+
+TEST_CASE("regression/method: a wrong method on a route is a 405 with Allow", "[regression][method]") {
+    plain_server();
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(kPlainPort));
+
+    client.send("POST /method/getonly HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n");
+    REQUIRE(client.wait_head());
+    CHECK(status_of(client.received()) == 405);
+    CHECK(head_has(client.received(), "allow: GET, HEAD, OPTIONS"));
+    // Like the static stage's 405, the reply closes the connection rather than
+    // drain a request body that was never going to be used.
+    CHECK(client.wait_eof());
+
+    client.close();
+}
+
+TEST_CASE("regression/method: a method the path serves still runs", "[regression][method]") {
+    plain_server();
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(kPlainPort));
+
+    client.send("PUT /method/multi HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n");
+    REQUIRE(client.wait_for("multi"));
+
+    client.close();
+}
+
+TEST_CASE("regression/method: GET serves HEAD with an empty body", "[regression][method]") {
+    plain_server();
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(kPlainPort));
+
+    client.send("HEAD /method/getonly HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(client.wait_head());
+    CHECK(status_of(client.received()) == 200);
+    CHECK(head_has(client.received(), "content-length: 7"));  // what a GET would produce…
+    CHECK(body_of(client.received()).empty());                // …but no body follows the head
+
+    client.close();
+}
+
+TEST_CASE("regression/method: OPTIONS is answered with Allow, the route does not run", "[regression][method]") {
+    plain_server();
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(kPlainPort));
+
+    client.send("OPTIONS /method/postonly HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(client.wait_head());
+    CHECK(status_of(client.received()) == 204);
+    CHECK(head_has(client.received(), "allow: POST, OPTIONS"));
+
+    client.close();
+}
+
+TEST_CASE("regression/method: an extension method on an any-method route is served", "[regression][method]") {
+    plain_server();
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(kPlainPort));
+
+    // PROPFIND parses to Method::Unknown; only an any-method route serves it.
+    client.send("PROPFIND /world HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(client.wait_for("hello"));
 
     client.close();
 }

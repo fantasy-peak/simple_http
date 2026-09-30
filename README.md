@@ -65,7 +65,7 @@ int main() {
 
     simple_http::Server server{cfg};
 
-    server.route("/hello", [](simple_http::RequestPtr, simple_http::ResponsePtr res) -> asio::awaitable<void> {
+    server.route({simple_http::Method::Get}, "/hello", [](simple_http::RequestPtr, simple_http::ResponsePtr res) -> asio::awaitable<void> {
         co_await res->status(200).content_type(simple_http::mime::text_plain).send("Hello World!");
     });
 
@@ -285,7 +285,7 @@ A handler that takes the third argument receives the connection's `SslHandle`
 certificate:
 
 ```cpp
-server.route("/whoami", [](simple_http::RequestPtr, simple_http::ResponsePtr res,
+server.route({simple_http::Method::Get}, "/whoami", [](simple_http::RequestPtr, simple_http::ResponsePtr res,
                            simple_http::SslHandle ssl) -> asio::awaitable<void> {
     X509* cert = SSL_get_peer_certificate(*ssl);  // owned by the caller: X509_free it
     // …
@@ -298,8 +298,14 @@ server.route("/whoami", [](simple_http::RequestPtr, simple_http::ResponsePtr res
 
 ```cpp
 // Exact and regex routes; the first match wins, `fallback` takes the rest.
-server.route("/world", handler);
-server.route_regex("^/api/(.*)$", handler);
+// A route is a (method, path) pair: methods first, as a braced list or any
+// iterable of `simple_http::Method` (a `std::vector` from config works too).
+// `any_methods` registers every method. GET implies HEAD, and a path whose
+// method does not match is answered 405 + `Allow`.
+server.route({simple_http::Method::Get}, "/world", handler);
+server.route({simple_http::Method::Post, simple_http::Method::Put}, "/users", handler);
+server.route(simple_http::any_methods, "/webhook", handler);      // any method
+server.route_regex({simple_http::Method::Get}, "^/api/(.*)$", handler);
 server.fallback(not_found);
 
 // A filter runs before routing; returning false short-circuits the request

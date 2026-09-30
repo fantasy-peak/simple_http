@@ -163,10 +163,14 @@ cfg.worker_threads = 4;
 // cfg.limits = EngineLimits{...};                     // 可选引擎调参
 
 Server server{cfg};
-server.route("/world", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
+server.route({Method::Get}, "/world", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
     co_await res->status(200).send("hello");
 });
-server.route_regex("/api/.*", handler);
+// 路由 = (method, path) 对，方法先行。方法集可以来自任意可迭代容器——配置解析
+// 出来的 std::vector<Method> 直接传。空集（any_methods）表示「任意方法」。
+server.route({Method::Post, Method::Put}, "/users", handler);
+server.route(any_methods, "/webhook", webhook_handler);   // 任意方法
+server.route_regex({Method::Get}, "/api/.*", handler);
 server.ws_route("/chat", ws_handler);
 server.fallback(not_found_handler);
 
@@ -174,6 +178,11 @@ server.start();      // 同步：启动所有监听并阻塞至绑定完成，�
 // 或 co_await server.run();  // 协程版
 server.stop();
 ```
+
+路由层是**方法感知**的（`router.h`）：`m_exact` 从 path→Handler 换成 path→`RouteEntry`（方法位图 + handler）。两条隐式规则跟着主流框架走（Flask / axum / Go 1.22 / Spring）：
+
+- **GET 隐含 HEAD**：注册 `{Method::Get}` 自动允许 HEAD，走同一 handler，writer 抑制 body（write 层本就按 HEAD 行为抑制，有回归测试）。
+- **405 + Allow（及自动 OPTIONS）**：path 存在但方法不符 → 405，`Allow` 头列出该 path 全部方法（含自动应答的 OPTIONS）；OPTIONS 本身则自动回 204 + Allow。语义照抄 static 阶段的「resolved first, then rejected」——path 不存在仍是 404，不是 405。405/OPTIONS 应答都 `res->close()` 关闭连接（不值得为一个永远不会被读的请求体做 drain，与 `static_files.h` 的 405 一致）。`Method::Unknown`（扩展方法 token）不可注册，但 `any_methods` 路由会接住它。
 
 CORS 是策略入口（`handler/cors.h`）：`CorsConfig` 编译成 `Filter` 存进 `m_cors`。
 
@@ -289,8 +298,10 @@ while (auto chunk = co_await (*stream)->read()) {   // 响应体：data 或 eof�
   `dispatch` 回该 executor，`HttpClient` 可跨线程共享（池有锁）。
 - **反代**：`Server::http_proxy*` 注册的路由由 `handler/http_proxy.h` 处理，上游复用 client 层
   （连接池、陈旧连接重试一次、h2 多路复用）；`HttpProxyTarget::tls` 让后端走 HTTPS 并由 ALPN
-  自动选 h2 / HTTP/1.1（`h2c` 则对明文后端尝试一次 Upgrade）。后端 TLS 的信任策略来自
-  `ServerConfig::proxy_client`（CA/客户端证书/是否校验）。WebSocket 反代
+  自动选 h2 / HTTP/1.1（`h2c` 则对明文后端尝试一次 Upgrade）。**每条反代路由自带一个
+  `ClientConfig`**（`http_proxy(path, target, client_cfg)`，缺省适合公网后端）——CA/客户端证书/
+  是否校验/超时/池大小都是这条路由自己的，不同后端各自独立（内部 mTLS 后端和公网后端绝不共享
+  凭据或连接池），所以它不属于 `ServerConfig`，也不设全局。WebSocket 反代
   （`ws_proxy*`）是字节级隧道，与 client 层无关。
 
 完整用法与边界用例参考 `test/client.cpp`（自检程序，`xmake run client`）。

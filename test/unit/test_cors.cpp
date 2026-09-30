@@ -61,7 +61,7 @@ TEST_CASE("cors: a preflight is answered 204 and never reaches the route", "[cor
     Router router;
     router.cors(CorsConfig{});
     bool ran = false;
-    router.route("/api", flag_handler(ran));
+    router.route(any_methods, "/api", flag_handler(ran));
 
     asio::io_context ctx;
     auto req = make_request(ctx, "/api");
@@ -95,7 +95,7 @@ TEST_CASE("cors: a plain OPTIONS is not a preflight", "[cors]") {
     Router router;
     router.cors(CorsConfig{});
     bool ran = false;
-    router.route("/api", flag_handler(ran));
+    router.route(any_methods, "/api", flag_handler(ran));
 
     asio::io_context ctx;
     auto req = make_request(ctx, "/api", Method::Options);
@@ -115,7 +115,7 @@ TEST_CASE("cors: no Origin means no CORS headers", "[cors]") {
     Router router;
     router.cors(CorsConfig{});
     bool ran = false;
-    router.route("/api", flag_handler(ran));
+    router.route(any_methods, "/api", flag_handler(ran));
 
     asio::io_context ctx;
     auto writer = dispatch(ctx, router, make_request(ctx, "/api"));
@@ -143,7 +143,7 @@ TEST_CASE("cors: an actual request gets the headers and the route still runs", "
     Router router;
     router.cors(CorsConfig{});
     bool ran = false;
-    router.route("/api", flag_handler(ran));
+    router.route(any_methods, "/api", flag_handler(ran));
 
     asio::io_context ctx;
     auto req = make_request(ctx, "/api");
@@ -163,7 +163,7 @@ TEST_CASE("cors: an allowlist mirrors the origin and adds Vary", "[cors]") {
     Router router;
     router.cors(CorsConfig{.allow_origins = {"https://app.example"}});
     bool ran = false;
-    router.route("/api", flag_handler(ran));
+    router.route(any_methods, "/api", flag_handler(ran));
 
     asio::io_context ctx;
     auto req = make_request(ctx, "/api");
@@ -213,7 +213,7 @@ TEST_CASE("cors: an unlisted origin gets no headers but the route still runs", "
     Router router;
     router.cors(CorsConfig{.allow_origins = {"https://app.example"}});
     bool ran = false;
-    router.route("/api", flag_handler(ran));
+    router.route(any_methods, "/api", flag_handler(ran));
 
     asio::io_context ctx;
     auto req = make_request(ctx, "/api");
@@ -232,7 +232,7 @@ TEST_CASE("cors: a disallowed-origin preflight is 204 without headers", "[cors]"
     Router router;
     router.cors(CorsConfig{.allow_origins = {"https://app.example"}});
     bool ran = false;
-    router.route("/api", flag_handler(ran));
+    router.route(any_methods, "/api", flag_handler(ran));
 
     asio::io_context ctx;
     auto req = make_request(ctx, "/api");

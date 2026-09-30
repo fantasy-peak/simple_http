@@ -50,11 +50,16 @@ static std::size_t query_uint(std::string_view query, std::string_view key, std:
 }
 
 // Registers the shared route table on a server.
+//
+// Every handler below is method-agnostic (it reads the body and query, never
+// `req->method()`), so each registers as `any_methods` — that is also what the
+// protocol-conformance suites require, since they hit "/" under any method. A
+// real endpoint would restrict the list instead: `route({Method::Post}, ...)`.
 template <typename ServerT>
 void register_routes(ServerT& server) {
     // One-shot response. Body size configurable via ?n= (default 1 KiB) so the
     // stress suite can compare 1k / 10k / 50k response packages.
-    server.route("/world", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
+    server.route(any_methods, "/world", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
         // Drain the request body. The body-size comparison POSTs a 512 B payload
         // (h2load -d); left unread it would corrupt keep-alive HTTP/1.1 framing.
         // GET sends an empty body, so read_all() returns immediately.
@@ -70,7 +75,7 @@ void register_routes(ServerT& server) {
     // Bidirectional streaming: read each request-body frame, log it, and echo a
     // response frame back per received frame. Chunked over HTTP/1.1, DATA frames
     // over HTTP/2 — every frame is flushed as it is produced.
-    server.route("/hello", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
+    server.route(any_methods, "/hello", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
         co_await res->status(200).content_type("text/plain").begin();
         int i = 0;
         for (;;) {
@@ -94,7 +99,7 @@ void register_routes(ServerT& server) {
     });
 
     // Reads the whole request body and echoes it back (one-shot).
-    server.route("/echo", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
+    server.route(any_methods, "/echo", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
         auto body = co_await req->body().read_all();
         if (!body) {
             co_await res->status(400).send("read error");
@@ -107,7 +112,7 @@ void register_routes(ServerT& server) {
     // pointed elsewhere, so this is not a duplicate of /echo but the path they
     // actually need — h1spec sends every case to it and checks the body comes
     // back verbatim under any method.
-    server.route("/", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
+    server.route(any_methods, "/", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
         auto body = co_await req->body().read_all();
         if (!body) {
             co_await res->status(400).send("read error");
@@ -117,13 +122,13 @@ void register_routes(ServerT& server) {
     });
 
     // A simple one-shot handler.
-    server.route("/sync", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
+    server.route(any_methods, "/sync", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
         co_await res->status(200).content_type("text/plain").send("simple one-shot reply");
     });
 
     // Echoes all received request headers. Handy to inspect what a reverse-proxy
     // forwards (X-Forwarded-For / X-Forwarded-Proto / X-Forwarded-Host / Host).
-    server.route("/headers", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
+    server.route(any_methods, "/headers", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
         std::string out;
         for (const auto& [name, value] : req->headers()) {
             out += name + ": " + value + "\n";
@@ -132,7 +137,7 @@ void register_routes(ServerT& server) {
     });
 
     // TLS-aware handler: inspects the peer (client) certificate.
-    server.route("/whoami",
+    server.route(any_methods, "/whoami",
                  [](std::shared_ptr<Request> req, std::shared_ptr<Response> res, SslHandle ssl) -> asio::awaitable<void> {
         std::string who = "no TLS";
         if (ssl && *ssl) {
@@ -145,7 +150,7 @@ void register_routes(ServerT& server) {
 
     // Large one-shot response body (default 1 MiB) — exercises flow control /
     // multiple DATA frames (h2) or a large chunked body (h1). Size via ?n=BYTES.
-    server.route("/big", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
+    server.route(any_methods, "/big", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
         std::size_t n = query_uint(req->query(), "n", 1024 * 1024);
         co_await res->status(200).send(std::string(n, 'x'));
     });
@@ -158,7 +163,7 @@ void register_routes(ServerT& server) {
     // server that retires the stream on that condition truncates the response
     // without an error anywhere. Each piece is flushed as it is written, so a
     // client sees the gap rather than one coalesced body.
-    server.route("/stream", [](std::shared_ptr<Request>, std::shared_ptr<Response> res) -> asio::awaitable<void> {
+    server.route(any_methods, "/stream", [](std::shared_ptr<Request>, std::shared_ptr<Response> res) -> asio::awaitable<void> {
         co_await res->status(200).content_type("text/plain").begin();
         for (int i = 0; i < 3; ++i) {
             asio::steady_timer timer{co_await asio::this_coro::executor};
@@ -171,7 +176,7 @@ void register_routes(ServerT& server) {
 
     // Reads the entire request body and replies with its length — exercises
     // large body upload + flow control.
-    server.route("/drain", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
+    server.route(any_methods, "/drain", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
         auto body = co_await req->body().read_all();
         if (!body) {
             co_await res->status(400).send("read error");
@@ -182,7 +187,7 @@ void register_routes(ServerT& server) {
 
     // Delays before responding (default 500 ms) — verifies the idle watchdog
     // does not kill an active-but-slow handler. Delay via ?ms=MILLIS.
-    server.route("/delay", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
+    server.route(any_methods, "/delay", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
         int ms = static_cast<int>(query_uint(req->query(), "ms", 500));
         asio::steady_timer timer{co_await asio::this_coro::executor};
         timer.expires_after(std::chrono::milliseconds(ms));
@@ -191,19 +196,19 @@ void register_routes(ServerT& server) {
     });
 
     // Handler that throws — the engine must not crash; the connection stays sane.
-    server.route("/throw", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
+    server.route(any_methods, "/throw", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
         throw std::runtime_error("handler failure (intentional)");
         co_return;
     });
 
     // Empty response (204 No Content, no body).
-    server.route("/empty", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
+    server.route(any_methods, "/empty", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
         co_await res->status(204).send("");
     });
 
     // Response carrying connection-specific headers that are illegal in HTTP/2;
     // the engine must strip them so the response stays valid.
-    server.route("/badhdr", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
+    server.route(any_methods, "/badhdr", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
         co_await res->status(200)
             .header("connection", "keep-alive")
             .header("transfer-encoding", "chunked")
@@ -219,7 +224,7 @@ void register_routes(ServerT& server) {
     //   * writer: pushes a server frame every 200ms on its own schedule, then ends
     // Neither waits on the other — true bidirectional flow, which only HTTP/2
     // supports. HTTP/1.1 is half-duplex, so it falls back to read-then-reply.
-    server.route("/duplex", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
+    server.route(any_methods, "/duplex", [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
         auto exec = co_await asio::this_coro::executor;
 
         if (req->version() != Version::Http2) {
@@ -267,7 +272,7 @@ void register_routes(ServerT& server) {
     });
 
     // Regex catch-all.
-    server.route_regex("/api/.*",
+    server.route_regex(any_methods, "/api/.*",
                        [](std::shared_ptr<Request> req, std::shared_ptr<Response> res) -> asio::awaitable<void> {
         co_await res->status(200).send(std::string{"api path: "} + std::string{req->path()});
     });

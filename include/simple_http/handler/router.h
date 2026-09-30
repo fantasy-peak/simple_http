@@ -2,11 +2,19 @@
 
 // Router: matches a request to a handler and runs it.
 //
-// Matching order: exact path map -> regex list (first match) -> fallback.
-// Optional `before` and `cors` filters run first and may short-circuit. The
-// Router's dispatch(shared_ptr<Request>, shared_ptr<Response>, SslHandle) matches the engine's
+// A route is a (method, path) pair; matching order is exact path map -> regex
+// list (first match) -> fallback. The methods are explicit at registration;
+// registering the empty list (`any_methods`) means "any method". Two implicit
+// rules follow the modern frameworks (Flask / axum / Go 1.22): a route that
+// serves GET also serves HEAD (the writer strips the body), and a path whose
+// method does not match is answered 405 with an Allow header — or an automatic
+// 204 OPTIONS — while a path nothing services continues to the 404. Optional
+// `before` and `cors` filters run first and may short-circuit. The Router's
+// dispatch(shared_ptr<Request>, shared_ptr<Response>, SslHandle) matches the engine's
 // Dispatcher type, so the same router serves every protocol version.
 
+#include <cstdint>
+#include <initializer_list>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -17,6 +25,8 @@
 #include <boost/asio/awaitable.hpp>
 
 #include "../client/http_client.h"  // HttpClient (reverse-proxy upstreams)
+#include "../core/http_field.h"
+#include "../core/http_method.h"
 #include "../core/http_status.h"
 #include "../core/logging.h"
 #include "../engine/dispatcher.h"  // WsProxyTarget, HttpProxyTarget
@@ -37,35 +47,68 @@ namespace simple_http {
 
 namespace asio = boost::asio;
 
+// A reverse-proxy route: the backend recipe (`HttpProxyTarget`) plus the
+// HttpClient that reaches it. Every proxy route builds its own client, so each
+// backend carries its own TLS trust policy and connection pool — an internal
+// mTLS backend and a public one can never share credentials or sockets.
+struct HttpProxyRoute {
+    HttpProxyTarget target;
+    std::shared_ptr<HttpClient> client;
+};
+
+// A route serving every method. Pass the empty set — or this named constant to
+// say "any" out loud at the call site: `route(any_methods, "/x", h)`.
+inline const std::vector<Method> any_methods{};
+
+// A registered route: the methods it serves, folded into a bitmask, and the
+// handler. Implied rules are applied at registration: the empty set (see
+// `any_methods`) becomes every method, and GET implies HEAD.
+struct RouteEntry {
+    // Every Method enumerator, Unknown included, so an any-method route matches
+    // an extension-method token (`method_bit(Unknown)` is in the mask).
+    static constexpr std::uint16_t all_bits = 0x03FF;
+    std::uint16_t method_bits{};
+    Handler handler;
+};
+
 class Router {
   public:
-    // `proxy_client` configures the client used by reverse-proxy routes: TLS
-    // policy for HTTPS backends (CA bundle, client certificate for mTLS, whether
-    // to verify), timeouts and pool sizing. The default suits public backends.
-    explicit Router(ClientConfig proxy_client = {})
-        : m_http_client(std::make_shared<HttpClient>(std::move(proxy_client))) {}
+    // The reverse-proxy routes each build their own HttpClient (per-route TLS
+    // policy and pool) at registration — see http_proxy.
+    Router() = default;
 
-    // The reverse-proxy upstream client's pooled sessions are idle keep-alive
-    // connections bound to worker executors — the server has to close them when
-    // it stops, or they outlive the process (their TLS streams leak at exit:
-    // ASan finds them as ssl::streams never freed). The server calls this just
-    // before stopping its io pool; the pool's drain is what unwinds the posted
-    // closes. Idle only: a session in the middle of a request is not in the
-    // pool and is left alone.
+    // Closes every reverse-proxy route's pooled idle sessions. The server calls
+    // this just before stopping its io pool: the pooled keep-alive connections
+    // are bound to worker executors, and if they are left open they outlive the
+    // process (their TLS streams leak at exit — ASan finds them as ssl::streams
+    // never freed). The pool's drain is what unwinds the posted closes. Idle
+    // only: a session in the middle of a request is not in the pool and is left
+    // alone.
     void close_proxy_client() {
-        if (m_http_client) {
-            m_http_client->close_idle();
+        for (const auto& [_, route] : m_http_proxy_exact) {
+            route.client->close_idle();
+        }
+        for (const auto& [_, route] : m_http_proxy_regex) {
+            route.client->close_idle();
         }
     }
 
     // --- registration (fluent) ---
+    // Methods come first: a route is a (method, path) pair. The list may be a
+    // braced literal (`{Method::Get, Method::Post}`), `any_methods`, or — the
+    // config-file case — the std::vector<Method> a parser filled, passed
+    // straight through: `route(parsed_methods, "/x", h)`.
     template <typename F>
-    Router& route(std::string path, F&& handler) {
+    Router& route(std::vector<Method> methods, std::string path, F&& handler) {
+        auto entry = make_route_entry(methods, make_handler(std::forward<F>(handler)));
+        if (!entry) {
+            return *this;  // Method::Unknown rejected — see make_route_entry
+        }
         // emplace, not insert_or_assign: the first registration wins, and that is
         // deliberate — test_router.cpp pins it by name. What it should not do is
         // keep the second one *silently*, since re-registering a path is a likely
         // result of moving a route around, so the duplicate says so.
-        auto [it, inserted] = m_exact.emplace(std::move(path), make_handler(std::forward<F>(handler)));
+        auto [it, inserted] = m_exact.emplace(std::move(path), std::move(*entry));
         if (!inserted) {
             SIMPLE_HTTP_INFO_LOG("route [{}] already registered; the first handler stays", it->first);
         }
@@ -73,9 +116,14 @@ class Router {
     }
 
     template <typename F>
-    Router& route_regex(const std::string& pattern, F&& handler) {
+    Router& route_regex(std::vector<Method> methods, const std::string& pattern, F&& handler) {
+        auto entry = make_route_entry(methods, make_handler(std::forward<F>(handler)));
+        if (!entry) {
+            return *this;  // Method::Unknown rejected — see make_route_entry
+        }
         try {
-            m_regex.emplace_back(RegexRoute{simple_http_regex::regex{pattern}, literal_prefix(pattern)}, make_handler(std::forward<F>(handler)));
+            m_regex.emplace_back(RegexRoute{simple_http_regex::regex{pattern}, literal_prefix(pattern)},
+                                 std::move(*entry));
         } catch (const std::exception& e) {
             SIMPLE_HTTP_ERROR_LOG("invalid route regex [{}]: {}", pattern, e.what());
         }
@@ -150,14 +198,18 @@ class Router {
     }
 
     // --- HTTP reverse-proxy route registration (request-level) ---
-    Router& http_proxy(std::string path, HttpProxyTarget target) {
-        m_http_proxy_exact.emplace(std::move(path), std::move(target));
+    Router& http_proxy(std::string path, HttpProxyTarget target, ClientConfig client_cfg = {}) {
+        m_http_proxy_exact.emplace(std::move(path),
+                                   HttpProxyRoute{std::move(target),
+                                                  std::make_shared<HttpClient>(std::move(client_cfg))});
         return *this;
     }
 
-    Router& http_proxy_regex(const std::string& pattern, HttpProxyTarget target) {
+    Router& http_proxy_regex(const std::string& pattern, HttpProxyTarget target, ClientConfig client_cfg = {}) {
         try {
-            m_http_proxy_regex.emplace_back(RegexRoute{simple_http_regex::regex{pattern}, literal_prefix(pattern)}, std::move(target));
+            m_http_proxy_regex.emplace_back(
+                RegexRoute{simple_http_regex::regex{pattern}, literal_prefix(pattern)},
+                HttpProxyRoute{std::move(target), std::make_shared<HttpClient>(std::move(client_cfg))});
         } catch (const std::exception& e) {
             SIMPLE_HTTP_ERROR_LOG("invalid http proxy regex [{}]: {}", pattern, e.what());
         }
@@ -227,25 +279,26 @@ class Router {
         return std::nullopt;
     }
 
-    // Looks up an HTTP reverse-proxy backend for a path (exact then regex).
-    // Returns std::nullopt if the path is not a proxy route. For a regex route
-    // whose rewrite_path is a substitution template, capture groups are expanded
-    // here, so the returned target's rewrite_path is the final target to send.
-    std::optional<HttpProxyTarget> find_http_proxy(std::string_view path) const {
+    // Looks up an HTTP reverse-proxy route for a path (exact then regex):
+    // the backend recipe and its own client. Returns std::nullopt if the path
+    // is not a proxy route. For a regex route whose rewrite_path is a
+    // substitution template, capture groups are expanded here, so the returned
+    // target's rewrite_path is the final target to send.
+    std::optional<HttpProxyRoute> find_http_proxy(std::string_view path) const {
         if (auto it = m_http_proxy_exact.find(path); it != m_http_proxy_exact.end()) {
             return it->second;
         }
         if (m_http_proxy_regex.empty()) {
             return std::nullopt;
         }
-        for (const auto& [route, target] : m_http_proxy_regex) {
+        for (const auto& [route, proxy] : m_http_proxy_regex) {
             if (!route.literal_prefix.empty() && !path.starts_with(route.literal_prefix)) continue;
             const std::string p{path};  // regex_match needs std::string; built only when a prefix may match
             simple_http_regex::smatch m;
             if (simple_http_regex::regex_match(p, m, route.pattern)) {
-                HttpProxyTarget out = target;
-                if (!out.rewrite_path.empty()) {
-                    out.rewrite_path = expand_rewrite(target.rewrite_path, m);
+                HttpProxyRoute out = proxy;
+                if (!out.target.rewrite_path.empty()) {
+                    out.target.rewrite_path = expand_rewrite(proxy.target.rewrite_path, m);
                 }
                 return out;
             }
@@ -275,33 +328,63 @@ class Router {
         // stays valid until req is moved into a handler below, and it is not
         // touched after that.
         const std::string_view path = req->path();
+        const Method method = req->method();
 
         // Local exact routes win outright — nginx's `location = /path` beats
         // everything, a proxy registered for the same path included. An exact
-        // endpoint therefore never pays the reverse-proxy lookup at all.
+        // endpoint therefore never pays the reverse-proxy lookup at all. A
+        // method this path does not serve is answered here (resolved first,
+        // rejected second): 405 + Allow, or the automatic OPTIONS reply — a
+        // path that nothing services continues below and ends in the 404.
         if (auto it = m_exact.find(path); it != m_exact.end()) {
-            co_await invoke_handler(it->second, std::move(req), std::move(res), ssl);
+            const RouteEntry& entry = it->second;
+            if (method_allowed(entry, method)) {
+                co_await invoke_handler(entry.handler, std::move(req), std::move(res), ssl);
+                co_return;
+            }
+            if (method == Method::Options) {
+                co_await reply_auto_options(res, entry.method_bits);
+            } else {
+                co_await reply_method_not_allowed(res, entry.method_bits);
+            }
             co_return;
         }
 
         // HTTP reverse-proxy routes: consulted after the exact local match but
         // before local regex/static handlers (exact before regex in both
         // tables). A dead backend still surfaces as a 502 for proxy-only paths.
-        if (auto target = find_http_proxy(path)) {
+        if (auto proxy = find_http_proxy(path)) {
             bool client_is_tls = ssl.has_value() && *ssl != nullptr;
-            co_await run_http_proxy(std::move(req), std::move(res), client_is_tls, std::move(*target),
-                                    *m_http_client);
+            co_await run_http_proxy(std::move(req), std::move(res), client_is_tls, std::move(proxy->target),
+                                    *proxy->client);
             co_return;
         }
 
         if (!m_regex.empty()) {
             const std::string owned_path{path};  // regex_match needs a string
-            for (const auto& [route, handler] : m_regex) {
+            bool method_mismatch = false;
+            std::uint16_t mismatch_bits = 0;
+            for (const auto& [route, entry] : m_regex) {
                 if (!route.literal_prefix.empty() && !path.starts_with(route.literal_prefix)) continue;
-                if (simple_http_regex::regex_match(owned_path, route.pattern)) {
-                    co_await invoke_handler(handler, std::move(req), std::move(res), ssl);
+                if (!simple_http_regex::regex_match(owned_path, route.pattern)) continue;
+                if (method_allowed(entry, method)) {
+                    co_await invoke_handler(entry.handler, std::move(req), std::move(res), ssl);
                     co_return;
                 }
+                // The path resolved to this pattern but the method was not
+                // allowed. Keep walking: a later pattern may resolve the same
+                // path with an allowed method. Method bits accumulate, so the
+                // 405's Allow lists every method any matching pattern serves.
+                method_mismatch = true;
+                mismatch_bits |= entry.method_bits;
+            }
+            if (method_mismatch) {
+                if (method == Method::Options) {
+                    co_await reply_auto_options(res, mismatch_bits);
+                } else {
+                    co_await reply_method_not_allowed(res, mismatch_bits);
+                }
+                co_return;
             }
         }
         // The static stage. Running it here — after the routes, before the
@@ -323,6 +406,66 @@ class Router {
     }
 
   private:
+    // The empty method set (see `any_methods`) means "any method", and GET implies
+    // HEAD — the two implicit rules shared with Flask / axum / Go 1.22.
+    static std::optional<RouteEntry> make_route_entry(const std::vector<Method>& methods, Handler handler) {
+        std::uint16_t bits = 0;
+        for (Method m : methods) {
+            if (m == Method::Unknown) {
+                SIMPLE_HTTP_ERROR_LOG("route: Method::Unknown is not routable; registration skipped");
+                return std::nullopt;
+            }
+            bits |= method_bit(m);
+        }
+        if (bits == 0) {
+            bits = RouteEntry::all_bits;  // any_methods — every method, Unknown included
+        } else if ((bits & method_bit(Method::Get)) != 0) {
+            // A GET route also serves HEAD; the response writer strips the body
+            // (regression-tested: "HEAD and 204 carry no body").
+            bits |= method_bit(Method::Head);
+        }
+        return RouteEntry{bits, std::move(handler)};
+    }
+
+    static bool method_allowed(const RouteEntry& entry, Method m) noexcept {
+        return (entry.method_bits & method_bit(m)) != 0;
+    }
+
+    // The Allow header (RFC 9110 §10.2.1) for a method bitmask, in canonical
+    // method order. HEAD appears with GET (folded in at registration) and
+    // OPTIONS always appears: the router answers OPTIONS automatically for a
+    // path it resolved, so it is supported even when never registered.
+    static std::string allow_value(std::uint16_t bits) {
+        bits |= method_bit(Method::Options);
+        std::string out;
+        for (Method m : {Method::Get, Method::Head, Method::Post, Method::Put, Method::Delete,
+                         Method::Options, Method::Patch, Method::Connect, Method::Trace}) {
+            if ((bits & method_bit(m)) == 0) continue;
+            if (!out.empty()) out += ", ";
+            out += to_string(m);
+        }
+        return out;
+    }
+
+    // Resolved first, rejected second: called only once a route's path matched
+    // but its method did not. The reply shape mirrors the static stage's 405
+    // (static_files.h), including the close that keeps the engine from draining
+    // a request body that was never going to be used.
+    asio::awaitable<void> reply_method_not_allowed(ResponsePtr res, std::uint16_t bits) const {
+        res->status(status::method_not_allowed);
+        res->header(field::allow, allow_value(bits));
+        res->content_type("text/plain; charset=utf-8");
+        (void)co_await res->send("405 Method Not Allowed");
+        (void)co_await res->close();
+    }
+
+    asio::awaitable<void> reply_auto_options(ResponsePtr res, std::uint16_t bits) const {
+        res->status(status::no_content);
+        res->header(field::allow, allow_value(bits));
+        (void)co_await res->send("");
+        (void)co_await res->close();
+    }
+
     // Expands a rewrite template against a regex match: $0 = whole match,
     // $1..$9 = capture groups (empty if the group did not participate), $$ = a
     // literal '$'. A lone '$' or '$' before a non-digit/non-'$' is kept verbatim.
@@ -399,8 +542,8 @@ class Router {
         std::size_t operator()(std::string_view s) const { return std::hash<std::string_view>{}(s); }
     };
 
-    std::unordered_map<std::string, Handler, string_hash, std::equal_to<>> m_exact;
-    std::vector<std::pair<RegexRoute, Handler>> m_regex;
+    std::unordered_map<std::string, RouteEntry, string_hash, std::equal_to<>> m_exact;
+    std::vector<std::pair<RegexRoute, RouteEntry>> m_regex;
     // Static file sites, consulted in registration order after the regex routes
     // and before the fallback. A vector rather than one slot so mounting several
     // roots is a later addition rather than a change of shape.
@@ -415,12 +558,8 @@ class Router {
     std::unordered_map<std::string, WsProxyTarget, string_hash, std::equal_to<>> m_ws_proxy_exact;
     std::vector<std::pair<RegexRoute, WsProxyTarget>> m_ws_proxy_regex;
 
-    std::unordered_map<std::string, HttpProxyTarget, string_hash, std::equal_to<>> m_http_proxy_exact;
-    // One client for every proxy route: it owns the upstream connection pool and
-    // the TLS context, and serves any number of origins (the target carries the
-    // origin per request).
-    std::shared_ptr<HttpClient> m_http_client;
-    std::vector<std::pair<RegexRoute, HttpProxyTarget>> m_http_proxy_regex;
+    std::unordered_map<std::string, HttpProxyRoute, string_hash, std::equal_to<>> m_http_proxy_exact;
+    std::vector<std::pair<RegexRoute, HttpProxyRoute>> m_http_proxy_regex;
 };
 
 }  // namespace simple_http
