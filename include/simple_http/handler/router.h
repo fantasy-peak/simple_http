@@ -15,6 +15,8 @@
 
 #include <cstdint>
 #include <initializer_list>
+#include <limits>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -34,6 +36,10 @@
 #include "handler.h"
 #include "http_proxy.h"
 #include "static_files.h"  // the static stage (m_static)
+
+#ifdef SIMPLE_HTTP_ENABLE_OPENAPI
+#include "../openapi/openapi.h"  // glaze-backed JSON Schemas for route<Req, Res>
+#endif
 
 #ifdef SIMPLE_HTTP_USE_BOOST_REGEX
 #include <boost/regex.hpp>
@@ -71,6 +77,16 @@ struct RouteEntry {
     Handler handler;
 };
 
+// A path-template route (`/users/{id}`): segments fixed at registration,
+// `std::nullopt` marking a `{name}` capture whose name sits in `param_names`.
+// Dispatching matches segment-by-segment and publishes captures onto the
+// Request (req->param("id")), so a template is an exact route with wildcards —
+// same tier, after the literal map.
+struct TemplateRoute {
+    std::vector<std::optional<std::string>> segments;
+    std::vector<std::string> param_names;  // one per nullopt segment
+};
+
 class Router {
   public:
     // The reverse-proxy routes each build their own HttpClient (per-route TLS
@@ -104,14 +120,22 @@ class Router {
         if (!entry) {
             return *this;  // Method::Unknown rejected — see make_route_entry
         }
-        // emplace, not insert_or_assign: the first registration wins, and that is
-        // deliberate — test_router.cpp pins it by name. What it should not do is
-        // keep the second one *silently*, since re-registering a path is a likely
-        // result of moving a route around, so the duplicate says so.
-        auto [it, inserted] = m_exact.emplace(std::move(path), std::move(*entry));
-        if (!inserted) {
-            SIMPLE_HTTP_INFO_LOG("route [{}] already registered; the first handler stays", it->first);
+        // A path holding `{name}` segments is a template route: matched
+        // segment-wise with captures published onto the Request. Still exact
+        // tier — a literal path with the same shape registers normally.
+        if (path.find('{') != std::string::npos) {
+            auto tmpl = parse_template(path);
+            if (!tmpl) {
+                SIMPLE_HTTP_ERROR_LOG("route [{}]: invalid path template; registration skipped", path);
+                return *this;
+            }
+            insert_template(std::move(*tmpl), methods, std::move(*entry));
+            return *this;
         }
+        // Per-(path, method) storage: one slot per method (see MethodTable),
+        // so GET /pets and POST /pets coexist under the same path and never
+        // substitute for each other.
+        insert_entry(m_exact[std::move(path)], *entry, methods);
         return *this;
     }
 
@@ -129,6 +153,116 @@ class Router {
         }
         return *this;
     }
+
+#ifdef SIMPLE_HTTP_ENABLE_OPENAPI
+    // Typed route: the (method, path, handler) registration is identical to
+    // route(), and <Req, Res> name the request/response body types, whose JSON
+    // Schemas (glaze, see openapi.h) are recorded into the OpenAPI document.
+    // The handler signature is unchanged — the types are a *declaration* for
+    // the document; parsing the body and composing the response stays the
+    // handler's job. <Res> alone means no request body (GET, DELETE, HEAD).
+    // Optional trailing parameters: OperationInfo for the free text and success
+    // status, then any number of openapi::resp<T>(status, description) for the
+    // error responses the handler may answer.
+    template <typename Res, typename F, typename... Extras>
+    Router& route(std::vector<Method> methods, std::string path, F&& handler, openapi::OperationInfo info = {},
+                  Extras&&... extras) {
+        route(methods, path, std::forward<F>(handler));  // the normal registration
+        std::vector<openapi::Param> params;
+        std::vector<openapi::Response> responses;
+        openapi::collect_annotation(params, responses, std::forward<Extras>(extras)...);
+        openapi::merge_path_params(params, path);
+        m_openapi->add_operation(methods, std::move(path), std::move(info), {}, openapi::schema_json<Res>(),
+                                 std::move(params), std::move(responses));
+        return *this;
+    }
+    template <typename Req, typename Res, typename F, typename... Extras>
+    Router& route(std::vector<Method> methods, std::string path, F&& handler, openapi::OperationInfo info = {},
+                  Extras&&... extras) {
+        route(methods, path, std::forward<F>(handler));  // the normal registration
+        std::vector<openapi::Param> params;
+        std::vector<openapi::Response> responses;
+        openapi::collect_annotation(params, responses, std::forward<Extras>(extras)...);
+        openapi::merge_path_params(params, path);
+        m_openapi->add_operation(methods, std::move(path), std::move(info), openapi::schema_json<Req>(),
+                                 openapi::schema_json<Res>(), std::move(params), std::move(responses));
+        return *this;
+    }
+
+    // Params-typed route: `Params` is the path-parameter struct whose field
+    // names must equal the route template's `{name}`s — the axum `Path<Params>`
+    // contract. Registration validates that equality (a mismatch is a loud
+    // skip, not a runtime 404), the document derives its path parameters from
+    // the struct's fields (name + type schema), and the handler reads the
+    // parsed values with openapi::path_params<Params>(req). `Second` is the
+    // request-body type or openapi::NoBody.
+    template <typename Params, typename Second, typename Res, typename F, typename... Extras>
+    Router& route(std::vector<Method> methods, std::string path, F&& handler, openapi::OperationInfo info = {},
+                  Extras&&... extras) {
+        if (!openapi::params_match_template<Params>(openapi::template_param_names(path))) {
+            SIMPLE_HTTP_ERROR_LOG("route [{}]: template {{name}}s do not match the Params fields; "
+                                  "registration skipped", path);
+            return *this;
+        }
+        route(methods, path, std::forward<F>(handler));  // the normal registration
+        std::vector<openapi::Param> params;
+        std::vector<openapi::Response> responses;
+        openapi::collect_annotation(params, responses, std::forward<Extras>(extras)...);
+        // The path parameters come from the Params struct; a user-declared
+        // annotation for the same name only refines it.
+        for (auto& p : openapi::path_params_schema<Params>()) {
+            bool declared = false;
+            for (const auto& q : params) {
+                if (q.name == p.name && q.in == p.in) {
+                    declared = true;
+                    break;
+                }
+            }
+            if (!declared) {
+                params.push_back(std::move(p));
+            }
+        }
+        const std::string request_schema = [] {
+            if constexpr (std::is_same_v<Second, openapi::NoBody>) {
+                return std::string{};
+            } else {
+                return openapi::schema_json<Second>();
+            }
+        }();
+        m_openapi->add_operation(methods, std::move(path), std::move(info), request_schema,
+                                 openapi::schema_json<Res>(), std::move(params), std::move(responses));
+        return *this;
+    }
+
+    // The document being collected, for its info fields: server.openapi()
+    //     .title("petshop").version("1.0.0").server("https://api.example");
+    openapi::OpenApiSpec& openapi() {
+        return *m_openapi;
+    }
+
+    // Serves the collected document at `path` (register under /openapi.json or
+    // wherever fits). Render runs per request, so routes added after this call
+    // still appear in the document.
+    Router& serve_openapi(std::string path = "/openapi.json") {
+        auto spec = m_openapi;
+        route(any_methods, std::move(path),
+              [spec](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+                  co_await res->status(status::ok).content_type(mime::app_json).send(spec->render_json());
+              });
+        return *this;
+    }
+    // Serves a CDN-backed Swagger UI page that loads the document from
+    // `spec_url` (usually the path passed to serve_openapi). See
+    // openapi::swagger_ui_html for the offline alternative.
+    Router& serve_swagger_ui(std::string path = "/swagger", std::string spec_url = "/openapi.json") {
+        route(any_methods, std::move(path),
+              [spec_url = std::move(spec_url)](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+                  co_await res->status(status::ok).content_type("text/html; charset=utf-8")
+                      .send(openapi::swagger_ui_html(spec_url));
+              });
+        return *this;
+    }
+#endif
 
     // Registers a static file site. It becomes a *stage* of dispatch rather than
     // a route, which is what makes the ordering guarantee structural: a real
@@ -337,15 +471,40 @@ class Router {
         // rejected second): 405 + Allow, or the automatic OPTIONS reply — a
         // path that nothing services continues below and ends in the 404.
         if (auto it = m_exact.find(path); it != m_exact.end()) {
-            const RouteEntry& entry = it->second;
-            if (method_allowed(entry, method)) {
-                co_await invoke_handler(entry.handler, std::move(req), std::move(res), ssl);
+            const MethodTable& tbl = it->second;
+            if (const RouteEntry* hit = lookup(tbl, method)) {
+                co_await invoke_handler(hit->handler, std::move(req), std::move(res), ssl);
                 co_return;
             }
+            const std::uint16_t bits = method_allow_bits(tbl);
             if (method == Method::Options) {
-                co_await reply_auto_options(res, entry.method_bits);
+                co_await reply_auto_options(res, bits);
             } else {
-                co_await reply_method_not_allowed(res, entry.method_bits);
+                co_await reply_method_not_allowed(res, bits);
+            }
+            co_return;
+        }
+
+        // Path-template routes (`/users/{id}`): a segment trie walked once per
+        // request; literal edges beat a {param} edge at each level (the more
+        // specific match wins, like Go's httprouter). A hit publishes its
+        // captures onto the Request before the handler runs; method miss is a
+        // 405, the same as an exact route.
+        const TrieTerminal* term = nullptr;
+        std::vector<std::string_view> values;
+        if (match_template(m_trie, path, term, values)) {
+            if (const RouteEntry* hit = lookup(term->tbl, method)) {
+                for (std::size_t i = 0; i < values.size(); ++i) {
+                    req->set_param(term->param_names[i], values[i]);
+                }
+                co_await invoke_handler(hit->handler, std::move(req), std::move(res), ssl);
+                co_return;
+            }
+            const std::uint16_t bits = method_allow_bits(term->tbl);
+            if (method == Method::Options) {
+                co_await reply_auto_options(res, bits);
+            } else {
+                co_await reply_method_not_allowed(res, bits);
             }
             co_return;
         }
@@ -406,6 +565,215 @@ class Router {
     }
 
   private:
+    // Splits a path into TemplateRoute segments; a `{name}` segment becomes a
+    // capture. Returns nullopt for a malformed template: an unmatched brace, an
+    // empty or duplicate parameter name, a brace inside a literal.
+    static std::optional<TemplateRoute> parse_template(std::string_view path) {
+        TemplateRoute out;
+        std::vector<std::string> seen;
+        std::size_t pos = 0;
+        for (;;) {
+            const std::size_t end = path.find('/', pos);
+            const std::string_view seg =
+                path.substr(pos, end == std::string_view::npos ? std::string_view::npos : end - pos);
+            if (seg.size() >= 2 && seg.front() == '{' && seg.back() == '}') {
+                std::string name{seg.substr(1, seg.size() - 2)};
+                if (name.empty()) {
+                    return std::nullopt;
+                }
+                for (const auto& prior : seen) {
+                    if (prior == name) {
+                        return std::nullopt;
+                    }
+                }
+                seen.push_back(name);
+                out.segments.push_back(std::nullopt);
+                out.param_names.push_back(std::move(name));
+            } else {
+                if (seg.find('{') != std::string_view::npos || seg.find('}') != std::string_view::npos) {
+                    return std::nullopt;
+                }
+                out.segments.push_back(std::string{seg});
+            }
+            if (end == std::string_view::npos) {
+                break;
+            }
+            pos = end + 1;
+        }
+        if (out.segments.empty()) {
+            return std::nullopt;
+        }
+        return out;
+    }
+
+    // A path's handlers, keyed by HTTP method: one slot per Method (indexed by the
+// enum), plus an any-method slot for a route registered with `any_methods`.
+// GET's implied HEAD is expanded into the HEAD slot at registration, so an
+// explicit HEAD registration simply overrides it. This is the "store by
+// (method, path)" shape: dispatch reads the exact slot, no scanning.
+struct MethodTable {
+    static constexpr std::size_t kSlots = 10;  // Method::Get .. Method::Unknown
+    std::array<std::optional<RouteEntry>, kSlots> by_method;
+    std::optional<RouteEntry> any;
+};
+
+// The handlers shared by every template that ends at a trie node, plus the
+    // path-order of their {name}s. The param edges themselves are anonymous —
+    // they are shared by every route that has a capture at that position, so
+    // two templates like /owners/{owner}/pets/{pet_id} and
+    // /owners/{owner_id}/pets coexist — and the names are applied at this
+    // terminal, where every same-shape route must agree on them (regex-less
+    // httprouter keeps the same discipline).
+    struct TrieTerminal {
+        std::vector<std::string> param_names;
+        MethodTable tbl;
+    };
+
+    // A node of the path-template trie: literal child edges keyed by segment,
+    // at most one (anonymous) `{name}` param edge, and the terminal routes
+    // ending here.
+    struct TrieNode {
+        static constexpr std::size_t npos = std::numeric_limits<std::size_t>::max();
+        std::map<std::string, std::size_t> literals;
+        std::size_t param_child{npos};
+        TrieTerminal terminal;
+    };
+
+    // Fills a path's per-method table from one registration: each explicit
+    // method becomes its own slot (same handler, copied), an empty list fills
+    // the any-method slot, and a GET registration also fills the implied HEAD
+    // slot unless HEAD was registered explicitly. A slot already holding a
+    // handler keeps it — first registration wins, test_router.cpp pins that.
+    static void insert_entry(MethodTable& tbl, const RouteEntry& entry, const std::vector<Method>& methods) {
+        if (methods.empty()) {
+            if (tbl.any) {
+                SIMPLE_HTTP_INFO_LOG("any-method route already registered; the first handler stays");
+            } else {
+                tbl.any = entry;
+            }
+            return;
+        }
+        for (Method m : methods) {
+            if (m == Method::Unknown) {
+                continue;
+            }
+            auto& slot = tbl.by_method[static_cast<std::size_t>(m)];
+            if (slot) {
+                SIMPLE_HTTP_INFO_LOG("route already registered for this method; the first handler stays");
+            } else {
+                slot = entry;
+            }
+        }
+        if ((entry.method_bits & method_bit(Method::Get)) != 0) {
+            auto& head = tbl.by_method[static_cast<std::size_t>(Method::Head)];
+            if (!head) {
+                head = entry;  // GET implies HEAD, unless HEAD is registered explicitly
+            }
+        }
+    }
+
+    // The union of the methods a path actually serves, for the Allow header.
+    // (An `any` slot means every method is served, so this is only consulted on
+    // the 405/OPTIONS path, where `any` cannot be present.)
+    static std::uint16_t method_allow_bits(const MethodTable& tbl) {
+        std::uint16_t bits = 0;
+        for (const auto& slot : tbl.by_method) {
+            if (slot) {
+                bits |= slot->method_bits;
+            }
+        }
+        return bits;
+    }
+
+    // The handler for `method` on a path's method-keyed table: the exact slot,
+    // or the any-method slot, or null. Every registration expands into slots,
+    // so this is a plain indexed read — no scanning.
+    static const RouteEntry* lookup(const MethodTable& tbl, Method m) {
+        const std::size_t idx = static_cast<std::size_t>(m);
+        if (idx < MethodTable::kSlots && tbl.by_method[idx]) {
+            return &*tbl.by_method[idx];
+        }
+        return tbl.any ? &*tbl.any : nullptr;
+    }
+
+    // Inserts a template route into the trie. A literal segment becomes a
+    // named edge; a `{name}` segment follows (or creates) the single, anonymous
+    // param edge. At the terminal the route's param names are recorded (first
+    // one wins; a later same-shape route must agree) and its per-method table
+    // is filled.
+    void insert_template(TemplateRoute tmpl, std::vector<Method> methods, RouteEntry entry) {
+        if (m_trie.empty()) {
+            m_trie.push_back(TrieNode{});
+        }
+        std::size_t node = 0;
+        for (const auto& seg : tmpl.segments) {
+            if (seg.has_value()) {
+                auto [it, fresh] = m_trie[node].literals.emplace(*seg, TrieNode::npos);
+                if (fresh) {
+                    it->second = m_trie.size();
+                    m_trie.push_back(TrieNode{});
+                }
+                node = it->second;
+            } else {
+                if (m_trie[node].param_child == TrieNode::npos) {
+                    m_trie[node].param_child = m_trie.size();
+                    m_trie.push_back(TrieNode{});
+                }
+                node = m_trie[node].param_child;
+            }
+        }
+        auto& term = m_trie[node].terminal;
+        if (term.param_names.empty()) {
+            term.param_names = std::move(tmpl.param_names);
+        } else if (term.param_names != tmpl.param_names) {
+            SIMPLE_HTTP_ERROR_LOG("route template conflicts on the {{name}} names at the same shape; "
+                                  "registration skipped");
+            return;
+        }
+        insert_entry(term.tbl, entry, methods);
+    }
+
+    // Walks the trie against the request path, segment by segment. A literal
+    // edge beats a param edge at each level (the more specific route wins).
+    // `term` points at the terminal and `values` holds the captures in path
+    // order (views into the request path, valid for the request's lifetime);
+    // the terminal's param_names pair them up. Returns false when no template
+    // matches or the shape differs.
+    bool match_template(const std::vector<TrieNode>& trie, std::string_view path, const TrieTerminal*& term,
+                        std::vector<std::string_view>& values) const {
+        if (trie.empty()) {
+            return false;
+        }
+        std::vector<std::string_view> found;
+        std::size_t node = 0;
+        std::size_t pos = 0;
+        for (;;) {
+            const TrieNode& n = trie[node];
+            const std::size_t end = path.find('/', pos);
+            const std::string_view part =
+                path.substr(pos, end == std::string_view::npos ? std::string_view::npos : end - pos);
+            const auto lit = n.literals.find(std::string{part});
+            if (lit != n.literals.end()) {
+                node = lit->second;
+            } else if (n.param_child != TrieNode::npos && !part.empty()) {
+                found.push_back(part);  // anonymous edge: the value only; the
+                node = n.param_child;   // terminal remaps it to this route's names
+            } else {
+                return false;
+            }
+            if (end == std::string_view::npos) {
+                break;
+            }
+            pos = end + 1;
+        }
+        // The terminal the template ended at always carries at least one
+        // handler (insert_template / insert_entry guarantee it); the walk
+        // above proved the whole path shape, so this is it.
+        term = &trie[node].terminal;
+        values = std::move(found);
+        return true;
+    }
+
     // The empty method set (see `any_methods`) means "any method", and GET implies
     // HEAD — the two implicit rules shared with Flask / axum / Go 1.22.
     static std::optional<RouteEntry> make_route_entry(const std::vector<Method>& methods, Handler handler) {
@@ -448,22 +816,22 @@ class Router {
     }
 
     // Resolved first, rejected second: called only once a route's path matched
-    // but its method did not. The reply shape mirrors the static stage's 405
-    // (static_files.h), including the close that keeps the engine from draining
-    // a request body that was never going to be used.
+    // but its method did not. The reply is a normal response — the engine
+    // drains any unread request body and keeps the connection alive, exactly
+    // like any handler that did not read the body. This matches the ecosystem
+    // (Go's ServeMux, axum, Spring: 405 is a keep-alive response, not a
+    // terminal close).
     asio::awaitable<void> reply_method_not_allowed(ResponsePtr res, std::uint16_t bits) const {
         res->status(status::method_not_allowed);
         res->header(field::allow, allow_value(bits));
         res->content_type("text/plain; charset=utf-8");
         (void)co_await res->send("405 Method Not Allowed");
-        (void)co_await res->close();
     }
 
     asio::awaitable<void> reply_auto_options(ResponsePtr res, std::uint16_t bits) const {
         res->status(status::no_content);
         res->header(field::allow, allow_value(bits));
         (void)co_await res->send("");
-        (void)co_await res->close();
     }
 
     // Expands a rewrite template against a regex match: $0 = whole match,
@@ -542,8 +910,22 @@ class Router {
         std::size_t operator()(std::string_view s) const { return std::hash<std::string_view>{}(s); }
     };
 
-    std::unordered_map<std::string, RouteEntry, string_hash, std::equal_to<>> m_exact;
+    // A path's handlers, keyed by HTTP method: one slot per Method (indexed by
+// the enum value), plus an any-method slot for `any_methods`. GET's implied
+// HEAD is expanded into the HEAD slot here, so an explicit HEAD registration
+// simply overrides it. This is the "store by (method, path)" shape.
+std::unordered_map<std::string, MethodTable, string_hash, std::equal_to<>> m_exact;
+    // Path-template routes, indexed in a segment trie (see TrieNode); each
+    // terminal holds the same per-method table. Literal templates stay in
+    // `m_exact`; only paths containing `{name}` land here.
+    std::vector<TrieNode> m_trie;
     std::vector<std::pair<RegexRoute, RouteEntry>> m_regex;
+#ifdef SIMPLE_HTTP_ENABLE_OPENAPI
+    // The OpenAPI document collected by the typed route overloads. Created
+    // eagerly; a build that never calls openapi() / serve_openapi just carries
+    // an empty spec.
+    std::shared_ptr<openapi::OpenApiSpec> m_openapi{std::make_shared<openapi::OpenApiSpec>()};
+#endif
     // Static file sites, consulted in registration order after the regex routes
     // and before the fallback. A vector rather than one slot so mounting several
     // roots is a later addition rather than a change of shape.

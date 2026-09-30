@@ -7,9 +7,11 @@
 // `co_await req.body().read()`.
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include <boost/asio.hpp>
 
@@ -48,7 +50,23 @@ class Request {
     Body& body() { return *m_body; }
     const Body& body() const { return *m_body; }
 
+    // A path parameter captured by the router from a template route
+    // (`/users/{id}`) — nullopt when the route was not a template or the name
+    // was not in it. The value is a view into the request path.
+    std::optional<std::string_view> param(std::string_view name) const {
+        for (const auto& [n, v] : m_params) {
+            if (n == name) return v;
+        }
+        return std::nullopt;
+    }
+
     // --- population API (engine side) ---
+    // Router side: records one captured template segment. The value must be a
+    // view into the request path (it is, for dispatch's own captures).
+    void set_param(std::string name, std::string_view value) {
+        m_params.emplace_back(std::move(name), value);
+    }
+
     void set_method(Method method) { m_method = method; }
     void set_method_token(std::string token) {
         m_method = method_from_string(token);
@@ -82,6 +100,10 @@ class Request {
     std::string m_method_token{"GET"};
     std::string m_target;
     Headers m_headers;
+
+    // Path parameters from a template route, published by the Router during
+    // dispatch. Values are views into m_target (stable after set_target).
+    std::vector<std::pair<std::string, std::string_view>> m_params;
 
     // Views into m_target (stable after set_target/assign_head).
     std::string_view m_path;

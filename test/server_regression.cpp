@@ -1584,9 +1584,10 @@ TEST_CASE("regression/method: a wrong method on a route is a 405 with Allow", "[
     REQUIRE(client.wait_head());
     CHECK(status_of(client.received()) == 405);
     CHECK(head_has(client.received(), "allow: GET, HEAD, OPTIONS"));
-    // Like the static stage's 405, the reply closes the connection rather than
-    // drain a request body that was never going to be used.
-    CHECK(client.wait_eof());
+    // 405 is a keep-alive response, like the mainstream routers (Go/axum/Spring):
+    // the same connection must carry the next exchange.
+    client.send("GET /method/getonly HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(client.wait_for("getonly"));
 
     client.close();
 }

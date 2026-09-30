@@ -243,6 +243,51 @@ class Server {
         return *this;
     }
 
+#ifdef SIMPLE_HTTP_ENABLE_OPENAPI
+    // --- OpenAPI (typed routes → OAS document + Swagger UI) ---
+    // Typed routes collect request/response schemas into the document; the
+    // handler signature and dispatch are unchanged. See Router::route.
+    template <typename Res, typename F, typename... Extras>
+    Server& route(std::vector<Method> methods, std::string path, F&& handler, openapi::OperationInfo info = {},
+                  Extras&&... extras) {
+        m_router->template route<Res>(std::move(methods), std::move(path), std::forward<F>(handler),
+                                      std::move(info), std::forward<Extras>(extras)...);
+        return *this;
+    }
+    template <typename Req, typename Res, typename F, typename... Extras>
+    Server& route(std::vector<Method> methods, std::string path, F&& handler, openapi::OperationInfo info = {},
+                  Extras&&... extras) {
+        m_router->template route<Req, Res>(std::move(methods), std::move(path), std::forward<F>(handler),
+                                           std::move(info), std::forward<Extras>(extras)...);
+        return *this;
+    }
+    // Params-typed route: Params is the path-parameter struct whose field names
+    // must match the template's {name}s — see Router::route.
+    template <typename Params, typename Second, typename Res, typename F, typename... Extras>
+    Server& route(std::vector<Method> methods, std::string path, F&& handler, openapi::OperationInfo info = {},
+                  Extras&&... extras) {
+        m_router->template route<Params, Second, Res>(std::move(methods), std::move(path),
+                                                      std::forward<F>(handler), std::move(info),
+                                                      std::forward<Extras>(extras)...);
+        return *this;
+    }
+    // The document collected by `route<Res>` / `route<Req, Res>`. Configure its
+    // info fields, then serve document and UI:
+    //     server.openapi().title("petshop").version("1.0.0").server("...");
+    //     server.serve_openapi("/openapi.json").serve_swagger_ui("/swagger");
+    openapi::OpenApiSpec& openapi() {
+        return m_router->openapi();
+    }
+    Server& serve_openapi(std::string path = "/openapi.json") {
+        m_router->serve_openapi(std::move(path));
+        return *this;
+    }
+    Server& serve_swagger_ui(std::string path = "/swagger", std::string spec_url = "/openapi.json") {
+        m_router->serve_swagger_ui(std::move(path), std::move(spec_url));
+        return *this;
+    }
+#endif
+
     Server& http_proxy(std::string path, HttpProxyTarget target, ClientConfig client_cfg = {}) {
         m_router->http_proxy(std::move(path), std::move(target), std::move(client_cfg));
         return *this;

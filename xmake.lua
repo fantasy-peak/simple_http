@@ -1,4 +1,4 @@
-add_rules("mode.debug", "mode.release")
+-- add_rules("mode.debug", "mode.release")
 
 set_languages("c++23")
 
@@ -24,11 +24,13 @@ add_requires("openssl3")
 add_requires("nghttp2 1.70.0")
 add_requires("ngtcp2", "nghttp3")
 add_requires("catch2")  -- unit tests only (target `unittest`)
+add_requires("glaze")  -- OpenAPI typed-route schemas (opt-in: SIMPLE_HTTP_ENABLE_OPENAPI); header-only
 -- Response-body compression (core/content_encoding.h). Only the targets that
 -- define SIMPLE_HTTP_ENABLE_COMPRESSION link these; the library itself stays
 -- dependency-free for downstream consumers that do not want compression.
 add_requires("zlib", "brotli")
 
+add_cxflags("-O2 -Wall -Wextra -Werror -pedantic-errors -Wno-missing-field-initializers -Wno-ignored-qualifiers")
 add_defines("SIMPLE_HTTP_EXPERIMENT_WEBSOCKET", "SIMPLE_HTTP_USE_BOOST_REGEX")
 
 target("simple_http")
@@ -48,7 +50,7 @@ target("server")
     set_kind("binary")
     on_load(function (target)
         if target:toolchain("gcc") then
-            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete")
+            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete", "-Wno-type-limits")
         end
         -- xmake f --toolchain=llvm --runtimes=c++_static -c -v
         if target:toolchain("llvm") then
@@ -75,7 +77,7 @@ target("client")
         if target:toolchain("gcc") then
             -- GCC false positives around asio's coroutine frames; the server
             -- target needs the first one too.
-            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete")
+            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete", "-Wno-type-limits")
         end
     end)
     add_deps("simple_http")
@@ -92,15 +94,39 @@ target("unittest")
     set_kind("binary")
     set_default(false)
     add_defines("SIMPLE_HTTP_ENABLE_HTTP3")
+    -- OpenAPI is opt-in for consumers; the unit target enables it so the
+    -- openapi tests (and the glaze-heavy umbrella include) are compiled.
+    add_defines("SIMPLE_HTTP_ENABLE_OPENAPI")
     on_load(function (target)
         if target:toolchain("gcc") then
-            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete")
+            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete", "-Wno-type-limits")
         end
     end)
     add_deps("simple_http")
     add_files("test/unit/*.cpp")
-    add_packages("catch2", "zlib", "brotli")
+    add_packages("catch2", "zlib", "brotli", "glaze")
     add_defines("SIMPLE_HTTP_ENABLE_COMPRESSION")
+    set_rundir(".")
+target_end()
+
+-- OpenAPI demo: typed routes (`route<Req, Res>`) collected into an OAS 3.1
+-- document served at /openapi.json, browsed at /swagger (CDN-hosted Swagger UI).
+-- A standalone binary so test/server.cpp — the conformance/stress surface —
+-- stays untouched. Run from the repository root:
+--   xmake build openapi_demo && xmake run openapi_demo
+-- then open http://127.0.0.1:7795/swagger
+target("openapi_demo")
+    set_kind("binary")
+    set_default(false)
+    on_load(function (target)
+        if target:toolchain("gcc") then
+            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete", "-Wno-type-limits")
+        end
+    end)
+    add_deps("simple_http")
+    add_files("test/openapi_demo.cpp")
+    add_packages("glaze")
+    add_defines("SIMPLE_HTTP_ENABLE_OPENAPI")
     set_rundir(".")
 target_end()
 
@@ -113,7 +139,7 @@ target("regression")
     add_defines("SIMPLE_HTTP_ENABLE_HTTP3")
     on_load(function (target)
         if target:toolchain("gcc") then
-            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete")
+            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete", "-Wno-type-limits")
         end
     end)
     add_deps("simple_http")
@@ -152,7 +178,7 @@ target("readme_examples")
     set_default(false)
     on_load(function (target)
         if target:toolchain("gcc") then
-            target:add("cxxflags", "-Wno-maybe-uninitialized")
+            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-type-limits")
         end
     end)
     add_deps("simple_http")

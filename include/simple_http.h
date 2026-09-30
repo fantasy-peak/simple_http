@@ -59,6 +59,11 @@
 #include "simple_http/handler/static_files.h"
 #include "simple_http/handler/router.h"
 
+#ifdef SIMPLE_HTTP_ENABLE_OPENAPI
+// --- openapi layer (typed routes → OAS 3.0 doc + CDN Swagger UI; opt-in) ---
+#include "simple_http/openapi/openapi.h"
+#endif
+
 // --- net layer (protocol detection + server facade) ---
 #include "simple_http/net/connection.h"
 #include "simple_http/net/server.h"
