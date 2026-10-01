@@ -1157,6 +1157,62 @@ asio::awaitable<void> suite_spec_validation(std::uint16_t plain_port) {
     co_return;
 }
 
+asio::awaitable<void> suite_raw_peer(asio::io_context &ctx);
+
+// --- redirect following & the cookie jar (convenience level) ------------------
+
+asio::awaitable<void> suite_redirect(std::uint16_t port) {
+    const std::string base = "http://127.0.0.1:" + std::to_string(port);
+    // No following by default: the 302 itself comes back.
+    {
+        sh::HttpClient client;
+        auto r = co_await client.get(base + "/redir/a");
+        check(r && r->status == 302 && r->header("location") == "/redir/b",
+              "redirects are not followed when max_redirects is 0 (the default)");
+    }
+    // With max_redirects set, the chain is followed to the 200.
+    {
+        sh::ClientConfig cfg;
+        cfg.max_redirects = 5;
+        sh::HttpClient client{cfg};
+        auto r = co_await client.get(base + "/redir/a");
+        check(r && r->status == 200 && r->body == "landed", "a 302 chain is followed to the 200");
+    }
+    // POST → 303 → GET: the second hop is a bodyless GET.
+    {
+        sh::ClientConfig cfg;
+        cfg.max_redirects = 5;
+        sh::HttpClient client{cfg};
+        auto r = co_await client.post(base + "/redir/post", "payload");
+        check(r && r->status == 200 && r->body == "landed", "a 303 turns the POST into a GET");
+    }
+    // 307 keeps the method: the echo handler reports POST.
+    {
+        sh::ClientConfig cfg;
+        cfg.max_redirects = 5;
+        sh::HttpClient client{cfg};
+        auto r = co_await client.post(base + "/redir/307", "payload");
+        check(r && r->status == 200 && r->body == "POST", "a 307 keeps the method and body");
+    }
+    // A relative Location resolves against the current directory.
+    {
+        sh::ClientConfig cfg;
+        cfg.max_redirects = 5;
+        sh::HttpClient client{cfg};
+        auto r = co_await client.get(base + "/dir/start");
+        check(r && r->body == "relative", "a relative Location resolves against the directory");
+    }
+    // A Set-Cookie from the redirect is replayed on the followed request.
+    {
+        sh::ClientConfig cfg;
+        cfg.max_redirects = 5;
+        cfg.cookie_jar = std::make_shared<sh::CookieJar>();
+        sh::HttpClient client{cfg};
+        auto r = co_await client.get(base + "/redir/cookie");
+        check(r && r->body == "sid=abc123", "a Set-Cookie from a redirect is replayed on the next hop");
+    }
+}
+
 asio::awaitable<void> run_all_suites(asio::io_context &ctx, std::uint16_t plain, std::uint16_t tls_port,
                                      std::uint16_t comp_port) {
     co_await suite_protocol_matrix(plain, tls_port);
@@ -1166,6 +1222,7 @@ asio::awaitable<void> run_all_suites(asio::io_context &ctx, std::uint16_t plain,
     co_await suite_errors(plain);
     co_await suite_spec_validation(plain);
     co_await suite_tls(tls_port);
+    co_await suite_redirect(plain);
     co_await suite_reverse_proxy(plain);
     co_await suite_raw_peer(ctx);
     co_await suite_compression(comp_port, plain);
@@ -1196,6 +1253,37 @@ int main() {
     proxy_cfg.tls.private_key_file = "./test/tls_certificates/client_key.pem";
     proxy_cfg.tls.verify_host = false; // the test certificate has no SAN
     register_routes(plain);
+    // Redirect targets for suite_redirect (convenience-layer following).
+    plain.route(sh::any_methods, "/redir/a", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->redirect("/redir/b").send("");
+    });
+    plain.route(sh::any_methods, "/redir/b", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(200).send("landed");
+    });
+    plain.route(sh::any_methods, "/redir/post", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->redirect("/redir/b", sh::status::see_other).send("");
+    });
+    plain.route(sh::any_methods, "/redir/307", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->redirect("/redir/echo-method", sh::status::temporary_redirect).send("");
+    });
+    plain.route(sh::any_methods, "/redir/echo-method",
+                [](sh::RequestPtr req, sh::ResponsePtr res) -> asio::awaitable<void> {
+                    co_await res->status(200).send(std::string{sh::to_string(req->method())});
+                });
+    plain.route(sh::any_methods, "/dir/start", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->redirect("b").send(""); // relative Location
+    });
+    plain.route(sh::any_methods, "/dir/b", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(200).send("relative");
+    });
+    plain.route(sh::any_methods, "/redir/cookie", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->header(sh::field::set_cookie, "sid=abc123; Path=/").redirect("/redir/cookie-check").send("");
+    });
+    plain.route(sh::any_methods, "/redir/cookie-check",
+                [](sh::RequestPtr req, sh::ResponsePtr res) -> asio::awaitable<void> {
+                    const auto cookie = req->header(sh::field::cookie);
+                    co_await res->status(200).send(cookie ? std::string{*cookie} : "none");
+                });
     sh::TlsConfig tls_cfg;
     tls_cfg.cert_chain_file = "./test/tls_certificates/server_cert.pem";
     tls_cfg.private_key_file = "./test/tls_certificates/server_key.pem";

@@ -24,6 +24,8 @@ the same protocols outbound.
 - [📋 Logging](#-logging)
 - [🔒 TLS & mTLS](#-tls--mtls)
 - [🧭 Routing, Middleware & Proxy](#-routing-middleware--proxy)
+- [📑 Queries, Forms & SSE](#-queries-forms--sse)
+- [🔗 Client: redirects, cookies & auth](#-client-redirects-cookies--auth)
 - [🗜 Response Compression](#-response-compression)
 - [📂 More Examples](#-more-examples)
 - [📊 Performance](#-performance)
@@ -42,7 +44,9 @@ the same protocols outbound.
 - **🌊 Streaming both ways** — request and response bodies stream with flow-control backpressure; a large payload never has to be materialized.
 - **🌐 Reverse proxy** — request-level HTTP proxying (plaintext, TLS or h2c backends) and byte-level WebSocket pass-through.
 - **🔌 TCP and UNIX-domain sockets** — bind a path instead of a port when the peer is a local sidecar; TLS, WebSocket and proxying all work over either.
-- **🧩 Middleware** — `before` filters that can short-circuit, plus built-in CORS: preflights answered automatically, `Vary: Origin` handled.
+- **🧩 Middleware** — Go `net/http` / tower-style middleware: global (`use`), per-group and per-route, with before/after wrapping, short-circuiting and per-request state — plus built-ins (`request_id`, `access_log`, `recovery`, `basic_auth`, `real_ip`, `clean_path`, `strip_prefix`, CORS).
+- **📑 Forms & queries** — `req->query_params()` (Go `r.URL.Query` / axum `Query<T>`), `read_urlencoded_body` and `read_multipart_body` (form/file uploads), plus `res->redirect()` and a Server-Sent Events wrapper.
+- **🧵 Client ergonomics** — automatic redirect following (`max_redirects`, Go semantics), a `CookieJar`, and `RequestSpec::basic_auth()`.
 - **🧵 Lock-free connection handling** — each connection is pinned to one single-threaded `io_context` for its whole life, so engines and writers never synchronize.
 - **📋 Logging that does not pick a side** — a four-field `LogSink` interface with no third-party types in it; wire it to spdlog, an in-house library, or nothing.
 - **🗜 Optional compression** — gzip/brotli response bodies and transparent client-side decompression, both opt-in.
@@ -107,7 +111,6 @@ Handlers take arguments by shape, picked at compile time:
 asio::awaitable<void>(RequestPtr, ResponsePtr)                  // ordinary
 asio::awaitable<void>(RequestPtr, ResponsePtr, SslHandle)       // + the TLS handle
 asio::awaitable<void>(RequestPtr, std::shared_ptr<WebSocket>)   // WebSocket route
-asio::awaitable<bool>(RequestPtr, ResponsePtr)                  // filter: false short-circuits
 ```
 
 A response is fluent, one-shot or streamed:
@@ -308,15 +311,46 @@ server.route(simple_http::any_methods, "/webhook", handler);      // any method
 server.route_regex({simple_http::Method::Get}, "^/api/(.*)$", handler);
 server.fallback(not_found);
 
-// A filter runs before routing; returning false short-circuits the request
-// (whatever it already wrote is the response).
-server.before([](simple_http::RequestPtr req, simple_http::ResponsePtr res) -> asio::awaitable<bool> {
+// Middleware — the Go net/http / tower shape. A middleware wraps the rest of
+// the chain: code before `co_await next(...)` runs before the handler, code
+// after it runs after, and never calling next() short-circuits the request:
+server.use([](simple_http::RequestPtr req, simple_http::ResponsePtr res,
+              simple_http::SslHandle ssl, simple_http::Next next) -> asio::awaitable<void> {
     if (!authorized(req)) {
         co_await res->status(401).send("unauthorized");
-        co_return false;
+        co_return; // answered here — the chain never runs
     }
-    co_return true;
+    co_await next(std::move(req), std::move(res), ssl);
+    log(res->status()); // the after-phase can observe the response
 });
+
+// Multiple `use()` run in order, outermost first. The request has a
+// per-request state slot (Go context / tower Extensions) for handing data from
+// a middleware to the handler:
+server.use([](simple_http::RequestPtr req, simple_http::ResponsePtr res,
+              simple_http::SslHandle ssl, simple_http::Next next) -> asio::awaitable<void> {
+    req->set_state(Principal{authorized_name(req)}); // handler reads it with req->get_state<Principal>()
+    co_await next(std::move(req), std::move(res), ssl);
+});
+
+// A group scopes a prefix and middleware to just its routes (chi/gin Group,
+// axum nest); a route can also carry its own per-route middleware (gin/echo
+// per-route, axum route_layer) that wraps only its handler:
+server.group("/api", {simple_http::middleware::basic_auth("svc", "s3cret")},
+             [](simple_http::Router &api) {
+                 api.route({simple_http::Method::Get}, "/users", users_handler); // → /api/users
+                 api.route({simple_http::Method::Post}, "/users",
+                           {rate_limit_middleware}, create_user_handler);
+             });
+
+// Built-ins: request_id / access_log / recovery / basic_auth (+ CORS below).
+server.use(simple_http::middleware::request_id());
+server.use(simple_http::middleware::access_log());
+
+// Trusted-proxy awareness and path normalization, like chi/tower-http:
+server.use(simple_http::middleware::real_ip({"127.0.0.1", "10.0.0.0"})); // X-Forwarded-For → ClientIp state
+server.use(simple_http::middleware::clean_path()); // %XX / "//" / "/./" normalized; ".." → 400
+server.use(simple_http::middleware::strip_prefix("/api")); // mount a sub-app registered from "/"
 
 // CORS: an OPTIONS preflight is answered 204 here and never reaches a route.
 // See the CORS section for the policy.
@@ -355,6 +389,61 @@ server.ws_route("/chat", [](simple_http::RequestPtr, std::shared_ptr<simple_http
     co_return;  // returning sends a Close frame and shuts the socket down gracefully
 });
 ```
+
+---
+
+## 📑 Queries, Forms & SSE
+
+Query strings and request bodies are parsed into typed views — the Go
+`r.URL.Query()` / axum `Query<T>` / `Form<T>` base:
+
+```cpp
+// The URL query, decoded (+ → space, %XX → byte), repeated names kept:
+if (auto q = req->query_params().get("q")) { /* q is a std::string_view */ }
+for (auto tag : req->query_params().get_all("tag")) { /* repeated */ }
+
+// a urlencoded form body:
+auto form = co_await simple_http::read_urlencoded_body(*req); // expected<QueryParams, error_code>
+
+// a multipart body (file uploads): boundary from Content-Type
+auto upload = co_await simple_http::read_multipart_body(*req); // expected<vector<MultipartPart>, error_code>
+//   part.name / part.filename / part.content_type / part.data
+```
+
+Responses get a fluent redirect and a thin SSE (Server-Sent Events) wrapper:
+
+```cpp
+co_await res->redirect("/login").send("");            // 302 + Location
+co_await res->redirect("/gone", simple_http::status::permanent_redirect).send("");
+
+co_await res->sse_begin();                            // text/event-stream + no-cache
+co_await res->sse_event("hello");                     // data: hello\n\n
+co_await res->sse_event("l1\nl2");                    // two data: lines, one event
+co_await res->sse_event("payload", "update", "42");   // event: / id: fields too
+co_await res->sse_comment("keepalive");               // : keepalive\n\n
+```
+
+---
+
+## 🔗 Client: redirects, cookies & auth
+
+The convenience level (`get`/`post`/`put`/`head`/`del`) can follow redirects
+and maintain a cookie jar — the `http.Client` experience:
+
+```cpp
+simple_http::ClientConfig cfg;
+cfg.max_redirects = 10;                                  // 0 (default) = return the 3xx itself
+cfg.cookie_jar = std::make_shared<simple_http::CookieJar>();
+simple_http::HttpClient client{cfg};
+
+auto r = co_await client.get("https://host/start");      // follows 301/302/303/307/308
+```
+
+Followed hops follow Go's semantics: 301/302/303 turn a POST/PUT/DELETE into a
+GET without a body, 307/308 keep the method and body, an `https → http`
+downgrade is refused (`client_errc::redirect_to_insecure`), and a
+`Set-Cookie` from a redirect is replayed on the next hop. `RequestSpec` also
+gains `spec.basic_auth("user", "pass")` for outbound HTTP Basic.
 
 ---
 
@@ -418,7 +507,7 @@ the router comes back 404 and the browser fails it whatever the route offers.
 
 ```cpp
 server.cors(simple_http::CorsConfig{
-    .allow_origins = {"https://app.example.com"},  // exact origins; {} = any
+    .allow_origins = {"https://app.example.com", "https://*.corp.example"}, // exact + subdomain wildcards; {} = any
     .allow_credentials = true,                     // mirrors the origin, never "*"
     .allow_methods = {"GET", "POST", "DELETE"},    // {} = whatever the browser asks
     .allow_headers = {"content-type", "authorization"},
@@ -429,7 +518,8 @@ server.cors(simple_http::CorsConfig{
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `allow_origins` | `{}` | Serialized origins — `scheme://host[:port]`, no trailing slash — compared whole and case-insensitively. Empty, or a literal `"*"`, allows any origin. |
+| `allow_origins` | `{}` | Serialized origins — `scheme://host[:port]`, no trailing slash — compared whole and case-insensitively. Empty, or a literal `"*"`, allows any origin. A `*` in the host is a **subdomain wildcard** (gin/rs-cors form): `"https://*.example.com"` matches `https://app.example.com` and `https://a.b.example.com` but not the bare `https://example.com`, and a scheme-less `"*.example.com"` matches any scheme. |
+| `allow_origin_fn` | `nullptr` | A custom `bool(std::string_view origin)` decision consulted after `allow_origins` — an origin accepted by either passes (rs/cors `AllowedOriginValidator`, tower-http `AllowOrigin::predicate`): per-tenant tables, suffix rules, a live config lookup. |
 | `allow_credentials` | `false` | Sends `Access-Control-Allow-Credentials: true`. `*` is illegal alongside it, so the request's own origin is mirrored instead. |
 | `allow_methods` | `{}` | Methods advertised on a preflight. Empty echoes the preflight's own `Access-Control-Request-Method`, so the default does not silently break a `PUT`/`DELETE` API. |
 | `allow_headers` | `{}` | Empty echoes the preflight's `Access-Control-Request-Headers` (bounded — see `max_echoed_request_headers`). Non-empty is enforced: it is echoed only if every requested name is on it. |
@@ -447,7 +537,7 @@ Things worth knowing before relying on it:
 - **A rejected origin is not a blocked request.** The route still runs; the CORS
   headers are simply omitted, so the browser is the one that refuses the reply.
   CORS is a browser gate, not authorization — enforce access in the handler or in
-  a `before` filter.
+  middleware.
 - **WebSocket upgrades are not covered.** `ws_route` and `ws_proxy` connections are
   looked up ahead of dispatch, so they get no CORS handling here. A browser
   WebSocket handshake is not subject to CORS in the first place, so this is a
@@ -455,29 +545,28 @@ Things worth knowing before relying on it:
   handler if you need it.
 - **A reverse-proxied upstream that sends its own `Access-Control-Allow-Origin`**
   produces two of them, which browsers reject outright. Strip CORS headers at the
-  upstream, or handle CORS in a `before` filter instead.
+  upstream, or handle CORS in a `use()` middleware instead.
 
 A policy this config cannot express — a per-path allowlist, one looked up at
-request time, a PNA preflight — goes in a `before` filter instead. The built-in
-filter runs only for requests carrying an `Origin`; a `before` filter runs for
-every request, so check first, and add your own `Vary: Origin`:
+request time, a PNA preflight — goes in a `use()` middleware instead. The built-in
+CORS middleware runs only for requests carrying an `Origin`; a `use()` middleware
+runs for every request, so check first (or start from `make_cors_middleware()`),
+and add your own `Vary: Origin`:
 
 ```cpp
-server.before([](simple_http::RequestPtr req, simple_http::ResponsePtr res) -> asio::awaitable<bool> {
-    const auto origin = req->header("origin");
-    if (!origin) {
-        co_return true;  // not a CORS request
-    }
-    if (req->path().starts_with("/public") || *origin == "https://app.example") {
+server.use([](simple_http::RequestPtr req, simple_http::ResponsePtr res,
+              simple_http::SslHandle ssl, simple_http::Next next) -> asio::awaitable<void> {
+    if (const auto origin = req->header("origin");
+        origin && (req->path().starts_with("/public") || *origin == "https://app.example")) {
         res->header(simple_http::field::access_control_allow_origin, std::string{*origin});
         res->header(simple_http::field::vary, "Origin");
     }
-    co_return true;
+    co_await next(std::move(req), std::move(res), ssl);
 });
 ```
 
-`make_cors_filter()` is public if you would rather narrow the built-in policy than
-rebuild it.
+`make_cors_middleware()` is public if you would rather narrow the built-in policy
+than rebuild it — mix it into a group or a route like any other middleware.
 
 ---
 

@@ -6,6 +6,7 @@
 // and feeds the body into the owned Body stream. Handlers read the body with
 // `co_await req.body().read()`.
 
+#include <any>
 #include <boost/asio.hpp>
 #include <memory>
 #include <optional>
@@ -18,6 +19,7 @@
 #include "../core/types.h"
 #include "body.h"
 #include "headers.h"
+#include "query.h"
 
 namespace simple_http {
 
@@ -40,6 +42,10 @@ class Request {
     std::string_view target() const { return m_target; }
     std::string_view path() const { return m_path; }
     std::string_view query() const { return m_query; }
+    // The URL query, parsed and decoded (Go's r.URL.Query() / axum Query<T>).
+    // Values live on the Request, so the views stay valid for the request's
+    // whole life.
+    const QueryParams &query_params() const { return m_query_params; }
     asio::ip::tcp::endpoint peer() const { return m_peer; }
     std::string peer_address() const { return m_peer.address().to_string(); }
 
@@ -60,6 +66,34 @@ class Request {
         return std::nullopt;
     }
 
+    // --- per-request state (middleware handoff) ---
+    // A typed value an outer middleware sets and an inner middleware or the
+    // handler reads — the Go `context.Context` / tower `Extensions` slot, for
+    // things that must not live in headers (an authenticated principal, a
+    // request id, a deadline). Values are keyed by static type, so
+    // `get_state<T>()` finds the value most recently set *as T*: last set wins.
+    // The type must match exactly — `set_state<std::string>("x")` is not found
+    // by `get_state<std::string_view>()`.
+    template <typename T> void set_state(T value) { m_state.push_back(std::any{std::move(value)}); }
+
+    // The value most recently set as T, or nullptr if none was.
+    template <typename T> T *get_state() {
+        for (auto it = m_state.rbegin(); it != m_state.rend(); ++it) {
+            if (auto *p = std::any_cast<T>(&*it)) {
+                return p;
+            }
+        }
+        return nullptr;
+    }
+    template <typename T> const T *get_state() const {
+        for (auto it = m_state.rbegin(); it != m_state.rend(); ++it) {
+            if (auto *p = std::any_cast<T>(&*it)) {
+                return p;
+            }
+        }
+        return nullptr;
+    }
+
     // --- population API (engine side) ---
     // Router side: records one captured template segment. The value must be a
     // view into the request path (it is, for dispatch's own captures).
@@ -74,6 +108,7 @@ class Request {
     void set_target(std::string target) {
         m_target = std::move(target);
         split_path_and_query();
+        m_query_params = QueryParams::parse(m_query);
     }
 
     Headers &mutable_headers() { return m_headers; }
@@ -102,6 +137,13 @@ class Request {
     // Path parameters from a template route, published by the Router during
     // dispatch. Values are views into m_target (stable after set_target).
     std::vector<std::pair<std::string, std::string_view>> m_params;
+
+    // The request URL query, parsed whenever the target is set.
+    QueryParams m_query_params;
+
+    // Per-request state set by middleware (see set_state/get_state). Stored
+    // type-erased; lookups scan from the back so the most recent set wins.
+    std::vector<std::any> m_state;
 
     // Views into m_target (stable after set_target/assign_head).
     std::string_view m_path;

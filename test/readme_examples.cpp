@@ -131,6 +131,36 @@ void readme_ssl_handle_route(simple_http::Server &server) {
                  });
 }
 
+// --- Middleware (README → Routing, Middleware & Proxy) -------------------------
+
+void readme_middleware(simple_http::Server &server) {
+    // Global middleware: outermost first, each may wrap the chain (before/after)
+    // or short-circuit it by never calling next().
+    server.use(simple_http::middleware::request_id());
+    server.use(simple_http::middleware::access_log());
+    server.use(simple_http::middleware::recovery());
+
+    // A group: a path prefix plus group middleware, applied only to the routes
+    // registered inside (chi/gin Group, axum nest).
+    server.group("/api", {simple_http::middleware::basic_auth("svc", "s3cret")}, [](simple_http::Router &api) {
+        api.route({simple_http::Method::Get}, "/users", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+            co_await res->status(200).send("users");
+        });
+        // Per-route middleware: wraps this route's handler only.
+        api.route(
+            {simple_http::Method::Post}, "/users",
+            {[](RequestPtr req, ResponsePtr res, simple_http::SslHandle ssl,
+                simple_http::Next next) -> asio::awaitable<void> {
+                if (!req->header("x-csrf-token")) {
+                    co_await res->status(403).send("csrf");
+                    co_return;
+                }
+                co_await next(std::move(req), std::move(res), ssl);
+            }},
+            [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(201).send("created"); });
+    });
+}
+
 // --- OpenAPI & Swagger UI (README → OpenAPI & Swagger UI) -----------------------
 #if defined(SIMPLE_HTTP_ENABLE_OPENAPI)
 namespace openapi_readme {
@@ -151,11 +181,10 @@ struct ErrorBody {
     std::string error;
 };
 
-}  // namespace openapi_readme
+} // namespace openapi_readme
 
 void readme_openapi() {
-    simple_http::ServerConfig cfg = {.listen = simple_http::InetAddress{"127.0.0.1", 7795, false},
-                                     .worker_threads = 4};
+    simple_http::ServerConfig cfg = {.listen = simple_http::InetAddress{"127.0.0.1", 7795, false}, .worker_threads = 4};
     simple_http::Server server{cfg};
     using namespace openapi_readme;
     namespace openapi = simple_http::openapi;
@@ -166,8 +195,7 @@ void readme_openapi() {
         [](simple_http::RequestPtr req, simple_http::ResponsePtr res) -> asio::awaitable<void> {
             const auto p = openapi::path_params<PetParams>(*req);
             const auto body = glz::write_json(Pet{.id = p->id, .name = "rex"});
-            co_await res->status(200).content_type(simple_http::mime::app_json)
-                .send(body ? *body : std::string{"{}"});
+            co_await res->status(200).content_type(simple_http::mime::app_json).send(body ? *body : std::string{"{}"});
         },
         openapi::OperationInfo{.summary = "get a pet", .operation_id = "getPet"},
         openapi::resp<ErrorBody>(404, "no such pet"));
@@ -175,7 +203,7 @@ void readme_openapi() {
     server.serve_openapi("/openapi.json");
     server.serve_swagger_ui("/swagger", "/openapi.json");
 }
-#endif  // SIMPLE_HTTP_ENABLE_OPENAPI
+#endif // SIMPLE_HTTP_ENABLE_OPENAPI
 
 using simple_http::HttpProxyTarget;
 
@@ -188,12 +216,14 @@ void readme_routing(simple_http::Server &server) {
     server.fallback(
         [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(404).send("not found"); });
 
-    server.before([](RequestPtr req, ResponsePtr res) -> asio::awaitable<bool> {
-        if (req->path().empty()) {
+    // An auth middleware: short-circuits by never calling next().
+    server.use([](RequestPtr req, ResponsePtr res, simple_http::SslHandle ssl,
+                  simple_http::Next next) -> asio::awaitable<void> {
+        if (!req->header("authorization")) {
             co_await res->status(401).send("unauthorized");
-            co_return false;
+            co_return;
         }
-        co_return true;
+        co_await next(std::move(req), std::move(res), ssl);
     });
 
     // CORS: an OPTIONS preflight is answered 204 here and never reaches a route.
@@ -235,16 +265,14 @@ void readme_cors(simple_http::Server &server) {
 }
 
 void readme_cors_custom(simple_http::Server &server) {
-    server.before([](RequestPtr req, ResponsePtr res) -> asio::awaitable<bool> {
+    server.use([](RequestPtr req, ResponsePtr res, simple_http::SslHandle ssl,
+                  simple_http::Next next) -> asio::awaitable<void> {
         const auto origin = req->header("origin");
-        if (!origin) {
-            co_return true; // not a CORS request
-        }
-        if (req->path().starts_with("/public") || *origin == "https://app.example") {
+        if (origin && (req->path().starts_with("/public") || *origin == "https://app.example")) {
             res->header(simple_http::field::access_control_allow_origin, std::string{*origin});
             res->header(simple_http::field::vary, "Origin");
         }
-        co_return true;
+        co_await next(std::move(req), std::move(res), ssl);
     });
 }
 

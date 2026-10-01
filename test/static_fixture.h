@@ -26,6 +26,7 @@
 
 #ifndef _WIN32
 #include <sys/stat.h> // mkfifo
+#include <unistd.h>   // getpid
 #endif
 
 namespace simple_http::test {

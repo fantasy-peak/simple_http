@@ -64,6 +64,7 @@ inline constexpr std::string_view user_agent = "user-agent";
 inline constexpr std::string_view vary = "vary";
 inline constexpr std::string_view via = "via";
 inline constexpr std::string_view www_authenticate = "www-authenticate";
+inline constexpr std::string_view x_request_id = "x-request-id";
 
 } // namespace field
 

@@ -1,30 +1,32 @@
 #pragma once
 
-// Built-in CORS: a policy in, a Filter out.
+// Built-in CORS: a policy in, a Middleware out.
 //
 // The problem this solves is the preflight. Nothing in the engines
 // special-cases OPTIONS, so an OPTIONS carrying Access-Control-Request-Method
 // reaches the route table like any other request and comes back 404 — which a
 // browser reads as a failed preflight, whatever the actual route offers. The
-// filter built here answers that OPTIONS itself (204, no body, no framing) and
-// returns false, so a preflight never reaches a route at all.
+// middleware built here answers that OPTIONS itself (204, no body, no framing)
+// and never calls next(), so a preflight never reaches a route at all.
 //
-// Router::cors takes a policy and stores the filter it compiles to, so
-// dispatch() needs no branch of its own: a filter returning false was already
-// its short-circuit signal. A policy this config cannot express belongs in
-// before() instead — which can start from make_cors_filter() when it only wants
-// to narrow the behaviour below.
+// Router::cors takes a policy and stores the middleware it compiles to
+// (make_cors_middleware), always positioned at the head of the dispatch chain,
+// so dispatch() needs no branch of its own: a middleware that does not call
+// next() was already its short-circuit signal. A policy this config cannot
+// express belongs in use() instead — which can start from
+// make_cors_middleware() when it only wants to narrow the behaviour below.
 //
 // Two boundaries worth knowing:
-//   * Only requests carrying an Origin are filtered (that gate lives in
-//     Router::dispatch). Browsers send Origin on both the preflight and the
-//     actual cross-origin request, so this is invisible in practice.
+//   * Only requests carrying an Origin are filtered (that gate lives inside the
+//     middleware). Browsers send Origin on both the preflight and the actual
+//     cross-origin request, so this is invisible in practice.
 //   * WebSocket upgrades do not go through dispatch — they are looked up ahead
 //   of
 //     it — so ws_route/ws_proxy connections get no CORS handling from here.
 
 #include <chrono>
 #include <cstddef>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -38,7 +40,7 @@
 #include "../core/types.h" // iequals_ci, is_http_token
 #include "../proto/request.h"
 #include "../proto/response.h"
-#include "handler.h" // Filter
+#include "handler.h" // Middleware, Next
 
 namespace simple_http {
 
@@ -51,11 +53,22 @@ namespace simple_http {
 // Installing one is what turns CORS on: there is no `enabled` flag, and an
 // empty config is not a no-op (it allows any origin).
 struct CorsConfig {
-    // Exact serialized origins: "https://app.example" — scheme, host, and port
-    // when non-default, with no trailing slash (an Origin never carries one, so a
-    // slash here would never match). Empty means any origin, and a literal "*"
-    // entry means the same. Matching is case-insensitive.
+    // Origins the policy accepts: serialized "scheme://host[:port]" with no
+    // trailing slash (an Origin never carries one, so a slash here would never
+    // match), compared whole and case-insensitively — or a subdomain wildcard
+    // "https://*.example.com" / "*.example.com" (the gin/rs-cors form): `*` in
+    // the host matches one or more leading labels, so "https://*.example.com"
+    // accepts "https://app.example.com" and "https://a.b.example.com" but not
+    // "https://example.com" or a different scheme. Empty means any origin, and
+    // a literal "*" entry means the same.
     std::vector<std::string> allow_origins{};
+
+    // A custom allow/deny decision, consulted after allow_origins — an origin
+    // accepted by either is allowed (rs/cors AllowedOriginValidator, tower-http
+    // AllowOrigin::predicate). Returns true to allow the origin. This is the
+    // escape hatch for what a string list cannot express: a per-tenant lookup,
+    // a config-backed table, a suffix rule.
+    std::function<bool(std::string_view origin)> allow_origin_fn{};
 
     // Send Access-Control-Allow-Credentials: true. "*" is illegal alongside it,
     // so with this on the request's own origin is mirrored even under an
@@ -116,17 +129,63 @@ inline std::string join(const std::vector<std::string> &list, std::string_view s
     return out;
 }
 
-// An empty list allows any origin, and so does a literal "*" entry. Origins are
-// compared whole and case-insensitively: "https://a.example/" would never
-// match, because a serialized Origin has no trailing slash.
-inline bool origin_allowed(const std::vector<std::string> &allowed, std::string_view origin) {
+// Splits "scheme://rest" into (scheme, rest); when there is no "://" the whole
+// string is the rest with an empty scheme. Origin values always carry a scheme;
+// a wildcard pattern may omit it ("*.example.com" = any scheme).
+inline std::pair<std::string_view, std::string_view> split_scheme(std::string_view s) {
+    const auto pos = s.find("://");
+    if (pos == std::string_view::npos) {
+        return {{}, s};
+    }
+    return {s.substr(0, pos), s.substr(pos + 3)};
+}
+
+// A subdomain wildcard in the gin-contrib/cors / rs/cors form: a leading "*."
+// label matches one or more leading domain labels of the origin's host.
+// "https://*.example.com" accepts "https://app.example.com" and
+// "https://a.b.example.com" but not "https://example.com" (no label) nor a
+// different scheme; "*.example.com" (no scheme) accepts any scheme.
+inline bool wildcard_match(std::string_view pattern, std::string_view origin) {
+    const auto [pattern_scheme, pattern_rest] = split_scheme(pattern);
+    const auto [origin_scheme, origin_rest] = split_scheme(origin);
+    if (!pattern_scheme.empty() && !iequals_ci(pattern_scheme, origin_scheme)) {
+        return false;
+    }
+    // Only a leading "*." segment is a wildcard here.
+    if (pattern_rest.size() < 3 || pattern_rest[0] != '*' || pattern_rest[1] != '.') {
+        return false;
+    }
+    const std::string_view suffix = pattern_rest.substr(2); // "example.com"
+    if (suffix.size() >= origin_rest.size()) {
+        return false; // nothing left for the wildcard label
+    }
+    if (!iequals_ci(origin_rest.substr(origin_rest.size() - suffix.size()), suffix)) {
+        return false;
+    }
+    // One or more non-empty labels must precede the suffix: "app.example.com"
+    // passes, "example.com" (nothing before) and ".example.com" (empty label)
+    // do not.
+    const std::string_view lead = origin_rest.substr(0, origin_rest.size() - suffix.size());
+    return !lead.empty() && lead.front() != '.';
+}
+
+// Whether the policy accepts `origin`: the configured list (empty = any, "*" =
+// any, exact entries whole+case-insensitive, wildcard entries by subdomain), or
+// the custom allow_origin_fn — either accepting suffices (rs/cors
+// AllowedOriginValidator / tower-http AllowOrigin::predicate semantics).
+inline bool origin_allowed(const CorsConfig &cfg, std::string_view origin) {
+    const auto &allowed = cfg.allow_origins;
     if (allowed.empty()) {
         return true;
     }
     for (const auto &entry : allowed) {
-        if (entry == "*" || iequals_ci(entry, origin)) {
+        if (entry == "*" || iequals_ci(entry, origin) ||
+            (entry.find('*') != std::string::npos && wildcard_match(entry, origin))) {
             return true;
         }
+    }
+    if (cfg.allow_origin_fn && cfg.allow_origin_fn(origin)) {
+        return true;
     }
     return false;
 }
@@ -201,22 +260,24 @@ inline void apply_preflight(const CorsConfig &cfg, const RequestPtr &req, const 
 
 } // namespace cors_detail
 
-// Builds the filter that implements `cfg`. The config is captured by value, so
-// the returned filter owns its policy and can outlive the caller's.
+// Builds the middleware that implements `cfg`. The config is captured by value,
+// so the returned middleware owns its policy and can outlive the caller's. The
+// preflight rule needs no branch of its own outside this function: a preflight
+// is answered here (204, bodyless) and next() is never called, so it never
+// reaches any other middleware or a route.
 //
-// The filter is also usable outside Router — pass it to before(), or hand it to
-// anything taking a Filter. One caveat when doing so: it appends `Vary: Origin`
-// rather than merging, which is correct only because Router::dispatch runs it
+// One caveat when using the middleware outside Router (a custom chain): it
+// appends `Vary: Origin` rather than merging, which is correct only when it runs
 // before any handler or static site writes a header. Called later, merge
 // instead.
-inline Filter make_cors_filter(CorsConfig cfg) {
-    return [cfg = std::move(cfg)](RequestPtr req, ResponsePtr res) -> asio::awaitable<bool> {
-        // Router::dispatch only calls this for a request carrying an Origin, but
-        // the filter is reachable other ways too, so a missing or empty Origin is a
-        // pass-through rather than a dereference.
+inline Middleware make_cors_middleware(CorsConfig cfg) {
+    return [cfg = std::move(cfg)](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
+        // A missing or empty Origin is a pass-through rather than a dereference:
+        // only cross-origin requests are CORS-filtered.
         const auto origin = req->header(field::origin);
         if (!origin || origin->empty()) {
-            co_return true;
+            co_await next(std::move(req), std::move(res), ssl);
+            co_return;
         }
 
         // A preflight is exactly "OPTIONS + Access-Control-Request-Method". A plain
@@ -225,7 +286,7 @@ inline Filter make_cors_filter(CorsConfig cfg) {
         const bool preflight =
             req->method() == Method::Options && req->header(field::access_control_request_method).has_value();
 
-        if (cors_detail::origin_allowed(cfg.allow_origins, *origin)) {
+        if (cors_detail::origin_allowed(cfg, *origin)) {
             // "*" is illegal next to credentials, and wrong under an explicit
             // allowlist — the answer would not be origin-independent after all — so
             // those cases mirror the request's own origin instead.
@@ -239,9 +300,9 @@ inline Filter make_cors_filter(CorsConfig cfg) {
             if (mirror) {
                 // The reply depends on Origin exactly when the origin is mirrored,
                 // so a cache keyed on the URL alone must not hand one origin's
-                // answer to another. Appending is right from this position: the
-                // filter runs before any handler or static site writes, so this is
-                // the first Vary, and compressing_writer's merge_vary folds
+                // answer to another. Appending is right from this position: this
+                // middleware runs before any handler or static site writes, so it
+                // is the first Vary, and compressing_writer's merge_vary folds
                 // Accept-Encoding into it afterwards.
                 res->header(field::vary, "Origin");
             }
@@ -253,14 +314,15 @@ inline Filter make_cors_filter(CorsConfig cfg) {
                 // peer.
                 res->status(status::no_content);
                 (void)co_await res->send_bodyless();
-                co_return false; // answered here — a preflight never reaches a route
+                co_return; // answered here — a preflight never reaches a route
             }
 
             if (!cfg.expose_headers.empty()) {
                 res->header(field::access_control_expose_headers, cors_detail::join(cfg.expose_headers, ", "));
             }
             // CORS is a browser gate, not authorization: the route still runs.
-            co_return true;
+            co_await next(std::move(req), std::move(res), ssl);
+            co_return;
         }
 
         // An origin the policy does not allow: not one CORS header, so the browser
@@ -273,9 +335,9 @@ inline Filter make_cors_filter(CorsConfig cfg) {
         if (preflight) {
             res->status(status::no_content);
             (void)co_await res->send_bodyless();
-            co_return false;
+            co_return;
         }
-        co_return true;
+        co_await next(std::move(req), std::move(res), ssl);
     };
 }
 

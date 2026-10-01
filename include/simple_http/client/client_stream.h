@@ -37,6 +37,8 @@
 #include <string_view>
 #include <utility>
 
+#include "../core/base64.h"
+#include "../core/http_field.h"
 #include "../core/http_method.h"
 #include "../core/types.h"
 #include "../proto/body.h" // ReadResult
@@ -64,6 +66,14 @@ struct RequestSpec {
     // Ask the peer to close after this exchange (`Connection: close`; on HTTP/2
     // the connection is simply not put back in the pool).
     bool close{false};
+
+    // HTTP Basic (RFC 7617): sets `Authorization: Basic base64(user:pass)` —
+    // the client-side counterpart of middleware::basic_auth. Returns *this for
+    // chaining: spec.basic_auth("svc", "s3cret").
+    RequestSpec &basic_auth(std::string username, std::string password) {
+        headers.add(std::string{field::authorization}, "Basic " + base64_encode(username + ":" + password));
+        return *this;
+    }
 };
 
 // The response head, as read_head() returns it.

@@ -447,3 +447,115 @@ TEST_CASE("cors: the headers reach a built-in 404", "[cors]") {
     CHECK(writer->last_status == status::not_found);
     CHECK(writer->header(field::access_control_allow_origin) == "*");
 }
+
+TEST_CASE("cors: a subdomain wildcard accepts any number of leading labels", "[cors]") {
+    Router router;
+    router.cors(CorsConfig{.allow_origins = {"https://*.example.com"}});
+    bool route_ran = false;
+    router.route(any_methods, "/api", flag_handler(route_ran, "real"));
+
+    asio::io_context ctx;
+    {
+        // A single leading label matches; the origin is mirrored (not "*") and
+        // Vary: Origin is set, because the reply depends on which subdomain hit.
+        auto req = make_request(ctx, "/api");
+        add_origin(req, "https://app.example.com");
+        auto writer = dispatch(ctx, router, req);
+        CHECK(writer->header(field::access_control_allow_origin) == "https://app.example.com");
+        CHECK(writer->has_header(field::vary));
+        CHECK(route_ran);
+    }
+    route_ran = false;
+    {
+        // Several leading labels match too.
+        auto req = make_request(ctx, "/api");
+        add_origin(req, "https://a.b.example.com");
+        auto writer = dispatch(ctx, router, req);
+        CHECK(writer->header(field::access_control_allow_origin) == "https://a.b.example.com");
+    }
+    {
+        // The bare domain is not a subdomain: no CORS headers, route still runs.
+        auto req = make_request(ctx, "/api");
+        add_origin(req, "https://example.com");
+        auto writer = dispatch(ctx, router, req);
+        CHECK_FALSE(writer->has_header(field::access_control_allow_origin));
+        CHECK(route_ran);
+    }
+    {
+        // A scheme outside the pattern is rejected even with a matching host.
+        auto req = make_request(ctx, "/api");
+        add_origin(req, "http://app.example.com");
+        auto writer = dispatch(ctx, router, req);
+        CHECK_FALSE(writer->has_header(field::access_control_allow_origin));
+    }
+}
+
+TEST_CASE("cors: a scheme-less wildcard accepts any scheme", "[cors]") {
+    Router router;
+    router.cors(CorsConfig{.allow_origins = {"*.example.com"}});
+
+    asio::io_context ctx;
+    for (const char *origin : {"https://app.example.com", "http://a.b.example.com"}) {
+        auto req = make_request(ctx, "/api");
+        add_origin(req, origin);
+        auto writer = dispatch(ctx, router, req);
+        CHECK(writer->header(field::access_control_allow_origin) == origin);
+    }
+    {
+        auto req = make_request(ctx, "/api");
+        add_origin(req, "https://example.com"); // bare domain still not a subdomain
+        auto writer = dispatch(ctx, router, req);
+        CHECK_FALSE(writer->has_header(field::access_control_allow_origin));
+    }
+}
+
+TEST_CASE("cors: allow_origin_fn is consulted and ORs with the list", "[cors]") {
+    Router router;
+    router.cors(CorsConfig{
+        .allow_origins = {"https://listed.example"},
+        .allow_origin_fn = [](std::string_view origin) { return origin.ends_with(".internal"); },
+    });
+    bool route_ran = false;
+    router.route(any_methods, "/api", flag_handler(route_ran, "real"));
+
+    asio::io_context ctx;
+    {
+        // The fn accepts an origin the list does not.
+        auto req = make_request(ctx, "/api");
+        add_origin(req, "https://svc.internal");
+        auto writer = dispatch(ctx, router, req);
+        CHECK(writer->header(field::access_control_allow_origin) == "https://svc.internal");
+        CHECK(route_ran);
+    }
+    route_ran = false;
+    {
+        // A list entry still works without the fn firing.
+        auto req = make_request(ctx, "/api");
+        add_origin(req, "https://listed.example");
+        auto writer = dispatch(ctx, router, req);
+        CHECK(writer->header(field::access_control_allow_origin) == "https://listed.example");
+        CHECK(route_ran);
+    }
+    route_ran = false;
+    {
+        // Neither accepts it: no CORS headers, route still runs.
+        auto req = make_request(ctx, "/api");
+        add_origin(req, "https://evil.example");
+        auto writer = dispatch(ctx, router, req);
+        CHECK_FALSE(writer->has_header(field::access_control_allow_origin));
+        CHECK(route_ran);
+    }
+    route_ran = false;
+    {
+        // A preflight for an fn-accepted origin is answered with the fn's
+        // decision reflected.
+        auto req = make_request(ctx, "/api");
+        req->set_method(Method::Options);
+        req->mutable_headers().add_lower("origin", "https://svc.internal");
+        req->mutable_headers().add_lower("access-control-request-method", "POST");
+        auto writer = dispatch(ctx, router, req);
+        CHECK(writer->last_status == status::no_content);
+        CHECK(writer->header(field::access_control_allow_origin) == "https://svc.internal");
+        CHECK_FALSE(route_ran);
+    }
+}

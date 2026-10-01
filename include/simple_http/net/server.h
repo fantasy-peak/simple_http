@@ -165,26 +165,60 @@ class Server {
     // --- route registration (fluent, forwarded to the Router) ---
     // Methods come first: a route is a (method, path) pair. Braced literal,
     // `any_methods`, or the std::vector<Method> a config file parser filled —
-    // see router.h.
+    // see router.h. The middlewares overload registers per-route middleware
+    // (gin/echo per-route, axum route_layer): they wrap this route's handler
+    // only, outermost first.
     template <typename F> Server &route(std::vector<Method> methods, std::string path, F &&handler) {
         m_router->route(std::move(methods), std::move(path), std::forward<F>(handler));
+        return *this;
+    }
+    template <typename F>
+    Server &route(std::vector<Method> methods, std::string path, std::vector<Middleware> middlewares, F &&handler) {
+        m_router->route(std::move(methods), std::move(path), std::move(middlewares), std::forward<F>(handler));
         return *this;
     }
     template <typename F> Server &route_regex(std::vector<Method> methods, const std::string &pattern, F &&handler) {
         m_router->route_regex(std::move(methods), pattern, std::forward<F>(handler));
         return *this;
     }
+    template <typename F>
+    Server &route_regex(std::vector<Method> methods, const std::string &pattern, std::vector<Middleware> middlewares,
+                        F &&handler) {
+        m_router->route_regex(std::move(methods), pattern, std::move(middlewares), std::forward<F>(handler));
+        return *this;
+    }
     template <typename F> Server &fallback(F &&handler) {
         m_router->fallback(std::forward<F>(handler));
         return *this;
     }
-    Server &before(Filter f) {
-        m_router->before(std::move(f));
+    // --- middleware (Go net/http / tower style) ---
+    // Appends a middleware to the dispatch chain: it runs before route matching
+    // (and before any earlier-registered middleware), may short-circuit by never
+    // calling next(), and runs again after the handler once next() resumes. See
+    // handler.h for the Middleware shape and Router::use for the ordering.
+    Server &use(Middleware middleware) {
+        m_router->use(std::move(middleware));
         return *this;
     }
-    // CORS — see handler/cors.h for the policy and the preflight rule.
+    // CORS — see handler/cors.h for the policy and the preflight rule. The
+    // policy runs as the outermost middleware, ahead of everything registered
+    // with use().
     Server &cors(CorsConfig config) {
         m_router->cors(std::move(config));
+        return *this;
+    }
+
+    // --- route groups (chi/gin Group, axum nest) ---
+    // A group of routes sharing a path prefix and, optionally, group
+    // middleware. See Router::group for the shape — routes registered inside
+    // get the prefix prepended and the group middleware wrapped around them.
+    template <typename F> Server &group(std::string prefix, F &&register_routes) {
+        m_router->group(std::move(prefix), std::forward<F>(register_routes));
+        return *this;
+    }
+    template <typename F>
+    Server &group(std::string prefix, std::vector<Middleware> group_middlewares, F &&register_routes) {
+        m_router->group(std::move(prefix), std::move(group_middlewares), std::forward<F>(register_routes));
         return *this;
     }
 

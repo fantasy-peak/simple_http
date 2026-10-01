@@ -71,6 +71,41 @@ inline std::string base64_encode(std::string_view in) {
     return detail::base64_encode_alphabet(base64_std_alphabet, in, true);
 }
 
+// Decodes standard base64 (RFC 4648 §4): '=' padding is accepted and ignored,
+// and decoding stops at the first character outside the alphabet, exactly like
+// the base64url decoder below.
+inline std::string base64_decode(std::string_view in) {
+    static constexpr std::array<int, 256> rev = [] {
+        std::array<int, 256> table{};
+        table.fill(-1);
+        for (int i = 0; i < 64; ++i) {
+            table[static_cast<unsigned char>(base64_std_alphabet[i])] = i;
+        }
+        return table;
+    }();
+
+    std::string out;
+    out.reserve(in.size() * 3 / 4);
+    std::uint32_t val = 0;
+    int bits = -8;
+    for (unsigned char c : in) {
+        if (c == '=') {
+            break; // padding ends the payload
+        }
+        const int mapped = rev[c];
+        if (mapped == -1) {
+            break;
+        }
+        val = ((val << 6) | static_cast<std::uint32_t>(mapped)) & 0xFFFFFFu;
+        bits += 6;
+        if (bits >= 0) {
+            out.push_back(static_cast<char>((val >> bits) & 0xFF));
+            bits -= 8;
+        }
+    }
+    return out;
+}
+
 // Decodes standard base64url, stopping at the first character outside the
 // alphabet (see the test that pins that: a stray '=' or space ends the
 // payload).

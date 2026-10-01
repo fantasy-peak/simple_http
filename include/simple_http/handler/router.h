@@ -8,16 +8,30 @@
 // rules follow the modern frameworks (Flask / axum / Go 1.22): a route that
 // serves GET also serves HEAD (the writer strips the body), and a path whose
 // method does not match is answered 405 with an Allow header — or an automatic
-// 204 OPTIONS — while a path nothing services continues to the 404. Optional
-// `before` and `cors` filters run first and may short-circuit. The Router's
-// dispatch(shared_ptr<Request>, shared_ptr<Response>, SslHandle) matches the
-// engine's Dispatcher type, so the same router serves every protocol version.
+// 204 OPTIONS — while a path nothing services continues to the 404.
+//
+// Middleware (Go net/http / tower style) runs before any of that, as a chain:
+// each middleware gets the request and a `next` continuation that runs the rest
+// of the chain, ending at route matching itself — so a middleware can run
+// before the handler, short-circuit it by never calling next(), and run again
+// after it once next() resumes (handler.h, Router::use). Global middleware
+// wraps the whole router; group() middlewares wrap just the group's routes;
+// per-route middlewares wrap just one route's handler (Router::route's
+// middlewares overload). The CORS policy (Router::cors) is the outermost
+// middleware, always positioned ahead of the user chain.
+//
+// The Router's dispatch(shared_ptr<Request>, shared_ptr<Response>, SslHandle)
+// matches the engine's Dispatcher type, so the same router serves every
+// protocol version.
 
+#include <atomic>
 #include <boost/asio/awaitable.hpp>
 #include <cstdint>
 #include <initializer_list>
+#include <iterator>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -31,7 +45,7 @@
 #include "../core/http_status.h"
 #include "../core/logging.h"
 #include "../engine/dispatcher.h" // WsProxyTarget, HttpProxyTarget
-#include "cors.h"                 // CorsConfig (built-in CORS -> a Filter)
+#include "cors.h"                 // CorsConfig (built-in CORS -> a Middleware)
 #include "handler.h"
 #include "http_proxy.h"
 #include "static_files.h" // the static stage (m_static)
@@ -74,6 +88,11 @@ struct RouteEntry {
     static constexpr std::uint16_t all_bits = 0x03FF;
     std::uint16_t method_bits{};
     Handler handler;
+    // Per-route middleware (see Router::route's middlewares overload), composed
+    // once at registration around the handler. Empty for routes registered
+    // without any — dispatch then calls the handler directly and skips the
+    // type-erased hop.
+    Next route_chain;
 };
 
 // A path-template route (`/users/{id}`): segments fixed at registration,
@@ -84,6 +103,16 @@ struct RouteEntry {
 struct TemplateRoute {
     std::vector<std::optional<std::string>> segments;
     std::vector<std::string> param_names; // one per nullopt segment
+};
+
+// A registration scope: one open group() call. The prefix accumulates across
+// nested groups ("/api" then "/admin" -> "/api/admin"); the middlewares are the
+// group chain, outermost first, applied to every route registered while the
+// scope is open (between the global chain and a route's own per-route chain).
+// The root scope (empty stack) is global: prefix "" and no middleware.
+struct RegistrationScope {
+    std::string prefix;
+    std::vector<Middleware> mws;
 };
 
 class Router {
@@ -113,37 +142,41 @@ class Router {
     // braced literal (`{Method::Get, Method::Post}`), `any_methods`, or — the
     // config-file case — the std::vector<Method> a parser filled, passed
     // straight through: `route(parsed_methods, "/x", h)`.
+    //
+    // The middlewares overload registers per-route (local) middleware — Go
+    // gin/echo per-route middleware, axum's route_layer. The middlewares wrap
+    // this route's handler only: they run in order (first outermost) when the
+    // handler is chosen, and a route whose method does not match (405 /
+    // automatic OPTIONS) or whose path nothing services never runs them. Global
+    // middleware (use) and CORS still run for every request, ahead of them.
+    // Registered inside a group, the path and the group middleware are applied
+    // automatically (see group()).
     template <typename F> Router &route(std::vector<Method> methods, std::string path, F &&handler) {
-        auto entry = make_route_entry(methods, make_handler(std::forward<F>(handler)));
-        if (!entry) {
-            return *this; // Method::Unknown rejected — see make_route_entry
-        }
-        // A path holding `{name}` segments is a template route: matched
-        // segment-wise with captures published onto the Request. Still exact
-        // tier — a literal path with the same shape registers normally.
-        if (path.find('{') != std::string::npos) {
-            auto tmpl = parse_template(path);
-            if (!tmpl) {
-                SIMPLE_HTTP_ERROR_LOG("route [{}]: invalid path template; registration skipped", path);
-                return *this;
-            }
-            insert_template(std::move(*tmpl), methods, std::move(*entry));
-            return *this;
-        }
-        // Per-(path, method) storage: one slot per method (see MethodTable),
-        // so GET /pets and POST /pets coexist under the same path and never
-        // substitute for each other.
-        insert_entry(m_exact[std::move(path)], *entry, methods);
-        return *this;
+        return route(std::move(methods), std::move(path), {}, std::forward<F>(handler));
+    }
+    template <typename F>
+    Router &route(std::vector<Method> methods, std::string path, std::vector<Middleware> middlewares, F &&handler) {
+        auto scoped_registration = scoped(std::move(path), std::move(middlewares));
+        return insert_route(
+            std::move(methods), std::move(scoped_registration.first),
+            make_route_entry(methods, make_handler(std::forward<F>(handler)), std::move(scoped_registration.second)));
     }
 
     template <typename F> Router &route_regex(std::vector<Method> methods, const std::string &pattern, F &&handler) {
-        auto entry = make_route_entry(methods, make_handler(std::forward<F>(handler)));
+        return route_regex(std::move(methods), pattern, {}, std::forward<F>(handler));
+    }
+    template <typename F>
+    Router &route_regex(std::vector<Method> methods, const std::string &pattern, std::vector<Middleware> middlewares,
+                        F &&handler) {
+        auto scoped_registration = scoped(pattern, std::move(middlewares));
+        auto entry =
+            make_route_entry(methods, make_handler(std::forward<F>(handler)), std::move(scoped_registration.second));
         if (!entry) {
             return *this; // Method::Unknown rejected — see make_route_entry
         }
+        const std::string full_pattern = m_scopes.empty() ? pattern : scope_regex(pattern);
         try {
-            m_regex.emplace_back(RegexRoute{simple_http_regex::regex{pattern}, literal_prefix(pattern)},
+            m_regex.emplace_back(RegexRoute{simple_http_regex::regex{full_pattern}, literal_prefix(full_pattern)},
                                  std::move(*entry));
         } catch (const std::exception &e) {
             SIMPLE_HTTP_ERROR_LOG("invalid route regex [{}]: {}", pattern, e.what());
@@ -164,24 +197,24 @@ class Router {
     template <typename Res, typename F, typename... Extras>
     Router &route(std::vector<Method> methods, std::string path, F &&handler, openapi::OperationInfo info = {},
                   Extras &&...extras) {
-        route(methods, path, std::forward<F>(handler)); // the normal registration
+        route(methods, path, std::forward<F>(handler)); // the normal registration (applies the group prefix)
         std::vector<openapi::Param> params;
         std::vector<openapi::Response> responses;
         openapi::collect_annotation(params, responses, std::forward<Extras>(extras)...);
         openapi::merge_path_params(params, path);
-        m_openapi->add_operation(methods, std::move(path), std::move(info), {}, openapi::schema_json<Res>(),
+        m_openapi->add_operation(methods, scoped_path(path), std::move(info), {}, openapi::schema_json<Res>(),
                                  std::move(params), std::move(responses));
         return *this;
     }
     template <typename Req, typename Res, typename F, typename... Extras>
     Router &route(std::vector<Method> methods, std::string path, F &&handler, openapi::OperationInfo info = {},
                   Extras &&...extras) {
-        route(methods, path, std::forward<F>(handler)); // the normal registration
+        route(methods, path, std::forward<F>(handler)); // the normal registration (applies the group prefix)
         std::vector<openapi::Param> params;
         std::vector<openapi::Response> responses;
         openapi::collect_annotation(params, responses, std::forward<Extras>(extras)...);
         openapi::merge_path_params(params, path);
-        m_openapi->add_operation(methods, std::move(path), std::move(info), openapi::schema_json<Req>(),
+        m_openapi->add_operation(methods, scoped_path(path), std::move(info), openapi::schema_json<Req>(),
                                  openapi::schema_json<Res>(), std::move(params), std::move(responses));
         return *this;
     }
@@ -202,7 +235,7 @@ class Router {
                                   path);
             return *this;
         }
-        route(methods, path, std::forward<F>(handler)); // the normal registration
+        route(methods, path, std::forward<F>(handler)); // the normal registration (applies the group prefix)
         std::vector<openapi::Param> params;
         std::vector<openapi::Response> responses;
         openapi::collect_annotation(params, responses, std::forward<Extras>(extras)...);
@@ -227,8 +260,8 @@ class Router {
                 return openapi::schema_json<Second>();
             }
         }();
-        m_openapi->add_operation(methods, std::move(path), std::move(info), request_schema, openapi::schema_json<Res>(),
-                                 std::move(params), std::move(responses));
+        m_openapi->add_operation(methods, scoped_path(path), std::move(info), request_schema,
+                                 openapi::schema_json<Res>(), std::move(params), std::move(responses));
         return *this;
     }
 
@@ -299,17 +332,76 @@ class Router {
         return *this;
     }
 
-    Router &before(Filter filter) {
-        m_before = std::move(filter);
+    // --- middleware (Go net/http / tower style) ---
+    // Appends a middleware to the dispatch chain. Middleware run in
+    // registration order, outermost first: the first `use`d sees the request
+    // before any other middleware and its after-phase (code after
+    // `co_await next(...)`) runs last. A middleware short-circuits the request
+    // by never calling next(); CORS (see cors()) is always outermost, ahead of
+    // everything registered here. The chain is frozen at the first dispatch —
+    // register middleware before start().
+    //
+    // Inside a group (see group()), use() scopes to that group: the middleware
+    // then wraps only the routes registered in the group, like chi/gin's
+    // `r.Group(...)` + `r.Use(...)`.
+    Router &use(Middleware middleware) {
+        if (m_scopes.empty()) {
+            m_middleware.push_back(std::move(middleware));
+            m_chain_built.store(false, std::memory_order_relaxed);
+        } else {
+            // Group scope: a group middleware is applied per route at
+            // registration, so the dispatch chain is untouched.
+            m_scopes.back().mws.push_back(std::move(middleware));
+        }
         return *this;
     }
-    // CORS: a policy in, and the filter it compiles to is what dispatch runs. See
-    // handler/cors.h — including why a preflight never reaches a route. A policy
-    // the config cannot express goes in a before() filter instead, which can
-    // start from make_cors_filter() if it only wants to narrow the built-in
-    // behaviour.
+    // CORS: a policy in, and the middleware it compiles to is what dispatch
+    // runs, always at the head of the chain (a preflight is answered here and
+    // never reaches any other middleware or a route). See handler/cors.h — a
+    // policy the config cannot express goes in a use() middleware instead,
+    // which can start from make_cors_middleware() if it only wants to narrow
+    // the built-in behaviour.
     Router &cors(CorsConfig config) {
-        m_cors = make_cors_filter(std::move(config));
+        m_cors = make_cors_middleware(std::move(config));
+        m_chain_built.store(false, std::memory_order_relaxed);
+        return *this;
+    }
+
+    // --- route groups (chi/gin Group, axum nest) ---
+    // Registers a group of routes that share a path prefix and (optionally)
+    // group middleware. The group middleware wraps every route registered
+    // inside — before the route's own per-route middleware — and the prefix is
+    // prepended to every path and regex registered inside, so a group reads as
+    // a sub-application:
+    //
+    //   server.group("/api", {auth_mw}, [](simple_http::Router &api) {
+    //       api.route({Method::Get}, "/users", users_handler);      // /api/users
+    //       api.route({Method::Post}, "/users", {rate_limit}, create); // + per-route mw
+    //       api.group("/admin", {admin_mw}, [](simple_http::Router &adm) {
+    //           adm.route({any_methods}, "/kick", kick_handler);    // /api/admin/kick
+    //       });
+    //   });
+    //
+    // The lambda receives the *same* Router (registration is flat — a group is
+    // a registration scope, not a separate table), so any route form works
+    // inside: route, route_regex, ws_route, http_proxy, static_files, and
+    // nested groups. Global middleware (use() outside a group) and CORS still
+    // run for every request, ahead of the group chain.
+    template <typename F> Router &group(std::string prefix, F &&register_routes) {
+        return group(std::move(prefix), {}, std::forward<F>(register_routes));
+    }
+    template <typename F>
+    Router &group(std::string prefix, std::vector<Middleware> group_middlewares, F &&register_routes) {
+        // Accumulate: the group's prefix appends to any outer group's, and its
+        // middlewares join the outer chain (outermost first). The scope stack is
+        // captured by the lambda that closes it, so nested groups compose.
+        RegistrationScope scope = m_scopes.empty() ? RegistrationScope{} : m_scopes.back();
+        scope.prefix += prefix;
+        scope.mws.insert(scope.mws.end(), std::make_move_iterator(group_middlewares.begin()),
+                         std::make_move_iterator(group_middlewares.end()));
+        m_scopes.push_back(std::move(scope));
+        std::forward<F>(register_routes)(*this);
+        m_scopes.pop_back();
         return *this;
     }
 
@@ -461,20 +553,58 @@ class Router {
     }
 
     // --- dispatch (satisfies the engine Dispatcher) ---
+    // Runs the composed middleware chain — CORS first, then the user
+    // middlewares in registration order — ending at route matching
+    // (dispatch_impl). The chain is built once, on first use, and frozen
+    // thereafter: registration (use/cors) must finish before start().
     asio::awaitable<void> dispatch(RequestPtr req, ResponsePtr res, SslHandle ssl) const {
-        // CORS runs only for cross-origin requests. The filter answers an OPTIONS
-        // preflight here and returns false, so a preflight never reaches a route.
-        if (m_cors && req->header("origin").has_value()) {
-            if (!co_await m_cors(req, res)) {
-                co_return;
-            }
-        }
-        if (m_before) {
-            if (!co_await m_before(req, res)) {
-                co_return;
-            }
-        }
+        co_await chain()(std::move(req), std::move(res), ssl);
+    }
 
+  private:
+    // The composed chain, built lazily on first dispatch so a Router that is
+    // configured but never dispatched pays nothing. Built under a mutex because
+    // dispatch may be entered concurrently (one worker thread per connection);
+    // after the first build the chain is read-only for the server's lifetime.
+    const Next &chain() const {
+        if (m_chain_built.load(std::memory_order_acquire)) {
+            return m_chain;
+        }
+        std::lock_guard<std::mutex> lock(m_chain_mutex);
+        if (m_chain_built.load(std::memory_order_relaxed)) {
+            return m_chain;
+        }
+        std::vector<Middleware> middlewares;
+        if (m_cors) {
+            middlewares.push_back(m_cors);
+        }
+        for (const Middleware &middleware : m_middleware) {
+            middlewares.push_back(middleware);
+        }
+        Next terminal = [this](RequestPtr req, ResponsePtr res, SslHandle ssl) -> asio::awaitable<void> {
+            co_await dispatch_impl(std::move(req), std::move(res), ssl);
+        };
+        m_chain = compose_middleware(std::move(middlewares), std::move(terminal));
+        m_chain_built.store(true, std::memory_order_release);
+        return m_chain;
+    }
+
+    // Runs a matched route's handler: through its per-route middleware chain
+    // (composed at registration) when the route has one, directly otherwise.
+    // The chain runs before the handler, may short-circuit it, and wraps its
+    // after-phase — same semantics as the global chain, scoped to one route.
+    static asio::awaitable<void> run_handler(const RouteEntry &hit, RequestPtr req, ResponsePtr res, SslHandle ssl) {
+        if (hit.route_chain) {
+            co_await hit.route_chain(std::move(req), std::move(res), ssl);
+        } else {
+            co_await invoke_handler(hit.handler, std::move(req), std::move(res), ssl);
+        }
+    }
+
+    // Route matching itself — the terminal stage of the middleware chain, what
+    // a middleware's next() ultimately reaches: exact routes, path templates,
+    // the reverse-proxy stage, regex, the static stage, fallback, built-in 404.
+    asio::awaitable<void> dispatch_impl(RequestPtr req, ResponsePtr res, SslHandle ssl) const {
         // A view, not a copy: the exact maps have transparent hashers, so they can
         // be probed with the request's own path, and the proxy lookups take a
         // string_view too. The copy is only needed for the regex walk — and only
@@ -493,7 +623,7 @@ class Router {
         if (auto it = m_exact.find(path); it != m_exact.end()) {
             const MethodTable &tbl = it->second;
             if (const RouteEntry *hit = lookup(tbl, method)) {
-                co_await invoke_handler(hit->handler, std::move(req), std::move(res), ssl);
+                co_await run_handler(*hit, std::move(req), std::move(res), ssl);
                 co_return;
             }
             const std::uint16_t bits = method_allow_bits(tbl);
@@ -517,7 +647,7 @@ class Router {
                 for (std::size_t i = 0; i < values.size(); ++i) {
                     req->set_param(term->param_names[i], values[i]);
                 }
-                co_await invoke_handler(hit->handler, std::move(req), std::move(res), ssl);
+                co_await run_handler(*hit, std::move(req), std::move(res), ssl);
                 co_return;
             }
             const std::uint16_t bits = method_allow_bits(term->tbl);
@@ -549,7 +679,7 @@ class Router {
                 if (!simple_http_regex::regex_match(owned_path, route.pattern))
                     continue;
                 if (method_allowed(entry, method)) {
-                    co_await invoke_handler(entry.handler, std::move(req), std::move(res), ssl);
+                    co_await run_handler(entry, std::move(req), std::move(res), ssl);
                     co_return;
                 }
                 // The path resolved to this pattern but the method was not
@@ -587,7 +717,6 @@ class Router {
         co_return;
     }
 
-  private:
     // Splits a path into TemplateRoute segments; a `{name}` segment becomes a
     // capture. Returns nullopt for a malformed template: an unmatched brace, an
     // empty or duplicate parameter name, a brace inside a literal.
@@ -735,6 +864,98 @@ class Router {
         return false;
     }
 
+    // Shared body of the route() overloads: honors `{name}` template paths
+    // (segment trie, captures published onto the Request) and literal paths
+    // (per-(path, method) table). Rejects Method::Unknown and bad templates
+    // loudly, like the pre-refactor registration.
+    Router &insert_route(std::vector<Method> methods, std::string path, std::optional<RouteEntry> entry) {
+        if (!entry) {
+            return *this; // Method::Unknown rejected — see make_route_entry
+        }
+        if (path.find('{') != std::string::npos) {
+            auto tmpl = parse_template(path);
+            if (!tmpl) {
+                SIMPLE_HTTP_ERROR_LOG("route [{}]: invalid path template; registration skipped", path);
+                return *this;
+            }
+            insert_template(std::move(*tmpl), std::move(methods), std::move(*entry));
+            return *this;
+        }
+        // Per-(path, method) storage: one slot per method (see MethodTable),
+        // so GET /pets and POST /pets coexist under the same path and never
+        // substitute for each other.
+        insert_entry(m_exact[std::move(path)], *entry, std::move(methods));
+        return *this;
+    }
+
+    // --- registration scope helpers (group()) ---
+
+    // The path as the current group scope sees it: group prefixes prepended.
+    std::string scoped_path(const std::string &path) const {
+        return m_scopes.empty() ? path : m_scopes.back().prefix + path;
+    }
+
+    // Applies the current scope to a route registration: the group prefix in
+    // front of the path, and the group middlewares (outermost first) ahead of
+    // the route's own per-route middlewares.
+    std::pair<std::string, std::vector<Middleware>> scoped(std::string path, std::vector<Middleware> route_mws) const {
+        std::pair<std::string, std::vector<Middleware>> out;
+        if (!m_scopes.empty()) {
+            const RegistrationScope &scope = m_scopes.back();
+            out.first = scope.prefix + std::move(path);
+            out.second = scope.mws; // copy: group middleware, shared by every route in the group
+        } else {
+            out.first = std::move(path);
+        }
+        out.second.insert(out.second.end(), std::make_move_iterator(route_mws.begin()),
+                          std::make_move_iterator(route_mws.end()));
+        return out;
+    }
+
+    // A regex registered inside a group is scoped to the prefix: the prefix is
+    // inserted as literal text (metacharacters escaped) before the pattern, with
+    // a leading '^' anchor staying at the head — `^/admin/(.*)$` under `/api`
+    // matches `/api/admin/x`.
+    std::string scope_regex(const std::string &pattern) const {
+        std::string body = pattern;
+        if (!body.empty() && body.front() == '^') {
+            body.erase(0, 1); // regex_match spans the whole input anyway; the anchor is redundant
+        }
+        return escape_literal(m_scopes.back().prefix) + body;
+    }
+
+    // Escapes regex metacharacters so a group prefix participates literally in a
+    // pattern instead of being parsed as one.
+    static std::string escape_literal(std::string_view s) {
+        std::string out;
+        out.reserve(s.size() * 2);
+        for (char c : s) {
+            switch (c) {
+            case '\\':
+            case '^':
+            case '$':
+            case '.':
+            case '[':
+            case ']':
+            case '(':
+            case ')':
+            case '{':
+            case '}':
+            case '*':
+            case '+':
+            case '?':
+            case '|':
+            case '-':
+                out.push_back('\\');
+                out.push_back(c);
+                break;
+            default:
+                out.push_back(c);
+            }
+        }
+        return out;
+    }
+
     // Inserts a template route into the trie. A literal segment becomes a
     // named edge; a `{name}` segment follows (or creates) the single, anonymous
     // param edge. At the terminal the route's param names are recorded (first
@@ -812,7 +1033,7 @@ class Router {
         term = &trie[node].terminal;
         if (!term->tbl.any) {
             bool has_handler = false;
-            for (const auto& slot : term->tbl.by_method) {
+            for (const auto &slot : term->tbl.by_method) {
                 if (slot) {
                     has_handler = true;
                     break;
@@ -829,7 +1050,12 @@ class Router {
 
     // The empty method set (see `any_methods`) means "any method", and GET
     // implies HEAD — the two implicit rules shared with Flask / axum / Go 1.22.
-    static std::optional<RouteEntry> make_route_entry(const std::vector<Method> &methods, Handler handler) {
+    // `middlewares` are the route's local middleware: composed once, here, into
+    // route_chain (which captures a *copy* of the handler — the entry is copied
+    // into per-method slots afterwards, so the chain must not reference the
+    // entry itself).
+    static std::optional<RouteEntry> make_route_entry(const std::vector<Method> &methods, Handler handler,
+                                                      std::vector<Middleware> middlewares) {
         std::uint16_t bits = 0;
         for (Method m : methods) {
             if (m == Method::Unknown) {
@@ -845,7 +1071,16 @@ class Router {
             // (regression-tested: "HEAD and 204 carry no body").
             bits |= method_bit(Method::Head);
         }
-        return RouteEntry{bits, std::move(handler)};
+        RouteEntry entry{bits, std::move(handler)};
+        if (!middlewares.empty()) {
+            Handler local = entry.handler; // a copy for the chain to own
+            Next terminal = [local = std::move(local)](RequestPtr req, ResponsePtr res,
+                                                       SslHandle ssl) -> asio::awaitable<void> {
+                co_await invoke_handler(local, std::move(req), std::move(res), ssl);
+            };
+            entry.route_chain = compose_middleware(std::move(middlewares), std::move(terminal));
+        }
+        return entry;
     }
 
     static bool method_allowed(const RouteEntry &entry, Method m) noexcept {
@@ -987,8 +1222,23 @@ class Router {
     // roots is a later addition rather than a change of shape.
     std::vector<std::shared_ptr<StaticFiles>> m_static;
     std::optional<Handler> m_fallback;
-    Filter m_before;
-    Filter m_cors;
+    // The global middleware chain, in registration order (Router::use outside a
+    // group). Read by chain() when the dispatch chain is composed.
+    std::vector<Middleware> m_middleware;
+    // The CORS policy as a middleware, always the outermost element of the
+    // chain (Router::cors). Empty until a policy is installed.
+    Middleware m_cors;
+    // The open group() registration scopes. Empty at the root: routes register
+    // globally and use() lands in m_middleware. Non-empty inside group(): the
+    // back() scope's prefix and middlewares apply to every route registered
+    // then, and use() appends to its middlewares.
+    std::vector<RegistrationScope> m_scopes;
+    // The composed dispatch chain, built once on first use (chain()). After
+    // that it is read-only for the server's lifetime; registration clears
+    // m_chain_built on the configuring thread, before start().
+    mutable Next m_chain;
+    mutable std::atomic<bool> m_chain_built{false};
+    mutable std::mutex m_chain_mutex;
 
     std::unordered_map<std::string, WsHandler, string_hash, std::equal_to<>> m_ws_exact;
     std::vector<std::pair<RegexRoute, WsHandler>> m_ws_regex;

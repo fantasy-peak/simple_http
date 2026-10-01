@@ -39,6 +39,10 @@ class Response {
         m_status = code;
         return *this;
     }
+    // The status code this response will be — or was — sent with. A middleware
+    // reads it in its after-phase (after `co_await next(...)` resumed) to see
+    // what the handler or the router's built-in replies ended on.
+    int status() const { return m_status; }
     Response &header(std::string_view name, std::string value) {
         // A field name or value carrying CR/LF/NUL would splice arbitrary bytes
         // into the head — response splitting, and this library's own reverse proxy
@@ -94,9 +98,78 @@ class Response {
     [[nodiscard]] asio::awaitable<void> close() { return m_writer->close(); }
     Version version() const { return m_writer->version(); }
 
+    // --- redirect & SSE helpers ---
+
+    // Fluent redirect: sets `Location` and the status (302 Found by default —
+    // status::see_other for a POST→GET transition, status::permanent_redirect
+    // for a moved-forever). The Location header goes through header(), so a
+    // CR/LF/NUL injection is refused there, not emitted. Use with .send(""):
+    //   co_await res->redirect("/login").send("");
+    Response &redirect(std::string location, int code = status::found) {
+        m_status = code;
+        return header(field::location, std::move(location));
+    }
+
+    // Server-Sent Events (SSE, text/event-stream): a thin stream wrapper.
+    //   co_await res->status(200).sse_begin();
+    //   co_await res->sse_event("hello");               // data: hello\n\n
+    //   co_await res->sse_event("l1\nl2");              // two data: lines, one event
+    //   co_await res->sse_event("payload", "update", "42", ""); // + event: and id:
+    //   co_await res->sse_comment("keepalive");         // : keepalive\n\n
+    // The connection stays open (h1 chunked / h2 DATA frames) until the handler
+    // returns or the client goes away; returning without finish() leaves the
+    // stream half-open, which the engine closes as part of cleanup.
+    [[nodiscard]] asio::awaitable<error_code> sse_begin() {
+        header(field::content_type, "text/event-stream; charset=utf-8");
+        header("cache-control", "no-cache");
+        return begin();
+    }
+    [[nodiscard]] asio::awaitable<error_code> sse_event(std::string data, std::string event = {}, std::string id = {},
+                                                        std::string retry = {}) {
+        return write(render_sse(data, event, id, retry));
+    }
+    [[nodiscard]] asio::awaitable<error_code> sse_comment(std::string text) {
+        return write(": " + std::move(text) + "\n\n");
+    }
+
     ResponseWriter &writer() { return *m_writer; }
 
   private:
+    // Renders one SSE event frame: optional event/id/retry fields, then one
+    // "data: " line per line of `data` (so multi-line payloads stay one event
+    // for the client), closed by a blank line.
+    static std::string render_sse(std::string_view data, std::string_view event, std::string_view id,
+                                  std::string_view retry) {
+        std::string frame;
+        if (!event.empty()) {
+            frame += "event: ";
+            frame += event;
+            frame += '\n';
+        }
+        if (!id.empty()) {
+            frame += "id: ";
+            frame += id;
+            frame += '\n';
+        }
+        if (!retry.empty()) {
+            frame += "retry: ";
+            frame += retry;
+            frame += '\n';
+        }
+        std::size_t pos = 0;
+        do {
+            const std::size_t nl = data.find('\n', pos);
+            frame += "data: ";
+            frame.append(data.substr(pos, nl == std::string_view::npos ? std::string_view::npos : nl - pos));
+            frame += '\n';
+            if (nl == std::string_view::npos) {
+                break;
+            }
+            pos = nl + 1;
+        } while (pos < data.size());
+        frame += '\n';
+        return frame;
+    }
     // Fill in Server and Content-Type headers if the handler did not set them.
     void apply_defaults() {
         if (!m_headers.contains("content-type")) {

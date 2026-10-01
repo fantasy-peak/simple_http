@@ -93,6 +93,18 @@ TEST_CASE("core/base64: standard alphabet is padded", "[core]") {
     CHECK(base64_encode("foobar") == "Zm9vYmFy");
 }
 
+TEST_CASE("core/base64: standard decoding round-trips and stops at padding/foreign bytes", "[core]") {
+    CHECK(base64_decode("") == "");
+    CHECK(base64_decode("Zg==") == "f");
+    CHECK(base64_decode("Zm8=") == "fo");
+    CHECK(base64_decode("Zm9v") == "foo");
+    CHECK(base64_decode(base64_encode("foobar")) == "foobar");
+    // '=' ends the payload; anything after it must not decode into output.
+    CHECK(base64_decode("Zm9vYg==junk") == "foob");
+    // Unicode bytes round-trip through the standard alphabet too.
+    CHECK(base64_decode(base64_encode("\xF0\x9F\x92\xA9")) == "\xF0\x9F\x92\xA9");
+}
+
 TEST_CASE("core/mime and version constants", "[core]") {
     CHECK(mime::text_plain == "text/plain");
     CHECK(mime::app_json == "application/json");

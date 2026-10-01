@@ -50,8 +50,11 @@ include/
     proto/                 版本无关的 HTTP 模型
       headers.h            Headers
       body.h               Body（流式请求体）
+      query.h              QueryParams：query-string/urlencoded 解析（Go r.URL.Query / axum Query<T>）
+      multipart.h          multipart/form-data 解析（boundary/part/name/filename）
+      form.h               read_urlencoded_body / read_multipart_body 高层读取
       request.h            Request
-      response.h           Response（fluent，面向用户）
+      response.h           Response（fluent，面向用户；redirect / SSE 封装）
       response_writer.h    ResponseWriter（版本收敛的纯虚接口）
       ws_frame.h           WebSocket 帧编解码 + 握手 key（手写）
       websocket.h          WebSocket 句柄（transport-agnostic，含写泵）
@@ -73,9 +76,13 @@ include/
                            与请求合法性校验都归 nghttp3 了
                            （#ifdef SIMPLE_HTTP_ENABLE_HTTP3）
     handler/               handler 类型系统 + 路由
-      handler.h            Handler 类型别名与 make_handler/invoke_handler
-      cors.h               内建 CORS：CorsConfig 编译成 Filter（预检在 filter 内应答 204，不进路由）
-      router.h             Router（含反代用的 HttpClient、反代匹配、静态阶段）
+      handler.h            Handler/Next/Middleware 类型别名、make_handler/invoke_handler/compose_middleware
+      builtin_middleware.h 内置中间件：request_id / access_log / recovery / basic_auth /
+                           real_ip（XFF/X-Real-IP → ClientIp state）/ clean_path（规范化+拒绝 ".."）/
+                           strip_prefix（子应用挂载）
+      cors.h               内建 CORS：CorsConfig 编译成 Middleware（预检在中间件内应答 204，不进路由）
+      router.h             Router（含反代用的 HttpClient、反代匹配、静态阶段）；use/group 与
+                           per-route 中间件注册；组前缀作用域 {@name RegistrationScope}
       http_proxy.h         请求级反代：上游走 client 层（连接池/TLS/h2），响应流式回传
       static_files.h       静态文件服务（static_table.h 的 serving 半边 + SPA fallback）
     quic/                  QUIC 传输（#ifdef SIMPLE_HTTP_ENABLE_HTTP3）——ngtcp2 的包装，
@@ -100,8 +107,11 @@ include/
       tls_client.h         客户端 ssl::context 与握手（SNI / ALPN / 主机名校验 / mTLS）
       h1_client.h          HTTP/1.1 会话（一次一交换，keep-alive、chunked、h2c Upgrade）
       h2_client.h          HTTP/2 会话（多路复用、流控、SETTINGS/PING/GOAWAY、h2c 播种流 1）
+      cookie_jar.h         CookieJar（客户端 Cookie 仓库：Domain/Path/Secure/Expires 过滤）
       client_pool.h        空闲连接池（每个 HttpClient 一个，按 executor/origin 分区）
-      http_client.h        HttpClient 门面：connect/open_stream + get/post/request
+      http_client.h        HttpClient 门面：connect/open_stream + get/post/request；
+                           request 便捷层支持重定向跟随（max_redirects，Go 语义 301/302/303→GET、
+                           307/308 保留方法、拒绝 https→http 降级）与 Cookie jar 回放
       client.h             聚合头
     openapi/               OpenAPI 3.1 文档 + Swagger UI（#ifdef SIMPLE_HTTP_ENABLE_OPENAPI）
       openapi_doc.h        OAS 3.1 文档模型 + 手写 JSON 渲染器 + components/schemas 去重
@@ -152,7 +162,29 @@ using ResponsePtr = std::shared_ptr<Response>;
 // 普通         : awaitable<void>(RequestPtr, ResponsePtr)
 // 带 TLS 句柄  : awaitable<void>(RequestPtr, ResponsePtr, SslHandle)
 // WebSocket    : awaitable<void>(RequestPtr, std::shared_ptr<WebSocket>)
-// 过滤器       : awaitable<bool>(RequestPtr, ResponsePtr)  // 返回 false 短路
+```
+
+中间件（`handler.h` 的 `Middleware`/`Next`，对标 Go net/http / axum from_fn）：
+
+```cpp
+// 全局：use() 按注册顺序嵌套，最外层先跑。next() 之前是 before 阶段，
+// 之后恢复是 after 阶段（可读 res->status()）；不调 next() 即短路。
+server.use([](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
+    co_await next(std::move(req), std::move(res), ssl);   // 继续链路（→ 路由 → handler）
+    log(res->status());                                    // after：观察响应
+});
+// 每请求类型化 state（Go context / tower Extensions）：
+req->set_state(Principal{...});  // 中间件写
+req->get_state<Principal>();     // handler 读；last-set-wins，按 static 类型键
+
+// 组（chi/gin Group / axum nest）：前缀 + 组中间件只作用于组内路由，可嵌套，
+// 组内 use() 只作用该组；per-route 中间件只包这一条路由的 handler。
+server.group("/api", {auth_mw}, [](Router &api) {
+    api.route({Get}, "/users", h);                    // → /api/users
+    api.route({Post}, "/users", {rate_limit_mw}, create); // 再加 per-route 中间件
+});
+// 内置中间件：middleware::request_id() / access_log() / recovery() / basic_auth()
+server.use(simple_http::middleware::request_id());
 ```
 
 `Server` 门面（`net/server.h`）为 fluent 风格，路由方法转发给内部 `Router`：
@@ -189,18 +221,22 @@ server.stop();
 - **GET 隐含 HEAD**：注册 `{Method::Get}` 自动允许 HEAD，走同一 handler，writer 抑制 body（write 层本就按 HEAD 行为抑制，有回归测试）。
 - **405 + Allow（及自动 OPTIONS）**：path 存在但方法不符 → 405，`Allow` 头列出该 path 全部方法（含自动应答的 OPTIONS）；OPTIONS 本身则自动回 204 + Allow。语义照抄 static 阶段的「resolved first, then rejected」——path 不存在仍是 404，不是 405。405/OPTIONS 是**普通 keep-alive 响应**（对齐 Go ServeMux / axum / Spring：返回后连接不断，引擎 drain 未读请求体后继续复用；曾有实现一度关闭连接，已改为主流行为）。`Method::Unknown`（扩展方法 token）不可注册，但 `any_methods` 路由会接住它。
 
-CORS 是策略入口（`handler/cors.h`）：`CorsConfig` 编译成 `Filter` 存进 `m_cors`。
+CORS 是策略入口（`handler/cors.h`）：`CorsConfig` 编译成 `Middleware` 存进 `m_cors`，始终置于 dispatch 链路头部。
 
 ```cpp
-// 带 Origin + Access-Control-Request-Method 的 OPTIONS 在 filter 内应答 204（无 body、
-// 无 framing）并短路，所以预检永远不会落到路由上——引擎层不特判 OPTIONS，交给路由只会
-// 得到 404，浏览器据此判定预检失败。
+// 带 Origin + Access-Control-Request-Method 的 OPTIONS 在中间件内应答 204（无 body、
+// 无 framing）并短路（不调 next），所以预检永远不会落到路由上——引擎层不特判 OPTIONS，
+// 交给路由只会得到 404，浏览器据此判定预检失败。
 server.cors(CorsConfig{.allow_origins = {"https://app.example"}});  // {} = 任意 origin
 ```
 
-`CorsConfig` 的字段语义见 `README.md` 的 CORS 段。`CorsConfig` 表达不了的策略（按路径
-分白名单、运行期查列表、PNA 预检）放 `before` filter——注意 `before` 对每个请求都跑，
-需自行判 `Origin` 并自己加 `Vary: Origin`；只想收窄内建行为可用 `make_cors_filter()`。
+`CorsConfig` 的字段语义见 `README.md` 的 CORS 段。配置面已对齐 gin-contrib/cors / rs-cors：
+`allow_origins` 支持子域通配（`"https://*.example.com"` 匹配任意多级子域、bare 域名不匹配；
+scheme-less 的 `"*.example.com"` 匹配任意 scheme），另有 `allow_origin_fn`（自定义判定，
+与列表取或，对应 rs-cors `AllowedOriginValidator` / tower-http `AllowOrigin::predicate`）。
+`CorsConfig` 表达不了的策略（按路径分白名单、运行期查列表、PNA 预检）放 `use()` 中间件——
+注意 `use()` 对每个请求都跑，需自行判 `Origin` 并自己加 `Vary: Origin`；只想收窄内建行为
+可用 `make_cors_middleware()`（可混进组或单条路由）。
 
 三条容易踩的边界：被拒 origin 的预检同样回 204（只是不带 CORS 头，这样浏览器发出的
 OPTIONS 不会在日志里变成 404）；实际请求不会因此被拦（CORS 是浏览器闸门而非鉴权）；
@@ -216,8 +252,17 @@ co_await res->write(chunk);
 co_await res->finish(last);
 ```
 
-`Request` 常用：`req->method()`（返回 `Method`）、`req->path()`、`req->query()`、
+`Request` 常用：`req->method()`（返回 `Method`）、`req->path()`、`req->query()`
+（原始串）、`req->query_params()`（解析后的键值，Go `r.URL.Query`）、
 `req->version()`、`req->header(name)`、`req->body().read()` / `read_all()`。
+
+`Response` 常用（fluent）：`status()/header()/content_type()`、`send(body)` 一次性、
+`begin()/write()/finish()` 流式、`redirect(location, code=302)`、SSE 三件套
+`sse_begin()/sse_event()/sse_comment()`。
+
+表单与查询：`read_urlencoded_body(req)` → `expected<QueryParams, error_code>`；
+`read_multipart_body(req)` → `expected<vector<MultipartPart>, error_code>`（字段/文件名/类型/内容，
+boundary 取自 Content-Type）。
 
 `WebSocket`（`proto/websocket.h`，handler 收到 `shared_ptr<WebSocket>`）：
 
@@ -323,6 +368,11 @@ while (auto chunk = co_await (*stream)->read()) {   // 响应体：data 或 eof�
 ```
 
 要点：
+- **便捷层重定向与 Cookie**（Go `http.Client` 语义）：`ClientConfig::max_redirects`（0 = 不跟随，
+  默认；301/302/303 把 POST/PUT/DELETE 转 GET、307/308 保留方法与 body；**拒绝 https→http 降级**
+  `redirect_to_insecure`；Location 支持绝对 / `//host` / `/root` / 相对目录四种形态）与
+  `ClientConfig::cookie_jar`（`CookieJar`：Set-Cookie 按 Domain/Path/Secure/Expires 过滤并回放）。
+  `RequestSpec::basic_auth(user, pass)` 给出站 HTTP Basic。
 - **一次一交换 vs 多路复用**：h1 会话同一时刻只服务一个交换（再开返回
   `session_busy`），h2 会话可同时开任意多流；两种版本的 `ClientStream` API 完全一致。
 - **读写形状与服务端对称**：请求体 `write()`/`finish()`（h1 走 chunked、h2 走 DATA 帧）；

@@ -23,6 +23,7 @@
 #include <memory>
 #include <utility>
 #include <variant>
+#include <vector>
 
 #include "../proto/request.h"
 #include "../proto/response.h"
@@ -47,8 +48,45 @@ using Handler = std::variant<CoroHandler, CoroSslHandler>;
 // (e.g. a separate writer) that may outlive the handler body.
 using WsHandler = std::function<asio::awaitable<void>(RequestPtr, std::shared_ptr<WebSocket>)>;
 
-// A filter (the before hook): returns false to short-circuit the request.
-using Filter = std::function<asio::awaitable<bool>(RequestPtr, ResponsePtr)>;
+// The rest of a middleware chain: what a middleware invokes to hand the request
+// onward. The terminal stage is the Router's own dispatch — route matching and
+// the handler — so a middleware calling next(req, res, ssl) is exactly "wrap the
+// handler". The Request and Response are shared_ptr, so a middleware keeps its
+// own references after next() returns and can still observe/write the response.
+using Next = std::function<asio::awaitable<void>(RequestPtr, ResponsePtr, SslHandle)>;
+
+// Middleware — the Go net/http / axum `from_fn` / tower shape, adapted to
+// coroutines. A middleware wraps the rest of the chain:
+//
+//   server.use([](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next)
+//                  -> asio::awaitable<void> {
+//       auto t0 = steady_clock::now();        // before the handler
+//       co_await next(std::move(req), std::move(res), ssl);  // run the chain
+//       log(res->status());                   // after — the response is observable
+//   });
+//
+// Code before `co_await next(...)` is the "before" phase; code after it resumes
+// is the "after" phase. Not calling next() at all answers the request here and
+// short-circuits the rest of the chain (auth, a CORS preflight). Middleware
+// registered with Router::use run in registration order, outermost first; the
+// CORS policy — Router::cors — is always the outermost of them.
+using Middleware = std::function<asio::awaitable<void>(RequestPtr, ResponsePtr, SslHandle, Next)>;
+
+// Composes middlewares around a terminal stage: the first element runs
+// outermost, the last runs just before `final`. `compose_middleware([a, b], h)`
+// runs a(b(h(...))). Used by the Router to build its dispatch chain once; a
+// consumer assembling its own Dispatcher (instead of a Router) can reuse it.
+inline Next compose_middleware(std::vector<Middleware> middlewares, Next final) {
+    for (auto it = middlewares.rbegin(); it != middlewares.rend(); ++it) {
+        Middleware mw = std::move(*it);
+        Next next = std::move(final);
+        final = [mw = std::move(mw), next = std::move(next)](RequestPtr req, ResponsePtr res,
+                                                             SslHandle ssl) -> asio::awaitable<void> {
+            co_await mw(std::move(req), std::move(res), ssl, next);
+        };
+    }
+    return final;
+}
 
 namespace detail {
 

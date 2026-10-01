@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -31,6 +32,9 @@
 namespace simple_http {
 
 namespace asio = boost::asio;
+
+// Feeds ClientConfig::cookie_jar; defined in client/cookie_jar.h.
+class CookieJar;
 
 // Which HTTP version to use on the wire.
 enum class HttpVersionPolicy : std::uint8_t {
@@ -186,6 +190,22 @@ struct ClientConfig {
     // accept-encoding itself keeps full control (nothing is injected).
     std::vector<std::string> accept_encodings{"br", "gzip"};
 
+    // Redirect handling for the convenience level (get/post/put/…):
+    //   * max_redirects — how many 3xx (301/302/303/307/308) with a Location to
+    //     follow. 0 = return the redirect response itself, like the session
+    //     level. Following is off by default because rewriting a request into a
+    //     different origin (and, for the 301/302/303 family, a different method
+    //     and body) is a decision the caller should be able to opt into.
+    //   * cookie_jar — when set, Set-Cookie from followed responses is stored
+    //     and a matching Cookie header is sent on later requests (Go's
+    //     http.Client CookieJar). The jar is shared across redirect hops.
+    //
+    // Redirect policies are Go-like: 301/302/303 turn a POST/PUT/DELETE into a
+    // GET without a body; 307/308 keep the method and body; an https → http
+    // hop is refused (redirect_to_insecure).
+    std::size_t max_redirects{0};
+    std::shared_ptr<CookieJar> cookie_jar{};
+
     // Optional name-resolution override: return the endpoints to try, in order.
     // Lets an application plug in its own DNS (cache, DoH, …) instead of the
     // built-in asio resolver. Empty = asio::ip::tcp::resolver.
@@ -217,8 +237,10 @@ enum class client_errc : int {
     goaway,                 // the peer is draining the connection (GOAWAY)
     connect_timeout,
     request_timeout,
-    invalid_spec, // the caller's RequestSpec contradicts itself (body +
-                  // stream_body)
+    invalid_spec,         // the caller's RequestSpec contradicts itself (body +
+                          // stream_body)
+    redirect_to_insecure, // a redirect would downgrade https -> http
+    too_many_redirects,   // the redirect chain exceeded ClientConfig::max_redirects
 };
 
 } // namespace simple_http
@@ -277,6 +299,10 @@ class ClientErrorCategory : public boost::system::error_category {
             return "request timed out";
         case client_errc::invalid_spec:
             return "the request spec sets both body and stream_body";
+        case client_errc::redirect_to_insecure:
+            return "a redirect would downgrade https to http";
+        case client_errc::too_many_redirects:
+            return "the redirect chain exceeded the configured limit";
         default:
             return "unknown client error";
         }

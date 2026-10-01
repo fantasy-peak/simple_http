@@ -47,6 +47,8 @@
 #include <utility>
 #include <vector>
 
+#include "../core/http_field.h"
+#include "../core/http_status.h"
 #include "../core/limits.h"
 #include "../core/logging.h"
 #include "../core/types.h"
@@ -55,6 +57,7 @@
 #include "client_config.h"
 #include "client_pool.h"
 #include "client_stream.h"
+#include "cookie_jar.h"
 #include "decompressing_stream.h"
 #include "h1_client.h"
 #include "h2_client.h"
@@ -213,7 +216,10 @@ class HttpClient {
 
     asio::awaitable<std::expected<ClientResponse, error_code>> request(ClientTarget target, RequestSpec spec,
                                                                        RequestOptions options = {}) {
-        co_return co_await do_request(std::move(target), std::move(spec), {}, options);
+        // A synthetic base URL for cookie scoping and relative redirects; the
+        // actual request target comes from the spec.
+        std::string current_url = (target.use_tls ? "https://" : "http://") + target.authority() + "/";
+        co_return co_await do_request(std::move(target), std::move(spec), {}, options, std::move(current_url));
     }
 
     asio::awaitable<std::expected<ClientResponse, error_code>> request(std::string_view url, RequestSpec spec,
@@ -222,7 +228,8 @@ class HttpClient {
         if (!parsed)
             co_return std::unexpected{parsed.error()};
         std::string fallback{parsed->target};
-        co_return co_await do_request(target_from_url(*parsed), std::move(spec), std::move(fallback), options);
+        co_return co_await do_request(target_from_url(*parsed), std::move(spec), std::move(fallback), options,
+                                      std::string{url});
     }
 
     asio::awaitable<std::expected<ClientResponse, error_code>> get(std::string_view url, RequestOptions options = {}) {
@@ -272,13 +279,82 @@ class HttpClient {
         return target;
     }
 
-    asio::awaitable<std::expected<ClientResponse, error_code>>
-    do_request(ClientTarget target, RequestSpec spec, std::string url_target, RequestOptions options) {
+    asio::awaitable<std::expected<ClientResponse, error_code>> do_request(ClientTarget target, RequestSpec spec,
+                                                                          std::string url_target,
+                                                                          RequestOptions options,
+                                                                          std::string current_url) {
         if (spec.target.empty())
             spec.target = url_target.empty() ? "/" : url_target;
         const std::size_t cap = options.max_body_bytes != 0 ? options.max_body_bytes : m_config.limits.max_body_bytes;
         const std::chrono::milliseconds limit =
             options.timeout.count() != 0 ? options.timeout : m_config.request_timeout;
+
+        co_return co_await follow_redirects(std::move(target), std::move(spec), std::move(url_target), cap, limit,
+                                            m_config.max_redirects, std::move(current_url));
+    }
+
+    // One hop of the convenience layer: an exchange, with the pooled-connection
+    // retry rule, then — when redirects are enabled and the response is a
+    // redirect with a Location — a rewritten next hop (method/body per the
+    // 301/302/303 vs 307/308 rules, cookies stored and replayed, https→http
+    // refused, `remaining` hops bound).
+    asio::awaitable<std::expected<ClientResponse, error_code>>
+    follow_redirects(ClientTarget target, RequestSpec spec, std::string url_target, std::size_t cap,
+                     std::chrono::milliseconds limit, std::size_t remaining, std::string current_url) {
+        auto response = co_await exchange_once(std::move(target), spec, url_target, cap, limit);
+        if (!response)
+            co_return std::unexpected{response.error()};
+
+        if (m_config.cookie_jar) {
+            m_config.cookie_jar->store(current_url, response->headers);
+        }
+
+        if (remaining == 0 || !is_redirect(response->status))
+            co_return response;
+        const auto location = response->header(field::location);
+        if (!location || location->empty())
+            co_return response;
+
+        auto hop = resolve_redirect(current_url, m_config.default_version, m_config.default_h2c, url_target, *location);
+        if (!hop)
+            co_return std::unexpected{hop.error()};
+
+        // RFC 9110 §15.4: 303 always becomes GET; 301/302 do for any method
+        // other than GET/HEAD. 307/308 preserve the method and body.
+        if (response->status == status::see_other ||
+            ((response->status == status::moved_permanently || response->status == status::found) &&
+             !get_like(spec.method))) {
+            spec.method = Method::Get;
+            spec.body.clear();
+            spec.stream_body = false;
+            spec.headers.erase("content-type"); // an empty GET carries no entity
+            spec.headers.erase("content-length");
+        }
+
+        if (m_config.cookie_jar) {
+            std::string cookie = m_config.cookie_jar->cookie_header(hop->url);
+            if (!cookie.empty()) {
+                spec.headers.erase("cookie");
+                spec.headers.add("cookie", std::move(cookie));
+            }
+        }
+
+        // The next hop's origin-form target supersedes the old one; exchange_once
+        // only fills an empty one.
+        spec.target = hop->url_target;
+        co_return co_await follow_redirects(std::move(hop->target), std::move(spec), std::move(hop->url_target), cap,
+                                            limit, remaining - 1, std::move(hop->url));
+    }
+
+    // The body of the old single-exchange convenience layer: one request, with
+    // the pooled-connection replay rule. `spec` is passed by value so each call
+    // has its own copy (start_exchange also takes one).
+    asio::awaitable<std::expected<ClientResponse, error_code>> exchange_once(ClientTarget target, RequestSpec spec,
+                                                                             const std::string &url_target,
+                                                                             std::size_t cap,
+                                                                             std::chrono::milliseconds limit) {
+        if (spec.target.empty())
+            spec.target = url_target.empty() ? "/" : url_target;
 
         for (int attempt = 0; attempt < 2; ++attempt) {
             auto opened = co_await start_exchange(target, spec, url_target,
@@ -316,6 +392,64 @@ class HttpClient {
             co_return std::unexpected{ec};
         }
         co_return std::unexpected{make_error_code(client_errc::session_closed)};
+    }
+
+    // Whether `status` is a redirect the convenience layer may follow.
+    static bool is_redirect(int status) noexcept {
+        return status == status::moved_permanently || status == status::found || status == status::see_other ||
+               status == status::temporary_redirect || status == status::permanent_redirect;
+    }
+
+    // GET and HEAD keep their method across a 301/302; every other method turns
+    // into GET (RFC 9110 §15.4; 307/308 keep the method).
+    static bool get_like(Method m) noexcept { return m == Method::Get || m == Method::Head; }
+
+    // One hop of a redirect chain: where the next request goes and what its
+    // request-target and absolute URL are.
+    struct RedirectHop {
+        ClientTarget target;
+        std::string url_target; // origin-form for the next request
+        std::string url;        // absolute, for cookies and further hops
+    };
+
+    // Resolves one redirect hop from `current_url` (the absolute URL that
+    // produced the response), `current_target` (that request's origin-form
+    // target, for relative Locations) and the Location value. Accepts absolute
+    // URLs, scheme-relative ("//host/path"), root-relative ("/path") and
+    // path-relative ("next", "../up") forms. An https→http downgrade is
+    // refused (redirect_to_insecure), like Go's http.Client.
+    std::expected<RedirectHop, error_code> resolve_redirect(const std::string &current_url, HttpVersionPolicy version,
+                                                            H2cMode h2c, const std::string &current_target,
+                                                            std::string_view location) const {
+        const Url base = parse_url(current_url).value_or(Url{});
+        std::string whole;
+        if (location.starts_with("http://") || location.starts_with("https://")) {
+            whole.assign(location);
+        } else if (location.starts_with("//")) {
+            whole = base.scheme + ":" + std::string{location};
+        } else if (!location.empty() && location.front() == '/') {
+            whole = base.scheme + "://" + base.authority() + std::string{location};
+        } else {
+            // Path-relative: join against the directory of the current request.
+            std::string path{current_target};
+            if (const auto q = path.find('?'); q != std::string::npos)
+                path.erase(q);
+            const auto slash = path.rfind('/');
+            whole = base.scheme + "://" + base.authority() +
+                    (slash == std::string::npos ? "/" : path.substr(0, slash + 1)) + std::string{location};
+        }
+        auto url = parse_url(whole);
+        if (!url)
+            return std::unexpected{url.error()};
+        if (base.use_tls() && !url->use_tls())
+            return std::unexpected{make_error_code(client_errc::redirect_to_insecure)};
+        RedirectHop hop;
+        hop.target = url->to_target();
+        hop.target.version = version;
+        hop.target.h2c = h2c;
+        hop.url_target = std::string{url->target};
+        hop.url = std::move(whole);
+        return hop;
     }
 
     // Reads the response of one exchange: head, then whole body, both under the

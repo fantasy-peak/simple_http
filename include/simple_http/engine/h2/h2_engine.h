@@ -1043,7 +1043,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         // Every rejection below is a *stream* error (§8.1.1): the connection stays
         // usable and only the offending stream is reset. Returning true then means
         // "handled" — the caller must not dispatch a stream that is already gone.
-        auto malformed = [&](std::string why) {
+        auto malformed = [&]([[maybe_unused]] std::string why) {
             SIMPLE_HTTP_ERROR_LOG("h2 malformed request (stream={}): {}; resetting stream", stream_id, why);
             reset_stream(stream_id, codec::H2_PROTOCOL_ERROR);
         };
