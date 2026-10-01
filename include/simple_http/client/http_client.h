@@ -152,23 +152,23 @@ class ClientEngine {
     // --- session level ---
 
     // Opens a request/response exchange without buffering anything: the caller
-    // writes the body on the returned stream (RequestSpec::stream_body), then
+    // writes the body on the returned stream (Request::stream_body), then
     // reads the response. This is the streaming entry point the http:: client
     // (client/http.h) builds its Stream on.
     asio::awaitable<std::expected<std::shared_ptr<ClientStream>, error_code>>
-    stream(ClientTarget target, RequestSpec spec, bool fresh_only = false) {
+    stream(ClientTarget target, std::shared_ptr<Request> spec, bool fresh_only = false) {
         auto opened = co_await start_exchange(std::move(target), std::move(spec), {}, fresh_only);
         if (!opened)
             co_return std::unexpected{opened.error()};
         co_return std::move(opened->stream);
     }
     asio::awaitable<std::expected<std::shared_ptr<ClientStream>, error_code>> stream(std::string_view url,
-                                                                                     RequestSpec spec) {
+                                                                                     std::shared_ptr<Request> spec) {
         auto parsed = parse_url(url);
         if (!parsed)
             co_return std::unexpected{parsed.error()};
-        if (spec.target.empty())
-            spec.target = std::string{parsed->target};
+        if (spec->target().empty())
+            spec->set_target(std::string{parsed->target});
         co_return co_await stream(target_from_url(*parsed), std::move(spec));
     }
 
@@ -195,14 +195,16 @@ class ClientEngine {
     // session as needed. A non-empty spec.target is used as-is; empty means the
     // origin's "/". The returned OpenedStream says whether the connection came
     // from the pool.
-    asio::awaitable<std::expected<OpenedStream, error_code>> open_stream(ClientTarget target, RequestSpec spec) {
+    asio::awaitable<std::expected<OpenedStream, error_code>> open_stream(ClientTarget target,
+                                                                         std::shared_ptr<Request> spec) {
         co_return co_await start_exchange(std::move(target), std::move(spec),
                                           /*url_target=*/{});
     }
 
     // Same, with the target taken from a URL (including its path and query when
     // spec.target is empty).
-    asio::awaitable<std::expected<OpenedStream, error_code>> open_stream(std::string_view url, RequestSpec spec) {
+    asio::awaitable<std::expected<OpenedStream, error_code>> open_stream(std::string_view url,
+                                                                         std::shared_ptr<Request> spec) {
         auto parsed = parse_url(url);
         if (!parsed)
             co_return std::unexpected{parsed.error()};
@@ -217,17 +219,17 @@ class ClientEngine {
     // send path drives it with fresh_only to implement pooled-replay) — it is
     // not part of the user-facing API.
     asio::awaitable<std::expected<OpenedStream, error_code>>
-    start_exchange(ClientTarget target, RequestSpec spec, std::string url_target, bool fresh_only = false) {
-        if (spec.target.empty())
-            spec.target = url_target.empty() ? "/" : url_target;
+    start_exchange(ClientTarget target, std::shared_ptr<Request> spec, std::string url_target, bool fresh_only = false) {
+        if (spec->target().empty())
+            spec->set_target(url_target.empty() ? "/" : url_target);
 
         // Every public entry point funnels through here, so this is the one
         // place that has to advertise what we can decode. A caller that set
         // accept-encoding itself keeps full control of the negotiation.
-        if (m_config.auto_decompress && !spec.headers.contains("accept-encoding")) {
+        if (m_config.auto_decompress && !spec->headers().contains("accept-encoding")) {
             std::string wanted = accept_encoding_value(m_config.accept_encodings);
             if (!wanted.empty()) {
-                spec.headers.add("accept-encoding", std::move(wanted));
+                spec->mutable_headers().add("accept-encoding", std::move(wanted));
             }
         }
 
@@ -237,7 +239,11 @@ class ClientEngine {
             if (!acquired)
                 co_return std::unexpected{acquired.error()};
 
-            auto usable = co_await negotiate_and_open(acquired->session, target, spec);
+            // A stale pooled connection costs one replay: build a fresh request
+            // for it (the body comes from the saved source — see Request's
+            // clone_for_replay). Each attempt sends its own copy.
+            auto usable = co_await negotiate_and_open(
+                acquired->session, target, spec->clone_for_replay(co_await asio::this_coro::executor));
             if (usable)
                 co_return OpenedStream{maybe_decompressing_stream(*usable, m_config.auto_decompress), acquired->pooled};
 
@@ -270,13 +276,18 @@ class ClientEngine {
 
     // Opens a stream, performing the h2c upgrade when the target asks for it.
     asio::awaitable<std::expected<std::shared_ptr<ClientStream>, error_code>>
-    negotiate_and_open(const std::shared_ptr<ClientSession> &session, const ClientTarget &target, RequestSpec spec) {
+    negotiate_and_open(const std::shared_ptr<ClientSession> &session, const ClientTarget &target,
+                       std::shared_ptr<Request> spec) {
         const bool want_upgrade = !target.use_tls && target.h2c == H2cMode::Upgrade &&
-                                  target.version != HttpVersionPolicy::Http11 && !spec.stream_body;
+                                  target.version != HttpVersionPolicy::Http11 && !spec->stream_body();
         if (want_upgrade) {
             auto h1 = std::dynamic_pointer_cast<Http1ClientSession<TcpStreamTransport>>(session);
-            if (h1 && h1->upgrade_available(spec.stream_body)) {
-                auto stream = co_await h1->open_stream_upgradeable(spec, h2_settings_base64url(m_config.limits));
+            if (h1 && h1->upgrade_available(spec->stream_body())) {
+                // The upgrading request is consumed by the h2c handshake; the
+                // plain path below would need it whole, so each path gets its
+                // own shared copy (the body rebuilds from the saved source).
+                auto stream = co_await h1->open_stream_upgradeable(
+                    spec->clone_for_replay(co_await asio::this_coro::executor), h2_settings_base64url(m_config.limits));
                 if (!stream)
                     co_return std::unexpected{stream.error()};
                 // A pinned HTTP/2 policy is not satisfied by an ignored upgrade.
@@ -441,7 +452,7 @@ class ClientEngine {
         auto pool = m_pool;
         std::weak_ptr<Session> weak_h1 = session;
         session->set_h2_upgrade_factory(
-            [config, pool, target, key, weak_h1](std::shared_ptr<Transport> transport, RequestSpec seed,
+            [config, pool, target, key, weak_h1](std::shared_ptr<Transport> transport, std::shared_ptr<Request> seed,
                                                  std::string initial)
                 -> asio::awaitable<std::expected<
                     std::pair<std::shared_ptr<ClientSession>, std::shared_ptr<ClientStream>>, error_code>> {
@@ -458,7 +469,7 @@ class ClientEngine {
                 } else {
                     h2->set_on_idle([pool, key, h2] { pool->put(key, h2); });
                 }
-                auto stream = co_await h2->start_with_stream(RequestSpec{}, std::move(initial));
+                auto stream = co_await h2->start_with_stream(std::shared_ptr<Request>{}, std::move(initial));
                 if (!stream) {
                     h2->close();
                     co_return std::unexpected{stream.error()};

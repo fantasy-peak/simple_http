@@ -1,6 +1,6 @@
 #pragma once
 
-// The client's request/response model: what to send (RequestSpec), what came
+// The client's request/response model: what to send (Request), what came
 // back (ResponseHead) and the two handles the caller drives — ClientStream for
 // one exchange, ClientSession for the connection under it.
 //
@@ -37,44 +37,24 @@
 #include <string_view>
 #include <utility>
 
-#include "../core/base64.h"
+#include "../core/base64.h" // ClientStream::write path (Request carries basic_auth)
 #include "../core/http_field.h"
 #include "../core/http_method.h"
 #include "../core/types.h"
 #include "../proto/body.h" // ReadResult
 #include "../proto/headers.h"
+#include "../proto/request.h" // Request — the shared request message type
 #include "client_config.h"
 
 namespace simple_http::detail {
 
 namespace asio = boost::asio;
 
-// One request to send. `body` is the whole body when it is known up front;
-// `stream_body` instead hands the body to ClientStream::write(), which the
-// session frames as chunked (HTTP/1.1) or DATA frames (HTTP/2). Framing headers
-// (Host, Content-Length, Transfer-Encoding, connection-specific fields) are the
-// session's business — anything set here that the protocol forbids is dropped.
-struct RequestSpec {
-    Method method{Method::Get};
-    // Origin-form request target (path + optional query). Empty means "the
-    // origin's /", or — for the URL-based facade calls — the URL's own path, so
-    // a caller can pass a bare spec and let the URL decide.
-    std::string target;
-    Headers headers;
-    std::string body;
-    bool stream_body{false};
-    // Ask the peer to close after this exchange (`Connection: close`; on HTTP/2
-    // the connection is simply not put back in the pool).
-    bool close{false};
-
-    // HTTP Basic (RFC 7617): sets `Authorization: Basic base64(user:pass)` —
-    // the client-side counterpart of middleware::basic_auth. Returns *this for
-    // chaining: spec.basic_auth("svc", "s3cret").
-    RequestSpec &basic_auth(std::string username, std::string password) {
-        headers.add(std::string{field::authorization}, "Basic " + base64_encode(username + ":" + password));
-        return *this;
-    }
-};
+// The request message type is `simple_http::Request` (proto/request.h), shared
+// with the server: a caller builds one (method/target/headers/body/close) and a
+// session sends it. Framing headers (Host, Content-Length, Transfer-Encoding,
+// connection-specific fields) are the session's business — anything set on the
+// Request that the protocol forbids is dropped at send time.
 
 // The response head, as read_head() returns it.
 struct ResponseHead {
@@ -95,7 +75,7 @@ class ClientStream {
 
     // --- request side ---
     // Sends a body chunk / finishes the body. Only valid for a request opened
-    // with RequestSpec::stream_body; otherwise body_not_streaming.
+    // with Request::stream_body; otherwise body_not_streaming.
     [[nodiscard]] virtual asio::awaitable<error_code> write(std::string data) = 0;
     [[nodiscard]] virtual asio::awaitable<error_code> finish(std::string data) = 0;
 
@@ -178,9 +158,12 @@ class ClientSession {
     virtual ~ClientSession() = default;
 
     // Starts an exchange. HTTP/1.1: one at a time. HTTP/2: any number, each
-    // multiplexed on the same connection.
+    // multiplexed on the same connection. The request to send is a shared_ptr
+    // to a `Request`, the same type the server hands its handlers — built the
+    // same way (method, target, headers, body) and read back by the engine at
+    // send time.
     [[nodiscard]] virtual asio::awaitable<std::expected<std::shared_ptr<ClientStream>, error_code>>
-    open_stream(RequestSpec spec) = 0;
+    open_stream(std::shared_ptr<Request> request) = 0;
 
     // The transport is usable and no fatal error has been seen.
     virtual bool alive() const = 0;

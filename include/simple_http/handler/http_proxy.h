@@ -151,9 +151,9 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
         co_return;
     }
 
-    simple_http::detail::RequestSpec spec;
-    spec.method = req->method();
-    spec.target = std::move(forwarded_target);
+    auto spec = std::make_shared<simple_http::Request>(simple_http::Version::Http11, co_await asio::this_coro::executor);
+    spec->set_method(req->method());
+    spec->set_target(std::move(forwarded_target));
 
     // Copy the frontend's fields, minus what the client layer owns (Host,
     // Content-Length, the connection's own headers) and minus anything the
@@ -176,13 +176,13 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
             co_await fail_502();
             co_return;
         }
-        spec.headers.add_lower(name, value);
+        spec->mutable_headers().add_lower(name, value);
     }
-    spec.headers.add_lower("x-forwarded-for",
-                           saw_xff && !xff.empty() ? xff + ", " + req->peer_address() : req->peer_address());
-    spec.headers.add_lower("x-forwarded-proto", client_is_tls ? "https" : "http");
+    spec->mutable_headers().add_lower("x-forwarded-for",
+                                     saw_xff && !xff.empty() ? xff + ", " + req->peer_address() : req->peer_address());
+    spec->mutable_headers().add_lower("x-forwarded-proto", client_is_tls ? "https" : "http");
     if (auto host = req->header("host"))
-        spec.headers.add_lower("x-forwarded-host", std::string{*host});
+        spec->mutable_headers().add_lower("x-forwarded-host", std::string{*host});
 
     // Does the request carry a body? Header hints work for HTTP/1.x but NOT for
     // HTTP/2, which frames the body with END_STREAM and carries neither header,
@@ -205,7 +205,7 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
         }
         // else: no body (immediate EOF), or a read error — forward with no body.
     }
-    spec.stream_body = has_body;
+    spec->set_stream_body(has_body);
 
     // --- the backend this target names ---
     simple_http::detail::ClientTarget upstream;

@@ -7,7 +7,7 @@
 // client_errc::session_busy (the facade opens another connection instead).
 //
 // Request framing follows the usual client rules: a body that is already known
-// goes out with Content-Length; a streamed one (RequestSpec::stream_body) is
+// goes out with Content-Length; a streamed one (Request::stream_body) is
 // sent chunked, one chunk per ClientStream::write(); a method that implies a
 // body gets Content-Length: 0 when the caller supplied none.
 //
@@ -119,7 +119,7 @@ class Http1ClientSession final : public ClientSession,
     // they are lost.
     using H2UpgradeFactory = std::function<asio::awaitable<
         std::expected<std::pair<std::shared_ptr<ClientSession>, std::shared_ptr<ClientStream>>, error_code>>(
-        std::shared_ptr<Transport> transport, RequestSpec seed, std::string initial)>;
+        std::shared_ptr<Transport> transport, std::shared_ptr<Request> seed, std::string initial)>;
 
     Http1ClientSession(std::shared_ptr<Transport> transport, std::string authority, EngineLimits limits,
                        std::chrono::milliseconds idle_timeout)
@@ -128,9 +128,9 @@ class Http1ClientSession final : public ClientSession,
 
     // --- ClientSession ---
 
-    asio::awaitable<std::expected<std::shared_ptr<ClientStream>, error_code>> open_stream(RequestSpec spec) override {
+    asio::awaitable<std::expected<std::shared_ptr<ClientStream>, error_code>> open_stream(std::shared_ptr<Request> request) override {
         co_await hop();
-        co_return co_await open_exchange(std::move(spec), /*allow_upgrade=*/false, {});
+        co_return co_await open_exchange(std::move(request), /*allow_upgrade=*/false, {});
     }
 
     // Like open_stream(), but in h2c Upgrade mode the request doubles as the
@@ -140,9 +140,9 @@ class Http1ClientSession final : public ClientSession,
     // returned stream serves an ordinary HTTP/1.1 exchange (the peer ignored the
     // upgrade, which is the common case for a server that does not speak h2c).
     asio::awaitable<std::expected<std::shared_ptr<ClientStream>, error_code>>
-    open_stream_upgradeable(RequestSpec spec, std::string http2_settings_b64) {
+    open_stream_upgradeable(std::shared_ptr<Request> request, std::string http2_settings_b64) {
         co_await hop();
-        co_return co_await open_exchange(std::move(spec), /*allow_upgrade=*/true, std::move(http2_settings_b64));
+        co_return co_await open_exchange(std::move(request), /*allow_upgrade=*/true, std::move(http2_settings_b64));
     }
 
     // Whether the connection is worth an upgrade attempt: the facade installs a
@@ -255,9 +255,9 @@ class Http1ClientSession final : public ClientSession,
     // --- opening an exchange ---
 
     asio::awaitable<std::expected<std::shared_ptr<ClientStream>, error_code>>
-    open_exchange(RequestSpec spec, bool allow_upgrade, std::string settings_b64) {
+    open_exchange(std::shared_ptr<Request> request, bool allow_upgrade, std::string settings_b64) {
         if (auto successor = m_successor.lock()) {
-            co_return co_await successor->open_stream(std::move(spec));
+            co_return co_await successor->open_stream(std::move(request));
         }
         if (!m_alive)
             co_return std::unexpected{closed_error()};
@@ -267,16 +267,16 @@ class Http1ClientSession final : public ClientSession,
         // things; asking for both is a contradiction, and the engines resolved it
         // differently — HTTP/2 sent `body` as the first chunk, HTTP/1.1 dropped it
         // without a word. Refusing is the only answer that cannot lose data.
-        if (spec.stream_body && !spec.body.empty())
+        if (request->stream_body() && request->content_length() >= 0)
             co_return std::unexpected{make_error_code(client_errc::invalid_spec)};
 
         auto stream = std::make_shared<Http1ClientStream<Transport>>(this->shared_from_this());
         m_stream = stream;
         m_busy = true;
         m_reusable = false;
-        reset_exchange(std::move(spec));
+        reset_exchange(std::move(request));
 
-        const bool want_upgrade = allow_upgrade && upgrade_available(m_spec.stream_body);
+        const bool want_upgrade = allow_upgrade && upgrade_available(m_spec->stream_body());
         error_code ec;
         if (want_upgrade) {
             ec = co_await start_upgrade_exchange(std::move(settings_b64));
@@ -317,8 +317,8 @@ class Http1ClientSession final : public ClientSession,
     }
 
     // Resets the per-exchange state for a new request.
-    void reset_exchange(RequestSpec spec) {
-        m_spec = std::move(spec);
+    void reset_exchange(std::shared_ptr<Request> request) {
+        m_spec = std::move(request);
         m_parser = H1ResponseParser{};
         m_buf.clear();
         m_head_parsed = false;
@@ -328,12 +328,12 @@ class Http1ClientSession final : public ClientSession,
         m_body_remaining = 0;
         m_body_done = false;
         m_close_after = false;
-        m_req_streaming = m_spec.stream_body;
+        m_req_streaming = m_spec->stream_body();
         m_req_finished = false;
         m_resp_truncated = false;
         m_switched = false;
         m_cancelled = false;
-        m_keep_alive = !m_spec.close;
+        m_keep_alive = !m_spec->close();
     }
 
     // --- request side ---
@@ -345,10 +345,16 @@ class Http1ClientSession final : public ClientSession,
         if (auto ec = build_request_head(head); ec)
             co_return ec;
 
-        if (!m_req_streaming) {
-            if (!m_spec.body.empty())
-                head.append(m_spec.body);
+        if (!m_req_streaming && m_spec->content_length() >= 0) {
+            auto body = co_await m_spec->body().read_all();
+            if (!body)
+                co_return body.error();
+            if (!body->empty())
+                head.append(std::move(*body));
             m_req_finished = true;
+        }
+        if (!m_req_streaming && m_spec->content_length() < 0) {
+            m_req_finished = true; // no up-front body to send
         }
         auto ec = co_await write_raw(head);
         if (!ec)
@@ -365,8 +371,19 @@ class Http1ClientSession final : public ClientSession,
             m_upgrading = false;
             co_return ec;
         }
-        if (!m_spec.body.empty())
-            head.append(m_spec.body);
+        if (m_req_streaming) {
+            m_upgrading = false;
+            co_return make_error_code(client_errc::invalid_spec); // an upgrade cannot stream
+        }
+        if (m_spec->content_length() >= 0) {
+            auto body = co_await m_spec->body().read_all();
+            if (!body) {
+                m_upgrading = false;
+                co_return body.error();
+            }
+            if (!body->empty())
+                head.append(std::move(*body));
+        }
         m_req_finished = true;
         auto ec = co_await write_raw(head);
         if (ec) {
@@ -401,22 +418,23 @@ class Http1ClientSession final : public ClientSession,
         "connection: Upgrade, HTTP2-Settings\r\nupgrade: h2c\r\nhttp2-settings: ";
 
     error_code build_request_head(std::string &out) {
-        const std::string_view method = to_string(m_spec.method);
+        const std::string_view method = to_string(m_spec->method());
         if (method.empty())
             return make_error_code(client_errc::protocol_error);
-        if (contains_ctl(m_spec.target) || contains_ctl(method))
+        const std::string_view target = m_spec->target();
+        if (contains_ctl(target) || contains_ctl(method))
             return make_error_code(client_errc::protocol_error);
 
         out.append(method);
         out.push_back(' ');
-        out.append(m_spec.target.empty() ? "/" : m_spec.target);
+        out.append(target.empty() ? "/" : target);
         out.append(" HTTP/1.1\r\n");
         out.append("host: ");
         out.append(m_authority);
         out.append("\r\n");
 
         bool saw_agent = false;
-        for (const auto &[name, value] : m_spec.headers) {
+        for (const auto &[name, value] : m_spec->headers()) {
             if (name == "host" || name == "content-length" || name == "transfer-encoding" || name == "connection" ||
                 name == "upgrade" || name == "http2-settings" || name == "keep-alive") {
                 continue; // ours to set (and hop-by-hop fields are never forwarded
@@ -446,11 +464,11 @@ class Http1ClientSession final : public ClientSession,
         // and reads the body bytes as the start of the HTTP/2 connection.
         if (m_req_streaming) {
             out.append("transfer-encoding: chunked\r\n");
-        } else if (!m_spec.body.empty()) {
+        } else if (m_spec->content_length() >= 0) {
             out.append("content-length: ");
-            append_size(out, m_spec.body.size());
+            append_size(out, static_cast<std::size_t>(m_spec->content_length()));
             out.append("\r\n");
-        } else if (method_expects_body(m_spec.method)) {
+        } else if (method_expects_body(m_spec->method())) {
             out.append("content-length: 0\r\n");
         }
 
@@ -649,7 +667,7 @@ class Http1ClientSession final : public ClientSession,
 
         // A response to HEAD, or to any request whose response carries no body
         // by definition (RFC 9110 §6.4.1), ends at the head.
-        const bool method_head = m_spec.method == Method::Head;
+        const bool method_head = m_spec->method() == Method::Head;
         if (method_head || head.status == 204 || head.status == 304) {
             m_body_mode = BodyMode::None;
             m_body_done = true;
@@ -1010,7 +1028,7 @@ class Http1ClientSession final : public ClientSession,
     // Current exchange (HTTP/1.x serves one at a time). The stream handle is
     // weak: it owns this session, so a strong link here would be a cycle.
     std::weak_ptr<Http1ClientStream<Transport>> m_stream;
-    RequestSpec m_spec;
+    std::shared_ptr<Request> m_spec;
     H1ResponseParser m_parser;
     std::string m_buf; // bytes read from the transport, not yet consumed
     ResponseHead m_head;

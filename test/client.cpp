@@ -415,11 +415,7 @@ asio::awaitable<void> suite_framing(std::uint16_t plain, asio::io_context &ctx) 
     auto empty = co_await fetch(http, http.get(url(plain, "/empty")));
     check(empty && empty->status == 204 && empty->body.empty() && empty->bodyless, "204 is bodyless");
 
-    sh::detail::RequestSpec head;
-    head.method = sh::Method::Head;
-    head.target = "/big?n=1000";
-    auto head_res = co_await fetch(
-        http, http.request(head.method, url(plain, "/big?n=1000")).headers(head.headers).body(head.body));
+    const auto head_res = co_await fetch(http, http.head(url(plain, "/big?n=1000")));
     check(head_res && head_res->status == 200 && head_res->body.empty() && head_res->bodyless,
           "HEAD returns the head and no body");
     {
@@ -430,8 +426,7 @@ asio::awaitable<void> suite_framing(std::uint16_t plain, asio::io_context &ctx) 
         cfg.default_version = sh::HttpVersionPolicy::Http11;
         cfg.default_h2c = sh::H2cMode::Off;
         h::Client h1_http{cfg};
-        auto r = co_await fetch(
-            h1_http, h1_http.request(head.method, url(plain, "/big?n=1000")).headers(head.headers).body(head.body));
+        auto r = co_await fetch(h1_http, h1_http.head(url(plain, "/big?n=1000")));
         check(r && r->body.empty() && r->header("content-length").value_or("") == "1000",
               "HEAD over HTTP/1.1 keeps the Content-Length a GET would have "
               "produced");
@@ -475,11 +470,7 @@ asio::awaitable<void> suite_framing(std::uint16_t plain, asio::io_context &ctx) 
         cfg.default_version = sh::HttpVersionPolicy::Http2;
         cfg.default_h2c = sh::H2cMode::PriorKnowledge;
         h::Client h2_http{cfg};
-        sh::detail::RequestSpec head;
-        head.method = sh::Method::Head;
-        head.target = "/big?n=2048";
-        auto head_res = co_await fetch(
-            h2_http, h2_http.request(head.method, url(plain, "/big?n=2048")).headers(head.headers).body(head.body));
+        auto head_res = co_await fetch(h2_http, h2_http.head(url(plain, "/big?n=2048")));
         check(head_res && head_res->status == 200 && head_res->body.empty() && head_res->bodyless,
               "HEAD over HTTP/2 ends at the headers");
         auto empty = co_await fetch(h2_http, h2_http.get(url(plain, "/empty")));
@@ -960,10 +951,8 @@ asio::awaitable<void> suite_compression(std::uint16_t comp_port, std::uint16_t p
 
         // Both accepted: brotli is preferred.
         {
-            sh::detail::RequestSpec spec;
-            spec.headers.add("accept-encoding", "br, gzip");
             auto r = co_await fetch(
-                http, http.request(spec.method, url(comp_port, "/big?n=8192")).headers(spec.headers).body(spec.body));
+                http, http.get(url(comp_port, "/big?n=8192")).header("accept-encoding", "br, gzip"));
             const std::string enc = r ? std::string{r->header("content-encoding").value_or("")} : std::string{};
             check(r && r->status == 200 && enc == "br" && r->body.size() < want.size() &&
                       sh::decompress_all(enc, r->body) == want,
@@ -974,10 +963,8 @@ asio::awaitable<void> suite_compression(std::uint16_t comp_port, std::uint16_t p
 
         // Only gzip accepted.
         {
-            sh::detail::RequestSpec spec;
-            spec.headers.add("accept-encoding", "gzip");
             auto r = co_await fetch(
-                http, http.request(spec.method, url(comp_port, "/big?n=8192")).headers(spec.headers).body(spec.body));
+                http, http.get(url(comp_port, "/big?n=8192")).header("accept-encoding", "gzip"));
             const std::string enc = r ? std::string{r->header("content-encoding").value_or("")} : std::string{};
             check(r && enc == "gzip" && sh::decompress_all(enc, r->body) == want,
                   tag + ": /big with 'gzip' -> " + (r ? enc : describe(r.error())));
@@ -992,20 +979,16 @@ asio::awaitable<void> suite_compression(std::uint16_t comp_port, std::uint16_t p
 
         // identity explicitly requested.
         {
-            sh::detail::RequestSpec spec;
-            spec.headers.add("accept-encoding", "identity");
             auto r = co_await fetch(
-                http, http.request(spec.method, url(comp_port, "/big?n=8192")).headers(spec.headers).body(spec.body));
+                http, http.get(url(comp_port, "/big?n=8192")).header("accept-encoding", "identity"));
             check(r && !r->header("content-encoding").has_value() && r->body == want,
                   tag + ": /big with 'identity' is untouched");
         }
 
         // Under min_bytes.
         {
-            sh::detail::RequestSpec spec;
-            spec.headers.add("accept-encoding", "br, gzip");
             auto r = co_await fetch(
-                http, http.request(spec.method, url(comp_port, "/world")).headers(spec.headers).body(spec.body));
+                http, http.get(url(comp_port, "/world")).header("accept-encoding", "br, gzip"));
             check(r && r->status == 200 && !r->header("content-encoding").has_value(),
                   tag + ": a short response stays uncompressed");
         }
@@ -1021,10 +1004,8 @@ asio::awaitable<void> suite_compression(std::uint16_t comp_port, std::uint16_t p
         // it is compressed anyway (compress_streamed defaults on). It must decode
         // back exactly, and must not claim a length.
         {
-            sh::detail::RequestSpec spec;
-            spec.headers.add("accept-encoding", "gzip");
             auto r = co_await fetch(
-                http, http.request(spec.method, url(comp_port, "/stream")).headers(spec.headers).body(spec.body));
+                http, http.get(url(comp_port, "/stream")).header("accept-encoding", "gzip"));
             const std::string enc = r ? std::string{r->header("content-encoding").value_or("")} : std::string{};
             check(r && enc == "gzip" && sh::decompress_all(enc, r->body) == "alpha-beta-gamma",
                   tag + ": a streamed response round-trips -> " + (r ? enc : describe(r.error())));
@@ -1034,11 +1015,8 @@ asio::awaitable<void> suite_compression(std::uint16_t comp_port, std::uint16_t p
 
         // HEAD carries no body, so nothing is encoded.
         {
-            sh::detail::RequestSpec spec;
-            spec.method = sh::Method::Head;
-            spec.headers.add("accept-encoding", "br, gzip");
-            auto r = co_await fetch(
-                http, http.request(spec.method, url(comp_port, "/big?n=8192")).headers(spec.headers).body(spec.body));
+            auto r = co_await fetch(http, http.head(url(comp_port, "/big?n=8192"))
+                                          .header("accept-encoding", "br, gzip"));
             check(r && r->status == 200 && r->bodyless && !r->header("content-encoding").has_value(),
                   tag + ": HEAD is not compressed");
         }
@@ -1047,11 +1025,9 @@ asio::awaitable<void> suite_compression(std::uint16_t comp_port, std::uint16_t p
     // A shared cache has to key on Accept-Encoding, or it can hand a gzipped
     // body to a client that only understands identity.
     {
-        sh::detail::RequestSpec spec;
-        spec.headers.add("accept-encoding", "gzip");
         h::Client http{base_config()};
         auto r = co_await fetch(
-            http, http.request(spec.method, url(comp_port, "/big?n=8192")).headers(spec.headers).body(spec.body));
+            http, http.get(url(comp_port, "/big?n=8192")).header("accept-encoding", "gzip"));
         const std::string vary = r ? std::string{r->header("vary").value_or("")} : std::string{};
         check(r && vary.find("Accept-Encoding") != std::string::npos,
               "a compressed response carries Vary: Accept-Encoding");
@@ -1059,11 +1035,9 @@ asio::awaitable<void> suite_compression(std::uint16_t comp_port, std::uint16_t p
 
     // The uncompressed listener must be unaffected: same request, no encoding.
     {
-        sh::detail::RequestSpec spec;
-        spec.headers.add("accept-encoding", "br, gzip");
         h::Client http{base_config()};
         auto r = co_await fetch(
-            http, http.request(spec.method, url(plain_port, "/big?n=8192")).headers(spec.headers).body(spec.body));
+            http, http.get(url(plain_port, "/big?n=8192")).header("accept-encoding", "br, gzip"));
         check(r && !r->header("content-encoding").has_value() && r->body == want,
               "a listener with compression off ignores accept-encoding");
     }
@@ -1111,10 +1085,8 @@ asio::awaitable<void> suite_compression(std::uint16_t comp_port, std::uint16_t p
         // A caller that sets the header keeps control of the negotiation, and
         // the result is still decoded.
         {
-            sh::detail::RequestSpec spec;
-            spec.headers.add("accept-encoding", "gzip");
             auto r = co_await fetch(
-                http, http.request(spec.method, url(comp_port, "/big?n=8192")).headers(spec.headers).body(spec.body));
+                http, http.get(url(comp_port, "/big?n=8192")).header("accept-encoding", "gzip"));
             check(r && r->body == want, tag + ": an explicit Accept-Encoding is respected");
         }
     }
@@ -1126,7 +1098,7 @@ asio::awaitable<void> suite_compression(std::uint16_t comp_port, std::uint16_t p
 // coroutine whose handle escapes (here, into co_spawn) trips a GCC
 // coroutine-frame lifetime problem in this toolchain, and the suites would then
 // run against a frame that has already been reused.
-// A RequestSpec asking for both an up-front body and a streamed one is a
+// A Request asking for both an up-front body and a streamed one is a
 // contradiction. The engines used to resolve it differently and silently —
 // HTTP/2 sent `body` as the first chunk, HTTP/1.1 dropped it entirely — so the
 // answer is now one refusal in both places.
@@ -1155,7 +1127,7 @@ asio::awaitable<void> suite_spec_validation(std::uint16_t plain_port) {
     }
 
     // StreamSpec::close keeps the connection out of the pool — the old
-    // RequestSpec::close semantics, now observable through the connection
+    // Request::close semantics, now observable through the connection
     // counters: a follow-up request must dial a fresh connection.
     {
         auto cfg1 = base_config();
@@ -1359,10 +1331,8 @@ asio::awaitable<void> suite_redirect(std::uint16_t port) {
             co_return std::pair{sh::error_code{}, std::move(endpoints)};
         };
         h::Client client{cfg};
-        sh::detail::RequestSpec spec;
-        spec.headers.add("authorization", "Bearer secret");
         auto r = co_await fetch(
-            client, client.request(spec.method, base + "/redir-host").headers(spec.headers).body(spec.body));
+            client, client.get(base + "/redir-host").header("authorization", "Bearer secret"));
         check(r && r->body == "no-auth", "a cross-origin redirect drops the Authorization header");
     }
     // A redirect loop is stopped at max_redirects with an error (Go returns the

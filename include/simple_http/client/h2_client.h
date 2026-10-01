@@ -264,7 +264,7 @@ class Http2ClientSession final : public ClientSession,
     // connection preface and SETTINGS, typically, or even the response itself.
     // Dropping those bytes costs a round trip at best and hangs at worst.
     asio::awaitable<std::expected<std::shared_ptr<ClientStream>, error_code>>
-    start_with_stream(RequestSpec seed, std::string initial = {}) {
+    start_with_stream(std::shared_ptr<Request> seed, std::string initial = {}) {
         auto result = co_await start_impl(std::move(seed), std::move(initial));
         if (!result)
             co_return std::unexpected{result.error()};
@@ -275,7 +275,7 @@ class Http2ClientSession final : public ClientSession,
 
     // --- ClientSession ---
 
-    asio::awaitable<std::expected<std::shared_ptr<ClientStream>, error_code>> open_stream(RequestSpec spec) override {
+    asio::awaitable<std::expected<std::shared_ptr<ClientStream>, error_code>> open_stream(std::shared_ptr<Request> request) override {
         co_await hop();
         if (m_goaway_received)
             co_return std::unexpected{make_error_code(client_errc::goaway)};
@@ -284,13 +284,13 @@ class Http2ClientSession final : public ClientSession,
         // See h1_client's open_exchange: a spec asking for both an up-front body
         // and a streamed one is a contradiction, and the two engines used to
         // resolve it differently. One answer, in both places.
-        if (spec.stream_body && !spec.body.empty())
+        if (request->stream_body() && request->content_length() >= 0)
             co_return std::unexpected{make_error_code(client_errc::invalid_spec)};
-        // RequestSpec::close is documented as keeping the connection out of the
-        // pool. HTTP/1.1 sends `Connection: close` for it; HTTP/2 has no such
-        // header, so the intent has to be remembered here — this engine used not
-        // to read the field at all, and pooled the session anyway.
-        if (spec.close)
+        // The request's `close` keeps the connection out of the pool. HTTP/1.1
+        // sends `Connection: close` for it; HTTP/2 has no such header, so the
+        // intent has to be remembered here — this engine used not to read the
+        // field at all, and pooled the session anyway.
+        if (request->close())
             m_close_requested = true;
         if (m_peer_max_concurrent_streams != 0 && m_streams.size() >= m_peer_max_concurrent_streams) {
             co_return std::unexpected{make_error_code(client_errc::too_many_streams)};
@@ -309,23 +309,35 @@ class Http2ClientSession final : public ClientSession,
         init_stream(st, id);
 
         std::string block;
-        if (auto ec = encode_request_head(spec, block); ec) {
+        if (auto ec = encode_request_head(*request, block); ec) {
             erase_stream(it);
             co_return std::unexpected{ec};
         }
 
-        const bool body_expected = spec.stream_body || !spec.body.empty();
-        if (!spec.body.empty()) {
-            st.out_queued = spec.body.size();
-            st.out_queue.push_back(spec.body);
+        // The up-front body, if there is one: read it whole, queue it as one
+        // DATA payload (the write path slices it to the frame size), and mark
+        // the stream's outbound done unless the caller will stream the rest.
+        std::string up_front;
+        if (!request->stream_body() && request->content_length() > 0) {
+            auto body = co_await request->body().read_all();
+            if (!body) {
+                erase_stream(it);
+                co_return std::unexpected{body.error()};
+            }
+            up_front = std::move(*body);
         }
-        if (!body_expected || !spec.stream_body)
+        const bool have_body = !up_front.empty() || request->stream_body();
+        if (!up_front.empty()) {
+            st.out_queued = up_front.size();
+            st.out_queue.push_back(std::move(up_front));
+        }
+        if (!have_body || !request->stream_body())
             st.out_finished = true; // whole body already queued
-        if (!body_expected)
+        if (!have_body)
             st.local_end = true;
         auto handle = std::make_shared<Http2ClientStream<Transport>>(this->shared_from_this(), id, st.outcome);
         st.handle = handle;
-        submit_headers(id, block, /*end_stream=*/!body_expected);
+        submit_headers(id, block, /*end_stream=*/!have_body);
         flush();
 
         SIMPLE_HTTP_ERROR_LOG("h2 client: stream {} opened on {}", id, m_authority);
@@ -335,7 +347,7 @@ class Http2ClientSession final : public ClientSession,
     bool alive() const override { return m_alive; }
 
     bool reusable() const override {
-        // A request that asked to close (`RequestSpec::close`) keeps the session
+        // A request that asked to close (`Request::close`) keeps the session
         // out of the pool even when the peer raised no objection: HTTP/2 has no
         // `Connection: close` to send, so this flag is the whole of the mechanism.
         return m_alive && !m_goaway_received && m_streams.empty() && !m_close_requested;
@@ -601,7 +613,7 @@ class Http2ClientSession final : public ClientSession,
     // Returns the seeded stream's handle (or null when there is no seed), so the
     // caller — not a weak reference — keeps it alive.
     asio::awaitable<std::expected<std::shared_ptr<ClientStream>, error_code>>
-    start_impl(std::optional<RequestSpec> seed, std::string carried_over) {
+    start_impl(std::optional<std::shared_ptr<Request>> seed, std::string carried_over) {
         m_authority = m_target.authority();
         m_recv_buf = std::move(carried_over);
         // The prefacing bytes go out as one write: the 24-octet client preface
@@ -665,20 +677,21 @@ class Http2ClientSession final : public ClientSession,
 
     // Encodes a request head as HPACK, with the static table carrying what it can
     // (the pseudo-headers of a plain GET cost one byte each).
-    error_code encode_request_head(const RequestSpec &spec, std::string &block) {
-        const std::string_view method = to_string(spec.method);
+    error_code encode_request_head(const Request &request, std::string &block) {
+        const std::string_view method = to_string(request.method());
         if (method.empty())
             return make_error_code(client_errc::protocol_error);
-        const std::string_view target = spec.target.empty() ? std::string_view{"/"} : std::string_view{spec.target};
+        const std::string_view target = request.target().empty() ? std::string_view{"/"}
+                                                                 : std::string_view{request.target()};
         if (target.front() != '/' || contains_ctl(target)) {
             return make_error_code(client_errc::protocol_error); // :path must be origin-form
         }
 
         // RFC 7541 Appendix A: 2 = :method GET, 3 = :method POST, 4 = :path /,
         // 6 = :scheme http, 7 = :scheme https.
-        if (spec.method == Method::Get) {
+        if (request.method() == Method::Get) {
             codec::hpack_append_indexed(block, 2);
-        } else if (spec.method == Method::Post) {
+        } else if (request.method() == Method::Post) {
             codec::hpack_append_indexed(block, 3);
         } else {
             codec::hpack_append_literal(block, ":method", method);
@@ -692,7 +705,7 @@ class Http2ClientSession final : public ClientSession,
         }
 
         bool saw_agent = false;
-        for (const auto &[name, value] : spec.headers) {
+        for (const auto &[name, value] : request.headers()) {
             if (name.empty() || name.front() == ':' || is_connection_specific(name))
                 continue;
             if (contains_ctl(name) || contains_ctl(value)) {
@@ -706,9 +719,10 @@ class Http2ClientSession final : public ClientSession,
         }
         if (!saw_agent)
             codec::hpack_append_literal(block, "user-agent", client_version);
-        if (!spec.body.empty() && !spec.stream_body) {
+        if (!request.stream_body() && request.content_length() >= 0) {
             // A known length: harmless on h2, and some origins want it.
-            codec::hpack_append_literal(block, "content-length", std::to_string(spec.body.size()));
+            codec::hpack_append_literal(block, "content-length",
+                                        std::to_string(request.content_length()));
         }
         return error_code{};
     }
@@ -1550,7 +1564,7 @@ class Http2ClientSession final : public ClientSession,
     std::uint32_t m_peer_max_concurrent_streams{0}; // 0 = no limit announced yet
 
     bool m_alive{false};
-    // Set by a stream whose RequestSpec::close asked for the connection to end
+    // Set by a stream whose Request::close asked for the connection to end
     // after that exchange; keeps the session out of the pool (see reusable()).
     bool m_close_requested{false};
     bool m_goaway_sent{false};

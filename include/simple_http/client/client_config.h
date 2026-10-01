@@ -251,7 +251,7 @@ enum class client_errc : int {
     goaway,                 // the peer is draining the connection (GOAWAY)
     connect_timeout,
     request_timeout,
-    invalid_spec,          // the caller's RequestSpec contradicts itself (body +
+    invalid_spec,          // the caller's Request contradicts itself (body +
                            // stream_body)
     redirect_to_insecure,  // a redirect would downgrade https -> http
     too_many_redirects,    // the redirect chain exceeded ClientConfig::max_redirects

@@ -1,10 +1,12 @@
 #pragma once
 
-// Request: the read-only view of an incoming HTTP request handed to a handler.
+// Request: the HTTP request message, shared by both sides of the wire.
 //
-// It is protocol-agnostic: an engine populates the request line and headers,
-// and feeds the body into the owned Body stream. Handlers read the body with
-// `co_await req.body().read()`.
+// Server-side: an engine populates the request line and headers, feeds the body
+// into the owned Body stream, and the handler reads it back with
+// `co_await req.body().read()`. Client-side: the caller sets method/target/
+// headers/body (or streams the body via body().feed()), and the engine reads it
+// to send. Go's http.Request is the same single type for both roles; so is this.
 
 #include <any>
 #include <boost/asio.hpp>
@@ -15,6 +17,7 @@
 #include <utility>
 #include <vector>
 
+#include "../core/base64.h" // basic_auth
 #include "../core/http_field.h"
 #include "../core/http_method.h"
 #include "../core/types.h"
@@ -28,12 +31,68 @@ namespace asio = boost::asio;
 
 class Request {
   public:
+    // Movable but not copyable: the owned Body stream cannot be duplicated, and
+    // once owned by a Request the body has already begun flowing. The path/query
+    // views are rebound to the moved-to target.
+    Request(Request &&other) noexcept
+        : m_version(other.m_version), m_peer(std::move(other.m_peer)), m_body(std::move(other.m_body)),
+          m_method(other.m_method), m_method_token(std::move(other.m_method_token)),
+          m_target(std::move(other.m_target)), m_headers(std::move(other.m_headers)),
+          m_params(std::move(other.m_params)), m_query_params(std::move(other.m_query_params)),
+          m_close(other.m_close), m_stream_body(other.m_stream_body), m_content_length(other.m_content_length),
+          m_body_source(std::move(other.m_body_source)) {
+        rebind_views();
+    }
+    Request &operator=(Request &&other) noexcept {
+        if (this == &other)
+            return *this;
+        m_version = other.m_version;
+        m_peer = std::move(other.m_peer);
+        m_body = std::move(other.m_body);
+        m_method = other.m_method;
+        m_method_token = std::move(other.m_method_token);
+        m_target = std::move(other.m_target);
+        m_headers = std::move(other.m_headers);
+        m_params = std::move(other.m_params);
+        m_query_params = std::move(other.m_query_params);
+        m_close = other.m_close;
+        m_stream_body = other.m_stream_body;
+        m_content_length = other.m_content_length;
+        m_body_source = std::move(other.m_body_source);
+        rebind_views();
+        return *this;
+    }
+    Request(const Request &) = delete;
+    Request &operator=(const Request &) = delete;
+
+  private:
+    void rebind_views() {
+        auto pos = m_target.find('?');
+        if (pos != std::string::npos) {
+            m_path = std::string_view{m_target}.substr(0, pos);
+            m_query = std::string_view{m_target}.substr(pos + 1);
+        } else {
+            m_path = m_target;
+            m_query = {};
+        }
+    }
+
+  public:
+    // Server-side construction: the engine fills the request as it parses it,
+    // and the handler reads it back. `peer` is the connection's remote address
+    // (the source of `X-Forwarded-For` and friend).
     template <typename Executor>
     Request(Version version, const Executor &exec, asio::ip::tcp::endpoint peer)
         : m_version(version), m_peer(std::move(peer)), m_body(std::make_unique<Body>(exec)) {}
 
-    Request(const Request &) = delete;
-    Request &operator=(const Request &) = delete;
+    // Client-side construction: the caller builds a request to send and the
+    // engine reads it back. No peer exists yet; one is only meaningful on the
+    // receiving side. The body starts empty — feed it and finish() it before
+    // handing the request to the client, or set stream_body(true) to write it
+    // as the exchange goes (Go's http.Request.Body with Close semantics).
+    template <typename Executor>
+    explicit Request(Version version, const Executor &exec)
+        : m_version(version), m_body(std::make_unique<Body>(exec)) {}
 
     // --- request line / metadata ---
     Method method() const { return m_method; }
@@ -89,6 +148,65 @@ class Request {
     Body &body() { return *m_body; }
     const Body &body() const { return *m_body; }
 
+    // Convenience for the client side: sets the whole body up front, as one
+    // chunk, and signals the end. Equivalent to feeding the body directly.
+    // Records the length so the engine can frame it with Content-Length. The
+    // source string is kept so a pooled-connection replay can rebuild the
+    // request (Go's http.Request.GetBody): the Body stream cannot be re-read
+    // once consumed, but a *fresh* request fed from the same source can.
+    void set_body(std::string data) {
+        m_body_source = std::move(data);
+        m_content_length = static_cast<std::int64_t>(m_body_source.size());
+        (void)m_body->feed(m_body_source);
+        m_body->finish();
+    }
+
+    // A fresh shared request carrying the same method/target/headers and a re-fed
+    // body. `exec` drives the new body's channel. Used by the client when a
+    // pooled connection turned out stale before the request was written, or
+    // when the h2c-upgrade handshake consumes the request: the body is rebuilt
+    // from the saved source, so the copy sends the same bytes.
+    template <typename Executor> std::shared_ptr<Request> clone_for_replay(const Executor &exec) const {
+        auto copy = std::make_shared<Request>(Version::Http11, exec);
+        copy->set_method(m_method);
+        copy->set_target(m_target);
+        copy->mutable_headers() = m_headers;
+        copy->m_close = m_close;
+        copy->m_stream_body = m_stream_body;
+        if (!m_body_source.empty()) {
+            copy->set_body(m_body_source);
+        }
+        return copy;
+    }
+
+    // HTTP Basic (RFC 7617): sets `Authorization: Basic base64(user:pass)` —
+    // the client-side counterpart of middleware::basic_auth. Returns *this for
+    // chaining: req.basic_auth("svc", "s3cret").set_target("/x").
+    Request &basic_auth(std::string username, std::string password) {
+        mutable_headers().add(std::string{field::authorization},
+                              "Basic " + base64_encode(username + ":" + password));
+        return *this;
+    }
+
+    // --- client-side transmission knobs (Go's http.Request.Close / Body) ---
+    // Ask the peer to close after this exchange (HTTP/1.1 `Connection: close`;
+    // on HTTP/2 the connection is simply not pooled). Server-side requests never
+    // set these; they describe what the *client* wants the wire to do.
+    void set_close(bool close) { m_close = close; }
+    bool close() const { return m_close; }
+    // The body is written as the exchange goes (HTTP/1.1 chunked, HTTP/2 DATA),
+    // rather than supplied up front. Set it and drive `body().feed()` from the
+    // caller — the engine reads what you feed as it sends.
+    void set_stream_body(bool stream) { m_stream_body = stream; }
+    bool stream_body() const { return m_stream_body; }
+
+    // The request body's length: set when the body is known up front
+    // (set_body), -1 when it is streamed and its length is unknown (Go's
+    // http.Request.ContentLength). A known length lets HTTP/1.1 frame with
+    // Content-Length; unknown uses chunked.
+    std::int64_t content_length() const { return m_content_length; }
+    void set_content_length(std::int64_t n) { m_content_length = n; }
+
     // A path parameter captured by the router from a template route
     // (`/users/{id}`) — nullopt when the route was not a template or the name
     // was not in it. The value is a view into the request path.
@@ -141,27 +259,22 @@ class Request {
 
     void set_target(std::string target) {
         m_target = std::move(target);
-        split_path_and_query();
+        rebind_views();
         m_query_params = QueryParams::parse(m_query);
     }
 
     Headers &mutable_headers() { return m_headers; }
 
   private:
-    void split_path_and_query() {
-        auto pos = m_target.find('?');
-        if (pos != std::string::npos) {
-            m_path = std::string_view{m_target}.substr(0, pos);
-            m_query = std::string_view{m_target}.substr(pos + 1);
-        } else {
-            m_path = m_target;
-            m_query = {};
-        }
-    }
 
     Version m_version;
     asio::ip::tcp::endpoint m_peer;
     std::unique_ptr<Body> m_body;
+
+    bool m_close{false};
+    bool m_stream_body{false};
+    std::int64_t m_content_length{-1};
+    std::string m_body_source; // for clone_for_replay (empty = no up-front body)
 
     Method m_method{Method::Get};
     std::string m_method_token{"GET"};
