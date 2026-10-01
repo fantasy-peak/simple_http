@@ -38,7 +38,9 @@
 #include "simple_http/proto/compressing_writer.h" // opt-in via CompressionConfig::enabled
 #include "simple_http/proto/form.h"               // read_urlencoded_body / read_multipart_body
 #include "simple_http/proto/headers.h"
+#include "simple_http/proto/json.h"      // read_json_body / write_json (glaze, unconditional)
 #include "simple_http/proto/multipart.h" // multipart/form-data parsing
+#include "simple_http/proto/params.h"    // path_params<T> / query_params<T> (axum Path/Query)
 #include "simple_http/proto/query.h"     // QueryParams: query-string & urlencoded parsing
 #include "simple_http/proto/request.h"
 #include "simple_http/proto/response.h"
@@ -62,6 +64,7 @@
 #include "simple_http/handler/builtin_middleware.h" // request_id / access_log / recovery / basic_auth
 #include "simple_http/handler/cors.h"               // CorsConfig (public: exported for server.cors)
 #include "simple_http/handler/handler.h"
+#include "simple_http/handler/rate_limit.h" // rate limiting (token bucket / per-key)
 #include "simple_http/handler/router.h"
 #include "simple_http/handler/static_files.h"
 

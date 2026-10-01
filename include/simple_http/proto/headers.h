@@ -46,6 +46,20 @@ class Headers {
 
     bool contains(std::string_view name) const { return get(name).has_value(); }
 
+    // Every value for `name`, in order of appearance — Go's r.Header.Values
+    // (multiple X-Forwarded-For hops, repeated Set-Cookie, duplicate Host in a
+    // smuggling test). The views point into this Headers' own storage and stay
+    // valid while it does.
+    std::vector<std::string_view> get_all(std::string_view name) const {
+        std::vector<std::string_view> out;
+        for (const auto &f : m_fields) {
+            if (iequals_ascii(f.first, name)) {
+                out.emplace_back(f.second);
+            }
+        }
+        return out;
+    }
+
     // How many fields carry `name` (case-insensitively). The request side needs
     // this for Host, where the rule is "exactly one" (RFC 9112 §3.2) and not "at
     // least one" — a second copy is a smuggling vector, not a repeatable field.

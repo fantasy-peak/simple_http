@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include "../core/http_field.h"
 #include "../core/http_method.h"
 #include "../core/types.h"
 #include "body.h"
@@ -51,6 +52,39 @@ class Request {
 
     const Headers &headers() const { return m_headers; }
     std::optional<std::string_view> header(std::string_view name) const { return m_headers.get(name); }
+
+    // The value of a cookie in the Cookie request header (first match), or
+    // nullopt. Values are returned as sent — no percent-decoding — like Go's
+    // r.Cookie. The header is "name=value; name2=value2"; a quoted value is
+    // returned without its quotes.
+    std::optional<std::string_view> cookie(std::string_view name) const {
+        const auto cookie_header = header(field::cookie);
+        if (!cookie_header) {
+            return std::nullopt;
+        }
+        std::size_t pos = 0;
+        for (;;) {
+            const std::size_t semi = cookie_header->find(';', pos);
+            std::string_view pair =
+                cookie_header->substr(pos, semi == std::string_view::npos ? std::string_view::npos : semi - pos);
+            while (!pair.empty() && pair.front() == ' ') {
+                pair.remove_prefix(1);
+            }
+            const std::size_t eq = pair.find('=');
+            if (eq != std::string_view::npos && pair.substr(0, eq) == name) {
+                std::string_view value = pair.substr(eq + 1);
+                if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
+                    value.remove_prefix(1);
+                    value.remove_suffix(1);
+                }
+                return value;
+            }
+            if (semi == std::string_view::npos) {
+                return std::nullopt;
+            }
+            pos = semi + 1;
+        }
+    }
 
     Body &body() { return *m_body; }
     const Body &body() const { return *m_body; }

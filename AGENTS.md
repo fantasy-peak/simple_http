@@ -53,6 +53,9 @@ include/
       query.h              QueryParams：query-string/urlencoded 解析（Go r.URL.Query / axum Query<T>）
       multipart.h          multipart/form-data 解析（boundary/part/name/filename）
       form.h               read_urlencoded_body / read_multipart_body 高层读取
+      params.h             path_params<T> / query_params<T> / parse_params<T>（axum Path/Query 提取器，
+                           glaze 反射按字段名取值+类型解析，默认可用；openapi::path_params 转发到此）
+      json.h               read_json_body<T> / write_json(res, T, status)（glaze 反射，默认可用）
       request.h            Request
       response.h           Response（fluent，面向用户；redirect / SSE 封装）
       response_writer.h    ResponseWriter（版本收敛的纯虚接口）
@@ -79,7 +82,9 @@ include/
       handler.h            Handler/Next/Middleware 类型别名、make_handler/invoke_handler/compose_middleware
       builtin_middleware.h 内置中间件：request_id / access_log / recovery / basic_auth /
                            real_ip（XFF/X-Real-IP → ClientIp state）/ clean_path（规范化+拒绝 ".."）/
-                           strip_prefix（子应用挂载）
+                           strip_prefix（子应用挂载）/ redirect_slashes（尾斜杠 301 归一）
+      rate_limit.h         限流：TokenBucket（线程安全令牌桶）/ RateLimiter（按 key 分桶，容量上限）
+                           + rate_limit(middleware)（429 + Retry-After，tower-http RateLimitLayer 形态）
       cors.h               内建 CORS：CorsConfig 编译成 Middleware（预检在中间件内应答 204，不进路由）
       router.h             Router（含反代用的 HttpClient、反代匹配、静态阶段）；use/group 与
                            per-route 中间件注册；组前缀作用域 {@name RegistrationScope}
@@ -126,6 +131,8 @@ include/
   是服务端对抗性回归；`unit/` 是 Catch2 单元测试；`conformance/` 与 `stress/` 是两套**外部**
   驱动脚本（见下两节）；`python/` 是第三方客户端套件；`manual_http1_keepalive.py` 是可选的
   **手工**交叉验证；`tls_certificates/` 是测试证书（`server.cpp.test` 是未参与构建的旧快照）。
+- `ROADMAP.md`：对照开源框架的 backlog ——「框架核心（建议做）/ 协议扩展 / 生态库边界 /
+  体验运维」四档。**没做但计划做的都在那里**，新增差异项先记到它下面再动工。
 - 没有 `docs/` 目录：架构说明就在本文件与各头文件顶部注释里。
 
 ## 架构要点（来自代码与设计）
@@ -254,15 +261,28 @@ co_await res->finish(last);
 
 `Request` 常用：`req->method()`（返回 `Method`）、`req->path()`、`req->query()`
 （原始串）、`req->query_params()`（解析后的键值，Go `r.URL.Query`）、
+`req->cookie(name)`（Cookie 头取值，Go `r.Cookie`）、
 `req->version()`、`req->header(name)`、`req->body().read()` / `read_all()`。
 
 `Response` 常用（fluent）：`status()/header()/content_type()`、`send(body)` 一次性、
-`begin()/write()/finish()` 流式、`redirect(location, code=302)`、SSE 三件套
-`sse_begin()/sse_event()/sse_comment()`。
+`begin()/write()/finish()` 流式、`redirect(location, code=302)`、`set_cookie(...)`
+（Go `http.SetCookie`：命名参数拼 Set-Cookie，含 Path/Max-Age/Secure/HttpOnly/SameSite）、
+SSE 三件套 `sse_begin()/sse_event()/sse_comment()`。
 
 表单与查询：`read_urlencoded_body(req)` → `expected<QueryParams, error_code>`；
 `read_multipart_body(req)` → `expected<vector<MultipartPart>, error_code>`（字段/文件名/类型/内容，
-boundary 取自 Content-Type）。
+boundary 取自 Content-Type）；`read_json_body<T>(req)` / `write_json(res, value, status)`（glaze
+反射，默认可用——对齐 axum `Json<T>` / Go `json.Marshal`）。
+类型化参数提取（`proto/params.h`，axum `Path<T>`/`Query<T>`，默认可用）：
+`path_params<T>(req)`（模板捕获→结构体，字段名==`{name}`，类型解析；缺/坏→nullopt，
+handler 定 404）、`query_params<T>(req)`（`?k=v` 按字段名→结构体）；
+`read_urlencoded_body` 的结果可 `parse_params<T>(form)` 复用。同名头多值：
+`headers().get_all(name)`（Go `r.Header.Values`，XFF 跳链/重复 Set-Cookie）。
+
+限流（`handler/rate_limit.h`）：全局令牌桶 `middleware::make_token_bucket(rate, burst)`
++ `server.use(middleware::rate_limit(bucket))`；按 key 分桶 `std::make_shared<middleware::RateLimiter>(rate,
+burst, max_keys)` + `rate_limit(limiter, key_fn)`（可配 `real_ip()` 的 ClientIp）。超限 429 +
+`Retry-After`，普通 keep-alive 响应。
 
 `WebSocket`（`proto/websocket.h`，handler 收到 `shared_ptr<WebSocket>`）：
 
@@ -303,7 +323,7 @@ WebSocket 实现要点（`ws_frame.h` + `websocket.h`）：
 
 ### OpenAPI（`openapi/` 层，`SIMPLE_HTTP_ENABLE_OPENAPI`）
 
-宏门控 + **glaze**（下游自备，header-only；`glaze_json_schema` 注解提供字段级
+宏门控 + **glaze**（已是主库默认依赖，`glaze_json_schema` 注解提供字段级
 description/enum）。typed 路由在注册时把 `(方法, path)`、body schema、参数、安全、
 错误响应收进一份 OAS 3.1 文档，serve 出去给 CDN 版 swagger-ui 浏览：
 
@@ -435,12 +455,13 @@ INTERFACE 目标安装，供下游 `find_package`）。日常开发用 xmake。
   OpenSSL 3.5.5 编的，本仓库用 openssl3 3.6.3，混链是 ABI 风险。
 - `SIMPLE_HTTP_ENABLE_OPENAPI`（默认未定义）：编入 OpenAPI 3.1 文档生成 + Swagger UI
   服务（`openapi/` 层与 `Router::route<Params, Second, Res>` / `serve_openapi` 等 API）。
-  需要下游自己把 **glaze** 放到 include 路径（header-only）；主库 target 不依赖它，镜子
-  压缩的 opt-in 先例——只在本仓库的 `openapi_demo` 与 `unittest` target 启用。schema
-  用 glaze 反射与 `glaze_json_schema` 注解生成，但**输出是手写内联、无 `$ref`/`$defs`**
-  （`$defs` 写进 OAS 中段会让 swagger-ui 解析崩溃，抓过一次），对象类型收拢进
-  `components/schemas` 再以 `$ref` 引用（文档根级，swagger 可解析）。宏未定义时这些
-  API 与字段**不存在**。
+  **glaze 已是主库默认依赖**（JSON helper 即它实现，见 `proto/json.h`），所以 OpenAPI 不再
+  需要消费者额外把 glaze 放 include 路径；宏门本身仍然保留——文档生成那坨重件（typed
+  route 模板重载、schema 收集、swagger 服务）默认不编译，只在本仓库的 `openapi_demo` 与
+  `unittest` target 启用。schema 用 glaze 反射与 `glaze_json_schema` 注解生成，但**输出是
+  手写内联、无 `$ref`/`$defs`**（`$defs` 写进 OAS 中段会让 swagger-ui 解析崩溃，抓过一次），
+  对象类型收拢进 `components/schemas` 再以 `$ref` 引用（文档根级，swagger 可解析）。宏未
+  定义时这些 API 与字段**不存在**。
 
 常用命令：
 

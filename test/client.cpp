@@ -1211,6 +1211,35 @@ asio::awaitable<void> suite_redirect(std::uint16_t port) {
         auto r = co_await client.get(base + "/redir/cookie");
         check(r && r->body == "sid=abc123", "a Set-Cookie from a redirect is replayed on the next hop");
     }
+    // A hop to a different host drops the Authorization header (Go's rule).
+    {
+        sh::ClientConfig cfg;
+        cfg.max_redirects = 5;
+        // Force every hostname (including "localhost") onto the IPv4 loopback,
+        // so the hop's host really differs from the first hop's "127.0.0.1".
+        cfg.resolve =
+            [](std::string,
+               std::string port) -> asio::awaitable<std::pair<sh::error_code, std::vector<asio::ip::tcp::endpoint>>> {
+            std::vector<asio::ip::tcp::endpoint> endpoints;
+            endpoints.emplace_back(asio::ip::make_address("127.0.0.1"), static_cast<std::uint16_t>(std::stoul(port)));
+            co_return std::pair{sh::error_code{}, std::move(endpoints)};
+        };
+        sh::HttpClient client{cfg};
+        sh::RequestSpec spec;
+        spec.headers.add("authorization", "Bearer secret");
+        auto r = co_await client.request(base + "/redir-host", std::move(spec));
+        check(r && r->body == "no-auth", "a cross-origin redirect drops the Authorization header");
+    }
+    // A redirect loop is stopped at max_redirects with an error (Go returns the
+    // last response *and* an error here; we report the error).
+    {
+        sh::ClientConfig cfg;
+        cfg.max_redirects = 3;
+        sh::HttpClient client{cfg};
+        auto r = co_await client.get(base + "/redir/loop");
+        check(!r && r.error() == sh::make_error_code(sh::client_errc::too_many_redirects),
+              "a redirect loop is cut off at max_redirects with an error");
+    }
 }
 
 asio::awaitable<void> run_all_suites(asio::io_context &ctx, std::uint16_t plain, std::uint16_t tls_port,
@@ -1284,6 +1313,22 @@ int main() {
                     const auto cookie = req->header(sh::field::cookie);
                     co_await res->status(200).send(cookie ? std::string{*cookie} : "none");
                 });
+    // A hop to a different host must drop credential headers: the Location
+    // names "localhost" while the client dialed "127.0.0.1" (suite_redirect
+    // pins both to IPv4 with a resolve hook).
+    plain.route(sh::any_methods, "/redir-host", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->redirect("http://localhost:" + std::to_string(kPlainPort) + "/redir-host-target").send("");
+    });
+    plain.route(sh::any_methods, "/redir-host-target",
+                [](sh::RequestPtr req, sh::ResponsePtr res) -> asio::awaitable<void> {
+                    const auto auth = req->header("authorization");
+                    co_await res->status(200).send(auth ? std::string{*auth} : "no-auth");
+                });
+    // A redirection loop: the convenience layer must stop at max_redirects with
+    // an error rather than chase the redirect forever.
+    plain.route(sh::any_methods, "/redir/loop", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->redirect("/redir/loop").send(""); // to itself
+    });
     sh::TlsConfig tls_cfg;
     tls_cfg.cert_chain_file = "./test/tls_certificates/server_cert.pem";
     tls_cfg.private_key_file = "./test/tls_certificates/server_key.pem";

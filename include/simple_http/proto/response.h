@@ -13,6 +13,7 @@
 //              co_await res.write("chunk"); ...; co_await res.finish();
 
 #include <boost/asio/awaitable.hpp>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -59,6 +60,47 @@ class Response {
         return *this;
     }
     Response &content_type(std::string_view ct) { return header("content-type", std::string{ct}); }
+
+    // Builds and adds one Set-Cookie header (RFC 6265), returning *this for
+    // chaining. A value containing characters the cookie grammar does not allow
+    // (;, ,, space, quote, backslash) is quoted with "...", mirroring Go's
+    // http.SetCookie. SameSite takes "Lax" / "Strict" / "None".
+    Response &set_cookie(std::string name, std::string value, std::chrono::seconds max_age = {}, std::string path = {},
+                         std::string domain = {}, bool secure = false, bool http_only = false,
+                         std::string same_site = {}) {
+        std::string field_value = std::move(name);
+        field_value.push_back('=');
+        if (value.find_first_of(";, \"\\") != std::string::npos) {
+            field_value.push_back('"');
+            field_value += value;
+            field_value.push_back('"');
+        } else {
+            field_value += value;
+        }
+        if (!domain.empty()) {
+            field_value += "; Domain=";
+            field_value += domain;
+        }
+        if (!path.empty()) {
+            field_value += "; Path=";
+            field_value += path;
+        }
+        if (max_age.count() > 0) {
+            field_value += "; Max-Age=";
+            field_value += std::to_string(max_age.count());
+        }
+        if (secure) {
+            field_value += "; Secure";
+        }
+        if (http_only) {
+            field_value += "; HttpOnly";
+        }
+        if (!same_site.empty()) {
+            field_value += "; SameSite=";
+            field_value += same_site;
+        }
+        return header(field::set_cookie, std::move(field_value));
+    }
 
     // --- one-shot ---
     [[nodiscard]] asio::awaitable<error_code> send(std::string body = {}) {

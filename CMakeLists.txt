@@ -26,6 +26,10 @@ project(simple_http VERSION ${SIMPLE_HTTP_VERSION} LANGUAGES CXX)
 find_package(Boost REQUIRED CONFIG)
 find_package(OpenSSL REQUIRED)
 
+# glaze is an unconditional dependency: it backs the JSON helpers
+# (proto/json.h, read_json_body / write_json). The OpenAPI layer stays opt-in.
+find_package(glaze CONFIG REQUIRED)
+
 add_library(simple_http INTERFACE)
 
 # Response-body compression is opt-in, and so is its dependency: this is the
@@ -52,6 +56,7 @@ target_link_libraries(simple_http INTERFACE
     Boost::boost
     OpenSSL::SSL
     OpenSSL::Crypto
+    glaze::glaze
 )
 
 install(DIRECTORY include/ DESTINATION include)

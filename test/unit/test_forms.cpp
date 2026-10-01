@@ -6,6 +6,7 @@
 // StripPrefix, tower-http equivalents).
 
 #include <catch2/catch_test_macros.hpp>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <vector>
@@ -120,6 +121,64 @@ TEST_CASE("proto/multipart: a leading CRLF is tolerated and framing errors are n
     CHECK_FALSE(parse_multipart("--B\r\nContent-Disposition: form-data; name=\"x\"\r\n\r\ndata", "B").has_value());
     // The per-part cap is enforced (0 = no part may carry a body).
     CHECK_FALSE(parse_multipart(body, "B", /*max_part_bytes=*/0, /*max_parts=*/100).has_value());
+}
+
+TEST_CASE("proto/request: cookie() picks a name from the Cookie header", "[forms]") {
+    asio::io_context ctx;
+    auto req = make_request(ctx, "/");
+    CHECK_FALSE(req->cookie("sid").has_value());
+    req->mutable_headers().add_lower("cookie", "theme=dark; sid=abc123; prefs=\"a,b\"");
+    CHECK(req->cookie("sid") == "abc123");
+    CHECK(req->cookie("theme") == "dark");
+    // Quoted values are returned without quotes.
+    CHECK(req->cookie("prefs") == "a,b");
+    CHECK_FALSE(req->cookie("missing").has_value());
+}
+
+TEST_CASE("proto/response: set_cookie formats a Set-Cookie header", "[forms]") {
+    asio::io_context ctx;
+    auto writer = std::make_shared<FakeResponseWriter>();
+    auto res = std::make_shared<Response>(writer);
+    REQUIRE(run_on(ctx, res->status(200).send("")));
+    // (set_cookie is a builder; exercise it directly below.)
+    auto writer2 = std::make_shared<FakeResponseWriter>();
+    auto res2 = std::make_shared<Response>(writer2);
+    res2->set_cookie("sid", "abc", std::chrono::seconds{3600}, "/", "", true, true, "Lax");
+    res2->set_cookie("tricky", "a;b");
+    REQUIRE(run_on(ctx, res2->status(200).send("")));
+    CHECK(writer2->header(field::set_cookie) == "sid=abc; Path=/; Max-Age=3600; Secure; HttpOnly; SameSite=Lax");
+    // The second Set-Cookie is a separate field; Headers::get returns the first.
+    CHECK(writer2->last_headers.count(field::set_cookie) == 2);
+    // A value with characters outside the cookie grammar is quoted.
+    bool found_quoted = false;
+    for (const auto &[name, value] : writer2->last_headers) {
+        if (name == "set-cookie" && value.find("tricky") != std::string::npos) {
+            found_quoted = value.find("tricky=\"a;b\"") != std::string::npos;
+        }
+    }
+    CHECK(found_quoted);
+}
+
+TEST_CASE("middleware: redirect_slashes 301s the slash form to the canonical path", "[forms]") {
+    Router router;
+    router.use(middleware::redirect_slashes());
+    router.route({Method::Get}, "/pets",
+                 [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(200).send("pets"); });
+
+    asio::io_context ctx;
+    {
+        auto req = make_request(ctx, "/pets/?q=1");
+        auto writer = dispatch(ctx, router, req);
+        CHECK(writer->last_status == status::moved_permanently);
+        CHECK(writer->header(field::location) == "/pets?q=1"); // query preserved
+    }
+    {
+        // The canonical form reaches the route; the root "/" is untouched.
+        auto writer = dispatch(ctx, router, make_request(ctx, "/pets"));
+        CHECK(writer->last_status == 200);
+        auto writer_root = dispatch(ctx, router, make_request(ctx, "/"));
+        CHECK(writer_root->last_status == 404); // no route at "/" — not redirected
+    }
 }
 
 TEST_CASE("proto/multipart: read_multipart_body on a request", "[forms]") {

@@ -20,7 +20,8 @@
 #include <type_traits>
 #include <vector>
 
-#include "../proto/request.h" // Request::param / Request::body for path_params / read_body
+#include "../proto/params.h"  // simple_http::path_params (openapi:: aliases it)
+#include "../proto/request.h" // Request::param / Request::body for read_body
 #include "openapi_doc.h"      // OpenApiSpec / OperationInfo, the model schema_json feeds
 
 namespace simple_http {
@@ -195,33 +196,9 @@ struct NoBody {};
 // captures of a template route are deserialized into `Params` by field name
 // (glaze reflection), exactly the same "field name == {name}" contract. A
 // missing or unparsable capture yields nullopt, and the handler decides (404).
-template <typename T> std::optional<T> path_params(const Request &req) {
-    T out{};
-    bool complete = true;
-    std::size_t i = 0;
-    glz::for_each_field(out, [&](auto &field) {
-        const std::string_view name = std::string_view{glz::reflect<T>::keys[i++]};
-        const auto value = req.param(name);
-        if (!value) {
-            complete = false;
-            return;
-        }
-        using Field = std::remove_cvref_t<decltype(field)>;
-        if constexpr (std::is_same_v<Field, std::string>) {
-            field = *value; // a path segment is already a bare string
-        } else {
-            // Numbers and booleans arrive bare on the wire, which is valid
-            // JSON scalar input; any read error marks the parse incomplete.
-            if (glz::read_json(field, *value)) {
-                complete = false;
-            }
-        }
-    });
-    if (!complete) {
-        return std::nullopt;
-    }
-    return out;
-}
+// Forwards to the always-on proto/params.h version — OpenAPI just re-exports
+// it so typed routes read the same as the untyped ones.
+template <typename T> std::optional<T> path_params(const Request &req) { return simple_http::path_params<T>(req); }
 
 // The `Params` field names, from glaze reflection — the set a route template's
 // `{name}` segments must equal at registration.
@@ -312,8 +289,12 @@ template <typename T> Param cookie(std::string name, ParamOptions opts = {}) {
 //     server.openapi().security_scheme("key",   openapi::api_key("X-Api-Key"));
 // An operation declares it is behind one or more of these via
 // OperationInfo::security = {"bearer"} — utoipa's security(("bearer" = [])).
-inline SecurityScheme bearer() { return {"http", "bearer", {}, {}}; }
-inline SecurityScheme basic() { return {"http", "basic", {}, {}}; }
+inline SecurityScheme bearer() {
+    return {"http", "bearer", {}, {}};
+}
+inline SecurityScheme basic() {
+    return {"http", "basic", {}, {}};
+}
 inline SecurityScheme api_key(std::string name, std::string in = "header") {
     return {"apiKey", {}, std::move(in), std::move(name)};
 }

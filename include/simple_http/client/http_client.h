@@ -301,6 +301,9 @@ class HttpClient {
     asio::awaitable<std::expected<ClientResponse, error_code>>
     follow_redirects(ClientTarget target, RequestSpec spec, std::string url_target, std::size_t cap,
                      std::chrono::milliseconds limit, std::size_t remaining, std::string current_url) {
+        // Saved before target is moved into the exchange: the next hop's origin
+        // comparison needs the current authority.
+        const std::string current_host = target.host;
         auto response = co_await exchange_once(std::move(target), spec, url_target, cap, limit);
         if (!response)
             co_return std::unexpected{response.error()};
@@ -309,8 +312,21 @@ class HttpClient {
             m_config.cookie_jar->store(current_url, response->headers);
         }
 
-        if (remaining == 0 || !is_redirect(response->status))
+        if (!is_redirect(response->status))
             co_return response;
+        // Over the configured hop budget: report the failure (and log where the
+        // chain ended) instead of silently handing back a redirect the caller
+        // asked us to follow — Go's http.Client returns the last response *and*
+        // an error here. max_redirects == 0 means "never follow": that budget is
+        // never spent, so the untouched 3xx comes back as-is.
+        if (remaining == 0) {
+            if (m_config.max_redirects == 0) {
+                co_return response;
+            }
+            SIMPLE_HTTP_ERROR_LOG("client: {} redirects followed, still at {} ({}) — giving up", m_config.max_redirects,
+                                  response->status, current_url);
+            co_return std::unexpected{make_error_code(client_errc::too_many_redirects)};
+        }
         const auto location = response->header(field::location);
         if (!location || location->empty())
             co_return response;
@@ -329,6 +345,16 @@ class HttpClient {
             spec.stream_body = false;
             spec.headers.erase("content-type"); // an empty GET carries no entity
             spec.headers.erase("content-length");
+        }
+
+        // A hop to a different origin must not carry the previous host's
+        // credentials — Go's http.Client rule. Cookies are replayed through the
+        // jar (domain-filtered) when one is configured; an ad-hoc Cookie header
+        // is dropped across origins either way.
+        if (!iequals_ci(hop->target.host, current_host)) {
+            spec.headers.erase("authorization");
+            spec.headers.erase("proxy-authorization");
+            spec.headers.erase("cookie");
         }
 
         if (m_config.cookie_jar) {

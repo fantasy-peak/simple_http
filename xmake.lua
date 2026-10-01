@@ -29,6 +29,9 @@ add_requires("glaze")  -- OpenAPI typed-route schemas (opt-in: SIMPLE_HTTP_ENABL
 -- define SIMPLE_HTTP_ENABLE_COMPRESSION link these; the library itself stays
 -- dependency-free for downstream consumers that do not want compression.
 add_requires("zlib", "brotli")
+-- glaze is an unconditional dependency: it backs the JSON helpers
+-- (proto/json.h, read_json_body / write_json). Header-only, no transitive deps.
+add_requires("glaze")
 
 add_cxflags("-O2 -Wextra -Wno-missing-field-initializers -Wno-ignored-qualifiers")
 add_defines("SIMPLE_HTTP_USE_BOOST_REGEX")
@@ -42,6 +45,7 @@ target("simple_http")
         "nghttp3",
         "boost",
         "openssl3",
+        "glaze",
         {public = true}
     )
 target_end()

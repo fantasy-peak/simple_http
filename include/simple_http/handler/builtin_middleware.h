@@ -278,5 +278,25 @@ inline Middleware strip_prefix(std::string prefix) {
     };
 }
 
+// redirect_slashes: 301s a path ending in '/' to the same path without it (the
+// query is preserved, the root "/" is untouched) — chi's RedirectSlashes, for
+// the API that treats "/x" and "/x/" as the same resource. Answer one form,
+// redirect the other, so clients and caches converge on the canonical URL.
+inline Middleware redirect_slashes() {
+    return [](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
+        const std::string_view path = req->path();
+        if (path.size() > 1 && path.back() == '/') {
+            std::string location{path.substr(0, path.size() - 1)};
+            if (!req->query().empty()) {
+                location.push_back('?');
+                location.append(req->query());
+            }
+            co_await res->redirect(std::move(location), status::moved_permanently).send("");
+            co_return; // answered here — the route table never sees the slash form
+        }
+        co_await next(std::move(req), std::move(res), ssl);
+    };
+}
+
 } // namespace middleware
 } // namespace simple_http

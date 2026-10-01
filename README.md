@@ -36,7 +36,7 @@ the same protocols outbound.
 
 ## ✨ Features
 
-- **📦 Header-only** — include and go; the library itself links nothing but Boost.Asio and OpenSSL.
+- **📦 Header-only** — include and go; the library links nothing but Boost.Asio and OpenSSL, with header-only glaze carrying the JSON helpers.
 - **🛡️ Modern C++** — C++23 coroutines (`asio::awaitable`), concepts, `std::expected`; no callbacks to thread through.
 - **🔄 One route table, every protocol** — HTTP/1.1, HTTP/2 (ALPN, h2c upgrade, prior knowledge) and h2c share handlers. Version differences live in the engines, not in your code.
 - **🔁 Server *and* client** — the client negotiates ALPN or h2c on its own, over `http://` and `https://`, with HTTP/2 stream multiplexing and a keep-alive pool.
@@ -45,7 +45,7 @@ the same protocols outbound.
 - **🌐 Reverse proxy** — request-level HTTP proxying (plaintext, TLS or h2c backends) and byte-level WebSocket pass-through.
 - **🔌 TCP and UNIX-domain sockets** — bind a path instead of a port when the peer is a local sidecar; TLS, WebSocket and proxying all work over either.
 - **🧩 Middleware** — Go `net/http` / tower-style middleware: global (`use`), per-group and per-route, with before/after wrapping, short-circuiting and per-request state — plus built-ins (`request_id`, `access_log`, `recovery`, `basic_auth`, `real_ip`, `clean_path`, `strip_prefix`, CORS).
-- **📑 Forms & queries** — `req->query_params()` (Go `r.URL.Query` / axum `Query<T>`), `read_urlencoded_body` and `read_multipart_body` (form/file uploads), plus `res->redirect()` and a Server-Sent Events wrapper.
+- **📑 Forms, queries & JSON** — `req->query_params()` (Go `r.URL.Query` / axum `Query<T>`), `read_urlencoded_body`, `read_multipart_body` and — on by default, via glaze — `read_json_body<T>` / `write_json` (axum `Json<T>`), plus `res->redirect()`, a Server-Sent Events wrapper, and rate limiting (`429` + `Retry-After`, token bucket or per-key).
 - **🧵 Client ergonomics** — automatic redirect following (`max_redirects`, Go semantics), a `CookieJar`, and `RequestSpec::basic_auth()`.
 - **🧵 Lock-free connection handling** — each connection is pinned to one single-threaded `io_context` for its whole life, so engines and writers never synchronize.
 - **📋 Logging that does not pick a side** — a four-field `LogSink` interface with no third-party types in it; wire it to spdlog, an in-house library, or nothing.
@@ -172,8 +172,9 @@ certificates and the ALPN list in `simple_http::TlsClientConfig`.
 ## 📦 Requirements
 
 - **C++23** or newer (GCC 13+, Clang 20+).
-- **Boost.Asio** and **OpenSSL**. Nothing else — compression is opt-in and brings
-  its own two (zlib, brotli).
+- **Boost.Asio**, **OpenSSL** and **glaze** (header-only — it backs the JSON
+  helpers, which are on by default). Everything else — compression — is opt-in
+  and brings its own two (zlib, brotli).
 - **xmake** for the example targets and dependency management; **CMake** is supported for consumption.
 
 ---
@@ -183,6 +184,7 @@ certificates and the ALPN list in `simple_http::TlsClientConfig`.
 | Macro | Description |
 | :--- | :--- |
 | `SIMPLE_HTTP_USE_BOOST_REGEX` | Uses `boost::regex` instead of `std::regex` for route matching. |
+| `SIMPLE_HTTP_ENABLE_OPENAPI` | Compiles in OpenAPI 3.1 document generation + Swagger UI. Off by default (glaze is a default dependency, so only the heavy typed-route/document layer is gated). |
 | `SIMPLE_HTTP_ENABLE_COMPRESSION` | Compiles in gzip/brotli response-body compression. Needs zlib and brotli; see [Response Compression](#-response-compression). |
 | `SIMPLE_HTTP_ENABLE_LOG` | Master switch for the logging facade (`1` by default). Set to `0` and every `SIMPLE_HTTP_*_LOG` expands to `((void)0)`. |
 | `SIMPLE_HTTP_LOG_ACTIVE_LEVEL` | Compile-time floor, `0` (Trace) … `5` (Critical). Records below it are discarded at compile time, so they cost nothing at the call site. |
@@ -351,6 +353,7 @@ server.use(simple_http::middleware::access_log());
 server.use(simple_http::middleware::real_ip({"127.0.0.1", "10.0.0.0"})); // X-Forwarded-For → ClientIp state
 server.use(simple_http::middleware::clean_path()); // %XX / "//" / "/./" normalized; ".." → 400
 server.use(simple_http::middleware::strip_prefix("/api")); // mount a sub-app registered from "/"
+server.use(simple_http::middleware::redirect_slashes());   // "/x/" → 301 "/x"; cookies via req->cookie() / res->set_cookie()
 
 // CORS: an OPTIONS preflight is answered 204 here and never reaches a route.
 // See the CORS section for the policy.
@@ -408,6 +411,30 @@ auto form = co_await simple_http::read_urlencoded_body(*req); // expected<QueryP
 // a multipart body (file uploads): boundary from Content-Type
 auto upload = co_await simple_http::read_multipart_body(*req); // expected<vector<MultipartPart>, error_code>
 //   part.name / part.filename / part.content_type / part.data
+
+// a JSON body and response — structs via glaze reflection, on by default
+// (axum Json<T> / Go json.Marshal+Decode):
+struct Pet { std::int64_t id{}; std::string name; };
+auto pet = co_await simple_http::read_json_body<Pet>(*req);      // expected<Pet, error_code>
+co_await simple_http::write_json(res, *pet, 201);                // one-shot JSON, app/json
+
+// typed request-parameter extraction — the axum Path<T> / Query<T> extractors:
+struct Params { std::int64_t page; std::string tag; };
+const auto p = simple_http::path_params<ItemParams>(*req);       // template captures, by field name
+const auto q = simple_http::query_params<Params>(*req);          // ?page=2&tag=x
+// (a urlencoded form body parses the same way: parse_params<Params>(form))
+```
+
+Rate limiting — a global token bucket or per-key buckets, answered 429 with
+`Retry-After` (tower-http RateLimitLayer / golang.org/x/time/rate):
+
+```cpp
+server.use(simple_http::middleware::rate_limit(
+    simple_http::middleware::make_token_bucket(100, 200)));        // 100 req/s, burst 200
+
+server.use(simple_http::middleware::rate_limit(
+    std::make_shared<simple_http::middleware::RateLimiter>(10, 20), // per-client: 10/s, burst 20
+    [](const simple_http::RequestPtr &req) { return std::string{req->peer_address()}; }));
 ```
 
 Responses get a fluent redirect and a thin SSE (Server-Sent Events) wrapper:
@@ -451,8 +478,9 @@ gains `spec.basic_auth("user", "pass")` for outbound HTTP Basic.
 
 `route` is the registration point, so an OpenAPI 3.1 document can be *collected*
 from your routes and schemas instead of maintained by hand. Opt in with
-`SIMPLE_HTTP_ENABLE_OPENAPI` (needs the header-only **glaze** on your include
-path); serve it, and browse the API through a CDN-hosted Swagger UI:
+`SIMPLE_HTTP_ENABLE_OPENAPI` (glaze is already a default dependency of the
+library — it backs the JSON helpers below — so nothing extra is needed on the
+include path); serve it, and browse the API through a CDN-hosted Swagger UI:
 
 ```cpp
 #define SIMPLE_HTTP_ENABLE_OPENAPI  // before including simple_http.h
