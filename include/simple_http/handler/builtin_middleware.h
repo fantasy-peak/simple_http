@@ -23,6 +23,10 @@
 #include <utility>
 #include <vector>
 
+#include <boost/asio/ip/address.hpp> // real_ip's CIDR matching (ip_covered)
+
+#include <array>
+
 #include "../core/base64.h"
 #include "../core/http_field.h"
 #include "../core/http_status.h"
@@ -59,10 +63,11 @@ inline std::string random_hex(std::size_t bytes) {
 
 } // namespace detail
 
-// Access log: one record per request — method, target, response status and
-// wall time — after the chain completed, so a logging middleware reports real
-// answers including the router's built-in 404/405. Keep it outermost for
-// shortest timing (tower-http's TraceLayer placement).
+// Access log: one record per request — method, target, response status, wall
+// time, and the request id when request_id() runs further in — after the chain
+// completed, so a logging middleware reports real answers including the
+// router's built-in 404/405. Keep it outermost for shortest timing (tower-http
+// TraceLayer placement); register request_id() anywhere inside it.
 inline Middleware access_log() {
     return [](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
         // maybe_unused: with SIMPLE_HTTP_ENABLE_LOG=0 the log call compiles
@@ -72,8 +77,13 @@ inline Middleware access_log() {
         co_await next(req, res, ssl);
         [[maybe_unused]] const auto elapsed =
             std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
-        SIMPLE_HTTP_INFO_LOG("{} \"{} {}\" {} {}us", req->peer_address(), req->method_token(), req->target(),
-                             res->status(), elapsed);
+        if (const auto *id = req->get_state<RequestId>()) {
+            SIMPLE_HTTP_INFO_LOG("{} [{}] \"{} {}\" {} {}us", req->peer_address(), id->value, req->method_token(),
+                                 req->target(), res->status(), elapsed);
+        } else {
+            SIMPLE_HTTP_INFO_LOG("{} \"{} {}\" {} {}us", req->peer_address(), req->method_token(), req->target(),
+                                 res->status(), elapsed);
+        }
     };
 }
 
@@ -161,13 +171,75 @@ struct ClientIp {
     std::string value;
 };
 
+namespace real_ip_detail {
+
+// Whether a trusted-proxy entry covers `ip`. An entry without '/' is an exact
+// address (IPv4 or IPv6, case-insensitive); with '/' it is a CIDR prefix
+// ("10.0.0.0/8", "2001:db8::/32"), matched by prefix bits — the tower-http
+// trusted-proxy shape.
+inline bool ip_covered(std::string_view entry, std::string_view ip) {
+    const std::size_t slash = entry.find('/');
+    if (slash == std::string_view::npos) {
+        return iequals_ci(entry, ip);
+    }
+    const std::string address_part{entry.substr(0, slash)};
+    unsigned prefix = 0;
+    for (std::size_t i = slash + 1; i < entry.size(); ++i) {
+        if (entry[i] < '0' || entry[i] > '9') {
+            return false;
+        }
+        prefix = prefix * 10 + static_cast<unsigned>(entry[i] - '0');
+    }
+    error_code ec; // simple_http's boost::system::error_code alias
+    const auto net = asio::ip::make_address(address_part, ec);
+    const auto host = asio::ip::make_address(std::string{ip}, ec);
+    if (ec) {
+        return false;
+    }
+    if (net.is_v4() != host.is_v4()) {
+        return false;
+    }
+    // One fixed-width byte array: a v4 address occupies its first 4 bytes, and
+    // the prefix is capped to 32, so the trailing v6 bytes never participate.
+    std::array<unsigned char, 16> bytes{};
+    std::array<unsigned char, 16> want{};
+    const unsigned max_bits = net.is_v4() ? 32 : 128;
+    if (net.is_v4()) {
+        const auto n = net.to_v4().to_bytes();
+        const auto h = host.to_v4().to_bytes();
+        for (std::size_t i = 0; i < 4; ++i) {
+            bytes[i] = n[i];
+            want[i] = h[i];
+        }
+    } else {
+        bytes = net.to_v6().to_bytes();
+        want = host.to_v6().to_bytes();
+    }
+    if (prefix > max_bits) {
+        return false;
+    }
+    unsigned bits = prefix;
+    for (std::size_t i = 0; i < bytes.size() && bits > 0; ++i) {
+        const unsigned take = std::min(bits, 8u);
+        const auto mask = static_cast<unsigned char>(0xFFu << (8 - take));
+        if ((bytes[i] & mask) != (want[i] & mask)) {
+            return false;
+        }
+        bits -= take;
+    }
+    return true;
+}
+
+} // namespace real_ip_detail
+
 // real_ip: resolves the client's real address behind a proxy. X-Real-IP wins if
 // present (chi's precedence); otherwise X-Forwarded-For is walked — with an
 // empty `trusted_proxies` the leftmost (original) address is taken, with a
 // list the first address walking right-to-left that is not a trusted proxy
-// (tower-http's SetXForwarded semantics). The result is published as ClientIp
-// on the request; it is never used as authorization — forwards can be spoofed,
-// so treat it as advisory.
+// (tower-http's SetXForwarded semantics). Entries in `trusted_proxies` are
+// exact addresses or CIDR prefixes ("10.0.0.0/8", "2001:db8::/32"), IPv4 and
+// IPv6. The result is published as ClientIp on the request; it is never used
+// as authorization — forwards can be spoofed, so treat it as advisory.
 inline Middleware real_ip(std::vector<std::string> trusted_proxies = {}) {
     return [trusted = std::move(trusted_proxies)](RequestPtr req, ResponsePtr res, SslHandle ssl,
                                                   Next next) -> asio::awaitable<void> {
@@ -208,7 +280,7 @@ inline Middleware real_ip(std::vector<std::string> trusted_proxies = {}) {
                     for (auto it = hops.rbegin(); it != hops.rend(); ++it) {
                         bool is_trusted = false;
                         for (const auto &t : trusted) {
-                            if (iequals_ci(*it, t)) {
+                            if (real_ip_detail::ip_covered(t, *it)) {
                                 is_trusted = true;
                                 break;
                             }

@@ -26,6 +26,10 @@ the same protocols outbound.
 - [🧭 Routing, Middleware & Proxy](#-routing-middleware--proxy)
 - [📑 Queries, Forms & SSE](#-queries-forms--sse)
 - [🔗 Client: redirects, cookies & auth](#-client-redirects-cookies--auth)
+- [📜 OpenAPI & Swagger UI](#-openapi--swagger-ui)
+- [🌐 CORS](#-cors)
+- [🔒 Security Headers](#-security-headers)
+- [📁 Static Files](#-static-files)
 - [🗜 Response Compression](#-response-compression)
 - [📂 More Examples](#-more-examples)
 - [📊 Performance](#-performance)
@@ -44,7 +48,7 @@ the same protocols outbound.
 - **🌊 Streaming both ways** — request and response bodies stream with flow-control backpressure; a large payload never has to be materialized.
 - **🌐 Reverse proxy** — request-level HTTP proxying (plaintext, TLS or h2c backends) and byte-level WebSocket pass-through.
 - **🔌 TCP and UNIX-domain sockets** — bind a path instead of a port when the peer is a local sidecar; TLS, WebSocket and proxying all work over either.
-- **🧩 Middleware** — Go `net/http` / tower-style middleware: global (`use`), per-group and per-route, with before/after wrapping, short-circuiting and per-request state — plus built-ins (`request_id`, `access_log`, `recovery`, `basic_auth`, `real_ip`, `clean_path`, `strip_prefix`, CORS).
+- **🧩 Middleware** — Go `net/http` / tower-style middleware: global (`use`), per-group and per-route, with before/after wrapping, short-circuiting and per-request state — plus built-ins (`request_id`, `access_log`, `recovery`, `basic_auth`, `real_ip`, `clean_path`, `strip_prefix`, `redirect_slashes`, `secure_headers`, CORS).
 - **📑 Forms, queries & JSON** — `req->query_params()` (Go `r.URL.Query` / axum `Query<T>`), `read_urlencoded_body`, `read_multipart_body` and — on by default, via glaze — `read_json_body<T>` / `write_json` (axum `Json<T>`), plus `res->redirect()`, a Server-Sent Events wrapper, and rate limiting (`429` + `Retry-After`, token bucket or per-key).
 - **🧵 Client ergonomics** — automatic redirect following (`max_redirects`, Go semantics), a `CookieJar`, and `RequestSpec::basic_auth()`.
 - **🧵 Lock-free connection handling** — each connection is pinned to one single-threaded `io_context` for its whole life, so engines and writers never synchronize.
@@ -130,42 +134,42 @@ co_await res->finish("last");
 #include <simple_http.h>
 
 asio::awaitable<void> fetch() {
-    simple_http::HttpClient http;  // default policy
+    namespace h = simple_http::http;
+    h::Client http;  // default policy — connection reuse/retry/redirects are internal
 
-    auto r = co_await http.get("https://example.com/");
+    // Buffered convenience: builder chain → Response (text/json/error_for_status).
+    auto r = co_await http.get("https://example.com/").query({{"q", "dogs"}}).send();
     if (!r) {
         std::println("failed: {}", r.error().message());
         co_return;
     }
-    std::println("{} {} ({} bytes)", r->status, simple_http::to_string(r->version), r->body.size());
+    auto body = co_await r->text();
+    std::println("{} {} ({} bytes)", r->status(), simple_http::to_string(r->version()), body->size());
+
+    // Explicit full-duplex streaming: one Stream, write end + read end.
+    auto up = co_await http.post("https://example.com/upload").send_stream();
+    if (!up) co_return;
+    co_await up->write("hello ");     // body chunks…
+    co_await up->finish("world");     // …and the end of the body
+
+    auto head = co_await up->read_head();       // status + headers
+    while (auto chunk = co_await up->read()) {  // then the body
+        if (chunk->eof) break;
+        std::println("recv: {}", chunk->data);
+    }
 }
 ```
 
-One connection, streamed both ways:
-
-```cpp
-simple_http::ClientTarget target{.host = "127.0.0.1", .port = 7789, .use_tls = true};
-auto session = co_await http.connect(target);
-if (!session) co_return;
-
-simple_http::RequestSpec spec{.method = simple_http::Method::Post, .target = "/upload", .stream_body = true};
-auto stream = co_await (*session)->open_stream(spec);
-if (!stream) co_return;
-
-co_await (*stream)->write("hello ");     // body chunks…
-co_await (*stream)->finish("world");     // …and the end of the body
-
-auto head = co_await (*stream)->read_head();       // status + headers
-while (auto chunk = co_await (*stream)->read()) {  // then the body
-    if (chunk->eof) break;
-    std::println("recv: {}", chunk->data);
-}
-```
-
-On HTTP/2 those streams are multiplexed, so several can be open on one session at
+On HTTP/2 those streams are multiplexed, so calls can be open on one connection at
 once. Timeouts, limits, pool sizing and decompression live in
 `simple_http::ClientConfig`; SNI, CA bundle, name verification, client
-certificates and the ALPN list in `simple_http::TlsClientConfig`.
+certificates and the ALPN list in `simple_http::TlsClientConfig`. Timeouts are
+layered on the explicit `Stream` path: `response_head_timeout` (TTFB) and
+`body_idle_timeout` (silence between body reads), overridable per request via
+`StreamSpec`; the buffered `send()` keeps the overall `request_timeout`. (The
+pre-`http::` session API — `HttpClient`/`ClientSession`/`ClientStream` — still
+exists purely as the engine behind `http::Client`; it is no longer part of the
+documented public API.)
 
 ---
 
@@ -354,6 +358,15 @@ server.use(simple_http::middleware::real_ip({"127.0.0.1", "10.0.0.0"})); // X-Fo
 server.use(simple_http::middleware::clean_path()); // %XX / "//" / "/./" normalized; ".." → 400
 server.use(simple_http::middleware::strip_prefix("/api")); // mount a sub-app registered from "/"
 server.use(simple_http::middleware::redirect_slashes());   // "/x/" → 301 "/x"; cookies via req->cookie() / res->set_cookie()
+
+// Security response headers, one line (tower-http SetResponseHeader / Spring
+// Security Headers): X-Frame-Options DENY + nosniff + Referrer-Policy by
+// default; CSP / HSTS are off until configured (HSTS only ever goes out over
+// TLS); a handler overrides per-route with res->replace_header(...):
+server.use(simple_http::middleware::secure_headers(simple_http::middleware::SecureHeadersConfig{
+    .content_security_policy = "default-src 'self'",
+    .hsts_max_age = std::chrono::seconds{31536000},
+}));
 
 // CORS: an OPTIONS preflight is answered 204 here and never reaches a route.
 // See the CORS section for the policy.
@@ -595,6 +608,45 @@ server.use([](simple_http::RequestPtr req, simple_http::ResponsePtr res,
 
 `make_cors_middleware()` is public if you would rather narrow the built-in policy
 than rebuild it — mix it into a group or a route like any other middleware.
+
+---
+
+## 🔒 Security Headers
+
+One line gives every response a defensive header baseline — the equivalent of
+tower-http `SetResponseHeader`, Go `unrolled/secure`, or Spring Security's
+header writers:
+
+```cpp
+server.use(simple_http::middleware::secure_headers());  // the baseline
+// or a per-site policy:
+server.use(simple_http::middleware::secure_headers(simple_http::middleware::SecureHeadersConfig{
+    .content_security_policy = "default-src 'self'",
+    .frame_options = "SAMEORIGIN",                       // a site that embeds itself
+    .hsts_max_age = std::chrono::seconds{31536000},
+    .hsts_include_subdomains = true,
+}));
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `content_security_policy` | `""` | `Content-Security-Policy` value. **Off until configured** — CSP is a per-site policy, and a guessed one breaks the site. |
+| `frame_options` | `"DENY"` | `X-Frame-Options` — `"DENY"` / `"SAMEORIGIN"`; empty = off. |
+| `no_sniff` | `true` | `X-Content-Type-Options: nosniff`. |
+| `referrer_policy` | `"strict-origin-when-cross-origin"` | `Referrer-Policy`. |
+| `x_xss_protection` | `""` | `X-XSS-Protection` — off by default (deprecated; browsers ignore it). |
+| `permissions_policy` | `""` | `Permissions-Policy` — off until configured. |
+| `hsts_max_age` | `0` | `Strict-Transport-Security` — `0` = off. **Only ever written over TLS** (a plaintext hop would see the browser ignore it). |
+| `hsts_include_subdomains` / `hsts_preload` | `false` | The matching HSTS directives. |
+
+The headers are written **before** routing (a one-shot `send()` moves the head
+away, so after would be too late), so every answer — the handler's, and the
+router's built-in 404/405/OPTIONS — carries them. A handler that needs a
+different value overrides it per-route without a duplicate on the wire:
+
+```cpp
+co_await res->replace_header(simple_http::field::x_frame_options, "SAMEORIGIN").send("");
+```
 
 ---
 

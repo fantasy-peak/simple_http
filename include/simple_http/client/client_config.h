@@ -163,6 +163,15 @@ struct ClientConfig {
     // Budget for one convenience request (head + body, both directions).
     // 0 = no limit. The session layer leaves the budget to its caller.
     std::chrono::milliseconds request_timeout{60000};
+    // Layered streaming budgets (the explicit http:: Stream path):
+    //   response_head_timeout — from the request being sent to the first
+    //     response byte (TTFB). A slow service and an endless download are
+    //     now separate concerns; this never cuts a large body off mid-stream.
+    //   body_idle_timeout — silence between body reads. 0 = a body may idle
+    //     forever (the downloader's pace decides).
+    // A StreamSpec may override both per request; 0 there means "use these".
+    std::chrono::milliseconds response_head_timeout{30000};
+    std::chrono::milliseconds body_idle_timeout{0};
 
     // Protocol limits. The HTTP/2 receive window is larger than the server's
     // default: a client is usually the one waiting on data, so a bigger window
@@ -237,10 +246,13 @@ enum class client_errc : int {
     goaway,                 // the peer is draining the connection (GOAWAY)
     connect_timeout,
     request_timeout,
-    invalid_spec,         // the caller's RequestSpec contradicts itself (body +
-                          // stream_body)
-    redirect_to_insecure, // a redirect would downgrade https -> http
-    too_many_redirects,   // the redirect chain exceeded ClientConfig::max_redirects
+    invalid_spec,          // the caller's RequestSpec contradicts itself (body +
+                           // stream_body)
+    redirect_to_insecure,  // a redirect would downgrade https -> http
+    too_many_redirects,    // the redirect chain exceeded ClientConfig::max_redirects
+    http_status,           // error_for_status(): the response status was not 2xx
+    response_head_timeout, // no response head within ClientConfig::response_head_timeout
+    body_idle_timeout,     // silence between body reads exceeded body_idle_timeout
 };
 
 } // namespace simple_http
@@ -303,6 +315,12 @@ class ClientErrorCategory : public boost::system::error_category {
             return "a redirect would downgrade https to http";
         case client_errc::too_many_redirects:
             return "the redirect chain exceeded the configured limit";
+        case client_errc::http_status:
+            return "response status was not 2xx";
+        case client_errc::response_head_timeout:
+            return "no response head within the configured TTFB budget";
+        case client_errc::body_idle_timeout:
+            return "the response body was silent past the idle budget";
         default:
             return "unknown client error";
         }

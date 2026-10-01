@@ -174,6 +174,27 @@ class HttpClient {
 
     // --- session level ---
 
+    // Opens a request/response exchange without buffering anything: the caller
+    // writes the body on the returned stream (RequestSpec::stream_body), then
+    // reads the response. This is the streaming entry point the http:: client
+    // (client/http.h) builds its Stream/send() on.
+    asio::awaitable<std::expected<std::shared_ptr<ClientStream>, error_code>>
+    stream(ClientTarget target, RequestSpec spec, bool fresh_only = false) {
+        auto opened = co_await start_exchange(std::move(target), std::move(spec), {}, fresh_only);
+        if (!opened)
+            co_return std::unexpected{opened.error()};
+        co_return std::move(opened->stream);
+    }
+    asio::awaitable<std::expected<std::shared_ptr<ClientStream>, error_code>> stream(std::string_view url,
+                                                                                     RequestSpec spec) {
+        auto parsed = parse_url(url);
+        if (!parsed)
+            co_return std::unexpected{parsed.error()};
+        if (spec.target.empty())
+            spec.target = std::string{parsed->target};
+        co_return co_await stream(target_from_url(*parsed), std::move(spec));
+    }
+
     // Connects to `target` (reusing a pooled session when one is available) and
     // returns the session. The caller opens streams on it.
     asio::awaitable<std::expected<std::shared_ptr<ClientSession>, error_code>> connect(ClientTarget target) {

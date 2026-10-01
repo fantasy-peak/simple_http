@@ -379,7 +379,14 @@ class Server {
             });
         }
         if (!m_acceptors.empty()) {
-            closed.wait();
+            // Bound the wait the same way IoCtxPool::stop() bounds its drain: a
+            // close posted onto a running context normally lands in
+            // microseconds, so a timeout here only ever fires for an acceptor
+            // loop that is stuck — a refusal to stop is a delayed shutdown, not
+            // a hung process.
+            if (closed.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
+                SIMPLE_HTTP_ERROR_LOG("server: acceptor close did not land within 2s; stopping anyway");
+            }
         }
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
         // Take the QUIC connections down, but do not close the sockets yet: a

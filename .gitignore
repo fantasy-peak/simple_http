@@ -9,3 +9,4 @@ __pycache__/
 
 .vscode/*
 !.vscode/c_cpp_properties.json
+test/rust

@@ -59,6 +59,21 @@ class Response {
         m_headers.add(std::string{name}, std::move(value));
         return *this;
     }
+
+    // Replaces every field with `name` (the last set wins) instead of appending
+    // a duplicate — the override a middleware-provided default (security
+    // headers, CORS Vary) needs from a handler: `res->replace_header(field::x_frame_options, "SAMEORIGIN")`.
+    // Like header(), a CR/LF/NUL in either part refuses the whole field.
+    Response &replace_header(std::string_view name, std::string value) {
+        if (contains_ctl(name) || contains_ctl(value)) {
+            SIMPLE_HTTP_ERROR_LOG("response field with CR/LF/NUL rejected");
+            m_field_rejected = true;
+            return *this;
+        }
+        m_headers.erase(name);
+        m_headers.add(std::string{name}, std::move(value));
+        return *this;
+    }
     Response &content_type(std::string_view ct) { return header("content-type", std::string{ct}); }
 
     // Builds and adds one Set-Cookie header (RFC 6265), returning *this for

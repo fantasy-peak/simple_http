@@ -1,5 +1,16 @@
 #pragma once
 
+// Legacy client aggregate header — **internal**. The public client API is
+// simple_http::http (client/http.h); this file wraps the pre-refactor client
+// types (HttpClient / ClientSession / ClientStream / RequestSpec / …), which
+// now exist only as the engine behind http::Client. It is not included by the
+// umbrella anymore; kept for any consumer mid-migration.
+
+#include "h1_client.h"
+#include "h2_client.h"
+#include "http_client.h"
+#include "tls_client.h"
+
 // The client layer, aggregated.
 //
 // client/ is the outbound mirror of the server side, sharing its codecs instead

@@ -41,6 +41,7 @@ include/
       mime.h               MIME 类型常量 + by_extension（扩展名→类型）
       http_date.h          IMF-fixdate 格式化/解析 + now_unix（手写，不用 strftime）
       url_path.h           请求路径解码与规范化（查找键）+ under_prefix
+      url_encoding.h       百分号编码（query_escape / path_escape，Go net/url 对标）
       accept_encoding.h    Accept-Encoding qvalue 解析（独立于编码器层）
       validators.h         ETag / 弱比较 / Range 解析
       static_table.h       文档根 → 不可变查找表（静态服务的协议无关半边）
@@ -83,9 +84,13 @@ include/
       builtin_middleware.h 内置中间件：request_id / access_log / recovery / basic_auth /
                            real_ip（XFF/X-Real-IP → ClientIp state）/ clean_path（规范化+拒绝 ".."）/
                            strip_prefix（子应用挂载）/ redirect_slashes（尾斜杠 301 归一）
+      secure_headers.h    安全响应头中间件 SecureHeadersConfig（HSTS 仅 TLS / CSP / X-Frame-Options /
+                           nosniff / Referrer-Policy / XSS / Permissions-Policy；before 写头，
+                           handler 用 Response::replace_header 覆盖）
       rate_limit.h         限流：TokenBucket（线程安全令牌桶）/ RateLimiter（按 key 分桶，容量上限）
                            + rate_limit(middleware)（429 + Retry-After，tower-http RateLimitLayer 形态）
       cors.h               内建 CORS：CorsConfig 编译成 Middleware（预检在中间件内应答 204，不进路由）
+      conditionals.h       handler 级条件请求 304（maybe_not_modified：If-None-Match/If-Modified-Since）
       router.h             Router（含反代用的 HttpClient、反代匹配、静态阶段）；use/group 与
                            per-route 中间件注册；组前缀作用域 {@name RegistrationScope}
       http_proxy.h         请求级反代：上游走 client 层（连接池/TLS/h2），响应流式回传
@@ -106,9 +111,14 @@ include/
       connection.h         serve_plaintext / serve_tls（协议检测）
       server.h             Server 门面 + ServerConfig / Listen
     client/                出站 HTTP 客户端（与 server 对称的一层）
+      http.h                **新 API（the http:: client）**：Client / RequestBuilder / Stream / Response，
+                           对标 Go net/http + Rust reqwest/hyper。连接不可见、请求链式构造、响应可
+                           缓冲/流式消费、Stream 双向（写端=请求体、读端=响应体，未来 WS 底座）。
+                           便捷 send() 复用旧便捷层（重定向/Cookie/重试/h2c）；显式 open_stream()
+                           是全流式新管道
       client_config.h      ClientConfig / ClientTarget / TlsClientConfig / client_errc
       url.h                绝对 URL 解析（parse_url）
-      client_stream.h      RequestSpec / ResponseHead / ClientStream / ClientSession
+      client_stream.h      RequestSpec / ResponseHead / ClientStream / ClientSession（新 API 的内部实现）
       tls_client.h         客户端 ssl::context 与握手（SNI / ALPN / 主机名校验 / mTLS）
       h1_client.h          HTTP/1.1 会话（一次一交换，keep-alive、chunked、h2c Upgrade）
       h2_client.h          HTTP/2 会话（多路复用、流控、SETTINGS/PING/GOAWAY、h2c 播种流 1）
@@ -191,6 +201,8 @@ server.group("/api", {auth_mw}, [](Router &api) {
     api.route({Post}, "/users", {rate_limit_mw}, create); // 再加 per-route 中间件
 });
 // 内置中间件：middleware::request_id() / access_log() / recovery() / basic_auth()
+//              / real_ip(trusted) / clean_path() / strip_prefix("/x") / redirect_slashes()
+//              / secure_headers(SecureHeadersConfig)（安全响应头基线，HSTS 仅 TLS）
 server.use(simple_http::middleware::request_id());
 ```
 
@@ -267,6 +279,7 @@ co_await res->finish(last);
 `Response` 常用（fluent）：`status()/header()/content_type()`、`send(body)` 一次性、
 `begin()/write()/finish()` 流式、`redirect(location, code=302)`、`set_cookie(...)`
 （Go `http.SetCookie`：命名参数拼 Set-Cookie，含 Path/Max-Age/Secure/HttpOnly/SameSite）、
+`replace_header(name, value)`（同名替换，覆盖中间件默认安全头）、
 SSE 三件套 `sse_begin()/sse_event()/sse_comment()`。
 
 表单与查询：`read_urlencoded_body(req)` → `expected<QueryParams, error_code>`；
@@ -363,10 +376,31 @@ server.serve_swagger_ui("/swagger", "/openapi.json");   // CDN 页，离线换 s
 
 ### 客户端（`client/` 层）
 
-与 handler 一样是协程，但方向相反：内部分**会话层**（连接 + 流）与**便捷层**
-（一次调用拿到完整响应）。协议由客户端自己协商：TLS 走 ALPN（`h2` / `http/1.1`），
-明文走 h2c（`H2cMode::Upgrade` 单次 Upgrade 往返，或 `PriorKnowledge` 直接发 preface）；
-协商不到要求的版本返回 `client_errc::version_not_negotiated`，不会静默降级。
+**新 API（推荐，`simple_http::http`，对标 Go net/http + Rust reqwest/hyper）**：
+
+```cpp
+namespace h = simple_http::http;
+h::Client client{cfg};                                   // cfg = ClientConfig
+// 便捷（半双工）：builder 链 → send → Response（可 text()/json<T>()/error_for_status()）
+auto r = co_await client.post("https://host/items").json(CreateItem{...}).bearer_auth(jwt).send();
+if (!r) { /* expected 错误，消息带 authority + 阶段 */ }
+if (auto err = r->error_for_status(); !err) { /* 4xx/5xx */ }
+// 显式（全双工）：Stream 同对象读写（写端=请求体、读端=响应体；h2 可交织）
+auto up = co_await client.open_stream("https://host/upload", {.method = Method::Post});
+co_await up->write(chunk); … co_await up->finish();
+auto head = co_await up->read_head(); while (auto c = co_await up->read()) { … }
+```
+
+分层超时（生产 P0）：`ClientConfig::response_head_timeout`（TTFB）与 `body_idle_timeout`（体静默）
+落在显式 `Stream` 上——慢服务在 TTFB 预算内报 `response_head_timeout`，大下载按流动节奏读、永不
+被整体预算砍断；`StreamSpec` 可逐请求覆盖，便捷 `send()` 缓冲路径保留整体 `request_timeout`。
+`Response::header_owned()` 给出无悬垂风险的头取值（视图 `header()` 随 Response 存活）。
+
+便捷 `send()` 复用旧便捷层（重定向/Cookie jar/陈旧重试/h2c/自动解压原逻辑）；
+`open_stream()`/`send_stream()` 是全流式新管道（`Stream` 即未来 WebSocket 底座）。
+**旧会话层类型（`HttpClient`/`ClientSession`/`ClientStream`/`RequestSpec`/`ClientTarget`/`ClientResponse`）仍保留，但只作为 `http::Client` 底下的内部引擎**——`client/client.h`（旧聚合头）已从伞形剥离并标注 internal；旧类型在新开发里不要新增使用点，功能缺口走 `http::`。
+
+旧层（过渡）：
 
 ```cpp
 simple_http::HttpClient http;                       // 策略：TLS/超时/限制/连接池

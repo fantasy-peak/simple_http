@@ -36,8 +36,11 @@ inline constexpr std::string_view content_encoding = "content-encoding";
 inline constexpr std::string_view content_language = "content-language";
 inline constexpr std::string_view content_length = "content-length";
 inline constexpr std::string_view content_range = "content-range";
+inline constexpr std::string_view content_security_policy = "content-security-policy";
 inline constexpr std::string_view content_type = "content-type";
 inline constexpr std::string_view cookie = "cookie";
+inline constexpr std::string_view cross_origin_opener_policy = "cross-origin-opener-policy";
+inline constexpr std::string_view cross_origin_resource_policy = "cross-origin-resource-policy";
 inline constexpr std::string_view date = "date";
 inline constexpr std::string_view etag = "etag";
 inline constexpr std::string_view expect = "expect";
@@ -52,8 +55,10 @@ inline constexpr std::string_view last_modified = "last-modified";
 inline constexpr std::string_view link = "link";
 inline constexpr std::string_view location = "location";
 inline constexpr std::string_view origin = "origin";
+inline constexpr std::string_view permissions_policy = "permissions-policy";
 inline constexpr std::string_view range = "range";
 inline constexpr std::string_view referer = "referer";
+inline constexpr std::string_view referrer_policy = "referrer-policy";
 inline constexpr std::string_view retry_after = "retry-after";
 inline constexpr std::string_view server = "server";
 inline constexpr std::string_view set_cookie = "set-cookie";
@@ -64,7 +69,10 @@ inline constexpr std::string_view user_agent = "user-agent";
 inline constexpr std::string_view vary = "vary";
 inline constexpr std::string_view via = "via";
 inline constexpr std::string_view www_authenticate = "www-authenticate";
+inline constexpr std::string_view x_content_type_options = "x-content-type-options";
+inline constexpr std::string_view x_frame_options = "x-frame-options";
 inline constexpr std::string_view x_request_id = "x-request-id";
+inline constexpr std::string_view x_xss_protection = "x-xss-protection";
 
 } // namespace field
 

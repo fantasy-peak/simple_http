@@ -39,7 +39,8 @@
 #include <utility>
 #include <vector>
 
-#include "../client/http_client.h"
+#include "../client/http.h"        // http::Client — the upstream leg lives on the new API
+#include "../client/http_client.h" // transport_failure (the retry rule)
 #include "../core/logging.h"
 #include "../core/types.h"
 #include "../engine/dispatcher.h" // HttpProxyTarget
@@ -116,7 +117,8 @@ inline bool contains_token(const std::vector<std::string> &tokens, std::string_v
 // has not started yet; a failure once the body is flowing aborts the frontend
 // response instead (a truncated body must never look complete).
 inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::shared_ptr<Response> res,
-                                            bool client_is_tls, HttpProxyTarget target, HttpClient &client) {
+                                            bool client_is_tls, HttpProxyTarget target,
+                                            simple_http::http::Client &client) {
     auto fail_502 = [&res]() -> asio::awaitable<void> {
         if (co_await res->connected()) {
             (void)co_await res->status(502).content_type("text/plain").send("Bad Gateway");
@@ -226,7 +228,7 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
     // closed it unnoticed) failing at the transport level, and only when the
     // request can be sent again — a body already taken from the frontend cannot.
     for (int attempt = 0; attempt < 2; ++attempt) {
-        auto opened = co_await client.open_stream(upstream, spec);
+        auto opened = co_await client.open_target(upstream, spec);
         if (!opened) {
             SIMPLE_HTTP_ERROR_LOG("http-proxy: no upstream connection to {}:{} ({})", target.host, target.port,
                                   opened.error().message());
@@ -263,7 +265,7 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
             if (!body_sent) {
                 // The request is half-sent: it cannot be replayed, and the
                 // frontend has not seen a response yet.
-                (void)co_await stream->cancel();
+                (void)co_await stream->abort();
                 co_await fail_502();
                 co_return;
             }
@@ -275,12 +277,12 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
             if (may_retry && transport_failure(head.error())) {
                 SIMPLE_HTTP_ERROR_LOG("http-proxy: {}:{} dropped a pooled connection ({}), retrying", target.host,
                                       target.port, head.error().message());
-                (void)co_await stream->cancel();
+                (void)co_await stream->abort();
                 continue;
             }
             SIMPLE_HTTP_ERROR_LOG("http-proxy: no response head from {}:{} ({})", target.host, target.port,
                                   head.error().message());
-            (void)co_await stream->cancel();
+            (void)co_await stream->abort();
             co_await fail_502();
             co_return;
         }
@@ -305,7 +307,7 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
             co_return;
         }
         if (auto ec = co_await res->begin(); ec) {
-            (void)co_await stream->cancel(); // the frontend went away; stop paying for the upstream
+            (void)co_await stream->abort(); // the frontend went away; stop paying for the upstream
             co_return;
         }
 
@@ -323,7 +325,7 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
             if (chunk->eof)
                 break;
             if (auto ec = co_await res->write(std::move(chunk->data)); ec) {
-                (void)co_await stream->cancel();
+                (void)co_await stream->abort();
                 co_return;
             }
         }
