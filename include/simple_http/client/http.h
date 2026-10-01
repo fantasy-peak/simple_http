@@ -154,8 +154,10 @@ class Stream {
 // Two shapes, one interface:
 //   * buffered  — from the convenience send(): the body is already in hand,
 //                 text()/json<T>() are immediate and read() replays it;
-//   * streaming — from open_stream()/send_stream(): the read end of the stream,
-//                 text()/json<T>() pull it, read() streams it.
+//   * streaming — from open_stream()/send_stream(): body() is a live Body bound
+//                 to the exchange's read end, so text()/json<T>()/read_all()
+//                 pull it and read() streams it. Go's http.Response.Body is the
+//                 same shape: a read stream owned by the response.
 class Response {
   public:
     int status() const { return m_head.status; }
@@ -181,6 +183,12 @@ class Response {
         return std::unexpected{make_error_code(client_errc::http_status)};
     }
 
+    // The response body as a uniform read stream — the counterpart of the
+    // server's Request::body(). Buffered shape replays the captured body;
+    // streaming shape reads the live exchange (Go's http.Response.Body).
+    Body &body() { return *m_body; }
+    const Body &body() const { return *m_body; }
+
     // --- buffered consumption ---
     [[nodiscard]] asio::awaitable<std::expected<std::string, error_code>> text() { co_return co_await bytes(); }
     [[nodiscard]] asio::awaitable<std::expected<std::string, error_code>> bytes() { co_return co_await read_all(); }
@@ -198,25 +206,26 @@ class Response {
 
     // --- streaming consumption ---
     [[nodiscard]] asio::awaitable<std::expected<ReadResult, error_code>> read() {
-        if (m_stream) {
-            co_return co_await m_stream->read();
-        }
-        // Buffered shape: replay the captured body once, then eof.
-        if (m_replay_index < m_buffer_body.size()) {
-            std::string data = m_buffer_body.substr(m_replay_index);
-            m_replay_index = m_buffer_body.size();
-            co_return ReadResult::chunk(std::move(data));
+        if (m_body->is_pull() || !m_body->eof()) {
+            co_return co_await m_body->read();
         }
         co_return ReadResult::end();
     }
     [[nodiscard]] asio::awaitable<std::expected<std::string, error_code>> read_all(std::size_t max_bytes = 0) {
-        if (m_stream) {
-            co_return co_await m_stream->read_all(max_bytes);
+        // Body::read_all caps nothing, so the convenience budget is enforced
+        // here (the streaming shape's underlying ClientStream::read_all also
+        // enforces it — this covers the buffered shape too).
+        std::string out;
+        for (;;) {
+            auto r = co_await m_body->read();
+            if (!r)
+                co_return std::unexpected{r.error()};
+            if (r->eof)
+                co_return out;
+            if (max_bytes != 0 && out.size() + r->data.size() > max_bytes)
+                co_return std::unexpected{make_error_code(client_errc::body_too_large)};
+            out.append(r->data);
         }
-        if (max_bytes != 0 && m_buffer_body.size() > max_bytes) {
-            co_return std::unexpected{make_error_code(client_errc::body_too_large)};
-        }
-        co_return m_buffer_body;
     }
 
     [[nodiscard]] asio::awaitable<void> abort() {
@@ -231,17 +240,31 @@ class Response {
     // body. Public so tests and Response decorators can build one by hand;
     // ordinary callers get it from Client::send().
     explicit Response(detail::ResponseHead head, std::string body)
-        : m_head(std::move(head)), m_buffer_body(std::move(body)) {}
+        : m_head(std::move(head)), m_body(std::make_shared<Body>(asio::system_executor{})) {
+        // Buffered replay: the captured body, delivered as one pull chunk.
+        m_body->set_pull_provider([body = std::move(body)]() mutable
+                                      -> asio::awaitable<std::expected<ReadResult, error_code>> {
+            if (body.empty())
+                co_return ReadResult::end();
+            std::string out = std::move(body);
+            co_return ReadResult::chunk(std::move(out));
+        });
+    }
     // Streaming shape (from open_stream()/send_stream()): the read end of a
-    // live exchange, plus the head parsed on the way.
-    explicit Response(std::shared_ptr<detail::ClientStream> stream, detail::ResponseHead head)
-        : m_head(std::move(head)), m_stream(std::move(stream)) {}
+    // live exchange, plus the head parsed on the way. The exchange's reads are
+    // wired in as the Body's pull provider, so body()/read() pull the stream.
+    explicit Response(std::shared_ptr<detail::ClientStream> stream, detail::ResponseHead head,
+                      asio::any_io_executor exec)
+        : m_head(std::move(head)), m_stream(std::move(stream)),
+          m_body(std::make_shared<Body>(std::move(exec))) {
+        m_body->set_pull_provider([this] { return m_stream->read(); });
+    }
 
   private:
     friend class RequestBuilder;
     friend class Client;
     detail::ResponseHead m_head;
-    std::string m_buffer_body;                        // buffered convenience shape
+    std::shared_ptr<Body> m_body;             // uniform read stream
     std::shared_ptr<detail::ClientStream> m_stream;   // streaming shape
     std::size_t m_replay_index{0};
 };
@@ -381,6 +404,43 @@ class Client {
     RequestBuilder patch(std::string url) const { return RequestBuilder(this, Method::Patch, std::move(url)); }
     RequestBuilder request(Method method, std::string url) const {
         return RequestBuilder(this, method, std::move(url));
+    }
+
+    // --- explicit send (Go's http.Client.Do) ---
+    // Sends a fully-built request (method/url/headers/body already set — see
+    // Request::set_url) and returns the buffered response, applying the
+    // convenience policy (redirects, cookies, pooled-retry). The request's body
+    // travels alongside for replay (Request::clone_for_replay), so 307/308
+    // redirects can resend it. `url` overrides the Request's own target when
+    // the request only carries an origin-form target.
+    [[nodiscard]] asio::awaitable<std::expected<Response, error_code>> send(std::shared_ptr<Request> request,
+                                                                            std::string url = {},
+                                                                            std::size_t max_body_bytes = 0,
+                                                                            std::chrono::milliseconds timeout = {}) const {
+        std::string current_url = url;
+        detail::ClientTarget target;
+        std::string url_target;
+        if (current_url.empty()) {
+            // The Request carries a full URL: derive the authority from it.
+            if (request->url().empty())
+                co_return std::unexpected{make_error_code(client_errc::bad_url)};
+            current_url = request->url();
+        }
+        auto parsed = detail::parse_url(current_url);
+        if (!parsed)
+            co_return std::unexpected{parsed.error()};
+        target = parsed->to_target();
+        target.version = m_cfg.default_version;
+        target.h2c = m_cfg.default_h2c;
+        url_target = request->target().empty() ? std::string{parsed->target} : std::string{request->target()};
+        if (request->target().empty())
+            request->set_target(url_target);
+
+        const std::size_t cap = max_body_bytes != 0 ? max_body_bytes : m_cfg.limits.max_body_bytes;
+        const std::chrono::milliseconds limit = timeout.count() != 0 ? timeout : m_cfg.request_timeout;
+        co_return co_await follow_redirects(m_impl, m_cfg, std::move(target), request->method(),
+                                            Headers{request->headers()}, request->body_source(), std::move(url_target),
+                                            cap, limit, m_cfg.max_redirects, std::move(current_url));
     }
 
     // --- explicit streaming (full-duplex) ---
@@ -685,24 +745,15 @@ inline asio::awaitable<std::expected<Response, error_code>> RequestBuilder::send
         co_return std::unexpected{make_error_code(asio::error::invalid_argument)};
     }
 
-    const std::size_t cap = m_max_body_bytes != 0 ? m_max_body_bytes : m_client->m_cfg.limits.max_body_bytes;
-    const std::chrono::milliseconds limit =
-        m_head_timeout.count() != 0 ? m_head_timeout : m_client->m_cfg.request_timeout;
+    auto request = std::make_shared<Request>(Version::Http11, co_await asio::this_coro::executor);
+    request->set_method(m_method);
+    request->set_url(url);
+    request->mutable_headers() = m_headers;
+    if (!m_body.empty()) {
+        request->set_body(m_body);
+    }
 
-    // The URL's own authority becomes the first hop's target; helpers keep the
-    // absolute URL for cookies and relative redirect resolution.
-    auto parsed = detail::parse_url(url);
-    if (!parsed)
-        co_return std::unexpected{parsed.error()};
-    detail::ClientTarget target = parsed->to_target();
-    target.version = m_client->m_cfg.default_version;
-    target.h2c = m_client->m_cfg.default_h2c;
-    std::string url_target{parsed->target};
-    std::string current_url = url;
-
-    co_return co_await Client::follow_redirects(m_client->m_impl, m_client->m_cfg, std::move(target), m_method,
-                                                m_headers, m_body, std::move(url_target), cap, limit,
-                                                m_client->m_cfg.max_redirects, std::move(current_url));
+    co_return co_await m_client->send(std::move(request), url, m_max_body_bytes, m_head_timeout);
 }
 
 } // namespace simple_http

@@ -1184,8 +1184,15 @@ asio::awaitable<void> suite_http_api(std::uint16_t port) {
         if (!r)
             co_return;
         check(r->status() == 200 && r->ok(), "http::Response ok() on a 200");
-        auto body = co_await r->text();
-        check(body && body->find("hello from") != std::string::npos, "http::send().text() delivers the body");
+        // The response body is a uniform Body stream (Go's http.Response.Body):
+        // readable via body().read_all() / body().read() in chunks.
+        {
+            auto whole = co_await r->body().read_all();
+            check(whole && whole->find("hello from") != std::string::npos,
+                  "http::Response::body() reads as a Body stream (read_all)");
+            auto next = co_await r->read();
+            check(next && next->eof, "http::Response::read() reports end-of-body after read_all()");
+        }
     }
     // query() percent-encodes and appends to the URL.
     {

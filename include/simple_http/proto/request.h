@@ -39,7 +39,7 @@ class Request {
           m_method(other.m_method), m_method_token(std::move(other.m_method_token)),
           m_target(std::move(other.m_target)), m_headers(std::move(other.m_headers)),
           m_params(std::move(other.m_params)), m_query_params(std::move(other.m_query_params)),
-          m_close(other.m_close), m_stream_body(other.m_stream_body), m_content_length(other.m_content_length),
+          m_close(other.m_close), m_stream_body(other.m_stream_body), m_content_length(other.m_content_length), m_url(std::move(other.m_url)),
           m_body_source(std::move(other.m_body_source)) {
         rebind_views();
     }
@@ -58,6 +58,7 @@ class Request {
         m_close = other.m_close;
         m_stream_body = other.m_stream_body;
         m_content_length = other.m_content_length;
+        m_url = std::move(other.m_url);
         m_body_source = std::move(other.m_body_source);
         rebind_views();
         return *this;
@@ -170,6 +171,7 @@ class Request {
         auto copy = std::make_shared<Request>(Version::Http11, exec);
         copy->set_method(m_method);
         copy->set_target(m_target);
+        copy->m_url = m_url;
         copy->mutable_headers() = m_headers;
         copy->m_close = m_close;
         copy->m_stream_body = m_stream_body;
@@ -178,6 +180,18 @@ class Request {
         }
         return copy;
     }
+
+    // --- Go's http.Request.URL: the absolute URL this request targets ---
+    // The client sets it (RequestBuilder's send() fills it from the caller's
+    // URL, Client::send derives the authority from it); the server never sets
+    // it, since the wire carries only the origin-form target. Kept separate
+    // from target() like Go keeps Request.URL and RequestURI apart.
+    void set_url(std::string url) { m_url = std::move(url); }
+    const std::string &url() const { return m_url; }
+
+    // The up-front body's source bytes, for replay (redirect 307/308, pooled
+    // retry). Empty when the request has a streamed or no body.
+    const std::string &body_source() const { return m_body_source; }
 
     // HTTP Basic (RFC 7617): sets `Authorization: Basic base64(user:pass)` —
     // the client-side counterpart of middleware::basic_auth. Returns *this for
@@ -274,6 +288,7 @@ class Request {
     bool m_close{false};
     bool m_stream_body{false};
     std::int64_t m_content_length{-1};
+    std::string m_url;         // absolute URL (Go's Request.URL; client side)
     std::string m_body_source; // for clone_for_replay (empty = no up-front body)
 
     Method m_method{Method::Get};
