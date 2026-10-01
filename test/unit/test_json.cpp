@@ -53,8 +53,8 @@ TEST_CASE("proto/json: a malformed or type-mismatched body is std::unexpected", 
 
 TEST_CASE("proto/json: write_json sends a one-shot JSON response", "[json]") {
     asio::io_context ctx;
-    auto writer = std::make_shared<FakeResponseWriter>();
-    auto res = std::make_shared<Response>(writer);
+    auto writer = std::make_shared<FakeResponseSink>();
+    auto res = std::make_shared<ResponseWriter>(writer);
 
     auto ec = run_on(ctx, write_json(res, Pet{3, "yuki"}, 201));
     REQUIRE(ec.has_value());

@@ -27,9 +27,9 @@ RequestPtr make_request(asio::io_context &ctx, std::string target,
     return req;
 }
 
-std::shared_ptr<FakeResponseWriter> dispatch(asio::io_context &ctx, Router &router, RequestPtr req) {
-    auto writer = std::make_shared<FakeResponseWriter>();
-    auto res = std::make_shared<Response>(writer);
+std::shared_ptr<FakeResponseSink> dispatch(asio::io_context &ctx, Router &router, RequestPtr req) {
+    auto writer = std::make_shared<FakeResponseSink>();
+    auto res = std::make_shared<ResponseWriter>(writer);
     REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
     return writer;
 }
@@ -60,8 +60,8 @@ TEST_CASE("conditionals: If-None-Match answers 304 and sets validators", "[tools
     asio::io_context ctx;
     const auto etag = make_etag(1700000000, 100, "id");
     {
-        auto writer = std::make_shared<FakeResponseWriter>();
-        auto res = std::make_shared<Response>(writer);
+        auto writer = std::make_shared<FakeResponseSink>();
+        auto res = std::make_shared<ResponseWriter>(writer);
         auto req = make_request(ctx, "/doc", {{"if-none-match", std::string{etag}}});
         bool not_modified = run_on(ctx, maybe_not_modified(req, res, etag, 1700000000)).value_or(false);
         CHECK(not_modified);
@@ -73,8 +73,8 @@ TEST_CASE("conditionals: If-None-Match answers 304 and sets validators", "[tools
         // A different validator: the 200 path, but the validators ride along
         // once the handler sends (a fresh Response; maybe_not_modified only
         // staged the headers until now).
-        auto writer = std::make_shared<FakeResponseWriter>();
-        auto res = std::make_shared<Response>(writer);
+        auto writer = std::make_shared<FakeResponseSink>();
+        auto res = std::make_shared<ResponseWriter>(writer);
         auto req = make_request(ctx, "/doc", {{"if-none-match", "\"other\""}});
         bool not_modified = run_on(ctx, maybe_not_modified(req, res, etag, 1700000000)).value_or(false);
         CHECK_FALSE(not_modified);
@@ -84,8 +84,8 @@ TEST_CASE("conditionals: If-None-Match answers 304 and sets validators", "[tools
     }
     {
         // "*" matches anything current.
-        auto writer = std::make_shared<FakeResponseWriter>();
-        auto res = std::make_shared<Response>(writer);
+        auto writer = std::make_shared<FakeResponseSink>();
+        auto res = std::make_shared<ResponseWriter>(writer);
         auto req = make_request(ctx, "/doc", {{"if-none-match", "*"}});
         bool not_modified = run_on(ctx, maybe_not_modified(req, res, etag, 1700000000)).value_or(false);
         CHECK(not_modified);
@@ -97,8 +97,8 @@ TEST_CASE("conditionals: If-Modified-Since and non-GET skip", "[tools]") {
     const auto etag = make_etag(1700000000, 100, "id");
     {
         // Client's If-Modified-Since is not newer than the resource: 304.
-        auto writer = std::make_shared<FakeResponseWriter>();
-        auto res = std::make_shared<Response>(writer);
+        auto writer = std::make_shared<FakeResponseSink>();
+        auto res = std::make_shared<ResponseWriter>(writer);
         auto req = make_request(ctx, "/doc",
                                 {{"if-modified-since", http_date(1700000000 + 5000)}}); // client newer -> not modified
         bool not_modified = run_on(ctx, maybe_not_modified(req, res, etag, 1700000000)).value_or(false);
@@ -106,8 +106,8 @@ TEST_CASE("conditionals: If-Modified-Since and non-GET skip", "[tools]") {
     }
     {
         // Only If-Modified-Since, no ETag path.
-        auto writer = std::make_shared<FakeResponseWriter>();
-        auto res = std::make_shared<Response>(writer);
+        auto writer = std::make_shared<FakeResponseSink>();
+        auto res = std::make_shared<ResponseWriter>(writer);
         auto req =
             make_request(ctx, "/doc", {{"if-modified-since", http_date(1600000000)}}); // resource newer -> modified
         bool not_modified = run_on(ctx, maybe_not_modified(req, res, "", 1700000000)).value_or(false);
@@ -118,8 +118,8 @@ TEST_CASE("conditionals: If-Modified-Since and non-GET skip", "[tools]") {
         auto req = make_request(ctx, "/doc");
         req->set_method(Method::Post);
         req->mutable_headers().add_lower("if-none-match", std::string{etag});
-        auto writer = std::make_shared<FakeResponseWriter>();
-        auto res = std::make_shared<Response>(writer);
+        auto writer = std::make_shared<FakeResponseSink>();
+        auto res = std::make_shared<ResponseWriter>(writer);
         bool not_modified = run_on(ctx, maybe_not_modified(req, res, etag, 1700000000)).value_or(false);
         CHECK_FALSE(not_modified);
     }
@@ -161,7 +161,7 @@ TEST_CASE("real_ip: trusted entries accept CIDR prefixes", "[tools]") {
 
 TEST_CASE("access_log: the request id is included when request_id ran", "[tools]") {
     Router router;
-    auto writer0 = std::make_shared<FakeResponseWriter>();
+    auto writer0 = std::make_shared<FakeResponseSink>();
     ScopedLog capture;
     // request_id inside access_log, so the id is set before the after-phase.
     router.use(middleware::access_log());

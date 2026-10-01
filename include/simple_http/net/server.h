@@ -315,11 +315,11 @@ class Server {
     }
 #endif
 
-    Server &http_proxy(std::string path, HttpProxyTarget target, ClientConfig client_cfg = {}) {
+    Server &http_proxy(std::string path, HttpProxyTarget target, simple_http::ClientConfig client_cfg = {}) {
         m_router->http_proxy(std::move(path), std::move(target), std::move(client_cfg));
         return *this;
     }
-    Server &http_proxy_regex(const std::string &pattern, HttpProxyTarget target, ClientConfig client_cfg = {}) {
+    Server &http_proxy_regex(const std::string &pattern, HttpProxyTarget target, simple_http::ClientConfig client_cfg = {}) {
         m_router->http_proxy_regex(pattern, std::move(target), std::move(client_cfg));
         return *this;
     }
@@ -478,7 +478,7 @@ class Server {
 
     Dispatcher make_dispatcher() {
         auto router = m_router;
-        return [router](std::shared_ptr<Request> req, std::shared_ptr<Response> res,
+        return [router](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res,
                         SslHandle ssl) -> asio::awaitable<void> {
             co_await router->dispatch(std::move(req), std::move(res), ssl);
         };
@@ -772,7 +772,7 @@ class Server {
             // writer and keeps itself alive from the handlers it spawns, so it has
             // to outlive run() for the same reason the HTTP/2 engine does.
             auto engine = std::make_shared<Http3Engine<QuicConnectionType>>(conn, limits);
-            co_await engine->run([router](std::shared_ptr<Request> req, std::shared_ptr<Response> res,
+            co_await engine->run([router](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res,
                                           SslHandle ssl) -> asio::awaitable<void> {
                 co_await router->dispatch(std::move(req), std::move(res), ssl);
             });

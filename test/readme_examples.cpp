@@ -68,35 +68,31 @@ simple_http::ServerConfig readme_unix_config() {
 // --- Client (README → Quick Start) -------------------------------------------
 
 asio::awaitable<void> readme_client() {
-    simple_http::HttpClient http; // default policy
+    simple_http::Client http; // default policy
 
-    auto r = co_await http.get("https://example.com/");
+    auto r = co_await http.get("https://example.com/").send();
     if (!r) {
         co_return;
     }
-    (void)r->status;
-    (void)simple_http::to_string(r->version);
-    (void)r->body.size();
+    (void)r->status();
+    (void)r->version();
+    (void)r->bodyless();
+    auto body = co_await r->read_all();
+    (void)body;
 }
 
 asio::awaitable<void> readme_client_streaming() {
-    simple_http::HttpClient http;
-    simple_http::ClientTarget target{.host = "127.0.0.1", .port = 7789, .use_tls = true};
-    auto session = co_await http.connect(target);
-    if (!session)
+    simple_http::Client http;
+    auto up = co_await http.open_stream("https://example.com/upload", {.method = simple_http::Method::Post});
+    if (!up)
         co_return;
 
-    simple_http::RequestSpec spec{.method = simple_http::Method::Post, .target = "/upload", .stream_body = true};
-    auto stream = co_await (*session)->open_stream(spec);
-    if (!stream)
-        co_return;
+    co_await up->write("hello "); // body chunks…
+    co_await up->finish("world"); // …and the end of the body
 
-    co_await (*stream)->write("hello "); // body chunks…
-    co_await (*stream)->finish("world"); // …and the end of the body
-
-    auto head = co_await (*stream)->read_head(); // status + headers
+    auto head = co_await up->read_head(); // status + headers
     (void)head->status;
-    while (auto chunk = co_await (*stream)->read()) { // then the body
+    while (auto chunk = co_await up->read()) { // then the body
         if (chunk->eof)
             break;
         (void)chunk->data;

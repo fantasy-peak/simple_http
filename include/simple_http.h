@@ -81,8 +81,8 @@
 #include "simple_http/net/server.h"
 
 // --- client layer (outbound requests; HTTP/1.1 + HTTP/2 over TCP/TLS) ---
-// The public client API is simple_http::http (client/http.h). The legacy
-// client types (HttpClient / ClientSession / …) remain only as the engine
-// behind it — they are no longer aggregated here.
+// The public client API is simple_http::http (client/http.h). The session-layer
+// engine (detail::ClientEngine / ClientStream / …) lives under simple_http::http::detail
+// — it is internal, and only the http:: facade is aggregated here.
 #include "simple_http/client/cookie_jar.h" // CookieJar (ClientConfig::cookie_jar)
 #include "simple_http/client/http.h"       // the http:: client: Client / RequestBuilder / Stream / Response

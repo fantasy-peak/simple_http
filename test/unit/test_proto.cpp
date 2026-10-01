@@ -1,4 +1,4 @@
-// proto/: the version-agnostic HTTP model — Headers, Body, Request, Response.
+// proto/: the version-agnostic HTTP model — Headers, Body, Request, ResponseWriter.
 
 #include <catch2/catch_test_macros.hpp>
 #include <memory>
@@ -271,14 +271,14 @@ TEST_CASE("proto/request: target splitting and method tokens", "[proto]") {
     CHECK(req.method() == Method::Post);
 }
 
-// --- Response + a fake writer ------------------------------------------------
+// --- ResponseWriter + a fake writer ------------------------------------------------
 
 TEST_CASE("proto/response: defaults are filled in but never override", "[proto]") {
     asio::io_context ctx;
-    auto writer = std::make_shared<FakeResponseWriter>();
+    auto writer = std::make_shared<FakeResponseSink>();
 
     {
-        Response res{writer};
+        ResponseWriter res{writer};
         REQUIRE(run_on(ctx, res.status(201).send("created")));
         CHECK(writer->last_status == 201);
         CHECK(writer->last_body == "created");
@@ -286,8 +286,8 @@ TEST_CASE("proto/response: defaults are filled in but never override", "[proto]"
         CHECK(writer->header("server") == std::string{server_version});
     }
     {
-        auto w2 = std::make_shared<FakeResponseWriter>();
-        Response res{w2};
+        auto w2 = std::make_shared<FakeResponseSink>();
+        ResponseWriter res{w2};
         REQUIRE(run_on(ctx, res.status(200).content_type("application/json").header("server", "mine").send("{}")));
         CHECK(w2->header("content-type") == "application/json");
         CHECK(w2->header("server") == "mine"); // explicit values win
@@ -296,8 +296,8 @@ TEST_CASE("proto/response: defaults are filled in but never override", "[proto]"
 
 TEST_CASE("proto/response: bodyless, streaming and state forwarding", "[proto]") {
     asio::io_context ctx;
-    auto writer = std::make_shared<FakeResponseWriter>();
-    Response res{writer};
+    auto writer = std::make_shared<FakeResponseSink>();
+    ResponseWriter res{writer};
 
     auto open = run_on(ctx, res.connected());
     REQUIRE(open.has_value());
@@ -327,7 +327,7 @@ TEST_CASE("proto/response: bodyless, streaming and state forwarding", "[proto]")
 
 TEST_CASE("proto/response: a writer error is reported to the caller", "[proto]") {
     // The fake reports success; a writer that fails must surface through send().
-    class FailingWriter : public FakeResponseWriter {
+    class FailingWriter : public FakeResponseSink {
       public:
         asio::awaitable<error_code> send(int, Headers, std::string) override {
             co_return make_error_code(asio::error::broken_pipe);
@@ -336,7 +336,7 @@ TEST_CASE("proto/response: a writer error is reported to the caller", "[proto]")
 
     asio::io_context ctx;
     auto writer = std::make_shared<FailingWriter>();
-    Response res{writer};
+    ResponseWriter res{writer};
     auto ec = run_on(ctx, res.send("x"));
     REQUIRE(ec.has_value());
     CHECK(*ec == asio::error::broken_pipe);

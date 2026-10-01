@@ -5,7 +5,7 @@
 // filesystem" is what makes traversal, symlink escape and TOCTOU structural
 // rather than checked, so it is tested by trying to break it rather than by
 // asserting the checks exist. The second half drives real requests through
-// FakeResponseWriter and is about the wire, where several header values are set
+// FakeResponseSink and is about the wire, where several header values are set
 // by hand for reasons that are easy to lose.
 
 #include <catch2/catch_test_macros.hpp>
@@ -56,13 +56,13 @@ std::shared_ptr<StaticFiles> load_standard(const StaticFixture &fx, StaticFilesC
 // The result of one request: the recorded writer, and whether the site claimed
 // it.
 struct Served {
-    std::shared_ptr<FakeResponseWriter> writer;
+    std::shared_ptr<FakeResponseSink> writer;
     bool handled = false;
 };
 
 Served serve(const StaticFiles &site, asio::io_context &ctx, const RequestPtr &req) {
-    auto writer = std::make_shared<FakeResponseWriter>();
-    auto res = std::make_shared<Response>(writer);
+    auto writer = std::make_shared<FakeResponseSink>();
+    auto res = std::make_shared<ResponseWriter>(writer);
     auto handled = run_on(ctx, site.try_serve(req, res));
     REQUIRE(handled.has_value());
     return Served{writer, *handled};
@@ -618,8 +618,8 @@ TEST_CASE("static: the 404 page is served when there is one", "[static]") {
     auto site = load_standard(fx);
 
     asio::io_context ctx;
-    auto writer = std::make_shared<FakeResponseWriter>();
-    auto res = std::make_shared<Response>(writer);
+    auto writer = std::make_shared<FakeResponseSink>();
+    auto res = std::make_shared<ResponseWriter>(writer);
     auto req = make_request(ctx, "/nope");
     REQUIRE(run_on(ctx, site->serve_not_found(req, res)));
 
@@ -634,8 +634,8 @@ TEST_CASE("static: the 404 is plain text when the site has no page", "[static]")
     auto site = load_standard(fx);
 
     asio::io_context ctx;
-    auto writer = std::make_shared<FakeResponseWriter>();
-    auto res = std::make_shared<Response>(writer);
+    auto writer = std::make_shared<FakeResponseSink>();
+    auto res = std::make_shared<ResponseWriter>(writer);
     auto req = make_request(ctx, "/nope");
     REQUIRE(run_on(ctx, site->serve_not_found(req, res)));
 
@@ -658,7 +658,7 @@ TEST_CASE("static: no response ever carries a header twice", "[static]") {
     // Response::header() and content_type() both *append*, and this module has
     // six different exit paths each setting five to eight headers. A duplicate is
     // the failure mode that a single path would not show.
-    auto check_once = [](const std::shared_ptr<FakeResponseWriter> &w, const char *what) {
+    auto check_once = [](const std::shared_ptr<FakeResponseSink> &w, const char *what) {
         INFO("response kind: " << what);
         for (const auto &[name, value] : w->last_headers) {
             (void)value;
@@ -714,8 +714,8 @@ TEST_CASE("static: no response ever carries a header twice", "[static]") {
         check_once(r.writer, "SPA fallback");
     }
     {
-        auto writer = std::make_shared<FakeResponseWriter>();
-        auto res = std::make_shared<Response>(writer);
+        auto writer = std::make_shared<FakeResponseSink>();
+        auto res = std::make_shared<ResponseWriter>(writer);
         auto req = make_request(ctx, "/nope");
         REQUIRE(run_on(ctx, site->serve_not_found(req, res)));
         check_once(writer, "404");

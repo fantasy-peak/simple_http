@@ -45,7 +45,7 @@
 #include "../proto/headers.h"
 #include "client_config.h"
 
-namespace simple_http {
+namespace simple_http::detail {
 
 namespace asio = boost::asio;
 
@@ -203,4 +203,4 @@ class ClientSession {
     virtual void disarm_idle_close() = 0;
 };
 
-} // namespace simple_http
+} // namespace simple_http::detail

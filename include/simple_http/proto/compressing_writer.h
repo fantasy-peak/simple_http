@@ -1,6 +1,6 @@
 #pragma once
 
-// CompressingResponseWriter: wraps an engine's ResponseWriter and compresses
+// CompressingResponseSink: wraps an engine's ResponseSink and compresses
 // the body when the client asked for it and the response is worth compressing.
 //
 // It is installed at the two places a Response is built (h1_engine.h and
@@ -44,9 +44,9 @@ namespace simple_http {
 
 namespace asio = boost::asio;
 
-class CompressingResponseWriter final : public ResponseWriter {
+class CompressingResponseSink final : public ResponseSink {
   public:
-    CompressingResponseWriter(std::shared_ptr<ResponseWriter> inner, asio::any_io_executor executor,
+    CompressingResponseSink(std::shared_ptr<ResponseSink> inner, asio::any_io_executor executor,
                               CompressionConfig config, std::string encoding, bool head_request)
         : m_inner(std::move(inner)), m_executor(std::move(executor)), m_config(std::move(config)),
           m_encoding(std::move(encoding)), m_head_request(head_request) {}
@@ -262,7 +262,7 @@ class CompressingResponseWriter final : public ResponseWriter {
         return packed;
     }
 
-    std::shared_ptr<ResponseWriter> m_inner;
+    std::shared_ptr<ResponseSink> m_inner;
     asio::any_io_executor m_executor;
     CompressionConfig m_config;
     std::string m_encoding;
@@ -275,7 +275,7 @@ class CompressingResponseWriter final : public ResponseWriter {
 // The engine-side entry point. Returns `inner` unchanged when compression is
 // off, no codec is compiled in, or the client accepts none of what we produce -
 // in which case not a single extra object is allocated.
-inline std::shared_ptr<ResponseWriter> maybe_compress_writer(std::shared_ptr<ResponseWriter> inner,
+inline std::shared_ptr<ResponseSink> maybe_compress_writer(std::shared_ptr<ResponseSink> inner,
                                                              asio::any_io_executor executor,
                                                              const CompressionConfig &config,
                                                              std::string_view accept_encoding, bool head_request) {
@@ -283,7 +283,7 @@ inline std::shared_ptr<ResponseWriter> maybe_compress_writer(std::shared_ptr<Res
     if (!encoding) {
         return inner;
     }
-    return std::make_shared<CompressingResponseWriter>(std::move(inner), std::move(executor), config,
+    return std::make_shared<CompressingResponseSink>(std::move(inner), std::move(executor), config,
                                                        std::move(*encoding), head_request);
 }
 

@@ -23,7 +23,7 @@ namespace simple_http {
 
 namespace asio = boost::asio;
 
-using Dispatcher = std::function<asio::awaitable<void>(std::shared_ptr<Request>, std::shared_ptr<Response>, SslHandle)>;
+using Dispatcher = std::function<asio::awaitable<void>(std::shared_ptr<Request>, std::shared_ptr<ResponseWriter>, SslHandle)>;
 
 // The WebSocket handler shape (mirrors handler layer's WsHandler).
 using WsHandlerFn = std::function<asio::awaitable<void>(std::shared_ptr<Request>, std::shared_ptr<WebSocket>)>;

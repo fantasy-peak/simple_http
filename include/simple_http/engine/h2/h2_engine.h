@@ -15,13 +15,13 @@
 // fresh HPACK response encoder (hpack_encoder.h). All connection state
 // (stream table, HPACK decoder, flow-control windows, output buffer) is touched
 // only on the single-threaded connection executor. Per "model A", every
-// Http2ResponseWriter operation hops onto that executor before touching engine
+// Http2ResponseSink operation hops onto that executor before touching engine
 // state, so a Response used from any thread stays safe.
 //
 // Lifetime: the engine is held by shared_ptr; handler coroutines capture it, so
 // it (and the stream state) outlives every in-flight handler, including
 // streaming handlers that suspend after run() would otherwise have returned.
-// Http2ResponseWriter holds a weak_ptr and lock()s it per operation.
+// Http2ResponseSink holds a weak_ptr and lock()s it per operation.
 
 #include <array>
 #include <boost/asio.hpp>
@@ -87,13 +87,13 @@ inline constexpr std::size_t kH2MaxFrameSize = 16384;
 inline constexpr std::size_t kOutHighWatermark = 1u << 20;  // 1 MiB: park the producer
 inline constexpr std::size_t kOutLowWatermark = 256u << 10; // 256 KiB: wake it again
 
-// ResponseWriter for a single HTTP/2 stream. Holds a weak_ptr to the engine so
+// ResponseSink for a single HTTP/2 stream. Holds a weak_ptr to the engine so
 // it can be used safely from any thread and after the connection has closed.
-template <TransportLike Transport> class Http2ResponseWriter : public ResponseWriter {
+template <TransportLike Transport> class Http2ResponseSink : public ResponseSink {
   public:
     using Executor = decltype(std::declval<Transport &>().get_executor());
 
-    Http2ResponseWriter(std::weak_ptr<Http2Engine<Transport>> engine, std::uint32_t stream_id, Executor exec)
+    Http2ResponseSink(std::weak_ptr<Http2Engine<Transport>> engine, std::uint32_t stream_id, Executor exec)
         : m_engine(std::move(engine)), m_stream_id(stream_id), m_executor(exec) {}
 
     asio::awaitable<error_code> send(int status, Headers headers, std::string body) override {
@@ -263,7 +263,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
     // Wake the write loop to drain pending frames / DATA.
     void flush() { (void)m_notify.try_send(error_code{}); }
 
-    // --- called by Http2ResponseWriter (already hopped onto our executor) ---
+    // --- called by Http2ResponseSink (already hopped onto our executor) ---
 
     // Serialize a response HEADERS block for `stream_id` into the control-frame
     // output queue. Connection-specific headers illegal in HTTP/2 are dropped.
@@ -407,7 +407,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
   private:
     struct Stream {
         std::shared_ptr<Request> request;
-        std::shared_ptr<Http2ResponseWriter<Transport>> writer;
+        std::shared_ptr<Http2ResponseSink<Transport>> writer;
         std::string header_block; // accumulates HEADERS + CONTINUATION
 
         // Outbound response body: a queue of chunks the write loop drains into
@@ -551,7 +551,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
             Stream &st = it->second;
             st.id = stream_id;
             st.request = std::make_shared<Request>(Version::Http2, m_executor, m_transport->peer());
-            st.writer = std::make_shared<Http2ResponseWriter<Transport>>(this->weak_from_this(), stream_id, m_executor);
+            st.writer = std::make_shared<Http2ResponseSink<Transport>>(this->weak_from_this(), stream_id, m_executor);
             st.send_window = m_peer_initial_window;
             st.recv_window = m_limits.h2_initial_window; // our advertised per-stream window
 
@@ -892,7 +892,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
 
         // Refuse streams beyond the concurrency limit we advertise (RFC 9113
         // §5.1.2): each accepted stream allocates a Request (with its Body
-        // channel), a ResponseWriter and a handler coroutine, so an unbounded
+        // channel), a ResponseSink and a handler coroutine, so an unbounded
         // stream count is an unbounded resource commitment.
         if (m_streams.find(hdr.stream_id) == m_streams.end() &&
             m_streams.size() >= m_limits.h2_max_concurrent_streams) {
@@ -1602,7 +1602,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                 // Same wrapper as h1: see the note there. `writer` stays in the
                 // engine's hands for stream bookkeeping; only the Response gets
                 // the compressing view.
-                auto response = std::make_shared<Response>(
+                auto response = std::make_shared<ResponseWriter>(
                     maybe_compress_writer(writer, self->m_executor, self->m_limits.compression,
                                           request->header("accept-encoding").value_or(std::string_view{}),
                                           request->method() == Method::Head));
@@ -1653,7 +1653,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
     // reading ahead of a handler that is not draining its body.
     bool m_body_paused = false;
 
-    friend class Http2ResponseWriter<Transport>;
+    friend class Http2ResponseSink<Transport>;
 }; // class Http2Engine
 
 } // namespace simple_http

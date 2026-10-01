@@ -96,16 +96,16 @@ inline constexpr std::size_t kH3QpackBlockedStreams = 16;
 
 template <typename Connection> class Http3Engine;
 
-// ResponseWriter for one HTTP/3 request stream. Holds a weak_ptr to the engine
+// ResponseSink for one HTTP/3 request stream. Holds a weak_ptr to the engine
 // so it can be used from any thread and after the connection has closed.
 //
 // Every method hops onto the connection executor first: the stream table lives
 // there, and so does every nghttp3 call it makes.
-template <typename Connection> class Http3ResponseWriter : public ResponseWriter {
+template <typename Connection> class Http3ResponseSink : public ResponseSink {
   public:
     using Executor = typename Connection::executor_type;
 
-    Http3ResponseWriter(std::weak_ptr<Http3Engine<Connection>> engine, std::int64_t stream_id, Executor exec)
+    Http3ResponseSink(std::weak_ptr<Http3Engine<Connection>> engine, std::int64_t stream_id, Executor exec)
         : m_engine(std::move(engine)), m_stream_id(stream_id), m_executor(exec) {}
 
     asio::awaitable<error_code> send(int status, Headers headers, std::string body) override {
@@ -279,7 +279,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
     // `next_stream_data()` — so this is the connection's.
     void flush() { m_conn->flush(); }
 
-    // --- called by Http3ResponseWriter (already hopped onto our executor) ---
+    // --- called by Http3ResponseSink (already hopped onto our executor) ---
 
     // Status and headers for `stream_id`. `with_body` installs the data reader
     // that will feed the body; `end_stream` says nothing follows the headers.
@@ -940,8 +940,8 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
             return;
         stream.dispatched = true;
 
-        auto writer = std::make_shared<Http3ResponseWriter<Connection>>(this->weak_from_this(), stream_id, m_executor);
-        stream.response = std::make_shared<Response>(maybe_compress_writer(
+        auto writer = std::make_shared<Http3ResponseSink<Connection>>(this->weak_from_this(), stream_id, m_executor);
+        stream.response = std::make_shared<ResponseWriter>(maybe_compress_writer(
             writer, m_executor, m_limits.compression,
             stream.request->header("accept-encoding").value_or(std::string_view{}), stream.is_head));
 

@@ -34,7 +34,7 @@ class CookieJar {
     // (Max-Age in the past / a past Expires) are dropped from the jar.
     void store(std::string_view url, const Headers &headers) {
         std::lock_guard<std::mutex> lock(m_mutex);
-        const Url parsed = parse_url(url).value_or(Url{});
+        const detail::Url parsed = detail::parse_url(url).value_or(detail::Url{});
         for (const auto &[name, value] : headers) {
             if (name != "set-cookie") {
                 continue;
@@ -51,7 +51,7 @@ class CookieJar {
     // matches. Cookies are joined without regard to duplicate names.
     std::string cookie_header(std::string_view url) const {
         std::lock_guard<std::mutex> lock(m_mutex);
-        const Url parsed = parse_url(url).value_or(Url{});
+        const detail::Url parsed = detail::parse_url(url).value_or(detail::Url{});
         std::string out;
         for (const auto &cookie : m_cookies) {
             if (!matches(cookie, parsed)) {
@@ -98,7 +98,7 @@ class CookieJar {
     // host-only, or a '.'-bounded suffix otherwise (a Domain of "example.com"
     // matches "example.com" and "app.example.com" but not "notexample.com").
     // Path: the request path must begin with the cookie's. Secure: https only.
-    static bool matches(const Cookie &cookie, const Url &url) {
+    static bool matches(const Cookie &cookie, const detail::Url &url) {
         if (url.scheme != "https" && cookie.secure) {
             return false;
         }
@@ -137,7 +137,7 @@ class CookieJar {
 
     // Parses one "name=value; Domain=...; ..." header against the request URL
     // that produced it (defaults: host-only, path = the request's directory).
-    static std::optional<Cookie> parse_set_cookie(std::string_view header, const Url &url) {
+    static std::optional<Cookie> parse_set_cookie(std::string_view header, const detail::Url &url) {
         const std::size_t semi = header.find(';');
         const std::size_t eq = header.find('=');
         if (eq == std::string_view::npos) {

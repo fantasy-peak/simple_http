@@ -34,7 +34,7 @@
 #include "client_config.h"
 #include "client_stream.h"
 
-namespace simple_http {
+namespace simple_http::detail {
 
 struct PoolKey {
     const void *executor{nullptr}; // executor identity (its io_context)
@@ -156,4 +156,4 @@ class ClientPool {
     std::size_t m_reused{0};
 };
 
-} // namespace simple_http
+} // namespace simple_http::detail

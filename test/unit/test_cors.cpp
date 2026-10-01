@@ -33,9 +33,9 @@ Handler flag_handler(bool &ran, std::string body = "real") {
 
 // Dispatches one request and hands back the fake writer, so a case reads as
 // request -> assertions on the recorded status, body and headers.
-std::shared_ptr<FakeResponseWriter> dispatch(asio::io_context &ctx, Router &router, RequestPtr req) {
-    auto writer = std::make_shared<FakeResponseWriter>();
-    auto res = std::make_shared<Response>(writer);
+std::shared_ptr<FakeResponseSink> dispatch(asio::io_context &ctx, Router &router, RequestPtr req) {
+    auto writer = std::make_shared<FakeResponseSink>();
+    auto res = std::make_shared<ResponseWriter>(writer);
     REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
     return writer;
 }

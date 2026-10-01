@@ -35,7 +35,7 @@ namespace simple_http {
 namespace asio = boost::asio;
 
 using RequestPtr = std::shared_ptr<Request>;
-using ResponsePtr = std::shared_ptr<Response>;
+using ResponsePtr = std::shared_ptr<ResponseWriter>;
 
 using CoroHandler = std::function<asio::awaitable<void>(RequestPtr, ResponsePtr)>;
 using CoroSslHandler = std::function<asio::awaitable<void>(RequestPtr, ResponsePtr, SslHandle)>;

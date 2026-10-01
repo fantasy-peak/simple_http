@@ -1,6 +1,6 @@
 #pragma once
 
-// ResponseWriter: the polymorphic, version-collapsing response backend.
+// ResponseSink: the polymorphic, version-collapsing response backend.
 //
 // Every protocol engine supplies a concrete writer. Every operation that
 // touches the transport or the engine - the writes below and the connection
@@ -23,9 +23,9 @@ namespace simple_http {
 
 namespace asio = boost::asio;
 
-class ResponseWriter {
+class ResponseSink {
   public:
-    virtual ~ResponseWriter() = default;
+    virtual ~ResponseSink() = default;
 
     // One-shot: status + headers + full body, framed optimally per protocol
     // (e.g. HTTP/1.x sets Content-Length).

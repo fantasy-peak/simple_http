@@ -20,7 +20,7 @@
 // io_context. Every public operation that touches connection state
 // (read/write/close) first hops onto that connection's executor before doing
 // so, which is what makes the handle safe to use from any coroutine or thread —
-// matching the guarantee the HTTP/2 ResponseWriter gives. Two exceptions:
+// matching the guarantee the HTTP/2 ResponseSink gives. Two exceptions:
 // is_open() is a synchronous snapshot of a flag (atomic, so reading it from
 // anywhere is race-free, though it can be a moment stale), and the destructor,
 // which cannot hop but posts instead - so the handle may be destroyed from any

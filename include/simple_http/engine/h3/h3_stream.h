@@ -69,7 +69,7 @@ struct H3Stream {
 
     // --- request ------------------------------------------------------------
     std::shared_ptr<Request> request;
-    std::shared_ptr<Response> response;
+    std::shared_ptr<ResponseWriter> response;
     // Collected by the header callbacks, applied in `finish_request()`: a real
     // Host field has to win over the one synthesised from :authority, and the
     // fields arrive in wire order, so which comes first is the peer's choice.

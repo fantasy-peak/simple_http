@@ -21,9 +21,9 @@ RequestPtr make_request(asio::io_context &ctx, std::string path, Method method =
     return req;
 }
 
-std::shared_ptr<FakeResponseWriter> dispatch(asio::io_context &ctx, Router &router, RequestPtr req) {
-    auto writer = std::make_shared<FakeResponseWriter>();
-    auto res = std::make_shared<Response>(writer);
+std::shared_ptr<FakeResponseSink> dispatch(asio::io_context &ctx, Router &router, RequestPtr req) {
+    auto writer = std::make_shared<FakeResponseSink>();
+    auto res = std::make_shared<ResponseWriter>(writer);
     REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
     return writer;
 }

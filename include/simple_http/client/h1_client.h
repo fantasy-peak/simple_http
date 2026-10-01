@@ -54,7 +54,7 @@
 #include "client_config.h"
 #include "client_stream.h"
 
-namespace simple_http {
+namespace simple_http::detail {
 
 namespace asio = boost::asio;
 
@@ -1032,4 +1032,4 @@ class Http1ClientSession final : public ClientSession,
     std::string m_upgrade_settings;
 };
 
-} // namespace simple_http
+} // namespace simple_http::detail

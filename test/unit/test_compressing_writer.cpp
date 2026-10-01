@@ -1,5 +1,5 @@
 // proto/compressing_writer.h: the decorator's method mapping and its boundary
-// rules. Driven against the recording FakeResponseWriter so every decision -
+// rules. Driven against the recording FakeResponseSink so every decision -
 // what reached the engine, and with which headers - is observable.
 
 #include <catch2/catch_test_macros.hpp>
@@ -60,7 +60,7 @@ template <typename T> void ok(asio::io_context &ctx, asio::awaitable<T> op) {
 
 TEST_CASE("compressing_writer: off means the writer is not wrapped", "[compression]") {
     asio::io_context ctx;
-    auto inner = std::make_shared<FakeResponseWriter>();
+    auto inner = std::make_shared<FakeResponseSink>();
 
     // Disabled, and enabled-but-nothing-acceptable, both hand back the same
     // object: no allocation, no behaviour change.
@@ -72,8 +72,8 @@ TEST_CASE("compressing_writer: off means the writer is not wrapped", "[compressi
 
 TEST_CASE("compressing_writer: a one-shot text response is compressed", "[compression]") {
     asio::io_context ctx;
-    auto inner = std::make_shared<FakeResponseWriter>();
-    CompressingResponseWriter writer(inner, ctx.get_executor(), enabled(), "gzip", false);
+    auto inner = std::make_shared<FakeResponseSink>();
+    CompressingResponseSink writer(inner, ctx.get_executor(), enabled(), "gzip", false);
 
     const std::string body = big_text();
     ok(ctx, writer.send(200, text_headers(), body));
@@ -90,9 +90,9 @@ TEST_CASE("compressing_writer: Content-Length follows the protocol", "[compressi
 
     SECTION("HTTP/2 gets the compressed length (its engine never recomputes)") {
         asio::io_context ctx;
-        auto inner = std::make_shared<FakeResponseWriter>();
+        auto inner = std::make_shared<FakeResponseSink>();
         inner->ver = Version::Http2;
-        CompressingResponseWriter writer(inner, ctx.get_executor(), enabled(), "gzip", false);
+        CompressingResponseSink writer(inner, ctx.get_executor(), enabled(), "gzip", false);
         ok(ctx, writer.send(200, text_headers(), body));
 
         REQUIRE(inner->has_header("content-length"));
@@ -101,9 +101,9 @@ TEST_CASE("compressing_writer: Content-Length follows the protocol", "[compressi
 
     SECTION("HTTP/1.x gets none (its engine writes its own)") {
         asio::io_context ctx;
-        auto inner = std::make_shared<FakeResponseWriter>();
+        auto inner = std::make_shared<FakeResponseSink>();
         inner->ver = Version::Http11;
-        CompressingResponseWriter writer(inner, ctx.get_executor(), enabled(), "gzip", false);
+        CompressingResponseSink writer(inner, ctx.get_executor(), enabled(), "gzip", false);
         ok(ctx, writer.send(200, text_headers(), body));
 
         // A second Content-Length would be a smuggling vector downstream.
@@ -116,8 +116,8 @@ TEST_CASE("compressing_writer: headers that forbid or predate compression", "[co
 
     const auto run_case = [&](Headers headers, int status, bool head, const char *label) {
         asio::io_context ctx;
-        auto inner = std::make_shared<FakeResponseWriter>();
-        CompressingResponseWriter writer(inner, ctx.get_executor(), enabled(), "gzip", head);
+        auto inner = std::make_shared<FakeResponseSink>();
+        CompressingResponseSink writer(inner, ctx.get_executor(), enabled(), "gzip", head);
         ok(ctx, writer.send(status, std::move(headers), body));
 
         INFO(label);
@@ -129,8 +129,8 @@ TEST_CASE("compressing_writer: headers that forbid or predate compression", "[co
         // Encoded as "br" on purpose: if the decorator compressed anyway and
         // rewrote the field, it would read back as "gzip" and this catches it.
         asio::io_context ctx;
-        auto inner = std::make_shared<FakeResponseWriter>();
-        CompressingResponseWriter writer(inner, ctx.get_executor(), enabled(), "gzip", false);
+        auto inner = std::make_shared<FakeResponseSink>();
+        CompressingResponseSink writer(inner, ctx.get_executor(), enabled(), "gzip", false);
 
         Headers h = text_headers();
         h.add("content-encoding", "br");
@@ -164,8 +164,8 @@ TEST_CASE("compressing_writer: headers that forbid or predate compression", "[co
 TEST_CASE("compressing_writer: small and incompressible bodies pass through", "[compression]") {
     SECTION("below min_bytes") {
         asio::io_context ctx;
-        auto inner = std::make_shared<FakeResponseWriter>();
-        CompressingResponseWriter writer(inner, ctx.get_executor(), enabled(1024), "gzip", false);
+        auto inner = std::make_shared<FakeResponseSink>();
+        CompressingResponseSink writer(inner, ctx.get_executor(), enabled(1024), "gzip", false);
         const std::string body = "tiny";
         ok(ctx, writer.send(200, text_headers(), body));
 
@@ -175,8 +175,8 @@ TEST_CASE("compressing_writer: small and incompressible bodies pass through", "[
 
     SECTION("compression would make it bigger") {
         asio::io_context ctx;
-        auto inner = std::make_shared<FakeResponseWriter>();
-        CompressingResponseWriter writer(inner, ctx.get_executor(), enabled(), "gzip", false);
+        auto inner = std::make_shared<FakeResponseSink>();
+        CompressingResponseSink writer(inner, ctx.get_executor(), enabled(), "gzip", false);
         const std::string body = incompressible(8192);
         ok(ctx, writer.send(200, text_headers(), body));
 
@@ -190,8 +190,8 @@ TEST_CASE("compressing_writer: small and incompressible bodies pass through", "[
 
 TEST_CASE("compressing_writer: Vary and ETag are maintained", "[compression]") {
     asio::io_context ctx;
-    auto inner = std::make_shared<FakeResponseWriter>();
-    CompressingResponseWriter writer(inner, ctx.get_executor(), enabled(), "gzip", false);
+    auto inner = std::make_shared<FakeResponseSink>();
+    CompressingResponseSink writer(inner, ctx.get_executor(), enabled(), "gzip", false);
 
     Headers headers = text_headers();
     headers.add("vary", "Origin");
@@ -206,9 +206,9 @@ TEST_CASE("compressing_writer: Vary and ETag are maintained", "[compression]") {
 
 TEST_CASE("compressing_writer: streaming", "[compression]") {
     asio::io_context ctx;
-    auto inner = std::make_shared<FakeResponseWriter>();
+    auto inner = std::make_shared<FakeResponseSink>();
     inner->ver = Version::Http2; // so the length rule is exercised the strict way
-    CompressingResponseWriter writer(inner, ctx.get_executor(), enabled(), "gzip", false);
+    CompressingResponseSink writer(inner, ctx.get_executor(), enabled(), "gzip", false);
     ok(ctx, writer.send_headers(200, text_headers()));
 
     const std::string part1 = big_text();
@@ -235,8 +235,8 @@ TEST_CASE("compressing_writer: a codec that buffers emits nothing, not an empty 
           "chunk",
           "[compression]") {
     asio::io_context ctx;
-    auto inner = std::make_shared<FakeResponseWriter>();
-    CompressingResponseWriter writer(inner, ctx.get_executor(), enabled(), "gzip", false);
+    auto inner = std::make_shared<FakeResponseSink>();
+    CompressingResponseSink writer(inner, ctx.get_executor(), enabled(), "gzip", false);
     ok(ctx, writer.send_headers(200, text_headers()));
 
     // One byte at a time: the codec will not produce output for most of these,
@@ -257,8 +257,8 @@ TEST_CASE("compressing_writer: a codec that buffers emits nothing, not an empty 
 
 TEST_CASE("compressing_writer: bodyless and control responses pass straight through", "[compression]") {
     asio::io_context ctx;
-    auto inner = std::make_shared<FakeResponseWriter>();
-    CompressingResponseWriter writer(inner, ctx.get_executor(), enabled(), "gzip", false);
+    auto inner = std::make_shared<FakeResponseSink>();
+    CompressingResponseSink writer(inner, ctx.get_executor(), enabled(), "gzip", false);
 
     Headers headers = text_headers();
     ok(ctx, writer.send_bodyless(204, headers));
@@ -279,8 +279,8 @@ TEST_CASE("compressing_writer: bodyless and control responses pass straight thro
 
 TEST_CASE("compressing_writer: brotli is used when negotiated", "[compression]") {
     asio::io_context ctx;
-    auto inner = std::make_shared<FakeResponseWriter>();
-    CompressingResponseWriter writer(inner, ctx.get_executor(), enabled(), "br", false);
+    auto inner = std::make_shared<FakeResponseSink>();
+    CompressingResponseSink writer(inner, ctx.get_executor(), enabled(), "br", false);
 
     const std::string body = big_text();
     ok(ctx, writer.send(200, text_headers(), body));

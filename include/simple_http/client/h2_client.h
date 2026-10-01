@@ -65,7 +65,7 @@
 #include "client_config.h"
 #include "client_stream.h"
 
-namespace simple_http {
+namespace simple_http::detail {
 
 namespace asio = boost::asio;
 
@@ -1557,4 +1557,4 @@ class Http2ClientSession final : public ClientSession,
     bool m_goaway_received{false};
 };
 
-} // namespace simple_http
+} // namespace simple_http::detail

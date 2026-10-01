@@ -27,9 +27,9 @@ RequestPtr make_request(asio::io_context &ctx, std::string target, Method method
     return req;
 }
 
-std::shared_ptr<FakeResponseWriter> dispatch(asio::io_context &ctx, Router &router, RequestPtr req) {
-    auto writer = std::make_shared<FakeResponseWriter>();
-    auto res = std::make_shared<Response>(writer);
+std::shared_ptr<FakeResponseSink> dispatch(asio::io_context &ctx, Router &router, RequestPtr req) {
+    auto writer = std::make_shared<FakeResponseSink>();
+    auto res = std::make_shared<ResponseWriter>(writer);
     REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
     return writer;
 }
@@ -137,12 +137,12 @@ TEST_CASE("proto/request: cookie() picks a name from the Cookie header", "[forms
 
 TEST_CASE("proto/response: set_cookie formats a Set-Cookie header", "[forms]") {
     asio::io_context ctx;
-    auto writer = std::make_shared<FakeResponseWriter>();
-    auto res = std::make_shared<Response>(writer);
+    auto writer = std::make_shared<FakeResponseSink>();
+    auto res = std::make_shared<ResponseWriter>(writer);
     REQUIRE(run_on(ctx, res->status(200).send("")));
     // (set_cookie is a builder; exercise it directly below.)
-    auto writer2 = std::make_shared<FakeResponseWriter>();
-    auto res2 = std::make_shared<Response>(writer2);
+    auto writer2 = std::make_shared<FakeResponseSink>();
+    auto res2 = std::make_shared<ResponseWriter>(writer2);
     res2->set_cookie("sid", "abc", std::chrono::seconds{3600}, "/", "", true, true, "Lax");
     res2->set_cookie("tricky", "a;b");
     REQUIRE(run_on(ctx, res2->status(200).send("")));
@@ -219,14 +219,14 @@ TEST_CASE("proto/multipart: read_urlencoded_body on a request", "[forms]") {
 
 TEST_CASE("proto/response: redirect sets Status and Location", "[forms]") {
     asio::io_context ctx;
-    auto writer = std::make_shared<FakeResponseWriter>();
-    auto res = std::make_shared<Response>(writer);
+    auto writer = std::make_shared<FakeResponseSink>();
+    auto res = std::make_shared<ResponseWriter>(writer);
     REQUIRE(run_on(ctx, res->redirect("/login").send("")));
     CHECK(writer->last_status == status::found);
     CHECK(writer->header(field::location) == "/login");
 
-    auto writer2 = std::make_shared<FakeResponseWriter>();
-    auto res2 = std::make_shared<Response>(writer2);
+    auto writer2 = std::make_shared<FakeResponseSink>();
+    auto res2 = std::make_shared<ResponseWriter>(writer2);
     REQUIRE(run_on(ctx, res2->redirect("/moved", status::permanent_redirect).send("")));
     CHECK(writer2->last_status == status::permanent_redirect);
     CHECK(writer2->header(field::location) == "/moved");
@@ -234,8 +234,8 @@ TEST_CASE("proto/response: redirect sets Status and Location", "[forms]") {
 
 TEST_CASE("proto/response: SSE frames are well-formed events", "[forms]") {
     asio::io_context ctx;
-    auto writer = std::make_shared<FakeResponseWriter>();
-    auto res = std::make_shared<Response>(writer);
+    auto writer = std::make_shared<FakeResponseSink>();
+    auto res = std::make_shared<ResponseWriter>(writer);
 
     REQUIRE(run_on(ctx, res->sse_begin()));
     CHECK(writer->begun);

@@ -99,8 +99,11 @@ struct TlsClientConfig {
     std::function<void(asio::ssl::context &)> setup;
 };
 
-// Where to connect and how to speak there. One HttpClient can serve many of
-// these; pooled connections are keyed by the whole target.
+// Where to connect and how to speak there. One client server can serve many of
+// these; pooled connections are keyed by the whole target. **Internal engine
+// type** — hidden in http::detail, since connection policy is not public API.
+namespace detail {
+
 struct ClientTarget {
     std::string host{"127.0.0.1"};
     std::uint16_t port{0}; // 0 = the scheme default (80 for http, 443 for https)
@@ -143,7 +146,9 @@ struct ClientTarget {
     bool h2c_enabled() const { return !use_tls && h2c != H2cMode::Off; }
 };
 
-// Policy shared by every connection an HttpClient opens.
+} // namespace detail
+
+// Policy shared by every connection the client opens.
 struct ClientConfig {
     TlsClientConfig tls{};
 

@@ -54,7 +54,7 @@ template <typename T> asio::awaitable<std::expected<T, error_code>> read_json_bo
 // response with `status_code` (200 by default). A value glaze cannot represent
 // is answered 500 and reported as an error — never a silent empty body.
 template <typename T>
-asio::awaitable<error_code> write_json(std::shared_ptr<Response> res, const T &value, int status_code = status::ok) {
+asio::awaitable<error_code> write_json(std::shared_ptr<ResponseWriter> res, const T &value, int status_code = status::ok) {
     auto json = glz::write_json(value);
     if (!json) {
         SIMPLE_HTTP_ERROR_LOG("json: failed to serialize the response");

@@ -7,7 +7,7 @@
 // request body (chunked / Content-Length / none) and feed it into
 // Request::body(), then hand the request to the dispatcher (Router) with the
 // transport's TLS handle. The loop repeats while the connection is keep-alive.
-// Responses go through Http1ResponseWriter, which hand-serializes either a
+// Responses go through Http1ResponseSink, which hand-serializes either a
 // Content-Length reply (one-shot) or a chunked stream directly onto the
 // transport.
 //
@@ -61,15 +61,15 @@ namespace asio = boost::asio;
 // directions.
 using SharedDeadline = std::shared_ptr<std::chrono::steady_clock::time_point>;
 
-// ResponseWriter for HTTP/1.x. Hand-serializes directly onto the transport.
-template <TransportLike Transport> class Http1ResponseWriter : public ResponseWriter {
+// ResponseSink for HTTP/1.x. Hand-serializes directly onto the transport.
+template <TransportLike Transport> class Http1ResponseSink : public ResponseSink {
   public:
     // `deadline` and `idle_timeout` let a write refresh the connection's idle
     // deadline (shared with the engine's read path and watchdog). `alt_svc` is
     // the already-rendered value of the Alt-Svc field, or empty for none: the
     // writer has no business knowing about ports or cache lifetimes, only about
     // where the octets go.
-    Http1ResponseWriter(std::shared_ptr<Transport> transport, Version version, SharedDeadline deadline,
+    Http1ResponseSink(std::shared_ptr<Transport> transport, Version version, SharedDeadline deadline,
                         std::chrono::steady_clock::duration idle_timeout, std::string alt_svc = {})
         : m_transport(std::move(transport)), m_executor(m_transport->get_executor()), m_version(version),
           m_deadline(std::move(deadline)), m_idle_timeout(idle_timeout), m_alt_svc(std::move(alt_svc)) {}
@@ -398,7 +398,7 @@ template <TransportLike Transport> class Http1Engine {
     // A read that refreshes the idle deadline on every attempt; all transport
     // reads in the engine go through this so the watchdog covers header reads,
     // body reads and pipelined-request reads alike. Writes refresh the same
-    // shared deadline from Http1ResponseWriter::write_raw.
+    // shared deadline from Http1ResponseSink::write_raw.
     asio::awaitable<std::pair<error_code, std::size_t>> read_some(std::span<std::byte> buf) {
         *m_deadline = std::chrono::steady_clock::now() + m_limits.idle_timeout;
         co_return co_await m_transport->async_read_some(buf);
@@ -552,7 +552,7 @@ template <TransportLike Transport> class Http1Engine {
                 co_return co_await pull_body_chunk();
             });
 
-            auto writer = std::make_shared<Http1ResponseWriter<Transport>>(
+            auto writer = std::make_shared<Http1ResponseSink<Transport>>(
                 m_transport, version, m_deadline, m_limits.idle_timeout, m_limits.alt_svc_value());
             writer->set_keep_alive(keep_alive);
             const bool head_request = head.method == Method::Head;
@@ -561,7 +561,7 @@ template <TransportLike Transport> class Http1Engine {
             // handler - the reverse proxy included - passes through it without
             // knowing. maybe_compress_writer returns `writer` unchanged when
             // compression is off or the client accepts none of what we produce.
-            auto response = std::make_shared<Response>(
+            auto response = std::make_shared<ResponseWriter>(
                 maybe_compress_writer(writer, m_transport->get_executor(), m_limits.compression,
                                       request->header("accept-encoding").value_or(std::string_view{}), head_request));
 
@@ -828,7 +828,7 @@ template <TransportLike Transport> class Http1Engine {
 
     // Runs the handler; captures failure so run() can close the connection.
     asio::awaitable<void> run_handler(const Dispatcher &dispatch, std::shared_ptr<Request> request,
-                                      std::shared_ptr<Response> response, bool &failed) {
+                                      std::shared_ptr<ResponseWriter> response, bool &failed) {
         try {
             co_await dispatch(std::move(request), std::move(response), m_transport->tls_handle());
         } catch (const std::exception &e) {
@@ -842,7 +842,7 @@ template <TransportLike Transport> class Http1Engine {
     }
 
     asio::awaitable<void> send_error_response(int status) {
-        auto writer = std::make_shared<Http1ResponseWriter<Transport>>(m_transport, Version::Http11, m_deadline,
+        auto writer = std::make_shared<Http1ResponseSink<Transport>>(m_transport, Version::Http11, m_deadline,
                                                                        m_limits.idle_timeout, m_limits.alt_svc_value());
         writer->set_keep_alive(false);
         Headers headers;

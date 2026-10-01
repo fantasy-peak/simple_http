@@ -9,6 +9,7 @@
 #include "test_support.h"
 
 using namespace simple_http;
+using namespace simple_http::detail;
 using namespace simple_http::test;
 
 // --- URL parsing -------------------------------------------------------------
@@ -263,28 +264,31 @@ TEST_CASE("client/errors: codes, messages and retryability", "[client]") {
 }
 
 TEST_CASE("client/response: ok() and header lookup", "[client]") {
-    ClientResponse response;
-    response.status = 204;
+    // The buffered shape, as the convenience send() produces it: a head + body.
+    Response response{ResponseHead{.status = 204}, std::string{}};
     CHECK(response.ok()); // 2xx: 204 is a success, it just has no body
-    response.status = 200;
-    CHECK(response.ok());
-    response.status = 299;
-    CHECK(response.ok());
-    response.status = 301;
-    CHECK_FALSE(response.ok());
-    response.status = 404;
-    CHECK_FALSE(response.ok());
-    response.status = 500;
-    CHECK_FALSE(response.ok());
 
-    response.headers.add("Content-Type", "text/plain");
-    CHECK(response.header("content-type") == "text/plain");
-    CHECK_FALSE(response.header("missing").has_value());
+    Response ok200{ResponseHead{.status = 200}, std::string{}};
+    CHECK(ok200.ok());
+    Response ok299{ResponseHead{.status = 299}, std::string{}};
+    CHECK(ok299.ok());
+    Response moved{ResponseHead{.status = 301}, std::string{}};
+    CHECK_FALSE(moved.ok());
+    Response notfound{ResponseHead{.status = 404}, std::string{}};
+    CHECK_FALSE(notfound.ok());
+    Response servererror{ResponseHead{.status = 500}, std::string{}};
+    CHECK_FALSE(servererror.ok());
 
-    ResponseHead head;
-    head.status = 200;
-    head.headers.add("x-a", "1");
-    CHECK(head.header("X-A") == "1");
-    CHECK(head.status == 200);
-    CHECK_FALSE(head.bodyless);
+    ResponseHead head{.status = 200};
+    head.headers.add("Content-Type", "text/plain");
+    Response with_header{std::move(head), std::string{}};
+    CHECK(with_header.header("content-type") == "text/plain");
+    CHECK_FALSE(with_header.header("missing").has_value());
+
+    ResponseHead h2;
+    h2.status = 200;
+    h2.headers.add("x-a", "1");
+    CHECK(h2.header("X-A") == "1");
+    CHECK(h2.status == 200);
+    CHECK_FALSE(h2.bodyless);
 }

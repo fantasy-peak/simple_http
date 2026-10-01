@@ -73,7 +73,7 @@ namespace asio = boost::asio;
 // mTLS backend and a public one can never share credentials or sockets.
 struct HttpProxyRoute {
     HttpProxyTarget target;
-    std::shared_ptr<simple_http::http::Client> client;
+    std::shared_ptr<simple_http::Client> client;
 };
 
 // A route serving every method. Pass the empty set — or this named constant to
@@ -439,18 +439,18 @@ class Router {
     }
 
     // --- HTTP reverse-proxy route registration (request-level) ---
-    Router &http_proxy(std::string path, HttpProxyTarget target, ClientConfig client_cfg = {}) {
+    Router &http_proxy(std::string path, HttpProxyTarget target, simple_http::ClientConfig client_cfg = {}) {
         m_http_proxy_exact.emplace(
             std::move(path),
-            HttpProxyRoute{std::move(target), std::make_shared<simple_http::http::Client>(std::move(client_cfg))});
+            HttpProxyRoute{std::move(target), std::make_shared<simple_http::Client>(std::move(client_cfg))});
         return *this;
     }
 
-    Router &http_proxy_regex(const std::string &pattern, HttpProxyTarget target, ClientConfig client_cfg = {}) {
+    Router &http_proxy_regex(const std::string &pattern, HttpProxyTarget target, simple_http::ClientConfig client_cfg = {}) {
         try {
             m_http_proxy_regex.emplace_back(
                 RegexRoute{simple_http_regex::regex{pattern}, literal_prefix(pattern)},
-                HttpProxyRoute{std::move(target), std::make_shared<simple_http::http::Client>(std::move(client_cfg))});
+                HttpProxyRoute{std::move(target), std::make_shared<simple_http::Client>(std::move(client_cfg))});
         } catch (const std::exception &e) {
             SIMPLE_HTTP_ERROR_LOG("invalid http proxy regex [{}]: {}", pattern, e.what());
         }

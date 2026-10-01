@@ -34,9 +34,9 @@ Handler body_handler(std::string body) {
 
 // Dispatches one request and hands back the fake writer, so a case reads as
 // request -> assertions on the recorded status, body and headers.
-std::shared_ptr<FakeResponseWriter> dispatch(asio::io_context &ctx, Router &router, RequestPtr req) {
-    auto writer = std::make_shared<FakeResponseWriter>();
-    auto res = std::make_shared<Response>(writer);
+std::shared_ptr<FakeResponseSink> dispatch(asio::io_context &ctx, Router &router, RequestPtr req) {
+    auto writer = std::make_shared<FakeResponseSink>();
+    auto res = std::make_shared<ResponseWriter>(writer);
     REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
     return writer;
 }
@@ -51,9 +51,9 @@ TEST_CASE("router: exact, regex and fallback matching", "[router]") {
 
     asio::io_context ctx;
     auto dispatch = [&](const std::string &path) {
-        auto writer = std::make_shared<FakeResponseWriter>();
+        auto writer = std::make_shared<FakeResponseSink>();
         auto req = make_request(ctx, path);
-        auto res = std::make_shared<Response>(writer);
+        auto res = std::make_shared<ResponseWriter>(writer);
         REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
         return writer;
     };
@@ -70,9 +70,9 @@ TEST_CASE("router: dispatch without a fallback answers 404", "[router]") {
     router.route({Method::Get}, "/only", body_handler("only"));
 
     asio::io_context ctx;
-    auto writer = std::make_shared<FakeResponseWriter>();
+    auto writer = std::make_shared<FakeResponseSink>();
     auto req = make_request(ctx, "/missing");
-    auto res = std::make_shared<Response>(writer);
+    auto res = std::make_shared<ResponseWriter>(writer);
     REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
     CHECK(writer->last_status == 404);
     CHECK(writer->last_body.empty());
@@ -94,18 +94,18 @@ TEST_CASE("router: middleware short-circuits and sees the request", "[router]") 
 
     asio::io_context ctx;
     {
-        auto writer = std::make_shared<FakeResponseWriter>();
+        auto writer = std::make_shared<FakeResponseSink>();
         auto req = make_request(ctx, "/blocked");
-        auto res = std::make_shared<Response>(writer);
+        auto res = std::make_shared<ResponseWriter>(writer);
         REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
         CHECK(mw_called);
         CHECK(writer->last_status == 403);
         CHECK(writer->last_body == "denied");
     }
     {
-        auto writer = std::make_shared<FakeResponseWriter>();
+        auto writer = std::make_shared<FakeResponseSink>();
         auto req = make_request(ctx, "/allowed");
-        auto res = std::make_shared<Response>(writer);
+        auto res = std::make_shared<ResponseWriter>(writer);
         REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
         CHECK(writer->last_body == "allowed");
     }
@@ -135,9 +135,9 @@ TEST_CASE("router: middleware wraps the handler — before, after, and ordering"
     });
 
     asio::io_context ctx;
-    auto writer = std::make_shared<FakeResponseWriter>();
+    auto writer = std::make_shared<FakeResponseSink>();
     auto req = make_request(ctx, "/chain");
-    auto res = std::make_shared<Response>(writer);
+    auto res = std::make_shared<ResponseWriter>(writer);
     REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
     CHECK(writer->last_status == 200);
     CHECK(writer->last_body == "ok");
@@ -167,9 +167,9 @@ TEST_CASE("router: middleware short-circuits by not calling next", "[router]") {
 
     asio::io_context ctx;
     {
-        auto writer = std::make_shared<FakeResponseWriter>();
+        auto writer = std::make_shared<FakeResponseSink>();
         auto req = make_request(ctx, "/blocked");
-        auto res = std::make_shared<Response>(writer);
+        auto res = std::make_shared<ResponseWriter>(writer);
         REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
         CHECK(writer->last_status == 403);
         CHECK(writer->last_body == "denied");
@@ -177,9 +177,9 @@ TEST_CASE("router: middleware short-circuits by not calling next", "[router]") {
     }
     trace.clear();
     {
-        auto writer = std::make_shared<FakeResponseWriter>();
+        auto writer = std::make_shared<FakeResponseSink>();
         auto req = make_request(ctx, "/allowed");
-        auto res = std::make_shared<Response>(writer);
+        auto res = std::make_shared<ResponseWriter>(writer);
         REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
         CHECK(writer->last_body == "allowed");
         CHECK(trace == std::vector<std::string>{"gate:before", "inner", "gate:after"});
@@ -198,9 +198,9 @@ TEST_CASE("router: the after-phase observes the response", "[router]") {
 
     asio::io_context ctx;
     {
-        auto writer = std::make_shared<FakeResponseWriter>();
+        auto writer = std::make_shared<FakeResponseSink>();
         auto req = make_request(ctx, "/created");
-        auto res = std::make_shared<Response>(writer);
+        auto res = std::make_shared<ResponseWriter>(writer);
         REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
         CHECK(seen_status == 201);
     }
@@ -209,9 +209,9 @@ TEST_CASE("router: the after-phase observes the response", "[router]") {
         // A request nothing serves answers the router's built-in 404, which the
         // after-phase sees too — a logging middleware reports real answers, not
         // "the handler did not run".
-        auto writer = std::make_shared<FakeResponseWriter>();
+        auto writer = std::make_shared<FakeResponseSink>();
         auto req = make_request(ctx, "/nothing-here");
-        auto res = std::make_shared<Response>(writer);
+        auto res = std::make_shared<ResponseWriter>(writer);
         REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
         CHECK(writer->last_status == 404);
         CHECK(seen_status == 404);
@@ -245,16 +245,16 @@ TEST_CASE("router: middleware state flows to the handler", "[router]") {
 
     asio::io_context ctx;
     {
-        auto writer = std::make_shared<FakeResponseWriter>();
+        auto writer = std::make_shared<FakeResponseSink>();
         auto req = make_request(ctx, "/who");
-        auto res = std::make_shared<Response>(writer);
+        auto res = std::make_shared<ResponseWriter>(writer);
         REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
         CHECK(writer->last_body == "alice");
     }
     {
-        auto writer = std::make_shared<FakeResponseWriter>();
+        auto writer = std::make_shared<FakeResponseSink>();
         auto req = make_request(ctx, "/none");
-        auto res = std::make_shared<Response>(writer);
+        auto res = std::make_shared<ResponseWriter>(writer);
         REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
         CHECK(writer->last_body == "no-string");
     }
@@ -322,9 +322,9 @@ TEST_CASE("router: compose_middleware builds a standalone chain", "[router]") {
     };
 
     asio::io_context ctx;
-    auto writer = std::make_shared<FakeResponseWriter>();
+    auto writer = std::make_shared<FakeResponseSink>();
     auto req = make_request(ctx, "/x");
-    auto res = std::make_shared<Response>(writer);
+    auto res = std::make_shared<ResponseWriter>(writer);
     auto chain = compose_middleware({std::move(a), std::move(b)}, std::move(terminal));
     REQUIRE(run_on(ctx, chain(req, res, std::nullopt)));
     CHECK(trace == std::vector<std::string>{"a:before", "b:before", "terminal", "b:after", "a:after"});
@@ -595,7 +595,7 @@ TEST_CASE("router: reverse-proxy routes are found and rewritten", "[router]") {
     // proxy knows still proxies, and a dead backend fails into a 502. A closed
     // port is not portable for that (some environments drop rather than
     // reject), so the failure is pinned to a short connect timeout instead.
-    ClientConfig proxy_cfg;
+    simple_http::ClientConfig proxy_cfg;
     proxy_cfg.connect_timeout = std::chrono::milliseconds(100);
     asio::io_context ctx;
     {
@@ -604,9 +604,9 @@ TEST_CASE("router: reverse-proxy routes are found and rewritten", "[router]") {
         // The short connect timeout travels with the route's own client.
         Router dead_backend;
         dead_backend.http_proxy("/p", HttpProxyTarget{"127.0.0.1", 1, {}}, proxy_cfg);
-        auto writer = std::make_shared<FakeResponseWriter>();
+        auto writer = std::make_shared<FakeResponseSink>();
         auto req = make_request(ctx, "/p");
-        auto res = std::make_shared<Response>(writer);
+        auto res = std::make_shared<ResponseWriter>(writer);
         ScopedLog capture;
         REQUIRE(run_on(ctx, dead_backend.dispatch(req, res, std::nullopt), std::chrono::seconds(2)));
         CHECK(writer->last_status == 502);
@@ -619,9 +619,9 @@ TEST_CASE("router: reverse-proxy routes are found and rewritten", "[router]") {
         Router both;
         both.http_proxy("/p", HttpProxyTarget{"127.0.0.1", 1, {}}, proxy_cfg);
         both.route({Method::Get}, "/p", body_handler("local"));
-        auto writer = std::make_shared<FakeResponseWriter>();
+        auto writer = std::make_shared<FakeResponseSink>();
         auto req = make_request(ctx, "/p");
-        auto res = std::make_shared<Response>(writer);
+        auto res = std::make_shared<ResponseWriter>(writer);
         ScopedLog capture;
         REQUIRE(run_on(ctx, both.dispatch(req, res, std::nullopt), std::chrono::seconds(2)));
         CHECK(writer->last_status == 200);
@@ -665,9 +665,9 @@ TEST_CASE("router: invalid regexes are dropped, not thrown", "[router]") {
 
     CHECK_FALSE(router.find_http_proxy("/broken").has_value());
     asio::io_context ctx;
-    auto writer = std::make_shared<FakeResponseWriter>();
+    auto writer = std::make_shared<FakeResponseSink>();
     auto req = make_request(ctx, "/broken");
-    auto res = std::make_shared<Response>(writer);
+    auto res = std::make_shared<ResponseWriter>(writer);
     REQUIRE(run_on(ctx, router.dispatch(req, res,
                                         std::nullopt))); // no route: the built-in 404
     CHECK(writer->last_status == 404);
@@ -680,9 +680,9 @@ TEST_CASE("router: a registered handler is found by path, first registration win
                  body_handler("second")); // emplace keeps the first
 
     asio::io_context ctx;
-    auto writer = std::make_shared<FakeResponseWriter>();
+    auto writer = std::make_shared<FakeResponseSink>();
     auto req = make_request(ctx, "/dup");
-    auto res = std::make_shared<Response>(writer);
+    auto res = std::make_shared<ResponseWriter>(writer);
     REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
     CHECK(writer->last_body == "first");
 }
@@ -714,9 +714,9 @@ TEST_CASE("router: the static stage sits between the routes and the fallback", "
 
     asio::io_context ctx;
     auto dispatch = [&](const std::string &path) {
-        auto writer = std::make_shared<FakeResponseWriter>();
+        auto writer = std::make_shared<FakeResponseSink>();
         auto req = make_request(ctx, path);
-        auto res = std::make_shared<Response>(writer);
+        auto res = std::make_shared<ResponseWriter>(writer);
         REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
         return writer;
     };
@@ -752,9 +752,9 @@ TEST_CASE("router: a declining static stage cannot leave a request unanswered", 
     router.static_files(site);
 
     asio::io_context ctx;
-    auto writer = std::make_shared<FakeResponseWriter>();
+    auto writer = std::make_shared<FakeResponseSink>();
     auto req = make_request(ctx, "/not-in-the-site");
-    auto res = std::make_shared<Response>(writer);
+    auto res = std::make_shared<ResponseWriter>(writer);
     REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
 
     CHECK(writer->last_status == 404); // written by the router, not left hanging
@@ -772,9 +772,9 @@ TEST_CASE("router: registering a disabled site is a no-op, not a silent 404 mach
     router.route({Method::Get}, "/", body_handler("route still works"));
 
     asio::io_context ctx;
-    auto writer = std::make_shared<FakeResponseWriter>();
+    auto writer = std::make_shared<FakeResponseSink>();
     auto req = make_request(ctx, "/");
-    auto res = std::make_shared<Response>(writer);
+    auto res = std::make_shared<ResponseWriter>(writer);
     REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
 
     CHECK(writer->last_body == "route still works");
@@ -784,9 +784,9 @@ TEST_CASE("router: registering a disabled site is a no-op, not a silent 404 mach
 
 // Dispatches one request on its own router state and returns the writer.
 auto method_dispatch = [](Router &router, asio::io_context &ctx, const std::string &path, Method m) {
-    auto writer = std::make_shared<FakeResponseWriter>();
+    auto writer = std::make_shared<FakeResponseSink>();
     auto req = make_request(ctx, path, m);
-    auto res = std::make_shared<Response>(writer);
+    auto res = std::make_shared<ResponseWriter>(writer);
     REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
     return writer;
 };

@@ -17,7 +17,7 @@
 #include "../core/types.h"
 #include "client_config.h"
 
-namespace simple_http {
+namespace simple_http::detail {
 
 struct Url {
     std::string scheme;    // "http" or "https"
@@ -72,8 +72,6 @@ struct Url {
     }
 };
 
-namespace detail {
-
 // Whether `c` is a valid URI scheme character (RFC 3986 §3.1).
 inline bool url_scheme_char(char c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '+' || c == '-' ||
@@ -103,8 +101,6 @@ inline bool url_valid_port(std::string_view s, std::uint16_t &out) {
     out = static_cast<std::uint16_t>(v);
     return true;
 }
-
-} // namespace detail
 
 // Parses an absolute http:// or https:// URL. On failure the returned
 // error_code is client_errc::unsupported_scheme (a well-formed URL for another
@@ -193,4 +189,4 @@ inline std::expected<Url, error_code> parse_url(std::string_view url) {
     return out;
 }
 
-} // namespace simple_http
+} // namespace simple_http::detail

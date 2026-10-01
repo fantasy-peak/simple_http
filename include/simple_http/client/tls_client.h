@@ -30,7 +30,7 @@
 #include "../transport/tls_transport.h"
 #include "client_config.h"
 
-namespace simple_http {
+namespace simple_http::detail {
 
 namespace asio = boost::asio;
 
@@ -172,4 +172,4 @@ inline asio::awaitable<error_code> tls_client_handshake(TlsStreamTransport &tran
     co_return ec;
 }
 
-} // namespace simple_http
+} // namespace simple_http::detail

@@ -42,10 +42,10 @@
 #include "../core/url_encoding.h" // query_escape
 #include "client_config.h"
 #include "cookie_jar.h"
-#include "http_client.h" // the underlying, verified convenience layer
+#include "http_client.h" // detail::ClientEngine — the connection engine
 #include "url.h"
 
-namespace simple_http::http {
+namespace simple_http {
 
 namespace asio = boost::asio;
 
@@ -103,7 +103,7 @@ class Stream {
   public:
     // Constructed by the http:: client (open_stream / open_target); public so
     // the stream can be owned via shared_ptr/make_shared.
-    explicit Stream(std::shared_ptr<simple_http::ClientStream> stream, std::chrono::milliseconds head_timeout = {},
+    explicit Stream(std::shared_ptr<detail::ClientStream> stream, std::chrono::milliseconds head_timeout = {},
                     std::chrono::milliseconds idle_timeout = {})
         : m_stream(std::move(stream)), m_head_timeout(head_timeout), m_idle_timeout(idle_timeout) {}
 
@@ -118,7 +118,7 @@ class Stream {
     // --- read end: the response ---
     // Bounded by the response-head (TTFB) budget: a slow service fails here as
     // client_errc::response_head_timeout, independently of body pace.
-    [[nodiscard]] asio::awaitable<std::expected<ResponseHead, error_code>> read_head() {
+    [[nodiscard]] asio::awaitable<std::expected<detail::ResponseHead, error_code>> read_head() {
         return detail::deadline(m_stream->read_head(), m_head_timeout, client_errc::response_head_timeout);
     }
     // Each read is bounded by the body-idle budget (silence between chunks);
@@ -131,7 +131,7 @@ class Stream {
     }
     // The head, once read_head() (or read()) has completed; default-constructed
     // (status 0) before that.
-    const ResponseHead &head() const { return m_stream->head(); }
+    const detail::ResponseHead &head() const { return m_stream->head(); }
 
     Version version() const { return m_stream->version(); }
 
@@ -144,7 +144,7 @@ class Stream {
 
   private:
     friend class Client;
-    std::shared_ptr<simple_http::ClientStream> m_stream;
+    std::shared_ptr<detail::ClientStream> m_stream;
     std::chrono::milliseconds m_head_timeout{};
     std::chrono::milliseconds m_idle_timeout{};
 };
@@ -202,9 +202,9 @@ class Response {
             co_return co_await m_stream->read();
         }
         // Buffered shape: replay the captured body once, then eof.
-        if (m_replay_index < m_buffer->body.size()) {
-            std::string data = m_buffer->body.substr(m_replay_index);
-            m_replay_index = m_buffer->body.size();
+        if (m_replay_index < m_buffer_body.size()) {
+            std::string data = m_buffer_body.substr(m_replay_index);
+            m_replay_index = m_buffer_body.size();
             co_return ReadResult::chunk(std::move(data));
         }
         co_return ReadResult::end();
@@ -213,10 +213,10 @@ class Response {
         if (m_stream) {
             co_return co_await m_stream->read_all(max_bytes);
         }
-        if (max_bytes != 0 && m_buffer->body.size() > max_bytes) {
+        if (max_bytes != 0 && m_buffer_body.size() > max_bytes) {
             co_return std::unexpected{make_error_code(client_errc::body_too_large)};
         }
-        co_return m_buffer->body;
+        co_return m_buffer_body;
     }
 
     [[nodiscard]] asio::awaitable<void> abort() {
@@ -226,17 +226,23 @@ class Response {
         co_return;
     }
 
-  private:
-    friend class RequestBuilder;
-    explicit Response(simple_http::ClientResponse buffered)
-        : m_head{buffered.status, buffered.version, std::move(buffered.headers), buffered.bodyless},
-          m_buffer(std::move(buffered)) {}
-    explicit Response(std::shared_ptr<simple_http::ClientStream> stream, ResponseHead head)
+  public:
+    // Buffered shape (from the convenience send()): status/headers + a captured
+    // body. Public so tests and Response decorators can build one by hand;
+    // ordinary callers get it from Client::send().
+    explicit Response(detail::ResponseHead head, std::string body)
+        : m_head(std::move(head)), m_buffer_body(std::move(body)) {}
+    // Streaming shape (from open_stream()/send_stream()): the read end of a
+    // live exchange, plus the head parsed on the way.
+    explicit Response(std::shared_ptr<detail::ClientStream> stream, detail::ResponseHead head)
         : m_head(std::move(head)), m_stream(std::move(stream)) {}
 
-    ResponseHead m_head;
-    std::optional<simple_http::ClientResponse> m_buffer; // buffered convenience shape
-    std::shared_ptr<simple_http::ClientStream> m_stream; // streaming shape
+  private:
+    friend class RequestBuilder;
+    friend class Client;
+    detail::ResponseHead m_head;
+    std::string m_buffer_body;                        // buffered convenience shape
+    std::shared_ptr<detail::ClientStream> m_stream;   // streaming shape
     std::size_t m_replay_index{0};
 };
 
@@ -350,10 +356,16 @@ class RequestBuilder {
 
 // --- the client facade --------------------------------------------------------
 
+// Connection counters, for diagnostics and for tests that assert reuse.
+struct Stats {
+    std::size_t connections_opened{0}; // fresh TCP/TLS connections dialed
+    std::size_t connections_reused{0}; // sessions taken from the pool
+};
+
 class Client {
   public:
     explicit Client(ClientConfig cfg = {})
-        : m_cfg(std::move(cfg)), m_impl(std::make_shared<simple_http::HttpClient>(m_cfg)) {}
+        : m_cfg(std::move(cfg)), m_impl(std::make_shared<detail::ClientEngine>(m_cfg)) {}
 
     Client(const Client &) = delete;
     Client &operator=(const Client &) = delete;
@@ -374,14 +386,14 @@ class Client {
     // --- explicit streaming (full-duplex) ---
     [[nodiscard]] asio::awaitable<std::expected<Stream, error_code>> open_stream(std::string url,
                                                                                  StreamSpec spec = {}) const {
-        auto parsed = parse_url(url);
+        auto parsed = detail::parse_url(url);
         if (!parsed) {
             co_return std::unexpected{parsed.error()};
         }
         if (spec.target.empty()) {
             spec.target = std::string{parsed->target};
         }
-        simple_http::RequestSpec inner;
+        detail::RequestSpec inner;
         inner.method = spec.method;
         inner.target = std::move(spec.target);
         inner.headers = std::move(spec.headers);
@@ -406,7 +418,7 @@ class Client {
 
     // Connection counters (connections opened / reused) — the diagnostics and
     // the tests that assert reuse.
-    simple_http::ClientStats stats() const { return m_impl->stats(); }
+    Stats stats() const { return Stats{m_impl->opened_count(), m_impl->reused_count()}; }
 
     // [internal — the reverse proxy's channel] Opens a stream by ClientTarget,
     // keeping the h2c-upgrade path and the pooled flag that the proxy's retry
@@ -417,7 +429,7 @@ class Client {
         bool pooled{false};
     };
     [[nodiscard]] asio::awaitable<std::expected<OpenTargetStream, error_code>>
-    open_target(simple_http::ClientTarget target, simple_http::RequestSpec spec) const {
+    open_target(detail::ClientTarget target, detail::RequestSpec spec) const {
         auto opened = co_await m_impl->open_stream(std::move(target), std::move(spec));
         if (!opened) {
             co_return std::unexpected{opened.error()};
@@ -427,8 +439,217 @@ class Client {
 
   private:
     friend class RequestBuilder;
+
+    // --- convenience internals (redirect / cookie / replay) ---
+    // The convenience layer's one buffered exchange: one request, with the
+    // pooled-connection replay rule. Returns a buffered Response.
+    static asio::awaitable<std::expected<Response, error_code>>
+    exchange_once(std::shared_ptr<detail::ClientEngine> impl, detail::ClientTarget target, detail::RequestSpec spec,
+                  const std::string &url_target, std::size_t cap, std::chrono::milliseconds limit) {
+        if (spec.target.empty())
+            spec.target = url_target.empty() ? "/" : url_target;
+
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            auto opened = co_await impl->start_exchange(target, spec, url_target,
+                                                        /*fresh_only=*/attempt > 0);
+            if (!opened)
+                co_return std::unexpected{opened.error()};
+            auto &stream = opened->stream;
+
+            auto response = co_await read_exchange(stream, cap, limit);
+            if (response)
+                co_return std::move(*response);
+
+            const error_code ec = response.error();
+            (void)co_await stream->cancel(); // h2: reset the stream, keeping the
+                                             // connection; h1: close it
+
+            // Replay only when a duplicate cannot cause a second side effect. The
+            // old rule — "the pooled connection died before answering, so it was
+            // idle and the request never reached anyone" — does not hold: by the
+            // time an error surfaces here the request has already been written, so
+            // a peer that processed the POST and died before answering would see
+            // it twice. What is genuinely safe is a peer that said it did not
+            // process the request (REFUSED_STREAM / a GOAWAY covering the stream),
+            // or a method that is idempotent by definition.
+            //
+            // A streamed body is excluded either way: it has already been taken
+            // from the caller and cannot be sent again.
+            if (attempt == 0 && opened->pooled && !spec.stream_body &&
+                (is_retryable(ec) || is_idempotent(spec.method))) {
+                SIMPLE_HTTP_ERROR_LOG("client: pooled connection to {} died before answering ({}), "
+                                      "retrying",
+                                      target.authority(), ec.message());
+                continue;
+            }
+            co_return std::unexpected{ec};
+        }
+        co_return std::unexpected{make_error_code(client_errc::session_closed)};
+    }
+
+    // One hop of the convenience layer: an exchange, then — when redirects are
+    // enabled and the response is a redirect with a Location — a rewritten next
+    // hop (method/body per the 301/302/303 vs 307/308 rules, cookies stored and
+    // replayed, https→http refused, `remaining` hops bound).
+    static asio::awaitable<std::expected<Response, error_code>>
+    follow_redirects(std::shared_ptr<detail::ClientEngine> impl, const ClientConfig &cfg, detail::ClientTarget target,
+                     detail::RequestSpec spec, std::string url_target, std::size_t cap,
+                     std::chrono::milliseconds limit, std::size_t remaining, std::string current_url) {
+        // Saved before target is moved into the exchange: the next hop's origin
+        // comparison needs the current authority.
+        const std::string current_host = target.host;
+        auto response = co_await exchange_once(impl, std::move(target), spec, url_target, cap, limit);
+        if (!response)
+            co_return std::unexpected{response.error()};
+
+        if (cfg.cookie_jar) {
+            cfg.cookie_jar->store(current_url, response->headers());
+        }
+
+        if (!is_redirect(response->status()))
+            co_return response;
+        // Over the configured hop budget: report the failure (and log where the
+        // chain ended) instead of silently handing back a redirect the caller
+        // asked us to follow — Go's http.Client returns the last response *and*
+        // an error here. max_redirects == 0 means "never follow": that budget is
+        // never spent, so the untouched 3xx comes back as-is.
+        if (remaining == 0) {
+            if (cfg.max_redirects == 0) {
+                co_return response;
+            }
+            SIMPLE_HTTP_ERROR_LOG("client: {} redirects followed, still at {} ({}) — giving up", cfg.max_redirects,
+                                  response->status(), current_url);
+            co_return std::unexpected{make_error_code(client_errc::too_many_redirects)};
+        }
+        const auto location = response->header(field::location);
+        if (!location || location->empty())
+            co_return response;
+
+        auto hop = resolve_redirect(current_url, cfg.default_version, cfg.default_h2c, url_target, *location);
+        if (!hop)
+            co_return std::unexpected{hop.error()};
+
+        // RFC 9110 §15.4: 303 always becomes GET; 301/302 do for any method
+        // other than GET/HEAD. 307/308 preserve the method and body.
+        if (response->status() == status::see_other ||
+            ((response->status() == status::moved_permanently || response->status() == status::found) &&
+             !get_like(spec.method))) {
+            spec.method = Method::Get;
+            spec.body.clear();
+            spec.stream_body = false;
+            spec.headers.erase("content-type"); // an empty GET carries no entity
+            spec.headers.erase("content-length");
+        }
+
+        // A hop to a different origin must not carry the previous host's
+        // credentials — Go's http.Client rule. Cookies are replayed through the
+        // jar (domain-filtered) when one is configured; an ad-hoc Cookie header
+        // is dropped across origins either way.
+        if (!iequals_ci(hop->target.host, current_host)) {
+            spec.headers.erase("authorization");
+            spec.headers.erase("proxy-authorization");
+            spec.headers.erase("cookie");
+        }
+
+        if (cfg.cookie_jar) {
+            std::string cookie = cfg.cookie_jar->cookie_header(hop->url);
+            if (!cookie.empty()) {
+                spec.headers.erase("cookie");
+                spec.headers.add("cookie", std::move(cookie));
+            }
+        }
+
+        // The next hop's origin-form target supersedes the old one; exchange_once
+        // only fills an empty one.
+        spec.target = hop->url_target;
+        co_return co_await follow_redirects(std::move(impl), cfg, std::move(hop->target), std::move(spec),
+                                            std::move(hop->url_target), cap, limit, remaining - 1, std::move(hop->url));
+    }
+
+    // Reads the response of one exchange: head, then whole body, both under the
+    // request budget.
+    static asio::awaitable<std::expected<Response, error_code>>
+    read_exchange(std::shared_ptr<detail::ClientStream> stream, std::size_t cap, std::chrono::milliseconds limit) {
+        // Both expected layers matter: the outer one is the deadline, the inner
+        // is the exchange itself.
+        auto head = co_await detail::await_with_deadline(stream->read_head(), limit);
+        if (!head || !*head)
+            co_return std::unexpected{head ? (*head).error() : head.error()};
+
+        std::string body;
+        for (;;) {
+            auto chunk = co_await detail::await_with_deadline(stream->read(), limit);
+            if (!chunk || !*chunk)
+                co_return std::unexpected{chunk ? (*chunk).error() : chunk.error()};
+            if ((*chunk)->eof)
+                break;
+            if (cap != 0 && body.size() + (*chunk)->data.size() > cap)
+                co_return std::unexpected{make_error_code(client_errc::body_too_large)};
+            body.append((*chunk)->data);
+        }
+        co_return Response{std::move(**head), std::move(body)};
+    }
+
+    // Whether `status` is a redirect the convenience layer may follow.
+    static bool is_redirect(int status) noexcept {
+        return status == status::moved_permanently || status == status::found || status == status::see_other ||
+               status == status::temporary_redirect || status == status::permanent_redirect;
+    }
+
+    // GET and HEAD keep their method across a 301/302; every other method turns
+    // into GET (RFC 9110 §15.4; 307/308 keep the method).
+    static bool get_like(Method m) noexcept { return m == Method::Get || m == Method::Head; }
+
+    // One hop of a redirect chain: where the next request goes and what its
+    // request-target and absolute URL are.
+    struct RedirectHop {
+        detail::ClientTarget target;
+        std::string url_target; // origin-form for the next request
+        std::string url;        // absolute, for cookies and further hops
+    };
+
+    // Resolves one redirect hop from `current_url` (the absolute URL that
+    // produced the response), `current_target` (that request's origin-form
+    // target, for relative Locations) and the Location value. Accepts absolute
+    // URLs, scheme-relative ("//host/path"), root-relative ("/path") and
+    // path-relative ("next", "../up") forms. An https→http downgrade is
+    // refused (redirect_to_insecure), like Go's http.Client.
+    static std::expected<RedirectHop, error_code>
+    resolve_redirect(const std::string &current_url, HttpVersionPolicy version, H2cMode h2c,
+                     const std::string &current_target, std::string_view location) {
+        const detail::Url base = detail::parse_url(current_url).value_or(detail::Url{});
+        std::string whole;
+        if (location.starts_with("http://") || location.starts_with("https://")) {
+            whole.assign(location);
+        } else if (location.starts_with("//")) {
+            whole = base.scheme + ":" + std::string{location};
+        } else if (!location.empty() && location.front() == '/') {
+            whole = base.scheme + "://" + base.authority() + std::string{location};
+        } else {
+            // Path-relative: join against the directory of the current request.
+            std::string path{current_target};
+            if (const auto q = path.find('?'); q != std::string::npos)
+                path.erase(q);
+            const auto slash = path.rfind('/');
+            whole = base.scheme + "://" + base.authority() +
+                    (slash == std::string::npos ? "/" : path.substr(0, slash + 1)) + std::string{location};
+        }
+        auto url = detail::parse_url(whole);
+        if (!url)
+            return std::unexpected{url.error()};
+        if (base.use_tls() && !url->use_tls())
+            return std::unexpected{make_error_code(client_errc::redirect_to_insecure)};
+        RedirectHop hop;
+        hop.target = url->to_target();
+        hop.target.version = version;
+        hop.target.h2c = h2c;
+        hop.url_target = std::string{url->target};
+        hop.url = std::move(whole);
+        return hop;
+    }
+
     ClientConfig m_cfg;
-    std::shared_ptr<simple_http::HttpClient> m_impl;
+    std::shared_ptr<detail::ClientEngine> m_impl;
 };
 
 inline asio::awaitable<std::expected<Stream, error_code>> RequestBuilder::send_stream() const {
@@ -449,20 +670,29 @@ inline asio::awaitable<std::expected<Response, error_code>> RequestBuilder::send
     if (m_json_failed) {
         co_return std::unexpected{make_error_code(asio::error::invalid_argument)};
     }
-    simple_http::RequestSpec spec;
+    detail::RequestSpec spec;
     spec.method = m_method;
     spec.headers = m_headers;
     spec.body = m_body;
-    simple_http::RequestOptions options;
-    options.max_body_bytes = m_max_body_bytes;
-    if (m_head_timeout.count() > 0) {
-        options.timeout = m_head_timeout; // the underlying per-exchange budget
-    }
-    auto response = co_await m_client->m_impl->request(url, std::move(spec), options);
-    if (!response) {
-        co_return std::unexpected{response.error()};
-    }
-    co_return Response{std::move(*response)};
+
+    const std::size_t cap = m_max_body_bytes != 0 ? m_max_body_bytes : m_client->m_cfg.limits.max_body_bytes;
+    const std::chrono::milliseconds limit =
+        m_head_timeout.count() != 0 ? m_head_timeout : m_client->m_cfg.request_timeout;
+
+    // The URL's own authority becomes the first hop's target; helpers keep the
+    // absolute URL for cookies and relative redirect resolution.
+    auto parsed = detail::parse_url(url);
+    if (!parsed)
+        co_return std::unexpected{parsed.error()};
+    detail::ClientTarget target = parsed->to_target();
+    target.version = m_client->m_cfg.default_version;
+    target.h2c = m_client->m_cfg.default_h2c;
+    std::string url_target = spec.target.empty() ? std::string{parsed->target} : spec.target;
+    std::string current_url = url;
+
+    co_return co_await Client::follow_redirects(m_client->m_impl, m_client->m_cfg, std::move(target), std::move(spec),
+                                                std::move(url_target), cap, limit, m_client->m_cfg.max_redirects,
+                                                std::move(current_url));
 }
 
-} // namespace simple_http::http
+} // namespace simple_http

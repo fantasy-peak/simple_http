@@ -27,7 +27,7 @@
 #include "client_config.h"
 #include "client_stream.h"
 
-namespace simple_http {
+namespace simple_http::detail {
 
 namespace asio = boost::asio;
 
@@ -158,4 +158,4 @@ inline std::shared_ptr<ClientStream> maybe_decompressing_stream(std::shared_ptr<
     return std::make_shared<DecompressingClientStream>(std::move(stream));
 }
 
-} // namespace simple_http
+} // namespace simple_http::detail

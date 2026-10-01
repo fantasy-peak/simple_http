@@ -1,11 +1,11 @@
 #pragma once
 
-// Response: the user-facing, fluent, version-agnostic reply handle.
+// ResponseWriter: the user-facing, fluent, version-agnostic reply handle.
 //
-// Response holds a ResponseWriter and forwards to it. Because the writer is
-// polymorphic and its write operations are awaitable, Response has zero
+// ResponseWriter holds a ResponseSink and forwards to it. Because the sink is
+// polymorphic and its write operations are awaitable, ResponseWriter has zero
 // protocol-version branching and its writes are safe from any thread (the
-// writer hops onto the connection executor internally).
+// sink hops onto the connection executor internally).
 //
 // Two usage modes:
 //   one-shot:  co_await res.status(200).header("k","v").send("body");
@@ -31,12 +31,12 @@ namespace simple_http {
 
 namespace asio = boost::asio;
 
-class Response {
+class ResponseWriter {
   public:
-    explicit Response(std::shared_ptr<ResponseWriter> writer) : m_writer(std::move(writer)) {}
+    explicit ResponseWriter(std::shared_ptr<ResponseSink> writer) : m_writer(std::move(writer)) {}
 
     // --- fluent setters (return *this for chaining) ---
-    Response &status(int code) {
+    ResponseWriter &status(int code) {
         m_status = code;
         return *this;
     }
@@ -44,7 +44,7 @@ class Response {
     // reads it in its after-phase (after `co_await next(...)` resumed) to see
     // what the handler or the router's built-in replies ended on.
     int status() const { return m_status; }
-    Response &header(std::string_view name, std::string value) {
+    ResponseWriter &header(std::string_view name, std::string value) {
         // A field name or value carrying CR/LF/NUL would splice arbitrary bytes
         // into the head — response splitting, and this library's own reverse proxy
         // is exactly the kind of intermediary that turns it into a real attack.
@@ -64,7 +64,7 @@ class Response {
     // a duplicate — the override a middleware-provided default (security
     // headers, CORS Vary) needs from a handler: `res->replace_header(field::x_frame_options, "SAMEORIGIN")`.
     // Like header(), a CR/LF/NUL in either part refuses the whole field.
-    Response &replace_header(std::string_view name, std::string value) {
+    ResponseWriter &replace_header(std::string_view name, std::string value) {
         if (contains_ctl(name) || contains_ctl(value)) {
             SIMPLE_HTTP_ERROR_LOG("response field with CR/LF/NUL rejected");
             m_field_rejected = true;
@@ -74,13 +74,13 @@ class Response {
         m_headers.add(std::string{name}, std::move(value));
         return *this;
     }
-    Response &content_type(std::string_view ct) { return header("content-type", std::string{ct}); }
+    ResponseWriter &content_type(std::string_view ct) { return header("content-type", std::string{ct}); }
 
     // Builds and adds one Set-Cookie header (RFC 6265), returning *this for
     // chaining. A value containing characters the cookie grammar does not allow
     // (;, ,, space, quote, backslash) is quoted with "...", mirroring Go's
     // http.SetCookie. SameSite takes "Lax" / "Strict" / "None".
-    Response &set_cookie(std::string name, std::string value, std::chrono::seconds max_age = {}, std::string path = {},
+    ResponseWriter &set_cookie(std::string name, std::string value, std::chrono::seconds max_age = {}, std::string path = {},
                          std::string domain = {}, bool secure = false, bool http_only = false,
                          std::string same_site = {}) {
         std::string field_value = std::move(name);
@@ -162,7 +162,7 @@ class Response {
     // for a moved-forever). The Location header goes through header(), so a
     // CR/LF/NUL injection is refused there, not emitted. Use with .send(""):
     //   co_await res->redirect("/login").send("");
-    Response &redirect(std::string location, int code = status::found) {
+    ResponseWriter &redirect(std::string location, int code = status::found) {
         m_status = code;
         return header(field::location, std::move(location));
     }
@@ -189,7 +189,7 @@ class Response {
         return write(": " + std::move(text) + "\n\n");
     }
 
-    ResponseWriter &writer() { return *m_writer; }
+    ResponseSink &writer() { return *m_writer; }
 
   private:
     // Renders one SSE event frame: optional event/id/retry fields, then one
@@ -237,7 +237,7 @@ class Response {
         }
     }
 
-    std::shared_ptr<ResponseWriter> m_writer;
+    std::shared_ptr<ResponseSink> m_writer;
     int m_status{200};
     Headers m_headers;
     // Set when header() refused a field; the response is then not sent at all.

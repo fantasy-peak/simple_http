@@ -39,8 +39,7 @@
 #include <utility>
 #include <vector>
 
-#include "../client/http.h"        // http::Client — the upstream leg lives on the new API
-#include "../client/http_client.h" // transport_failure (the retry rule)
+#include "../client/http.h"        // simple_http::Client — the upstream leg lives on the new API
 #include "../core/logging.h"
 #include "../core/types.h"
 #include "../engine/dispatcher.h" // HttpProxyTarget
@@ -116,9 +115,9 @@ inline bool contains_token(const std::vector<std::string> &tokens, std::string_v
 // `res`. On any upstream failure a 502 Bad Gateway is sent while the response
 // has not started yet; a failure once the body is flowing aborts the frontend
 // response instead (a truncated body must never look complete).
-inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::shared_ptr<Response> res,
+inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res,
                                             bool client_is_tls, HttpProxyTarget target,
-                                            simple_http::http::Client &client) {
+                                            simple_http::Client &client) {
     auto fail_502 = [&res]() -> asio::awaitable<void> {
         if (co_await res->connected()) {
             (void)co_await res->status(502).content_type("text/plain").send("Bad Gateway");
@@ -152,7 +151,7 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
         co_return;
     }
 
-    RequestSpec spec;
+    simple_http::detail::RequestSpec spec;
     spec.method = req->method();
     spec.target = std::move(forwarded_target);
 
@@ -209,18 +208,18 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
     spec.stream_body = has_body;
 
     // --- the backend this target names ---
-    ClientTarget upstream;
+    simple_http::detail::ClientTarget upstream;
     upstream.host = target.host;
     upstream.port = target.port;
     upstream.use_tls = target.tls;
     if (target.tls) {
-        upstream.version = HttpVersionPolicy::Auto; // ALPN: h2 when the backend offers it
+        upstream.version = simple_http::HttpVersionPolicy::Auto; // ALPN: h2 when the backend offers it
     } else if (target.h2c) {
-        upstream.version = HttpVersionPolicy::Http2;
-        upstream.h2c = H2cMode::Upgrade;
+        upstream.version = simple_http::HttpVersionPolicy::Http2;
+        upstream.h2c = simple_http::H2cMode::Upgrade;
     } else {
-        upstream.version = HttpVersionPolicy::Http11; // the historical default: plain HTTP/1.1
-        upstream.h2c = H2cMode::Off;
+        upstream.version = simple_http::HttpVersionPolicy::Http11; // the historical default: plain HTTP/1.1
+        upstream.h2c = simple_http::H2cMode::Off;
     }
 
     // One retry, under the same rule the client's convenience layer uses: only a
@@ -274,7 +273,7 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
         // --- the backend's response head ---
         auto head = co_await stream->read_head();
         if (!head) {
-            if (may_retry && transport_failure(head.error())) {
+            if (may_retry && simple_http::detail::transport_failure(head.error())) {
                 SIMPLE_HTTP_ERROR_LOG("http-proxy: {}:{} dropped a pooled connection ({}), retrying", target.host,
                                       target.port, head.error().message());
                 (void)co_await stream->abort();

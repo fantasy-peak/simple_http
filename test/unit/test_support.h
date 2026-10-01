@@ -231,7 +231,7 @@ class MockTransport {
 
 // Implements the ResponseWriter seam so Response (and anything that replies)
 // can be exercised without a connection. Records the last call's arguments.
-class FakeResponseWriter : public ResponseWriter {
+class FakeResponseSink : public ResponseSink {
   public:
     asio::awaitable<error_code> send(int status, Headers headers, std::string body) override {
         ++calls;
