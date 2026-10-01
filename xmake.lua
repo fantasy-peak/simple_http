@@ -192,4 +192,51 @@ target("readme_examples")
     set_rundir(".")
 target_end()
 
+-- Cross-validation of the client-side WebSocket against an independent server
+-- (test/python/ws_echo_server.py, the `websockets` library). See the file's
+-- header comment:   test/python/.venv/bin/python test/python/ws_echo_server.py
+--                    xmake run ws_cross -- 27920
+target("ws_cross")
+    set_kind("binary")
+    set_default(false)
+    on_load(function (target)
+        if target:toolchain("gcc") then
+            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-type-limits")
+        end
+    end)
+    add_deps("simple_http")
+    add_files("test/ws_client_cross.cpp")
+    set_rundir(".")
+target_end()
+
+-- Cross-validation of the client against an independent HTTP/1.1 server
+-- (test/python/http_server.py, stdlib http.server). See the file header.
+target("client_cross")
+    set_kind("binary")
+    set_default(false)
+    on_load(function (target)
+        if target:toolchain("gcc") then
+            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-type-limits")
+        end
+    end)
+    add_deps("simple_http")
+    add_files("test/client_cross.cpp")
+    set_rundir(".")
+target_end()
+
+-- One-shot: build the two client cross-validation binaries and drive them
+-- against the independent Python servers (test/python/run_client_cross.py).
+target("client-cross-python")
+    set_kind("phony")
+    set_default(false)
+    add_deps("client_cross", "ws_cross")
+    on_run(function ()
+        local python = "test/python/.venv/bin/python"
+        if not os.isfile(python) then
+            raise("no virtualenv at test/python/.venv — see test/python/requirements.txt")
+        end
+        os.execv(python, {"test/python/run_client_cross.py"})
+    end)
+target_end()
+
 

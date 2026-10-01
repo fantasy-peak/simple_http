@@ -44,6 +44,7 @@
 #include "cookie_jar.h"
 #include "http_client.h" // detail::ClientEngine — the connection engine
 #include "url.h"
+#include "ws_client.h" // WebSocketSpec / detail::ws_upgrade (open_websocket)
 
 namespace simple_http {
 
@@ -471,6 +472,47 @@ class Client {
         const std::chrono::milliseconds idle =
             spec.body_idle_timeout.count() > 0 ? spec.body_idle_timeout : m_cfg.body_idle_timeout;
         co_return Stream{std::move(*stream), head, idle};
+    }
+
+    // --- WebSocket client (RFC 6455) ---
+    // Dial and upgrade to `url` (ws:// or wss://), returning a WebSocket handle
+    // identical to the server's — read() pulls whole messages, write_text/
+    // write_binary serialize via one write pump, close() sends a Close frame.
+    // `spec` carries extra request headers and an optional Origin.
+    [[nodiscard]] asio::awaitable<std::expected<std::shared_ptr<WebSocket>, error_code>>
+    open_websocket(std::string url, WebSocketSpec spec = {}) const {
+        // ws:// vs wss:// are http:// vs https:// with an upgrade; normalize so
+        // the shared URL parser (which the Scheme-less client already uses) can
+        // handle host/port/path, then remember the TLS choice.
+        const bool is_tls = url.rfind("wss://", 0) == 0;
+        const bool is_ws = url.rfind("ws://", 0) == 0;
+        if (!is_ws && !is_tls) {
+            co_return std::unexpected{make_error_code(client_errc::bad_url)};
+        }
+        const std::string http_url =
+            std::string{is_tls ? "https://" : "http://"} + std::string{url}.substr(url.find("://") + 3);
+        auto parsed = detail::parse_url(http_url);
+        if (!parsed) {
+            co_return std::unexpected{parsed.error()};
+        }
+
+        detail::ClientTarget target = parsed->to_target();
+        target.use_tls = is_tls;
+        target.version = HttpVersionPolicy::Http11; // WebSocket is HTTP/1-based
+        target.h2c = H2cMode::Off;
+
+        auto transport = co_await m_impl->dial_transport(target, co_await asio::this_coro::executor);
+        if (!transport)
+            co_return std::unexpected{transport.error()};
+
+        const std::string authority = target.authority();
+        const std::string path = std::string{parsed->target};
+        co_return co_await std::visit(
+            [&](auto &typed)
+                -> asio::awaitable<std::expected<std::shared_ptr<WebSocket>, error_code>> {
+                co_return co_await detail::ws_upgrade(typed, authority, path, spec, m_cfg.idle_timeout);
+            },
+            *transport);
     }
 
     // Closes idle pooled connections (in-flight ones are untouched).

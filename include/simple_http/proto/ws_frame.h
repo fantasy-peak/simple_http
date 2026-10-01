@@ -119,7 +119,16 @@ class WsFrameParser {
 
     // Payload size cap; frames larger than this are rejected. The engine sets
     // this from its EngineLimits before serving.
-    explicit WsFrameParser(std::uint64_t max_payload = 16u * 1024 * 1024) : m_max_payload(max_payload) {}
+    //
+    // `expect_masked`: RFC 6455 §5.1 — every frame a *client* sends MUST be
+    // masked; a server's frames NEVER are. This parser is used by both sides:
+    // the server (WsBackendImpl over an accepted connection) expects masked
+    // client frames and rejects unmasked ones (the mask stops a
+    // cache-poisoning intermediary from replaying client bytes verbatim);
+    // the client (open_websocket reuse of WsBackendImpl) expects unmasked
+    // server frames. The flag picks which.
+    explicit WsFrameParser(std::uint64_t max_payload = 16u * 1024 * 1024, bool expect_masked = true)
+        : m_max_payload(max_payload), m_expect_masked(expect_masked) {}
 
     void append(std::string_view bytes) { m_buf.append(bytes); }
     void append(const std::byte *data, std::size_t n) { m_buf.append(reinterpret_cast<const char *>(data), n); }
@@ -190,16 +199,16 @@ class WsFrameParser {
         if (payload_len > m_max_payload)
             return Status::Error;
 
-        // RFC 6455 §5.1: every frame a client sends MUST be masked. This parser
-        // only ever sees client-to-server frames (WsBackendImpl is its only user),
-        // so an unmasked one is a protocol error and not a permissiveness to
-        // tolerate — the mask is what stops a cache-poisoning intermediary from
-        // replaying a client's bytes verbatim into another connection.
-        if (!mask)
+        // RFC 6455 §5.1: every frame a client sends MUST be masked. The server
+        // side only ever sees client-to-server frames, so there an unmasked one
+        // is a protocol error — the mask stops a cache-poisoning intermediary
+        // from replaying a client's bytes verbatim into another connection. The
+        // client side reads server frames, which are never masked.
+        if (mask != m_expect_masked)
             return Status::Error;
 
         unsigned char mask_key[4] = {0, 0, 0, 0};
-        {
+        if (m_expect_masked) {
             if (size < pos + 4)
                 return Status::NeedMore;
             mask_key[0] = data[pos];
@@ -225,8 +234,9 @@ class WsFrameParser {
         out.opcode = static_cast<WsOpcode>(opcode);
         out.payload.assign(reinterpret_cast<const char *>(data + pos), static_cast<std::size_t>(payload_len));
         out.already_delivered = m_partial_off;
-        ws_unmask(out.payload.data(), out.payload.size(),
-                  mask_key); // every frame past the check above is masked
+        if (m_expect_masked) {
+            ws_unmask(out.payload.data(), out.payload.size(), mask_key);
+        }
 
         m_partial_active = false;
         m_buf.erase(0, pos + static_cast<std::size_t>(payload_len));
@@ -250,12 +260,15 @@ class WsFrameParser {
             return out;
         out.bytes.assign(m_buf, m_partial_start + m_partial_off, have - m_partial_off);
         // Payload octet i is masked with key[i % 4], and this chunk starts at
-        // octet m_partial_off, so the key has to be rotated into phase.
-        unsigned char rotated[4];
-        for (std::size_t i = 0; i < 4; ++i) {
-            rotated[i] = m_partial_key[(m_partial_off + i) % 4];
+        // octet m_partial_off, so the key has to be rotated into phase. Only the
+        // server side masks/unmasks; client-side frames arrive in clear.
+        if (m_expect_masked) {
+            unsigned char rotated[4];
+            for (std::size_t i = 0; i < 4; ++i) {
+                rotated[i] = m_partial_key[(m_partial_off + i) % 4];
+            }
+            ws_unmask(out.bytes.data(), out.bytes.size(), rotated);
         }
-        ws_unmask(out.bytes.data(), out.bytes.size(), rotated);
         m_partial_off = have;
         return out;
     }
@@ -271,6 +284,7 @@ class WsFrameParser {
   private:
     std::string m_buf;
     std::uint64_t m_max_payload;
+    bool m_expect_masked{true}; // true = server (client frames are masked)
 
     // In-flight frame bookkeeping for take_partial_payload().
     bool m_partial_active = false;

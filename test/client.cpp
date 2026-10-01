@@ -179,6 +179,17 @@ void register_routes(sh::Server &server) {
         auto body = co_await req->body().read_all();
         co_await res->status(200).send(body ? *body : std::string{});
     });
+    // WebSocket echo, for the client-side open_websocket suite (suite_websocket).
+    server.ws_route("/wsecho", [](sh::RequestPtr, std::shared_ptr<sh::WebSocket> ws) -> asio::awaitable<void> {
+        for (;;) {
+            auto msg = co_await ws->read();
+            if (!msg)
+                break;
+            if (auto ec = co_await ws->write(msg->data, msg->text))
+                break;
+        }
+        co_return;
+    });
     server.route(sh::any_methods, "/drain", [](sh::RequestPtr req, sh::ResponsePtr res) -> asio::awaitable<void> {
         auto body = co_await req->body().read_all();
         co_await res->status(200).send("received " + std::to_string(body ? body->size() : 0) + " bytes");
@@ -1354,6 +1365,44 @@ asio::awaitable<void> suite_redirect(std::uint16_t port) {
     }
 }
 
+asio::awaitable<void> suite_websocket(std::uint16_t port) {
+    std::printf("\n== client WebSocket (open_websocket) ==\n");
+    const std::string base = "ws://127.0.0.1:" + std::to_string(port);
+
+    h::Client client{base_config()};
+    auto ws = co_await client.open_websocket(base + "/wsecho");
+    if (!ws) {
+        check(false, "open_websocket handshake -> " + std::string{ws.error().message()});
+        co_return;
+    }
+    check(ws.has_value(), "client opens a WebSocket to the server's /echo");
+
+    // Echo round-trip over WebSocket (text).
+    if (auto ec = co_await (*ws)->write_text("hello ws"); ec) {
+        check(false, "write_text -> " + ec.message());
+        co_return;
+    }
+    auto msg = co_await (*ws)->read();
+    check(msg && msg->text && msg->data == "hello ws", "text echo round-trips");
+
+    // Binary echo keeps the type flag.
+    if (auto ec = co_await (*ws)->write_binary(std::string{"\x00\x01\x02", 3}); ec) {
+        check(false, "write_binary -> " + ec.message());
+        co_return;
+    }
+    auto bin = co_await (*ws)->read();
+    check(bin && !bin->text && bin->data == std::string{"\x00\x01\x02", 3}, "binary echo keeps type and bytes");
+
+    // Graceful close.
+    if (auto ec = co_await (*ws)->close(); ec) {
+        check(false, "close -> " + ec.message());
+        co_return;
+    }
+    auto after = co_await (*ws)->read();
+    check(!after, "read after close returns an error (not an infinite loop)");
+    check(!(*ws)->is_open(), "is_open() is false after close");
+}
+
 asio::awaitable<void> run_all_suites(asio::io_context &ctx, std::uint16_t plain, std::uint16_t tls_port,
                                      std::uint16_t comp_port) {
     co_await suite_protocol_matrix(plain, tls_port);
@@ -1364,6 +1413,7 @@ asio::awaitable<void> run_all_suites(asio::io_context &ctx, std::uint16_t plain,
     co_await suite_spec_validation(plain);
     co_await suite_tls(tls_port);
     co_await suite_redirect(plain);
+    co_await suite_websocket(plain);
     co_await suite_http_api(plain);
     co_await suite_reverse_proxy(plain);
     co_await suite_raw_peer(ctx);

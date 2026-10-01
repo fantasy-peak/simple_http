@@ -108,7 +108,10 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
     using ResultChannel = asio::experimental::channel<void(error_code)>;
     struct WriteReq {
         std::string payload; // frame payload: the caller's buffer, moved in
-        char header[10]{};   // serialized frame header (at most 10 bytes)
+        // Serialized frame header. A plain (server) frame is at most 10 bytes
+        // (FIN+opcode, len prefix, 64-bit length); a masked (client) frame adds
+        // the MASK bit and a 4-byte key, so the worst case is 14.
+        char header[14]{};
         std::size_t header_len{0};
         std::shared_ptr<ResultChannel> done; // null for fire-and-forget (auto Pong)
         bool close_after = false;            // stop the pump once this frame is written
@@ -127,10 +130,55 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
     // Builds a queued frame without any concatenation buffer: the header is
     // serialized into the request itself (10 bytes inline) and the payload's
     // buffer is moved in. The pump sends the two segments as one write.
+    //
+    // `mask` — a client MUST mask every frame it sends (RFC 6455 §5.3), so the
+    // client-side backend (expect_masked=false) adds the mask bit, a random
+    // 4-byte key and the XOR. The server side (expect_masked=true) does not.
     static WriteReq make_req(WsOpcode opcode, std::string payload, std::shared_ptr<ResultChannel> done,
-                             bool close_after = false) {
+                             bool close_after = false, bool mask = false) {
         WriteReq req;
         req.header_len = ws_encode_header(req.header, opcode, payload.size());
+        if (mask) {
+            // Set the MASK bit (0x80 on the second header octet — the length
+            // field, whose lower 7 bits are the payload length).
+            unsigned char mask_key[4];
+            for (auto &b : mask_key)
+                b = static_cast<unsigned char>(std::rand() & 0xFF);
+            // Rebuild the length octet(s) with the mask bit. The header layout
+            // from ws_encode_header is: [FIN+opcode][len...]; the mask bit rides
+            // on the byte that carries the length.
+            const char fin_opcode = req.header[0];
+            std::size_t len_bytes = req.header_len - 1; // octets after opcode
+            unsigned char len7 = static_cast<unsigned char>(req.header[1]);
+            len7 = static_cast<unsigned char>(len7 | 0x80);
+            req.header[1] = static_cast<char>(len7);
+            // Insert the mask key right after the length prefix + any extended
+            // length. Extended length lives in header[2 .. len_bytes].
+            std::size_t insert_at = req.header_len;
+            // But the ordinary case is a small payload (header_len == 2); for
+            // extended lengths the key goes after those bytes. We rebuild the
+            // whole header here for clarity.
+            char rebuilt[14];
+            rebuilt[0] = fin_opcode;
+            std::uint64_t l = payload.size();
+            std::size_t n = 1;
+            if (l <= 125) {
+                rebuilt[n++] = static_cast<char>(0x80 | l);
+            } else if (l <= 0xFFFF) {
+                rebuilt[n++] = static_cast<char>(0x80 | 126);
+                rebuilt[n++] = static_cast<char>((l >> 8) & 0xFF);
+                rebuilt[n++] = static_cast<char>(l & 0xFF);
+            } else {
+                rebuilt[n++] = static_cast<char>(0x80 | 127);
+                for (int i = 7; i >= 0; --i)
+                    rebuilt[n++] = static_cast<char>((l >> (8 * i)) & 0xFF);
+            }
+            for (auto b : mask_key)
+                rebuilt[n++] = static_cast<char>(b);
+            std::memcpy(req.header, rebuilt, n);
+            req.header_len = n;
+            ws_unmask(payload.data(), payload.size(), mask_key);
+        }
         req.payload = std::move(payload);
         req.done = std::move(done);
         req.close_after = close_after;
@@ -138,10 +186,15 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
     }
 
   public:
+    // `expect_masked`: server side (default) reads masked client frames; the
+    // client side (open_websocket) reads unmasked server frames. See
+    // WsFrameParser.
     explicit WsBackendImpl(std::shared_ptr<Transport> transport, std::uint64_t max_payload = 16u * 1024 * 1024,
-                           std::chrono::steady_clock::duration idle_timeout = std::chrono::seconds(120))
-        : m_transport(std::move(transport)), m_executor(m_transport->get_executor()), m_parser(max_payload),
-          m_max_payload(max_payload), m_idle_timeout(idle_timeout),
+                           std::chrono::steady_clock::duration idle_timeout = std::chrono::seconds(120),
+                           bool expect_masked = true)
+        : m_transport(std::move(transport)), m_executor(m_transport->get_executor()),
+          m_parser(max_payload, expect_masked), m_max_payload(max_payload), m_idle_timeout(idle_timeout),
+          m_expect_masked(expect_masked),
           m_watchdog_timer(std::make_shared<asio::steady_timer>(m_executor)), m_notify(m_executor, 1) {
         m_deadline = std::chrono::steady_clock::now() + m_idle_timeout;
     }
@@ -323,7 +376,8 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
             co_return make_error_code(asio::error::not_connected);
         }
         auto done = std::make_shared<ResultChannel>(m_executor, 1);
-        m_pending.push_back(make_req(text ? WsOpcode::Text : WsOpcode::Binary, std::move(data), done, false));
+        m_pending.push_back(make_req(text ? WsOpcode::Text : WsOpcode::Binary, std::move(data), done, false,
+                                         !m_expect_masked));
         (void)m_notify.try_send(error_code{}); // wake the pump; coalescing is fine
         auto [ec] = co_await done->async_receive(asio::as_tuple(asio::use_awaitable));
         co_return ec;
@@ -347,7 +401,8 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
         if (m_open) {
             m_open = false;
             auto done = std::make_shared<ResultChannel>(m_executor, 1);
-            m_pending.push_back(make_req(WsOpcode::Close, ws_close_payload(code), done, /*close_after=*/true));
+            m_pending.push_back(make_req(WsOpcode::Close, ws_close_payload(code), done, /*close_after=*/true,
+                                         !m_expect_masked));
             (void)m_notify.try_send(error_code{});
             // Wait for the pump to actually write the Close frame.
             co_await done->async_receive(asio::as_tuple(asio::use_awaitable));
@@ -475,7 +530,7 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
         if (!m_open || m_pending.size() >= kMaxPendingFrames) {
             co_return;
         }
-        m_pending.push_back(make_req(opcode, std::move(payload), nullptr, close_after));
+        m_pending.push_back(make_req(opcode, std::move(payload), nullptr, close_after, /*mask=*/!m_expect_masked));
         (void)m_notify.try_send(error_code{});
         co_return;
     }
@@ -557,6 +612,7 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
     std::uint64_t m_max_payload;
     std::chrono::steady_clock::duration m_idle_timeout;
     std::chrono::steady_clock::time_point m_deadline{};
+    bool m_expect_masked{true}; // client side (false) masks its writes / reads unmasked frames
     std::shared_ptr<asio::steady_timer> m_watchdog_timer; // cancelled on teardown
     WriteQueue m_pending;                                 // queued frames: owned by us, cleared on teardown
     Notify m_notify;                                      // pump wake-up signal (carries only a trivial error_code)

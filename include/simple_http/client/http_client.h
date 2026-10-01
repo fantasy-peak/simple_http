@@ -331,6 +331,68 @@ class ClientEngine {
     // that is, until it is known to be at a request boundary.
     asio::awaitable<std::expected<std::shared_ptr<ClientSession>, error_code>>
     dial(ClientTarget target, asio::any_io_executor ex, PoolKey key) {
+        auto transport = co_await dial_transport(target, ex);
+        if (!transport)
+            co_return std::unexpected{transport.error()};
+        auto session = co_await std::visit(
+            [&](auto &typed) -> asio::awaitable<std::expected<std::shared_ptr<ClientSession>, error_code>> {
+                using Transport = std::decay_t<decltype(*typed)>;
+                // Same session startup as the old start_plain/start_tls: an
+                // HTTP/1.1 session, or an HTTP/2 one when the policy says so
+                // (h2c prior-knowledge) / ALPN selected h2, and the wire allows
+                // it. WebSockets never come through here — see dial_transport.
+                if constexpr (std::is_same_v<Transport, TlsStreamTransport>) {
+                    const std::string_view alpn = typed->alpn_selected();
+                    if (target.version == HttpVersionPolicy::Http2 && alpn != "h2") {
+                        typed->close();
+                        co_return std::unexpected{make_error_code(client_errc::version_not_negotiated)};
+                    }
+                    if (alpn == "h2") {
+                        auto session = std::make_shared<Http2ClientSession<TlsStreamTransport>>(
+                            typed, target, m_config.limits, m_config.idle_timeout);
+                        wire_session(session, key);
+                        if (auto ec = co_await session->start(); ec) {
+                            session->close();
+                            co_return std::unexpected{ec};
+                        }
+                        co_return session;
+                    }
+                    auto session = std::make_shared<Http1ClientSession<TlsStreamTransport>>(
+                        typed, target.authority(), m_config.limits, m_config.idle_timeout);
+                    wire_h1_session(session, target, key);
+                    co_return session;
+                } else {
+                    const bool speak_h2_at_once =
+                        target.h2c == H2cMode::PriorKnowledge && target.version != HttpVersionPolicy::Http11;
+                    if (speak_h2_at_once) {
+                        auto session = std::make_shared<Http2ClientSession<TcpStreamTransport>>(
+                            typed, target, m_config.limits, m_config.idle_timeout);
+                        wire_session(session, key);
+                        if (auto ec = co_await session->start(); ec) {
+                            session->close();
+                            co_return std::unexpected{ec};
+                        }
+                        co_return session;
+                    }
+                    auto session = std::make_shared<Http1ClientSession<TcpStreamTransport>>(
+                        typed, target.authority(), m_config.limits, m_config.idle_timeout);
+                    wire_h1_session(session, target, key);
+                    co_return session;
+                }
+            },
+            *transport);
+        co_return session;
+    }
+
+    // Resolves, connects and TLS-handshakes to `target`, returning the raw
+    // transport — no HTTP session is started. The caller (the WebSocket
+    // client) speaks its own protocol over it.
+    // Public: the WebSocket client (client/ws_client.h) dials through here.
+  public:
+    using DialedTransport =
+        std::variant<std::shared_ptr<TcpStreamTransport>, std::shared_ptr<TlsStreamTransport>>;
+    asio::awaitable<std::expected<DialedTransport, error_code>> dial_transport(ClientTarget target,
+                                                                               asio::any_io_executor ex) {
         error_code ec;
         auto endpoints = co_await resolve(target, ex);
         if (!endpoints)
@@ -346,42 +408,10 @@ class ClientEngine {
         auto peer = socket->remote_endpoint(pe);
         ++m_opened;
 
-        if (target.use_tls) {
-            co_return co_await start_tls_session(std::move(target), std::move(socket), peer, std::move(key));
+        if (!target.use_tls) {
+            co_return DialedTransport{std::make_shared<TcpStreamTransport>(std::move(socket), peer)};
         }
-        co_return co_await start_plain_session(std::move(target), std::move(socket), peer, std::move(key));
-    }
 
-    asio::awaitable<std::expected<std::shared_ptr<ClientSession>, error_code>>
-    start_plain_session(ClientTarget target, std::shared_ptr<asio::ip::tcp::socket> socket,
-                        asio::ip::tcp::endpoint peer, PoolKey key) {
-        auto transport = std::make_shared<TcpStreamTransport>(std::move(socket), peer);
-        // Plaintext h2c has two shapes, and which one applies is H2cMode's call:
-        // PriorKnowledge speaks h2 from the first byte, while Upgrade stays
-        // HTTP/1.1 until a request switches the connection — even when HTTP/2 is
-        // required, in which case a peer that will not upgrade fails the request
-        // rather than quietly answering over HTTP/1.1.
-        const bool speak_h2_at_once =
-            target.h2c == H2cMode::PriorKnowledge && target.version != HttpVersionPolicy::Http11;
-        if (speak_h2_at_once) {
-            auto session = std::make_shared<Http2ClientSession<TcpStreamTransport>>(transport, target, m_config.limits,
-                                                                                    m_config.idle_timeout);
-            wire_session(session, key);
-            if (auto ec = co_await session->start(); ec) {
-                session->close();
-                co_return std::unexpected{ec};
-            }
-            co_return session;
-        }
-        auto session = std::make_shared<Http1ClientSession<TcpStreamTransport>>(transport, target.authority(),
-                                                                                m_config.limits, m_config.idle_timeout);
-        wire_h1_session(session, target, key);
-        co_return session;
-    }
-
-    asio::awaitable<std::expected<std::shared_ptr<ClientSession>, error_code>>
-    start_tls_session(ClientTarget target, std::shared_ptr<asio::ip::tcp::socket> socket, asio::ip::tcp::endpoint peer,
-                      PoolKey key) {
         auto stream = std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(std::move(*socket), *m_ssl_context);
         auto transport = std::make_shared<TlsStreamTransport>(stream, peer);
 
@@ -389,44 +419,26 @@ class ClientEngine {
         hs.sni = target.sni.empty() && !m_config.tls.sni_override.empty() ? m_config.tls.sni_override
                                                                           : std::string{target.sni_host()};
         hs.verify_host = m_config.tls.verify_host && m_config.tls.verify_peer;
+        // The caller's version policy decides the ALPN list (dial_transport is
+        // also the WebSocket client's path, which pins http/1.1 itself — see
+        // ws_client.h). A TLS WebSocket must not negotiate h2, or the upgrade
+        // would be impossible.
         hs.alpn_wire = alpn_wire_list(target, m_config.tls);
 
-        // The handshake shares the connect budget: DNS + TCP + TLS is what the
-        // caller's timeout is about.
         auto outcome = co_await await_with_deadline(tls_client_handshake(*transport, hs), m_config.connect_timeout);
         if (!outcome) {
             transport->close();
             co_return std::unexpected{outcome.error()};
         }
-        if (error_code ec = *outcome) {
-            SIMPLE_HTTP_ERROR_LOG("client: TLS handshake with {} failed: {}", target.sni_host(), ec.message());
+        if (error_code e = *outcome) {
+            SIMPLE_HTTP_ERROR_LOG("client: TLS handshake with {} failed: {}", target.sni_host(), e.message());
             transport->close();
-            co_return std::unexpected{ec};
+            co_return std::unexpected{e};
         }
-
-        const std::string_view alpn = transport->alpn_selected();
-        if (target.version == HttpVersionPolicy::Http2 && alpn != "h2") {
-            SIMPLE_HTTP_ERROR_LOG("client: {} did not negotiate HTTP/2 over TLS (ALPN='{}')", target.sni_host(), alpn);
-            transport->close();
-            co_return std::unexpected{make_error_code(client_errc::version_not_negotiated)};
-        }
-        if (alpn == "h2") {
-            auto session = std::make_shared<Http2ClientSession<TlsStreamTransport>>(transport, target, m_config.limits,
-                                                                                    m_config.idle_timeout);
-            wire_session(session, key);
-            if (auto ec = co_await session->start(); ec) {
-                session->close();
-                co_return std::unexpected{ec};
-            }
-            co_return session;
-        }
-        // "http/1.1", or no ALPN at all (an older peer): HTTP/1.1.
-        auto session = std::make_shared<Http1ClientSession<TlsStreamTransport>>(transport, target.authority(),
-                                                                                m_config.limits, m_config.idle_timeout);
-        wire_h1_session(session, target, key);
-        co_return session;
+        co_return DialedTransport{std::move(transport)};
     }
 
+  private:
     // Gives a session its pool identity: when it goes idle and reusable, it goes
     // back to the pool (the pool arms the idle timer that eventually closes it).
     template <typename Session> void wire_session(std::shared_ptr<Session> session, const PoolKey &key) {
