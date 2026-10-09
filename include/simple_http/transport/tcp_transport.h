@@ -5,12 +5,13 @@
 // Templated on the underlying Asio socket so plain TCP and Unix-domain sockets
 // share one implementation. Satisfies the TransportLike concept.
 
+#include <algorithm>
+#include <array>
+#include <boost/asio.hpp>
 #include <cstddef>
 #include <memory>
 #include <span>
 #include <utility>
-
-#include <boost/asio.hpp>
 
 #include "../core/types.h"
 #include "transport.h"
@@ -21,7 +22,7 @@ namespace asio = boost::asio;
 
 // Orderly shutdown+close, selected by socket type via overloading (no
 // if-constexpr chains).
-inline void shutdown_socket(asio::ip::tcp::socket& s) {
+inline void shutdown_socket(asio::ip::tcp::socket &s) {
     if (s.is_open()) {
         error_code ec;
         s.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
@@ -29,8 +30,10 @@ inline void shutdown_socket(asio::ip::tcp::socket& s) {
     }
 }
 
-#ifdef SIMPLE_HTTP_BIND_UNIX_SOCKET
-inline void shutdown_socket(asio::local::stream_protocol::socket& s) {
+// Compiles in wherever the platform has AF_UNIX. asio is the one that knows, so
+// there is no switch for a consumer to set (and none to forget).
+#ifdef BOOST_ASIO_HAS_LOCAL_SOCKETS
+inline void shutdown_socket(asio::local::stream_protocol::socket &s) {
     if (s.is_open()) {
         error_code ec;
         s.shutdown(asio::local::stream_protocol::socket::shutdown_both, ec);
@@ -39,8 +42,10 @@ inline void shutdown_socket(asio::local::stream_protocol::socket& s) {
 }
 #endif
 
-template <typename Socket>
-class TcpTransport {
+// Most buffers one scatter-gather write accepts; see async_write_seq.
+inline constexpr std::size_t kMaxWriteBuffers = 8;
+
+template <typename Socket> class TcpTransport {
   public:
     explicit TcpTransport(std::shared_ptr<Socket> socket, asio::ip::tcp::endpoint peer = {})
         : m_socket(std::move(socket)), m_peer(std::move(peer)) {}
@@ -51,8 +56,35 @@ class TcpTransport {
         co_return IoResult{ec, n};
     }
 
+    // Reads exactly `buffer.size()` bytes. Composed operation: it completes when
+    // the buffer is full, or with an error (EOF included) after a partial read -
+    // the result still reports the bytes read.
+    asio::awaitable<IoResult> async_read(ByteSpan buffer) {
+        auto [ec, n] = co_await asio::async_read(*m_socket, asio::buffer(buffer.data(), buffer.size()),
+                                                 asio::as_tuple(asio::use_awaitable));
+        co_return IoResult{ec, n};
+    }
+
     asio::awaitable<IoResult> async_write(ConstByteSpan buffer) {
         auto [ec, n] = co_await asio::async_write(*m_socket, asio::buffer(buffer.data(), buffer.size()),
+                                                  asio::as_tuple(asio::use_awaitable));
+        co_return IoResult{ec, n};
+    }
+    // Writes several buffers as one operation (one writev), so a frame header and
+    // its payload need not be concatenated first. Like async_write this is a
+    // composed operation: it completes only once every byte has been written.
+    asio::awaitable<IoResult> async_write_seq(std::span<const ConstByteSpan> buffers) {
+        // Bounded by the iovec this builds. Callers pass a handful at most (a head
+        // and a body, a frame header and its payload), so the cap is a backstop
+        // rather than a real limit — dropping buffers past it would write a
+        // *shorter* message and still report success, which is silent truncation.
+        assert(buffers.size() <= kMaxWriteBuffers);
+        const std::size_t count = std::min<std::size_t>(buffers.size(), kMaxWriteBuffers);
+        std::array<asio::const_buffer, 8> bufs{};
+        for (std::size_t i = 0; i < count; ++i) {
+            bufs[i] = asio::buffer(buffers[i].data(), buffers[i].size());
+        }
+        auto [ec, n] = co_await asio::async_write(*m_socket, std::span<const asio::const_buffer>{bufs.data(), count},
                                                   asio::as_tuple(asio::use_awaitable));
         co_return IoResult{ec, n};
     }
@@ -65,12 +97,8 @@ class TcpTransport {
 
     void close() { shutdown_socket(*m_socket); }
 
-    Socket& socket() { return *m_socket; }
-    const std::shared_ptr<Socket>& socket_ptr() const { return m_socket; }
-
-    // The underlying Beast-compatible stream (for the HTTP/1.x engine, which
-    // uses Beast's parser/serializer directly). For plaintext this is the socket.
-    Socket& beast_stream() { return *m_socket; }
+    Socket &socket() { return *m_socket; }
+    const std::shared_ptr<Socket> &socket_ptr() const { return m_socket; }
 
   private:
     std::shared_ptr<Socket> m_socket;
@@ -78,8 +106,8 @@ class TcpTransport {
 };
 
 using TcpStreamTransport = TcpTransport<asio::ip::tcp::socket>;
-#ifdef SIMPLE_HTTP_BIND_UNIX_SOCKET
+#ifdef BOOST_ASIO_HAS_LOCAL_SOCKETS
 using UnixStreamTransport = TcpTransport<asio::local::stream_protocol::socket>;
 #endif
 
-}  // namespace simple_http
+} // namespace simple_http

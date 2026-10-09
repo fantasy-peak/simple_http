@@ -1,3 +1,12 @@
 @PACKAGE_INIT@
 
+# The exported target carries its dependencies as INTERFACE link libraries, so
+# those imported targets must exist before simple_httpTargets.cmake is included.
+include(CMakeFindDependencyMacro)
+
+find_dependency(Boost CONFIG)
+find_dependency(OpenSSL)
+find_dependency(ZLIB)
+find_dependency(Brotli)
+
 include("${CMAKE_CURRENT_LIST_DIR}/simple_httpTargets.cmake")

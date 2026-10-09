@@ -12,16 +12,16 @@
 // three-state ReadResult (data / end-of-body). This avoids the ambiguity of a
 // nested expected<optional<string>> and cleanly represents empty DATA frames.
 
+#include <boost/asio.hpp>
+#include <boost/asio/experimental/concurrent_channel.hpp>
 #include <cstddef>
 #include <expected>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <variant>
-
-#include <boost/asio.hpp>
-#include <boost/asio/experimental/concurrent_channel.hpp>
 
 #include "../core/types.h"
 
@@ -30,7 +30,8 @@ namespace simple_http {
 namespace asio = boost::asio;
 
 // Result of a single Body::read(). When `eof` is true the body is complete and
-// `data` is empty; otherwise `data` holds the chunk (which may itself be empty).
+// `data` is empty; otherwise `data` holds the chunk (which may itself be
+// empty).
 struct ReadResult {
     std::string data;
     bool eof = false;
@@ -46,13 +47,12 @@ class Body {
     using Channel = asio::experimental::concurrent_channel<void(error_code, Frame)>;
 
     template <typename Executor>
-    explicit Body(const Executor& exec, std::size_t capacity = 1024)
-        : m_channel(std::make_shared<Channel>(exec, capacity)) {}
+    explicit Body(const Executor &exec, std::size_t capacity = 1024) : m_exec(exec), m_capacity(capacity) {}
 
-    Body(const Body&) = delete;
-    Body& operator=(const Body&) = delete;
-    Body(Body&&) = default;
-    Body& operator=(Body&&) = default;
+    Body(const Body &) = delete;
+    Body &operator=(const Body &) = delete;
+    Body(Body &&) = default;
+    Body &operator=(Body &&) = default;
 
     // --- consumer API (handler side) ---
 
@@ -64,18 +64,31 @@ class Body {
         // Pull mode (HTTP/1.x): fetch the next chunk on demand from the provider.
         if (m_pull) {
             auto r = co_await m_pull();
-            if (!r || r->eof) m_eof = true;
+            if (!r || r->eof)
+                m_eof = true;
             co_return r;
         }
         error_code ec;
         Frame frame;
         // Fast path: a frame is already queued.
-        bool got = m_channel->try_receive([&](error_code e, Frame f) {
+        Channel &ch = channel();
+        bool got = ch.try_receive([&](error_code e, Frame f) {
             ec = e;
             frame = std::move(f);
         });
         if (!got) {
-            std::tie(ec, frame) = co_await m_channel->async_receive(asio::as_tuple(asio::use_awaitable));
+            // A finish()/fail() that could not fit when it arrived. Reaching here
+            // means the queue is drained (try_receive failed), so delivering the
+            // recorded terminator now is exactly what a queued one would have done.
+            if (m_pending_error) {
+                m_eof = true;
+                co_return std::unexpected(*m_pending_error);
+            }
+            if (m_pending_eof) {
+                m_eof = true;
+                co_return ReadResult::end();
+            }
+            std::tie(ec, frame) = co_await ch.async_receive(asio::as_tuple(asio::use_awaitable));
         }
         if (ec) {
             m_eof = true;
@@ -114,14 +127,52 @@ class Body {
 
     // --- producer API (protocol engine side) ---
 
-    // Enqueues a body chunk. Returns false if the channel is full/closed.
-    [[nodiscard]] bool feed(std::string data) { return m_channel->try_send(error_code{}, Frame{std::move(data)}); }
+    // Enqueues a body chunk. Returns false if the channel is full or closed, and
+    // on failure `data` is left untouched so the caller can retry it.
+    //
+    // There is no way to ask "is there room?" first: asio's concurrent_channel
+    // reports readiness for *sending or receiving*, which stays true while a
+    // reader is parked, not whether the buffer has space. So the caller must
+    // check this result and keep the frame — a dropped frame is silent data loss,
+    // and on HTTP/2 it also strands the connection, because those bytes were
+    // already debited against the connection window and the credit is only
+    // returned when the handler consumes.
+    //
+    // `data` is handed straight to try_send rather than wrapped in a Frame here:
+    // asio moves its arguments into the queued frame only on success, so a refused
+    // send leaves `data` intact. Wrapping it first would move it unconditionally
+    // and lose it on failure.
+    [[nodiscard]] bool feed(std::string &&data) { return channel().try_send(error_code{}, std::move(data)); }
 
     // Signals normal end-of-body.
-    [[nodiscard]] bool finish() { return m_channel->try_send(error_code{}, Frame{Eof{}}); }
+    //
+    // Unlike feed(), this must never be droppable: the consumer *waits* for it,
+    // so losing it hangs the reader rather than truncating it. It is therefore
+    // also recorded out of band, and read() reports it once the queued frames
+    // have drained — whether or not the channel had room when it arrived.
+    void finish() {
+        if (m_terminated)
+            return; // first terminator wins (see fail())
+        m_terminated = true;
+        m_pending_eof = true;
+        (void)channel().try_send(error_code{}, Frame{Eof{}});
+    }
 
-    // Signals a stream failure (reset/disconnect) to the consumer.
-    [[nodiscard]] bool fail(error_code ec) { return m_channel->try_send(ec, Frame{Eof{}}); }
+    // Signals a stream failure (reset/disconnect) to the consumer. Same
+    // out-of-band guarantee as finish(), and for the same reason.
+    //
+    // First terminator wins: a body that already ended normally must not be
+    // rewritten into a failure by a later teardown (an engine now fails every
+    // in-flight body on connection shutdown and on its own stream resets, which
+    // can run after a normal finish()), and repeated fails must not queue a
+    // second terminator.
+    void fail(error_code ec) {
+        if (m_terminated)
+            return;
+        m_terminated = true;
+        m_pending_error = ec;
+        (void)channel().try_send(ec, Frame{Eof{}});
+    }
 
     // Installs a consumption hook invoked (from the consumer's context) with the
     // byte count of each data chunk the handler reads. The HTTP/2 engine uses it
@@ -142,10 +193,28 @@ class Body {
     bool is_pull() const { return static_cast<bool>(m_pull); }
 
   private:
+    // The frame channel is created on first use. HTTP/1.x runs the body in pull
+    // mode and never feeds or reads the channel, so building it in the
+    // constructor would allocate a channel object plus its deque for every
+    // request and use neither.
+    Channel &channel() {
+        if (!m_channel)
+            m_channel = std::make_shared<Channel>(m_exec, m_capacity);
+        return *m_channel;
+    }
+
+    asio::any_io_executor m_exec;
+    std::size_t m_capacity{1024};
     std::shared_ptr<Channel> m_channel;
     bool m_eof{false};
+    // Terminators that did not fit on the channel when they arrived; see
+    // finish().
+    bool m_pending_eof{false};
+    // A terminator (finish or fail) has been recorded; only the first one wins.
+    bool m_terminated{false};
+    std::optional<error_code> m_pending_error;
     std::function<void(std::size_t)> m_on_consumed;
-    PullProvider m_pull;  // set in pull mode (HTTP/1.x); unset = pushed channel (HTTP/2)
+    PullProvider m_pull; // set in pull mode (HTTP/1.x); unset = pushed channel (HTTP/2)
 };
 
-}  // namespace simple_http
+} // namespace simple_http

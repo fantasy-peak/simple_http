@@ -1,23 +1,29 @@
 #pragma once
 
-// HTTP/1.x request-head parser — a beast-free, incremental, byte-level parser.
+// HTTP/1.x head parsers — beast-free, incremental, byte-level.
 //
-// The parsing approach follows paozhu's httpparse (vendor/httpserver/
-// http_parse.cpp): scan the request line for method / target / version, then
-// split each header line on the first ':' with leading-whitespace folding and a
-// lowercased field name. paozhu wrote everything into its httppeer god-object
-// and also decoded the query string; here the parser stays minimal and
-// framework-free — it fills a small ParsedHead (Method + target + Version +
-// Headers) and leaves body framing to the caller. It depends only on the
-// standard library and simple_http core types (no Asio, no Beast).
+// The parsing approach: scan the start line for its tokens, then split each
+// header line on the first ':' with leading-whitespace folding and a lowercased
+// field name. The parsers stay minimal and framework-free — they fill a small
+// struct and leave body framing (and the query string) to the caller. They
+// depend only on the standard library and simple_http core types (no Asio, no
+// Beast).
+//
+// Two parsers share the line/field scanning below:
+//   * H1Parser         — the request head (method / target / version), used by
+//                        the server's HTTP/1.x engine.
+//   * H1ResponseParser — the status line + headers of a response, used by the
+//                        client (client/h1_client.h).
 //
 // Usage: append received bytes with feed(); call parse_head(). While it returns
-// NeedMore, keep reading and feeding. On Done, head() holds the parsed request
-// line + headers and consumed() bytes have been taken from the buffer (the
-// remainder is the start of the body). On Error, error() explains why.
+// NeedMore, keep reading and feeding. On Done, head() holds the parsed head and
+// consumed() bytes have been taken from the buffer (the remainder is the start
+// of the body). On Error the line was malformed.
 
 #include <cctype>
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -28,9 +34,134 @@
 
 namespace simple_http {
 
+// Shared line/field scanning for both head parsers. Kept free of parser state
+// so the request and response sides cannot drift apart.
+namespace h1_detail {
+
+// Returns the next CRLF/LF-delimited line of `block` and advances `pos` past
+// its terminator (a trailing CR is stripped).
+inline std::string_view next_line(std::string_view block, std::size_t &pos) {
+    std::size_t nl = block.find('\n', pos);
+    std::size_t line_end = (nl == std::string_view::npos) ? block.size() : nl;
+    std::size_t raw_end = line_end;
+    if (raw_end > pos && block[raw_end - 1] == '\r') {
+        raw_end -= 1; // strip trailing CR
+    }
+    std::string_view line = block.substr(pos, raw_end - pos);
+    pos = (nl == std::string_view::npos) ? block.size() : nl + 1;
+    return line;
+}
+
+// Why a header line was rejected (the callers report it differently).
+enum class FieldLine { Ok, Malformed, NameTooLong };
+
+// Whether `c` may appear in a field name: RFC 9110 §5.6.2's tchar. Anything
+// else — a bracket, a space, a bare CR left behind by a line that did not end
+// in CRLF — makes the line malformed rather than something to fold into the
+// name.
+inline bool is_tchar(unsigned char c) {
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
+        return true;
+    }
+    switch (c) {
+    case '!':
+    case '#':
+    case '$':
+    case '%':
+    case '&':
+    case '\'':
+    case '*':
+    case '+':
+    case '-':
+    case '.':
+    case '^':
+    case '_':
+    case '`':
+    case '|':
+    case '~':
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Whether a field value carries a byte it may not (RFC 9110 §5.5): a control
+// character other than HTAB, or DEL. obs-text (0x80-0xFF) stays legal. Letting
+// one through would put it into whatever the handler or the reverse proxy
+// builds downstream, where it means something the sender never said.
+inline bool has_forbidden_field_value_byte(std::string_view value) {
+    // Fast path: skip clean 8-byte words with a SWAR existence test, then fall
+    // through to the exact per-byte scan for anything flagged. The SWAR only
+    // ever over-approximates (bytes == HTAB count as suspicious too, and the
+    // classic lane masks are "exists" checks, not per-lane exact): when it stays
+    // silent the word has no byte < 0x20 and no 0x7F, so nothing to report;
+    // when it flags we confirm byte-exactly. Correctness never depends on the
+    // masks.
+    const auto *p = reinterpret_cast<const unsigned char *>(value.data());
+    const std::size_t n = value.size();
+    constexpr std::uint64_t k01 = 0x0101010101010101ULL;
+    constexpr std::uint64_t k80 = 0x8080808080808080ULL;
+    std::size_t i = 0;
+    while (i + 8 <= n) {
+        std::uint64_t w{};
+        std::memcpy(&w, p + i, 8);
+        const std::uint64_t lo = (w - k01 * 0x20) & ~w & k80;                             // any lane < 0x20
+        const std::uint64_t del = ((w ^ (k01 * 0x7F)) - k01) & ~(w ^ (k01 * 0x7F)) & k80; // any lane == 0x7F
+        if (((lo | del) != 0)) {
+            break; // suspicious word: confirm byte-exactly below
+        }
+        i += 8;
+    }
+    for (; i < n; ++i) {
+        const auto c = p[i];
+        if (c == '\t')
+            continue;
+        if (c < 0x20 || c == 0x7F)
+            return true;
+    }
+    return false;
+}
+
+// Parses one "name: value" field line into `out`: split on the first ':', skip
+// leading whitespace in the value, trim trailing OWS, lowercase the name (done
+// by Headers::add).
+inline FieldLine parse_field_line(std::string_view line, Headers &out) {
+    std::size_t colon = line.find(':');
+    if (colon == std::string_view::npos || colon == 0) {
+        return FieldLine::Malformed;
+    }
+    std::string_view key = line.substr(0, colon);
+    for (char ch : key) {
+        if (!is_tchar(static_cast<unsigned char>(ch))) {
+            return FieldLine::Malformed;
+        }
+    }
+    std::size_t vstart = colon + 1;
+    while (vstart < line.size() && (line[vstart] == ' ' || line[vstart] == '\t')) {
+        ++vstart;
+    }
+    std::string_view value = line.substr(vstart);
+    std::size_t vend = value.size();
+    while (vend > 0 && (value[vend - 1] == ' ' || value[vend - 1] == '\t')) {
+        --vend;
+    }
+    value = value.substr(0, vend);
+
+    if (key.size() > 200) { // sanity bound on field-name length
+        return FieldLine::NameTooLong;
+    }
+    if (has_forbidden_field_value_byte(value)) {
+        return FieldLine::Malformed;
+    }
+    out.add(std::string{key}, std::string{value});
+    return FieldLine::Ok;
+}
+
+} // namespace h1_detail
+
 struct ParsedHead {
     Method method = Method::Unknown;
-    std::string method_token;  // raw token, so unknown/extension methods survive
+    std::string method_token; // raw token, so unknown/extension methods survive
     std::string target;
     Version version = Version::Http11;
     Headers headers;
@@ -42,21 +173,25 @@ class H1Parser {
 
     // Appends freshly-read bytes to the internal buffer.
     void feed(std::string_view bytes) { m_buf.append(bytes); }
-    void feed(const std::byte* data, std::size_t n) {
-        m_buf.append(reinterpret_cast<const char*>(data), n);
-    }
+    void feed(const std::byte *data, std::size_t n) { m_buf.append(reinterpret_cast<const char *>(data), n); }
 
     // Attempts to parse a complete request head (up to and including the blank
     // line CRLFCRLF). Idempotent while NeedMore.
     State parse_head() {
-        // Locate the end of the header block.
-        std::size_t end = m_buf.find("\r\n\r\n");
+        // Locate the end of the header block, resuming where the previous call
+        // stopped. feed() only appends, so a terminator that was absent before
+        // cannot begin earlier than (old_size - 3): a 4-byte CRLFCRLF may
+        // straddle the old end. Without this cursor a peer dribbling a head
+        // byte-by-byte made every parse_head re-scan the whole buffer (O(n^2),
+        // up to max_header_bytes — a Slowloris amplifier).
+        std::size_t end = m_buf.find("\r\n\r\n", m_scan_from);
         std::size_t sep = 4;
         if (end == std::string::npos) {
             // Tolerate bare-LF line endings (some minimal clients / tests).
-            end = m_buf.find("\n\n");
+            end = m_buf.find("\n\n", m_scan_from);
             sep = 2;
             if (end == std::string::npos) {
+                m_scan_from = m_buf.size() >= 3 ? m_buf.size() - 3 : 0;
                 return State::NeedMore;
             }
         }
@@ -66,10 +201,16 @@ class H1Parser {
             return State::Error;
         }
         m_consumed = end + sep;
+        m_scan_from = 0;
         return State::Done;
     }
 
-    const ParsedHead& head() const { return m_head; }
+    const ParsedHead &head() const { return m_head; }
+    // Mutable access so the engine can move the parsed head (target, header
+    // fields) straight into the Request it builds, instead of copying each
+    // string. Safe because all the search/semantics reads happen before this
+    // point and the parser itself is a per-request local (re-parsed next loop).
+    ParsedHead &head() { return m_head; }
     std::size_t consumed() const { return m_consumed; }
     unsigned int error() const { return m_error; }
 
@@ -78,15 +219,14 @@ class H1Parser {
     std::size_t buffered() const { return m_buf.size(); }
 
     // The bytes remaining after the parsed head (the beginning of the body).
-    std::string_view remainder() const {
-        return std::string_view{m_buf}.substr(m_consumed);
-    }
+    std::string_view remainder() const { return std::string_view{m_buf}.substr(m_consumed); }
 
     // Resets so the same parser can serve the next pipelined request. Drops the
     // consumed head and keeps any leftover bytes.
     void reset_after_head() {
         m_buf.erase(0, m_consumed);
         m_consumed = 0;
+        m_scan_from = 0;
         m_head = ParsedHead{};
         m_error = 0;
     }
@@ -103,7 +243,7 @@ class H1Parser {
         while (pos < block.size()) {
             std::string_view hline = next_line(block, pos);
             if (hline.empty()) {
-                continue;  // defensive; the block excludes the terminating blank line
+                continue; // defensive; the block excludes the terminating blank line
             }
             if (!parse_header_line(hline)) {
                 return false;
@@ -113,16 +253,8 @@ class H1Parser {
     }
 
     // Returns the next CRLF/LF-delimited line and advances pos past the newline.
-    static std::string_view next_line(std::string_view block, std::size_t& pos) {
-        std::size_t nl = block.find('\n', pos);
-        std::size_t line_end = (nl == std::string_view::npos) ? block.size() : nl;
-        std::size_t raw_end = line_end;
-        if (raw_end > pos && block[raw_end - 1] == '\r') {
-            raw_end -= 1;  // strip trailing CR
-        }
-        std::string_view line = block.substr(pos, raw_end - pos);
-        pos = (nl == std::string_view::npos) ? block.size() : nl + 1;
-        return line;
+    static std::string_view next_line(std::string_view block, std::size_t &pos) {
+        return h1_detail::next_line(block, pos);
     }
 
     bool parse_request_line(std::string_view line) {
@@ -155,46 +287,156 @@ class H1Parser {
         } else if (version == "HTTP/1.0") {
             m_head.version = Version::Http1;
         } else {
+            // A version this server does not speak, or no version at all — both are
+            // malformed request lines and a 400 says so. A listener that serves
+            // HTTP/2 only never reaches here: it does not sniff, so its peer's
+            // octets are judged as an HTTP/2 preface instead (see
+            // PlaintextProtocols in net/connection.h).
             m_error = 40005;
             return false;
         }
         return true;
     }
 
-    // Header field parsing mirrors paozhu process_header_line: split on the
-    // first ':', skip leading spaces in the value, lowercase the field name.
+    // Header field parsing: split on the first ':', skip leading spaces in the
+    // value, lowercase the field name.
     bool parse_header_line(std::string_view line) {
-        std::size_t colon = line.find(':');
-        if (colon == std::string_view::npos || colon == 0) {
+        switch (h1_detail::parse_field_line(line, m_head.headers)) {
+        case h1_detail::FieldLine::Ok:
+            return true;
+        case h1_detail::FieldLine::Malformed:
             m_error = 40003;
             return false;
-        }
-        std::string_view key = line.substr(0, colon);
-        std::size_t vstart = colon + 1;
-        while (vstart < line.size() && (line[vstart] == ' ' || line[vstart] == '\t')) {
-            ++vstart;
-        }
-        std::string_view value = line.substr(vstart);
-        // Trim trailing optional whitespace (OWS) from the value.
-        std::size_t vend = value.size();
-        while (vend > 0 && (value[vend - 1] == ' ' || value[vend - 1] == '\t')) {
-            --vend;
-        }
-        value = value.substr(0, vend);
-
-        if (key.size() > 200) {  // sanity bound on field-name length
+        case h1_detail::FieldLine::NameTooLong:
             m_error = 40004;
             return false;
         }
-        // Headers::add lowercases the name for us.
-        m_head.headers.add(std::string{key}, std::string{value});
+        m_error = 40003;
+        return false;
+    }
+
+    std::string m_buf;
+    std::size_t m_consumed = 0;
+    std::size_t m_scan_from = 0; // where parse_head resumes its terminator search
+    ParsedHead m_head;
+    unsigned int m_error = 0;
+};
+
+// Parsed status line + headers of an HTTP/1.x response.
+struct ParsedResponseHead {
+    int status = 0;
+    Version version = Version::Http11;
+    Headers headers;
+};
+
+// Incremental parser for a response head (status line + header block up to
+// CRLFCRLF), the mirror image of H1Parser. Body framing (Content-Length /
+// chunked / EOF-delimited) is left to the caller: the client's h1 session
+// decides it from these fields plus the request method.
+class H1ResponseParser {
+  public:
+    enum class State { NeedMore, Done, Error };
+
+    // Appends freshly-read bytes to the internal buffer.
+    void feed(std::string_view bytes) { m_buf.append(bytes); }
+    void feed(const std::byte *data, std::size_t n) { m_buf.append(reinterpret_cast<const char *>(data), n); }
+
+    // Attempts to parse a complete head. Idempotent while NeedMore.
+    State parse_head() {
+        // Same resume cursor as H1Parser: a response head dribbled in small
+        // reads must not re-scan the whole buffer each time.
+        std::size_t end = m_buf.find("\r\n\r\n", m_scan_from);
+        std::size_t sep = 4;
+        if (end == std::string::npos) {
+            // Tolerate bare-LF line endings (some minimal servers / tests).
+            end = m_buf.find("\n\n", m_scan_from);
+            sep = 2;
+            if (end == std::string::npos) {
+                m_scan_from = m_buf.size() >= 3 ? m_buf.size() - 3 : 0;
+                return State::NeedMore;
+            }
+        }
+        std::string_view block{m_buf.data(), end};
+        if (!parse_block(block))
+            return State::Error;
+        m_consumed = end + sep;
+        m_scan_from = 0;
+        return State::Done;
+    }
+
+    const ParsedResponseHead &head() const { return m_head; }
+    std::size_t consumed() const { return m_consumed; }
+
+    // Bytes currently buffered while still parsing the head — the caller bounds
+    // the head size with this (an endless head must not grow the buffer).
+    std::size_t buffered() const { return m_buf.size(); }
+
+    // Bytes remaining after the parsed head: the start of the body (or, for a
+    // bodyless response, the start of whatever the peer sent next).
+    std::string_view remainder() const { return std::string_view{m_buf}.substr(m_consumed); }
+
+    // Drops the consumed head and keeps any leftover bytes, so the same parser
+    // can read the next response on a keep-alive connection (or skip an
+    // informational response and parse the final head that follows it).
+    void reset_after_head() {
+        m_buf.erase(0, m_consumed);
+        m_consumed = 0;
+        m_scan_from = 0;
+        m_head = ParsedResponseHead{};
+    }
+
+  private:
+    bool parse_block(std::string_view block) {
+        std::size_t pos = 0;
+        std::string_view line = h1_detail::next_line(block, pos);
+        if (!parse_status_line(line))
+            return false;
+        while (pos < block.size()) {
+            std::string_view hline = h1_detail::next_line(block, pos);
+            if (hline.empty())
+                continue; // defensive; the block excludes the blank line
+            if (h1_detail::parse_field_line(hline, m_head.headers) != h1_detail::FieldLine::Ok)
+                return false;
+        }
+        return true;
+    }
+
+    bool parse_status_line(std::string_view line) {
+        // HTTP-version SP status-code SP reason-phrase
+        std::size_t sp1 = line.find(' ');
+        if (sp1 == std::string_view::npos)
+            return false;
+        std::size_t sp2 = line.find(' ', sp1 + 1);
+        std::string_view version = line.substr(0, sp1);
+        std::string_view code =
+            (sp2 == std::string_view::npos) ? line.substr(sp1 + 1) : line.substr(sp1 + 1, sp2 - sp1 - 1);
+
+        if (version == "HTTP/1.1") {
+            m_head.version = Version::Http11;
+        } else if (version == "HTTP/1.0") {
+            m_head.version = Version::Http1;
+        } else {
+            return false;
+        }
+
+        if (code.size() != 3)
+            return false;
+        int status = 0;
+        for (char c : code) {
+            if (c < '0' || c > '9')
+                return false;
+            status = status * 10 + (c - '0');
+        }
+        if (status < 100 || status > 599)
+            return false;
+        m_head.status = status;
         return true;
     }
 
     std::string m_buf;
     std::size_t m_consumed = 0;
-    ParsedHead m_head;
-    unsigned int m_error = 0;
+    std::size_t m_scan_from = 0; // where parse_head resumes its terminator search
+    ParsedResponseHead m_head;
 };
 
-}  // namespace simple_http
+} // namespace simple_http

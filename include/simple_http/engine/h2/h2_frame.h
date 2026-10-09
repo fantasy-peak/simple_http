@@ -2,9 +2,9 @@
 
 // HTTP/2 frame constants and the 9-octet frame header (RFC 7540 §4.1),
 // framework-free. The frame-type / flag / settings / error enumerations and the
-// big-endian header layout mirror paozhu (vendor/httpserver/http2_parse.h and
-// http2_frame.h); here they are expressed as plain constants plus a small
-// parse/serialize pair over std::string_view, with no Asio or httppeer coupling.
+// big-endian header layout follow RFC 7540 §6; they are expressed as plain
+// constants plus a small parse/serialize pair over std::string_view, with no
+// Asio coupling.
 
 #include <cstddef>
 #include <cstdint>
@@ -28,11 +28,11 @@ enum class H2FrameType : uint8_t {
 };
 
 // Frame flags (bit values are shared across several frame types).
-inline constexpr uint8_t H2_FLAG_END_STREAM = 0x01;   // DATA, HEADERS
-inline constexpr uint8_t H2_FLAG_ACK = 0x01;          // SETTINGS, PING
-inline constexpr uint8_t H2_FLAG_END_HEADERS = 0x04;  // HEADERS, CONTINUATION, PUSH_PROMISE
-inline constexpr uint8_t H2_FLAG_PADDED = 0x08;       // DATA, HEADERS, PUSH_PROMISE
-inline constexpr uint8_t H2_FLAG_PRIORITY = 0x20;     // HEADERS
+inline constexpr uint8_t H2_FLAG_END_STREAM = 0x01;  // DATA, HEADERS
+inline constexpr uint8_t H2_FLAG_ACK = 0x01;         // SETTINGS, PING
+inline constexpr uint8_t H2_FLAG_END_HEADERS = 0x04; // HEADERS, CONTINUATION, PUSH_PROMISE
+inline constexpr uint8_t H2_FLAG_PADDED = 0x08;      // DATA, HEADERS, PUSH_PROMISE
+inline constexpr uint8_t H2_FLAG_PRIORITY = 0x20;    // HEADERS
 
 // SETTINGS parameter identifiers (RFC 7540 §6.5.2).
 inline constexpr uint16_t H2_SETTINGS_HEADER_TABLE_SIZE = 0x1;
@@ -41,6 +41,9 @@ inline constexpr uint16_t H2_SETTINGS_MAX_CONCURRENT_STREAMS = 0x3;
 inline constexpr uint16_t H2_SETTINGS_INITIAL_WINDOW_SIZE = 0x4;
 inline constexpr uint16_t H2_SETTINGS_MAX_FRAME_SIZE = 0x5;
 inline constexpr uint16_t H2_SETTINGS_MAX_HEADER_LIST_SIZE = 0x6;
+// RFC 8441: opt-in to extended CONNECT, which is how a WebSocket runs over
+// HTTP/2. Advertised as 1 by default (see EngineLimits::h2_enable_connect_protocol).
+inline constexpr uint16_t H2_SETTINGS_ENABLE_CONNECT_PROTOCOL = 0x8;
 
 // Error codes (RFC 7540 §7).
 inline constexpr uint32_t H2_NO_ERROR = 0x0;
@@ -63,18 +66,19 @@ inline constexpr std::size_t kH2FrameHeaderSize = 9;
 inline constexpr std::string_view kH2ClientPreface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 struct H2FrameHeader {
-    uint32_t length = 0;    // payload length (24-bit)
-    uint8_t type = 0;       // H2FrameType
+    uint32_t length = 0; // payload length (24-bit)
+    uint8_t type = 0;    // H2FrameType
     uint8_t flags = 0;
-    uint32_t stream_id = 0;  // 31-bit (reserved bit cleared)
+    uint32_t stream_id = 0; // 31-bit (reserved bit cleared)
 
     bool has_flag(uint8_t f) const { return (flags & f) != 0; }
 };
 
 // Parses a 9-octet frame header from the front of `buf`. Returns false if
 // fewer than 9 bytes are available.
-inline bool parse_frame_header(std::string_view buf, H2FrameHeader& out) {
-    if (buf.size() < kH2FrameHeaderSize) return false;
+inline bool parse_frame_header(std::string_view buf, H2FrameHeader &out) {
+    if (buf.size() < kH2FrameHeaderSize)
+        return false;
     auto b = [&](std::size_t i) { return static_cast<uint32_t>(static_cast<unsigned char>(buf[i])); };
     out.length = (b(0) << 16) | (b(1) << 8) | b(2);
     out.type = static_cast<uint8_t>(b(3));
@@ -84,8 +88,7 @@ inline bool parse_frame_header(std::string_view buf, H2FrameHeader& out) {
 }
 
 // Appends a 9-octet frame header to `out`.
-inline void serialize_frame_header(std::string& out, uint32_t length, uint8_t type, uint8_t flags,
-                                   uint32_t stream_id) {
+inline void serialize_frame_header(std::string &out, uint32_t length, uint8_t type, uint8_t flags, uint32_t stream_id) {
     out.push_back(static_cast<char>((length >> 16) & 0xFF));
     out.push_back(static_cast<char>((length >> 8) & 0xFF));
     out.push_back(static_cast<char>(length & 0xFF));
@@ -105,4 +108,4 @@ inline uint32_t read_u32(std::string_view buf, std::size_t off) {
            static_cast<uint32_t>(static_cast<unsigned char>(buf[off + 3]));
 }
 
-}  // namespace simple_http::codec
+} // namespace simple_http::codec

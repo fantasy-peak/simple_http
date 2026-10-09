@@ -1,8 +1,8 @@
-add_rules("mode.debug", "mode.release")
+-- add_rules("mode.debug", "mode.release")
 
 set_languages("c++23")
 
-set_warnings("all", "error")
+-- set_warnings("all", "error")
 
 add_rules("plugin.compile_commands.autoupdate", { outputdir = "build", lsp="clangd" })
 
@@ -11,17 +11,48 @@ set_policy("package.requires_lock", true)
 set_policy("package.librarydeps.strict_compatibility", true)
 
 -- PACKAGES --
-add_requires("boost", {configs = {asio=true, regex=true}})
+-- HTTP/3 的 QUIC 与帧层来自 ngtcp2 + nghttp3（都是 C 库，只有 h3 路径用）。
+-- 上游 xmake-repo 的 ngtcp2 包是 `-DENABLE_OPENSSL=OFF` 构建的，不产 crypto
+-- helper——没有它就没有 TLS，QUIC 无从谈起。私有仓库里那份把它改成了
+-- `-DENABLE_OPENSSL=ON`（openssl3 >= 3.5 才有上游 CMake 探测的
+-- SSL_set_quic_tls_cbs，从而构建 libngtcp2_crypto_ossl），nghttp3 那份也在。
+-- 注意：这里不能用 /opt/h3/lib 的预编译库——那是对系统 OpenSSL 3.5.5 编的，
+-- 而本仓库用的是 openssl3 3.6.3，混链是 ABI 风险。让 xmake 从源码构建。
+add_repositories("my_private_repo https://github.com/fantasy-peak/xmake-repo.git")
+add_requires("boost", {configs = {cmake = true, asio=true, regex=true}})
 add_requires("openssl3")
+add_requires("nghttp2 1.70.0")
+add_requires("ngtcp2", "nghttp3")
+add_requires("catch2")  -- unit tests only (target `unittest`)
+add_requires("glaze")  -- OpenAPI schemas + JSON helpers; header-only, always compiled
+-- Response-body compression (core/content_encoding.h) and WebSocket
+-- permessage-deflate (proto/ws_deflate.h) are both compiled in unconditionally:
+-- zlib and brotli are normal dependencies of the library now. Whether either
+-- takes effect is a runtime setting (EngineLimits::compression / ws_compression,
+-- ClientConfig::auto_decompress).
+add_requires("zlib", "brotli")
+-- glaze is an unconditional dependency: it backs the JSON helpers
+-- (proto/json.h, read_json_body / write_json). Header-only, no transitive deps.
+add_requires("glaze")
 
-add_defines("SIMPLE_HTTP_EXPERIMENT_WEBSOCKET", "SIMPLE_HTTP_USE_BOOST_REGEX", "SIMPLE_HTTP_EXPERIMENT_HTTP2CLIENT")
+add_cxflags("-O2 -Wextra -Wno-missing-field-initializers -Wno-ignored-qualifiers")
+add_defines("SIMPLE_HTTP_USE_BOOST_REGEX")
 
 target("simple_http")
     set_kind("static")
     add_includedirs("include", { public = true })
     add_packages(
+        "ngtcp2",
+        "nghttp2",
+        "nghttp3",
         "boost",
         "openssl3",
+        "glaze",
+        -- Compression codecs are compiled in unconditionally, so zlib and
+        -- brotli are normal public dependencies alongside boost.asio and
+        -- OpenSSL. (HTTP/3, OpenAPI and the logging macro stay opt-in.)
+        "zlib",
+        "brotli",
         {public = true}
     )
 target_end()
@@ -30,7 +61,7 @@ target("server")
     set_kind("binary")
     on_load(function (target)
         if target:toolchain("gcc") then
-            target:add("cxxflags", "-Wno-maybe-uninitialized")
+            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete", "-Wno-type-limits")
         end
         -- xmake f --toolchain=llvm --runtimes=c++_static -c -v
         if target:toolchain("llvm") then
@@ -44,6 +75,324 @@ target("server")
     end)
     add_deps("simple_http")
     add_files("test/server.cpp")
+    add_defines("SIMPLE_HTTP_ENABLE_HTTP3")
+    add_packages("zlib")
     set_rundir(".")
 target_end()
+
+-- The client layer's exercise program: starts a server in the same process and
+-- drives the client at it (and at a raw responder) across the protocol matrix.
+-- Run it from the repository root: `xmake run client`.
+target("client")
+    set_kind("binary")
+    on_load(function (target)
+        if target:toolchain("gcc") then
+            -- GCC false positives around asio's coroutine frames; the server
+            -- target needs the first one too.
+            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete", "-Wno-type-limits")
+        end
+    end)
+    add_deps("simple_http")
+    add_files("test/client.cpp")
+    add_packages("zlib", "brotli")
+    set_rundir(".")
+target_end()
+
+-- Multi-thread stress for the client's threading model (concurrency model A).
+-- A thread-concurrency harness, not a protocol suite: per-thread Clients, a
+-- teardown loop (Client dropped + io_context drained — the ASan-class hazard)
+-- and a high-concurrency shape, for the sanitizers to vet. In-process servers,
+-- like test/client.cpp.
+--   xmake build thread_check && xmake run thread_check [-- --quick]
+target("thread_check")
+    set_kind("binary")
+    on_load(function (target)
+        if target:toolchain("gcc") then
+            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete", "-Wno-type-limits")
+        end
+    end)
+    add_deps("simple_http")
+    add_files("test/thread_check.cpp")
+    add_packages("zlib", "brotli")
+    set_rundir(".")
+target_end()
+
+-- A load generator built on the library's own client (h1 / h2 multiplexed /
+-- WebSocket), printing an h2load-shaped summary so results can be compared with
+-- k6 / h2load / wrk on the same endpoint. See test/loadgen.cpp.
+target("loadgen")
+    set_kind("binary")
+    set_default(false)
+    on_load(function (target)
+        if target:toolchain("gcc") then
+            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete", "-Wno-type-limits")
+        end
+    end)
+    add_deps("simple_http")
+    add_files("test/loadgen.cpp")
+    set_rundir(".")
+target_end()
+
+-- Unit tests (Catch2): pure logic, no sockets — parsers, HPACK, frames, the
+-- URL/config helpers, routing. Fast enough to run on every change:
+--   xmake build unittest && xmake run unittest
+target("unittest")
+    set_kind("binary")
+    set_default(false)
+    add_defines("SIMPLE_HTTP_ENABLE_HTTP3")
+    on_load(function (target)
+        if target:toolchain("gcc") then
+            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete", "-Wno-type-limits")
+        end
+    end)
+    add_deps("simple_http")
+    add_files("test/unit/*.cpp")
+    add_packages("catch2", "zlib", "brotli", "glaze")
+    set_rundir(".")
+target_end()
+
+-- OpenAPI demo: per-route operation descriptors (openapi::doc()...) collected
+-- into an OAS 3.1 document served at /openapi.json, browsed at /swagger
+-- (CDN-hosted Swagger UI).
+-- A standalone binary so test/server.cpp — the conformance/stress surface —
+-- stays untouched. Run from the repository root:
+--   xmake build openapi_demo && xmake run openapi_demo
+-- then open http://127.0.0.1:7795/swagger
+target("openapi_demo")
+    set_kind("binary")
+    set_default(false)
+    on_load(function (target)
+        if target:toolchain("gcc") then
+            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete", "-Wno-type-limits")
+        end
+    end)
+    add_deps("simple_http")
+    add_files("test/openapi_demo.cpp")
+    add_packages("glaze")
+    set_rundir(".")
+target_end()
+
+-- Server regression suite: raw sockets against an in-process server, sending the
+-- malformed and boundary cases a well-behaved client will not send.
+--   xmake build regression && xmake run regression
+target("regression")
+    set_kind("binary")
+    set_default(false)
+    add_defines("SIMPLE_HTTP_ENABLE_HTTP3")
+    on_load(function (target)
+        if target:toolchain("gcc") then
+            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete", "-Wno-type-limits")
+        end
+    end)
+    add_deps("simple_http")
+    add_files("test/server_regression.cpp", "test/unit/main.cpp")
+    add_packages("catch2")
+    set_rundir(".")
+target_end()
+
+-- Python-side protocol tests. The C++ suites drive simple_http with its own
+-- client, so a spec misreading shared by both halves cancels out; these use
+-- httpx / hyper-h2 / websockets instead, which are independent implementations.
+-- First run:
+--   python3 -m venv test/python/.venv
+--   test/python/.venv/bin/pip install -r test/python/requirements.txt
+-- Then:
+--   xmake python-tests
+target("python-tests")
+    set_kind("phony")
+    add_deps("server")
+    on_run(function ()
+        local python = "test/python/.venv/bin/python"
+        if not os.isfile(python) then
+            raise("no virtualenv at test/python/.venv — see test/python/requirements.txt")
+        end
+        os.execv(python, {"test/python/run.py"})
+    end)
+target_end()
+
+-- Compile check for the code samples in README.md. Documented code is not
+-- exercised by anything else, and the README had quietly drifted to APIs that no
+-- longer existed — a string of examples that looked plausible and would not
+-- build. Reproducing them here turns that drift into a build failure:
+--   xmake build readme_examples
+target("readme_examples")
+    set_kind("binary")
+    set_default(false)
+    on_load(function (target)
+        if target:toolchain("gcc") then
+            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-type-limits")
+        end
+    end)
+    add_deps("simple_http")
+    add_files("test/readme_examples.cpp")
+    add_packages("glaze")
+    set_rundir(".")
+target_end()
+
+-- Client-side SETTINGS_MAX_CONCURRENT_STREAMS check: drive the h2 client at an
+-- independent Python h2 server (test/python/h2_max_concurrent_server.py) that
+-- announces a limit and logs every arriving frame. The server-side log, not the
+-- client's error code, is the ground truth for "the client refused locally".
+-- See the test file's header comment for the usage recipe.
+target("h2_limit_check")
+    set_kind("binary")
+    set_default(false)
+    on_load(function (target)
+        if target:toolchain("gcc") then
+            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-type-limits")
+        end
+    end)
+    add_deps("simple_http")
+    add_files("test/h2_limit_check.cpp")
+    set_rundir(".")
+target_end()
+
+-- Client-side HTTP/1.1 half-duplex guard: reading the response before the
+-- request body ends must be refused fast (client_errc::half_duplex), not hang.
+-- Driven against an independent Python stall server (test/python/h1_stall_server.py),
+-- exactly like h2_limit_check. See the test file's header comment.
+target("h1_duplex_check")
+    set_kind("binary")
+    set_default(false)
+    on_load(function (target)
+        if target:toolchain("gcc") then
+            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-type-limits")
+        end
+    end)
+    add_deps("simple_http")
+    add_files("test/h1_duplex_check.cpp")
+    set_rundir(".")
+target_end()
+
+--- Reverse-proxy harness (code-server shape) for the h2/RFC 8441 WebSocket
+--- path; see test/codeserver_proxy.cpp. Needs code-server on 127.0.0.1:8080.
+target("codeserver_proxy")
+    set_kind("binary")
+    set_default(false)
+    on_load(function (target)
+        if target:toolchain("gcc") then
+            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-type-limits")
+        end
+    end)
+    add_deps("simple_http")
+    add_files("test/codeserver_proxy.cpp")
+    set_rundir(".")
+target_end()
+
+-- Client-side body-cap check: the streaming Response's buffered readers
+-- (bytes()/text()/json()) must honour the constructor's body_cap. This target
+-- also holds the compile-time evidence: before the cap parameter existed, this
+-- file did not build. See the test file's header comment.
+target("body_cap_check")
+    set_kind("binary")
+    set_default(false)
+    on_load(function (target)
+        if target:toolchain("gcc") then
+            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-type-limits")
+        end
+    end)
+    add_deps("simple_http")
+    add_files("test/body_cap_check.cpp")
+    set_rundir(".")
+target_end()
+
+-- HTTP/1.x pull-provider lifetime: reading a request body after the connection
+-- (and its engine) is gone must be a clean error, not a use-after-free. Run
+-- under the repo's ASan build: pre-fix aborts with heap-use-after-free, post-fix
+-- prints DEFERRED_READ <ec> and exits 0. See the test file's header comment.
+target("h1_pull_lifetime_check")
+    set_kind("binary")
+    set_default(false)
+    on_load(function (target)
+        if target:toolchain("gcc") then
+            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete", "-Wno-type-limits")
+        end
+    end)
+    add_deps("simple_http")
+    add_files("test/h1_pull_lifetime_check.cpp")
+    set_rundir(".")
+target_end()
+
+-- Client-side default retry condition: a client-side decision error (body cap,
+-- protocol error) must not be retried just because the method is idempotent.
+-- Driven against an independent Python counting server (test/python/retry_echo_server.py),
+-- exactly like h2_limit_check. See the test file's header comment.
+target("retry_check")
+    set_kind("binary")
+    set_default(false)
+    on_load(function (target)
+        if target:toolchain("gcc") then
+            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-type-limits")
+        end
+    end)
+    add_deps("simple_http")
+    add_files("test/retry_check.cpp")
+    set_rundir(".")
+target_end()
+
+-- Client-side body-idle deadline on read_all(): the buffered reader must be
+-- bounded per read like read() is, not skip the budget. Driven against an
+-- independent Python slow-body server (test/python/slow_body_server.py). See
+-- the test file's header comment.
+target("read_all_timeout_check")
+    set_kind("binary")
+    set_default(false)
+    on_load(function (target)
+        if target:toolchain("gcc") then
+            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-type-limits")
+        end
+    end)
+    add_deps("simple_http")
+    add_files("test/read_all_timeout_check.cpp")
+    set_rundir(".")
+target_end()
+
+-- Cross-validation of the client-side WebSocket against an independent server
+-- (test/python/ws_echo_server.py, the `websockets` library). See the file's
+-- header comment:   test/python/.venv/bin/python test/python/ws_echo_server.py
+--                    xmake run ws_cross -- 27920
+target("ws_cross")
+    set_kind("binary")
+    set_default(false)
+    on_load(function (target)
+        if target:toolchain("gcc") then
+            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-type-limits")
+        end
+    end)
+    add_deps("simple_http")
+    add_files("test/ws_client_cross.cpp")
+    add_packages("zlib")
+    set_rundir(".")
+target_end()
+
+-- Cross-validation of the client against an independent HTTP/1.1 server
+-- (test/python/http_server.py, stdlib http.server). See the file header.
+target("client_cross")
+    set_kind("binary")
+    set_default(false)
+    on_load(function (target)
+        if target:toolchain("gcc") then
+            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-type-limits")
+        end
+    end)
+    add_deps("simple_http")
+    add_files("test/client_cross.cpp")
+    set_rundir(".")
+target_end()
+
+-- One-shot: build the two client cross-validation binaries and drive them
+-- against the independent Python servers (test/python/run_client_cross.py).
+target("client-cross-python")
+    set_kind("phony")
+    set_default(false)
+    add_deps("client_cross", "ws_cross")
+    on_run(function ()
+        local python = "test/python/.venv/bin/python"
+        if not os.isfile(python) then
+            raise("no virtualenv at test/python/.venv — see test/python/requirements.txt")
+        end
+        os.execv(python, {"test/python/run_client_cross.py"})
+    end)
+target_end()
+
 

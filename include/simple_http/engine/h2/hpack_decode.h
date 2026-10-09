@@ -2,17 +2,26 @@
 
 // HPACK header-block decoder (RFC 7541), framework-free.
 //
-// The decoding *algorithm* is adapted from paozhu's http2parse::headertype1..4
-// (vendor/httpserver/http2_parse.cpp): the same prefix-bit dispatch, HPACK
-// integer decoding, Huffman string decoding and the dynamic-table maintenance
-// (push_front + a fixed 255-entry cap). paozhu wrote decoded fields straight
-// into its httppeer god-object; this version instead returns a plain list of
-// (name, value) pairs and owns a per-connection dynamic table, so it depends
-// only on the standard library and the ported Huffman codec.
+// The decoding algorithm: the RFC 7541 prefix-bit dispatch (§6), HPACK integer
+// decoding, Huffman string decoding and the dynamic-table maintenance (newest
+// entry first). It returns a plain list of (name, value) pairs and owns a
+// per-connection dynamic table, so it depends only on the standard library and
+// the Huffman codec.
+//
+// The dynamic table is accounted in *bytes* (RFC 7541 §4.1: each entry costs
+// name + value + 32) against the size this decoder advertised in
+// SETTINGS_HEADER_TABLE_SIZE, and it honours a Dynamic Table Size Update
+// (§6.3). That matters beyond tidiness: an entry larger than the table must
+// empty the table and *not* be inserted (§4.4), so a peer that sends a big
+// cookie and we insert it anyway would shift every later dynamic index and
+// silently hand back the wrong header values. (Byte accounting also makes the
+// previous fixed 255-entry cap unnecessary; it is kept only as a
+// belt-and-braces bound.)
 //
 // One HpackDecoder instance lives per HTTP/2 connection (the dynamic table is
 // connection-scoped and shared across streams, per the spec).
 
+#include <algorithm>
 #include <cstdint>
 #include <list>
 #include <string>
@@ -20,8 +29,8 @@
 #include <utility>
 #include <vector>
 
-#include "hpack_encode.h"   // http2_header_static_table
-#include "hpack_huffman.h"  // http_huffman_decode, HUFFMAN_OK
+#include "hpack_huffman.h"      // http_huffman_decode, HUFFMAN_OK
+#include "hpack_static_table.h" // http2_header_static_table
 
 namespace simple_http::codec {
 
@@ -38,7 +47,7 @@ class HpackDecoder {
 
     // Decodes one complete header block into `out`. Returns true on success;
     // on a malformed block returns false and sets last_error().
-    bool decode(std::string_view block, std::vector<HpackHeader>& out);
+    bool decode(std::string_view block, std::vector<HpackHeader> &out);
 
     // Convenience: decode into a fresh vector.
     std::vector<HpackHeader> decode(std::string_view block) {
@@ -49,37 +58,80 @@ class HpackDecoder {
 
     unsigned int last_error() const { return m_error; }
 
-    // Dynamic-table maximum entry count (paozhu uses a fixed 255-entry cap
-    // rather than the RFC byte-size accounting).
+    // The size advertised in SETTINGS_HEADER_TABLE_SIZE: the largest dynamic
+    // table the peer may keep. A size update above it is a compression error
+    // (RFC 7541 §4.2), so the value must be set before decoding begins.
+    void set_max_table_size(std::size_t bytes) {
+        m_advertised_max = bytes;
+        m_max_size = bytes;
+    }
+
+    std::size_t max_table_size() const { return m_advertised_max; }
+    // Bytes currently occupied by the dynamic table.
+    std::size_t dynamic_table_size() const { return m_size; }
+
+    // Cap the decoded header-list size (name + value + 32 per field, RFC 9113
+    // §6.5.2). A compressed block that is small can decode to an arbitrarily
+    // large list — one indexed octet references a whole dynamic-table entry — so
+    // bounding only the compressed block leaves a decompression bomb. Default is
+    // effectively unbounded for callers that never advertise a limit.
+    void set_max_list_size(std::size_t bytes) { m_max_list_size = bytes; }
+
+    // True when the last decode() stopped because the decoded list exceeded the
+    // cap (a stream error, not a compression error). Reset at each decode().
+    bool header_list_too_large() const { return m_list_too_large; }
+
+    // Dynamic-table entry cap, a belt-and-braces bound on top of the RFC byte
+    // accounting (an entry can never be smaller than 32 bytes, so a legitimate
+    // table cannot exceed the size limit / 32 entries).
     static constexpr std::size_t kDynamicTableMaxEntries = 255;
+
+    // Default decoded-header-list bound (name + value + 32 per field,
+    // RFC 9113 §6.5.2). A caller that advertises SETTINGS_MAX_HEADER_LIST_SIZE
+    // should set the same value with set_max_list_size(); the default is a
+    // concrete 64 KiB rather than "unbounded" so a caller that forgets is still
+    // protected from the decompression bomb (a small indexed block expanding to
+    // an arbitrarily large list).
+    static constexpr std::size_t kDefaultMaxListSize = 64 * 1024;
 
   private:
     // HPACK integer decode with an N-bit prefix (RFC 7541 §5.1). `prefix` is the
     // already-masked prefix value; advances `pos`. Returns the full integer.
-    bool decode_integer(std::string_view block, std::size_t& pos, unsigned int prefix_bits, uint64_t& out);
+    bool decode_integer(std::string_view block, std::size_t &pos, unsigned int prefix_bits, uint64_t &out);
 
     // HPACK string decode (RFC 7541 §5.2): length-prefixed, optionally Huffman.
-    bool decode_string(std::string_view block, std::size_t& pos, std::string& out);
+    bool decode_string(std::string_view block, std::size_t &pos, std::string &out);
 
     // Resolves a table index (1-based) to a name/value pair. Index into the
     // static table if < 62, otherwise into the dynamic table.
-    bool resolve_index(uint64_t index, std::string& name, std::string& value) const;
+    bool resolve_index(uint64_t index, std::string &name, std::string &value) const;
 
     void dynamic_insert(std::string name, std::string value);
 
-    std::list<std::pair<std::string, std::string>> m_dynamic;  // most-recent at front
+    // Drops the oldest entries until the table fits in `m_max_size` (§4.3).
+    void evict_to_fit();
+
+    std::list<std::pair<std::string, std::string>> m_dynamic; // most-recent at front
+    std::size_t m_max_size = 4096;                            // current table budget (may be lowered by a size update)
+    std::size_t m_advertised_max = 4096;                      // what we advertised; a size update may not exceed it
+    std::size_t m_size = 0;                                   // bytes occupied (name + value + 32 per entry)
+    std::size_t m_max_list_size = kDefaultMaxListSize;
+    std::size_t m_list_size = 0; // running decoded size of the current block
+    bool m_list_too_large = false;
     unsigned int m_error = 0;
 };
 
-// --- inline definitions (algorithm adapted from paozhu http2parse::headertype1..4) ---
+// --- inline definitions ---
 
 namespace detail {
 // Number of entries in the static table (indices 1..61; slot 0 is a sentinel).
-inline constexpr uint64_t kStaticTableCount = 61;
-}  // namespace detail
+// Derived from the table rather than written out: the table's first entry is
+// the RFC's "no index" sentinel, so the real entries are everything after it.
+inline constexpr uint64_t kStaticTableCount = http2_header_static_table.size() - 1;
+} // namespace detail
 
-inline bool HpackDecoder::decode_integer(std::string_view block, std::size_t& pos, unsigned int prefix_bits,
-                                         uint64_t& out) {
+inline bool HpackDecoder::decode_integer(std::string_view block, std::size_t &pos, unsigned int prefix_bits,
+                                         uint64_t &out) {
     const unsigned int max_prefix = (1u << prefix_bits) - 1u;
     // The prefix byte was already read by the caller at pos-1; recompute it.
     unsigned char first = static_cast<unsigned char>(block[pos - 1]);
@@ -98,8 +150,9 @@ inline bool HpackDecoder::decode_integer(std::string_view block, std::size_t& po
         unsigned char b = static_cast<unsigned char>(block[pos++]);
         value += static_cast<uint64_t>(b & 0x7F) << shift;
         shift += 7;
-        if ((b & 0x80) == 0) break;
-        if (shift > 62) {  // guard against overflow / malformed input
+        if ((b & 0x80) == 0)
+            break;
+        if (shift > 62) { // guard against overflow / malformed input
             m_error = 40141;
             return false;
         }
@@ -108,14 +161,14 @@ inline bool HpackDecoder::decode_integer(std::string_view block, std::size_t& po
     return true;
 }
 
-inline bool HpackDecoder::decode_string(std::string_view block, std::size_t& pos, std::string& out) {
+inline bool HpackDecoder::decode_string(std::string_view block, std::size_t &pos, std::string &out) {
     if (pos >= block.size()) {
         m_error = 40142;
         return false;
     }
     unsigned char first = static_cast<unsigned char>(block[pos]);
     bool huffman = (first & 0x80) != 0;
-    pos += 1;  // consume prefix byte so decode_integer can re-read it at pos-1
+    pos += 1; // consume prefix byte so decode_integer can re-read it at pos-1
     uint64_t len = 0;
     if (!decode_integer(block, pos, 7, len)) {
         return false;
@@ -125,11 +178,28 @@ inline bool HpackDecoder::decode_string(std::string_view block, std::size_t& pos
         return false;
     }
     if (huffman) {
+        const std::size_t decoded_at = out.size();
         unsigned char state = 0;
-        if (http_huffman_decode(&state, reinterpret_cast<unsigned char*>(const_cast<char*>(block.data() + pos)),
+        if (http_huffman_decode(&state, reinterpret_cast<unsigned char *>(const_cast<char *>(block.data() + pos)),
                                 static_cast<std::size_t>(len), out, 1) != HUFFMAN_OK) {
             m_error = 40144;
             return false;
+        }
+        // RFC 7541 §5.2: the trailing padding must be under 8 bits and must be a
+        // prefix of the EOS code (30 ones). The decoder's end-state check rejects
+        // a tail that is no EOS prefix at all, but not padding made of ones that
+        // is merely too long — eight ones are still a valid EOS prefix. Re-encoding
+        // settles it: a conforming encoder emits the shortest form, so anything
+        // longer cannot round-trip. Over-long padding always leaves the final
+        // octet 0xff, and that is what keeps this off the common path.
+        if (len > 0 && static_cast<unsigned char>(block[pos + len - 1]) == 0xff) {
+            std::string reencoded;
+            http_huffman_encode(reinterpret_cast<unsigned char *>(out.data() + decoded_at),
+                                static_cast<unsigned int>(out.size() - decoded_at), reencoded);
+            if (reencoded.size() != len || !std::equal(reencoded.begin(), reencoded.end(), block.begin() + pos)) {
+                m_error = 40145;
+                return false;
+            }
         }
     } else {
         out.append(block.data() + pos, static_cast<std::size_t>(len));
@@ -138,7 +208,7 @@ inline bool HpackDecoder::decode_string(std::string_view block, std::size_t& pos
     return true;
 }
 
-inline bool HpackDecoder::resolve_index(uint64_t index, std::string& name, std::string& value) const {
+inline bool HpackDecoder::resolve_index(uint64_t index, std::string &name, std::string &value) const {
     if (index == 0) {
         return false;
     }
@@ -147,9 +217,9 @@ inline bool HpackDecoder::resolve_index(uint64_t index, std::string& name, std::
         value = http2_header_static_table[index].value;
         return true;
     }
-    uint64_t dyn = index - detail::kStaticTableCount - 1;  // 0-based into dynamic table
+    uint64_t dyn = index - detail::kStaticTableCount - 1; // 0-based into dynamic table
     uint64_t j = 0;
-    for (const auto& entry : m_dynamic) {
+    for (const auto &entry : m_dynamic) {
         if (j == dyn) {
             name = entry.first;
             value = entry.second;
@@ -161,15 +231,50 @@ inline bool HpackDecoder::resolve_index(uint64_t index, std::string& name, std::
 }
 
 inline void HpackDecoder::dynamic_insert(std::string name, std::string value) {
+    // RFC 7541 §4.1: an entry costs 32 bytes plus the name and value lengths.
+    const std::size_t entry_size = name.size() + value.size() + 32;
+    // §4.4: an entry larger than the whole table empties the table and is *not*
+    // inserted. Skipping this is what makes a later dynamic index point at the
+    // wrong entry, so the peer and we would disagree silently.
+    if (entry_size > m_max_size) {
+        m_dynamic.clear();
+        m_size = 0;
+        return;
+    }
+    m_size += entry_size;
     m_dynamic.push_front({std::move(name), std::move(value)});
-    if (m_dynamic.size() > kDynamicTableMaxEntries) {
+    evict_to_fit();
+}
+
+inline void HpackDecoder::evict_to_fit() {
+    while ((!m_dynamic.empty() && m_size > m_max_size) || m_dynamic.size() > kDynamicTableMaxEntries) {
+        const auto &oldest = m_dynamic.back();
+        const std::size_t entry_size = oldest.first.size() + oldest.second.size() + 32;
+        m_size -= std::min(m_size, entry_size);
         m_dynamic.pop_back();
     }
 }
 
-inline bool HpackDecoder::decode(std::string_view block, std::vector<HpackHeader>& out) {
+inline bool HpackDecoder::decode(std::string_view block, std::vector<HpackHeader> &out) {
     m_error = 0;
+    m_list_too_large = false;
+    m_list_size = 0;
     std::size_t pos = 0;
+    // Appends one decoded field, enforcing the decoded-size cap as it grows so a
+    // small block cannot allocate an unbounded list.
+    auto emit = [&](std::string name, std::string value) -> bool {
+        m_list_size += name.size() + value.size() + 32;
+        if (m_list_size > m_max_list_size) {
+            m_error = 40170;
+            m_list_too_large = true;
+            return false;
+        }
+        out.push_back({std::move(name), std::move(value)});
+        return true;
+    };
+    // Whether any field representation has been decoded yet. Only a dynamic
+    // table size update that opens the block is legal (RFC 7541 §4.2).
+    bool seen_field = false;
     while (pos < block.size()) {
         unsigned char c = static_cast<unsigned char>(block[pos]);
 
@@ -177,18 +282,22 @@ inline bool HpackDecoder::decode(std::string_view block, std::vector<HpackHeader
             // 6.1 Indexed Header Field: 1xxxxxxx
             pos += 1;
             uint64_t index = 0;
-            if (!decode_integer(block, pos, 7, index)) return false;
+            if (!decode_integer(block, pos, 7, index))
+                return false;
             std::string name, value;
             if (!resolve_index(index, name, value)) {
                 m_error = 40150;
                 return false;
             }
-            out.push_back({std::move(name), std::move(value)});
+            if (!emit(std::move(name), std::move(value)))
+                return false;
+            seen_field = true;
         } else if (c & 0x40) {
             // 6.2.1 Literal Header Field with Incremental Indexing: 01xxxxxx
             pos += 1;
             uint64_t index = 0;
-            if (!decode_integer(block, pos, 6, index)) return false;
+            if (!decode_integer(block, pos, 6, index))
+                return false;
             std::string name, value;
             if (index != 0) {
                 std::string dummy;
@@ -197,23 +306,43 @@ inline bool HpackDecoder::decode(std::string_view block, std::vector<HpackHeader
                     return false;
                 }
             } else {
-                if (!decode_string(block, pos, name)) return false;
+                if (!decode_string(block, pos, name))
+                    return false;
             }
-            if (!decode_string(block, pos, value)) return false;
-            out.push_back({name, value});
+            if (!decode_string(block, pos, value))
+                return false;
+            if (!emit(name, value))
+                return false;
             dynamic_insert(std::move(name), std::move(value));
+            seen_field = true;
         } else if (c & 0x20) {
-            // 6.3 Dynamic Table Size Update: 001xxxxx — read and ignore the size
-            // (paozhu uses a fixed entry-count cap and does not honor byte sizes).
+            // 6.3 Dynamic Table Size Update: 001xxxxx. The encoder tells us how
+            // much of the table it will use; anything above what we advertised
+            // is a compression error (§4.2), and lowering it evicts entries
+            // immediately (§4.3).
+            if (seen_field) {
+                // §4.2: the update must open the block. One that follows a field
+                // representation is a decoding error, not a resize applied late.
+                m_error = 40161;
+                return false;
+            }
             pos += 1;
             uint64_t size = 0;
-            if (!decode_integer(block, pos, 5, size)) return false;
+            if (!decode_integer(block, pos, 5, size))
+                return false;
+            if (size > m_advertised_max) {
+                m_error = 40160;
+                return false;
+            }
+            m_max_size = static_cast<std::size_t>(size);
+            evict_to_fit();
         } else {
             // 6.2.2 (0000xxxx) without indexing / 6.2.3 (0001xxxx) never indexed:
             // both use a 4-bit index prefix and are not added to the dynamic table.
             pos += 1;
             uint64_t index = 0;
-            if (!decode_integer(block, pos, 4, index)) return false;
+            if (!decode_integer(block, pos, 4, index))
+                return false;
             std::string name, value;
             if (index != 0) {
                 std::string dummy;
@@ -222,13 +351,17 @@ inline bool HpackDecoder::decode(std::string_view block, std::vector<HpackHeader
                     return false;
                 }
             } else {
-                if (!decode_string(block, pos, name)) return false;
+                if (!decode_string(block, pos, name))
+                    return false;
             }
-            if (!decode_string(block, pos, value)) return false;
-            out.push_back({std::move(name), std::move(value)});
+            if (!decode_string(block, pos, value))
+                return false;
+            if (!emit(std::move(name), std::move(value)))
+                return false;
+            seen_field = true;
         }
     }
     return true;
 }
 
-}  // namespace simple_http::codec
+} // namespace simple_http::codec

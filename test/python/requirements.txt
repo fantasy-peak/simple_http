@@ -1,0 +1,12 @@
+# Client-side protocol implementations, deliberately third-party.
+#
+# The C++ suites drive simple_http with simple_http's own client, so a spec
+# misreading shared by both halves cancels out and they agree on something wrong.
+# These are independent implementations: where one disagrees with the server, one
+# of the two is wrong — which is the whole value of this suite.
+#
+# Pinned so a CI run six months from now tests the server rather than a new
+# release of the client.
+h2==4.4.1
+httpx[http2]==0.28.1
+websockets==17.1
