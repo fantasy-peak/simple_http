@@ -27,6 +27,7 @@
 #include <atomic>
 #include <boost/asio/awaitable.hpp>
 #include <cstdint>
+#include <functional>
 #include <initializer_list>
 #include <iterator>
 #include <limits>
@@ -784,7 +785,12 @@ class Router {
     // ending here.
     struct TrieNode {
         static constexpr std::size_t npos = std::numeric_limits<std::size_t>::max();
-        std::map<std::string, std::size_t> literals;
+        // `std::less<>` (transparent) so lookup can take a string_view segment
+        // straight from the request path: with the default comparator find()
+        // demands a std::string key, and match_template built one per segment
+        // per request — a heap allocation on the hot path of every templated
+        // route.
+        std::map<std::string, std::size_t, std::less<>> literals;
         std::size_t param_child{npos};
         TrieTerminal terminal;
     };
@@ -1004,7 +1010,7 @@ class Router {
             const std::size_t end = path.find('/', pos);
             const std::string_view part =
                 path.substr(pos, end == std::string_view::npos ? std::string_view::npos : end - pos);
-            const auto lit = n.literals.find(std::string{part});
+            const auto lit = n.literals.find(part);
             if (lit != n.literals.end()) {
                 node = lit->second;
             } else if (n.param_child != TrieNode::npos && !part.empty()) {
