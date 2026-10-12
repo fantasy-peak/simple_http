@@ -20,6 +20,7 @@
 #include <string>
 #include <string_view>
 
+#include "../core/address.h"
 #include "../core/limits.h"
 #include "../engine/dispatcher.h"
 #include "../engine/h1/h1_engine.h"
@@ -169,7 +170,7 @@ inline asio::awaitable<void> serve_tls(std::shared_ptr<TlsTransportT> transport,
         // attempts (or a misconfigured client pointing at the wrong port) looks
         // like nothing but noise with no source to chase.
         const auto peer = transport->peer();
-        SIMPLE_HTTP_ERROR_LOG("TLS handshake failed from {}:{}: {}", peer.address().to_string(), peer.port(),
+        SIMPLE_HTTP_ERROR_LOG("TLS handshake failed from {}:{}: {}", address_string(peer.address()), peer.port(),
                               ec.message());
         transport->close();
         co_return;

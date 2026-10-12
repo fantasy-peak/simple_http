@@ -17,6 +17,7 @@
 #include <utility>
 #include <vector>
 
+#include "../core/address.h" // peer_address
 #include "../core/base64.h" // basic_auth
 #include "../core/http_field.h"
 #include "../core/http_method.h"
@@ -108,7 +109,9 @@ class Request {
     // whole life.
     const QueryParams &query_params() const { return m_query_params; }
     asio::ip::tcp::endpoint peer() const { return m_peer; }
-    std::string peer_address() const { return m_peer.address().to_string(); }
+    // Presents the peer address the way it will be read: an IPv4 client on a
+    // dual-stack listener arrives v4-mapped and is unmapped (see core/address.h).
+    std::string peer_address() const { return address_string(m_peer.address()); }
 
     const Headers &headers() const { return m_headers; }
     std::optional<std::string_view> header(std::string_view name) const { return m_headers.get(name); }
