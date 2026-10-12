@@ -155,16 +155,27 @@ template <typename Connection> class Http3ResponseSink : public ResponseSink {
     asio::awaitable<error_code> send_chunk(std::string data) override {
         co_await hop();
         auto eng = m_engine.lock();
-        if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
-            co_return make_error_code(asio::error::not_connected);
+        // While the response head is being withheld for a request that is still
+        // uploading, writes are just buffered: nghttp3 has not seen a response
+        // yet, so its "is the stream writable" answer says nothing.
+        const bool deferred = eng && eng->response_pending(m_stream_id);
+        // Deliberately NOT gating on nghttp3_conn_is_stream_writable2: that
+        // reports false while the stream is parked for WOULDBLOCK
+        // (READ_DATA_BLOCKED), and enqueueing the data is precisely what
+        // resumes it. Only a stream that is gone or reset by the peer is
+        // unsendable.
+        if (!eng || !eng->alive() || (!deferred && !eng->stream_sendable(m_stream_id))) {
+                        co_return make_error_code(asio::error::not_connected);
         }
         if (eng->method_is_head(m_stream_id))
             co_return error_code{}; // HEAD: no body
         // Backpressure: block while this stream's unacknowledged bytes are over
         // the high mark, so a fast producer (a reverse proxy streaming an
         // upstream body) is paced by the peer rather than by memory.
-        if (auto ec = co_await eng->await_out_space(m_stream_id); ec)
-            co_return ec;
+        if (!deferred) {
+            if (auto ec = co_await eng->await_out_space(m_stream_id); ec)
+                co_return ec;
+        }
         eng->enqueue_body(m_stream_id, std::move(data), /*last=*/false);
         co_return error_code{};
     }
@@ -172,13 +183,16 @@ template <typename Connection> class Http3ResponseSink : public ResponseSink {
     asio::awaitable<error_code> send_last(std::string data) override {
         co_await hop();
         auto eng = m_engine.lock();
-        if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
+        const bool deferred = eng && eng->response_pending(m_stream_id);
+        if (!eng || !eng->alive() || (!deferred && !eng->stream_sendable(m_stream_id))) {
             co_return make_error_code(asio::error::not_connected);
         }
         if (eng->method_is_head(m_stream_id))
             co_return error_code{}; // HEAD: no body
-        if (auto ec = co_await eng->await_out_space(m_stream_id); ec)
-            co_return ec;
+        if (!deferred) {
+            if (auto ec = co_await eng->await_out_space(m_stream_id); ec)
+                co_return ec;
+        }
         eng->enqueue_body(m_stream_id, std::move(data), /*last=*/true);
         co_return error_code{};
     }
@@ -290,10 +304,39 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
     // reader), and there is no way to say "no body yet" other than by having the
     // reader report it.
     void begin_response(std::int64_t stream_id, int status, const Headers &headers, bool end_stream, bool with_body) {
+                auto it = m_streams.find(stream_id);
+        if (it == m_streams.end() || m_h3 == nullptr)
+            return;
+        Stream &stream = *it->second;
+
+        if (!stream.request_complete && !stream.response_started) {
+            // Respond promptly, WITHOUT waiting for the request body to finish:
+            // an xhttp "stream-one" client only ends its upload once it has
+            // seen the server answer (it half-closes the request stream in
+            // reply), so waiting for FIN here would deadlock. Delivering the
+            // response head early is fine as long as the stream is not torn
+            // down when the client then closes its side — see on_stream_close.
+                    }
+
+        do_submit_response(stream, status, headers.fields(), end_stream, with_body);
+    }
+
+    // The request body has ended; a response that had to wait for it can now go.
+    void flush_pending_response(std::int64_t stream_id) {
         auto it = m_streams.find(stream_id);
         if (it == m_streams.end() || m_h3 == nullptr)
             return;
         Stream &stream = *it->second;
+        if (!stream.response_pending)
+            return;
+                stream.response_pending = false;
+        do_submit_response(stream, stream.pending_status, stream.pending_headers, stream.pending_end_stream,
+                           stream.pending_with_body);
+    }
+
+    void do_submit_response(Stream &stream, int status, const std::vector<std::pair<std::string, std::string>> &fields,
+                            bool end_stream, bool with_body) {
+        const std::int64_t stream_id = stream.id;
 
         // §4.2: fields that describe the connection are not the peer's to
         // receive. nghttp3 rejects them on the way in; on the way out it would
@@ -302,7 +345,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         m_nva.clear();
         m_owned_status = std::to_string(status);
         m_nva.push_back(make_nv(":status", m_owned_status));
-        for (const auto &[name, value] : headers.fields()) {
+        for (const auto &[name, value] : fields) {
             if (is_connection_specific_field(name))
                 continue;
             if (contains_ctl(name) || contains_ctl(value))
@@ -343,7 +386,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
     }
 
     void enqueue_body(std::int64_t stream_id, std::string data, bool last) {
-        auto it = m_streams.find(stream_id);
+                auto it = m_streams.find(stream_id);
         if (it == m_streams.end())
             return;
         Stream &stream = *it->second;
@@ -356,7 +399,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         // nghttp3 stopped asking for this stream's body when it found none ready.
         // Nothing else will restart it: this is that moment, and missing it is
         // the classic deadlock of the pull model.
-        if (stream.data_blocked && m_h3 != nullptr) {
+                if (m_h3 != nullptr) {
             stream.data_blocked = false;
             (void)nghttp3_conn_resume_stream(m_h3, stream_id);
         }
@@ -383,18 +426,21 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
 
     [[nodiscard]] bool stream_writable(std::int64_t stream_id) const {
         auto it = m_streams.find(stream_id);
-        if (it == m_streams.end())
-            return false;
-        if (it->second->reset_by_peer)
-            return false;
+        if (it == m_streams.end()) {
+                        return false;
+        }
+        if (it->second->reset_by_peer) {
+                        return false;
+        }
         // nghttp3 knows the state machine — whether the request ended, whether
         // the write side was shut — so it answers this rather than us.
         if (m_h3 != nullptr) {
             const int rv = nghttp3_conn_is_stream_writable2(m_h3, stream_id);
             // An unknown stream is not writable either, but the table above is
             // the authority on that; anything else is nghttp3 saying no.
-            if (rv == 0)
-                return false;
+            if (rv == 0) {
+                                return false;
+            }
         }
         return true;
     }
@@ -404,8 +450,23 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         return it != m_streams.end() && it->second->is_head;
     }
 
-    void reset_stream(std::int64_t stream_id, std::uint64_t app_error_code) {
+    [[nodiscard]] bool response_pending(std::int64_t stream_id) const {
         auto it = m_streams.find(stream_id);
+        return it != m_streams.end() && it->second->response_pending;
+    }
+
+    // A peer reset makes the stream unusable; a stream merely *parked* for
+    // WOULDBLOCK (READ_DATA_BLOCKED) is the opposite — enqueueing data is what
+    // resumes it, so it must not be reported as unsendable.
+    [[nodiscard]] bool stream_sendable(std::int64_t stream_id) const {
+        auto it = m_streams.find(stream_id);
+        if (it == m_streams.end())
+            return false;
+        return !it->second->reset_by_peer;
+    }
+
+    void reset_stream(std::int64_t stream_id, std::uint64_t app_error_code) {
+                auto it = m_streams.find(stream_id);
         if (it == m_streams.end())
             return;
         it->second->end_stream_sent = true;
@@ -424,14 +485,15 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         std::array<nghttp3_vec, 8> vec{};
         const nghttp3_ssize count = nghttp3_conn_writev_stream(m_h3, &stream_id, &fin, vec.data(), vec.size());
         if (count < 0) {
-            // nghttp3 is in a connection-error state.
+                        // nghttp3 is in a connection-error state.
             // `nghttp3_err_infer_quic_app_error_code` is the only sanctioned
             // translation, and the connection closes with it.
             out.error = nghttp3_err_infer_quic_app_error_code(static_cast<int>(count));
             return out;
         }
-        if (count == 0 || stream_id < 0)
-            return out;
+        if (count == 0 || stream_id < 0) {
+                        return out;
+        }
 
         m_vec_count = std::min<std::size_t>(static_cast<std::size_t>(count), m_vec.size());
         for (std::size_t i = 0; i < m_vec_count; ++i) {
@@ -440,22 +502,27 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         }
         out.stream_id = stream_id;
         out.fin = fin;
-        out.vec = std::span<const quic::ByteVec>{m_vec.data(), m_vec_count};
+                out.vec = std::span<const quic::ByteVec>{m_vec.data(), m_vec_count};
         return out;
     }
 
     void on_stream_data_written(std::int64_t stream_id, std::size_t datalen) noexcept override {
-        // The cursor that nghttp3 hands slices from. It does not advance this
-        // itself — `nghttp3_conn_writev_stream` only reads — so a call missed
-        // here re-sends the same bytes forever, and a call made early drops
-        // them.
-        if (m_h3 != nullptr && datalen > 0) {
-            (void)nghttp3_conn_add_write_offset(m_h3, stream_id, datalen);
+        // This is nghttp3's own cursor (bytes it handed to ngtcp2 for the
+        // stream); our handoff watermark is advanced inside read_response_data
+        // instead, so it cannot drift when ngtcp2 reports a cumulative or
+        // WRITE_MORE datalen. An encoder/control uni-stream is not in
+        // m_streams, so only the wake is gated on the lookup; add_write_offset
+        // applies to every stream, uni included.
+        auto it = m_streams.find(stream_id);
+        if (it != m_streams.end()) {
+            h3::wake(it->second->out_space);
         }
+        if (m_h3 != nullptr && datalen > 0)
+            (void)nghttp3_conn_add_write_offset(m_h3, stream_id, datalen);
     }
 
     void on_stream_blocked(std::int64_t stream_id) noexcept override {
-        auto it = m_streams.find(stream_id);
+                auto it = m_streams.find(stream_id);
         if (it == m_streams.end())
             return;
         it->second->data_blocked = true;
@@ -464,7 +531,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
     }
 
     void on_stream_shut_wr(std::int64_t stream_id) noexcept override {
-        if (m_h3 != nullptr)
+                if (m_h3 != nullptr)
             nghttp3_conn_shutdown_stream_write(m_h3, stream_id);
     }
 
@@ -518,7 +585,14 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
 
     void on_stream_close(std::int64_t stream_id, std::optional<std::uint64_t> rx_error,
                          std::optional<std::uint64_t> tx_error) noexcept override {
-        if (m_h3 != nullptr) {
+                auto it = m_streams.find(stream_id);
+        // The response side decides whether the stream may go. A client that
+        // half-closes its *request* (true for a duplex "stream-one" xhttp
+        // session) must not tear the stream down here: the response is still
+        // flowing on it, and erasing it makes every further write fail with
+        // ENOTCONN. Only a stream whose response has ended is fully done.
+        const bool response_done = it == m_streams.end() || it->second->end_stream_sent;
+        if (m_h3 != nullptr && response_done) {
             // nghttp3 1.17 reports one application error code, not the rx/tx
             // pair later versions take.
             const std::uint64_t code = rx_error.value_or(tx_error.value_or(0));
@@ -529,11 +603,12 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
                 SIMPLE_HTTP_ERROR_LOG("h3: close_stream failed: {} (stream={})", nghttp3_strerror(rv), stream_id);
             }
         }
-        erase_stream(stream_id);
+        if (response_done)
+            erase_stream(stream_id);
     }
 
     void on_stream_reset(std::int64_t stream_id, std::uint64_t app_error_code) noexcept override {
-        auto it = m_streams.find(stream_id);
+                auto it = m_streams.find(stream_id);
         if (it != m_streams.end()) {
             it->second->reset_by_peer = true;
             if (it->second->request) {
@@ -550,7 +625,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
     }
 
     void on_stream_stop_sending(std::int64_t stream_id, std::uint64_t app_error_code) noexcept override {
-        auto it = m_streams.find(stream_id);
+                auto it = m_streams.find(stream_id);
         if (it != m_streams.end()) {
             // The peer does not want the rest of this response. Unpark a writer
             // parked on backpressure so it can observe that and stop.
@@ -638,7 +713,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
     }
 
     void on_connection_closed() noexcept override {
-        m_alive = false;
+                m_alive = false;
         for (auto &[id, stream] : m_streams) {
             if (stream->request) {
                 (void)stream->request->body().fail(make_error_code(asio::error::connection_reset));
@@ -705,7 +780,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
     }
 
     void on_headers_end(std::int64_t stream_id, bool fin) noexcept override {
-        auto it = m_streams.find(stream_id);
+                auto it = m_streams.find(stream_id);
         if (it == m_streams.end())
             return;
         Stream &stream = *it->second;
@@ -718,17 +793,25 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
             return;
         }
         // A request with no body is complete as soon as its headers are: a client
-        // cannot send more after the FIN, and waiting for `end_stream` would
-        // deadlock every GET.
+        // cannot send more after the FIN.
         if (fin) {
             stream.request_complete = true;
             (void)stream.request->body().finish();
-            spawn_handler(stream_id);
         }
+        // The (possibly withheld) response head can now go out.
+        flush_pending_response(stream_id);
+        // Dispatch as soon as the request head is complete, exactly like the h2
+        // engine, and let on_data feed the body to the running handler. A
+        // handler must NOT wait for END_STREAM to start: a full-duplex
+        // "stream-one" client (VLESS over xhttp, say) keeps the request body
+        // open for the life of the session -- it only ends when the handler
+        // closes the response -- so waiting here would deadlock instead of
+        // merely serialising the body.
+        spawn_handler(stream_id);
     }
 
     void on_data(std::int64_t stream_id, std::span<const std::uint8_t> data) noexcept override {
-        auto it = m_streams.find(stream_id);
+                auto it = m_streams.find(stream_id);
         if (it == m_streams.end())
             return;
         Stream &stream = *it->second;
@@ -744,17 +827,21 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
     }
 
     void on_end_stream(std::int64_t stream_id) noexcept override {
-        auto it = m_streams.find(stream_id);
+                auto it = m_streams.find(stream_id);
         if (it == m_streams.end())
             return;
         Stream &stream = *it->second;
         stream.request_complete = true;
         (void)stream.request->body().finish();
+        // The request body is done: submit a response head that had to wait for
+        // it (an xhttp stream-one client cancels the stream if the server
+        // answers mid-upload), then run the handler.
+        flush_pending_response(stream_id);
         spawn_handler(stream_id);
     }
 
     void on_stream_closed(std::int64_t stream_id, std::uint64_t /*app_error_code*/) noexcept override {
-        erase_stream(stream_id);
+                erase_stream(stream_id);
     }
 
     void on_acked(std::int64_t stream_id, std::uint64_t datalen) noexcept override {
@@ -776,11 +863,29 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
     }
 
     void on_stop_sending(std::int64_t stream_id, std::uint64_t app_error_code) noexcept override {
-        m_conn->shutdown_stream_read(stream_id, app_error_code);
+        // nghttp3 fires this as soon as it considers the *request* side done —
+        // for a full-duplex "stream-one" session that is the instant the
+        // client half-closes its upload, while the response is still flowing
+        // on the same stream. Forwarding it to the peer as STOP_SENDING makes
+        // the client cancel the whole stream (it reads the code as e.g.
+        // H3_REQUEST_CANCELLED), killing the response we are still writing.
+        // Only after our response has ended is the stream truly over.
+        auto it = m_streams.find(stream_id);
+        const bool response_done = it == m_streams.end() || it->second->end_stream_sent;
+                if (response_done)
+            m_conn->shutdown_stream_read(stream_id, app_error_code);
     }
 
     void on_reset_stream(std::int64_t stream_id, std::uint64_t app_error_code) noexcept override {
-        m_conn->shutdown_stream_write(stream_id, app_error_code);
+                // The peer aborted ITS send side — the request. RFC 9000 §3.5: a
+        // RESET_STREAM only touches the direction the sender owned, so it must
+        // NOT shut our write side: the response to an xhttp "stream-one"
+        // session still flows on this stream (the client half-closes its
+        // upload with exactly such a reset after the initial flush). Only stop
+        // reading the request so a parked uplink read observes the end; the
+        // stream stays usable for the response.
+        if (m_h3 != nullptr)
+            (void)nghttp3_conn_shutdown_stream_read(m_h3, stream_id);
     }
 
     void on_deferred_consume(std::int64_t stream_id, std::size_t nconsumed) noexcept override {
@@ -837,20 +942,27 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         if (filled == 0) {
             if (stream.out_eof) {
                 *flags |= NGHTTP3_DATA_FLAG_EOF;
-                return 0;
+                                return 0;
             }
             // More body is coming but none of it is here yet. There is no flag
             // for this — returning zero vectors without EOF trips an assertion
             // inside nghttp3 — so the error code is the only correct answer, and
             // `enqueue_body` is what clears it.
             stream.data_blocked = true;
-            return NGHTTP3_ERR_WOULDBLOCK;
+                        return NGHTTP3_ERR_WOULDBLOCK;
         }
         // The whole body has now been handed over (this call's slice included).
         if (stream.out_eof && stream.out_write + total >= stream.out_end()) {
             *flags |= NGHTTP3_DATA_FLAG_EOF;
         }
-        return static_cast<nghttp3_ssize>(filled);
+        // The bytes handed to nghttp3 (this call's slice included) have left our
+        // queue's readable front; the skip logic above relies on this
+        // watermark. Advancing it here — from the amount *we* supplied rather
+        // than ngtcp2's writev datalen, whose exact meaning varies by code path
+        // (WRITE_MORE / re-offers) — keeps read_response_data and
+        // on_stream_data_written self-consistent.
+        stream.out_write += total;
+                return static_cast<nghttp3_ssize>(filled);
     }
 
   private:
@@ -965,7 +1077,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
     }
 
     void erase_stream(std::int64_t stream_id) {
-        auto it = m_streams.find(stream_id);
+                auto it = m_streams.find(stream_id);
         if (it == m_streams.end())
             return;
         StreamPtr stream = std::move(it->second);

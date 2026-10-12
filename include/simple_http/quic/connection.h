@@ -581,6 +581,19 @@ template <typename Executor> void QuicConnection<Executor>::on_datagram(std::spa
             close_now();
             return;
         }
+        if (rv == NGTCP2_ERR_RETRY) {
+            // A reordered/duplicate Initial (or a new attempt from the same
+            // peer that shares a connection ID) landed on this connection.
+            // `ERR_RETRY` is ngtcp2 asking the *application* to send a Retry
+            // packet — it is not a fatal error, and the reference server
+            // answers with a Retry and keeps the connection attempt alive.
+            // Killing the connection here tears down in-flight sessions along
+            // with the stray datagram (observed against Xray's h3 client:
+            // one extra QUIC connection trips this path and, once failed,
+            // drags the working request stream down with it). Drop the
+            // datagram and keep the connection.
+                        return;
+        }
         fail(rv);
         return;
     }
@@ -651,7 +664,7 @@ template <typename Executor> void QuicConnection<Executor>::extend_connection_of
 
 template <typename Executor>
 void QuicConnection<Executor>::shutdown_stream_read(std::int64_t stream_id, std::uint64_t app_error_code) noexcept {
-    if (m_closed || m_conn == nullptr)
+        if (m_closed || m_conn == nullptr)
         return;
     if (ngtcp2_conn_shutdown_stream_read(m_conn, 0, stream_id, app_error_code) != 0) {
         // The stream is usually already gone — the peer reset it, or the
@@ -663,7 +676,7 @@ void QuicConnection<Executor>::shutdown_stream_read(std::int64_t stream_id, std:
 
 template <typename Executor>
 void QuicConnection<Executor>::reset_stream(std::int64_t stream_id, std::uint64_t app_error_code) noexcept {
-    if (m_closed || m_conn == nullptr)
+        if (m_closed || m_conn == nullptr)
         return;
     if (ngtcp2_conn_shutdown_stream(m_conn, 0, stream_id, app_error_code) != 0)
         return;
@@ -679,7 +692,7 @@ template <typename Executor> void QuicConnection<Executor>::extend_max_streams_b
 
 template <typename Executor>
 void QuicConnection<Executor>::shutdown_stream_write(std::int64_t stream_id, std::uint64_t app_error_code) noexcept {
-    if (m_closed || m_conn == nullptr)
+        if (m_closed || m_conn == nullptr)
         return;
     if (ngtcp2_conn_shutdown_stream_write(m_conn, 0, stream_id, app_error_code) != 0)
         return;
@@ -830,7 +843,7 @@ ngtcp2_ssize QuicConnection<Executor>::write_pkt(ngtcp2_path *path, ngtcp2_pkt_i
             case NGTCP2_ERR_STREAM_SHUT_WR:
                 // The stream is gone from the sending side — the peer reset
                 // it, or we did. nghttp3 has to stop writing to it.
-                proto->on_stream_shut_wr(stream_id);
+                                proto->on_stream_shut_wr(stream_id);
                 continue;
             case NGTCP2_ERR_WRITE_MORE:
                 // Accepted into a packet that is already being built. The
@@ -900,7 +913,7 @@ template <typename Executor> void QuicConnection<Executor>::close_now() {
     if (m_closed)
         return;
     m_closed = true;
-
+    
     if (m_conn != nullptr && !m_close_sent) {
         m_close_sent = true;
         std::array<std::uint8_t, kMaxDatagram> buf{};
@@ -932,7 +945,7 @@ template <typename Executor> void QuicConnection<Executor>::close_now() {
 template <typename Executor> void QuicConnection<Executor>::fail(int liberr) {
     if (m_closed)
         return;
-    // A callback may already have recorded something more specific than
+        // A callback may already have recorded something more specific than
     // `liberr` says — an HTTP/3 or QPACK error code, say. That one wins.
     if (!m_has_error) {
         if (liberr == NGTCP2_ERR_CRYPTO) {
@@ -1002,7 +1015,7 @@ template <typename Executor>
 int QuicConnection<Executor>::cb_stream_close(ngtcp2_conn *conn, std::uint32_t flags, std::int64_t stream_id,
                                               std::uint64_t app_error_code, void *user_data, void *) noexcept {
     auto *self = from(user_data);
-    // Hand the stream slot back. `ngtcp2_is_bidi_stream` and bit 0 together
+        // Hand the stream slot back. `ngtcp2_is_bidi_stream` and bit 0 together
     // spell "the client opened this one" — this is a server, so streams we
     // initiate are the other parity, and crediting those would be crediting
     // ourselves.
