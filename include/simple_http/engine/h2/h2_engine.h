@@ -107,7 +107,19 @@ template <TransportLike Transport> class Http2ResponseSink : public ResponseSink
         }
         // A response to HEAD has no body: END_STREAM on the HEADERS frame, and the
         // headers still carry the Content-Length a GET would have produced.
+        //
+        // Only a HEAD is given that length explicitly. HTTP/2 does not need
+        // content-length to frame a body - END_STREAM delimits it - so adding one
+        // to every one-shot response would be redundant. A HEAD is the exception:
+        // nothing else in the response conveys the size that was deliberately not
+        // sent, so without this a `HEAD /world` over HTTP/2 answered `200 +
+        // content-type + server` where the same route over HTTP/1.1 answered
+        // `content-length: 1024` (h1_engine.h send() sets it for HEAD too).
         const bool head = eng->method_is_head(m_stream_id);
+        if (head) {
+            headers.erase("content-length");
+            headers.add_lower("content-length", std::to_string(body.size()));
+        }
         eng->submit_headers(m_stream_id, status, headers, /*end_stream=*/head);
         if (!head)
             eng->enqueue_body(m_stream_id, std::move(body), /*last=*/true);
@@ -132,6 +144,13 @@ template <TransportLike Transport> class Http2ResponseSink : public ResponseSink
         if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
             co_return make_error_code(asio::error::not_connected);
         }
+        // A streamed response has no length it can promise - END_STREAM delimits
+        // it - so a handler-supplied Content-Length must not survive next to it.
+        // HTTP/1.1's sink erases it for the same reason (h1_engine.h,
+        // send_headers): a message carrying two framings is a response-splitting
+        // vector for any intermediary, and a wrong one here would be repeated
+        // downstream by the reverse proxy.
+        headers.erase("content-length");
         eng->submit_headers(m_stream_id, status, headers,
                             /*end_stream=*/eng->method_is_head(m_stream_id));
         eng->flush();
@@ -180,9 +199,9 @@ template <TransportLike Transport> class Http2ResponseSink : public ResponseSink
         co_return eng && eng->alive() && eng->stream_writable(m_stream_id);
     }
     asio::awaitable<void> close() override {
-        co_await hop(); // reset_stream() touches the same table
+        co_await hop(); // close_stream() touches the same table
         if (auto eng = m_engine.lock()) {
-            eng->reset_stream(m_stream_id, codec::H2_CANCEL);
+            eng->close_stream(m_stream_id);
         }
     }
     Version version() const override { return Version::Http2; }
@@ -269,6 +288,15 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         if (!body.empty())
             (void)st.request->body().feed(std::move(body));
         (void)st.request->body().finish();
+        // The upgraded request arrived in full as HTTP/1.1 - body included - so
+        // its read side is already closed. Without this the stream can never
+        // satisfy maybe_complete_stream() (which is what retires a finished
+        // stream) and stays in the table for the connection's life: one leaked
+        // entry per upgraded connection, still counted against
+        // h2_max_concurrent_streams. Measured with the limit at 2: the upgraded
+        // request was answered 200 and ended, and the *next* new stream on that
+        // connection was refused with REFUSED_STREAM.
+        st.half_closed_remote = true;
         m_next_peer_stream_id = 1; // the upgraded request's id is the highest seen so far
         dispatch_stream(1);
 
@@ -320,8 +348,11 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         // over HEADERS + CONTINUATION frames (RFC 9113 §6.2/§6.10): a compliant
         // peer answers a larger frame with FRAME_SIZE_ERROR and closes the
         // connection.
-        const std::size_t limit =
-            std::max<std::size_t>(1, std::min<std::size_t>(m_peer_max_frame_size, m_limits.h2_max_frame_size));
+        // Only the peer's SETTINGS_MAX_FRAME_SIZE bounds what we may send;
+        // m_limits.h2_max_frame_size is the limit we advertise for what *we*
+        // accept, so folding it in here split our HEADERS into more CONTINUATION
+        // frames than the peer asked for.
+        const std::size_t limit = std::max<std::size_t>(1, m_peer_max_frame_size);
         std::size_t off = 0;
         bool first = true;
         do {
@@ -436,6 +467,34 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         flush();
     }
 
+    // ResponseSink::close() for one stream.
+    //
+    // Deliberately *not* reset_stream(): this response may already be complete
+    // and merely queued. HTTP/1.1's sink writes to the socket inside send()
+    // (`co_await write_raw(...)`), so a handler that does send() and then
+    // close() - which is exactly what the static-file stage does for its 400 and
+    // 405 replies, "closing keeps the engine from draining a request body that
+    // was never going to be used" - has its response on the wire before close()
+    // runs. HTTP/2's sink only queues, so an immediate RST_STREAM there would
+    // discard the response and answer the peer with a cancelled stream whose
+    // headers it already received (measured: a 405 with an empty body and
+    // StreamReset(CANCEL)). So:
+    //   * response already ended          -> nothing left to close;
+    //   * body complete but not yet framed -> deliver it, then reset (the client
+    //     still needs to be told to stop sending, which is what close() is for);
+    //   * anything else (mid-stream abort, or nothing sent at all) -> reset now.
+    void close_stream(std::uint32_t stream_id) {
+        auto it = m_streams.find(stream_id);
+        if (it == m_streams.end() || it->second.end_stream_sent)
+            return; // gone, or the response already carried END_STREAM
+        if (it->second.out_finished) {
+            it->second.reset_after_end = true;
+            flush(); // make sure the write loop is running to finish it
+            return;
+        }
+        reset_stream(stream_id, codec::H2_CANCEL);
+    }
+
   private:
     struct Stream {
         std::shared_ptr<Request> request;
@@ -465,6 +524,11 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         bool dispatched = false;
         bool half_closed_remote = false; // client sent END_STREAM
         bool end_stream_sent = false;    // our terminating DATA (END_STREAM) emitted
+
+        // close() was called while this stream's response was already complete
+        // but not yet framed. The response is delivered first (END_STREAM), and
+        // the RST_STREAM follows in the write loop - see close_stream().
+        bool reset_after_end = false;
 
         // The request's declared body length (content-length), or -1 when it
         // declared none, and the body octets seen so far. A body that does not
@@ -739,10 +803,16 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
     }
 
     asio::awaitable<void> write_loop() {
+        // Hoisted out of the loop deliberately. Swapping into a fresh local each
+        // pass hands m_out's capacity to a string that dies at the end of that
+        // pass, so m_out regrew from nothing on every write (a malloc per pass,
+        // for the life of the connection). With the buffer held here the two
+        // strings trade capacities instead, and neither reallocates again.
+        std::string chunk;
         for (;;) {
             fill_data_frames(); // frame as much stream DATA as flow control allows
             while (!m_out.empty()) {
-                std::string chunk;
+                chunk.clear();
                 chunk.swap(m_out);
                 // Writing is connection activity: refresh the idle deadline so the
                 // watchdog does not reap a connection that is busy sending (e.g.
@@ -1344,10 +1414,22 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
             // handler cannot make the engine buffer without bound.
             if (st.websocket) {
                 if (!data.empty()) {
-                    st.recv_owed_conn += static_cast<std::int64_t>(data.size());
-                    st.ws_inbox.append(data);
-                    if (st.ws_wake)
-                        (void)st.ws_wake->try_send(error_code{});
+                    if (st.ws_closed) {
+                        // The tunnel is gone: refused (no ws route), a failed proxy
+                        // handshake, or a handler that already returned. Nothing
+                        // will ever read ws_inbox, so hand the connection credit
+                        // straight back instead of banking bytes nobody drains -
+                        // banked bytes keep the shared connection window debited
+                        // for the rest of the connection's life. Measured: 1 MiB
+                        // of DATA on a 404'd extended CONNECT left the connection
+                        // unable to send any request body on *any* stream.
+                        credit_consumed(st, static_cast<std::int64_t>(data.size()));
+                    } else {
+                        st.recv_owed_conn += static_cast<std::int64_t>(data.size());
+                        st.ws_inbox.append(data);
+                        if (st.ws_wake)
+                            (void)st.ws_wake->try_send(error_code{});
+                    }
                 }
                 if (hdr.has_flag(codec::H2_FLAG_END_STREAM)) {
                     st.half_closed_remote = true;
@@ -1669,9 +1751,28 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         // this executor when the handler replies, appending the HEADERS frame to
         // m_out before any body bytes are queued here.
         std::vector<std::uint32_t> finished; // streams that just emitted END_STREAM
+
+        // The connection window is shared, so this walk has to share it too. A
+        // stream that always has bytes queued would otherwise take every refill
+        // (the walk starts from the same place every pass), starving its
+        // siblings for as long as it lasts. Measured before this cap: with a
+        // 64 MiB response in flight, 12 of 20 concurrent 1 KiB responses on the
+        // same connection were answered at ~160 ms - the instant the big one
+        // finished - where the same 20 on an idle connection all answered in
+        // 3.4 ms. So every stream with something to send gets an equal share of
+        // what is currently available, per pass.
+        std::size_t active = 0;
+        for (const auto &[sid, st] : m_streams) {
+            if (!st.end_stream_sent && (!st.out_queue.empty() || st.out_finished))
+                ++active;
+        }
+        const std::int64_t share =
+            active ? std::max<std::int64_t>(1, m_conn_send_window / static_cast<std::int64_t>(active)) : 0;
+
         for (auto &[stream_id, st] : m_streams) {
             if (st.end_stream_sent)
                 continue;
+            std::int64_t emitted = 0; // what this stream has sent so far this pass
 
             // Emit DATA while the connection and stream windows both allow it.
             for (;;) {
@@ -1692,15 +1793,22 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
 
                 std::string &front = st.out_queue.front();
                 std::size_t available = front.size() - st.out_offset;
-                std::size_t budget = static_cast<std::size_t>(
-                    std::min<std::int64_t>(window, static_cast<std::int64_t>(std::min<std::uint32_t>(
-                                                       m_peer_max_frame_size, m_limits.h2_max_frame_size))));
-                std::size_t take = std::min(available, budget);
+                // Bound a DATA frame by the *peer's* SETTINGS_MAX_FRAME_SIZE:
+                // that is what it accepts. Our own advertised value limits what
+                // we receive, not what we send, so folding it in here (as this
+                // used to) only split frames smaller than the peer allows.
+                std::int64_t budget = std::min<std::int64_t>(window, static_cast<std::int64_t>(m_peer_max_frame_size));
+                if (share > 0)
+                    budget = std::min(budget, share - emitted); // fair share is spent
+                if (budget <= 0)
+                    break; // this stream's share for this pass is used up
+                std::size_t take = std::min(available, static_cast<std::size_t>(budget));
                 if (take == 0) {
                     // No progress possible (frame-size limit configured to 0):
                     // stop rather than spin and grow m_out without bound.
                     break;
                 }
+                emitted += static_cast<std::int64_t>(take);
 
                 // Frame [out_offset, out_offset+take) of the front chunk directly,
                 // with no intermediate copy.
@@ -1733,9 +1841,19 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
             }
         }
         // Retire any stream that is now complete in both directions (this may
-        // erase entries, so it must happen after the iteration above).
-        for (std::uint32_t sid : finished)
+        // erase entries, so it must happen after the iteration above). A stream
+        // whose close() arrived after its body was complete got its response
+        // framed above; the RST_STREAM close() asked for follows it here, so the
+        // peer sees the response and only then the reset that tells it to stop
+        // sending (see close_stream()).
+        for (std::uint32_t sid : finished) {
+            auto it = m_streams.find(sid);
+            if (it != m_streams.end() && it->second.reset_after_end) {
+                reset_stream(sid, codec::H2_CANCEL);
+                continue;
+            }
             maybe_complete_stream(sid);
+        }
     }
 
     // --- handler dispatch ---
@@ -1845,7 +1963,14 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         if (!handler_fn) {
             asio::co_spawn(
                 m_executor,
-                [self, writer]() -> asio::awaitable<void> { (void)co_await writer->send_bodyless(404, Headers{}); },
+                [self, writer, stream_id]() -> asio::awaitable<void> {
+                    (void)co_await writer->send_bodyless(404, Headers{});
+                    // There is no tunnel on this stream, so close its read side:
+                    // inbound DATA then returns its flow-control credit instead of
+                    // being banked for a reader that will never exist (see
+                    // on_data).
+                    self->ws_stream_close(stream_id);
+                },
                 asio::detached);
             return;
         }
@@ -1943,8 +2068,11 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         auto sink = it->second.writer;
         const auto idle = m_limits.idle_timeout;
 
-        auto fail = [sink](int status) -> asio::awaitable<void> {
+        auto fail = [this, sink, stream_id](int status) -> asio::awaitable<void> {
             (void)co_await sink->send_bodyless(status, Headers{});
+            // The tunnel is not happening, whatever the reason: close its read
+            // side so inbound DATA is credited back rather than banked (on_data).
+            ws_stream_close(stream_id);
             co_return;
         };
 

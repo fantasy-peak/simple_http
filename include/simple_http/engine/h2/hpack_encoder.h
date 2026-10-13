@@ -11,20 +11,23 @@
 // (hpack_static_table.h is all that remains of that file).
 //
 // Strategy: every header field is encoded as "Literal Header Field without
-// Indexing" (RFC 7541 §6.2.2), with both name and value Huffman-coded. This is
-// always valid HPACK, keeps the encoder itself tiny and correct, and needs no
-// encoder-side dynamic table (the peer's dynamic table is simply never
-// populated by us, which HPACK permits — indexing is an optimization, not a
-// requirement). The one exception is `:status`, which uses the indexed static
-// table entries for the common codes (200/204/206/304/400/404/500) to keep
-// typical responses a single byte for that field, matching what most HTTP/2
-// servers emit.
+// Indexing" (RFC 7541 §6.2.2), with the value Huffman-coded and the name taken
+// from the static table when it is there (one or two octets instead of the
+// ~6-13 a Huffman-coded name costs). This is always valid HPACK, keeps the
+// encoder itself tiny and correct, and needs no encoder-side dynamic table (the
+// peer's dynamic table is simply never populated by us, which HPACK permits —
+// indexing is an optimization, not a requirement). `:status` additionally uses
+// the indexed static table entries for the common codes
+// (200/204/206/304/400/404/500) to keep typical responses a single byte for that
+// field, matching what most HTTP/2 servers emit.
 
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "hpack_huffman.h"
+#include "hpack_static_table.h"
 
 namespace simple_http::codec {
 
@@ -58,10 +61,75 @@ inline void hpack_append_string(std::string &out, std::string_view value) {
     out.append(huff);
 }
 
+// Appends a literal field whose *name* comes from the table (RFC 7541 §6.2.2,
+// index prefix 4 bits): the name costs one byte instead of a Huffman-coded
+// string, which is what makes a head mostly table references.
+inline void hpack_append_literal_indexed_name(std::string &out, uint64_t name_index, std::string_view value) {
+    hpack_append_integer(out, 0x00, 4, name_index);
+    hpack_append_string(out, value);
+}
+
+// Field names we can reference by static-table index instead of spelling out.
+// A name costs one or two octets as a reference where the literal costs a
+// Huffman-coded string (11 octets for "content-type"), and encoding it is work
+// skipped. The static table is not fully sorted (RFC 7541 Appendix A lists
+// "accept-ranges" before "accept"), so this is a linear scan over a short list
+// rather than a search in the table itself.
+inline constexpr std::pair<std::string_view, std::uint64_t> kHpackIndexedNames[] = {
+    {":status", 8},
+    {"accept-ranges", 18},
+    {"allow", 22},
+    {"cache-control", 24},
+    {"content-disposition", 25},
+    {"content-encoding", 26},
+    {"content-language", 27},
+    {"content-length", 28},
+    {"content-range", 30},
+    {"content-type", 31},
+    {"date", 33},
+    {"etag", 34},
+    {"last-modified", 44},
+    {"location", 46},
+    {"retry-after", 53},
+    {"server", 54},
+    {"set-cookie", 55},
+    {"strict-transport-security", 56},
+    {"vary", 59},
+    {"www-authenticate", 61},
+};
+
+// Compile-time guard. An index that does not name the field it claims would
+// rename that header on the wire for every peer - a silent, total correctness
+// failure - so the pairing with the RFC table is checked here instead of by
+// review.
+constexpr bool hpack_indexed_names_match_static_table() {
+    for (const auto &[name, index] : kHpackIndexedNames) {
+        if (index >= http2_header_static_table.size() || http2_header_static_table[index].key != name) {
+            return false;
+        }
+    }
+    return true;
+}
+static_assert(hpack_indexed_names_match_static_table(), "kHpackIndexedNames disagrees with the HPACK static table");
+
+// The static-table index for `name`, or 0 when the name is not in that list.
+inline std::uint64_t hpack_name_index(std::string_view name) {
+    for (const auto &[n, index] : kHpackIndexedNames) {
+        if (n == name) {
+            return index;
+        }
+    }
+    return 0;
+}
+
 // Appends one header field as "Literal Header Field without Indexing"
-// (RFC 7541 §6.2.2: 0000 0000 prefix byte since the name is given as a
-// literal, not a table index), with both name and value Huffman-coded.
+// (RFC 7541 §6.2.2), with the name taken from the static table when it is there
+// and the value Huffman-coded.
 inline void hpack_append_literal(std::string &out, std::string_view name, std::string_view value) {
+    if (const std::uint64_t index = hpack_name_index(name); index != 0) {
+        hpack_append_literal_indexed_name(out, index, value);
+        return;
+    }
     out.push_back('\x00'); // index=0 (literal name follows), "without indexing" pattern
     hpack_append_string(out, name);
     hpack_append_string(out, value);
@@ -72,14 +140,6 @@ inline void hpack_append_literal(std::string &out, std::string_view name, std::s
 // for
 // `:method: GET`).
 inline void hpack_append_indexed(std::string &out, uint64_t index) { hpack_append_integer(out, 0x80, 7, index); }
-
-// Appends a literal field whose *name* comes from the table (RFC 7541 §6.2.2,
-// index prefix 4 bits): the name costs one byte instead of a Huffman-coded
-// string, which is what makes a request head mostly table references.
-inline void hpack_append_literal_indexed_name(std::string &out, uint64_t name_index, std::string_view value) {
-    hpack_append_integer(out, 0x00, 4, name_index);
-    hpack_append_string(out, value);
-}
 
 // Appends `:status` using the static-table index when the code is one of the
 // entries HPACK reserves (RFC 7541 Appendix A), else falls back to a literal.
