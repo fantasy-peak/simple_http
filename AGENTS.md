@@ -142,6 +142,23 @@ include/
    轮转分配；开启时每个 worker context 各持一个 acceptor（SO_REUSEPORT），连接留在
    accept 它的那个 context 上。`Response`/`WebSocket` 可被 handler 用
    `shared_ptr` 捕获并跨线程/跨协程使用，写操作会先 hop 回连接所属 executor。
+   四层（h1 / h2 / h3 / WebSocket）遵守的是**同一套**约束，机制逐字一致：sink 的每个
+   操作先 `co_await asio::dispatch(asio::bind_executor(m_executor, asio::use_awaitable))`
+   （`h1_engine.h` / `h2_engine.h` / `h3_engine.h` 各有一个 `hop()`，`websocket.h` 同款），
+   handler 都在连接 executor 上 `co_spawn`，请求体消费钩子都 post 回该 executor，并且
+   `engine/` 下零 mutex / 零 atomic。三条**刻意例外**都在 handler 层，因为那些对象本就
+   跨连接共享：`rate_limit.h` 的令牌桶按 key 加锁、`router.h` 惰性构建的中间件链用
+   atomic + mutex、日志 sink 用 `atomic<shared_ptr>` 安装（见第 5 条）。WebSocket 的
+   `is_open()` 是唯一不 hop 的状态读取（非协程接口、任意线程可调），所以 `m_open` 是
+   `atomic<bool>`；读泵/写泵与 `m_inbox` 都在连接 executor 上，交接用 executor 绑定的
+   channel。
+   h3 有一处粒度差异要记住：QUIC 的 connection executor **就是 endpoint 的 executor**
+   （`quic/endpoint.h`），而 endpoint 是每个 io_context 一个 UDP socket——不开
+   `reuse_port` 时一个监听只有一条线程跑**所有** QUIC 连接（模型 A 仍成立，但线程共享
+   比 TCP 粗得多，这也正是 QUIC 监听必须开 `reuse_port` 的原因）。h3 侧没有 WebSocket
+   （RFC 9220 扩展 CONNECT 未实现）。另：`quic/endpoint.h` 的 `m_send_wake` 是 QUIC
+   路径里唯一带锁的地方（`concurrent_channel`），与 `engine/h3/h3_stream.h` 里「ngtcp2/
+   nghttp3 回调与消费者同线程、所以用无锁 channel」的契约并不一致（未测量其开销）。
 5. **日志与后端解耦**：库只定义 `LogSink`（`level` / `where` / `category` / `message`，
    不含任何第三方类型），是否保留某条记录由 sink 的 `enabled()` 决定，且在格式化**之前**
    询问。适配第三方日志库的代码写在**消费者侧**（README 的 Logging 节有 spdlog 示例）。
