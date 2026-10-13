@@ -18,7 +18,7 @@
 #include <vector>
 
 #include "../core/address.h" // peer_address
-#include "../core/base64.h" // basic_auth
+#include "../core/base64.h"  // basic_auth
 #include "../core/http_field.h"
 #include "../core/http_method.h"
 #include "../core/types.h"

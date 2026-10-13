@@ -382,8 +382,11 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
                            ngtcp2_tstamp ts) noexcept;
     // ngtcp2's timer expired — or, since any wake-up runs this, might have.
     void handle_expiry_due();
-    // Emit the terminal packet and mark the connection finished.
+    // Mark the connection finished. If a callback is on the stack the packet
+    // itself is deferred to `finish_close()` — see m_in_read_pkt.
     void close_now();
+    // Emit the terminal packet and release the engine and its waiters.
+    void finish_close();
     // Turn a fatal ngtcp2 error into a close.
     void fail(int liberr);
     // Park until there is work or ngtcp2's timer expires.
@@ -408,6 +411,14 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
 
     QuicCrypto m_crypto;
     ngtcp2_conn *m_conn{nullptr};
+    // True for the duration of `ngtcp2_conn_read_pkt`, which is the only place
+    // ngtcp2 forbids building a packet from: its callbacks (the protocol engine)
+    // must not call `ngtcp2_conn_write_connection_close`, and an HTTP/3 error
+    // found while decoding — a malformed field section, an oversized one — is
+    // reported *from* one of those callbacks. Such a close is recorded here and
+    // finished by `on_datagram` the moment the parse has returned.
+    bool m_in_read_pkt{false};
+    bool m_close_deferred{false};
     ngtcp2_ccerr m_last_error{};
     ngtcp2_cid m_scid{};
 
@@ -569,7 +580,17 @@ template <typename Executor> void QuicConnection<Executor>::on_datagram(std::spa
                              static_cast<ngtcp2_socklen>(m_remote.size()), nullptr);
     ngtcp2_pkt_info pi{};
 
+    // A callback that closes the connection can only record it (see
+    // close_now); the terminal packet is built here, once ngtcp2 is no longer
+    // inside the parse.
+    m_in_read_pkt = true;
     const int rv = ngtcp2_conn_read_pkt(m_conn, &ps.path, &pi, datagram.data(), datagram.size(), now());
+    m_in_read_pkt = false;
+    if (m_close_deferred) {
+        m_close_deferred = false;
+        finish_close();
+        return;
+    }
     if (rv != 0) {
         // A datagram that arrives for a connection already closing is expected,
         // not an error: the peer has not seen our close yet.
@@ -592,7 +613,7 @@ template <typename Executor> void QuicConnection<Executor>::on_datagram(std::spa
             // one extra QUIC connection trips this path and, once failed,
             // drags the working request stream down with it). Drop the
             // datagram and keep the connection.
-                        return;
+            return;
         }
         fail(rv);
         return;
@@ -664,7 +685,7 @@ template <typename Executor> void QuicConnection<Executor>::extend_connection_of
 
 template <typename Executor>
 void QuicConnection<Executor>::shutdown_stream_read(std::int64_t stream_id, std::uint64_t app_error_code) noexcept {
-        if (m_closed || m_conn == nullptr)
+    if (m_closed || m_conn == nullptr)
         return;
     if (ngtcp2_conn_shutdown_stream_read(m_conn, 0, stream_id, app_error_code) != 0) {
         // The stream is usually already gone — the peer reset it, or the
@@ -676,7 +697,7 @@ void QuicConnection<Executor>::shutdown_stream_read(std::int64_t stream_id, std:
 
 template <typename Executor>
 void QuicConnection<Executor>::reset_stream(std::int64_t stream_id, std::uint64_t app_error_code) noexcept {
-        if (m_closed || m_conn == nullptr)
+    if (m_closed || m_conn == nullptr)
         return;
     if (ngtcp2_conn_shutdown_stream(m_conn, 0, stream_id, app_error_code) != 0)
         return;
@@ -692,7 +713,7 @@ template <typename Executor> void QuicConnection<Executor>::extend_max_streams_b
 
 template <typename Executor>
 void QuicConnection<Executor>::shutdown_stream_write(std::int64_t stream_id, std::uint64_t app_error_code) noexcept {
-        if (m_closed || m_conn == nullptr)
+    if (m_closed || m_conn == nullptr)
         return;
     if (ngtcp2_conn_shutdown_stream_write(m_conn, 0, stream_id, app_error_code) != 0)
         return;
@@ -843,7 +864,7 @@ ngtcp2_ssize QuicConnection<Executor>::write_pkt(ngtcp2_path *path, ngtcp2_pkt_i
             case NGTCP2_ERR_STREAM_SHUT_WR:
                 // The stream is gone from the sending side — the peer reset
                 // it, or we did. nghttp3 has to stop writing to it.
-                                proto->on_stream_shut_wr(stream_id);
+                proto->on_stream_shut_wr(stream_id);
                 continue;
             case NGTCP2_ERR_WRITE_MORE:
                 // Accepted into a packet that is already being built. The
@@ -913,7 +934,22 @@ template <typename Executor> void QuicConnection<Executor>::close_now() {
     if (m_closed)
         return;
     m_closed = true;
-    
+
+    // `ngtcp2_conn_write_connection_close` "must not be called from inside the
+    // callback functions" (ngtcp2.h) — and the engine's callbacks are exactly
+    // where a protocol error is discovered, since `nghttp3_conn_read_stream2`
+    // reports it by returning to them. Deferring the packet keeps the close
+    // ordered with everything else: `on_datagram` finishes it as soon as the
+    // parse is off the stack. Nothing observes the difference — `m_closed` is
+    // set either way, which is what stops the read loop and the engine.
+    if (m_in_read_pkt) {
+        m_close_deferred = true;
+        return;
+    }
+    finish_close();
+}
+
+template <typename Executor> void QuicConnection<Executor>::finish_close() {
     if (m_conn != nullptr && !m_close_sent) {
         m_close_sent = true;
         std::array<std::uint8_t, kMaxDatagram> buf{};
@@ -945,7 +981,7 @@ template <typename Executor> void QuicConnection<Executor>::close_now() {
 template <typename Executor> void QuicConnection<Executor>::fail(int liberr) {
     if (m_closed)
         return;
-        // A callback may already have recorded something more specific than
+    // A callback may already have recorded something more specific than
     // `liberr` says — an HTTP/3 or QPACK error code, say. That one wins.
     if (!m_has_error) {
         if (liberr == NGTCP2_ERR_CRYPTO) {
@@ -1015,7 +1051,7 @@ template <typename Executor>
 int QuicConnection<Executor>::cb_stream_close(ngtcp2_conn *conn, std::uint32_t flags, std::int64_t stream_id,
                                               std::uint64_t app_error_code, void *user_data, void *) noexcept {
     auto *self = from(user_data);
-        // Hand the stream slot back. `ngtcp2_is_bidi_stream` and bit 0 together
+    // Hand the stream slot back. `ngtcp2_is_bidi_stream` and bit 0 together
     // spell "the client opened this one" — this is a server, so streams we
     // initiate are the other parity, and crediting those would be crediting
     // ourselves.

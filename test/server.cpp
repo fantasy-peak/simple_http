@@ -189,6 +189,25 @@ template <typename ServerT> void register_routes(ServerT &server) {
                      co_await res->finish("end\n");
                  });
 
+    // A streamed response that ends with an EMPTY final chunk, after the last
+    // data has already been flushed. This is the shape a streaming reverse proxy
+    // and every `finish()` with no argument produce, and it is the one state in
+    // which nghttp3 reports "0 length data + FIN" from
+    // `nghttp3_conn_writev_stream` (count 0, stream id set, fin set) — which an
+    // HTTP/3 engine has to forward to QUIC as-is. Dropping it leaves the client
+    // reading a body that never ends. The wait between the last write and the
+    // finish is what puts the EOF in a call of its own; without it the FIN rides
+    // along with the final DATA and the bug stays hidden.
+    server.route(any_methods, "/stream-fin",
+                 [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+                     co_await res->status(200).content_type("text/plain").begin();
+                     co_await res->write("hello");
+                     asio::steady_timer timer{co_await asio::this_coro::executor};
+                     timer.expires_after(std::chrono::milliseconds(200));
+                     co_await timer.async_wait(asio::use_awaitable);
+                     co_await res->finish();
+                 });
+
     // Reads the entire request body and replies with its length — exercises
     // large body upload + flow control.
     server.route(any_methods, "/drain",

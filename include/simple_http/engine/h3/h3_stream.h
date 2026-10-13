@@ -31,8 +31,6 @@
 #include <deque>
 #include <memory>
 #include <string>
-#include <utility>
-#include <vector>
 
 #include "../../core/types.h"
 #include "../../proto/request.h"
@@ -109,18 +107,10 @@ struct H3Stream {
 
     // --- response -----------------------------------------------------------
     bool response_started{false};
+    // The response ended together with its HEADERS — no reader was installed
+    // (a bodyless response, or HEAD). A response whose body follows is not
+    // covered by this: it ends when the reader reports EOF.
     bool end_stream_sent{false};
-    // A response requested before the request body completed. Deliberately
-    // withheld: an xhttp "stream-one" client cancels the request stream
-    // (H3_REQUEST_CANCELLED) if the server answers before it has finished
-    // its upload, and a Go http3 server only responds after reading the
-    // whole request body. Held here and submitted by the engine once
-    // `request_complete` turns true.
-    bool response_pending{false};
-    bool pending_with_body{false};
-    bool pending_end_stream{false};
-    int pending_status{0};
-    std::vector<std::pair<std::string, std::string>> pending_headers;
 
     [[nodiscard]] std::uint64_t out_end() const noexcept { return out_base + out_bytes; }
     [[nodiscard]] bool stream_ended() const noexcept { return request_complete && end_stream_sent; }

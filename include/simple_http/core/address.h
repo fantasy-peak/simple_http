@@ -26,4 +26,4 @@ inline std::string address_string(const boost::asio::ip::address &a) {
     return a.to_string();
 }
 
-}  // namespace simple_http
+} // namespace simple_http

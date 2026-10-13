@@ -434,6 +434,9 @@ template <typename Executor> class QuicEndpoint {
         co_await m_serve(conn);
         co_await conn->await_closed();
         m_live.erase(std::remove(m_live.begin(), m_live.end(), conn), m_live.end());
+        // Its IDs are dead with it: nothing can route to this connection again,
+        // and the weak entries would otherwise outlive it by the process.
+        forget_cids(conn.get());
         co_return;
     }
 
@@ -449,13 +452,32 @@ template <typename Executor> class QuicEndpoint {
     void associate_cid(std::span<const std::uint8_t> cid, const std::weak_ptr<Connection> &conn) {
         if (cid.empty())
             return;
-        m_by_cid[cid_key(cid.data(), cid.size())] = conn;
+        const CidKey key = cid_key(cid.data(), cid.size());
+        m_by_cid[key] = conn;
+        // Remember which keys this connection owns. ngtcp2 retires an ID through
+        // its `remove_connection_id` callback, but it does not call that on
+        // teardown — `ngtcp2_conn_del` only frees memory. Without this list every
+        // connection that ever existed leaves its connection IDs in the table
+        // for the life of the endpoint (an entry is only dropped when a datagram
+        // happens to arrive for it, which for a random 18-byte ID never happens).
+        if (auto live = conn.lock())
+            m_cids_by_conn[live.get()].push_back(key);
     }
 
     void dissociate_cid(std::span<const std::uint8_t> cid) {
         if (cid.empty())
             return;
         m_by_cid.erase(cid_key(cid.data(), cid.size()));
+    }
+
+    // Drop everything the CID table still holds for a finished connection.
+    void forget_cids(const Connection *conn) {
+        const auto it = m_cids_by_conn.find(conn);
+        if (it == m_cids_by_conn.end())
+            return;
+        for (const CidKey &key : it->second)
+            m_by_cid.erase(key);
+        m_cids_by_conn.erase(it);
     }
 
     // --- stateless answers --------------------------------------------------
@@ -649,6 +671,9 @@ template <typename Executor> class QuicEndpoint {
     std::array<std::uint8_t, 32> m_secret{};
 
     std::unordered_map<CidKey, std::weak_ptr<Connection>, CidKey::Hash> m_by_cid;
+    // Which keys in `m_by_cid` belong to which connection, so they can be
+    // released when it ends (see associate_cid / forget_cids).
+    std::unordered_map<const Connection *, std::vector<CidKey>> m_cids_by_conn;
     std::vector<ConnectionPtr> m_live;
 
     std::deque<SendItem> m_send_queue;
