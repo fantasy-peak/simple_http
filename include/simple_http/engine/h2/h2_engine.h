@@ -1013,6 +1013,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                 return true;
             if (end_stream) {
                 it->second.half_closed_remote = true;
+                mark_ws_remote_end(it->second); // extended CONNECT: the head ends the tunnel's read side
                 (void)it->second.request->body().finish();
             }
             // Dispatch as soon as the request head is complete. The handler runs
@@ -1054,6 +1055,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
             if (it2 == m_streams.end())
                 return true;
             if (it2->second.half_closed_remote) {
+                mark_ws_remote_end(it2->second); // END_STREAM arrived on the (split) head
                 (void)it2->second.request->body().finish();
             }
             dispatch_stream(hdr.stream_id);
@@ -1349,9 +1351,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                 }
                 if (hdr.has_flag(codec::H2_FLAG_END_STREAM)) {
                     st.half_closed_remote = true;
-                    st.ws_eof = true;
-                    if (st.ws_wake)
-                        (void)st.ws_wake->try_send(error_code{});
+                    mark_ws_remote_end(st); // tunnel EOF; shared with the head-END_STREAM path
                     maybe_complete_stream(hdr.stream_id);
                 }
                 return true;
@@ -2154,6 +2154,21 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
             co_return ec;
         enqueue_body(id, std::string(reinterpret_cast<const char *>(data.data()), data.size()), /*last=*/false);
         co_return error_code{};
+    }
+
+    // The peer ended its half of a stream (END_STREAM). For a WebSocket tunnel
+    // that is the reader's EOF, and it has to be recorded wherever the end can
+    // arrive — a DATA frame, or the request head itself. On an extended CONNECT
+    // whose HEADERS carry END_STREAM nothing else will ever set it: RFC 9113 §5.1
+    // forbids further DATA on a half-closed(remote) stream, so the tunnel reader
+    // would park on ws_wake until the idle watchdog fired (measured: the peer
+    // half-closing at CONNECT time got no reply for 120s).
+    static void mark_ws_remote_end(Stream &st) {
+        if (!st.websocket)
+            return;
+        st.ws_eof = true;
+        if (st.ws_wake)
+            (void)st.ws_wake->try_send(error_code{});
     }
 
     // Inbound tunnel read: hands the ws backend buffered DATA bytes and returns

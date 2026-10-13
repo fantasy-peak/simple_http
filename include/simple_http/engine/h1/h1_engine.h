@@ -504,7 +504,10 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
                 if (m_ws_lookup) {
                     if (auto run = m_ws_lookup(ws_path)) {
                         m_buf.assign(parser.remainder());
-                        const bool upgraded = co_await (*run)(request, response, m_transport->tls_handle(), upgrade_fn);
+                        // The bool is deliberately ignored: m_upgraded already records
+                        // whether the 101 went out, and this engine is done either way
+                        // (upgraded, or answered by a short-circuiting middleware).
+                        (void)co_await (*run)(request, response, m_transport->tls_handle(), upgrade_fn);
                         co_return; // upgraded, or answered by middleware — either way the engine is done
                     }
                 }
@@ -524,7 +527,9 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
                 if (m_ws_regex_lookup) {
                     if (auto run = m_ws_regex_lookup(ws_path)) {
                         m_buf.assign(parser.remainder());
-                        const bool upgraded = co_await (*run)(request, response, m_transport->tls_handle(), upgrade_fn);
+                        // Same as the exact-route branch above: the bool is ignored,
+                        // m_upgraded records whether the 101 went out.
+                        (void)co_await (*run)(request, response, m_transport->tls_handle(), upgrade_fn);
                         co_return;
                     }
                 }

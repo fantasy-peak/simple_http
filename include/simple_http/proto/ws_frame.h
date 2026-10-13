@@ -379,9 +379,15 @@ inline std::string ws_encode_pong(std::string_view payload) { return ws_encode_f
 inline std::string ws_encode_ping(std::string_view payload) { return ws_encode_frame(WsOpcode::Ping, payload); }
 
 // Whether `code` is one a peer is allowed to put on the wire (RFC 6455 §7.4.1).
-// 1004 is reserved, 1005/1006 exist only to be *reported* locally, and
-// 1012-2999 were unassigned — a Close carrying any of them is a protocol error,
-// not a close to echo back.
+// 1004 is reserved, 1005/1006 exist only to be *reported* locally, and 1015 is
+// reserved for a TLS failure only the stack can report — a Close carrying any
+// of those is a protocol error, not a close to echo back.
+//
+// 1012-1014 are accepted too: RFC 6455 left them to "future use", and IANA has
+// since assigned them (1012 Service Restart, 1013 Try Again Later, 1014 Bad
+// Gateway). They are in the wild — browsers and proxies use them — so treating
+// them as protocol errors failed a connection the peer closed cleanly, and
+// refused close(1013, ...) to an application.
 inline bool ws_valid_close_code(std::uint16_t code) {
     if (code >= 3000 && code <= 4999)
         return true;
@@ -395,6 +401,9 @@ inline bool ws_valid_close_code(std::uint16_t code) {
     case 1009:
     case 1010:
     case 1011:
+    case 1012:
+    case 1013:
+    case 1014:
         return true;
     default:
         return false;

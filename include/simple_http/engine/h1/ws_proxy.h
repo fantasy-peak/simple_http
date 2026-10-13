@@ -31,6 +31,7 @@
 #include <string_view>
 #include <utility>
 
+#include "../../core/http_status.h" // reason_phrase (the 502 body/status line)
 #include "../../core/logging.h"
 #include "../../core/types.h"
 #include "../../proto/headers.h"
@@ -64,6 +65,26 @@ inline std::string rebuild_request_head(const ParsedHead &head, std::string_view
     return out;
 }
 
+// Answers the client when the tunnel could not be established, then closes the
+// client side. Without this the peer sees a bare connection close with no HTTP
+// status at all — measured: an upgrade to a route whose backend refused the
+// connection (ECONNREFUSED) delivered 0 bytes and an immediate EOF, so a browser
+// reports "connection closed before the handshake completed" and nothing ties it
+// to the unreachable backend. A backend that is merely unreachable is a 502,
+// which is what the HTTP/2 proxy path has always answered.
+//
+// Called only before any byte of the tunnel has been written to the client, so
+// the 502 is the response to its upgrade request and nothing else.
+template <typename Transport>
+inline asio::awaitable<void> ws_proxy_fail(const std::shared_ptr<Transport> &client, int status) {
+    const std::string resp = "HTTP/1.1 " + std::to_string(status) + " " + std::string{reason_phrase(status)} +
+                             "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    (void)co_await client->async_write(
+        std::span<const std::byte>{reinterpret_cast<const std::byte *>(resp.data()), resp.size()});
+    client->close();
+    co_return;
+}
+
 // Runs a byte-level WebSocket proxy tunnel between the already-upgraded client
 // transport and a freshly-opened backend TCP connection. Returns after both
 // directions have finished (the caller owns lifetime of the client transport
@@ -87,11 +108,13 @@ run_ws_proxy(std::shared_ptr<Transport> client, const ParsedHead &head, std::str
         co_await resolver.async_resolve(target.host, std::to_string(target.port), asio::as_tuple(asio::use_awaitable));
     if (rec) {
         SIMPLE_HTTP_ERROR_LOG("ws-proxy resolve {}:{} failed: {}", target.host, target.port, rec.message());
+        co_await ws_proxy_fail(client, 502);
         co_return false;
     }
     auto [cec, _] = co_await asio::async_connect(*backend, endpoints, asio::as_tuple(asio::use_awaitable));
     if (cec) {
         SIMPLE_HTTP_ERROR_LOG("ws-proxy connect {}:{} failed: {}", target.host, target.port, cec.message());
+        co_await ws_proxy_fail(client, 502);
         co_return false;
     }
 
@@ -124,6 +147,7 @@ run_ws_proxy(std::shared_ptr<Transport> client, const ParsedHead &head, std::str
             error_code sec;
             backend->shutdown(asio::ip::tcp::socket::shutdown_both, sec);
             backend->close(sec);
+            co_await ws_proxy_fail(client, 502);
             co_return false;
         }
     }

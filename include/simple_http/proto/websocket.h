@@ -224,26 +224,15 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
         req.header_len = ws_encode_header(req.header, opcode, payload.size(), rsv1);
         if (mask) {
             // Set the MASK bit (0x80 on the second header octet — the length
-            // field, whose lower 7 bits are the payload length).
+            // field, whose lower 7 bits are the payload length) and insert the
+            // 4-byte key between the length and the payload. The header is
+            // rebuilt here rather than patched, because the key has to land
+            // after the length octets whatever width they are (2, 4 or 10).
             unsigned char mask_key[4];
             for (auto &b : mask_key)
                 b = static_cast<unsigned char>(std::rand() & 0xFF);
-            // Rebuild the length octet(s) with the mask bit. The header layout
-            // from ws_encode_header is: [FIN+opcode][len...]; the mask bit rides
-            // on the byte that carries the length.
-            const char fin_opcode = req.header[0];
-            std::size_t len_bytes = req.header_len - 1; // octets after opcode
-            unsigned char len7 = static_cast<unsigned char>(req.header[1]);
-            len7 = static_cast<unsigned char>(len7 | 0x80);
-            req.header[1] = static_cast<char>(len7);
-            // Insert the mask key right after the length prefix + any extended
-            // length. Extended length lives in header[2 .. len_bytes].
-            std::size_t insert_at = req.header_len;
-            // But the ordinary case is a small payload (header_len == 2); for
-            // extended lengths the key goes after those bytes. We rebuild the
-            // whole header here for clarity.
             char rebuilt[14];
-            rebuilt[0] = fin_opcode;
+            rebuilt[0] = req.header[0]; // FIN+opcode, as ws_encode_header wrote it
             std::uint64_t l = payload.size();
             std::size_t n = 1;
             if (l <= 125) {
