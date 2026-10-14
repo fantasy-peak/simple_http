@@ -13,7 +13,10 @@
 using namespace simple_http;
 using namespace simple_http::test;
 
-namespace {
+// Reflected by glaze (openapi::doc() request_body / response / error): the
+// types must have external linkage — see test_params.cpp for why. Named
+// namespace, then pulled in for unqualified use.
+namespace openapi_types {
 
 struct UserProfile {
     std::int64_t id{};
@@ -28,6 +31,14 @@ struct CreateUserReq {
 struct ErrorBody {
     std::string error;
 };
+
+} // namespace openapi_types
+
+namespace {
+
+using openapi_types::CreateUserReq;
+using openapi_types::ErrorBody;
+using openapi_types::UserProfile;
 
 RequestPtr make_request(asio::io_context &ctx, std::string path, Method method = Method::Get) {
     auto req = std::make_shared<Request>(Version::Http11, ctx.get_executor(), asio::ip::tcp::endpoint{});

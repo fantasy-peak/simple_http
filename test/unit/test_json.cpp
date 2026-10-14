@@ -12,12 +12,21 @@
 using namespace simple_http;
 using namespace simple_http::test;
 
-namespace {
+// Reflected by glaze (read_json_body / write_json): the type must have external
+// linkage — see test_params.cpp for why. Named namespace, then pulled in for
+// unqualified use.
+namespace json_types {
 
 struct Pet {
     std::int64_t id{};
     std::string name;
 };
+
+} // namespace json_types
+
+namespace {
+
+using json_types::Pet;
 
 } // namespace
 

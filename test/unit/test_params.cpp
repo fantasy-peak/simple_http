@@ -12,7 +12,14 @@
 using namespace simple_http;
 using namespace simple_http::test;
 
-namespace {
+// These param structs are reflected by glaze (path_params / query_params /
+// parse_params). Glaze's field-name reflection declares `extern const T
+// external;`, which is ill-formed for a type with internal linkage — clang
+// rejects an anonymous-namespace type here ("used but not defined ... its type
+// does not have linkage"). So the reflected types live in a named namespace
+// (external linkage) and are pulled into the anonymous namespace only for
+// unqualified use below.
+namespace params_types {
 
 struct ItemParams {
     std::string order_id;
@@ -23,6 +30,13 @@ struct Page {
     std::int64_t page;
     std::string tag;
 };
+
+} // namespace params_types
+
+namespace {
+
+using params_types::ItemParams;
+using params_types::Page;
 
 RequestPtr make_request(asio::io_context &ctx, std::string target) {
     auto req = std::make_shared<Request>(Version::Http11, ctx.get_executor(), asio::ip::tcp::endpoint{});
