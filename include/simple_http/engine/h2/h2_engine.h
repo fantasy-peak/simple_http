@@ -90,6 +90,20 @@ inline constexpr std::size_t kH2MaxFrameSize = 16384;
 inline constexpr std::size_t kOutHighWatermark = 1u << 20;  // 1 MiB: park the producer
 inline constexpr std::size_t kOutLowWatermark = 256u << 10; // 256 KiB: wake it again
 
+// Upper bound on how many bytes of DATA one fill_data_frames() pass may frame
+// into the connection's output buffer (m_out). Without it, m_out grows to the
+// peer's whole flow-control window: a client that advertises a 4 MiB window
+// (Go/xray's HTTP/2 client does) made each connection frame several MiB before
+// the write loop was given a chance to drain, so every connection held multi-MB
+// output buffers (measured: 2-4 MiB std::string allocations inside
+// append_frame, per connection). Those are freed when the connection closes,
+// but on a server that churns connections the allocator retains that much more,
+// which shows up as slowly rising RSS. Capping a pass keeps m_out roughly this
+// size regardless of the peer's window; the write loop simply refills after
+// each write, so throughput is unaffected (it writes this much per syscall
+// anyway).
+inline constexpr std::size_t kMaxFramedPerPass = 256u << 10; // 256 KiB
+
 // ResponseSink for a single HTTP/2 stream. Holds a weak_ptr to the engine so
 // it can be used safely from any thread and after the connection has closed.
 template <TransportLike Transport> class Http2ResponseSink : public ResponseSink {
@@ -1772,6 +1786,11 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         for (auto &[stream_id, st] : m_streams) {
             if (st.end_stream_sent)
                 continue;
+            // Enough is framed for one pass: let the write loop drain m_out
+            // before framing more, so a big peer window cannot grow m_out to
+            // multi-MB (see kMaxFramedPerPass). The rest stays queued.
+            if (m_out.size() >= kMaxFramedPerPass)
+                break;
             std::int64_t emitted = 0; // what this stream has sent so far this pass
 
             // Emit DATA while the connection and stream windows both allow it.
@@ -1838,6 +1857,8 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                     finished.push_back(stream_id);
                     break;
                 }
+                if (m_out.size() >= kMaxFramedPerPass)
+                    break; // one pass' worth framed; the write loop drains it next
             }
         }
         // Retire any stream that is now complete in both directions (this may
