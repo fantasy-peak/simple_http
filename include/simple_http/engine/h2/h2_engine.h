@@ -840,6 +840,18 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                     co_return;
                 fill_data_frames(); // a handler may have queued more while we wrote
             }
+            // Idle: no stream is active on this connection right now. An
+            // xhttp/stream-one client pools many such connections (Go/xray keeps
+            // tens alive with keepalive PINGs), and each would otherwise pin its
+            // output buffers' capacity (m_out + chunk, hundreds of KiB after a
+            // large response) for as long as it is held - a per-connection floor
+            // that grows with the pool. Give the capacity back between requests;
+            // the next response reallocates. gated on an empty stream table so an
+            // in-flight response never pays a realloc per chunk.
+            if (m_streams.empty()) {
+                std::string().swap(m_out);
+                std::string().swap(chunk);
+            }
             if (m_goaway_sent && streams_all_done())
                 co_return;
             auto [ec] = co_await m_notify.async_receive(asio::as_tuple(asio::use_awaitable));
