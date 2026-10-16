@@ -172,7 +172,9 @@ TEST_CASE("access_log: the request id is included when request_id ran", "[tools]
     asio::io_context ctx;
     dispatch(ctx, router, make_request(ctx, "/ok"));
     REQUIRE(capture.records.size() >= 1);
-    // The record carries the id in brackets: `peer [<id>] "GET /ok" 200 ...`.
+    // The record carries the generated id as a structured attr.
     const auto &rec = capture.records.front();
-    CHECK(rec.message.find("] \"GET /ok\" 200") != std::string::npos);
+    CHECK(rec.message == "request");
+    CHECK(rec.attr("request_id").size() == 32); // 16 random bytes, hex
+    CHECK(rec.attr("path") == "/ok");
 }

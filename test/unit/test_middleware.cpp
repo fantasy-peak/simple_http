@@ -71,8 +71,11 @@ TEST_CASE("middleware: access_log records after the chain with the real status",
     REQUIRE(capture.records.size() == 1);
     const auto &rec = capture.records.front();
     CHECK(rec.level == LogLevel::Info);
-    // method, target, status and elapsed are all in the record.
-    CHECK(rec.message.find("\"GET /ok\" 202") != std::string::npos);
+    // The structured record carries method, path and the real status as attrs.
+    CHECK(rec.message == "request");
+    CHECK(rec.attr("method") == "GET");
+    CHECK(rec.attr("path") == "/ok");
+    CHECK(rec.attr("status") == "202");
 }
 
 TEST_CASE("middleware: recovery turns a throwing middleware into a 500", "[middleware]") {

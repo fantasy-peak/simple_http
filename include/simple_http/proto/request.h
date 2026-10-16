@@ -21,6 +21,7 @@
 #include "../core/base64.h"  // basic_auth
 #include "../core/http_field.h"
 #include "../core/http_method.h"
+#include "../core/logging.h" // LogFields (access-log context)
 #include "../core/types.h"
 #include "body.h"
 #include "headers.h"
@@ -260,6 +261,20 @@ class Request {
             }
         }
         return nullptr;
+    }
+
+    // The request's access-log context (see logging.h LogFields): a middleware or
+    // handler attaches key/value context (user id, tenant, trace id) here once,
+    // and access_log() merges it into the structured record — the cheap stand-in
+    // for a tracing span / slog logger.With. Stored as request state, so it costs
+    // nothing until first used:
+    //     req->log_fields().add("user_id", id);
+    LogFields &log_fields() {
+        if (auto *fields = get_state<LogFields>()) {
+            return *fields;
+        }
+        set_state(LogFields{});
+        return *get_state<LogFields>();
     }
 
     // --- population API (engine side) ---

@@ -328,6 +328,18 @@ class ScopedLog {
         std::string file;
         int line;
         std::string message;
+        // Attr values rendered as text (the sink's own choice would differ).
+        std::vector<std::pair<std::string, std::string>> attrs;
+
+        // The rendered value of a structured attr, or empty when absent.
+        std::string attr(std::string_view key) const {
+            for (const auto &[k, v] : attrs) {
+                if (k == key) {
+                    return v;
+                }
+            }
+            return {};
+        }
     };
 
     std::vector<Record> records;
@@ -344,8 +356,15 @@ class ScopedLog {
         }
 
         void log(const LogRecord &record) override {
-            m_owner->records.push_back(Record{record.level, std::string{record.where.file_name()},
-                                              static_cast<int>(record.where.line()), std::string{record.message}});
+            Record rec{record.level,
+                       std::string{record.where.file_name()},
+                       static_cast<int>(record.where.line()),
+                       std::string{record.message},
+                       {}};
+            for (const Attr &attr : record.attrs) {
+                rec.attrs.emplace_back(std::string{attr.key}, detail::attr_text(attr));
+            }
+            m_owner->records.push_back(std::move(rec));
         }
 
       private:

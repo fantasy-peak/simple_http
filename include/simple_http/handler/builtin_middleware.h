@@ -10,10 +10,13 @@
 //   server.group("/api", {simple_http::middleware::basic_auth("svc", "s3cret")}, ...);
 //   server.route({Method::Post}, "/payments", {simple_http::middleware::recovery()}, handler);
 //
-// CORS is its own policy (router.cors / make_cors_middleware); compression is
-// handled by the compressing writer, not by middleware. Request timeouts are
-// covered by EngineLimits (idle/request caps) rather than a middleware, because
-// cancelling a mid-flight coroutine chain safely needs engine-level support.
+// CORS is its own policy (router.cors / make_cors_middleware). Compression is a
+// middleware here (middleware::compress): mounting it enables the compressing
+// writer for that scope, so there is no separate server-level switch. There is
+// deliberately no request-timeout middleware — EngineLimits carries only the
+// connection idle timeout and the header/body size caps; a per-handler deadline
+// is application policy, because enforcing it means cancelling a mid-flight
+// coroutine chain.
 
 #include <chrono>
 #include <cstdint>
@@ -47,6 +50,13 @@ struct RequestId {
     std::string value;
 };
 
+// The real client address, resolved from a forwarded header by real_ip(); the
+// access log and a handler or later middleware read it:
+//   if (const auto *ip = req->get_state<simple_http::middleware::ClientIp>()) ...
+struct ClientIp {
+    std::string value;
+};
+
 namespace detail {
 
 // A thread-local generator seeded once; enough uniqueness for a request id.
@@ -65,27 +75,49 @@ inline std::string random_hex(std::size_t bytes) {
 
 } // namespace detail
 
-// Access log: one record per request — method, target, response status, wall
-// time, and the request id when request_id() runs further in — after the chain
-// completed, so a logging middleware reports real answers including the
-// router's built-in 404/405. Keep it outermost for shortest timing (tower-http
-// TraceLayer placement); register request_id() anywhere inside it.
+// Access log: one structured record per request — method, path, status, wall
+// time, and the request id / real IP / any LogFields context set further in —
+// emitted after the chain completed, so it reports real answers including the
+// router's built-in 404/405. The level follows the status (5xx error, 4xx warn),
+// as the Go/Rust access-log middlewares do. Keep it outermost for shortest
+// timing (tower-http TraceLayer placement); register request_id() anywhere
+// inside it. The record's attrs let a JSON sink emit the fields directly; a text
+// sink renders them as key=value.
 inline Middleware access_log() {
     return [](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
-        // maybe_unused: with SIMPLE_HTTP_ENABLE_LOG=0 the log call compiles
-        // away and these would otherwise trip -Wunused-variable.
-        [[maybe_unused]] const auto start = std::chrono::steady_clock::now();
+        const auto start = std::chrono::steady_clock::now();
         // Copy, not move: the after-phase still needs req/res.
         co_await next(req, res, ssl);
-        [[maybe_unused]] const auto elapsed =
+        const auto elapsed_us =
             std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
-        if (const auto *id = req->get_state<RequestId>()) {
-            SIMPLE_HTTP_INFO_LOG("{} [{}] \"{} {}\" {} {}us", req->peer_address(), id->value, req->method_token(),
-                                 req->target(), res->status(), elapsed);
-        } else {
-            SIMPLE_HTTP_INFO_LOG("{} \"{} {}\" {} {}us", req->peer_address(), req->method_token(), req->target(),
-                                 res->status(), elapsed);
+        const int status = res->status();
+        const std::string peer = req->peer_address();
+
+        std::vector<Attr> attrs;
+        attrs.reserve(12);
+        attrs.emplace_back("method", req->method_token());
+        attrs.emplace_back("path", req->path());
+        if (!req->query().empty()) {
+            attrs.emplace_back("query", req->query());
         }
+        attrs.emplace_back("status", static_cast<std::int64_t>(status));
+        attrs.emplace_back("duration_ms", static_cast<double>(elapsed_us) / 1000.0);
+        attrs.emplace_back("peer", peer);
+        attrs.emplace_back("http_version", to_string(req->version()));
+        if (const auto *id = req->get_state<RequestId>()) {
+            attrs.emplace_back("request_id", id->value);
+        }
+        if (const auto *ip = req->get_state<ClientIp>()) {
+            attrs.emplace_back("client_ip", ip->value);
+        }
+        if (const auto *fields = req->get_state<LogFields>()) {
+            for (const auto &[key, value] : fields->kv) {
+                attrs.emplace_back(key, value);
+            }
+        }
+
+        const LogLevel level = status >= 500 ? LogLevel::Error : (status >= 400 ? LogLevel::Warn : LogLevel::Info);
+        log_with_attrs(level, "access", std::source_location::current(), "request", attrs);
     };
 }
 
@@ -169,10 +201,6 @@ inline Middleware basic_auth(std::string username, std::string password) {
 // The real client address, resolved from a forwarded header by real_ip(); a
 // handler or a later middleware reads it:
 //   if (const auto *ip = req->get_state<simple_http::middleware::ClientIp>()) ...
-struct ClientIp {
-    std::string value;
-};
-
 namespace real_ip_detail {
 
 // Whether a trusted-proxy entry covers `ip`. An entry without '/' is an exact
