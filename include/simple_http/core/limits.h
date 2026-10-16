@@ -75,9 +75,29 @@ struct EngineLimits {
     // decouple them. Exceeding it is a stream error (ENHANCE_YOUR_CALM).
     std::size_t h2_max_header_list_size{0};
 
+    // Rapid Reset (CVE-2023-44487) defense: how many streams may sit queued
+    // waiting for a handler slot, on top of the h2_max_concurrent_streams
+    // handlers allowed to run at once.
+    //
+    // h2_max_concurrent_streams bounds *open* streams, but a stream that opens
+    // and is immediately RST_STREAMed frees its table slot while the handler it
+    // started keeps running — so a reset flood can spawn handlers without
+    // bound. Executing handlers are therefore capped at h2_max_concurrent_streams
+    // (as in Go's HTTP/2 server), and the excess queues here. A queue that
+    // outgrows this bound is a connection error (ENHANCE_YOUR_CALM). 0 means
+    // "follow h2_max_concurrent_streams". Note the queue is bounded *anyway* by
+    // h2_max_concurrent_streams, because a queued stream still occupies a table
+    // slot — this is the explicit, tunable bound on top of that.
+    std::size_t h2_max_queued_streams{0};
+
     // The decoded header-list bound actually applied (see above).
     [[nodiscard]] std::size_t effective_max_header_list_size() const {
         return h2_max_header_list_size != 0 ? h2_max_header_list_size : max_header_bytes;
+    }
+
+    // The Rapid Reset dispatch-queue bound actually applied (see above).
+    [[nodiscard]] std::size_t effective_max_queued_streams() const {
+        return h2_max_queued_streams != 0 ? h2_max_queued_streams : h2_max_concurrent_streams;
     }
 
     // --- HTTP/3 advertisement ---

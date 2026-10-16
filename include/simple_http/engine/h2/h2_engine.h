@@ -312,7 +312,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         // connection was refused with REFUSED_STREAM.
         st.half_closed_remote = true;
         m_next_peer_stream_id = 1; // the upgraded request's id is the highest seen so far
-        dispatch_stream(1);
+        (void)dispatch_stream(1);
 
         // Bytes already read past the HTTP/1.1 upgrade request: the client's
         // connection preface and whatever followed it. Handed to the reader
@@ -536,6 +536,11 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         std::int64_t recv_pending = 0;               // consumed bytes awaiting a batched stream WINDOW_UPDATE
         std::int64_t recv_owed_conn = 0; // delivered-but-unconsumed body bytes still owing connection credit
         bool dispatched = false;
+        // Whether this stream's handler has actually started. `dispatched` is set
+        // the moment the request head is accepted — so a later HEADERS is still
+        // read as trailers — while `handler_started` distinguishes a started
+        // handler from one queued behind the executing-handler cap (Rapid Reset).
+        bool handler_started = false;
         bool half_closed_remote = false; // client sent END_STREAM
         bool end_stream_sent = false;    // our terminating DATA (END_STREAM) emitted
 
@@ -1116,7 +1121,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
             // concurrently with any DATA frames still arriving, reading the body
             // through the async Body channel (see on_data). A body-less request
             // simply sees an immediately-finished body.
-            dispatch_stream(hdr.stream_id);
+            return dispatch_stream(hdr.stream_id);
         } else {
             m_continuation_stream = hdr.stream_id; // CONTINUATION frames follow
             if (end_stream)
@@ -1154,7 +1159,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                 mark_ws_remote_end(it2->second); // END_STREAM arrived on the (split) head
                 (void)it2->second.request->body().finish();
             }
-            dispatch_stream(hdr.stream_id);
+            return dispatch_stream(hdr.stream_id);
         }
         return true;
     }
@@ -1647,6 +1652,11 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         // the stream's disappearance instead of waiting forever.
         if (it->second.ws_wake)
             it->second.ws_wake->close();
+        // A stream reset while its handler was still queued (Rapid Reset): drop
+        // the queue entry so the bound is not spent on a stream that is gone.
+        // The handler itself, if one was already running, keeps its slot and
+        // releases it via handler_finished().
+        std::erase(m_pending_dispatch, stream_id);
         m_streams.erase(it);
     }
 
@@ -1891,11 +1901,48 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
 
     // --- handler dispatch ---
 
-    void dispatch_stream(std::uint32_t stream_id) {
+    // Dispatch a stream's handler, or queue it while the executing-handler cap is
+    // reached. Returns false on a fatal connection error (a GOAWAY has been
+    // queued by the caller's own dispatch).
+    //
+    // Rapid Reset (CVE-2023-44487) opens a stream and immediately RST_STREAMs it.
+    // The reset frees the stream-table slot that the h2_max_concurrent_streams
+    // check counts, but not the handler the stream already started — so without a
+    // cap on *executing* handlers a reset flood spawns handlers without bound.
+    // The defense mirrors Go's HTTP/2 server: bound concurrently executing
+    // handlers to h2_max_concurrent_streams, queue the excess, and treat an
+    // overgrown queue as a connection error. (A Hyper-style alternative — defer
+    // the per-stream allocation until the handler really runs — is stronger
+    // still; this keeps the existing eager-dispatch shape.)
+    bool dispatch_stream(std::uint32_t stream_id) {
         auto it = m_streams.find(stream_id);
         if (it == m_streams.end() || it->second.dispatched)
-            return;
+            return true;
+        // Mark the head accepted immediately: a HEADERS arriving later on this
+        // stream is then a trailing block, whether or not its handler has started.
         it->second.dispatched = true;
+        if (m_active_handlers >= m_limits.h2_max_concurrent_streams) {
+            if (m_pending_dispatch.size() >= m_limits.effective_max_queued_streams()) {
+                SIMPLE_HTTP_ERROR_LOG("h2: dispatch queue over {} (stream={}); GOAWAY", m_pending_dispatch.size(),
+                                      stream_id);
+                go_away(codec::H2_ENHANCE_YOUR_CALM);
+                return false;
+            }
+            m_pending_dispatch.push_back(stream_id);
+            return true;
+        }
+        start_handler(stream_id);
+        return true;
+    }
+
+    // Runs one stream's handler now, occupying an executing-handler slot until it
+    // returns (see handler_finished).
+    void start_handler(std::uint32_t stream_id) {
+        auto it = m_streams.find(stream_id);
+        if (it == m_streams.end() || it->second.handler_started)
+            return;
+        it->second.handler_started = true;
+        ++m_active_handlers;
         // RFC 8441: an extended-CONNECT WebSocket stream runs the ws middleware
         // chain and, if it reaches the terminal, becomes a tunnel.
         if (it->second.websocket) {
@@ -1924,9 +1971,29 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                     self->reset_stream(sid, codec::H2_INTERNAL_ERROR);
                 }
                 self->flush();
+                self->handler_finished();
                 co_return;
             },
             asio::detached);
+    }
+
+    // A dispatched handler (ordinary or WebSocket) has returned: free its slot
+    // and start whatever the cap made wait. Runs on the connection executor.
+    void handler_finished() {
+        if (m_active_handlers > 0)
+            --m_active_handlers;
+        pump_dispatch();
+    }
+
+    void pump_dispatch() {
+        while (m_active_handlers < m_limits.h2_max_concurrent_streams && !m_pending_dispatch.empty()) {
+            const std::uint32_t id = m_pending_dispatch.front();
+            m_pending_dispatch.pop_front();
+            // A queued stream may have been reset (cheaply) while it waited — that
+            // is the whole point — so it can already be gone.
+            if (auto it = m_streams.find(id); it != m_streams.end() && !it->second.handler_started)
+                start_handler(id);
+        }
     }
 
     // --- HTTP/2 WebSocket (RFC 8441) ---
@@ -1969,8 +2036,12 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
     // no matching ws route the stream is answered 404 and ended.
     void dispatch_ws_stream(std::uint32_t stream_id) {
         auto it = m_streams.find(stream_id);
-        if (it == m_streams.end())
+        if (it == m_streams.end()) {
+            // The stream vanished between start_handler and here: release the slot
+            // taken for it, or the leak would stall the dispatch queue.
+            handler_finished();
             return;
+        }
         auto request = it->second.request;
         auto writer = it->second.writer;
         const std::string path{request->path()};
@@ -1986,6 +2057,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                     m_executor,
                     [self, request, stream_id, target = std::move(*target)]() mutable -> asio::awaitable<void> {
                         (void)co_await self->run_h2_ws_proxy(stream_id, std::move(request), std::move(target));
+                        self->handler_finished();
                     },
                     asio::detached);
                 return;
@@ -2003,6 +2075,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                     // being banked for a reader that will never exist (see
                     // on_data).
                     self->ws_stream_close(stream_id);
+                    self->handler_finished();
                 },
                 asio::detached);
             return;
@@ -2024,6 +2097,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                     SIMPLE_HTTP_ERROR_LOG("h2 ws handler(stream={}) threw unknown exception", stream_id);
                     self->reset_stream(stream_id, codec::H2_INTERNAL_ERROR);
                 }
+                self->handler_finished();
                 co_return;
             },
             asio::detached);
@@ -2414,6 +2488,13 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
     WsProxyLookup m_ws_proxy_lookup; // byte-level ws reverse-proxy routes, empty if none
     codec::HpackDecoder m_decoder;   // connection-scoped (read loop only)
     std::unordered_map<std::uint32_t, Stream> m_streams;
+
+    // Rapid Reset defense: handlers currently executing on this connection, and
+    // the streams queued behind the cap. Both touched only on the connection
+    // executor (dispatch runs from the read loop; handler_finished from the
+    // handler coroutines, which run there too).
+    std::size_t m_active_handlers{0};
+    std::deque<std::uint32_t> m_pending_dispatch;
 
     std::string m_recv_buf; // received bytes awaiting frame parsing
     std::string m_out;      // serialized frames awaiting transport write

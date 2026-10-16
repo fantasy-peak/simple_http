@@ -1752,3 +1752,49 @@ TEST_CASE("regression/static: the same responses over h2c", "[regression][static
 
     client.close();
 }
+
+// --- server lifecycle: connection limiting (Go netutil.LimitListener shape) --
+
+// The limiter is backpressure, not rejection: at the limit the acceptor simply
+// stops accepting, so a further connection sits in the kernel backlog — its TCP
+// handshake succeeds — until an earlier one frees its slot. Asserting the negative
+// (no response while the slot is held) is what distinguishes this from an
+// accept-then-close design, which would answer the queued request immediately with
+// a reset.
+TEST_CASE("regression/server: max_connections waits for a slot instead of rejecting", "[regression][server]") {
+    constexpr std::uint16_t port = 27940;
+    sh::ServerConfig cfg;
+    cfg.listen = sh::InetAddress{"127.0.0.1", port, false};
+    cfg.worker_threads = 2;
+    cfg.max_connections = 1;
+    cfg.limits.idle_timeout = std::chrono::seconds(10); // generous: no watchdog interference
+    sh::Server server{cfg};
+    server.route({sh::Method::Get}, "/hello", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(200).content_type(sh::mime::text_plain).send("hello");
+    });
+    REQUIRE(server.start());
+
+    asio::io_context ctx;
+
+    // The first connection takes the only slot and keeps it (keep-alive).
+    RawClient first{ctx};
+    REQUIRE(first.connect(port));
+    first.send("GET /hello HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(first.wait_for("hello"));
+    CHECK(server.active_connections() == 1);
+
+    // The second connection's handshake completes against the backlog, but the
+    // request is not served while the first holds the slot.
+    RawClient second{ctx};
+    REQUIRE(second.connect(port));
+    second.send("GET /hello HTTP/1.1\r\nHost: x\r\n\r\n");
+    second.pump(std::chrono::milliseconds(250));
+    CHECK(second.received().empty());
+
+    // Release the slot: the waiting connection is admitted and answered.
+    first.close();
+    REQUIRE(second.wait_for("hello"));
+
+    second.close();
+    server.stop();
+}

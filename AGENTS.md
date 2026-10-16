@@ -215,6 +215,7 @@ cfg.worker_threads = 4;
 // cfg.tls = TlsConfig{ .cert_chain_file=..., .private_key_file=...,
 //                      .mutual=true, .ca_file=... };  // 可选 TLS/mTLS
 // cfg.limits = EngineLimits{...};                     // 可选引擎调参
+// cfg.max_connections = 0;                            // 0=不限；到上限由内核 backlog 排队（Go netutil.LimitListener 形态）
 // cfg.reuse_port = true; cfg.tcp_nodelay = true; cfg.plaintext_protocols = ...;
 // #ifdef SIMPLE_HTTP_ENABLE_HTTP3: cfg.quic = QuicAddress{"0.0.0.0", 7792, false};
 
@@ -576,3 +577,16 @@ add dev <iface> root netem loss 3%` 注入丢包，`h2load --alpn-list=h3 …` �
   复现已固化为 `test/python/test_regressions.py`。
 - **`Body::feed` 语义**：改为收 `std::string&&` 并直接转发 `try_send`——asio 只在成功分支
   移动参数，失败时参数原样保留，调用方可重试；提前包成 `Frame` 会无条件 move、失败即丢。
+- **连接数上限（2.1）**：`ServerConfig::max_connections`（0=不限）。语义对齐 Go
+  `netutil.LimitListener`：到上限时 accept 循环**不发起 `async_accept`**，把连接留在内核
+  listen backlog 里排队（背压，非拒绝）；计数由 `std::atomic` 跨 acceptor 共享，释放发生在
+  连接的 co_spawn 完成回调（不是 handler 返回时）。同时给 accept 加了资源类错误（EMFILE/
+  ENOBUFS/ENOMEM）的**指数退避**（5ms→1s），对齐 Go `http.Server`——此前只打日志后
+  `continue`，fd 耗尽会空转烧核。可观测：`Server::active_connections()`。
+- **HTTP/2 Rapid Reset（2.3，CVE-2023-44487）**：`h2_max_concurrent_streams` 只限**打开的流**，
+  而「开流→立刻 RST」会释放流表槽位但不释放已启动的 handler，故 reset 洪泛能无限派发 handler。
+  修法对齐 Go 的 HTTP/2 修复：把**同时在跑的 handler** 上限设为 `h2_max_concurrent_streams`，
+  超出的流进 `m_pending_dispatch` 队列；队列越过 `EngineLimits::h2_max_queued_streams`
+  （0=跟随并发上限）则 `GOAWAY(ENHANCE_YOUR_CALM)`。handler 返回时 `handler_finished()`
+  释放槽位并 `pump_dispatch()` 续跑队列；被 reset 的排队流在 `erase_stream` 里从队列移除
+  （这才是廉价路径）。测试：`test/unit/test_h2_engine.cpp`（MockTransport 驱动，断言真实并发峰值）。

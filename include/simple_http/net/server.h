@@ -11,10 +11,12 @@
 // The accept topology follows ServerConfig::reuse_port: a single acceptor that
 // round-robins the pool, or one acceptor per worker context (SO_REUSEPORT).
 
+#include <algorithm>
 #include <atomic>
 #include <boost/asio.hpp>
 #include <boost/asio/local/stream_protocol.hpp>
 #include <boost/asio/ssl.hpp>
+#include <chrono>
 #include <cstddef>
 #include <filesystem>
 #include <functional>
@@ -91,6 +93,15 @@ struct ServerConfig {
     // Threads serving connections. Without reuse_port the pool also carries a
     // dedicated acceptor thread, so the process runs one more than this.
     unsigned worker_threads{4};
+    // Upper bound on simultaneously served connections; 0 (the default) means
+    // unlimited. Modelled on Go's netutil.LimitListener: when the limit is
+    // reached the acceptor stops calling async_accept, so the kernel's listen
+    // backlog holds new connections (bounded by the listen queue) instead of the
+    // server accepting and immediately closing them. A connection is counted
+    // from just before accept until its connection coroutine finishes. Reaching
+    // the limit is backpressure, not rejection — a client simply waits for the
+    // next free slot, exactly as it would for a busy worker.
+    std::size_t max_connections{0};
     // Fan the listener out to one acceptor per worker context, so each worker
     // accepts on its own thread: accept capacity scales with the pool and a
     // connection is never handed across threads. Off by default — a single
@@ -441,6 +452,11 @@ class Server {
     // single-acceptor model, one per worker once reuse_port fanned out — and
     // back to 1 where the platform rejected SO_REUSEPORT.
     std::size_t acceptor_count() const { return m_acceptors.size(); }
+
+    // Connections currently being served, against ServerConfig::max_connections.
+    // Readable from any thread; useful for a readiness/health endpoint or for
+    // checking that the limit is in effect.
+    std::size_t active_connections() const { return m_active_connections.load(std::memory_order_relaxed); }
 
     std::shared_ptr<IoCtxPool> pool() { return m_pool; }
 
@@ -861,24 +877,64 @@ class Server {
         auto ws_lookup = make_ws_lookup();
         auto ws_proxy_lookup = make_ws_proxy_lookup();
         auto ws_regex_lookup = make_ws_regex_lookup();
+        // Exponential backoff for a retryable accept error (a resource-exhaustion
+        // error like EMFILE). Reset on every successful accept; see below.
+        std::chrono::milliseconds accept_backoff{0};
         for (;;) {
             // Pinned: the kernel already picked this socket, so keep the
             // connection here. Otherwise round-robin the pool, which spreads
             // long-lived connections more evenly than the kernel's hash does.
             const std::shared_ptr<asio::io_context> &ctx_ptr = pinned ? pinned : m_pool->next_ptr();
             asio::io_context &ctx = *ctx_ptr;
+
+            // A connection slot, before async_accept (Go's netutil.LimitListener
+            // model): at the limit the acceptor simply does not accept, so the
+            // kernel backlog holds the excess. The count is global, shared by
+            // every accept loop, so a slot freed on one context wakes the loops
+            // on the others; a freed slot lands on an arbitrary thread, so a
+            // cheap re-check timer is used instead of a cross-thread wake
+            // channel — it only runs while saturated.
+            if (m_config.max_connections != 0) {
+                for (;;) {
+                    if (m_stopped.load(std::memory_order_acquire))
+                        co_return;
+                    std::size_t current = m_active_connections.load(std::memory_order_acquire);
+                    if (current < m_config.max_connections &&
+                        m_active_connections.compare_exchange_weak(current, current + 1, std::memory_order_acq_rel))
+                        break;
+                    asio::steady_timer timer{ctx};
+                    timer.expires_after(std::chrono::milliseconds(25));
+                    co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+                }
+            }
+
             Socket socket{ctx};
             auto [ec] = co_await acceptor->async_accept(socket, asio::as_tuple(asio::use_awaitable));
             if (ec) {
+                if (m_config.max_connections != 0)
+                    m_active_connections.fetch_sub(1, std::memory_order_acq_rel);
                 if (ec == asio::error::operation_aborted)
                     break;
-                // Never retry in silence: a persistent accept error — EMFILE and
-                // ENOBUFS are both reachable, since this loop opens a socket per
-                // connection — would otherwise spin a core with no diagnostic at
-                // all, and the port would look merely "slow" from outside.
-                SIMPLE_HTTP_ERROR_LOG("accept: {}", ec.message());
+                // Never retry in silence, and never retry hot: a persistent
+                // accept error — EMFILE and ENOBUFS are both reachable, since
+                // this loop opens a socket per connection — would otherwise spin
+                // a core with no diagnostic, and the port would look merely
+                // "slow" from outside. Go's http.Server backs off exponentially
+                // for the same reason.
+                if (is_retryable_accept_error(ec)) {
+                    accept_backoff = accept_backoff == std::chrono::milliseconds{0}
+                                         ? kAcceptBackoffMin
+                                         : std::min(accept_backoff * 2, kAcceptBackoffMax);
+                    SIMPLE_HTTP_ERROR_LOG("accept: {}; retrying in {}ms", ec.message(), accept_backoff.count());
+                    asio::steady_timer timer{ctx};
+                    timer.expires_after(accept_backoff);
+                    co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+                } else {
+                    SIMPLE_HTTP_ERROR_LOG("accept: {}", ec.message());
+                }
                 continue;
             }
+            accept_backoff = std::chrono::milliseconds{0};
 
             // The socket hook and the TCP linger option are typed for a TCP
             // socket, and a UNIX-domain socket has neither — nor a peer address,
@@ -900,6 +956,11 @@ class Server {
                 peer = socket.remote_endpoint(pe);
             }
 
+            // The release is the mirror of the acquire above, run once the
+            // connection's coroutine has finished (not when the handler returns —
+            // a streaming handler keeps the connection alive long after). It also
+            // carries the registry handle (`live`), which is what keeps the
+            // connection's `LiveConnection` entry alive for exactly its lifetime.
             if (m_tls) {
                 auto stream = std::make_shared<asio::ssl::stream<Socket>>(std::move(socket), m_tls->context());
                 auto transport = std::make_shared<TlsTransport<Socket>>(std::move(stream), peer);
@@ -908,7 +969,10 @@ class Server {
                 // the entry lives exactly as long as the connection does.
                 asio::co_spawn(
                     ctx, serve_tls(transport, dispatch, ws_lookup, m_config.limits, ws_proxy_lookup, ws_regex_lookup),
-                    [live](std::exception_ptr) {});
+                    [this, live](std::exception_ptr) {
+                        if (m_config.max_connections != 0)
+                            m_active_connections.fetch_sub(1, std::memory_order_acq_rel);
+                    });
             } else {
                 auto sock_ptr = std::make_shared<Socket>(std::move(socket));
                 auto transport = std::make_shared<TcpTransport<Socket>>(std::move(sock_ptr), peer);
@@ -916,11 +980,25 @@ class Server {
                 asio::co_spawn(ctx,
                                serve_plaintext(transport, dispatch, ws_lookup, m_config.limits, ws_proxy_lookup,
                                                ws_regex_lookup, m_config.plaintext_protocols),
-                               [live](std::exception_ptr) {});
+                               [this, live](std::exception_ptr) {
+                                   if (m_config.max_connections != 0)
+                                       m_active_connections.fetch_sub(1, std::memory_order_acq_rel);
+                               });
             }
         }
         co_return;
     }
+
+    // Accept errors that mean "the process is out of a resource right now", not
+    // "this listener is broken": retrying immediately would spin, so the loop
+    // backs off instead. EMFILE (no_descriptors) is the one that matters — this
+    // loop opens a socket per connection — with ENOBUFS/ENOMEM beside it.
+    static bool is_retryable_accept_error(const error_code &ec) {
+        return ec == asio::error::no_descriptors || ec == asio::error::no_buffer_space || ec == asio::error::no_memory;
+    }
+
+    static constexpr auto kAcceptBackoffMin = std::chrono::milliseconds(5);
+    static constexpr auto kAcceptBackoffMax = std::chrono::milliseconds(1000);
 
     static std::string local_address(const asio::ip::tcp::acceptor &acceptor) {
         error_code ec;
@@ -943,6 +1021,10 @@ class Server {
     std::shared_ptr<Router> m_router;
     std::optional<TlsContext> m_tls;
     std::vector<Listener> m_acceptors;
+    // Live connection count against ServerConfig::max_connections. Atomic
+    // because accept loops run on several threads (reuse_port) and each
+    // connection's completion runs on its own executor thread.
+    std::atomic<std::size_t> m_active_connections{0};
     // Connections still being served, so stop() can take them down. Guarded by a
     // mutex because accept loops run on several threads and each registers its
     // own connections.
