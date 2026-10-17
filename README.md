@@ -130,6 +130,25 @@ co_await res->write("first ");
 co_await res->finish("last");
 ```
 
+A response may end with a **trailer section** (RFC 9110 §6.5) — the version-agnostic
+way to carry fields that are only known once the body is done (gRPC's
+`grpc-status`, a checksum, `Server-Timing`). Accumulate fields with `trailer()`
+and they go out when the response ends, or pass them explicitly:
+
+```cpp
+res->trailer("grpc-status", "0");           // emitted by the final finish()
+co_await res->finish();
+
+co_await res->status(200).begin();
+co_await res->write(chunk);
+co_await res->finish_trailers({{"server-timing", "db;dur=53"}});  // ends the stream
+```
+
+On HTTP/1.1 this is the chunked terminator (`0\r\n<fields>\r\n`), on HTTP/2 a
+trailing HEADERS frame with END_STREAM, on HTTP/3 nghttp3's trailer section. A
+close-delimited HTTP/1.0 response and a response to HEAD cannot carry trailers,
+so the fields are dropped there.
+
 ### Client
 
 ```cpp
@@ -904,7 +923,7 @@ xmake build client     && xmake run client       # client integration: protocol 
 C++ — no Python or external services.
 
 A fourth suite drives the same server with **third-party clients** — httpx,
-hyper-h2 and websockets — and that is the point rather than an implementation
+hyper-h2, websockets and aioquic — and that is the point rather than an implementation
 detail: the C++ suites use simple_http's own client, so a spec misreading shared
 by both halves cancels out and the two agree on something wrong. An independent
 implementation disagrees exactly where the server is wrong. It found, for

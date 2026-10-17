@@ -23,6 +23,7 @@ import test_edges  # noqa: E402
 import test_h2  # noqa: E402
 import test_http1  # noqa: E402
 import test_regressions  # noqa: E402
+import test_trailers  # noqa: E402
 import test_ws  # noqa: E402
 import test_ws_deflate  # noqa: E402
 
@@ -31,6 +32,7 @@ def main() -> int:
     with harness.Server():
         test_http1.run()
         test_h2.run()
+        test_trailers.run()
         test_ws.run()
         test_ws_deflate.run()
         test_edges.run()

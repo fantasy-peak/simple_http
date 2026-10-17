@@ -261,6 +261,13 @@ class FakeResponseSink : public ResponseSink {
         co_return error_code{};
     }
 
+    asio::awaitable<error_code> send_trailers(Headers trailers) override {
+        ++calls;
+        last_trailers = std::move(trailers);
+        sent_trailers = true;
+        co_return error_code{};
+    }
+
     asio::awaitable<error_code> send_bodyless(int status, Headers headers) override {
         ++calls;
         last_status = status;
@@ -289,10 +296,12 @@ class FakeResponseSink : public ResponseSink {
     int last_status{0};
     std::string last_body;
     Headers last_headers;
+    Headers last_trailers;
     std::vector<std::string> chunks;
     bool begun{false};
     bool finished{false};
     bool sent_bodyless{false};
+    bool sent_trailers{false};
     bool open{true};
     Version ver{Version::Http11};
 

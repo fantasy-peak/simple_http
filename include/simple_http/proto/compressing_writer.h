@@ -129,6 +129,25 @@ class CompressingResponseSink final : public ResponseSink {
         co_return co_await m_inner->send_last(std::move(out));
     }
 
+    asio::awaitable<error_code> send_trailers(Headers trailers) override {
+        co_await hop();
+        if (m_done) {
+            co_return co_await m_inner->send_trailers(std::move(trailers));
+        }
+        m_done = true;
+        // Trailer fields are metadata, never compressed - but a compressing
+        // response still owes the codec's own trailer (the gzip footer) as a
+        // final body chunk before the HTTP trailer section closes the stream.
+        if (m_state == State::Compressing) {
+            if (std::string tail = m_encoder->finish(); !tail.empty()) {
+                if (auto ec = co_await m_inner->send_chunk(std::move(tail)); ec) {
+                    co_return ec;
+                }
+            }
+        }
+        co_return co_await m_inner->send_trailers(std::move(trailers));
+    }
+
     // --- never compressed ---
 
     asio::awaitable<error_code> send_bodyless(int status, Headers headers) override {

@@ -123,6 +123,13 @@ class ResponseWriter {
             co_return make_error_code(asio::error::invalid_argument);
         }
         apply_defaults();
+        // A response carrying trailers cannot be one-shot: the fields follow the
+        // body, so it is framed as a stream (chunked on HTTP/1.x) and closed by
+        // the trailer section. `send()` on a trailer-less response keeps the
+        // one-shot framing (a known Content-Length on HTTP/1.x).
+        if (!m_trailers.empty()) {
+            co_return co_await send_stream(std::move(body), std::move(m_trailers));
+        }
         co_return co_await m_writer->send(m_status, std::move(m_headers), std::move(body));
     }
 
@@ -146,8 +153,50 @@ class ResponseWriter {
     }
     [[nodiscard]] asio::awaitable<error_code> write(std::string data) { return m_writer->send_chunk(std::move(data)); }
     [[nodiscard]] asio::awaitable<error_code> finish(std::string data = {}) {
-        return m_writer->send_last(std::move(data));
+        // Trailer fields accumulated with trailer() end the response instead of
+        // the final body chunk, so a `finish()` after them still emits them. The
+        // response head already went out in begin(), so any final body bytes go
+        // out as an ordinary chunk and the trailer section closes the stream.
+        if (!m_trailers.empty()) {
+            if (!data.empty()) {
+                if (auto ec = co_await m_writer->send_chunk(std::move(data)); ec) {
+                    co_return ec;
+                }
+            }
+            co_return co_await m_writer->send_trailers(std::move(m_trailers));
+        }
+        co_return co_await m_writer->send_last(std::move(data));
     }
+
+    // Accumulates one trailer field (RFC 9110 §6.5), sent when the response ends
+    // via finish() or finish_trailers(). Trailer fields must not be pseudo-headers
+    // or framing headers; a CR/LF/NUL is refused exactly as it is for header().
+    //   co_await res->status(200).begin();
+    //   co_await res->write(chunk);
+    //   res->trailer("server-timing", "db;dur=53");
+    //   co_await res->finish();
+    ResponseWriter &trailer(std::string_view name, std::string value) {
+        if (contains_ctl(name) || contains_ctl(value)) {
+            SIMPLE_HTTP_ERROR_LOG("response trailer with CR/LF/NUL rejected");
+            m_field_rejected = true;
+            return *this;
+        }
+        m_trailers.add(std::string{name}, std::move(value));
+        return *this;
+    }
+
+    bool has_trailers() const { return !m_trailers.empty(); }
+
+    // Ends a streamed response with the given trailing field section, replacing
+    // the final finish(). Available even when no trailer() was accumulated.
+    [[nodiscard]] asio::awaitable<error_code> finish_trailers(Headers trailers) {
+        if (m_field_rejected) {
+            co_return make_error_code(asio::error::invalid_argument);
+        }
+        co_return co_await m_writer->send_trailers(std::move(trailers));
+    }
+    // Ends a streamed response with the fields accumulated by trailer().
+    [[nodiscard]] asio::awaitable<error_code> finish_trailers() { return finish_trailers(std::move(m_trailers)); }
 
     // --- connection state ---
     // Both hop onto the connection executor inside the writer, like the writes.
@@ -231,6 +280,22 @@ class ResponseWriter {
         frame += '\n';
         return frame;
     }
+    // Frames a one-shot response whose end is a trailer section: headers
+    // (chunked on HTTP/1.x), an optional body chunk, then the trailers. Only for
+    // send(), where the head has not gone out yet; the streaming finish() path
+    // has already sent its head in begin().
+    [[nodiscard]] asio::awaitable<error_code> send_stream(std::string body, Headers trailers) {
+        if (auto ec = co_await m_writer->send_headers(m_status, std::move(m_headers)); ec) {
+            co_return ec;
+        }
+        if (!body.empty()) {
+            if (auto ec = co_await m_writer->send_chunk(std::move(body)); ec) {
+                co_return ec;
+            }
+        }
+        co_return co_await m_writer->send_trailers(std::move(trailers));
+    }
+
     // Fill in Server and Content-Type headers if the handler did not set them.
     void apply_defaults() {
         if (!m_headers.contains("content-type")) {
@@ -244,6 +309,8 @@ class ResponseWriter {
     std::shared_ptr<ResponseSink> m_writer;
     int m_status{200};
     Headers m_headers;
+    // Trailer fields accumulated with trailer(); sent by finish()/finish_trailers().
+    Headers m_trailers;
     // Set when header() refused a field; the response is then not sent at all.
     // Emitting the rest would put a head on the wire that the handler did not
     // intend — and the whole point of rejecting at header() was to not do that.

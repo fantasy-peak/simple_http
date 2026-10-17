@@ -39,6 +39,22 @@ class ResponseSink {
     // The final body chunk; ends the response.
     [[nodiscard]] virtual asio::awaitable<error_code> send_last(std::string data) = 0;
 
+    // Sends a trailing field section and ends the response (RFC 9110 §6.5).
+    // This replaces the final send_last() rather than following it: the trailer
+    // fields are what carries the end-of-stream marker on every version (the
+    // terminating chunk on HTTP/1.x, a trailing HEADERS frame with END_STREAM on
+    // HTTP/2 and HTTP/3). Only meaningful for a streamed response (send_headers
+    // has run); a one-shot send() never carries trailers.
+    //
+    // HTTP/1.x needs chunked framing for this; a close-delimited response (an
+    // HTTP/1.0 client) or a response to HEAD has nowhere to put a trailer
+    // section, so the fields are dropped there. Implementers that carry no
+    // trailers at all may keep the default, which ignores them.
+    [[nodiscard]] virtual asio::awaitable<error_code> send_trailers(Headers trailers) {
+        (void)trailers;
+        co_return error_code{};
+    }
+
     // Status + headers for a response with no body and no body framing at all:
     // 204/304 and every response to HEAD. Nothing follows the header block, so
     // the client sees the response end where the headers end (RFC 9110 §6.3).

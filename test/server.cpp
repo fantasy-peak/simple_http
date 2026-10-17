@@ -208,6 +208,25 @@ template <typename ServerT> void register_routes(ServerT &server) {
                      co_await res->finish();
                  });
 
+    // A streamed response that ends with a trailer section (RFC 9110 §6.5): the
+    // body arrives first, and the fields after it are the ones only known once
+    // the body is done (gRPC's grpc-status is the canonical user). `?oneshot=1`
+    // exercises the same fields through the one-shot send() path, which has to
+    // switch to streamed framing to have somewhere to put them.
+    server.route(any_methods, "/trailers",
+                 [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+                     if (req->query().find("oneshot=1") != std::string::npos) {
+                         res->trailer("x-checksum", "abc123");
+                         co_await res->status(200).content_type("text/plain").send("oneshot body");
+                         co_return;
+                     }
+                     co_await res->status(200).content_type("text/plain").begin();
+                     co_await res->write("first ");
+                     co_await res->write("second");
+                     res->trailer("x-checksum", "abc123").trailer("x-trailer-count", "2");
+                     co_await res->finish();
+                 });
+
     // Reads the entire request body and replies with its length — exercises
     // large body upload + flow control.
     server.route(any_methods, "/drain",

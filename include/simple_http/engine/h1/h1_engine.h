@@ -162,6 +162,9 @@ template <TransportLike Transport> class Http1ResponseSink : public ResponseSink
             m_keep_alive_out = false;
         } else {
             headers.add_lower("transfer-encoding", "chunked");
+            // Remembered so send_trailers() knows there is a chunked framing to
+            // hang a trailer section on; a close-delimited response has none.
+            m_chunked = true;
         }
         std::string out;
         out.reserve(kResponseOverhead + headers_bytes_with_alt_svc(headers));
@@ -201,6 +204,38 @@ template <TransportLike Transport> class Http1ResponseSink : public ResponseSink
         } else {
             ec = co_await write_chunked(data, /*last=*/true);
         }
+        if (ec)
+            m_open = false;
+        co_return ec;
+    }
+
+    // Ends a chunked response with a trailer section: the terminating chunk is
+    // "0\r\n<fields>\r\n" instead of the trailer-less "0\r\n\r\n". A response to
+    // HEAD, or one that is close-delimited (HTTP/1.0, and any response whose
+    // framing never became chunked), has nowhere to carry trailers, so they are
+    // dropped there - the connection close already delimits those bodies.
+    asio::awaitable<error_code> send_trailers(Headers trailers) override {
+        if (m_head_request)
+            co_return error_code{}; // HEAD: headers only, no body and no trailers
+        co_await hop();
+        if (!m_open)
+            co_return make_error_code(asio::error::not_connected);
+        if (!m_chunked) {
+            co_return error_code{}; // close-delimited: nothing to terminate
+        }
+        std::string out;
+        out.reserve(3 + headers_bytes(trailers) + 2);
+        out.append("0\r\n");
+        for (const auto &[name, value] : trailers) {
+            if (is_forbidden_trailer_field(name))
+                continue;
+            out.append(name);
+            out.append(": ");
+            out.append(value);
+            out.append("\r\n");
+        }
+        out.append("\r\n");
+        auto ec = co_await write_raw(out);
         if (ec)
             m_open = false;
         co_return ec;
@@ -350,6 +385,7 @@ template <TransportLike Transport> class Http1ResponseSink : public ResponseSink
     bool m_open{true};
     bool m_keep_alive_out{true};
     bool m_head_request{false}; // response to HEAD: no body (RFC 9110 §9.3.2)
+    bool m_chunked{false};      // send_headers chose chunked framing (trailers possible)
     SharedDeadline m_deadline;  // shared with the engine (read path + watchdog)
     std::chrono::steady_clock::duration m_idle_timeout{};
     std::string m_alt_svc; // rendered Alt-Svc value; empty for none

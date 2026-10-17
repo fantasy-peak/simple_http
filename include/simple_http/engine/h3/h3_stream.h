@@ -31,6 +31,8 @@
 #include <deque>
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "../../core/types.h"
 #include "../../proto/request.h"
@@ -104,6 +106,16 @@ struct H3Stream {
     // resumed when it is, or the stream never sends again.
     bool data_blocked{false};
     Signal out_space;
+
+    // Response trailer section (RFC 9110 §6.5). Owned here so the nghttp3_nv
+    // pointers handed to nghttp3_conn_submit_trailers stay valid until that call
+    // runs; `pending` is set by the sink and consumed by the data reader, which
+    // suppresses END_STREAM on the final DATA so the trailer HEADERS can carry
+    // it instead.
+    std::vector<std::pair<std::string, std::string>> trailer_fields;
+    bool trailers_pending{false};
+    bool trailers_submitted{false};
+    bool trailer_signaled{false}; // the data reader suppressed END_STREAM for the trailer section
 
     // --- response -----------------------------------------------------------
     bool response_started{false};

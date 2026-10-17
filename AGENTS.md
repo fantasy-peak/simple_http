@@ -59,8 +59,8 @@ include/
       params.h             path_params<T> / query_params<T> / parse_params<T>（axum 提取器，glaze 反射）
       json.h               read_json_body<T> / write_json(res, T, status)（glaze 反射，默认可用）
       request.h            Request（两端共用；set_body 保留 m_body_source 供重放）
-      response.h           Response（fluent；redirect / SSE 封装）
-      response_writer.h    ResponseWriter（版本收敛的纯虚接口）
+      response.h           Response（fluent；redirect / SSE / trailer 封装）
+      response_writer.h    ResponseWriter（版本收敛的纯虚接口；含 send_trailers）
       compressing_writer.h 响应体压缩装饰（宏门控）
       ws_frame.h           WebSocket 帧编解码 + 握手 key（手写）
       websocket.h          WebSocket 句柄 + WsBackendImpl（读泵 + 写泵）
@@ -260,7 +260,9 @@ co_await res->status(200).begin();  co_await res->write(chunk);  co_await res->f
 `Request` 常用：`method() / path() / query() / query_params() / cookie(name) / version()
 / header(name) / body().read() / read_all()`。`Response` 常用：`status/header/content_type`、
 `send`、`begin/write/finish`、`redirect`、`set_cookie`（Go `http.SetCookie` 命名参数）、
-`replace_header`（同名替换）、SSE 三件套 `sse_begin/sse_event/sse_comment`。
+`replace_header`（同名替换）、SSE 三件套 `sse_begin/sse_event/sse_comment`、尾部字段
+`trailer(name,value)` + `finish_trailers(...)`（RFC 9110 §6.5：h1 走 chunked 终止符、
+h2 走带 END_STREAM 的尾部 HEADERS、h3 走 nghttp3 trailer；HEAD/HTTP/1.0 关闭分隔无位置承载则丢弃）。
 
 表单与查询：`read_urlencoded_body(req)`、`read_multipart_body(req)`、`read_json_body<T>` /
 `write_json`。客户端上行 multipart 用 `proto/multipart.h` 的 `MultipartForm`
@@ -420,8 +422,9 @@ auto ws = co_await client.open_websocket("wss://host/chat", {.origin = "https://
 
 完整用法与边界用例参考 `test/client.cpp`（自检，`xmake run client`，161 checks，含
 `suite_websocket`/`suite_multipart`/`suite_retry`/`suite_reverse_proxy`）。**双向 Python
-交叉验证**：`test/python/run.py` 用第三方客户端驱动 C++ 服务端（httpx/h2/websockets，
-54 checks）；`test/python/run_client_cross.py` 用独立服务端驱动 C++ 客户端。
+交叉验证**：`test/python/run.py` 用第三方客户端驱动 C++ 服务端（httpx/h2/websockets/aioquic，
+101 checks，含 h1/h2/h3 三传输的响应 trailer）；`test/python/run_client_cross.py`
+用独立服务端驱动 C++ 客户端。
 
 ### 压测工具（loadgen，用本库自己的客户端打负载）
 
@@ -489,10 +492,10 @@ xmake run server         # 运行示例服务器（明文 :7788，TLS :7789，h2
 xmake build unittest && xmake run unittest      # 纯逻辑单元测试（Catch2，秒级；257 用例）
 xmake build regression && xmake run regression  # 服务端对抗性回归（裸 socket）
 xmake build client && xmake run client          # 客户端整合自检（PASS/FAIL + 退出码；161 checks）
-xmake build server && xmake run python-tests    # 第三方客户端驱动服务端（54 checks）
+xmake build server && xmake run python-tests    # 第三方客户端驱动服务端（101 checks）
 ```
 
-- **`test/python/`**：用 **httpx / hyper-h2 / websockets** 这三个**独立实现**驱动
+- **`test/python/`**：用 **httpx / hyper-h2 / websockets / aioquic** 这几个**独立实现**驱动
   `test/server.cpp` 起的服务端。理由是 C++ 套件用的是本库自己的客户端，客户端与服务端
   **共享的规范误读会互相抵消**。依赖用虚拟环境管理（`test/python/requirements.txt`，版本
   已 pin），首跑需先建 venv。

@@ -188,6 +188,18 @@ template <typename Connection> class Http3ResponseSink : public ResponseSink {
         co_return error_code{};
     }
 
+    asio::awaitable<error_code> send_trailers(Headers trailers) override {
+        co_await hop();
+        auto eng = m_engine.lock();
+        if (!eng || !eng->alive() || !eng->stream_sendable(m_stream_id)) {
+            co_return make_error_code(asio::error::not_connected);
+        }
+        if (eng->method_is_head(m_stream_id))
+            co_return error_code{}; // HEAD: no body, so no trailer section either
+        eng->submit_trailers(m_stream_id, trailers);
+        co_return error_code{};
+    }
+
     asio::awaitable<bool> connected() const override {
         // The hop matters here more than anywhere: stream_writable() walks the
         // engine's stream table, which the connection executor is inserting into
@@ -379,6 +391,34 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         m_conn->flush();
     }
 
+    // Queue a trailer section for `stream_id` (RFC 9110 §6.5). The fields are
+    // copied so the nghttp3_nv pointers can be rebuilt when the actual submit
+    // runs; that submit is deferred because nghttp3_conn_submit_trailers implies
+    // end-of-stream, so it must not run before the last body byte has been handed
+    // over. The reader suppresses END_STREAM on the final DATA, then the deferred
+    // submit (do_submit_trailers) adds the trailing HEADERS.
+    void submit_trailers(std::int64_t stream_id, const Headers &trailers) {
+        auto it = m_streams.find(stream_id);
+        if (it == m_streams.end())
+            return;
+        Stream &stream = *it->second;
+        stream.trailer_fields.clear();
+        for (const auto &[name, value] : trailers) {
+            if (is_forbidden_trailer_field(name) || contains_ctl(name) || contains_ctl(value))
+                continue;
+            stream.trailer_fields.emplace_back(name, value);
+        }
+        stream.trailers_pending = true;
+        stream.out_eof = true;
+        // Nothing else will produce body for this stream; wake nghttp3 so its
+        // final (EOF) read happens and the deferred submit is scheduled.
+        if (h3() != nullptr) {
+            stream.data_blocked = false;
+            (void)nghttp3_conn_resume_stream(m_h3, stream_id);
+        }
+        m_conn->flush();
+    }
+
     // Wait until this stream's unacknowledged bytes fall to the low mark.
     asio::awaitable<error_code> await_out_space(std::int64_t stream_id) {
         for (;;) {
@@ -447,6 +487,16 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         quic::StreamData out;
         if (h3() == nullptr)
             return out;
+
+        // A body just ended with a trailer section pending: submit it now, before
+        // the next writev, so nghttp3 schedules the trailing HEADERS. This runs
+        // outside the data-reader callback that armed it (calling into nghttp3
+        // from within that callback is not allowed).
+        if (m_trailer_ready >= 0) {
+            const std::int64_t id = m_trailer_ready;
+            m_trailer_ready = -1;
+            do_submit_trailers(id);
+        }
 
         std::int64_t stream_id = -1;
         int fin = 0;
@@ -881,6 +931,48 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         // arrive, and ngtcp2 reports the close when it comes.
     }
 
+    // Flag the end of a response body. With a trailer section pending, the FIN is
+    // suppressed (the trailing HEADERS will carry END_STREAM, and nghttp3 sends
+    // submitted trailers regardless of NO_END_STREAM) and the deferred submit is
+    // armed. Runs inside the data-reader callback, so it only records state and
+    // pokes the connection; the nghttp3 call itself happens in the write pass.
+    void signal_body_eof(Stream &stream, std::int64_t stream_id, std::uint32_t *flags) noexcept {
+        *flags |= NGHTTP3_DATA_FLAG_EOF;
+        if (stream.trailers_pending && !stream.trailers_submitted) {
+            *flags |= NGHTTP3_DATA_FLAG_NO_END_STREAM;
+            if (!stream.trailer_signaled) {
+                stream.trailer_signaled = true;
+                m_trailer_ready = stream_id;
+                m_conn->flush();
+            }
+        }
+    }
+
+    // Submit a queued trailer section now that the body has been fully handed
+    // over. Must run outside the data-reader callback (it is the callback that
+    // armed it).
+    void do_submit_trailers(std::int64_t stream_id) {
+        auto it = m_streams.find(stream_id);
+        if (it == m_streams.end() || h3() == nullptr)
+            return;
+        Stream &stream = *it->second;
+        if (stream.trailers_submitted)
+            return;
+        m_nva.clear();
+        for (const auto &[name, value] : stream.trailer_fields) {
+            m_nva.push_back(make_nv(name, value));
+        }
+        const int rv = nghttp3_conn_submit_trailers(m_h3, stream_id, m_nva.data(), m_nva.size());
+        if (rv != 0) {
+            SIMPLE_HTTP_ERROR_LOG("h3: submit_trailers failed (stream={}): {}", stream_id, nghttp3_strerror(rv));
+            reset_stream(stream_id, kH3InternalError);
+            return;
+        }
+        stream.trailers_submitted = true;
+        stream.end_stream_sent = true;
+        m_conn->flush();
+    }
+
     nghttp3_ssize read_response_data(std::int64_t stream_id, nghttp3_vec *vec, std::size_t veccnt,
                                      std::uint32_t *flags) noexcept override {
         auto it = m_streams.find(stream_id);
@@ -917,7 +1009,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
 
         if (filled == 0) {
             if (stream.out_eof) {
-                *flags |= NGHTTP3_DATA_FLAG_EOF;
+                signal_body_eof(stream, stream_id, flags);
                 return 0;
             }
             // More body is coming but none of it is here yet. There is no flag
@@ -929,7 +1021,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         }
         // The whole body has now been handed over (this call's slice included).
         if (stream.out_eof && stream.out_write + total >= stream.out_end()) {
-            *flags |= NGHTTP3_DATA_FLAG_EOF;
+            signal_body_eof(stream, stream_id, flags);
         }
         // The bytes handed to nghttp3 (this call's slice included) have left our
         // queue's readable front; the skip logic above relies on this
@@ -1129,6 +1221,12 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
     // callback cannot return one.
     std::int64_t m_invalid_stream{-1};
     std::int64_t m_oversize_stream{-1};
+    // A stream whose body just ended with a trailer section pending. The
+    // deferred nghttp3_conn_submit_trailers runs at the top of the next write
+    // pass, outside the data-reader callback that flagged it. At most one stream
+    // is flagged per pass (nghttp3's writev visits one stream), so a single slot
+    // is enough.
+    std::int64_t m_trailer_ready{-1};
     bool m_alive{true};
 };
 

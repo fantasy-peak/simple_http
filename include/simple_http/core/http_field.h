@@ -76,4 +76,17 @@ inline constexpr std::string_view x_xss_protection = "x-xss-protection";
 
 } // namespace field
 
+// Whether a field must be kept out of a trailer section (RFC 9110 §6.5.1): a
+// pseudo-header, a field needed for framing (Content-Length, Transfer-Encoding)
+// or routing (Host), or one of the hop-by-hop fields (RFC 9110 §7.6.1). Every
+// engine's send_trailers() filters through this so the same field is refused on
+// every version.
+[[nodiscard]] inline bool is_forbidden_trailer_field(std::string_view name) {
+    if (name.empty() || name.front() == ':')
+        return true;
+    return name == field::content_length || name == field::host || name == field::connection ||
+           name == field::transfer_encoding || name == "keep-alive" || name == field::upgrade ||
+           name == "proxy-connection" || name == "te" || name == "trailer";
+}
+
 } // namespace simple_http

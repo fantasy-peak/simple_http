@@ -201,6 +201,18 @@ template <TransportLike Transport> class Http2ResponseSink : public ResponseSink
         co_return error_code{};
     }
 
+    asio::awaitable<error_code> send_trailers(Headers trailers) override {
+        co_await hop();
+        auto eng = m_engine.lock();
+        if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
+            co_return make_error_code(asio::error::not_connected);
+        }
+        if (eng->method_is_head(m_stream_id))
+            co_return error_code{}; // HEAD: no body, so no trailer section either
+        eng->submit_trailers(m_stream_id, trailers);
+        co_return error_code{};
+    }
+
     asio::awaitable<bool> connected() const override {
         // The hop matters here more than anywhere: stream_writable() walks the
         // engine's stream table, which the connection executor is inserting into
@@ -358,32 +370,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         if (const std::string alt_svc = m_limits.alt_svc_value(); !alt_svc.empty()) {
             codec::hpack_append_literal(block, "alt-svc", alt_svc);
         }
-        // A header block larger than the peer's advertised frame size must be split
-        // over HEADERS + CONTINUATION frames (RFC 9113 §6.2/§6.10): a compliant
-        // peer answers a larger frame with FRAME_SIZE_ERROR and closes the
-        // connection.
-        // Only the peer's SETTINGS_MAX_FRAME_SIZE bounds what we may send;
-        // m_limits.h2_max_frame_size is the limit we advertise for what *we*
-        // accept, so folding it in here split our HEADERS into more CONTINUATION
-        // frames than the peer asked for.
-        const std::size_t limit = std::max<std::size_t>(1, m_peer_max_frame_size);
-        std::size_t off = 0;
-        bool first = true;
-        do {
-            const std::size_t take = std::min(limit, block.size() - off);
-            const bool last = (off + take == block.size());
-            std::uint8_t flags = last ? codec::H2_FLAG_END_HEADERS : 0;
-            if (first) {
-                if (end_stream)
-                    flags |= codec::H2_FLAG_END_STREAM;
-                append_frame(codec::H2FrameType::Headers, flags, stream_id, std::string_view{block}.substr(off, take));
-            } else {
-                append_frame(codec::H2FrameType::Continuation, flags, stream_id,
-                             std::string_view{block}.substr(off, take));
-            }
-            first = false;
-            off += take;
-        } while (off < block.size());
+        append_field_block(stream_id, block, end_stream);
 
         if (end_stream) {
             // The HEADERS block itself ends the stream (a response to HEAD, or a
@@ -399,6 +386,52 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                 maybe_complete_stream(stream_id);
             }
         }
+    }
+
+    // Serialize an already-compressed field block as one HEADERS frame (plus
+    // CONTINUATION frames when it exceeds the peer's advertised
+    // SETTINGS_MAX_FRAME_SIZE, RFC 9113 §6.2/§6.10), setting END_STREAM on the
+    // first frame when `end_stream`. Only the peer's value bounds what we send;
+    // m_limits.h2_max_frame_size is what *we* accept.
+    void append_field_block(std::uint32_t stream_id, std::string_view block, bool end_stream) {
+        const std::size_t limit = std::max<std::size_t>(1, m_peer_max_frame_size);
+        std::size_t off = 0;
+        bool first = true;
+        do {
+            const std::size_t take = std::min(limit, block.size() - off);
+            const bool last = (off + take == block.size());
+            std::uint8_t flags = last ? codec::H2_FLAG_END_HEADERS : 0;
+            if (first) {
+                if (end_stream)
+                    flags |= codec::H2_FLAG_END_STREAM;
+                append_frame(codec::H2FrameType::Headers, flags, stream_id, block.substr(off, take));
+            } else {
+                append_frame(codec::H2FrameType::Continuation, flags, stream_id, block.substr(off, take));
+            }
+            first = false;
+            off += take;
+        } while (off < block.size());
+    }
+
+    // Queue a trailer section for `stream_id`: stored compressed and emitted as a
+    // trailing HEADERS frame with END_STREAM once the body queue drains (RFC 9113
+    // §8.1). Marks the response body finished, since a trailer section ends it.
+    void submit_trailers(std::uint32_t stream_id, const Headers &trailers) {
+        if (!stream_writable(stream_id))
+            return;
+        std::string block;
+        for (const auto &[name, value] : trailers) {
+            if (is_forbidden_trailer_field(name))
+                continue;
+            codec::hpack_append_literal(block, name, value);
+        }
+        auto it = m_streams.find(stream_id);
+        if (it == m_streams.end())
+            return;
+        it->second.out_trailers = std::move(block);
+        it->second.out_trailers_set = true;
+        it->second.out_finished = true;
+        flush();
     }
 
     // Enqueue a response body chunk for `stream_id`. `last` marks end-of-body so
@@ -521,6 +554,11 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         std::deque<std::string> out_queue;
         std::size_t out_offset = 0;
         bool out_finished = false; // handler signalled end-of-body (send/send_last)
+        // Compressed trailer field block, emitted as a trailing HEADERS frame
+        // with END_STREAM once the body queue drains (RFC 9113 §8.1). When set,
+        // the final DATA frame does NOT carry END_STREAM - the trailer block does.
+        std::string out_trailers;
+        bool out_trailers_set = false;
 
         // Bytes queued but not yet framed into DATA frames. Drives the producer
         // backpressure in await_out_space() (kOutHighWatermark/kOutLowWatermark).
@@ -1818,10 +1856,16 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
             // Emit DATA while the connection and stream windows both allow it.
             for (;;) {
                 if (st.out_queue.empty()) {
-                    // No queued bytes. If the body is done, emit the terminating
-                    // empty DATA frame with END_STREAM, once.
+                    // No queued bytes. If the body is done, end the stream once:
+                    // with a trailing HEADERS frame carrying the trailer section
+                    // when one was submitted, otherwise the terminating empty
+                    // DATA frame with END_STREAM.
                     if (st.out_finished) {
-                        append_frame(codec::H2FrameType::Data, codec::H2_FLAG_END_STREAM, stream_id, {});
+                        if (st.out_trailers_set) {
+                            append_field_block(stream_id, st.out_trailers, /*end_stream=*/true);
+                        } else {
+                            append_frame(codec::H2FrameType::Data, codec::H2_FLAG_END_STREAM, stream_id, {});
+                        }
                         st.end_stream_sent = true;
                         finished.push_back(stream_id);
                     }
@@ -1856,7 +1900,9 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                 std::string_view piece{front.data() + st.out_offset, take};
                 st.out_offset += take;
                 bool front_done = (st.out_offset >= front.size());
-                bool last = front_done && st.out_queue.size() == 1 && st.out_finished;
+                // A pending trailer section carries END_STREAM itself, so the
+                // final DATA frame must not (the trailer HEADERS follows it).
+                bool last = front_done && st.out_queue.size() == 1 && st.out_finished && !st.out_trailers_set;
 
                 std::uint8_t flags = last ? codec::H2_FLAG_END_STREAM : 0;
                 append_frame(codec::H2FrameType::Data, flags, stream_id, piece);

@@ -7,6 +7,7 @@
 #
 # Pinned so a CI run six months from now tests the server rather than a new
 # release of the client.
+aioquic==1.5.0
 h2==4.4.1
 httpx[http2]==0.28.1
 websockets==17.1
