@@ -9,6 +9,7 @@
 //   xmake build regression && xmake run regression
 
 #include <array>
+#include <atomic>
 #include <boost/asio.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
@@ -1796,5 +1797,37 @@ TEST_CASE("regression/server: max_connections waits for a slot instead of reject
     REQUIRE(second.wait_for("hello"));
 
     second.close();
+    server.stop();
+}
+
+// The listener-side counterpart of socket_setup: a hook that runs on every TCP
+// acceptor after bind() and before listen(), so options that only exist on a
+// listener (TCP_FASTOPEN, the listen queue's buffer sizes) can be set. It has to
+// run once per acceptor — including each SO_REUSEPORT fan-out socket — and before
+// any accept loop starts.
+TEST_CASE("regression/server: listener_setup runs on each acceptor before accept", "[regression][server]") {
+    constexpr std::uint16_t port = 27935;
+    sh::ServerConfig cfg;
+    cfg.listen = sh::InetAddress{"127.0.0.1", port, false};
+    cfg.worker_threads = 2;
+    cfg.reuse_port = true; // fan the listener out, so the hook has to run per socket
+
+    std::atomic<int> calls{0};
+    std::atomic<bool> bound_and_settable{false};
+    cfg.listener_setup = [&](asio::ip::tcp::acceptor &acceptor) {
+        ++calls;
+        // Bound but not yet listening, and still settable — which is the window
+        // the hook exists for.
+        boost::system::error_code ec;
+        const bool open = acceptor.is_open();
+        acceptor.set_option(asio::ip::tcp::acceptor::reuse_address(true), ec);
+        bound_and_settable = open && !ec;
+    };
+
+    sh::Server server{cfg};
+    REQUIRE(server.start());
+    CHECK(calls.load() == static_cast<int>(server.acceptor_count()));
+    CHECK(calls.load() >= 1);
+    CHECK(bound_and_settable.load());
     server.stop();
 }

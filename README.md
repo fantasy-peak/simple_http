@@ -112,6 +112,23 @@ cfg.listen = UnixAddress{"/run/myapp.sock"};
 `Listen` is a `std::variant` of the two, so naming both a port and a path is not
 a rule to remember — it does not compile.
 
+Two optional hooks tune the sockets, split by which side of `accept()` they own:
+`cfg.socket_setup(socket)` runs on every accepted connection (TCP_NODELAY,
+keepalive, per-connection buffers), and `cfg.listener_setup(acceptor)` runs on
+every TCP listening socket after `bind()` and before `listen()` — where options
+that only exist on a listener belong, `TCP_FASTOPEN` being the usual one:
+
+```cpp
+#include <netinet/tcp.h>
+cfg.listener_setup = [](asio::ip::tcp::acceptor &acceptor) {
+    boost::system::error_code ec;
+    acceptor.set_option(asio::detail::socket_option::integer<IPPROTO_TCP, TCP_FASTOPEN>{1024}, ec);
+};
+```
+
+Both run for every `SO_REUSEPORT` fan-out socket as well as the single-acceptor
+case.
+
 Handlers take arguments by shape, picked at compile time:
 
 ```cpp

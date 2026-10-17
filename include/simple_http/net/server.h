@@ -129,6 +129,18 @@ struct ServerConfig {
     // touches the socket. Use the error_code overloads of set_option to avoid
     // throwing.
     std::function<void(asio::ip::tcp::socket &)> socket_setup;
+    // Optional per-listening-socket hook — the acceptor-side counterpart of
+    // socket_setup, for the options that only exist on a listener. TCP_FASTOPEN
+    // is the motivating one (set the queue length here, e.g.
+    // `listener.set_option(asio::detail::socket_option::integer<IPPROTO_TCP,
+    // TCP_FASTOPEN>{1024})`, and the accepted sockets' early data arrives through
+    // the normal read path); SO_RCVBUF/SO_SNDBUF on the listen queue also belong
+    // here. Invoked once per TCP acceptor after bind() and before listen(), which
+    // is where nginx sets TCP_FASTOPEN, and before any accept loop starts — so it
+    // also runs for every SO_REUSEPORT fan-out socket. Not called for a
+    // UNIX-domain listener, which has no TCP options. Exceptions propagate out of
+    // Server::start(); use the error_code overloads of set_option to avoid them.
+    std::function<void(asio::ip::tcp::acceptor &)> listener_setup;
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
     // The QUIC listener, for HTTP/3. Independent of `listen`: both may be set,
     // which is the usual deployment — one port number, two transports, and the
@@ -566,6 +578,12 @@ class Server {
         acceptor->bind(ep, ec);
         if (ec)
             return nullptr;
+        // Listener-only options (TCP_FASTOPEN, listen-queue buffer sizes) are set
+        // here, after the bind that makes this a listener and before listen()
+        // turns accepts on — nginx's own order for TCP_FASTOPEN. Runs for every
+        // SO_REUSEPORT fan-out socket too, since they all come through here.
+        if (m_config.listener_setup)
+            m_config.listener_setup(*acceptor);
         acceptor->listen(asio::socket_base::max_listen_connections, ec);
         if (ec)
             return nullptr;

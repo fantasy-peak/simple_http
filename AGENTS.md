@@ -217,6 +217,8 @@ cfg.worker_threads = 4;
 // cfg.limits = EngineLimits{...};                     // 可选引擎调参
 // cfg.max_connections = 0;                            // 0=不限；到上限由内核 backlog 排队（Go netutil.LimitListener 形态）
 // cfg.reuse_port = true; cfg.tcp_nodelay = true; cfg.plaintext_protocols = ...;
+// cfg.socket_setup   = [](asio::ip::tcp::socket &s){...};      // 每 accept 出的连接
+// cfg.listener_setup = [](asio::ip::tcp::acceptor &a){...};    // 每个监听 socket（bind 后 listen 前，TCP_FASTOPEN 等）
 // #ifdef SIMPLE_HTTP_ENABLE_HTTP3: cfg.quic = QuicAddress{"0.0.0.0", 7792, false};
 
 Server server{cfg};
