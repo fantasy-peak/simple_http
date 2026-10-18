@@ -12,11 +12,10 @@
 //
 // CORS is its own policy (router.cors / make_cors_middleware). Compression is a
 // middleware here (middleware::compress): mounting it enables the compressing
-// writer for that scope, so there is no separate server-level switch. There is
-// deliberately no request-timeout middleware — EngineLimits carries only the
-// connection idle timeout and the header/body size caps; a per-handler deadline
-// is application policy, because enforcing it means cancelling a mid-flight
-// coroutine chain.
+// writer for that scope, so there is no separate server-level switch. A
+// per-request deadline is middleware::timeout: it fences the chain with a timer
+// and, on expiry, cancels the request (see Request::wait_cancelled) so a
+// cooperative handler unwinds instead of running on after the client is gone.
 
 #include <chrono>
 #include <cstdint>
@@ -26,7 +25,9 @@
 #include <utility>
 #include <vector>
 
+#include <boost/asio/experimental/awaitable_operators.hpp>
 #include <boost/asio/ip/address.hpp> // real_ip's CIDR matching (ip_covered)
+#include <boost/asio/steady_timer.hpp>
 
 #include <array>
 
@@ -479,6 +480,73 @@ inline Middleware ws_origin(std::vector<std::string> allowed_origins, bool allow
             co_return;
         }
         co_await next(std::move(req), std::move(res), ssl);
+    };
+}
+
+// Per-request deadline: fences the rest of the chain with a timer (the tower
+// `Timeout` shape). On expiry:
+//   * the chain is cancelled — asio's `operator||` cancels the loser, so a
+//     handler parked on a timer, a socket or wait_cancelled() unwinds at once;
+//   * the request's cancellation token fires, so any coroutine the handler
+//     spawned and left running (which `operator||` does not own) observes it and
+//     can clean up;
+//   * the reply is finished — a 504 if the head had not gone out yet, otherwise
+//     the response is aborted with close(), because a truncated body must never
+//     look complete.
+//
+//   server.use(simple_http::middleware::timeout(std::chrono::seconds(5)));
+//
+// Because the chain is cancelled rather than merely signalled, a handler cannot
+// catch its own deadline and reply — producing the timeout reply is this
+// middleware's job. The token is for work that outlives the handler body. For a
+// cancellation a handler *can* observe and react to, see the engine-driven
+// signals (peer stream reset / connection close): those fire Request::cancel
+// without cancelling the handler, so `co_await req->wait_cancelled()` there is
+// the cooperative pattern.
+//
+// Cancellation reaches the handler's pending await, which is as far as any
+// framework can go: a handler spinning in CPU or blocked in a non-asio call is
+// not interrupted. WebSocket handshakes pass through untouched — a deadline on
+// a long-lived tunnel is a footgun, and this middleware is commonly mounted
+// globally.
+inline Middleware timeout(std::chrono::milliseconds deadline) {
+    return [deadline](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
+        // WebSocket (h1 Upgrade, or the h2 RFC 8441 extended CONNECT): out of
+        // scope — a tunnel has no "one request" deadline.
+        const auto upgrade = req->header(field::upgrade);
+        const bool ws = (upgrade && middleware_detail::contains_ci(*upgrade, "websocket") &&
+                         req->header("sec-websocket-key").has_value()) ||
+                        req->method() == Method::Connect;
+        if (ws) {
+            co_await next(std::move(req), std::move(res), ssl);
+            co_return;
+        }
+
+        using namespace asio::experimental::awaitable_operators;
+        asio::steady_timer timer{co_await asio::this_coro::executor};
+        timer.expires_after(deadline);
+        // The deadline branch fires the request token *before* it completes, so
+        // the token is already set when `operator||` then cancels the chain.
+        // invoke_handler reads that flag to tell a cancellation apart from a
+        // handler failure — without this ordering the handler's aborted await is
+        // caught as a throw (a spurious error log, and a 500 racing the 504).
+        // `operator||` runs both operands on this coroutine's executor and
+        // cancels the loser; Request::wait_cancelled binds to that same executor,
+        // so timer and token always line up. `res` is kept for the after-phase —
+        // next() receives its own copy of the shared_ptr.
+        auto on_deadline = [&timer, req]() -> asio::awaitable<void> {
+            co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+            req->cancel(); // signal first; the chain is cancelled next
+        };
+        auto outcome = co_await (next(req, res, ssl) || on_deadline());
+        if (outcome.index() == 0) {
+            co_return; // the chain finished first
+        }
+        if (!res->started()) {
+            (void)co_await res->status(status::gateway_timeout).content_type("text/plain").send("Gateway Timeout");
+        } else {
+            co_await res->close(); // mid-response: abort, never truncate silently
+        }
     };
 }
 

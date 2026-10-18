@@ -10,8 +10,10 @@
 
 #include <any>
 #include <boost/asio.hpp>
+#include <boost/asio/experimental/channel.hpp>
 #include <memory>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -42,7 +44,7 @@ class Request {
           m_target(std::move(other.m_target)), m_headers(std::move(other.m_headers)),
           m_params(std::move(other.m_params)), m_query_params(std::move(other.m_query_params)), m_close(other.m_close),
           m_stream_body(other.m_stream_body), m_content_length(other.m_content_length), m_url(std::move(other.m_url)),
-          m_body_source(std::move(other.m_body_source)) {
+          m_body_source(std::move(other.m_body_source)), m_stop(std::move(other.m_stop)) {
         rebind_views();
     }
     Request &operator=(Request &&other) noexcept {
@@ -62,6 +64,7 @@ class Request {
         m_content_length = other.m_content_length;
         m_url = std::move(other.m_url);
         m_body_source = std::move(other.m_body_source);
+        m_stop = std::move(other.m_stop);
         rebind_views();
         return *this;
     }
@@ -277,6 +280,74 @@ class Request {
         return *get_state<LogFields>();
     }
 
+    // --- cancellation (request-scoped) ---
+    //
+    // A one-shot signal that the request is no longer wanted: the peer went away
+    // (HTTP/2/3 stream reset or connection close), a per-request deadline
+    // elapsed (middleware::timeout), or the server is shutting the request down.
+    // It is the Go `r.Context()` / axum `CancellationToken` shape, and like both
+    // it is *cooperative*: a handler that never observes it is not stopped by it.
+    //
+    //   * flag side  — cancel()/cancelled()/cancel_token(): thread-safe, usable
+    //     from any thread or executor (an engine fires it from the connection
+    //     executor).
+    //   * wait side  — wait_cancelled(): resumes on the executor of the coroutine
+    //     that awaits it. It binds its internal wake-up to *that* executor, never
+    //     to the connection's, so it composes correctly inside
+    //     `co_await (work() || req->wait_cancelled())` — asio's `operator||`
+    //     spawns both operands on the awaiting coroutine's executor, so the timer
+    //     and this wait end up on one executor by construction. The cancel side
+    //     only ever `post`s to that executor, so a cross-thread cancel cannot
+    //     resume a coroutine on the wrong thread.
+    //
+    // Typical use, fencing a slow wait against the peer leaving:
+    //
+    //   using namespace asio::experimental::awaitable_operators;
+    //   asio::steady_timer t{co_await asio::this_coro::executor};
+    //   t.expires_after(std::chrono::seconds(30));
+    //   co_await (t.async_wait(asio::use_awaitable) || req->wait_cancelled());
+    //   if (req->cancelled()) co_return;  // peer gone: stop, do not reply
+
+    // Fires the cancellation signal. Idempotent; safe from any thread.
+    void cancel() { m_stop.request_stop(); }
+
+    // Whether cancellation has been signalled. A cheap atomic read; poll it in a
+    // loop-shaped handler instead of awaiting when that reads better.
+    [[nodiscard]] bool cancelled() const noexcept { return m_stop.stop_requested(); }
+
+    // The underlying token, for registering a std::stop_callback directly.
+    [[nodiscard]] std::stop_token cancel_token() const noexcept { return m_stop.get_token(); }
+
+    // Suspends until the request is cancelled; returns immediately if it already
+    // was. Resumes on the awaiting coroutine's executor.
+    asio::awaitable<void> wait_cancelled() {
+        if (m_stop.stop_requested()) {
+            co_return; // fast path: no executor, no allocation
+        }
+        auto exec = co_await asio::this_coro::executor;
+        // Lock-free `channel` (not `concurrent_channel`): every access happens on
+        // `exec` — creation here, the receive below, and the try_send that the
+        // stop_callback posts onto `exec` — so one thread drives it and the
+        // thread-safe variant would only add a lock nothing here needs.
+        using Notify = asio::experimental::channel<void(error_code)>;
+        auto wake = std::make_shared<Notify>(exec, 1);
+        // The callback runs on whatever thread calls cancel(). It must not touch
+        // asio state inline — that would resume this coroutine on the cancelling
+        // thread. It only posts onto the waiter's executor. If the request was
+        // already cancelled before this registration, the standard guarantees the
+        // callback fires immediately from this constructor, so there is no
+        // check-then-register race.
+        std::stop_callback cb{m_stop.get_token(), [wake, exec]() mutable {
+                                  asio::post(exec, [wake] { (void)wake->try_send(error_code{}); });
+                              }};
+        // Parked on `exec`; a cancel event, or `operator||` cancelling this
+        // branch, both complete it. `cb` is a local: the coroutine frame's
+        // destruction deregisters it. Even if a post is already queued when the
+        // frame dies, the lambda holds `wake` by shared_ptr, so nothing dangles.
+        auto [ec] = co_await wake->async_receive(asio::as_tuple(asio::use_awaitable));
+        (void)ec;
+    }
+
     // --- population API (engine side) ---
     // Router side: records one captured template segment. The value must be a
     // view into the request path (it is, for dispatch's own captures).
@@ -322,6 +393,10 @@ class Request {
     // Per-request state set by middleware (see set_state/get_state). Stored
     // type-erased; lookups scan from the back so the most recent set wins.
     std::vector<std::any> m_state;
+
+    // Request-scoped cancellation (see cancel()/wait_cancelled() above). One-shot
+    // and thread-safe; costs nothing until first observed.
+    std::stop_source m_stop;
 
     // Views into m_target (stable after set_target/assign_head).
     std::string_view m_path;

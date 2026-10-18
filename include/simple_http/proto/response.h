@@ -44,6 +44,13 @@ class ResponseWriter {
     // reads it in its after-phase (after `co_await next(...)` resumed) to see
     // what the handler or the router's built-in replies ended on.
     int status() const { return m_status; }
+    // Whether the response head has already gone out (send()/begin()/
+    // send_bodyless() was called). A middleware uses this to decide whether it
+    // can still substitute its own reply — before it starts it can, after it
+    // starts the only honest action is close(). It is the same ResponseWriter
+    // object all the way down the chain, so the flag the handler sets is what a
+    // middleware observes.
+    bool started() const { return m_started; }
     ResponseWriter &header(std::string_view name, std::string value) {
         // A field name or value carrying CR/LF/NUL would splice arbitrary bytes
         // into the head — response splitting, and this library's own reverse proxy
@@ -123,6 +130,7 @@ class ResponseWriter {
             co_return make_error_code(asio::error::invalid_argument);
         }
         apply_defaults();
+        m_started = true;
         // A response carrying trailers cannot be one-shot: the fields follow the
         // body, so it is framed as a stream (chunked on HTTP/1.x) and closed by
         // the trailer section. `send()` on a trailer-less response keeps the
@@ -140,6 +148,7 @@ class ResponseWriter {
             co_return make_error_code(asio::error::invalid_argument);
         }
         apply_defaults();
+        m_started = true;
         co_return co_await m_writer->send_bodyless(m_status, std::move(m_headers));
     }
 
@@ -149,6 +158,7 @@ class ResponseWriter {
             co_return make_error_code(asio::error::invalid_argument);
         }
         apply_defaults();
+        m_started = true;
         co_return co_await m_writer->send_headers(m_status, std::move(m_headers));
     }
     [[nodiscard]] asio::awaitable<error_code> write(std::string data) { return m_writer->send_chunk(std::move(data)); }
@@ -315,6 +325,8 @@ class ResponseWriter {
     // Emitting the rest would put a head on the wire that the handler did not
     // intend — and the whole point of rejecting at header() was to not do that.
     bool m_field_rejected{false};
+    // Set once the head has gone out (see started()).
+    bool m_started{false};
 };
 
 } // namespace simple_http

@@ -10,6 +10,7 @@
 #include <openssl/x509.h>
 
 #include <atomic>
+#include <boost/asio/experimental/awaitable_operators.hpp>
 #include <charconv>
 #include <csignal>
 #include <format>
@@ -248,6 +249,41 @@ template <typename ServerT> void register_routes(ServerT &server) {
                      timer.expires_after(std::chrono::milliseconds(ms));
                      co_await timer.async_wait(asio::use_awaitable);
                      co_await res->status(200).send(std::format("waited {} ms", ms));
+                 });
+
+    // Request cancellation, for the sanitizer/stress runs. The handler races a
+    // short timer against req->wait_cancelled(); the timer normally wins and
+    // operator|| cancels the token branch — so every request tears down a parked
+    // wait_cancelled() (frame destruction + std::stop_callback deregistration),
+    // which is exactly where a lifetime bug would surface under ASan.
+    server.route(any_methods, "/cancel-race",
+                 [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+                     using namespace asio::experimental::awaitable_operators;
+                     asio::steady_timer timer{co_await asio::this_coro::executor};
+                     timer.expires_after(std::chrono::milliseconds(5));
+                     co_await (timer.async_wait(asio::as_tuple(asio::use_awaitable)) || req->wait_cancelled());
+                     if (req->cancelled())
+                         co_return;
+                     co_await res->status(200).send("raced");
+                 });
+
+    // Per-route deadline under load: the handler always overruns, so every
+    // request runs the timeout path — cancel the chain, fire the request token,
+    // answer 504 — and a detached coroutine parked on wait_cancelled() must
+    // observe the token.
+    server.route(any_methods, "/timeout", {simple_http::middleware::timeout(std::chrono::milliseconds(150))},
+                 [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+                     auto exec = co_await asio::this_coro::executor;
+                     asio::co_spawn(
+                         exec,
+                         [req]() -> asio::awaitable<void> {
+                             co_await req->wait_cancelled(); // woken when the deadline fires
+                         },
+                         asio::detached);
+                     asio::steady_timer timer{exec};
+                     timer.expires_after(std::chrono::seconds(3));
+                     co_await timer.async_wait(asio::use_awaitable); // cancelled by the deadline
+                     co_await res->status(200).send("too late");
                  });
 
     // Handler that throws — the engine must not crash; the connection stays sane.

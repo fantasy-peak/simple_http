@@ -81,7 +81,7 @@ include/
     handler/               handler 类型系统 + 路由
       handler.h            Handler/Next/Middleware 类型别名、make_handler/invoke_handler/compose_middleware
       builtin_middleware.h request_id / access_log / recovery / basic_auth / real_ip / clean_path /
-                           strip_prefix / redirect_slashes
+                           strip_prefix / redirect_slashes / timeout(deadline)
       secure_headers.h     安全响应头中间件 SecureHeadersConfig
       rate_limit.h         TokenBucket / RateLimiter + rate_limit(middleware)（429 + Retry-After）
       cors.h               内建 CORS：CorsConfig 编译成 Middleware（预检 204，不进路由）
@@ -200,9 +200,21 @@ server.group("/api", {auth_mw}, [](Router &api) {
 });
 // 内置中间件：middleware::request_id() / access_log() / recovery() / basic_auth()
 //              / real_ip(trusted) / clean_path() / strip_prefix("/x") / redirect_slashes()
+//              / timeout(5s)（per-request deadline，超时 504 / 中止响应）
 //              / secure_headers(SecureHeadersConfig)（安全响应头基线，HSTS 仅 TLS）
 server.use(simple_http::middleware::request_id());
 ```
+
+**请求级取消（`proto/request.h`）**：对标 Go `r.Context()` / axum `CancellationToken`，
+是**协作式**的——不观察它的 handler 不会被它停下。`Request` 上提供
+`cancel()` / `cancelled()` / `cancel_token()`（线程安全，任意执行器）与
+`wait_cancelled()`（在**等待者自己的**执行器上恢复）。引擎在现有的拆连接路径上触发它：
+h2/h3 的流 reset 与连接关闭（`reset_stream` / peer RST / 连接 teardown）会
+`request->cancel()`，所以一个既没在读 body、也没在写响应、而是卡在 timer/上游上的 handler
+也能被唤醒。`middleware::timeout(d)` 建在同一套信号上：到期时取消链路（asio `operator||`
+取消输家）并触发 token，然后回 504（响应头已发出则 `close()` 中止）。h1 是半双工、handler
+内联运行，客户端断开只能在下次读写时被观察到，故 h1 侧不做额外触发（连接级 `idle_timeout`
+已通过 `serve_loop || watchdog` 取消 handler）。
 
 `Server` 门面（`net/server.h`）为 fluent 风格，路由方法转发给内部 `Router`：
 

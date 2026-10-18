@@ -271,6 +271,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         for (auto &[id, stream] : m_streams) {
             if (stream->request) {
                 (void)stream->request->body().fail(make_error_code(asio::error::connection_reset));
+                stream->request->cancel(); // connection gone: signal every handler
             }
             h3::wake(stream->in_space);
             h3::wake(stream->out_space);
@@ -478,6 +479,8 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         if (it == m_streams.end())
             return;
         it->second->end_stream_sent = true;
+        if (it->second->request)
+            it->second->request->cancel(); // our own reset: signal the handler's token
         m_conn->reset_stream(stream_id, app_error_code);
     }
 
@@ -652,6 +655,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
             it->second->reset_by_peer = true;
             if (it->second->request) {
                 (void)it->second->request->body().fail(make_error_code(asio::error::connection_reset));
+                it->second->request->cancel(); // peer reset: signal the handler's token
             }
             h3::wake(it->second->in_space);
             h3::wake(it->second->out_space);
@@ -756,6 +760,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         for (auto &[id, stream] : m_streams) {
             if (stream->request) {
                 (void)stream->request->body().fail(make_error_code(asio::error::connection_reset));
+                stream->request->cancel(); // connection gone: signal every handler
             }
             h3::wake(stream->in_space);
             h3::wake(stream->out_space);

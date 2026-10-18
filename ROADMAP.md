@@ -93,4 +93,5 @@ request_id/access_log/recovery/basic_auth/real_ip/clean_path/strip_prefix/redire
 Referrer-Policy，`Response::replace_header` 覆盖）**、
 限流（令牌桶/per-key）、query/form/multipart/json 解析、类型化参数提取
 （path_params/query_params）、redirect、SSE、Cookie 读写+jar、客户端重定向（含跨源丢敏感头、
-超限报错）+basic_auth、OpenAPI 3.1、压缩、graceful stop、405/OPTIONS、静态文件 ETag/Range/304。
+超限报错）+basic_auth、OpenAPI 3.1、压缩、graceful stop、405/OPTIONS、静态文件 ETag/Range/304、
+**请求级取消 token（`Request::cancel`/`wait_cancelled`，对标 Go `r.Context()`）+ `middleware::timeout`**。

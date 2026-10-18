@@ -25,6 +25,7 @@ knowledge) and h2c, and the client speaks the same protocols outbound. HTTP/3
 - [📋 Logging](#-logging)
 - [🔒 TLS & mTLS](#-tls--mtls)
 - [🧭 Routing, Middleware & Proxy](#-routing-middleware--proxy)
+- [⏱ Request Cancellation & Timeouts](#-request-cancellation--timeouts)
 - [🔌 WebSocket](#-websocket)
 - [📑 Queries, Forms & SSE](#-queries-forms--sse)
 - [🔗 Client: redirects, cookies & auth](#-client-redirects-cookies--auth)
@@ -51,7 +52,7 @@ knowledge) and h2c, and the client speaks the same protocols outbound. HTTP/3
 - **🧱 Backpressure that survives a hostile peer** — a request body that backs up is parked per stream (HTTP/2) or drained by a bounded internal reader (WebSocket), so one stream or one serial handler cannot stall the connection.
 - **🌐 Reverse proxy** — request-level HTTP proxying (plaintext, TLS or h2c backends, each route carrying its own client policy) and byte-level WebSocket pass-through.
 - **🔌 TCP and UNIX-domain sockets** — bind a path instead of a port when the peer is a local sidecar; TLS, WebSocket and proxying all work over either.
-- **🧩 Middleware** — Go `net/http` / tower-style middleware: global (`use`), per-group and per-route, with before/after wrapping, short-circuiting and per-request state — plus built-ins (`request_id`, `access_log`, `recovery`, `basic_auth`, `real_ip`, `clean_path`, `strip_prefix`, `redirect_slashes`, `secure_headers`, CORS, rate limiting).
+- **🧩 Middleware** — Go `net/http` / tower-style middleware: global (`use`), per-group and per-route, with before/after wrapping, short-circuiting and per-request state — plus built-ins (`request_id`, `access_log`, `recovery`, `basic_auth`, `real_ip`, `clean_path`, `strip_prefix`, `redirect_slashes`, `timeout`, `secure_headers`, CORS, rate limiting).
 - **📑 Forms, queries & JSON** — `req->query_params()` (Go `r.URL.Query` / axum `Query<T>`), `read_urlencoded_body`, `read_multipart_body` and the client-side `MultipartForm` / `RequestBuilder::multipart()`, and — on by default, via glaze — `read_json_body<T>` / `write_json` (axum `Json<T>`), plus `res->redirect()`, a Server-Sent Events wrapper, and rate limiting (`429` + `Retry-After`, token bucket or per-key).
 - **🧵 Client ergonomics** — automatic redirect following (`max_redirects`, Go semantics), a `CookieJar`, `basic_auth()` / `bearer_auth()`, and per-request layered timeouts.
 - **🧵 Lock-free connection handling** — each connection is pinned to one single-threaded `io_context` for its whole life, so engines and writers never synchronize.
@@ -425,6 +426,7 @@ server.group("/api", {simple_http::middleware::basic_auth("svc", "s3cret")},
 // Built-ins: request_id / access_log / recovery / basic_auth (+ CORS below).
 server.use(simple_http::middleware::request_id());
 server.use(simple_http::middleware::access_log());
+server.use(simple_http::middleware::timeout(std::chrono::seconds(5))); // per-request deadline (see below)
 
 // Trusted-proxy awareness and path normalization, like chi/tower-http:
 server.use(simple_http::middleware::real_ip({"127.0.0.1", "10.0.0.0"})); // X-Forwarded-For → ClientIp state
@@ -467,6 +469,51 @@ headers are stripped. Each proxy route carries its **own** `ClientConfig` (TLS
 trust, client certificates, timeouts), so an internal mTLS backend and a public
 one never share credentials, and a `Client` is built per proxied request — no
 pool, no cross-request head-of-line blocking.
+
+---
+
+## ⏱ Request Cancellation & Timeouts
+
+Every request carries a one-shot, cooperative cancellation signal — the Go
+`r.Context()` / axum `CancellationToken` shape. The engine fires it when the peer
+goes away (an HTTP/2 or HTTP/3 stream reset, or the connection closing), so a
+handler that is not touching the body or the response — parked on a timer, a
+database call, an upstream fetch — can still learn to stop:
+
+```cpp
+using namespace asio::experimental::awaitable_operators;
+
+server.route({simple_http::Method::Get}, "/slow",
+             [](simple_http::RequestPtr req, simple_http::ResponsePtr res) -> asio::awaitable<void> {
+    asio::steady_timer t{co_await asio::this_coro::executor};
+    t.expires_after(std::chrono::seconds(30));
+    // Wait for the work OR the peer leaving, whichever comes first. `operator||`
+    // runs both on this coroutine's executor and cancels the loser.
+    co_await (t.async_wait(asio::use_awaitable) || req->wait_cancelled());
+    if (req->cancelled()) {
+        co_return; // peer gone: stop, do not reply
+    }
+    co_await res->status(200).send("done");
+});
+```
+
+`req->cancel()` / `req->cancelled()` / `req->cancel_token()` are thread-safe;
+`wait_cancelled()` resumes on the awaiting coroutine's executor. A loop-shaped
+handler can simply poll `req->cancelled()` instead of awaiting.
+
+A per-request deadline is the same signal plus a timer — mount
+`middleware::timeout`:
+
+```cpp
+server.use(simple_http::middleware::timeout(std::chrono::seconds(5)));
+// On expiry the chain is cancelled and the request token fires; the client gets
+// 504 Gateway Timeout if the response had not started, or the response is
+// aborted (close()) if it had. WebSocket handshakes pass through untouched.
+```
+
+Cancellation is cooperative: it reaches the handler's pending `co_await` (a
+timer, a socket, `wait_cancelled()`), which is as far as any framework can go. A
+handler spinning in CPU or blocked in a non-asio call is not interrupted.
 
 ---
 

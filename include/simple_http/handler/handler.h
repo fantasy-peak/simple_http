@@ -131,6 +131,9 @@ inline asio::awaitable<void> invoke_handler(const Handler &handler, RequestPtr r
     // Kept back because `res` is moved into the handler; both point at the same
     // Response, so this is the same object the handler was given.
     const ResponsePtr fallback = res;
+    // Same for the request: after the handler is entered, `req` is gone, but the
+    // cancelled flag is read below to tell a cancellation apart from a failure.
+    const RequestPtr req_keep = req;
     // The catch blocks only record — `co_await` is not permitted inside a
     // coroutine's handler, so the 500 is sent after the try has been left.
     bool threw = false;
@@ -150,6 +153,14 @@ inline asio::awaitable<void> invoke_handler(const Handler &handler, RequestPtr r
     }
 
     if (threw) {
+        // A cancellation is not a handler failure: a request deadline or a peer
+        // that went away unwinds the handler as an aborted operation, and the
+        // layer that cancelled it (middleware::timeout, or the engine's own
+        // teardown) owns the reply. Answering 500 here would race that reply —
+        // and on the timeout path would turn the intended 504 into a 500.
+        if (req_keep && req_keep->cancelled()) {
+            co_return;
+        }
         SIMPLE_HTTP_ERROR_LOG("handler threw: {}", why);
         if (fallback) {
             // A handler that throws has usually not answered yet. If it already

@@ -508,8 +508,15 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         // by the handler's shared_from_this()) and the whole connection alive.
         // fail() is a no-op once the body terminated normally, so this cannot
         // rewrite a completed upload into an error.
-        if (auto it = m_streams.find(stream_id); it != m_streams.end())
-            (void)it->second.request->body().fail(make_error_code(asio::error::connection_reset));
+        if (auto it = m_streams.find(stream_id); it != m_streams.end()) {
+            if (it->second.request) {
+                (void)it->second.request->body().fail(make_error_code(asio::error::connection_reset));
+                // Signal the request's cancellation token too: a handler parked
+                // on wait_cancelled() (or polling cancelled()) observes the reset
+                // even when it is not touching the body or the response.
+                it->second.request->cancel();
+            }
+        }
         erase_stream(stream_id);
         flush();
     }
@@ -791,8 +798,10 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         // body().read() (dispatched at END_HEADERS) must observe the connection's
         // death, or it waits forever and keeps this engine alive with it.
         for (auto &entry : m_streams) {
-            if (entry.second.request)
+            if (entry.second.request) {
                 (void)entry.second.request->body().fail(make_error_code(asio::error::connection_reset));
+                entry.second.request->cancel(); // connection gone: signal every handler
+            }
             if (entry.second.out_space)
                 entry.second.out_space->close();
             entry.second.ws_closed = true;
@@ -1668,6 +1677,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
             return true;
         }
         (void)it->second.request->body().fail(make_error_code(asio::error::connection_reset));
+        it->second.request->cancel(); // peer reset: signal the handler's token
         erase_stream(hdr.stream_id);
         return true;
     }
