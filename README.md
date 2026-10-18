@@ -502,13 +502,18 @@ server.route({simple_http::Method::Get}, "/slow",
 handler can simply poll `req->cancelled()` instead of awaiting.
 
 A per-request deadline is the same signal plus a timer — mount
-`middleware::timeout`:
+`middleware::timeout`. Its rule is one sentence: **the handler must start
+responding within `deadline`; once it has, it must not go silent for
+`deadline`.** Before the response head goes out that is an absolute deadline (a
+hung or slow handler is cancelled); after it, every write pushes the deadline
+back, so a stream that keeps producing is never killed while one that stalls is:
 
 ```cpp
 server.use(simple_http::middleware::timeout(std::chrono::seconds(5)));
-// On expiry the chain is cancelled and the request token fires; the client gets
+// On expiry the request token fires and the chain is cancelled; the client gets
 // 504 Gateway Timeout if the response had not started, or the response is
-// aborted (close()) if it had. WebSocket handshakes pass through untouched.
+// aborted (close()) if it had. SSE / long downloads / streaming proxies survive
+// as long as they keep writing; WebSocket handshakes pass through untouched.
 ```
 
 Cancellation is cooperative: it reaches the handler's pending `co_await` (a

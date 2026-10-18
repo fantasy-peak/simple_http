@@ -483,13 +483,23 @@ inline Middleware ws_origin(std::vector<std::string> allowed_origins, bool allow
     };
 }
 
-// Per-request deadline: fences the rest of the chain with a timer (the tower
-// `Timeout` shape). On expiry:
-//   * the chain is cancelled — asio's `operator||` cancels the loser, so a
+// Per-request deadline, streaming-aware. The rule is one sentence: **the handler
+// must start responding within `deadline`; once it has, it must not go silent for
+// `deadline`.** So:
+//   * before the response head goes out this is an absolute deadline — a hung or
+//     slow handler that has produced nothing is cancelled at `deadline` (and a
+//     handler reading a slow upload without responding is bounded the same way);
+//   * once the head is out every write pushes the deadline back — an SSE stream,
+//     a long download or a streaming proxy that keeps producing is never killed,
+//     while one that stalls (a peer that stopped reading, an upstream that went
+//     quiet) is.
+//
+// On expiry:
+//   * the request's cancellation token fires first, so invoke_handler sees a
+//     cancellation rather than a handler failure (no spurious 500) and any
+//     coroutine the handler spawned and left running observes it;
+//   * the chain is then cancelled — asio's `operator||` cancels the loser, so a
 //     handler parked on a timer, a socket or wait_cancelled() unwinds at once;
-//   * the request's cancellation token fires, so any coroutine the handler
-//     spawned and left running (which `operator||` does not own) observes it and
-//     can clean up;
 //   * the reply is finished — a 504 if the head had not gone out yet, otherwise
 //     the response is aborted with close(), because a truncated body must never
 //     look complete.
@@ -523,21 +533,47 @@ inline Middleware timeout(std::chrono::milliseconds deadline) {
         }
 
         using namespace asio::experimental::awaitable_operators;
-        asio::steady_timer timer{co_await asio::this_coro::executor};
-        timer.expires_after(deadline);
-        // The deadline branch fires the request token *before* it completes, so
-        // the token is already set when `operator||` then cancels the chain.
-        // invoke_handler reads that flag to tell a cancellation apart from a
-        // handler failure — without this ordering the handler's aborted await is
-        // caught as a throw (a spurious error log, and a 500 racing the 504).
-        // `operator||` runs both operands on this coroutine's executor and
-        // cancels the loser; Request::wait_cancelled binds to that same executor,
-        // so timer and token always line up. `res` is kept for the after-phase —
-        // next() receives its own copy of the shared_ptr.
-        auto on_deadline = [&timer, req]() -> asio::awaitable<void> {
-            co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
-            req->cancel(); // signal first; the chain is cancelled next
+        using clock = std::chrono::steady_clock;
+        // Poll granularity: a fraction of the deadline, bounded so a long deadline
+        // does not wake often and a short one stays precise.
+        auto tick = deadline / 4;
+        if (tick < std::chrono::milliseconds(10))
+            tick = std::chrono::milliseconds(10);
+        if (tick > std::chrono::seconds(1))
+            tick = std::chrono::seconds(1);
+        if (tick > deadline && deadline > std::chrono::milliseconds(0))
+            tick = deadline;
+
+        auto timer = std::make_shared<asio::steady_timer>(co_await asio::this_coro::executor);
+        auto last_change = std::make_shared<clock::time_point>(clock::now());
+        auto last_seq = std::make_shared<std::uint64_t>(res->activity());
+        // Poll response progress rather than observing writes directly: the
+        // activity counter is a relaxed atomic, so this stays correct even if the
+        // handler writes from another thread. Before the head there are no writes,
+        // so the window is absolute; after it, each write advances the counter and
+        // resets the window. Firing the token before returning lets invoke_handler
+        // recognise the unwinding as a cancellation, not a handler failure.
+        auto on_deadline = [timer, req, res, last_change, last_seq, deadline, tick]() -> asio::awaitable<void> {
+            for (;;) {
+                timer->expires_after(tick);
+                auto [ec] = co_await timer->async_wait(asio::as_tuple(asio::use_awaitable));
+                if (ec)
+                    co_return; // cancelled by operator|| (the chain finished)
+                const std::uint64_t seq = res->activity();
+                if (seq != *last_seq) { // progress: reset the window
+                    *last_seq = seq;
+                    *last_change = clock::now();
+                    continue;
+                }
+                if (clock::now() - *last_change >= deadline) {
+                    req->cancel();
+                    co_return;
+                }
+            }
         };
+        // `operator||` runs both operands on this coroutine's executor and cancels
+        // the loser; `res` is kept for the after-phase — next() receives its own
+        // copy of the shared_ptr.
         auto outcome = co_await (next(req, res, ssl) || on_deadline());
         if (outcome.index() == 0) {
             co_return; // the chain finished first
@@ -545,7 +581,7 @@ inline Middleware timeout(std::chrono::milliseconds deadline) {
         if (!res->started()) {
             (void)co_await res->status(status::gateway_timeout).content_type("text/plain").send("Gateway Timeout");
         } else {
-            co_await res->close(); // mid-response: abort, never truncate silently
+            co_await res->close(); // mid-stream: abort, never truncate silently
         }
     };
 }

@@ -286,6 +286,34 @@ template <typename ServerT> void register_routes(ServerT &server) {
                      co_await res->status(200).send("too late");
                  });
 
+    // Streaming under a deadline: ~200 ms of output at 10 ms intervals with a
+    // 50 ms timeout. The stream is four times the deadline end to end but never
+    // idle for more than 10 ms, so the idle half of middleware::timeout must keep
+    // it alive (where an absolute deadline would truncate it).
+    server.route(any_methods, "/stream-timed", {simple_http::middleware::timeout(std::chrono::milliseconds(50))},
+                 [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+                     co_await res->status(200).content_type("text/plain").begin();
+                     for (int i = 0; i < 20; ++i) {
+                         asio::steady_timer t{co_await asio::this_coro::executor};
+                         t.expires_after(std::chrono::milliseconds(10));
+                         co_await t.async_wait(asio::use_awaitable);
+                         co_await res->write("x");
+                     }
+                     co_await res->finish();
+                 });
+
+    // The same shape, but the stream goes silent after the first chunk: the idle
+    // half of the deadline must abort it (close, not a 504 — the head is out).
+    server.route(any_methods, "/stream-stall", {simple_http::middleware::timeout(std::chrono::milliseconds(100))},
+                 [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+                     co_await res->status(200).content_type("text/plain").begin();
+                     co_await res->write("first");
+                     asio::steady_timer t{co_await asio::this_coro::executor};
+                     t.expires_after(std::chrono::seconds(3));
+                     co_await t.async_wait(asio::use_awaitable);
+                     co_await res->finish();
+                 });
+
     // Handler that throws — the engine must not crash; the connection stays sane.
     server.route(any_methods, "/throw",
                  [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {

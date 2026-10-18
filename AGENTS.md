@@ -200,7 +200,7 @@ server.group("/api", {auth_mw}, [](Router &api) {
 });
 // 内置中间件：middleware::request_id() / access_log() / recovery() / basic_auth()
 //              / real_ip(trusted) / clean_path() / strip_prefix("/x") / redirect_slashes()
-//              / timeout(5s)（per-request deadline，超时 504 / 中止响应）
+//              / timeout(5s)（响应头前绝对、头后空闲；超时 504 / 中止响应）
 //              / secure_headers(SecureHeadersConfig)（安全响应头基线，HSTS 仅 TLS）
 server.use(simple_http::middleware::request_id());
 ```
@@ -211,10 +211,13 @@ server.use(simple_http::middleware::request_id());
 `wait_cancelled()`（在**等待者自己的**执行器上恢复）。引擎在现有的拆连接路径上触发它：
 h2/h3 的流 reset 与连接关闭（`reset_stream` / peer RST / 连接 teardown）会
 `request->cancel()`，所以一个既没在读 body、也没在写响应、而是卡在 timer/上游上的 handler
-也能被唤醒。`middleware::timeout(d)` 建在同一套信号上：到期时取消链路（asio `operator||`
-取消输家）并触发 token，然后回 504（响应头已发出则 `close()` 中止）。h1 是半双工、handler
-内联运行，客户端断开只能在下次读写时被观察到，故 h1 侧不做额外触发（连接级 `idle_timeout`
-已通过 `serve_loop || watchdog` 取消 handler）。
+也能被唤醒。`middleware::timeout(d)` 建在同一套信号上，且**流式友好**：规则一句话——**响应头
+发出前是绝对时限（d 内必须开始响应），发出后是空闲时限（每次写就重置）**。实现靠
+`ResponseWriter::activity()`（每次写自增的 relaxed 原子）轮询推进；到期时先触发 token 再取消
+链路（asio `operator||` 取消输家），然后回 504（响应头未发出）或 `close()` 中止（已发出）。
+SSE/长下载/流式反代只要持续写就不会被误杀，中途静默则被中止；WebSocket 握手直接放行。h1 是
+半双工、handler 内联运行，客户端断开只能在下次读写时被观察到，故 h1 侧不做额外触发（连接级
+`idle_timeout` 已通过 `serve_loop || watchdog` 取消 handler）。
 
 `Server` 门面（`net/server.h`）为 fluent 风格，路由方法转发给内部 `Router`：
 

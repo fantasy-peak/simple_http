@@ -12,8 +12,10 @@
 //   streaming: co_await res.status(200).begin();
 //              co_await res.write("chunk"); ...; co_await res.finish();
 
+#include <atomic>
 #include <boost/asio/awaitable.hpp>
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -51,6 +53,11 @@ class ResponseWriter {
     // object all the way down the chain, so the flag the handler sets is what a
     // middleware observes.
     bool started() const { return m_started; }
+    // A monotonic counter bumped at the start of every write. A middleware reads
+    // it to observe response progress without a callback — e.g. an idle timeout
+    // polls it and resets its deadline when it advances. Cheap (a relaxed atomic)
+    // and safe from any thread.
+    [[nodiscard]] std::uint64_t activity() const noexcept { return m_activity.load(std::memory_order_relaxed); }
     ResponseWriter &header(std::string_view name, std::string value) {
         // A field name or value carrying CR/LF/NUL would splice arbitrary bytes
         // into the head — response splitting, and this library's own reverse proxy
@@ -129,6 +136,7 @@ class ResponseWriter {
         if (m_field_rejected) {
             co_return make_error_code(asio::error::invalid_argument);
         }
+        note_activity();
         apply_defaults();
         m_started = true;
         // A response carrying trailers cannot be one-shot: the fields follow the
@@ -147,6 +155,7 @@ class ResponseWriter {
         if (m_field_rejected) {
             co_return make_error_code(asio::error::invalid_argument);
         }
+        note_activity();
         apply_defaults();
         m_started = true;
         co_return co_await m_writer->send_bodyless(m_status, std::move(m_headers));
@@ -157,12 +166,17 @@ class ResponseWriter {
         if (m_field_rejected) {
             co_return make_error_code(asio::error::invalid_argument);
         }
+        note_activity();
         apply_defaults();
         m_started = true;
         co_return co_await m_writer->send_headers(m_status, std::move(m_headers));
     }
-    [[nodiscard]] asio::awaitable<error_code> write(std::string data) { return m_writer->send_chunk(std::move(data)); }
+    [[nodiscard]] asio::awaitable<error_code> write(std::string data) {
+        note_activity();
+        return m_writer->send_chunk(std::move(data));
+    }
     [[nodiscard]] asio::awaitable<error_code> finish(std::string data = {}) {
+        note_activity();
         // Trailer fields accumulated with trailer() end the response instead of
         // the final body chunk, so a `finish()` after them still emits them. The
         // response head already went out in begin(), so any final body bytes go
@@ -203,6 +217,7 @@ class ResponseWriter {
         if (m_field_rejected) {
             co_return make_error_code(asio::error::invalid_argument);
         }
+        note_activity();
         co_return co_await m_writer->send_trailers(std::move(trailers));
     }
     // Ends a streamed response with the fields accumulated by trailer().
@@ -327,6 +342,10 @@ class ResponseWriter {
     bool m_field_rejected{false};
     // Set once the head has gone out (see started()).
     bool m_started{false};
+    // Bumped by note_activity() at the start of every write (see activity()).
+    std::atomic<std::uint64_t> m_activity{0};
+
+    void note_activity() { m_activity.fetch_add(1, std::memory_order_relaxed); }
 };
 
 } // namespace simple_http

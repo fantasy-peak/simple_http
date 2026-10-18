@@ -124,6 +124,48 @@ TEST_CASE("middleware: timeout leaves a handler that finishes in time alone", "[
     CHECK(writer->last_body == "ok");
 }
 
+TEST_CASE("middleware: timeout does not kill a stream that keeps producing", "[cancellation]") {
+    Router router;
+    router.use(middleware::timeout(std::chrono::milliseconds(50)));
+    router.route({Method::Get}, "/stream", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(200).content_type("text/plain").begin();
+        // Ten chunks, 20 ms apart: ~200 ms total, four times the deadline, but
+        // never idle for more than 20 ms — the stream must survive.
+        for (int i = 0; i < 10; ++i) {
+            asio::steady_timer t{co_await asio::this_coro::executor};
+            t.expires_after(std::chrono::milliseconds(20));
+            co_await t.async_wait(asio::use_awaitable);
+            co_await res->write("x");
+        }
+        co_await res->finish();
+    });
+
+    asio::io_context ctx;
+    auto writer = run_chain(ctx, router, make_request(ctx, "/stream"));
+    CHECK(writer->begun);
+    CHECK(writer->finished);
+    CHECK(writer->chunks.size() == 11); // 10 writes + the final chunk
+}
+
+TEST_CASE("middleware: timeout aborts a stream that goes silent", "[cancellation]") {
+    Router router;
+    router.use(middleware::timeout(std::chrono::milliseconds(50)));
+    router.route({Method::Get}, "/stall", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(200).content_type("text/plain").begin();
+        co_await res->write("first");
+        asio::steady_timer t{co_await asio::this_coro::executor};
+        t.expires_after(std::chrono::seconds(5)); // then silence
+        co_await t.async_wait(asio::use_awaitable);
+        co_await res->finish();
+    });
+
+    asio::io_context ctx;
+    auto writer = run_chain(ctx, router, make_request(ctx, "/stall"));
+    CHECK(writer->begun);
+    CHECK_FALSE(writer->finished); // never completed
+    CHECK_FALSE(writer->open);     // aborted with close(), not a 504
+}
+
 TEST_CASE("middleware: timeout fires the token for work the handler left running", "[cancellation]") {
     Router router;
     router.use(middleware::timeout(std::chrono::milliseconds(30)));
