@@ -271,6 +271,29 @@ TEST_CASE("proto/request: target splitting and method tokens", "[proto]") {
     CHECK(req.method() == Method::Post);
 }
 
+TEST_CASE("proto/request: typed state survives a move", "[proto]") {
+    // Request is movable (the client may move it between owners), so every
+    // member has to travel with it - including the type-erased middleware state
+    // (request id, real client IP, log fields, compression policy, ...).
+    asio::io_context ctx;
+    Request source{Version::Http11, ctx.get_executor(), asio::ip::tcp::endpoint{}};
+    source.set_target("/x");
+    source.set_state(std::string{"principal"});
+    source.set_state(42);
+
+    Request moved{std::move(source)};
+    REQUIRE(moved.get_state<std::string>() != nullptr);
+    CHECK(*moved.get_state<std::string>() == "principal");
+    REQUIRE(moved.get_state<int>() != nullptr);
+    CHECK(*moved.get_state<int>() == 42);
+
+    Request assigned{Version::Http11, ctx.get_executor(), asio::ip::tcp::endpoint{}};
+    assigned = std::move(moved);
+    REQUIRE(assigned.get_state<std::string>() != nullptr);
+    CHECK(*assigned.get_state<std::string>() == "principal");
+    CHECK(assigned.target() == "/x");
+}
+
 // --- ResponseWriter + a fake writer ------------------------------------------------
 
 TEST_CASE("proto/response: defaults are filled in but never override", "[proto]") {

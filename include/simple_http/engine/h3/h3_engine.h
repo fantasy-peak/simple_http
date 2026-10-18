@@ -160,11 +160,15 @@ template <typename Connection> class Http3ResponseSink : public ResponseSink {
         // parked for WOULDBLOCK (READ_DATA_BLOCKED) — and enqueueing the data is
         // precisely what resumes it. Only a stream that is gone or reset by the
         // peer is unsendable.
-        if (!eng || !eng->alive() || !eng->stream_sendable(m_stream_id)) {
+        if (!eng || !eng->alive()) {
             co_return make_error_code(asio::error::not_connected);
         }
-        if (eng->method_is_head(m_stream_id))
+        // The cached flag answers after nghttp3 has closed the stream as well;
+        // a stream-table lookup no longer can.
+        if (m_head_request)
             co_return error_code{}; // HEAD: no body
+        if (!eng->stream_sendable(m_stream_id))
+            co_return make_error_code(asio::error::not_connected);
         // Backpressure: block while this stream's unacknowledged bytes are over
         // the high mark, so a fast producer (a reverse proxy streaming an
         // upstream body) is paced by the peer rather than by memory.
@@ -177,11 +181,13 @@ template <typename Connection> class Http3ResponseSink : public ResponseSink {
     asio::awaitable<error_code> send_last(std::string data) override {
         co_await hop();
         auto eng = m_engine.lock();
-        if (!eng || !eng->alive() || !eng->stream_sendable(m_stream_id)) {
+        if (!eng || !eng->alive()) {
             co_return make_error_code(asio::error::not_connected);
         }
-        if (eng->method_is_head(m_stream_id))
+        if (m_head_request)
             co_return error_code{}; // HEAD: no body
+        if (!eng->stream_sendable(m_stream_id))
+            co_return make_error_code(asio::error::not_connected);
         if (auto ec = co_await eng->await_out_space(m_stream_id); ec)
             co_return ec;
         eng->enqueue_body(m_stream_id, std::move(data), /*last=*/true);
@@ -191,11 +197,13 @@ template <typename Connection> class Http3ResponseSink : public ResponseSink {
     asio::awaitable<error_code> send_trailers(Headers trailers) override {
         co_await hop();
         auto eng = m_engine.lock();
-        if (!eng || !eng->alive() || !eng->stream_sendable(m_stream_id)) {
+        if (!eng || !eng->alive()) {
             co_return make_error_code(asio::error::not_connected);
         }
-        if (eng->method_is_head(m_stream_id))
+        if (m_head_request)
             co_return error_code{}; // HEAD: no body, so no trailer section either
+        if (!eng->stream_sendable(m_stream_id))
+            co_return make_error_code(asio::error::not_connected);
         eng->submit_trailers(m_stream_id, trailers);
         co_return error_code{};
     }
@@ -219,6 +227,11 @@ template <typename Connection> class Http3ResponseSink : public ResponseSink {
     }
 
     Version version() const override { return Version::Http3; }
+    bool head_request() const noexcept override { return m_head_request; }
+
+    // Cached when the handler starts: after nghttp3 closes a HEAD response's
+    // stream, the engine's stream table no longer has the request to ask.
+    void set_head_request(bool head) noexcept { m_head_request = head; }
 
   private:
     asio::awaitable<void> hop() const { co_await asio::dispatch(asio::bind_executor(m_executor, asio::use_awaitable)); }
@@ -226,6 +239,7 @@ template <typename Connection> class Http3ResponseSink : public ResponseSink {
     std::weak_ptr<Http3Engine<Connection>> m_engine;
     std::int64_t m_stream_id;
     Executor m_executor;
+    bool m_head_request{false};
 };
 
 template <typename Connection>
@@ -970,6 +984,12 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         const int rv = nghttp3_conn_submit_trailers(m_h3, stream_id, m_nva.data(), m_nva.size());
         if (rv != 0) {
             SIMPLE_HTTP_ERROR_LOG("h3: submit_trailers failed (stream={}): {}", stream_id, nghttp3_strerror(rv));
+            // This runs from next_stream_data(), i.e. inside ngtcp2's write loop.
+            // reset_stream() only reaches ngtcp2_conn_shutdown_stream(), and
+            // ngtcp2 explicitly exempts the shutdown calls from the "nothing but
+            // writev_stream while in the write loop" rule (see write_pkt) - so
+            // this is legal here, unlike nghttp3_conn_writev_stream or
+            // close/read_pkt, which must be deferred.
             reset_stream(stream_id, kH3InternalError);
             return;
         }
@@ -1149,6 +1169,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         stream.dispatched = true;
 
         auto writer = std::make_shared<Http3ResponseSink<Connection>>(this->weak_from_this(), stream_id, m_executor);
+        writer->set_head_request(stream.is_head); // cached before the response can retire the stream entry
         stream.response =
             std::make_shared<ResponseWriter>(maybe_compress_writer(writer, m_executor, stream.request, stream.is_head));
 

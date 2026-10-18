@@ -280,6 +280,8 @@ co_await res->status(200).begin();  co_await res->write(chunk);  co_await res->f
 `replace_header`（同名替换）、SSE 三件套 `sse_begin/sse_event/sse_comment`、尾部字段
 `trailer(name,value)` + `finish_trailers(...)`（RFC 9110 §6.5：h1 走 chunked 终止符、
 h2 走带 END_STREAM 的尾部 HEADERS、h3 走 nghttp3 trailer；HEAD/HTTP/1.0 关闭分隔无位置承载则丢弃）。
+客户端的 `Stream::trailers()` 暴露响应尾部字段（h1 chunked / h2 尾部 HEADERS），反向代理据此
+用 `finish_trailers()` 把上游 trailer 转发给下游。
 
 表单与查询：`read_urlencoded_body(req)`、`read_multipart_body(req)`、`read_json_body<T>` /
 `write_json`。客户端上行 multipart 用 `proto/multipart.h` 的 `MultipartForm`

@@ -336,8 +336,10 @@ Four things worth knowing before writing your own:
 - **A record is valid only during the call.** `message` and `category` point at a
   stack buffer; copy them if you need to keep them. The example above hands them
   straight to spdlog, so it does not.
-- **Records carry a category, empty by default.** The library logs untagged; use
-  `SIMPLE_HTTP_ERROR_LOG_CAT("h2", …)` and friends when a backend routes on it.
+- **Records carry a category, empty by default.** The per-level macros log
+  untagged; the structured entry point (`log_with_attrs(level, category, …)`,
+  used by `access_log()` with `"access"`) names one when a backend routes on it.
+  The record's typed `attrs` are the structured counterpart of the message.
 - **Nothing is allocated for the common case.** Messages up to 512 bytes are
   formatted onto the stack.
 

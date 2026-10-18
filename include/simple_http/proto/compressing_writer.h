@@ -180,6 +180,7 @@ class CompressingResponseSink final : public ResponseSink {
     }
 
     Version version() const override { return m_inner->version(); }
+    bool head_request() const noexcept override { return m_head_request || m_inner->head_request(); }
 
   private:
     enum class State { Passthrough, Compressing };

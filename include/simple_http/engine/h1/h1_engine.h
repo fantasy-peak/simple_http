@@ -184,7 +184,16 @@ template <TransportLike Transport> class Http1ResponseSink : public ResponseSink
         co_await hop();
         if (!m_open)
             co_return make_error_code(asio::error::not_connected);
-        auto ec = co_await write_chunked(data, /*last=*/false);
+        // A close-delimited body (HTTP/1.0) has no chunked framing to hang the
+        // bytes on: writing "size\r\n<data>\r\n" there would put the framing
+        // itself in the client's body. The connection close delimits it instead.
+        error_code ec;
+        if (!m_chunked) {
+            if (!data.empty())
+                ec = co_await write_raw(data);
+        } else {
+            ec = co_await write_chunked(data, /*last=*/false);
+        }
         if (ec)
             m_open = false;
         co_return ec;
@@ -196,10 +205,15 @@ template <TransportLike Transport> class Http1ResponseSink : public ResponseSink
         co_await hop();
         if (!m_open)
             co_return make_error_code(asio::error::not_connected);
-        // An empty final chunk is nothing but the terminator; otherwise the data
-        // chunk and the terminator go out together.
         error_code ec;
-        if (data.empty()) {
+        if (!m_chunked) {
+            // Close-delimited: the final bytes, with no terminator to write -
+            // the engine closes the connection to end the body.
+            if (!data.empty())
+                ec = co_await write_raw(data);
+        } else if (data.empty()) {
+            // An empty final chunk is nothing but the terminator; otherwise the
+            // data chunk and the terminator go out together.
             ec = co_await write_raw(kLastChunk);
         } else {
             ec = co_await write_chunked(data, /*last=*/true);
@@ -251,6 +265,7 @@ template <TransportLike Transport> class Http1ResponseSink : public ResponseSink
         m_transport->close();
     }
     Version version() const override { return m_version; }
+    bool head_request() const noexcept override { return m_head_request; }
 
     // Set by the engine from the parsed request's Connection header so the
     // response line matches what the engine decided about keep-alive.
@@ -679,7 +694,12 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
             bool drained = co_await drain_body();
 
             const bool still_open = co_await writer->connected();
-            if (handler_failed || !keep_alive || !still_open || !drained) {
+            // `keep_alive_out` is what the *response* announced: a streamed
+            // HTTP/1.0 body (or a streamed HEAD) is close-delimited, so the
+            // engine must actually close even when the request asked to keep
+            // the connection alive - otherwise the client waits for an EOF that
+            // never comes.
+            if (handler_failed || !keep_alive || !writer->keep_alive_out() || !still_open || !drained) {
                 break;
             }
         }

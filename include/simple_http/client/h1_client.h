@@ -874,7 +874,13 @@ class Http1ClientSession final : public ClientSession,
             }
 
             if (chunk_len == 0) {
-                // Last chunk: skip the trailers up to the terminating blank line.
+                // Last chunk: the trailer fields follow, up to the terminating
+                // blank line. They are surfaced through response_trailers()
+                // (the reverse proxy forwards them; a plain caller may ignore
+                // them). The whole section is bounded like the response head: a
+                // peer that never terminates it must not grow memory.
+                Headers trailers;
+                std::size_t trailer_bytes = 0;
                 for (;;) {
                     std::size_t tnl = m_buf.find('\n');
                     if (tnl == std::string::npos) {
@@ -901,7 +907,25 @@ class Http1ClientSession final : public ClientSession,
                         line.pop_back();
                     if (line.empty())
                         break; // end of trailers: the body is complete
+                    trailer_bytes += line.size() + 2;
+                    if (trailer_bytes > m_limits.max_header_bytes) {
+                        fail_session();
+                        co_return std::unexpected{make_error_code(client_errc::header_too_large)};
+                    }
+                    switch (h1_detail::parse_field_line(line, trailers)) {
+                    case h1_detail::FieldLine::Ok:
+                        break;
+                    case h1_detail::FieldLine::NameTooLong:
+                        fail_session();
+                        co_return std::unexpected{make_error_code(client_errc::header_too_large)};
+                    case h1_detail::FieldLine::Malformed:
+                        SIMPLE_HTTP_ERROR_LOG("h1 client: malformed trailer field from {}", m_authority);
+                        fail_session();
+                        co_return std::unexpected{make_error_code(client_errc::protocol_error)};
+                    }
                 }
+                if (auto stream = m_stream.lock())
+                    stream->set_trailers(std::move(trailers));
                 m_body_done = true;
                 finish_exchange();
                 co_return ReadResult::end();

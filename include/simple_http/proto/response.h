@@ -139,11 +139,28 @@ class ResponseWriter {
         note_activity();
         apply_defaults();
         m_started = true;
-        // A response carrying trailers cannot be one-shot: the fields follow the
-        // body, so it is framed as a stream (chunked on HTTP/1.x) and closed by
-        // the trailer section. `send()` on a trailer-less response keeps the
-        // one-shot framing (a known Content-Length on HTTP/1.x).
+        // 204/304 carry no content, so nothing follows the header block (RFC
+        // 9110 §15.3.5/§15.4.5) - and there is nowhere for a trailer section
+        // either. h1 already routed these to send_bodyless() inside its own
+        // send(); doing it here gives h2/h3 the same rule (they used to emit the
+        // body as DATA when a handler passed one).
+        if (m_status == status::no_content || m_status == status::not_modified) {
+            co_return co_await m_writer->send_bodyless(m_status, std::move(m_headers));
+        }
         if (!m_trailers.empty()) {
+            // A response to HEAD has no body and therefore no trailer section,
+            // but it should still carry the Content-Length a GET would have
+            // produced. HTTP/1.0 has no chunked framing to hang a trailer
+            // section on either. Both keep the one-shot framing (and its known
+            // length) and drop the fields instead of switching to a streamed
+            // response that would have to be close-delimited.
+            if (m_writer->head_request() || m_writer->version() == Version::Http1) {
+                co_return co_await m_writer->send(m_status, std::move(m_headers), std::move(body));
+            }
+            // A response carrying trailers cannot be one-shot: the fields follow
+            // the body, so it is framed as a stream (chunked on HTTP/1.x) and
+            // closed by the trailer section. `send()` on a trailer-less response
+            // keeps the one-shot framing (a known Content-Length on HTTP/1.x).
             co_return co_await send_stream(std::move(body), std::move(m_trailers));
         }
         co_return co_await m_writer->send(m_status, std::move(m_headers), std::move(body));

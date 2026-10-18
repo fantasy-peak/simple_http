@@ -196,4 +196,259 @@ TEST_CASE("h2/engine: trailers are a trailing HEADERS frame with END_STREAM", "[
     CHECK(saw_status);
 }
 
+// --- protocols without a place for a trailer section: the body must stay intact ---
+
+TEST_CASE("h1/engine: an HTTP/1.0 streamed body is close-delimited, not chunk-framed", "[h1]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    // HTTP/1.0 has no chunked framing. The request asks for keep-alive, so only
+    // the connection close can delimit the body: the engine must close after the
+    // response and not answer the pipelined second request.
+    transport->push("GET / HTTP/1.0\r\nHost: x\r\nConnection: keep-alive\r\n\r\n"
+                    "GET / HTTP/1.0\r\nHost: x\r\nConnection: keep-alive\r\n\r\n");
+
+    auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res,
+                         SslHandle) -> asio::awaitable<void> {
+        co_await res->status(200).content_type("text/plain").begin();
+        co_await res->write("first ");
+        co_await res->write("second");
+        res->trailer("x-checksum", "abc123");
+        co_await res->finish();
+    };
+
+    auto engine = std::make_shared<Http1Engine<MockTransport>>(transport);
+    REQUIRE(run_on(ctx, engine->run(dispatcher)));
+
+    const std::string &out = transport->written();
+    CHECK(out.find("transfer-encoding") == std::string::npos);
+    // The old bug wrote the chunk framing into the body ("6\r\nfirst \r\n...").
+    CHECK(out.find("\r\n6\r\nfirst") == std::string::npos);
+    const auto head_end = out.find("\r\n\r\n");
+    REQUIRE(head_end != std::string::npos);
+    // Raw bytes, and the trailer fields dropped (there is nowhere to put them).
+    CHECK(out.substr(head_end + 4) == "first second");
+    // Exactly one response: the close-delimited body ended the connection.
+    CHECK(out.find("HTTP/1.0 200 OK") == out.rfind("HTTP/1.0 200 OK"));
+}
+
+TEST_CASE("h1/engine: one-shot send() with trailers on HTTP/1.0 keeps its Content-Length", "[h1]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    transport->push("GET / HTTP/1.0\r\nHost: x\r\n\r\n");
+
+    auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res,
+                         SslHandle) -> asio::awaitable<void> {
+        res->trailer("x-checksum", "abc123");
+        co_await res->status(200).content_type("text/plain").send("hello");
+    };
+
+    auto engine = std::make_shared<Http1Engine<MockTransport>>(transport);
+    REQUIRE(run_on(ctx, engine->run(dispatcher)));
+
+    const std::string &out = transport->written();
+    CHECK(out.find("content-length: 5") != std::string::npos);
+    CHECK(out.find("transfer-encoding") == std::string::npos);
+    CHECK(out.find("x-checksum") == std::string::npos); // nowhere to carry it
+    const auto head_end = out.find("\r\n\r\n");
+    REQUIRE(head_end != std::string::npos);
+    CHECK(out.substr(head_end + 4) == "hello");
+}
+
+TEST_CASE("h1/engine: a HEAD response with trailers keeps its Content-Length", "[h1]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    transport->push("HEAD / HTTP/1.1\r\nHost: x\r\n\r\n");
+
+    auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res,
+                         SslHandle) -> asio::awaitable<void> {
+        res->trailer("x-checksum", "abc123");
+        co_await res->status(200).content_type("text/plain").send("hello");
+    };
+
+    auto engine = std::make_shared<Http1Engine<MockTransport>>(transport);
+    REQUIRE(run_on(ctx, engine->run(dispatcher)));
+
+    const std::string &out = transport->written();
+    CHECK(out.find("content-length: 5") != std::string::npos);
+    CHECK(out.find("transfer-encoding") == std::string::npos);
+    CHECK(out.find("connection: close") == std::string::npos);
+    const auto head_end = out.find("\r\n\r\n");
+    REQUIRE(head_end != std::string::npos);
+    CHECK(out.substr(head_end + 4).empty()); // headers only
+}
+
+TEST_CASE("h1/engine: a 204 with trailers stays bodyless", "[h1]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    transport->push("GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+
+    auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res,
+                         SslHandle) -> asio::awaitable<void> {
+        res->trailer("x-checksum", "abc123");
+        co_await res->status(204).send("must not appear");
+    };
+
+    auto engine = std::make_shared<Http1Engine<MockTransport>>(transport);
+    REQUIRE(run_on(ctx, engine->run(dispatcher)));
+
+    const std::string &out = transport->written();
+    CHECK(out.find("204 No Content") != std::string::npos);
+    CHECK(out.find("transfer-encoding") == std::string::npos);
+    CHECK(out.find("must not appear") == std::string::npos);
+    const auto head_end = out.find("\r\n\r\n");
+    REQUIRE(head_end != std::string::npos);
+    CHECK(out.substr(head_end + 4).empty());
+}
+
+TEST_CASE("h2/engine: a HEAD response with trailers sends headers and reports success", "[h2]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+
+    std::string in{codec::kH2ClientPreface};
+    append_frame(in, H2FrameType::Settings, 0, 0, "");
+    {
+        std::string block;
+        hpack_append_literal(block, ":method", "HEAD");
+        hpack_append_indexed(block, 7); // :scheme https
+        hpack_append_literal(block, ":path", "/");
+        hpack_append_literal(block, ":authority", "example.com");
+        append_frame(in, H2FrameType::Headers, H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM, 1, block);
+    }
+    transport->push(std::move(in));
+
+    error_code send_ec = make_error_code(asio::error::would_block); // sentinel
+    auto dispatcher = [&send_ec](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res,
+                                 SslHandle) -> asio::awaitable<void> {
+        res->trailer("x-checksum", "abc123");
+        send_ec = co_await res->status(200).content_type("text/plain").send("hello");
+    };
+
+    auto engine = std::make_shared<Http2Engine<MockTransport>>(transport);
+    REQUIRE(run_on(ctx, engine->run(dispatcher)));
+
+    // A HEAD response was sent with END_STREAM on its HEADERS frame, so the
+    // trailers had nowhere to go - but that is not an error: the alternative
+    // returned not_connected here while the response itself was fine.
+    CHECK_FALSE(send_ec);
+    int headers_frames = 0;
+    int data_frames = 0;
+    const std::string &out = transport->written();
+    for (std::size_t i = 0; i + kH2FrameHeaderSize <= out.size();) {
+        H2FrameHeader hdr;
+        REQUIRE(parse_frame_header(out.substr(i), hdr));
+        const std::size_t end = i + kH2FrameHeaderSize + hdr.length;
+        REQUIRE(end <= out.size());
+        if (hdr.stream_id == 1 && hdr.type == static_cast<std::uint8_t>(H2FrameType::Headers)) {
+            ++headers_frames;
+            CHECK((hdr.flags & H2_FLAG_END_STREAM) != 0);
+        }
+        if (hdr.stream_id == 1 && hdr.type == static_cast<std::uint8_t>(H2FrameType::Data))
+            ++data_frames;
+        i = end;
+    }
+    CHECK(headers_frames == 1);
+    CHECK(data_frames == 0);
+}
+
+TEST_CASE("h2/engine: a streamed HEAD response ends the stream without an error", "[h2]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+
+    std::string in{codec::kH2ClientPreface};
+    append_frame(in, H2FrameType::Settings, 0, 0, "");
+    {
+        std::string block;
+        hpack_append_literal(block, ":method", "HEAD");
+        hpack_append_indexed(block, 7); // :scheme https
+        hpack_append_literal(block, ":path", "/");
+        hpack_append_literal(block, ":authority", "example.com");
+        append_frame(in, H2FrameType::Headers, H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM, 1, block);
+    }
+    transport->push(std::move(in));
+
+    error_code begin_ec = make_error_code(asio::error::would_block);  // sentinel
+    error_code write_ec = make_error_code(asio::error::would_block);  // sentinel
+    error_code finish_ec = make_error_code(asio::error::would_block); // sentinel
+    auto dispatcher = [&](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res,
+                          SslHandle) -> asio::awaitable<void> {
+        begin_ec = co_await res->status(200).content_type("text/plain").begin();
+        write_ec = co_await res->write("dropped");
+        res->trailer("x-checksum", "abc123");
+        finish_ec = co_await res->finish_trailers();
+    };
+
+    auto engine = std::make_shared<Http2Engine<MockTransport>>(transport);
+    REQUIRE(run_on(ctx, engine->run(dispatcher)));
+
+    // begin() ends the stream for HEAD; the following writes must still be
+    // accepted as no-ops rather than reported as not_connected.
+    CHECK_FALSE(begin_ec);
+    CHECK_FALSE(write_ec);
+    CHECK_FALSE(finish_ec);
+    int data_frames = 0;
+    const std::string &out = transport->written();
+    for (std::size_t i = 0; i + kH2FrameHeaderSize <= out.size();) {
+        H2FrameHeader hdr;
+        REQUIRE(parse_frame_header(out.substr(i), hdr));
+        const std::size_t end = i + kH2FrameHeaderSize + hdr.length;
+        REQUIRE(end <= out.size());
+        if (hdr.stream_id == 1 && hdr.type == static_cast<std::uint8_t>(H2FrameType::Data))
+            ++data_frames;
+        i = end;
+    }
+    CHECK(data_frames == 0);
+}
+
+TEST_CASE("h2/engine: a 204 response never carries a DATA frame", "[h2]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+
+    std::string in{codec::kH2ClientPreface};
+    append_frame(in, H2FrameType::Settings, 0, 0, "");
+    {
+        std::string block;
+        hpack_append_indexed(block, 2); // :method GET
+        hpack_append_indexed(block, 7); // :scheme https
+        hpack_append_literal(block, ":path", "/");
+        hpack_append_literal(block, ":authority", "example.com");
+        append_frame(in, H2FrameType::Headers, H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM, 1, block);
+    }
+    transport->push(std::move(in));
+
+    auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res,
+                         SslHandle) -> asio::awaitable<void> { co_await res->status(204).send("must not appear"); };
+
+    auto engine = std::make_shared<Http2Engine<MockTransport>>(transport);
+    REQUIRE(run_on(ctx, engine->run(dispatcher)));
+
+    // 204 has no content (RFC 9110 §15.3.5): the header block ends the stream.
+    int headers_frames = 0;
+    int data_frames = 0;
+    bool saw_204 = false;
+    const std::string &out = transport->written();
+    for (std::size_t i = 0; i + kH2FrameHeaderSize <= out.size();) {
+        H2FrameHeader hdr;
+        REQUIRE(parse_frame_header(out.substr(i), hdr));
+        const std::size_t end = i + kH2FrameHeaderSize + hdr.length;
+        REQUIRE(end <= out.size());
+        if (hdr.stream_id == 1 && hdr.type == static_cast<std::uint8_t>(H2FrameType::Headers)) {
+            ++headers_frames;
+            CHECK((hdr.flags & H2_FLAG_END_STREAM) != 0);
+            HpackDecoder decoder;
+            std::vector<HpackHeader> fields;
+            REQUIRE(decoder.decode(out.substr(i + kH2FrameHeaderSize, hdr.length), fields));
+            for (const auto &field : fields) {
+                if (field.name == ":status" && field.value == "204")
+                    saw_204 = true;
+            }
+        }
+        if (hdr.stream_id == 1 && hdr.type == static_cast<std::uint8_t>(H2FrameType::Data))
+            ++data_frames;
+        i = end;
+    }
+    CHECK(saw_204);
+    CHECK(headers_frames == 1);
+    CHECK(data_frames == 0);
+}
+
 } // namespace

@@ -36,15 +36,15 @@ def h2c_connect():
     return sock, conn
 
 
-def h2_get(path: str):
-    """One GET on its own connection. Returns (status, headers, body, trailers)."""
+def h2_get(path: str, method: str = "GET"):
+    """One request on its own connection. Returns (status, headers, body, trailers)."""
     sock, conn = h2c_connect()
     try:
         sid = conn.get_next_available_stream_id()
         conn.send_headers(
             sid,
             [
-                (":method", "GET"),
+                (":method", method),
                 (":path", path),
                 (":scheme", "http"),
                 (":authority", f"127.0.0.1:{PLAIN_PORT}"),
@@ -131,6 +131,72 @@ def h1_trailers() -> None:
           "h1 chunked terminator carries the trailer fields")
 
 
+def h2_head_trailers() -> None:
+    # A HEAD response has no body and no trailer section, but the response must
+    # still end cleanly at its HEADERS frame (no DATA, no reset).
+    try:
+        status, headers, body, trailers = h2_get("/trailers?oneshot=1", method="HEAD")
+        check(status == 200 and body == b"", f"h2 HEAD with trailers -> {status} {body!r}")
+        check((headers or {}).get("content-length") == "12",
+              f"h2 HEAD keeps its Content-Length -> {(headers or {}).get('content-length')!r}")
+        check(trailers is None, "h2 HEAD carries no trailer section")
+    except (TimeoutError, socket.timeout):
+        fail("h2 HEAD /trailers?oneshot=1 stalled")
+    except RuntimeError as exc:
+        fail(f"h2 HEAD /trailers?oneshot=1: {exc}")
+
+
+def h1_http10_trailers() -> None:
+    # HTTP/1.0 has no chunked framing, so the body is close-delimited and the
+    # fields are dropped. What must NOT happen is the chunk framing appearing in
+    # the client's body (the one-shot path used to switch to it).
+    def fetch(raw_request: bytes) -> bytes:
+        with socket.create_connection(("127.0.0.1", PLAIN_PORT), timeout=10) as sock:
+            sock.sendall(raw_request)
+            raw = b""
+            while True:
+                chunk = sock.recv(65535)
+                if not chunk:
+                    break
+                raw += chunk
+        return raw
+
+    try:
+        raw = fetch(b"GET /trailers?oneshot=1 HTTP/1.0\r\nHost: x\r\n\r\n")
+        head, _, body = raw.partition(b"\r\n\r\n")
+        check(body == b"oneshot body", f"h1.0 one-shot body is not chunk-framed -> {body!r}")
+        check(b"transfer-encoding" not in head.lower(), "h1.0 one-shot response announces no chunking")
+        check(b"x-checksum" not in raw, "h1.0 one-shot drops the trailer fields")
+
+        raw = fetch(b"GET /trailers HTTP/1.0\r\nHost: x\r\n\r\n")
+        _, _, body = raw.partition(b"\r\n\r\n")
+        check(body == b"first second", f"h1.0 streamed body is not chunk-framed -> {body!r}")
+    except (TimeoutError, socket.timeout):
+        fail("h1.0 /trailers stalled")
+
+
+def h1_head_trailers() -> None:
+    # A HEAD response carries the headers a GET would have - Content-Length
+    # included - and nothing after the blank line.
+    try:
+        with socket.create_connection(("127.0.0.1", PLAIN_PORT), timeout=10) as sock:
+            sock.sendall(b"HEAD /trailers?oneshot=1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            raw = b""
+            while True:
+                chunk = sock.recv(65535)
+                if not chunk:
+                    break
+                raw += chunk
+    except (TimeoutError, socket.timeout):
+        fail("h1 HEAD /trailers?oneshot=1 stalled")
+        return
+
+    head, _, body = raw.partition(b"\r\n\r\n")
+    check(b"content-length: 12" in head.lower(), f"h1 HEAD keeps its Content-Length -> {head!r}")
+    check(b"transfer-encoding" not in head.lower(), "h1 HEAD is not streamed")
+    check(body == b"", f"h1 HEAD carries no body -> {body!r}")
+
+
 # --- HTTP/3 (aioquic) --------------------------------------------------------
 #
 # The trailer section on HTTP/3 is a second HEADERS frame after the DATA, sent
@@ -170,12 +236,12 @@ if _HAVE_AIOQUIC:
                 ):
                     self._done.set()
 
-        def get(self, authority: str, path: str) -> int:
+        def get(self, authority: str, path: str, method: str = "GET") -> int:
             self.stream_id = self._quic.get_next_available_stream_id()
             self.http.send_headers(
                 self.stream_id,
                 [
-                    (b":method", b"GET"),
+                    (b":method", method.encode()),
                     (b":scheme", b"https"),
                     (b":authority", authority.encode()),
                     (b":path", path.encode()),
@@ -188,11 +254,11 @@ if _HAVE_AIOQUIC:
         async def wait_done(self) -> None:
             await self._done.wait()
 
-    async def _h3_fetch(path: str):
+    async def _h3_fetch(path: str, method: str = "GET"):
         cfg = QuicConfiguration(is_client=True, alpn_protocols=H3_ALPN)
         cfg.verify_mode = ssl.CERT_NONE  # the test listener's cert is self-signed
         async with quic_connect("127.0.0.1", H3_PORT, configuration=cfg, create_protocol=_H3Client) as client:
-            sid = client.get(f"127.0.0.1:{H3_PORT}", path)
+            sid = client.get(f"127.0.0.1:{H3_PORT}", path, method)
             await asyncio.wait_for(client.wait_done(), timeout=10)
 
             status = 0
@@ -240,6 +306,15 @@ if _HAVE_AIOQUIC:
         except Exception as exc:  # noqa: BLE001
             fail(f"h3 /trailers?oneshot=1: {exc!r}")
 
+        try:
+            status, body, trailers = await _h3_fetch("/trailers?oneshot=1", method="HEAD")
+            check(status == 200 and body == b"", f"h3 HEAD with trailers -> {status} {body!r}")
+            check(trailers is None, "h3 HEAD carries no trailer section")
+        except (TimeoutError, asyncio.TimeoutError):
+            fail("h3 HEAD /trailers?oneshot=1 stalled")
+        except Exception as exc:  # noqa: BLE001
+            fail(f"h3 HEAD /trailers?oneshot=1: {exc!r}")
+
 
 def h3_trailers() -> None:
     if not _HAVE_AIOQUIC:
@@ -252,7 +327,10 @@ def run() -> None:
     print("\n== response trailers (hyper-h2 + raw HTTP/1.1) ==")
     h2_trailers()
     h2_trailers_oneshot()
+    h2_head_trailers()
     h1_trailers()
+    h1_http10_trailers()
+    h1_head_trailers()
 
     print("\n== response trailers over HTTP/3 (aioquic) ==")
     h3_trailers()

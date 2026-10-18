@@ -306,6 +306,14 @@ void register_routes(sh::Server &server) {
         (void)co_await res->write("beta-");
         (void)co_await res->finish("gamma");
     });
+    // A body that ends with a trailer section, for the reverse proxy's
+    // trailer-forwarding check (suite_reverse_proxy).
+    server.route(sh::any_methods, "/trailers", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+        (void)co_await res->status(200).content_type("text/plain").begin();
+        (void)co_await res->write("trailer body");
+        res->trailer("x-checksum", "abc123");
+        (void)co_await res->finish();
+    });
     server.route(sh::any_methods, "/headers", [](sh::RequestPtr req, sh::ResponsePtr res) -> asio::awaitable<void> {
         std::string out;
         for (const auto &[name, value] : req->headers()) {
@@ -435,6 +443,52 @@ asio::awaitable<void> suite_reverse_proxy(std::uint16_t plain_port) {
     check(proxied_stream && proxied_stream->body == "alpha-beta-gamma",
           "a chunked backend passes through the proxy intact -> " +
               (proxied_stream ? proxied_stream->body : describe(proxied_stream.error())));
+
+    // Trailer forwarding: the backend ends its body with a trailer section; the
+    // proxy must relay the fields. The upstream leg is HTTP/1.1 (chunked), the
+    // frontend leg is h2 for the default client and h1 for the pinned one, so
+    // both wire shapes are exercised end to end.
+    {
+        auto s = co_await http.open_stream(front + "/rp/trailers");
+        if (!s) {
+            check(false, "open_stream /rp/trailers (h2 frontend): " + describe(s.error()));
+        } else {
+            // open_stream() keeps the write end open (full-duplex), so even a
+            // bodyless GET must finish() to send END_STREAM - otherwise the
+            // backend-side request never ends.
+            (void)co_await s->finish();
+            std::string got;
+            while (auto c = co_await s->read()) {
+                if (c->eof)
+                    break;
+                got += c->data;
+            }
+            check(got == "trailer body" && s->trailers().get("x-checksum") == "abc123",
+                  "a proxied response's trailers reach an h2 client -> " +
+                      std::string{s->trailers().get("x-checksum").value_or("<none>")});
+        }
+    }
+    {
+        auto cfg = base_config();
+        cfg.default_version = sh::HttpVersionPolicy::Http11;
+        cfg.default_h2c = sh::H2cMode::Off;
+        h::Client h1_http{co_await asio::this_coro::executor, cfg};
+        auto s = co_await h1_http.open_stream(front + "/rp/trailers");
+        if (!s) {
+            check(false, "open_stream /rp/trailers (h1 frontend): " + describe(s.error()));
+        } else {
+            (void)co_await s->finish(); // see above: the write end must be closed explicitly
+            std::string got;
+            while (auto c = co_await s->read()) {
+                if (c->eof)
+                    break;
+                got += c->data;
+            }
+            check(got == "trailer body" && s->trailers().get("x-checksum") == "abc123",
+                  "a proxied response's trailers reach an h1 client -> " +
+                      std::string{s->trailers().get("x-checksum").value_or("<none>")});
+        }
+    }
 
     auto tls_backend = co_await fetch(http, http.get(front + "/rptls/world"));
     check(tls_backend && tls_backend->status == 200 && tls_backend->body == "hello from HTTP/2",

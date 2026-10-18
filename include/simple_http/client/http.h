@@ -142,6 +142,9 @@ class Stream {
     // The head, once read_head() (or read()) has completed; default-constructed
     // (status 0) before that.
     const detail::ResponseHead &head() const { return m_stream->head(); }
+    // Trailer fields received after the body (RFC 9110 §6.5), complete once
+    // read() reported end-of-body. Empty when the peer sent none.
+    [[nodiscard]] const Headers &trailers() const { return m_stream->response_trailers(); }
 
     Version version() const { return m_stream->version(); }
 

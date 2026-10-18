@@ -86,9 +86,17 @@ inline std::string random_hex(std::size_t bytes) {
 // sink renders them as key=value.
 inline Middleware access_log() {
     return [](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
+#if SIMPLE_HTTP_ENABLE_LOG
         const auto start = std::chrono::steady_clock::now();
+#endif
         // Copy, not move: the after-phase still needs req/res.
         co_await next(req, res, ssl);
+        // The budget (timing, peer address, the attrs vector) is only paid when
+        // logging is compiled in. The macros compile out at build time; doing
+        // the same here is what keeps this middleware a no-op in that build,
+        // rather than allocating a vector per request for a record nothing can
+        // receive.
+#if SIMPLE_HTTP_ENABLE_LOG
         const auto elapsed_us =
             std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
         const int status = res->status();
@@ -119,6 +127,7 @@ inline Middleware access_log() {
 
         const LogLevel level = status >= 500 ? LogLevel::Error : (status >= 400 ? LogLevel::Warn : LogLevel::Info);
         log_with_attrs(level, "access", std::source_location::current(), "request", attrs);
+#endif
     };
 }
 

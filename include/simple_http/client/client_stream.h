@@ -116,6 +116,15 @@ class ClientStream {
     const ResponseHead &head() const { return m_head ? *m_head : m_no_head; }
     int status() const { return head().status; }
 
+    // Trailer fields received after the response body (RFC 9110 §6.5): the
+    // chunked trailer section on HTTP/1.1, the trailing HEADERS block on
+    // HTTP/2. Empty when the peer sent none. The engine publishes them while
+    // reading the body, so they are complete once read() reported end-of-body
+    // (a caller that only ever reads the head sees an empty set). Like head(),
+    // this is written on the session's executor and safe to read once the
+    // exchange has delivered the values.
+    [[nodiscard]] const Headers &response_trailers() const noexcept { return m_trailers; }
+
     // The next body event: a chunk, or end-of-body. The head is parsed on the
     // way if the caller never asked for it.
     [[nodiscard]] virtual asio::awaitable<std::expected<ReadResult, error_code>> read() = 0;
@@ -167,6 +176,10 @@ class ClientStream {
     // head still follows and must not be masked by the cached interim.
     void reset_head() { m_head_ready = false; }
 
+    // Called by the engine once the body's trailing field section has been
+    // parsed; see response_trailers().
+    void set_trailers(Headers trailers) { m_trailers = std::move(trailers); }
+
     // Waits until the response head is available (and publishes it via
     // set_head()), or fails. Implemented by the session: only it knows how the
     // head arrives on its wire.
@@ -176,6 +189,7 @@ class ClientStream {
     std::shared_ptr<ResponseHead> m_head;
     bool m_head_ready{false};
     ResponseHead m_no_head{};
+    Headers m_trailers;
     std::function<void()> m_on_destroy;
     std::shared_ptr<void> m_gate_token;
 };

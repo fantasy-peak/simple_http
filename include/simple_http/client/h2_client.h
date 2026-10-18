@@ -1135,6 +1135,10 @@ class Http2ClientSession final : public ClientSession,
         // a malformed response. It can only end the stream, never start a second
         // response.
         if (st.head_seen) {
+            // A trailing field section: keep it for the caller (the reverse
+            // proxy forwards it through Response::finish_trailers()).
+            if (auto handle = st.handle.lock())
+                handle->set_trailers(std::move(headers));
             st.remote_end = true;
             wake(st);
             return true;

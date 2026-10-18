@@ -351,7 +351,15 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
                 co_return;
             }
         }
-        (void)co_await res->finish();
+        // Forward the backend's trailer fields (RFC 9110 §6.5; grpc-status is
+        // the canonical user). Whether the frontend can carry them is its
+        // engine's decision: chunked HTTP/1.1, HTTP/2 and HTTP/3 do; a
+        // close-delimited HTTP/1.0 response or a response to HEAD drops them.
+        if (const Headers &trailers = stream->trailers(); !trailers.empty()) {
+            (void)co_await res->finish_trailers(trailers);
+        } else {
+            (void)co_await res->finish();
+        }
         co_return;
     }
     co_return;

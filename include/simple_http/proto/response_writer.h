@@ -44,7 +44,7 @@ class ResponseSink {
     // fields are what carries the end-of-stream marker on every version (the
     // terminating chunk on HTTP/1.x, a trailing HEADERS frame with END_STREAM on
     // HTTP/2 and HTTP/3). Only meaningful for a streamed response (send_headers
-    // has run); a one-shot send() never carries trailers.
+    // has run); Response::send() with trailers switches to that framing itself.
     //
     // HTTP/1.x needs chunked framing for this; a close-delimited response (an
     // HTTP/1.0 client) or a response to HEAD has nowhere to put a trailer
@@ -76,6 +76,14 @@ class ResponseSink {
 
     // A plain value: no hop, safe from any thread.
     virtual Version version() const = 0;
+
+    // Whether this request was a HEAD. A HEAD response has no body and no
+    // trailer section, but it still carries the Content-Length a GET would have
+    // produced - so the one-shot send() path is the right one for it, even when
+    // the handler accumulated trailers. Known before the response starts (the
+    // engine sets it from the parsed request), unlike the stream-table lookups
+    // the write methods use.
+    [[nodiscard]] virtual bool head_request() const noexcept { return false; }
 };
 
 } // namespace simple_http

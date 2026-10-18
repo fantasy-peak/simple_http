@@ -174,11 +174,18 @@ template <TransportLike Transport> class Http2ResponseSink : public ResponseSink
     asio::awaitable<error_code> send_chunk(std::string data) override {
         co_await hop();
         auto eng = m_engine.lock();
-        if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
+        if (!eng || !eng->alive()) {
             co_return make_error_code(asio::error::not_connected);
         }
-        if (eng->method_is_head(m_stream_id))
+        // Check the cached HEAD flag before stream_writable(): a response to HEAD
+        // ends the stream with its HEADERS frame, and the entry is retired right
+        // there. Looking the method up in the stream table (or checking
+        // writability first) would report not_connected for a body that must
+        // simply be dropped.
+        if (m_head_request)
             co_return error_code{}; // HEAD: no body
+        if (!eng->stream_writable(m_stream_id))
+            co_return make_error_code(asio::error::not_connected);
         // Backpressure: block while this stream's queue is over the high mark, so
         // a fast producer (reverse proxy) is paced by the peer's window.
         if (auto ec = co_await eng->await_out_space(m_stream_id); ec)
@@ -190,11 +197,13 @@ template <TransportLike Transport> class Http2ResponseSink : public ResponseSink
     asio::awaitable<error_code> send_last(std::string data) override {
         co_await hop();
         auto eng = m_engine.lock();
-        if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
+        if (!eng || !eng->alive()) {
             co_return make_error_code(asio::error::not_connected);
         }
-        if (eng->method_is_head(m_stream_id))
+        if (m_head_request)
             co_return error_code{}; // HEAD: no body
+        if (!eng->stream_writable(m_stream_id))
+            co_return make_error_code(asio::error::not_connected);
         if (auto ec = co_await eng->await_out_space(m_stream_id); ec)
             co_return ec;
         eng->enqueue_body(m_stream_id, std::move(data), /*last=*/true);
@@ -204,11 +213,13 @@ template <TransportLike Transport> class Http2ResponseSink : public ResponseSink
     asio::awaitable<error_code> send_trailers(Headers trailers) override {
         co_await hop();
         auto eng = m_engine.lock();
-        if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
+        if (!eng || !eng->alive()) {
             co_return make_error_code(asio::error::not_connected);
         }
-        if (eng->method_is_head(m_stream_id))
+        if (m_head_request)
             co_return error_code{}; // HEAD: no body, so no trailer section either
+        if (!eng->stream_writable(m_stream_id))
+            co_return make_error_code(asio::error::not_connected);
         eng->submit_trailers(m_stream_id, trailers);
         co_return error_code{};
     }
@@ -231,6 +242,12 @@ template <TransportLike Transport> class Http2ResponseSink : public ResponseSink
         }
     }
     Version version() const override { return Version::Http2; }
+    bool head_request() const noexcept override { return m_head_request; }
+
+    // Cached when the handler starts (the parsed method is only available then).
+    // The write methods need it after the HEADERS frame has already retired the
+    // stream, when a stream-table lookup would no longer find the request.
+    void set_head_request(bool head) noexcept { m_head_request = head; }
 
   private:
     asio::awaitable<void> hop() const { co_await asio::dispatch(asio::bind_executor(m_executor, asio::use_awaitable)); }
@@ -238,6 +255,7 @@ template <TransportLike Transport> class Http2ResponseSink : public ResponseSink
     std::weak_ptr<Http2Engine<Transport>> m_engine;
     std::uint32_t m_stream_id;
     Executor m_executor;
+    bool m_head_request{false};
 };
 
 template <TransportLike Transport> class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> {
@@ -2007,6 +2025,10 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         }
         auto request = it->second.request;
         auto writer = it->second.writer;
+        // Remember the method on the sink before the response starts: once a HEAD
+        // response's HEADERS frame ends the stream, the entry is retired and the
+        // stream table can no longer answer "was this a HEAD?".
+        writer->set_head_request(request->method() == Method::Head);
         auto self = this->shared_from_this(); // keep engine alive across suspensions
         std::uint32_t sid = stream_id;
         asio::co_spawn(

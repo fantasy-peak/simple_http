@@ -44,7 +44,8 @@ class Request {
           m_target(std::move(other.m_target)), m_headers(std::move(other.m_headers)),
           m_params(std::move(other.m_params)), m_query_params(std::move(other.m_query_params)), m_close(other.m_close),
           m_stream_body(other.m_stream_body), m_content_length(other.m_content_length), m_url(std::move(other.m_url)),
-          m_body_source(std::move(other.m_body_source)), m_stop(std::move(other.m_stop)) {
+          m_body_source(std::move(other.m_body_source)), m_state(std::move(other.m_state)),
+          m_stop(std::move(other.m_stop)) {
         rebind_views();
     }
     Request &operator=(Request &&other) noexcept {
@@ -64,6 +65,7 @@ class Request {
         m_content_length = other.m_content_length;
         m_url = std::move(other.m_url);
         m_body_source = std::move(other.m_body_source);
+        m_state = std::move(other.m_state);
         m_stop = std::move(other.m_stop);
         rebind_views();
         return *this;
