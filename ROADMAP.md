@@ -29,7 +29,7 @@ axum/tower、reqwest/tungstenite）的能力面整理。分四档：
 - **`Request` 两端共用**（`proto/request.h`）：服务端引擎填充（`set_method`/`set_target`/`mutable_headers`/`body().feed`）、handler 读（`method/path/query/header/body/param/state`）；客户端构建（`set_url`、`set_body`、`close`/`stream_body`、`basic_auth`）+ 引擎发送。`clone_for_replay`（= Go `GetBody`）供策略重试与 h2c upgrade 重放。会话接口收 `shared_ptr<Request>`，与服务端 `RequestPtr` 对称。
 - **旧类型已移除**：`HttpClient`（连接引擎入 `simple_http::detail::ClientEngine`，便捷层迁入 `Client`）、`RequestSpec`（并入 `Request`）均删除；`client/client.h` 聚合头删除。
 - **客户端 WebSocket**（`client/ws_client.h`）：`Client::open_websocket(url, spec)` → `expected<shared_ptr<WebSocket>>`；经由 `ClientEngine::dial_transport`（裸建连，不开 HTTP 会话）+ HTTP/1.1 Upgrade 握手（校验 101 + `Sec-WebSocket-Accept`），复用服务端 `WsBackendImpl`/`WebSocket`（方向参数：服务端解析掩码帧、客户端解析无掩码帧、客户端写帧掩码）。
-- 测试：`test/client.cpp`（151 checks，含 `suite_websocket`/`suite_multipart`/`suite_retry`/`suite_reverse_proxy`），`test/client_cross.cpp`+`test/ws_client_cross.cpp` 为**双向 Python 交叉验证**（stdlib http.server / websockets 库对客户端；`xmake run client-cross-python`）。
+- 测试：`test/client.cpp`（175 checks，含 `suite_websocket`/`suite_multipart`/`suite_retry`/`suite_reverse_proxy`），`test/client_cross.cpp`+`test/ws_client_cross.cpp` 为**双向 Python 交叉验证**（stdlib http.server / websockets 库对客户端；`xmake run client-cross-python`）。
 
 **剩余功能 backlog（回接上文各档）**：出站代理、SNI 多证书、请求体缓存读取、
 per-route 体积上限、进程内测试工具、请求 dump、
@@ -39,7 +39,8 @@ AccessLog 结构化。
 
 | 能力 | 对标 | 现状与方案 |
 |---|---|---|
-| **HTTP/2 上的 WebSocket（RFC 8441）** | axum/tower `ws` over h2 | ✅ 已完成（服务端）：h2 引擎宣告 `SETTINGS_ENABLE_CONNECT_PROTOCOL`，处理 `CONNECT + :protocol: websocket`（校验 method/`:scheme`/`:path`，凭据不足则 PROTOCOL_ERROR 重置流；未路由则 404），回 `200` 后由 `engine/h2/h2_ws_transport.h` 把单条流适配成 `WsBackendImpl` 的 Transport，复用全部帧编解码/掩码/流控/permessage-deflate；半关闭（客户端 END_STREAM）后仍可回写。验证：`test/python/rfc8441_client.py`（hyper-h2，77 checks，含 h2c/TLS/`wss`/deflate/分片/极限/多路复用）。客户端 h2 WebSocket 仍未做 |
+| **HTTP/2 上的 WebSocket（RFC 8441）** | axum/tower `ws` over h2 | ✅ 已完成（服务端）：h2 引擎宣告 `SETTINGS_ENABLE_CONNECT_PROTOCOL`，处理 `CONNECT + :protocol: websocket`（校验 method/`:scheme`/`:path`，凭据不足则 PROTOCOL_ERROR 重置流；未路由则 404），回 `200` 后由 `engine/h2/h2_ws_transport.h` 把单条流适配成 `WsBackendImpl` 的 Transport，复用全部帧编解码/掩码/流控/permessage-deflate；半关闭（客户端 END_STREAM）后仍可回写。验证：`test/python/rfc8441_client.py`（hyper-h2，84 checks，含 h2c/TLS/`wss`/deflate/分片/极限/多路复用）。客户端 h2 WebSocket 仍未做 |
+| **反向代理对齐 Go `httputil.ReverseProxy`** | Go `net/http/httputil` | ✅ 已完成：请求级 HTTP 代理对齐 Go（hop-by-hop 过滤含所有 `Connection` 点名字段、X-Forwarded-* 自证、`TE: trailers`/响应 trailer、CONNECT 405、幂等安全重试、请求取消、`hooks.rewrite`/`modify_response`/`error_handler`、`preserve_host`/`host_header`、h2c Upgrade 或 prior knowledge）；WebSocket 字节级隧道由 h1 Upgrade 与 h2 extended CONNECT 共用 `engine/ws_proxy_common.h` 握手/头策略，校验 101 后原样拼接。后端 wss/TLS 与通用 101 仍未做 |
 | **出站代理** | reqwest `Proxy`、Go `http.ProxyFromEnvironment` | `HTTP_PROXY`/`HTTPS_PROXY` 环境变量 + `ClientConfig::proxy`；HTTP 代理用 `CONNECT` 隧道（TLS）或绝对-form 请求（明文）；SOCKS5 可选。涉及连接层（`acquire` 处把代理端当作对端握手） |
 | **客户端构造 multipart 上传** | reqwest `.multipart()`、Go `mime/multipart` | ✅ 已完成（`proto/multipart.h` 的 `MultipartForm`——boundary 生成、part 头（name/filename 引号转义，Go escapeQuotes 语义）、3 参 `file()` 按扩展名自动 Content-Type、`release_body()` 免拷贝；`RequestBuilder::multipart(form)` 进 `send()`/`send_stream()` 便捷层。测试：`suite_multipart`（9 checks）+ 单测 `[forms]`） |
 | **URL 百分号编码工具** | Go `net/url.QueryEscape` / `PathEscape`、axum 无（serde） | ✅ 已完成（`core/url_encoding.h`：`query_escape` / `path_escape`） |
@@ -62,7 +63,7 @@ AccessLog 结构化。
 
 | 能力 | 对标 | 备注 |
 |---|---|---|
-| **HTTP/2 上的 WebSocket（RFC 8441）** | axum/tower `ws` over h2 | `h2_engine` 未见 `CONNECT + :protocol: websocket` 处理；AGENTS 已注明"尚未接入" |
+| **HTTP/2 上的 WebSocket（RFC 8441）** | axum/tower `ws` over h2 | ✅ 已完成（服务端），见上表；客户端 h2 WebSocket 仍未做 |
 | **WebSocket permessage-deflate** | Autobahn 停 216 个 UNIMPLEMENTED | RFC 7692 扩展协商 + 压缩帧数据 |
 | **multipart 流式处理** | axum `Multipart` 不整块入内存 | 目前 `parse_multipart` 整段缓冲（单 part 有上限兜底）；如需大文件上传流式落盘再动 |
 | **HTTP/3 0-RTT / 连接迁移** | ngtcp2 能力 | 0-RTT 默认关（安全）；迁移是新连接的优化项 |

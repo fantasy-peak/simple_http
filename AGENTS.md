@@ -70,11 +70,15 @@ include/
       tls_context.h        TlsContext / TlsConfig（OpenSSL + ALPN）
       tls_transport.h      TlsStreamTransport（ssl::stream）
     engine/                各版本协议引擎（实现 ResponseWriter）
-      dispatcher.h         Dispatcher / WsLookup / WsHandlerFn 类型（引擎↔handler 的窄接缝）
+      dispatcher.h         Dispatcher / WsLookup / WsHandlerFn 类型（引擎↔handler 的窄接缝）；
+                           WsProxyTarget / HttpProxyTarget（反代路由与钩子）
+      ws_proxy_common.h    h1 Upgrade 与 h2 extended CONNECT 共用的 WS 后端握手：
+                           构建 Upgrade 请求、hop-by-hop/转发头策略、101 校验、连接预算
       h1/                  HTTP/1.x 引擎 + 请求头解析器 h1_parser.h（含 WebSocket 升级握手、
-                           h2c 升级）；ws_proxy.h 是字节级 WebSocket 隧道
+                           h2c 升级）；ws_proxy.h 是字节级 WebSocket 隧道（半关闭 + 响应校验）
       h2/                  HTTP/2 引擎 + 帧层 + HPACK（h2_frame / hpack_*）；读/写分离
-                           （read_loop || write_loop），请求体按流停放
+                           （read_loop || write_loop），请求体按流停放；h2 extended CONNECT
+                           的 ws 反代复用 ws_proxy_common.h
       h3/                  HTTP/3 引擎——nghttp3 与本库 Dispatcher 之间的适配层：
                            h3_engine.h / h3_stream.h / h3_callbacks.h
                            （#ifdef SIMPLE_HTTP_ENABLE_HTTP3）
@@ -87,7 +91,9 @@ include/
       cors.h               内建 CORS：CorsConfig 编译成 Middleware（预检 204，不进路由）
       conditionals.h       handler 级条件请求 304
       router.h             Router（方法感知精确路由 + 段 trie + 反代 + 静态阶段；group/per-route）
-      http_proxy.h         请求级反代：每请求一条上游连接（client 层），响应流式回传
+      http_proxy.h         请求级反代（Go ReverseProxy 形态）：每请求一条上游连接（client 层），
+                           响应流式回传；hop-by-hop/X-Forwarded-*/TE:trailers、CONNECT 405、
+                           幂等重试、请求取消、Rewrite/ModifyResponse/ErrorHandler 钩子
       static_files.h       静态文件服务（static_table.h 的 serving 半边 + SPA fallback）
     quic/                  QUIC 传输（#ifdef SIMPLE_HTTP_ENABLE_HTTP3）——ngtcp2 的包装
       protocol.h / connection.h / endpoint.h / ngtcp2_config.h / ngtcp2_crypto.h / tls.h
@@ -347,10 +353,12 @@ DATA 流当作 WebSocket 隧道（`engine/h2/h2_ws_transport.h` 把单条 h2 流
 - **h2 extended CONNECT（RFC 8441）**：在 **h2 引擎内**判定——`:method = CONNECT` +
   `:protocol = websocket`，校验 `:scheme`/`:path` 后按 nginx 序查找：本地精确 ws 路由 →
   `ws_proxy` 反代 → 本地正则 ws 路由。本地路由走上 ws 中间件链，终端的 `WsUpgrade` 回
-  `200` 并建立流级隧道；`ws_proxy` 在前端 h2 与后端 HTTP/1.1 之间做**握手翻译**（向后端
-  合成 `Sec-WebSocket-Key` 发起 Upgrade，等 101 后回 h2 `200`，保留 query 字符串，转发
-  后端协商的 `Sec-WebSocket-Extensions` 等头部，随后字节级拼接）。`:protocol` 非
-  websocket 走普通 dispatch。
+  `200` 并建立流级隧道；`ws_proxy` 反代复用 `engine/ws_proxy_common.h`：与 h1 Upgrade
+  同一套上游握手（hop-by-hop 过滤、X-Forwarded-* 策略、Host 策略、连接预算），合成
+  `Sec-WebSocket-Key` 发起 Upgrade，校验 101/`Sec-WebSocket-Accept` 后回 h2 `200`，
+  保留 query 与后端协商的 `Sec-WebSocket-Extensions`/`Sec-WebSocket-Protocol`，随后
+  字节级拼接；后端拒绝升级时回传其真实状态（非 502）。`:protocol` 非 websocket 走普通
+  dispatch。
 - 升级成功后 transport 交由对应协议层接管，H1 引擎不再关闭它（`m_upgraded`）。
 
 完整用法参考 `test/server.cpp`。
@@ -434,15 +442,20 @@ auto ws = co_await client.open_websocket("wss://host/chat", {.origin = "https://
   它绑定的会话（退出 worker 前先 drain）。
 - **客户端 WebSocket**：`open_websocket` 经 `dial_transport` 裸建连 + HTTP/1.1 Upgrade 握手
   （校验 101 + `Sec-WebSocket-Accept`），复用服务端 `WsBackendImpl`；帧方向由参数区分。
-- **反代**：`Server::http_proxy*` 由 `handler/http_proxy.h` 处理，上游走 client 层
-  （TLS/ALPN 选 h2、`h2c` 尝试一次 Upgrade）。每条反代路由自带一个 `ClientConfig`；
-  按 nginx 默认形态**每请求新建一个 Client**（pinned 到当前连接 executor），交换结束即释放。
-  WebSocket 反代（`ws_proxy*`）是字节级隧道。
+- **反代**：`Server::http_proxy*` 由 `handler/http_proxy.h` 处理，形态对齐 Go
+  `httputil.ReverseProxy`（hop-by-hop 全量过滤、X-Forwarded-* 自证、TE: trailers、
+  幂等安全重试、请求取消、CONNECT 405、`hooks.rewrite`/`modify_response`/`error_handler`、
+  `preserve_host`/`host_header`），上游走 client 层（TLS/ALPN 选 h2、`h2c` 可选 Upgrade
+  或 prior knowledge）。每条反代路由自带一个 `ClientConfig`；按 nginx 默认形态**每请求新建
+  一个 Client**（pinned 到当前连接 executor），交换结束即释放。WebSocket 反代（`ws_proxy*`）
+  是字节级隧道：h1 Upgrade 与 h2 extended CONNECT 共用 `ws_proxy_common.h` 的握手与头策略，
+  校验 101 后原样拼接；后端固定为 HTTP/1.1 明文。
 
-完整用法与边界用例参考 `test/client.cpp`（自检，`xmake run client`，161 checks，含
+完整用法与边界用例参考 `test/client.cpp`（自检，`xmake run client`，175 checks，含
 `suite_websocket`/`suite_multipart`/`suite_retry`/`suite_reverse_proxy`）。**双向 Python
 交叉验证**：`test/python/run.py` 用第三方客户端驱动 C++ 服务端（httpx/h2/websockets/aioquic，
-101 checks，含 h1/h2/h3 三传输的响应 trailer）；`test/python/run_client_cross.py`
+113 checks，含 h1/h2/h3 三传输的响应 trailer）；`test/python/rfc8441_client.py` 单独验证
+h2 extended CONNECT 与 h2 ws 反代（84 checks）；`test/python/run_client_cross.py`
 用独立服务端驱动 C++ 客户端。
 
 ### 压测工具（loadgen，用本库自己的客户端打负载）
@@ -508,10 +521,10 @@ xmake run server         # 运行示例服务器（明文 :7788，TLS :7789，h2
 四套自检（前三套默认不参与 all，`set_default(false)`）：
 
 ```sh
-xmake build unittest && xmake run unittest      # 纯逻辑单元测试（Catch2，秒级；257 用例）
+xmake build unittest && xmake run unittest      # 纯逻辑单元测试（Catch2，秒级；294 用例）
 xmake build regression && xmake run regression  # 服务端对抗性回归（裸 socket）
-xmake build client && xmake run client          # 客户端整合自检（PASS/FAIL + 退出码；161 checks）
-xmake build server && xmake run python-tests    # 第三方客户端驱动服务端（101 checks）
+xmake build client && xmake run client          # 客户端整合自检（PASS/FAIL + 退出码；175 checks）
+xmake build server && xmake run python-tests    # 第三方客户端驱动服务端（113 checks）
 ```
 
 - **`test/python/`**：用 **httpx / hyper-h2 / websockets / aioquic** 这几个**独立实现**驱动

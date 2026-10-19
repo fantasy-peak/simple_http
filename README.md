@@ -50,7 +50,7 @@ knowledge) and h2c, and the client speaks the same protocols outbound. HTTP/3
 - **🔒 HTTPS & mTLS** — server and client side, including client-certificate inspection from a handler.
 - **🌊 Streaming both ways** — request and response bodies stream with flow-control backpressure; a large payload never has to be materialized.
 - **🧱 Backpressure that survives a hostile peer** — a request body that backs up is parked per stream (HTTP/2) or drained by a bounded internal reader (WebSocket), so one stream or one serial handler cannot stall the connection.
-- **🌐 Reverse proxy** — request-level HTTP proxying (plaintext, TLS or h2c backends, each route carrying its own client policy) and byte-level WebSocket pass-through.
+- **🌐 Reverse proxy** — request-level HTTP proxying (`httputil.ReverseProxy`-shaped: hop-by-hop stripping, `X-Forwarded-*`, `TE: trailers`, `Rewrite`/`ModifyResponse`/`ErrorHandler`, Host policy) and byte-level WebSocket pass-through for both h1 Upgrade and h2 extended CONNECT.
 - **🔌 TCP and UNIX-domain sockets** — bind a path instead of a port when the peer is a local sidecar; TLS, WebSocket and proxying all work over either.
 - **🧩 Middleware** — Go `net/http` / tower-style middleware: global (`use`), per-group and per-route, with before/after wrapping, short-circuiting and per-request state — plus built-ins (`request_id`, `access_log`, `recovery`, `basic_auth`, `real_ip`, `clean_path`, `strip_prefix`, `redirect_slashes`, `timeout`, `secure_headers`, CORS, rate limiting).
 - **📑 Forms, queries & JSON** — `req->query_params()` (Go `r.URL.Query` / axum `Query<T>`), `read_urlencoded_body`, `read_multipart_body` and the client-side `MultipartForm` / `RequestBuilder::multipart()`, and — on by default, via glaze — `read_json_body<T>` / `write_json` (axum `Json<T>`), plus `res->redirect()`, a Server-Sent Events wrapper, and rate limiting (`429` + `Retry-After`, token bucket or per-key).
@@ -450,27 +450,48 @@ server.use(simple_http::middleware::secure_headers(simple_http::middleware::Secu
 server.cors(simple_http::CorsConfig{.allow_origins = {"https://app.example"}});
 ```
 
-Reverse proxy — request-level for HTTP, byte-level for WebSocket:
+Reverse proxy — request-level HTTP (`httputil.ReverseProxy`-shaped) and
+byte-level WebSocket pass-through:
 
 ```cpp
 // Plaintext HTTP/1.1 backend: the short form.
 server.http_proxy("/api", "backend.internal", 8080);
-// An https backend gets HTTP/2 for free when it offers it over ALPN — set `h2c`
-// instead to reach a plaintext HTTP/2 backend.
+// An https backend gets HTTP/2 for free when it offers it over ALPN; `h2c`
+// reaches a plaintext HTTP/2 backend (Upgrade by default, prior knowledge
+// opt-in with h2c_prior_knowledge).
 server.http_proxy("/v2", HttpProxyTarget{.host = "10.0.0.5", .port = 8443, .tls = true});
 // Regex routes take capture groups in the rewrite.
 server.http_proxy_regex("^/v1/(.*)$", "10.0.0.5", 9000, "/$1");
-// WebSocket frames pass through untouched.
+// Per-route Go-style hooks: Rewrite / ModifyResponse / ErrorHandler.
+HttpProxyTarget target{.host = "10.0.0.5", .port = 8080};
+target.hooks.rewrite = [](const Request &, Request &out) { out.set_target("/internal/health"); };
+target.hooks.modify_response = [](int &status, Headers &headers, const Request &) {
+    headers.add("x-proxied-by", "simple_http");
+    return error_code{};
+};
+server.http_proxy("/health", std::move(target));
+// WebSocket: an h1 Upgrade and an h2 extended CONNECT (RFC 8441) both tunnel to
+// an HTTP/1.1 backend; frames, fragmentation, control frames and deflate pass
+// through untouched.
 server.ws_proxy("/ws", "backend.internal", 9000);
 ```
 
-Proxying runs through the client layer, so the upstream may be plaintext or TLS
-and may speak HTTP/1.1 or HTTP/2, regardless of what the frontend speaks. Bodies
-stream in both directions; `X-Forwarded-*` headers are added and hop-by-hop
-headers are stripped. Each proxy route carries its **own** `ClientConfig` (TLS
-trust, client certificates, timeouts), so an internal mTLS backend and a public
-one never share credentials, and a `Client` is built per proxied request — no
-pool, no cross-request head-of-line blocking.
+The HTTP side follows Go's `ReverseProxy`: hop-by-hop fields (including every
+field named by any `Connection`) are stripped, `X-Forwarded-For`/`-Proto`/`-Host`
+are authored by the proxy (`preserve_inbound_forwarding`, or a `hooks.rewrite`,
+keeps/deletes inbound values), `TE: trailers` and upstream trailers are
+forwarded, `CONNECT` is answered 405, and only replay-safe requests are retried
+after anything reached the wire. `preserve_host` / `host_header` choose between
+the frontend Host, the backend authority and an explicit override. Each proxy
+route carries its **own** `ClientConfig` (TLS trust, client certificates,
+timeouts), so an internal mTLS backend and a public one never share credentials,
+and a `Client` is built per proxied request — no pool, no cross-request
+head-of-line blocking.
+
+The WebSocket side is byte-level on both frontends: `ws_proxy*` builds the
+backend Upgrade request with the same header policy, validates the 101
+(including `Sec-WebSocket-Accept`), then splices bytes verbatim — no frame
+parsing, no size cap. The upstream leg is HTTP/1.1 over plaintext TCP today.
 
 ---
 
@@ -561,6 +582,14 @@ An `Upgrade: websocket` request is answered 101 by the HTTP/1.1 engine; a
 protocol error, a received Close and invalid UTF-8 are all answered with the
 correct Close code **after** the handler's pending echoes, so ordering on the
 wire matches what a read-driven handler would have produced.
+
+`server.ws_proxy*` is the byte-level reverse-proxy counterpart: the h1 Upgrade
+and the h2 extended-CONNECT paths share one upstream handshake
+(`engine/ws_proxy_common.h`), which applies the same header policy as the HTTP
+proxy, validates the backend's 101 (`Upgrade` plus `Sec-WebSocket-Accept`), and
+then splices the two byte streams. Nothing after the handshake is decoded, so
+subprotocols, fragmentation, control frames and permessage-deflate pass through
+unchanged.
 
 ---
 
