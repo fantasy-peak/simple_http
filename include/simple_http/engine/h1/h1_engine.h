@@ -411,6 +411,11 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
     explicit Http1Engine(std::shared_ptr<Transport> transport, EngineLimits limits = {})
         : m_transport(std::move(transport)), m_executor(m_transport->get_executor()), m_limits(limits) {}
 
+    // Whether an `Upgrade: h2c` request may switch this connection to HTTP/2.
+    // A listener declared PlaintextHttp::Http1Only turns this off so the
+    // upgrade is not silently honoured.
+    void allow_h2c_upgrade(bool allow) { m_allow_h2c = allow; }
+
     // Serve requests on this connection until it closes or a request is not
     // keep-alive. `dispatch` runs the handler for each request. `initial` may
     // contain bytes already read from the transport during protocol detection
@@ -600,7 +605,7 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
             // continue the connection as HTTP/2, replaying this request as
             // stream 1 (RFC 7540 §3.2). The transport is then owned by the h2
             // engine, so serve_loop returns.
-            if (upgrade && is_h2c_upgrade(head, *upgrade)) {
+            if (m_allow_h2c && upgrade && is_h2c_upgrade(head, *upgrade)) {
                 m_buf.assign(parser.remainder());
                 co_await do_h2c_upgrade(dispatch, head);
                 co_return;
@@ -1223,6 +1228,7 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
     WsLookup m_ws_regex_lookup;      // local WebSocket route lookup, regex only
                                      // (empty if none)
     bool m_upgraded{false};          // connection handed off to the WebSocket / proxy layer
+    bool m_allow_h2c{true};          // PlaintextHttp::Http1Only turns this off
 };
 
 } // namespace simple_http

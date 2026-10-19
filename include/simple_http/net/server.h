@@ -1345,7 +1345,8 @@ class Server {
                 auto live = track_connection(ctx_ptr, [transport] { transport->close(); });
                 asio::co_spawn(ctx,
                                serve_plaintext(transport, dispatch, ws_lookup, meta->limits, ws_proxy_lookup,
-                                               ws_regex_lookup, to_plaintext_protocols(meta->cfg.plaintext)),
+                                               ws_regex_lookup, to_plaintext_protocols(meta->cfg.plaintext),
+                                               meta->cfg.plaintext != PlaintextHttp::Http1Only),
                                [this, live, meta](std::exception_ptr) {
                                    if (meta->max_connections != 0)
                                        meta->active.fetch_sub(1, std::memory_order_acq_rel);

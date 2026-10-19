@@ -59,10 +59,10 @@ enum class PlaintextProtocols {
 // connection open (the engines' own watchdogs only start once a protocol has
 // been chosen).
 template <typename Transport>
-inline asio::awaitable<void> serve_plaintext(std::shared_ptr<Transport> transport, Dispatcher dispatch,
-                                             WsLookup ws_lookup = {}, EngineLimits limits = {},
-                                             WsProxyLookup ws_proxy_lookup = {}, WsLookup ws_regex_lookup = {},
-                                             PlaintextProtocols protocols = PlaintextProtocols::Both) {
+inline asio::awaitable<void>
+serve_plaintext(std::shared_ptr<Transport> transport, Dispatcher dispatch, WsLookup ws_lookup = {},
+                EngineLimits limits = {}, WsProxyLookup ws_proxy_lookup = {}, WsLookup ws_regex_lookup = {},
+                PlaintextProtocols protocols = PlaintextProtocols::Both, bool allow_h2c_upgrade = true) {
     using namespace asio::experimental::awaitable_operators;
 
     // A listener that serves one protocol does not sniff — that is the whole
@@ -80,6 +80,7 @@ inline asio::awaitable<void> serve_plaintext(std::shared_ptr<Transport> transpor
         // Shared: the request bodies' pull providers hold a weak_ptr (see
         // h1_engine.h serve_loop), which needs the engine to be shared-owned.
         auto engine = std::make_shared<Http1Engine<Transport>>(transport, limits);
+        engine->allow_h2c_upgrade(allow_h2c_upgrade);
         co_await engine->run(dispatch, {}, std::move(ws_lookup), std::move(ws_proxy_lookup),
                              std::move(ws_regex_lookup));
         co_return;
