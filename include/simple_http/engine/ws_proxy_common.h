@@ -13,17 +13,22 @@
 // is a Transport and the other is an h2 stream, but the handshake must not
 // drift between them.
 
+#include <algorithm>
 #include <array>
 #include <boost/asio.hpp>
+#include <boost/asio/cancel_after.hpp>
 #include <boost/asio/experimental/awaitable_operators.hpp>
 #include <charconv>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <memory>
 #include <random>
+#include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -256,11 +261,28 @@ struct WsProxyReplyHead {
     std::string initial; // bytes the backend sent after the head
 };
 
+// One bounded read from the backend. `timeout == 0` means no deadline (the
+// route's connect budget disabled); otherwise the operation is cancelled with
+// asio::error::timed_out. Every handshake/refusal read goes through this so a
+// backend that accepts and then says nothing cannot pin the frontend forever.
+template <typename Socket>
+asio::awaitable<std::pair<error_code, std::size_t>> ws_proxy_read_some(Socket &socket, std::span<std::byte> buf,
+                                                                       std::chrono::steady_clock::duration timeout) {
+    if (timeout.count() <= 0) {
+        auto [ec, n] =
+            co_await socket.async_read_some(asio::buffer(buf.data(), buf.size()), asio::as_tuple(asio::use_awaitable));
+        co_return std::pair{ec, n};
+    }
+    auto [ec, n] = co_await socket.async_read_some(asio::buffer(buf.data(), buf.size()),
+                                                   asio::cancel_after(timeout, asio::as_tuple(asio::use_awaitable)));
+    co_return std::pair{ec, n};
+}
+
 // Reads and parses the backend's response head. Bounded by `max_header_bytes`;
 // anything after the head is returned as `initial` so no tunnel byte is lost.
 template <typename Socket>
-asio::awaitable<std::expected<WsProxyReplyHead, error_code>> ws_proxy_read_reply(Socket &socket,
-                                                                                 std::size_t max_header_bytes) {
+asio::awaitable<std::expected<WsProxyReplyHead, error_code>>
+ws_proxy_read_reply(Socket &socket, std::size_t max_header_bytes, std::chrono::steady_clock::duration timeout) {
     H1ResponseParser parser;
     std::string raw;
     std::array<std::byte, 4096> buf{};
@@ -280,13 +302,171 @@ asio::awaitable<std::expected<WsProxyReplyHead, error_code>> ws_proxy_read_reply
         if (raw.size() > max_header_bytes) {
             co_return std::unexpected{make_error_code(asio::error::no_buffer_space)};
         }
-        auto [ec, n] =
-            co_await socket.async_read_some(asio::buffer(buf.data(), buf.size()), asio::as_tuple(asio::use_awaitable));
+        auto [ec, n] = co_await ws_proxy_read_some(socket, std::span<std::byte>{buf}, timeout);
         if (ec || n == 0) {
             co_return std::unexpected{ec ? ec : make_error_code(asio::error::eof)};
         }
         raw.append(reinterpret_cast<const char *>(buf.data()), n);
         parser.feed(std::string_view{reinterpret_cast<const char *>(buf.data()), n});
+    }
+}
+
+// Tracks where an HTTP/1.1 body ends without buffering or decoding it. Only the
+// refusal path uses this: the body is relayed verbatim, but the proxy must know
+// when to stop instead of waiting for a close-delimited EOF (a keep-alive
+// backend never sends one) or truncating at a Content-Length that is not there.
+class H1ChunkedEndScanner {
+  public:
+    void feed(std::string_view bytes) {
+        for (char c : bytes) {
+            if (m_state == State::Done)
+                return;
+            switch (m_state) {
+            case State::Size:
+                if (c == '\r') {
+                    m_state = State::SizeLf;
+                } else if (c == ';') {
+                    m_state = State::SizeExt;
+                } else if (int digit = hex_value(c); digit >= 0) {
+                    m_size = m_size * 16 + static_cast<std::uint64_t>(digit);
+                } else {
+                    m_state = State::Done; // malformed: stop relaying, never spin
+                }
+                break;
+            case State::SizeExt:
+                if (c == '\r')
+                    m_state = State::SizeLf;
+                break;
+            case State::SizeLf:
+                m_state = c == '\n' ? (m_size == 0 ? State::TrailerStart : State::Data) : State::Done;
+                m_remaining = m_size;
+                break;
+            case State::Data:
+                if (m_remaining > 0)
+                    --m_remaining;
+                if (m_remaining == 0)
+                    m_state = State::DataCr;
+                break;
+            case State::DataCr:
+                m_state = c == '\r' ? State::DataLf : State::Done;
+                break;
+            case State::DataLf:
+                if (c != '\n') {
+                    m_state = State::Done;
+                } else {
+                    m_size = 0;
+                    m_state = State::Size;
+                }
+                break;
+            case State::TrailerStart:
+                m_state = c == '\r' ? State::TrailerEndLf : State::TrailerRest;
+                break;
+            case State::TrailerRest:
+                if (c == '\r')
+                    m_state = State::TrailerLf;
+                break;
+            case State::TrailerLf:
+                m_state = c == '\n' ? State::TrailerStart : State::Done;
+                break;
+            case State::TrailerEndLf:
+                // The terminating blank line's LF; anything else is malformed,
+                // and either way the relay stops here.
+                m_state = State::Done;
+                break;
+            case State::Done:
+                break;
+            }
+        }
+    }
+
+    [[nodiscard]] bool done() const { return m_state == State::Done; }
+
+  private:
+    enum class State {
+        Size,
+        SizeExt,
+        SizeLf,
+        Data,
+        DataCr,
+        DataLf,
+        TrailerStart,
+        TrailerRest,
+        TrailerLf,
+        TrailerEndLf,
+        Done
+    };
+
+    static int hex_value(char c) {
+        if (c >= '0' && c <= '9')
+            return c - '0';
+        if (c >= 'a' && c <= 'f')
+            return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F')
+            return c - 'A' + 10;
+        return -1;
+    }
+
+    State m_state{State::Size};
+    std::uint64_t m_size{0};
+    std::uint64_t m_remaining{0};
+};
+
+// Appends a non-101 refusal body to `out` (which already holds the head and the
+// bytes returned as `initial`) until the response ends. Content-Length is
+// honored exactly; chunked runs to its terminating chunk; anything else is
+// close-delimited and stops at EOF. Bounded in bytes and in time.
+template <typename Socket>
+asio::awaitable<void> ws_proxy_relay_refusal_body(Socket &backend, std::string &out, std::string_view initial,
+                                                  const Headers &headers, std::chrono::steady_clock::duration timeout) {
+    constexpr std::size_t kMaxRefusalBodyBytes = 4 * 1024 * 1024;
+    const std::size_t body_start = out.size() - initial.size();
+    std::array<std::byte, 8192> buf{};
+
+    std::uint64_t want = 0;
+    bool has_length = false;
+    if (auto cl = headers.get("content-length")) {
+        auto [ptr, ec] = std::from_chars(cl->data(), cl->data() + cl->size(), want);
+        has_length = ec == std::errc{} && ptr == cl->data() + cl->size();
+    }
+    bool chunked = false;
+    for (auto value : headers.get_all("transfer-encoding")) {
+        if (ws_value_has_token(value, "chunked"))
+            chunked = true;
+    }
+    // RFC 9112 §6.3: Transfer-Encoding overrides Content-Length. Honoring both
+    // would stop at a byte count the sender did not frame the body with.
+    if (chunked)
+        has_length = false;
+
+    auto body_size = [&] { return out.size() - body_start; };
+    auto over_cap = [&] { return body_size() >= kMaxRefusalBodyBytes; };
+
+    if (has_length && initial.size() >= want) {
+        co_return; // the head read already carried the whole body
+    }
+
+    H1ChunkedEndScanner scanner;
+    if (chunked)
+        scanner.feed(initial);
+
+    std::uint64_t left = has_length ? want - std::min<std::uint64_t>(want, initial.size()) : 0;
+    for (;;) {
+        if (over_cap())
+            co_return;
+        if (has_length && left == 0)
+            co_return;
+        if (chunked && scanner.done())
+            co_return;
+        const std::size_t ask =
+            has_length ? static_cast<std::size_t>(std::min<std::uint64_t>(buf.size(), left)) : buf.size();
+        auto [ec, n] = co_await ws_proxy_read_some(backend, std::span<std::byte>{buf.data(), ask}, timeout);
+        if (ec || n == 0)
+            co_return; // EOF is the end for a close-delimited body, and an error ends the relay
+        out.append(reinterpret_cast<const char *>(buf.data()), n);
+        if (chunked)
+            scanner.feed(std::string_view{reinterpret_cast<const char *>(buf.data()), n});
+        if (has_length)
+            left -= std::min<std::uint64_t>(left, n);
     }
 }
 

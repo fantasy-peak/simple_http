@@ -85,7 +85,9 @@ struct WsProxyTarget {
     // chain instead of replacing it with the real peer.
     bool preserve_inbound_forwarding{false};
 
-    // Resolve + TCP connect budget for the backend leg. 0 disables the timer.
+    // Budget for establishing the backend leg: name resolution, TCP connect, and
+    // the Upgrade handshake (a backend that accepts and then never answers is
+    // bounded by this, not left to the idle watchdog). 0 disables the timer.
     std::chrono::milliseconds connect_timeout{10000};
 };
 

@@ -134,6 +134,15 @@ run_ws_proxy(std::shared_ptr<Transport> client, const ParsedHead &head, std::str
     } else if (const auto q = head.target.find('?'); q != std::string_view::npos) {
         replay_target.append(head.target.substr(q));
     }
+    // Defence in depth: the h1 parser already rejects control bytes in the
+    // target, but a proxy must not rely on its caller. Anything here would be
+    // spliced verbatim into the backend's request line.
+    if (contains_ctl(replay_target)) {
+        SIMPLE_HTTP_ERROR_LOG("ws-proxy: refusing a request target with CR/LF/NUL");
+        close_backend();
+        co_await ws_proxy_fail(client, status::bad_request);
+        co_return false;
+    }
 
     const auto inbound_host = head.headers.get("host");
     std::string key;
@@ -161,7 +170,7 @@ run_ws_proxy(std::shared_ptr<Transport> client, const ParsedHead &head, std::str
         }
     }
 
-    auto reply = co_await detail::ws_proxy_read_reply(*backend, max_header_bytes);
+    auto reply = co_await detail::ws_proxy_read_reply(*backend, max_header_bytes, target.connect_timeout);
     if (!reply) {
         SIMPLE_HTTP_ERROR_LOG("ws-proxy backend handshake failed: {}", reply.error().message());
         close_backend();
@@ -173,24 +182,13 @@ run_ws_proxy(std::shared_ptr<Transport> client, const ParsedHead &head, std::str
         // The backend refused the upgrade. Relay its actual response (head plus
         // whatever body bytes already arrived) instead of inventing a 502; the
         // h1 client sees the same 401/403/302 a direct connection would have
-        // produced. A Content-Length body is drained up to the announced size.
+        // produced. The body is framed like any HTTP/1.1 response: Content-Length,
+        // chunked, or close-delimited — the relay must not stop at the first
+        // `initial` bytes.
         std::string out = reply->raw;
         out.append(reply->initial);
-        std::size_t body_sent = reply->initial.size();
-        std::size_t want = 0;
-        if (auto cl = reply->head.headers.get("content-length")) {
-            (void)std::from_chars(cl->data(), cl->data() + cl->size(), want);
-        }
-        while (body_sent < want) {
-            std::array<std::byte, 8192> buf{};
-            const std::size_t left = want - body_sent;
-            auto [rec, n] = co_await backend->async_read_some(asio::buffer(buf.data(), std::min(buf.size(), left)),
-                                                              asio::as_tuple(asio::use_awaitable));
-            if (rec || n == 0)
-                break;
-            out.append(reinterpret_cast<const char *>(buf.data()), n);
-            body_sent += n;
-        }
+        co_await detail::ws_proxy_relay_refusal_body(*backend, out, reply->initial, reply->head.headers,
+                                                     target.connect_timeout);
         (void)co_await client->async_write(
             std::span<const std::byte>{reinterpret_cast<const std::byte *>(out.data()), out.size()});
         close_backend();

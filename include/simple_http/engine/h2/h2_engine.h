@@ -2283,6 +2283,15 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         }
         if (replay_target.empty())
             replay_target = "/";
+        // The h2 engine rejects control bytes in :path/the field set, but the
+        // proxy must not rely on its caller before splicing this into a request
+        // line (the same guard the h1 proxy applies).
+        if (contains_ctl(replay_target)) {
+            SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy: refusing a request target with CR/LF/NUL");
+            close_backend();
+            co_await fail(400);
+            co_return false;
+        }
 
         const std::string key = detail::make_ws_client_key();
         const auto inbound_host = request->header("host");
@@ -2301,7 +2310,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
             }
         }
 
-        auto reply = co_await detail::ws_proxy_read_reply(*backend, m_limits.max_header_bytes);
+        auto reply = co_await detail::ws_proxy_read_reply(*backend, m_limits.max_header_bytes, target.connect_timeout);
         if (!reply) {
             SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy backend handshake failed: {}", reply.error().message());
             close_backend();
@@ -2367,8 +2376,13 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
             for (;;) {
                 auto [rec2, n] = co_await backend->async_read_some(asio::buffer(buf.data(), buf.size()),
                                                                    asio::as_tuple(asio::use_awaitable));
-                if (rec2 || n == 0)
+                if (rec2 || n == 0) {
+                    // The backend is done sending. End the tunnel's read side,
+                    // which also wakes client_to_backend; unlike the old `||`
+                    // race this happens only after the direction really ended.
+                    ws_stream_close(stream_id);
                     break;
+                }
                 deadline = std::chrono::steady_clock::now() + idle;
                 if (auto ec = co_await ws_stream_write_bytes(stream_id, std::span<const std::byte>{buf.data(), n}); ec)
                     break;
@@ -2379,8 +2393,14 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
             std::array<std::byte, 16384> buf{};
             for (;;) {
                 auto [rec2, n] = co_await ws_stream_read(stream_id, std::span<std::byte>{buf.data(), buf.size()});
-                if (rec2 || n == 0)
+                if (rec2 || n == 0) {
+                    // Client half-close (END_STREAM): stop sending to the
+                    // backend, but leave the opposite direction running so the
+                    // backend's Close frame and trailing messages still arrive.
+                    error_code sec;
+                    backend->shutdown(asio::ip::tcp::socket::shutdown_send, sec);
                     break;
+                }
                 deadline = std::chrono::steady_clock::now() + idle;
                 auto [wec, w] = co_await asio::async_write(*backend, asio::buffer(buf.data(), n),
                                                            asio::as_tuple(asio::use_awaitable));
@@ -2404,7 +2424,14 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
             }
         };
 
-        co_await (backend_to_client() || client_to_backend() || idle_check());
+        // Go's io.Copy pair: both directions run to completion (a half-close in
+        // one does not cancel the other), with the idle watchdog as the only
+        // early exit. This matches the h1 tunnel, which fixed the same mistake.
+        if (idle.count() > 0) {
+            co_await ((backend_to_client() && client_to_backend()) || idle_check());
+        } else {
+            co_await (backend_to_client() && client_to_backend());
+        }
         close_backend();
         ws_stream_close(stream_id);
         co_return true;

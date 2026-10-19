@@ -25,6 +25,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -120,7 +121,7 @@ struct TcpListenerConfig {
     bool reuse_port{true};
     std::size_t acceptors{0};
 
-    std::size_t max_connections{0};     // 0 = ServerConfig::max_connections
+    std::size_t max_connections{0};     // additional per-listener cap; 0 = none
     std::optional<EngineLimits> limits; // override the global limits
 
     std::function<void(asio::ip::tcp::socket &)> socket_setup;
@@ -687,15 +688,10 @@ class Server {
     // back to 1 where the platform rejected SO_REUSEPORT.
     std::size_t acceptor_count() const { return m_acceptors.size(); }
 
-    // Connections currently being served, against ServerConfig::max_connections.
-    // Readable from any thread; useful for a readiness/health endpoint or for
-    // checking that the limit is in effect.
-    std::size_t active_connections() const {
-        std::size_t total = 0;
-        for (const auto &meta : m_metas)
-            total += meta->active.load(std::memory_order_relaxed);
-        return total;
-    }
+    // Connections currently being served across every listener. Counted even
+    // when no limit is configured. Readable from any thread; useful for a
+    // readiness/health endpoint or for checking that a limit is in effect.
+    std::size_t active_connections() const { return m_active_connections->load(std::memory_order_relaxed); }
 
     std::shared_ptr<IoCtxPool> pool() { return m_pool; }
 
@@ -740,9 +736,13 @@ class Server {
         std::string name;
         TcpListenerConfig cfg;
         EngineLimits limits;
-        std::size_t max_connections{0};
-        std::shared_ptr<TlsContext> tls; // null = plaintext
-        std::atomic<std::size_t> active{0};
+        std::size_t max_connections{0};        // this listener's own cap (0 = none)
+        std::size_t global_max_connections{0}; // ServerConfig::max_connections (0 = none)
+        // Shared by every listener's accept loops: one server-wide budget.
+        std::shared_ptr<std::atomic<std::size_t>> global_active;
+        std::atomic<std::size_t> active{0}; // this listener's connections
+        std::shared_ptr<TlsContext> tls;    // null = plaintext
+        bool partitioned{false};            // bound one acceptor per worker context
     };
 
     struct Listener {
@@ -825,7 +825,8 @@ class Server {
             tcp.plaintext = to_plaintext_http(m_config.plaintext_protocols);
             tcp.reuse_port = m_config.reuse_port;
             tcp.acceptors = m_config.acceptors;
-            tcp.max_connections = m_config.max_connections;
+            // max_connections stays 0 here: it is a per-listener override, and
+            // the server-wide cap is applied separately by make_tcp_meta().
             tcp.limits = m_config.limits;
             tcp.socket_setup = m_config.socket_setup;
             tcp.listener_setup = m_config.listener_setup;
@@ -839,7 +840,6 @@ class Server {
                 quic.tls = *m_config.tls;
             }
             quic.reuse_port = m_config.reuse_port;
-            quic.max_connections = m_config.max_connections;
             quic.limits = m_config.limits;
             quic.options = m_config.quic_options;
             m_quic_configs.push_back(std::move(quic));
@@ -900,9 +900,29 @@ class Server {
         meta->name = cfg.name;
         meta->cfg = std::move(cfg);
         meta->limits = meta->cfg.limits.value_or(m_config.limits);
-        meta->max_connections = meta->cfg.max_connections != 0 ? meta->cfg.max_connections : m_config.max_connections;
+        meta->max_connections = meta->cfg.max_connections;
+        meta->global_max_connections = m_config.max_connections;
+        meta->global_active = m_active_connections;
         if (meta->cfg.tls) {
-            meta->tls = std::make_shared<TlsContext>(*meta->cfg.tls);
+            // The listener's ALPN policy is the offer list. Without this the
+            // context always advertised h2 + http/1.1, so Http1Only/Http2Only
+            // were accepted by the builder and silently ignored.
+            static constexpr std::string_view h2{"h2"};
+            static constexpr std::string_view http11{"http/1.1"};
+            std::vector<std::string_view> protocols;
+            switch (meta->cfg.alpn) {
+            case TlsHttp::Http1Only:
+                protocols = {http11};
+                break;
+            case TlsHttp::Http2Only:
+                protocols = {h2};
+                break;
+            case TlsHttp::Http1AndHttp2:
+            default:
+                protocols = {h2, http11};
+                break;
+            }
+            meta->tls = std::make_shared<TlsContext>(*meta->cfg.tls, std::span<const std::string_view>{protocols});
         }
         m_metas.push_back(meta);
         return meta;
@@ -1066,11 +1086,14 @@ class Server {
             normalize_configs();
         StartReport report;
         std::vector<ListenerFailure> failures;
-        for (auto &cfg : m_tcp_configs) {
+        // The plans stay in m_tcp_configs/m_quic_configs: start_tcp_listener
+        // takes a copy. Moving them out made a retry after a failed start bind
+        // moved-from (empty) listener configs.
+        for (const auto &cfg : m_tcp_configs) {
             std::string name = cfg.name;
             const std::size_t before = m_acceptors.size();
-            if (!start_tcp_listener(std::move(cfg))) {
-                failures.push_back(ListenerFailure{name, make_error_code(server_errc::bind_failed)});
+            if (auto err = start_tcp_listener(cfg)) {
+                failures.push_back(ListenerFailure{name, make_error_code(*err)});
                 if (policy == StartPolicy::AllOrNothing) {
                     close_listeners();
                     return std::unexpected{StartupError{failures}};
@@ -1080,11 +1103,11 @@ class Server {
             report.bound.push_back(make_bound(before, m_acceptors.size() - before));
         }
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
-        for (auto &cfg : m_quic_configs) {
+        for (const auto &cfg : m_quic_configs) {
             std::string name = cfg.name;
             const std::size_t before = m_quic_runtimes.size();
-            if (!start_quic_listener(std::move(cfg))) {
-                failures.push_back(ListenerFailure{name, make_error_code(server_errc::bind_failed)});
+            if (auto err = start_quic_listener(cfg)) {
+                failures.push_back(ListenerFailure{name, make_error_code(*err)});
                 if (policy == StartPolicy::AllOrNothing) {
                     close_listeners();
                     return std::unexpected{StartupError{failures}};
@@ -1104,49 +1127,64 @@ class Server {
         }
         apply_alt_svc();
 #endif
+        // Spawn only after every listener is bound and Alt-Svc has been
+        // finalized: accept loops copy meta->limits, so mutating it after they
+        // start would race (and connections accepted in between would miss the
+        // header).
+        spawn_accept_loops(0);
         report.failures = std::move(failures);
         return report;
     }
 
-    bool start_tcp_listener(TcpListenerConfig cfg) {
+    // Binds one TCP listener. Returns the failure cause, or nullopt on success.
+    // The accept loop is spawned later, by start_listeners(), once every
+    // listener is bound and Alt-Svc is final.
+    std::optional<server_errc> start_tcp_listener(TcpListenerConfig cfg) {
         std::shared_ptr<ListenerMeta> meta;
         try {
             meta = make_tcp_meta(std::move(cfg));
         } catch (const std::exception &e) {
             SIMPLE_HTTP_ERROR_LOG("TLS setup failed: {}", e.what());
-            return false;
+            return server_errc::tls_setup_failed;
+        }
+        if (const auto *inet = std::get_if<InetAddress>(&meta->cfg.address)) {
+            error_code addr_ec;
+            (void)asio::ip::make_address(inet->host, addr_ec);
+            if (addr_ec) {
+                SIMPLE_HTTP_ERROR_LOG("invalid listen address '{}': {}", inet->host, addr_ec.message());
+                return server_errc::invalid_config;
+            }
         }
         const std::size_t first_new = m_acceptors.size();
 
         return std::visit(
-            [&](const auto &address) -> bool {
+            [&](const auto &address) -> std::optional<server_errc> {
                 using T = std::remove_cvref_t<decltype(address)>;
                 if constexpr (std::is_same_v<T, InetAddress>) {
                     error_code ec;
                     auto acceptor = probe_acceptor(meta->cfg, ec);
                     if (!acceptor) {
                         SIMPLE_HTTP_ERROR_LOG("bind({}:{}): {}", address.host, address.port, ec.message());
-                        return false;
+                        return server_errc::bind_failed;
                     }
                     const auto host = local_address(*acceptor);
                     const auto port = local_port(*acceptor);
                     auto ctx = meta->cfg.reuse_port ? m_pool->at(0) : m_pool->main_context();
                     m_acceptors.push_back(Listener{acceptor, ctx, meta});
-                    bool partitioned = false;
                     if (meta->cfg.reuse_port) {
-                        partitioned = fan_out(meta->cfg, meta, host, port, address.v6 && is_ipv6_host(host), first_new);
-                        if (!partitioned) {
+                        meta->partitioned =
+                            fan_out(meta->cfg, meta, host, port, address.v6 && is_ipv6_host(host), first_new);
+                        if (!meta->partitioned) {
                             SIMPLE_HTTP_INFO_LOG("SO_REUSEPORT unavailable; serving {}:{} with a single acceptor", host,
                                                  port);
                         }
                     }
-                    spawn_accept_loops(first_new, partitioned);
                     SIMPLE_HTTP_INFO_LOG("listening on {}:{} ({})", host, port, meta->name);
-                    return true;
+                    return std::nullopt;
                 } else {
 #ifndef BOOST_ASIO_HAS_LOCAL_SOCKETS
                     SIMPLE_HTTP_ERROR_LOG("UNIX-domain sockets are unavailable on this platform: {}", address.path);
-                    return false;
+                    return server_errc::invalid_config;
 #else
                     std::error_code ignored;
                     std::filesystem::remove(address.path, ignored);
@@ -1161,12 +1199,11 @@ class Server {
                         acceptor->listen(asio::socket_base::max_listen_connections, ec);
                     if (ec) {
                         SIMPLE_HTTP_ERROR_LOG("bind(unix:{}): {}", address.path, ec.message());
-                        return false;
+                        return server_errc::bind_failed;
                     }
                     m_acceptors.push_back(Listener{acceptor, ctx, meta});
-                    spawn_accept_loops(first_new, /*partitioned=*/false);
                     SIMPLE_HTTP_INFO_LOG("listening on unix:{} ({})", address.path, meta->name);
-                    return true;
+                    return std::nullopt;
 #endif
                 }
             },
@@ -1174,7 +1211,7 @@ class Server {
     }
 
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
-    bool start_quic_listener(QuicListenerConfig cfg) {
+    std::optional<server_errc> start_quic_listener(QuicListenerConfig cfg) {
         auto rt = std::make_shared<QuicRuntime>();
         rt->name = cfg.name;
         rt->cfg = std::move(cfg);
@@ -1183,13 +1220,13 @@ class Server {
             rt->tls = std::make_shared<quic::QuicTlsContext>(rt->cfg.tls);
         } catch (const std::exception &e) {
             SIMPLE_HTTP_ERROR_LOG("QUIC TLS setup: {}", e.what());
-            return false;
+            return server_errc::tls_setup_failed;
         }
         error_code ec;
         const auto addr = asio::ip::make_address(rt->cfg.address.host, ec);
         if (ec) {
             SIMPLE_HTTP_ERROR_LOG("QUIC bind({}:{}): {}", rt->cfg.address.host, rt->cfg.address.port, ec.message());
-            return false;
+            return server_errc::invalid_config;
         }
         const asio::ip::udp::endpoint endpoint{addr, rt->cfg.address.port};
         const std::size_t sockets =
@@ -1204,7 +1241,7 @@ class Server {
                                       ec.message());
                 for (auto &bound : rt->endpoints)
                     bound->close();
-                return false;
+                return server_errc::bind_failed;
             }
             quic->start();
             rt->endpoints.push_back(std::move(quic));
@@ -1212,7 +1249,7 @@ class Server {
         SIMPLE_HTTP_INFO_LOG("listening on udp {}:{} (quic, alpn=h3, sockets={})", rt->cfg.address.host,
                              rt->cfg.address.port, rt->endpoints.size());
         m_quic_runtimes.push_back(std::move(rt));
-        return true;
+        return std::nullopt;
     }
 
     // A TLS TCP listener advertises a same-port QUIC listener (nginx's
@@ -1225,6 +1262,8 @@ class Server {
                 continue;
             if (const auto *inet = std::get_if<InetAddress>(&meta->cfg.address); inet && inet->port != 0) {
                 for (const auto &rt : m_quic_runtimes) {
+                    if (!rt->cfg.advertise_alt_svc)
+                        continue;
                     if (rt->cfg.address.port == inet->port && !rt->endpoints.empty()) {
                         const auto quic_port = rt->endpoints.front()->port();
                         meta->limits.alt_svc = meta->limits.render_alt_svc(quic_port);
@@ -1310,7 +1349,7 @@ class Server {
     // acceptor/socket pair; this is the only place that names both, and the
     // protocol hands the socket type back rather than making it a second
     // parameter to thread through by hand.
-    void spawn_accept_loops(std::size_t from, bool partitioned) {
+    void spawn_accept_loops(std::size_t from) {
         for (std::size_t i = from; i < m_acceptors.size(); ++i) {
             auto &listener = m_acceptors[i];
             std::visit(
@@ -1320,6 +1359,7 @@ class Server {
                     // Pinned only when the fan-out really happened: re-dispatching
                     // a connection the kernel already assigned to this socket
                     // would give back the affinity the fan-out bought.
+                    const bool partitioned = listener.meta->partitioned;
                     asio::co_spawn(
                         *listener.ctx,
                         accept_loop<Acceptor, Socket>(acceptor, partitioned ? listener.ctx : nullptr, listener.meta),
@@ -1385,25 +1425,41 @@ class Server {
             // each loop parks at most one accepted socket here while it waits
             // for a permit, so the over-limit backlog stays in the kernel.
             //
-            // The count is global, shared by every accept loop; a freed slot
-            // lands on an arbitrary thread, so a cheap re-check timer is used
-            // instead of a cross-thread wake channel — it only runs while
-            // saturated.
-            if (meta->max_connections != 0) {
-                for (;;) {
-                    if (m_stopped.load(std::memory_order_acquire)) {
-                        error_code ignored;
-                        socket.close(ignored);
-                        co_return;
-                    }
-                    std::size_t current = meta->active.load(std::memory_order_acquire);
-                    if (current < meta->max_connections &&
-                        meta->active.compare_exchange_weak(current, current + 1, std::memory_order_acq_rel))
-                        break;
+            // Two budgets, both honored here: ServerConfig::max_connections is
+            // one count shared by every listener (the Go netutil.LimitListener
+            // semantics), and a listener's own max_connections is an additional
+            // cap. Both counters are maintained unconditionally so
+            // active_connections() reports the real total, not only while a
+            // limit is configured.
+            //
+            // A freed slot lands on an arbitrary thread, so a cheap re-check
+            // timer is used instead of a cross-thread wake channel — it only
+            // runs while saturated.
+            for (;;) {
+                if (m_stopped.load(std::memory_order_acquire)) {
+                    error_code ignored;
+                    socket.close(ignored);
+                    co_return;
+                }
+                std::size_t global = meta->global_active->load(std::memory_order_acquire);
+                if (meta->global_max_connections != 0 && global >= meta->global_max_connections) {
                     asio::steady_timer timer{ctx};
                     timer.expires_after(std::chrono::milliseconds(25));
                     co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+                    continue;
                 }
+                if (!meta->global_active->compare_exchange_weak(global, global + 1, std::memory_order_acq_rel))
+                    continue;
+                const std::size_t listener = meta->active.fetch_add(1, std::memory_order_acq_rel);
+                if (meta->max_connections != 0 && listener >= meta->max_connections) {
+                    meta->active.fetch_sub(1, std::memory_order_acq_rel);
+                    meta->global_active->fetch_sub(1, std::memory_order_acq_rel);
+                    asio::steady_timer timer{ctx};
+                    timer.expires_after(std::chrono::milliseconds(25));
+                    co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+                    continue;
+                }
+                break;
             }
 
             // The socket hook and the TCP linger option are typed for a TCP
@@ -1440,8 +1496,8 @@ class Server {
                 asio::co_spawn(
                     ctx, serve_tls(transport, dispatch, ws_lookup, meta->limits, ws_proxy_lookup, ws_regex_lookup),
                     [this, live, meta](std::exception_ptr) {
-                        if (meta->max_connections != 0)
-                            meta->active.fetch_sub(1, std::memory_order_acq_rel);
+                        meta->active.fetch_sub(1, std::memory_order_acq_rel);
+                        meta->global_active->fetch_sub(1, std::memory_order_acq_rel);
                     });
             } else {
                 auto sock_ptr = std::make_shared<Socket>(std::move(socket));
@@ -1452,8 +1508,8 @@ class Server {
                                                ws_regex_lookup, to_plaintext_protocols(meta->cfg.plaintext),
                                                meta->cfg.plaintext != PlaintextHttp::Http1Only),
                                [this, live, meta](std::exception_ptr) {
-                                   if (meta->max_connections != 0)
-                                       meta->active.fetch_sub(1, std::memory_order_acq_rel);
+                                   meta->active.fetch_sub(1, std::memory_order_acq_rel);
+                                   meta->global_active->fetch_sub(1, std::memory_order_acq_rel);
                                });
             }
         }
@@ -1490,6 +1546,10 @@ class Server {
     ServerConfig m_config;
     std::shared_ptr<IoCtxPool> m_pool;
     std::shared_ptr<Router> m_router;
+    // One budget for all listeners; ListenerMeta holds a shared reference for
+    // the accept loops. Always counted, so active_connections() is meaningful
+    // even when no limit is configured.
+    std::shared_ptr<std::atomic<std::size_t>> m_active_connections = std::make_shared<std::atomic<std::size_t>>(0);
     std::vector<TcpListenerConfig> m_tcp_configs;
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
     std::vector<QuicListenerConfig> m_quic_configs;

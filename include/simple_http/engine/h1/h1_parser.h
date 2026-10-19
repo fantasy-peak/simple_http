@@ -277,6 +277,14 @@ class H1Parser {
             m_error = 40002;
             return false;
         }
+        // The request line is LF-delimited, so a bare CR inside the target
+        // survives the line-ending strip. A target is later replayed verbatim by
+        // the reverse proxy into a synthesized HTTP/1.1 request line, where that
+        // CR would start an attacker-authored field. NUL is equally unusable.
+        if (contains_ctl(method_tok) || contains_ctl(target) || contains_ctl(version)) {
+            m_error = 40006;
+            return false;
+        }
 
         m_head.method_token.assign(method_tok);
         m_head.method = method_from_string(method_tok);

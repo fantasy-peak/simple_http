@@ -126,6 +126,30 @@ TEST_CASE("h1/parser: malformed heads are rejected with a reason code", "[h1]") 
     }
 }
 
+TEST_CASE("h1/parser: control bytes in the request target are rejected", "[h1]") {
+    // The request line is split on LF, so a bare CR inside the target survives
+    // the line-ending strip. Forwarding that target into a synthesized HTTP/1.1
+    // request line (the ws reverse proxy does exactly that) would inject a field
+    // into the backend request. A control byte there is not a request target.
+    {
+        H1Parser parser;
+        parser.feed("GET /ws?x=\rHost:evil HTTP/1.1\r\nHost: front\r\n\r\n");
+        CHECK(parser.parse_head() == H1Parser::State::Error);
+        CHECK(parser.error() == 40006);
+    }
+    {
+        H1Parser parser;
+        parser.feed(std::string{"GET /ws?x=\0y HTTP/1.1\r\nHost: front\r\n\r\n", 38});
+        CHECK(parser.parse_head() == H1Parser::State::Error);
+        CHECK(parser.error() == 40006);
+    }
+    {
+        H1Parser parser;
+        parser.feed("GET /plain?q=1 HTTP/1.1\r\nHost: front\r\n\r\n");
+        CHECK(parser.parse_head() == H1Parser::State::Done);
+    }
+}
+
 TEST_CASE("h1/parser: header value whitespace is trimmed", "[h1]") {
     H1Parser parser;
     parser.feed("GET / HTTP/1.1\r\nA:   spaced   \r\nB:\t\ttabbed\t\r\nC:\r\n\r\n");

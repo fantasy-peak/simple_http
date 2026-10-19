@@ -11,13 +11,18 @@
 #include <array>
 #include <atomic>
 #include <boost/asio.hpp>
+#include <boost/asio/ssl.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <future>
 #include <memory>
+#include <mutex>
+#include <openssl/ssl.h>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -1829,5 +1834,518 @@ TEST_CASE("regression/server: listener_setup runs on each acceptor before accept
     CHECK(calls.load() == static_cast<int>(server.acceptor_count()));
     CHECK(calls.load() >= 1);
     CHECK(bound_and_settable.load());
+    server.stop();
+}
+
+// --- review regressions: listener policy, startup, and the ws proxy ----------
+
+namespace {
+
+// A scripted TCP backend for the reverse-proxy cases: binds an ephemeral port,
+// accepts one connection (with a deadline), reads the request head, then hands
+// the socket to the responder on the backend thread. Blocking calls are fine
+// here — this is a test double, not a model-A engine.
+class RawBackend {
+  public:
+    using Responder =
+        std::function<void(asio::ip::tcp::socket &, std::string_view request, const std::atomic<bool> &stop)>;
+
+    explicit RawBackend(Responder responder) {
+        std::promise<std::uint16_t> ready;
+        auto future = ready.get_future();
+        m_thread = std::thread([this, responder = std::move(responder), ready = std::move(ready)]() mutable {
+            asio::io_context io;
+            asio::ip::tcp::acceptor acceptor{io};
+            sh::error_code ec;
+            acceptor.open(asio::ip::tcp::v4(), ec);
+            if (!ec)
+                acceptor.set_option(asio::ip::tcp::acceptor::reuse_address(true), ec);
+            if (!ec)
+                acceptor.bind({asio::ip::make_address("127.0.0.1"), 0}, ec);
+            if (!ec)
+                acceptor.listen(64, ec);
+            if (ec) {
+                ready.set_value(0);
+                return;
+            }
+            ready.set_value(acceptor.local_endpoint().port());
+            acceptor.non_blocking(true, ec);
+            asio::ip::tcp::socket socket{io};
+            const auto accept_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            for (;;) {
+                if (m_stop || std::chrono::steady_clock::now() >= accept_deadline)
+                    return;
+                acceptor.accept(socket, ec);
+                if (!ec)
+                    break;
+                if (ec != asio::error::would_block && ec != asio::error::try_again)
+                    return;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            std::string request;
+            std::array<char, 4096> buf{};
+            const auto read_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            for (;;) {
+                if (m_stop || request.find("\r\n\r\n") != std::string::npos ||
+                    std::chrono::steady_clock::now() >= read_deadline)
+                    break;
+                const auto n = socket.read_some(asio::buffer(buf), ec);
+                if (!ec)
+                    request.append(buf.data(), n);
+                else if (ec != asio::error::would_block && ec != asio::error::try_again)
+                    break;
+                else
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            {
+                std::lock_guard lock(m_mutex);
+                m_request = request;
+            }
+            socket.non_blocking(false, ec);
+            responder(socket, request, m_stop);
+        });
+        m_port = future.get();
+    }
+
+    ~RawBackend() {
+        m_stop = true;
+        if (m_thread.joinable())
+            m_thread.join();
+    }
+
+    RawBackend(const RawBackend &) = delete;
+    RawBackend &operator=(const RawBackend &) = delete;
+
+    std::uint16_t port() const { return m_port; }
+    std::string request() const {
+        std::lock_guard lock(m_mutex);
+        return m_request;
+    }
+
+  private:
+    std::thread m_thread;
+    std::atomic<bool> m_stop{false};
+    std::uint16_t m_port{0};
+    mutable std::mutex m_mutex;
+    std::string m_request;
+};
+
+void backend_write(asio::ip::tcp::socket &socket, std::string_view bytes) {
+    sh::error_code ec;
+    asio::write(socket, asio::buffer(bytes.data(), bytes.size()), ec);
+}
+
+constexpr std::string_view kUpgradeRequest = "GET /wsproxy HTTP/1.1\r\n"
+                                             "Host: front\r\n"
+                                             "Connection: Upgrade\r\n"
+                                             "Upgrade: websocket\r\n"
+                                             "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                                             "Sec-WebSocket-Version: 13\r\n\r\n";
+
+// Starts a one-listener server whose router proxies `path` to `target`.
+struct ProxyServer {
+    sh::Server server;
+    explicit ProxyServer(std::uint16_t port, std::string path, sh::WsProxyTarget target) : server(make_cfg(port)) {
+        server.router()->ws_proxy(std::move(path), std::move(target));
+    }
+    static sh::ServerConfig make_cfg(std::uint16_t port) {
+        sh::ServerConfig cfg;
+        cfg.listen = sh::InetAddress{"127.0.0.1", port, false};
+        cfg.worker_threads = 1;
+        cfg.reuse_port = false;
+        return cfg;
+    }
+};
+
+std::string negotiated_alpn(std::uint16_t port, const std::vector<std::string> &protocols) {
+    asio::io_context io;
+    asio::ssl::context ctx{asio::ssl::context::tls_client};
+    ctx.set_verify_mode(asio::ssl::verify_none);
+    asio::ssl::stream<asio::ip::tcp::socket> stream{io, ctx};
+    sh::error_code ec;
+    stream.next_layer().connect({asio::ip::make_address("127.0.0.1"), port}, ec);
+    if (ec)
+        return {"<connect failed>"};
+    std::vector<unsigned char> wire;
+    for (const auto &proto : protocols) {
+        wire.push_back(static_cast<unsigned char>(proto.size()));
+        wire.insert(wire.end(), proto.begin(), proto.end());
+    }
+    if (SSL_set_alpn_protos(stream.native_handle(), wire.data(), static_cast<unsigned int>(wire.size())) != 0)
+        return {"<alpn setup failed>"};
+    stream.handshake(asio::ssl::stream_base::client, ec);
+    if (ec)
+        return {"<handshake failed>"};
+    const unsigned char *selected = nullptr;
+    unsigned int len = 0;
+    SSL_get0_alpn_selected(stream.native_handle(), &selected, &len);
+    return std::string(
+        reinterpret_cast<const char *>(selected ? selected : reinterpret_cast<const unsigned char *>("")), len);
+}
+
+sh::TlsConfig test_tls_config() {
+    return sh::TlsConfig{"./test/tls_certificates/server_cert.pem", "./test/tls_certificates/server_key.pem"};
+}
+
+} // namespace
+
+TEST_CASE("regression/ws-proxy: control bytes in the target never reach the backend", "[regression][wsproxy]") {
+    constexpr std::uint16_t port = 27960;
+    RawBackend backend([](asio::ip::tcp::socket &socket, std::string_view, const std::atomic<bool> &stop) {
+        backend_write(socket, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n");
+        while (!stop)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    });
+    ProxyServer front{port, "/wsproxy", sh::WsProxyTarget{"127.0.0.1", backend.port(), {}}};
+    REQUIRE(front.server.start());
+
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(port));
+    client.send("GET /wsproxy?x=\rHost:evil HTTP/1.1\r\n"
+                "Host: front\r\n"
+                "Connection: Upgrade\r\n"
+                "Upgrade: websocket\r\n"
+                "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                "Sec-WebSocket-Version: 13\r\n\r\n");
+    CHECK(client.wait_for("400", std::chrono::seconds(2)));
+    CHECK(backend.request().find("Host:evil") == std::string::npos);
+    client.close();
+    front.server.stop();
+}
+
+TEST_CASE("regression/ws-proxy: a backend that never answers the handshake is reaped", "[regression][wsproxy]") {
+    constexpr std::uint16_t port = 27961;
+    RawBackend backend([](asio::ip::tcp::socket &, std::string_view, const std::atomic<bool> &stop) {
+        while (!stop)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    });
+    sh::WsProxyTarget target{"127.0.0.1", backend.port(), {}};
+    target.connect_timeout = std::chrono::milliseconds(300);
+    ProxyServer front{port, "/wsproxy", std::move(target)};
+    REQUIRE(front.server.start());
+
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(port));
+    client.send(kUpgradeRequest);
+    // The establishment phase must be bounded: a backend that accepts but never
+    // replies cannot pin the frontend connection forever.
+    CHECK(client.wait_for("502", std::chrono::milliseconds(1600)));
+    client.close();
+    front.server.stop();
+}
+
+TEST_CASE("regression/ws-proxy: a chunked refusal body is relayed in full", "[regression][wsproxy]") {
+    constexpr std::uint16_t port = 27962;
+    RawBackend backend([](asio::ip::tcp::socket &socket, std::string_view, const std::atomic<bool> &) {
+        backend_write(socket, "HTTP/1.1 403 Forbidden\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+        // Separate TCP segments: the head must be read before the body arrives,
+        // which is the case the old "never read past Content-Length" path lost.
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        backend_write(socket, "5\r\nhello\r\n0\r\n\r\n");
+        // Keep the socket open so the proxy has to stop at the terminating
+        // chunk rather than wait for EOF.
+        std::this_thread::sleep_for(std::chrono::milliseconds(700));
+    });
+    sh::WsProxyTarget target{"127.0.0.1", backend.port(), {}};
+    target.connect_timeout = std::chrono::seconds(2);
+    ProxyServer front{port, "/wsproxy", std::move(target)};
+    REQUIRE(front.server.start());
+
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(port));
+    client.send(kUpgradeRequest);
+    CHECK(client.wait_for("hello", std::chrono::seconds(2)));
+    CHECK(client.wait_for("0\r\n\r\n", std::chrono::seconds(1)));
+    client.close();
+    front.server.stop();
+}
+
+TEST_CASE("regression/server: listener ALPN policy is applied", "[regression][server][tls]") {
+    constexpr std::uint16_t port = 27963;
+    sh::ServerConfig cfg;
+    sh::TcpListenerConfig listener;
+    listener.address = sh::InetAddress{"127.0.0.1", port, false};
+    listener.reuse_port = false;
+    listener.tls = test_tls_config();
+    listener.alpn = sh::TlsHttp::Http1Only;
+    cfg.worker_threads = 1;
+    cfg.listeners = {listener};
+    sh::Server server{cfg};
+    REQUIRE(server.start());
+
+    // A client offering both protocols must be steered to http/1.1; before the
+    // listener policy was wired through, the context always offered h2 first.
+    CHECK(negotiated_alpn(port, {"h2", "http/1.1"}) == "http/1.1");
+    server.stop();
+}
+
+TEST_CASE("regression/server: start() can be retried after a bind failure", "[regression][server]") {
+    constexpr std::uint16_t port = 27964;
+    asio::io_context io;
+    asio::ip::tcp::acceptor blocker{io};
+    sh::error_code ec;
+    blocker.open(asio::ip::tcp::v4(), ec);
+    REQUIRE_FALSE(ec);
+    blocker.set_option(asio::ip::tcp::acceptor::reuse_address(true), ec);
+    REQUIRE_FALSE(ec);
+    blocker.bind({asio::ip::make_address("127.0.0.1"), port}, ec);
+    REQUIRE_FALSE(ec);
+    blocker.listen(8, ec);
+    REQUIRE_FALSE(ec);
+
+    sh::ServerConfig cfg;
+    cfg.listen = sh::InetAddress{"127.0.0.1", port, false};
+    cfg.worker_threads = 1;
+    cfg.reuse_port = false;
+    sh::Server server{cfg};
+    server.route({sh::Method::Get}, "/hello", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(200).send("hello");
+    });
+
+    const auto first = server.start();
+    REQUIRE_FALSE(first);
+    blocker.close();
+
+    // close_listeners() documents that the caller may fix the config and start
+    // again; a successful retry is the whole point.
+    const auto second = server.start();
+    CHECK(second.has_value());
+    if (second)
+        server.stop();
+}
+
+TEST_CASE("regression/server: max_connections is one budget shared by every listener", "[regression][server]") {
+    constexpr std::uint16_t port_a = 27965;
+    constexpr std::uint16_t port_b = 27966;
+    sh::ServerConfig cfg;
+    cfg.worker_threads = 2;
+    cfg.max_connections = 1;
+    sh::TcpListenerConfig a;
+    a.name = "a";
+    a.address = sh::InetAddress{"127.0.0.1", port_a, false};
+    a.reuse_port = false;
+    sh::TcpListenerConfig b;
+    b.name = "b";
+    b.address = sh::InetAddress{"127.0.0.1", port_b, false};
+    b.reuse_port = false;
+    cfg.listeners = {a, b};
+    sh::Server server{cfg};
+    server.route({sh::Method::Get}, "/hello", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(200).send("hello");
+    });
+    REQUIRE(server.start());
+
+    asio::io_context ctx;
+    RawClient first{ctx};
+    REQUIRE(first.connect(port_a));
+    first.send("GET /hello HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(first.wait_for("hello"));
+
+    // The connection on the other listener must wait for the one global slot,
+    // not get a second budget of its own.
+    RawClient second{ctx};
+    REQUIRE(second.connect(port_b));
+    second.send("GET /hello HTTP/1.1\r\nHost: x\r\n\r\n");
+    second.pump(std::chrono::milliseconds(250));
+    CHECK(second.received().empty());
+
+    first.close();
+    REQUIRE(second.wait_for("hello"));
+    second.close();
+    server.stop();
+}
+
+TEST_CASE("regression/server: startup failures name their cause", "[regression][server]") {
+    constexpr std::uint16_t port = 27967;
+    {
+        sh::ServerConfig cfg;
+        cfg.listen = sh::InetAddress{"127.0.0.1", port, false};
+        cfg.worker_threads = 1;
+        cfg.reuse_port = false;
+        cfg.tls =
+            sh::TlsConfig{"./test/tls_certificates/does_not_exist.pem", "./test/tls_certificates/does_not_exist.key"};
+        sh::Server server{cfg};
+        const auto started = server.start();
+        REQUIRE_FALSE(started);
+        REQUIRE(started.error().failures.size() == 1);
+        CHECK(started.error().failures[0].error == sh::make_error_code(sh::server_errc::tls_setup_failed));
+    }
+    {
+        sh::ServerConfig cfg;
+        cfg.listen = sh::InetAddress{"999.999.999.999", port, false};
+        cfg.worker_threads = 1;
+        cfg.reuse_port = false;
+        sh::Server server{cfg};
+        const auto started = server.start();
+        REQUIRE_FALSE(started);
+        REQUIRE(started.error().failures.size() == 1);
+        CHECK(started.error().failures[0].error == sh::make_error_code(sh::server_errc::invalid_config));
+    }
+}
+
+TEST_CASE("regression/ws-proxy: h2 extended CONNECT keeps the backend's trailing frames", "[regression][wsproxy][h2]") {
+    constexpr std::uint16_t port = 27968;
+    RawBackend backend([](asio::ip::tcp::socket &socket, std::string_view request, const std::atomic<bool> &) {
+        constexpr std::string_view prefix{"sec-websocket-key: "};
+        std::string key;
+        if (const auto at = request.find(prefix); at != std::string_view::npos) {
+            const auto begin = at + prefix.size();
+            const auto end = request.find("\r\n", begin);
+            key.assign(request.substr(begin, end == std::string_view::npos ? end : end - begin));
+        }
+        backend_write(socket, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                              "Sec-WebSocket-Accept: " +
+                                  sh::ws_accept_key(key) + "\r\n\r\n");
+        // Wait until the frontend forwards the client's END_STREAM as a send
+        // half-close.
+        std::array<char, 4096> buf{};
+        sh::error_code ec;
+        for (;;) {
+            const auto n = socket.read_some(asio::buffer(buf), ec);
+            (void)n;
+            if (ec)
+                break;
+        }
+        // The backend still has a Close/final frame to deliver after the client
+        // half-closes. Server-to-client frames are unmasked.
+        backend_write(socket, std::string{"\x81\x03"
+                                          "bye",
+                                          5});
+    });
+    ProxyServer front{port, "/wsproxy", sh::WsProxyTarget{"127.0.0.1", backend.port(), {}}};
+    REQUIRE(front.server.start());
+
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(port));
+    client.send(h2_preface_and_settings());
+
+    std::string block;
+    sh::codec::hpack_append_literal(block, ":method", "CONNECT");
+    sh::codec::hpack_append_literal(block, ":scheme", "http");
+    sh::codec::hpack_append_literal(block, ":authority", "127.0.0.1");
+    sh::codec::hpack_append_literal(block, ":path", "/wsproxy");
+    sh::codec::hpack_append_literal(block, ":protocol", "websocket");
+    client.send(h2_frame(sh::codec::H2FrameType::Headers, sh::codec::H2_FLAG_END_HEADERS, 1, block));
+
+    std::string observed_status;
+    const bool established = client.pump_until(
+        [&] {
+            const auto frames = parse_frames(client.received());
+            for (const auto &frame : frames) {
+                if (frame.header.type == static_cast<std::uint8_t>(sh::codec::H2FrameType::Headers) &&
+                    frame.header.stream_id == 1) {
+                    observed_status = header_value(decode_headers(frame.payload), ":status");
+                    return observed_status == "200";
+                }
+            }
+            return false;
+        },
+        std::chrono::seconds(3));
+    INFO("observed :status = " << observed_status);
+    INFO("client received: " << printable(client.received()));
+    INFO("backend request: " << printable(backend.request()));
+    REQUIRE(established);
+
+    // Client half-closes its tunnel; the backend's "bye" must still arrive.
+    client.send(h2_frame(sh::codec::H2FrameType::Data, sh::codec::H2_FLAG_END_STREAM, 1, "x"));
+
+    client.pump_until(
+        [&] {
+            std::string data;
+            for (const auto &frame : parse_frames(client.received())) {
+                if (frame.header.type == static_cast<std::uint8_t>(sh::codec::H2FrameType::Data) &&
+                    frame.header.stream_id == 1) {
+                    data.append(frame.payload);
+                }
+            }
+            return data.find("bye") != std::string::npos;
+        },
+        std::chrono::seconds(2));
+    std::string data;
+    for (const auto &frame : parse_frames(client.received())) {
+        if (frame.header.type == static_cast<std::uint8_t>(sh::codec::H2FrameType::Data) && frame.header.stream_id == 1)
+            data.append(frame.payload);
+    }
+    CHECK(data.find("bye") != std::string::npos);
+    client.close();
+    front.server.stop();
+}
+
+namespace {
+
+std::string tls_http_get(std::uint16_t port, std::string_view request, const std::vector<std::string> &protocols) {
+    asio::io_context io;
+    asio::ssl::context ctx{asio::ssl::context::tls_client};
+    ctx.set_verify_mode(asio::ssl::verify_none);
+    asio::ssl::stream<asio::ip::tcp::socket> stream{io, ctx};
+    sh::error_code ec;
+    stream.next_layer().connect({asio::ip::make_address("127.0.0.1"), port}, ec);
+    if (ec)
+        return {"<connect failed>"};
+    std::vector<unsigned char> wire;
+    for (const auto &proto : protocols) {
+        wire.push_back(static_cast<unsigned char>(proto.size()));
+        wire.insert(wire.end(), proto.begin(), proto.end());
+    }
+    if (SSL_set_alpn_protos(stream.native_handle(), wire.data(), static_cast<unsigned int>(wire.size())) != 0)
+        return {"<alpn setup failed>"};
+    stream.handshake(asio::ssl::stream_base::client, ec);
+    if (ec)
+        return {"<handshake failed>"};
+    asio::write(stream, asio::buffer(request.data(), request.size()), ec);
+    if (ec)
+        return {"<write failed>"};
+    std::string response;
+    std::array<char, 4096> buf{};
+    for (;;) {
+        const auto n = stream.read_some(asio::buffer(buf), ec);
+        if (ec)
+            break;
+        response.append(buf.data(), n);
+        if (response.find("\r\n\r\n") != std::string::npos)
+            break;
+    }
+    return response;
+}
+
+} // namespace
+
+TEST_CASE("regression/server: a QUIC listener can opt out of Alt-Svc", "[regression][server][tls]") {
+    constexpr std::uint16_t port = 27969;
+    sh::ServerConfig cfg;
+    cfg.worker_threads = 1;
+    cfg.auto_alt_svc = true;
+
+    sh::TcpListenerConfig tcp;
+    tcp.name = "tls";
+    tcp.address = sh::InetAddress{"127.0.0.1", port, false};
+    tcp.reuse_port = false;
+    tcp.tls = test_tls_config();
+    tcp.alpn = sh::TlsHttp::Http1Only;
+
+    sh::QuicListenerConfig quic;
+    quic.name = "quic";
+    quic.address = sh::QuicAddress{"127.0.0.1", port, false};
+    quic.tls = test_tls_config();
+    quic.reuse_port = false;
+    quic.advertise_alt_svc = false;
+
+    cfg.listeners = {tcp, quic};
+    sh::Server server{cfg};
+    server.route({sh::Method::Get}, "/world", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(200).send("hello");
+    });
+    REQUIRE(server.start());
+
+    const auto response =
+        tls_http_get(port, "GET /world HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", {"http/1.1"});
+    INFO("response: " << printable(response));
+    CHECK(response.find("hello") != std::string::npos);
+    // The QUIC listener opted out, so the TLS listener must not advertise it.
+    CHECK_FALSE(head_value(response, "alt-svc").has_value());
     server.stop();
 }

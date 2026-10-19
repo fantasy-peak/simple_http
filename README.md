@@ -100,7 +100,7 @@ independent TCP/QUIC topology — either through `cfg.listeners` or the fluent
 builder:
 
 ```cpp
-simple_http::Server server;                        // no listener yet
+simple_http::Server server{simple_http::ServerConfig{}}; // no listener yet
 
 server.listen(simple_http::InetAddress{"0.0.0.0", 80})
       .name("public")

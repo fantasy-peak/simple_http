@@ -15,8 +15,10 @@
 #include <format>
 #include <functional>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "../core/logging.h"
@@ -46,9 +48,32 @@ inline const std::vector<unsigned char> &alpn_wire_list() {
     return list;
 }
 
+// TLS wire format for an explicit protocol list, in preference order. An
+// empty span means "use alpn_wire_list()" (the historical h2 + http/1.1 set).
+inline std::vector<unsigned char> make_alpn_wire_list(std::span<const std::string_view> protocols) {
+    std::vector<unsigned char> out;
+    std::size_t bytes = 0;
+    for (auto protocol : protocols)
+        bytes += 1 + protocol.size();
+    out.reserve(bytes);
+    for (auto protocol : protocols) {
+        if (protocol.empty() || protocol.size() > 255)
+            continue;
+        out.push_back(static_cast<unsigned char>(protocol.size()));
+        out.insert(out.end(), protocol.begin(), protocol.end());
+    }
+    return out;
+}
+
 class TlsContext {
   public:
-    explicit TlsContext(const TlsConfig &cfg) : m_ctx(asio::ssl::context::tlsv13_server) { configure(cfg); }
+    // `alpn` overrides the advertised protocol list. The listener policy
+    // (`TlsHttp`) is translated here, so a listener configured as
+    // HTTP/1.1-only really offers http/1.1 and no h2.
+    explicit TlsContext(const TlsConfig &cfg, std::span<const std::string_view> alpn = {})
+        : m_ctx(asio::ssl::context::tlsv13_server) {
+        configure(cfg, alpn);
+    }
 
     asio::ssl::context &context() { return m_ctx; }
 
@@ -58,7 +83,7 @@ class TlsContext {
         return std::filesystem::is_regular_file(path, ec) && !ec;
     }
 
-    void configure(const TlsConfig &cfg) {
+    void configure(const TlsConfig &cfg, std::span<const std::string_view> alpn) {
         if (!is_regular_file(cfg.cert_chain_file)) {
             throw std::runtime_error(std::format("TLS certificate not found: {}", cfg.cert_chain_file));
         }
@@ -102,15 +127,16 @@ class TlsContext {
             throw std::runtime_error(std::format("use_private_key_file: {}", ec.message()));
         }
 
-        install_alpn();
+        install_alpn(alpn);
     }
 
-    void install_alpn() {
+    void install_alpn(std::span<const std::string_view> alpn) {
+        m_alpn = alpn.empty() ? alpn_wire_list() : make_alpn_wire_list(alpn);
         SSL_CTX_set_alpn_select_cb(
             m_ctx.native_handle(),
             [](SSL *, const unsigned char **out, unsigned char *outlen, const unsigned char *in, unsigned int inlen,
-               void *) -> int {
-                const auto &list = alpn_wire_list();
+               void *arg) -> int {
+                const auto &list = *static_cast<const std::vector<unsigned char> *>(arg);
                 if (SSL_select_next_proto(const_cast<unsigned char **>(out), outlen, list.data(),
                                           static_cast<unsigned int>(list.size()), in,
                                           inlen) != OPENSSL_NPN_NEGOTIATED) {
@@ -118,9 +144,12 @@ class TlsContext {
                 }
                 return SSL_TLSEXT_ERR_OK;
             },
-            nullptr);
+            &m_alpn);
     }
 
+    // Declared before the context it is registered with: the ALPN callback
+    // holds a pointer to it, and members are destroyed in reverse order.
+    std::vector<unsigned char> m_alpn;
     asio::ssl::context m_ctx;
 };
 
