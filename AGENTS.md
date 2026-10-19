@@ -159,9 +159,9 @@ include/
    `atomic<bool>`；读泵/写泵与 `m_inbox` 都在连接 executor 上，交接用 executor 绑定的
    channel。
    h3 有一处粒度差异要记住：QUIC 的 connection executor **就是 endpoint 的 executor**
-   （`quic/endpoint.h`），而 endpoint 是每个 io_context 一个 UDP socket——不开
+   （`quic/endpoint.h`），而 endpoint 是每个 io_context 一个 UDP socket——显式关掉
    `reuse_port` 时一个监听只有一条线程跑**所有** QUIC 连接（模型 A 仍成立，但线程共享
-   比 TCP 粗得多，这也正是 QUIC 监听必须开 `reuse_port` 的原因）。h3 侧没有 WebSocket
+   比 TCP 粗得多，这也正是 QUIC 的 `reuse_port` 默认开的原因）。h3 侧没有 WebSocket
    （RFC 9220 扩展 CONNECT 未实现）。另：`quic/endpoint.h` 的 `m_send_wake` 是 QUIC
    路径里唯一带锁的地方（`concurrent_channel`），与 `engine/h3/h3_stream.h` 里「ngtcp2/
    nghttp3 回调与消费者同线程、所以用无锁 channel」的契约并不一致（未测量其开销）。
@@ -237,7 +237,8 @@ cfg.worker_threads = 4;
 //                      .mutual=true, .ca_file=... };  // 可选 TLS/mTLS
 // cfg.limits = EngineLimits{...};                     // 可选引擎调参
 // cfg.max_connections = 0;                            // 0=不限；到上限由内核 backlog 排队（Go netutil.LimitListener 形态）
-// cfg.reuse_port = true; cfg.tcp_nodelay = true; cfg.plaintext_protocols = ...;
+// cfg.reuse_port = true;  // 默认 true（明文/TLS/QUIC 共用；false = 独占端口）
+// cfg.tcp_nodelay = true; cfg.plaintext_protocols = ...;
 // cfg.socket_setup   = [](asio::ip::tcp::socket &s){...};      // 每 accept 出的连接
 // cfg.listener_setup = [](asio::ip::tcp::acceptor &a){...};    // 每个监听 socket（bind 后 listen 前，TCP_FASTOPEN 等）
 // #ifdef SIMPLE_HTTP_ENABLE_HTTP3: cfg.quic = QuicAddress{"0.0.0.0", 7792, false};
@@ -580,8 +581,8 @@ test/conformance/run.sh h2spec   # 只跑指定的（h2spec / h1spec / autobahn 
 
 一致性套件每例从干净连接开始，看不见「同一条连接上第 N 个请求」。`test/stress/run.sh` 专问
 那件事：复用门线（一条连接串行 200 请求必须全成）+ 吞吐（只报告，不写死，因为依赖机器）。
-门线只有一条：**失败数必须为 0**。`-t/-c/-m/-n` 等见脚本头部配置。QUIC 侧要开
-`ServerConfig::reuse_port`，否则只跑在机器一小部分上。
+门线只有一条：**失败数必须为 0**。`-t/-c/-m/-n` 等见脚本头部配置。QUIC 侧依赖
+`ServerConfig::reuse_port`（默认已开；若显式关掉，一个 QUIC 监听只会跑在机器一小部分上）。
 
 ### 丢包与乱序下的复现（手工，需要 root）
 

@@ -96,7 +96,8 @@ int main() {
 
 `cfg.listen` is a single endpoint on purpose. Serving several addresses or
 protocol stacks is a multi-process concern: start another `Server`, or another
-process sharing the port via `cfg.reuse_port`. IPv4 and IPv6 come from one
+process sharing the port via `cfg.reuse_port` (on by default, for plaintext and
+TLS alike; set it to false for an exclusive port). IPv4 and IPv6 come from one
 listener — `{"::", port, false}` is dual-stack, and falls back to IPv4 where the
 platform has no IPv6.
 

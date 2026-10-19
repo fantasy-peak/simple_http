@@ -8,8 +8,9 @@
 // in the net/connection layer. The Router's dispatch is used as the engine
 // Dispatcher, so one route table serves HTTP/1.x, HTTP/2 and h2c.
 //
-// The accept topology follows ServerConfig::reuse_port: a single acceptor that
-// round-robins the pool, or one acceptor per worker context (SO_REUSEPORT).
+// The accept topology follows ServerConfig::reuse_port (default true): one
+// acceptor per worker context (SO_REUSEPORT), falling back to a single
+// acceptor that round-robins the pool when the platform rejects it.
 
 #include <algorithm>
 #include <atomic>
@@ -104,12 +105,20 @@ struct ServerConfig {
     std::size_t max_connections{0};
     // Fan the listener out to one acceptor per worker context, so each worker
     // accepts on its own thread: accept capacity scales with the pool and a
-    // connection is never handed across threads. Off by default — a single
-    // acceptor round-robining the pool spreads load more evenly than the
-    // kernel's four-tuple hash, which skews badly when few clients hold
-    // long-lived connections (HTTP/2, WebSocket). Falls back to the single
-    // acceptor if the platform rejects SO_REUSEPORT.
-    bool reuse_port{false};
+    // connection is never handed across threads. Applies to every TCP listener
+    // — plaintext and TLS share this path — and to the QUIC listener (where it
+    // is effectively required: without it one io_context thread runs every QUIC
+    // connection).
+    //
+    // On by default. With SO_REUSEPORT, a second process can bind the same port
+    // and the kernel splits traffic between them: that is what enables zero-
+    // downtime restarts, but it also means `EADDRINUSE` no longer signals "an
+    // instance is already running". Set it to false when you want an exclusive
+    // port (single-process dev, tests, or a workload where one round-robin
+    // acceptor distributes long-lived connections more evenly than the kernel's
+    // four-tuple hash). Falls back to the single acceptor if the platform
+    // rejects SO_REUSEPORT.
+    bool reuse_port{true};
     // Disable Nagle's algorithm on every accepted connection (TCP_NODELAY).
     // On by default, matching nginx's `tcp_nodelay on`: without it small
     // responses can sit in the kernel for up to ~40ms waiting to coalesce,
@@ -905,32 +914,9 @@ class Server {
             const std::shared_ptr<asio::io_context> &ctx_ptr = pinned ? pinned : m_pool->next_ptr();
             asio::io_context &ctx = *ctx_ptr;
 
-            // A connection slot, before async_accept (Go's netutil.LimitListener
-            // model): at the limit the acceptor simply does not accept, so the
-            // kernel backlog holds the excess. The count is global, shared by
-            // every accept loop, so a slot freed on one context wakes the loops
-            // on the others; a freed slot lands on an arbitrary thread, so a
-            // cheap re-check timer is used instead of a cross-thread wake
-            // channel — it only runs while saturated.
-            if (m_config.max_connections != 0) {
-                for (;;) {
-                    if (m_stopped.load(std::memory_order_acquire))
-                        co_return;
-                    std::size_t current = m_active_connections.load(std::memory_order_acquire);
-                    if (current < m_config.max_connections &&
-                        m_active_connections.compare_exchange_weak(current, current + 1, std::memory_order_acq_rel))
-                        break;
-                    asio::steady_timer timer{ctx};
-                    timer.expires_after(std::chrono::milliseconds(25));
-                    co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
-                }
-            }
-
             Socket socket{ctx};
             auto [ec] = co_await acceptor->async_accept(socket, asio::as_tuple(asio::use_awaitable));
             if (ec) {
-                if (m_config.max_connections != 0)
-                    m_active_connections.fetch_sub(1, std::memory_order_acq_rel);
                 if (ec == asio::error::operation_aborted)
                     break;
                 // Never retry in silence, and never retry hot: a persistent
@@ -953,6 +939,36 @@ class Server {
                 continue;
             }
             accept_backoff = std::chrono::milliseconds{0};
+
+            // A connection slot, now that the kernel has handed us a socket.
+            // Acquiring before async_accept would starve connections that hash
+            // to another SO_REUSEPORT listener: that socket's loop would hold
+            // the permit while blocked in accept on a queue with no pending
+            // connection, and the socket that does have one would never be
+            // polled. Accepting first keeps every listener's accept posted;
+            // each loop parks at most one accepted socket here while it waits
+            // for a permit, so the over-limit backlog stays in the kernel.
+            //
+            // The count is global, shared by every accept loop; a freed slot
+            // lands on an arbitrary thread, so a cheap re-check timer is used
+            // instead of a cross-thread wake channel — it only runs while
+            // saturated.
+            if (m_config.max_connections != 0) {
+                for (;;) {
+                    if (m_stopped.load(std::memory_order_acquire)) {
+                        error_code ignored;
+                        socket.close(ignored);
+                        co_return;
+                    }
+                    std::size_t current = m_active_connections.load(std::memory_order_acquire);
+                    if (current < m_config.max_connections &&
+                        m_active_connections.compare_exchange_weak(current, current + 1, std::memory_order_acq_rel))
+                        break;
+                    asio::steady_timer timer{ctx};
+                    timer.expires_after(std::chrono::milliseconds(25));
+                    co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+                }
+            }
 
             // The socket hook and the TCP linger option are typed for a TCP
             // socket, and a UNIX-domain socket has neither — nor a peer address,
