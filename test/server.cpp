@@ -614,9 +614,19 @@ int main() {
     std::signal(SIGINT, request_stop);
     std::signal(SIGTERM, request_stop);
 
-    // Plaintext server: HTTP/1.1, h2c upgrade, HTTP/2 prior-knowledge.
+    // Plaintext server: HTTP/1.1, h2c upgrade, HTTP/2 prior-knowledge. This one
+    // uses the explicit listener list (the multi-listener form) rather than the
+    // single-listener sugar, so the whole third-party suite exercises it.
     ServerConfig plain_cfg;
-    plain_cfg.listen = InetAddress{"0.0.0.0", 7788, false};
+    TcpListenerConfig plain_listener;
+    plain_listener.address = InetAddress{"0.0.0.0", 7788, false};
+    plain_cfg.listeners.push_back(std::move(plain_listener));
+    // A second TCP listener on the same Server: different port, explicit
+    // protocol policy, exercising the multi-listener configuration.
+    TcpListenerConfig secondary;
+    secondary.address = InetAddress{"0.0.0.0", 7794, false};
+    secondary.plaintext = PlaintextHttp::Http1Only;
+    plain_cfg.listeners.push_back(std::move(secondary));
     plain_cfg.worker_threads = 4;
     // permessage-deflate (RFC 7692) on: the Autobahn and third-party Python
     // suites drive this listener, so the extension's whole wire surface
