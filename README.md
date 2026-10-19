@@ -94,12 +94,38 @@ int main() {
 }
 ```
 
-`cfg.listen` is a single endpoint on purpose. Serving several addresses or
-protocol stacks is a multi-process concern: start another `Server`, or another
-process sharing the port via `cfg.reuse_port` (on by default, for plaintext and
-TLS alike; set it to false for an exclusive port). IPv4 and IPv6 come from one
-listener — `{"::", port, false}` is dual-stack, and falls back to IPv4 where the
-platform has no IPv6.
+`cfg.listen` is the single-listener shorthand. A `Server` can own several
+listeners — different ports, per-listener TLS, plaintext/ALPN policy, and
+independent TCP/QUIC topology — either through `cfg.listeners` or the fluent
+builder:
+
+```cpp
+simple_http::Server server;                        // no listener yet
+
+server.listen(simple_http::InetAddress{"0.0.0.0", 80})
+      .name("public")
+      .plaintext(simple_http::PlaintextHttp::Http1WithH2cUpgrade);
+
+server.listen(simple_http::InetAddress{"0.0.0.0", 443})
+      .name("https")
+      .tls(simple_http::TlsConfig{.cert_chain_file = "cert.pem", .private_key_file = "key.pem"})
+      .alpn(simple_http::TlsHttp::Http1AndHttp2);
+
+auto started = server.start();
+if (!started) {
+    for (const auto &failure : started.error().failures)
+        std::println("{}: {}", failure.name, failure.error.message());
+    return 1;
+}
+for (const auto &bound : started->bound)
+    std::println("listening on {}://{}:{}", bound.scheme, bound.host, bound.port);
+```
+
+`Server::router()` is shared, so two `Server`s can serve the same route table on
+different listeners. IPv4 and IPv6 come from one listener — `{"::", port, false}`
+is dual-stack, and falls back to IPv4 where the platform has no IPv6. TCP
+`reuse_port` is on by default for plaintext and TLS alike; set it to false (or
+`.reuse_port(false)` on one listener) for an exclusive port.
 
 A UNIX-domain socket replaces the port with a path. There is no macro and
 nothing extra to link: `boost::asio::local::stream_protocol` is part of Asio, so

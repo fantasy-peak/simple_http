@@ -242,6 +242,14 @@ cfg.worker_threads = 4;
 // cfg.socket_setup   = [](asio::ip::tcp::socket &s){...};      // 每 accept 出的连接
 // cfg.listener_setup = [](asio::ip::tcp::acceptor &a){...};    // 每个监听 socket（bind 后 listen 前，TCP_FASTOPEN 等）
 // #ifdef SIMPLE_HTTP_ENABLE_HTTP3: cfg.quic = QuicAddress{"0.0.0.0", 7792, false};
+// 以上单监听字段是 sugar；显式多监听写 cfg.listeners（TcpListenerConfig /
+// QuicListenerConfig），或在 Server 上用 builder：
+//   server.listen(InetAddress{"0.0.0.0", 80}).plaintext(PlaintextHttp::Http1WithH2cUpgrade);
+//   server.listen(InetAddress{"0.0.0.0", 443}).tls(...).alpn(TlsHttp::Http1AndHttp2);
+// 每个 listener 自带 tls/alpn/plaintext/reuse_port/acceptors/limits/hooks/max_connections。
+// start()/run() 返回 std::expected<StartReport, StartupError>：
+//   AllOrNothing（默认）失败整体回滚；BestEffort 保留已绑定并在 report.failures 报告。
+// Server::router() 可共享给多个 Server。
 
 Server server{cfg};
 server.route({Method::Get}, "/world", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
