@@ -178,7 +178,7 @@ class Request {
     // from the saved source, so the copy sends the same bytes.
     template <typename Executor> std::shared_ptr<Request> clone_for_replay(const Executor &exec) const {
         auto copy = std::make_shared<Request>(Version::Http11, exec);
-        copy->set_method(m_method);
+        copy->set_method_token(std::string{m_method_token});
         copy->set_target(m_target);
         copy->m_url = m_url;
         copy->mutable_headers() = m_headers;
@@ -355,7 +355,14 @@ class Request {
     // view into the request path (it is, for dispatch's own captures).
     void set_param(std::string name, std::string_view value) { m_params.emplace_back(std::move(name), value); }
 
-    void set_method(Method method) { m_method = method; }
+    // Keeps the wire token in sync with the enum. The client engines write the
+    // token (not the enum), so a Request built with set_method(Post) must carry
+    // "POST" even when no set_method_token() call follows. Extension methods use
+    // set_method_token("PROPFIND") directly and keep Method::Unknown.
+    void set_method(Method method) {
+        m_method = method;
+        m_method_token = method == Method::Unknown ? std::string{} : std::string{to_string(method)};
+    }
     void set_method_token(std::string token) {
         m_method = method_from_string(token);
         m_method_token = std::move(token);

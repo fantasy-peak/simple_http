@@ -691,8 +691,12 @@ class Http2ClientSession final : public ClientSession,
     // Encodes a request head as HPACK, with the static table carrying what it can
     // (the pseudo-headers of a plain GET cost one byte each).
     error_code encode_request_head(const Request &request, std::string &block) {
-        const std::string_view method = to_string(request.method());
+        // The raw token carries extension methods; set_method() keeps it in sync
+        // for the standard verbs.
+        std::string_view method = request.method_token();
         if (method.empty())
+            method = to_string(request.method());
+        if (method.empty() || contains_ctl(method))
             return make_error_code(client_errc::protocol_error);
         const std::string_view target =
             request.target().empty() ? std::string_view{"/"} : std::string_view{request.target()};
@@ -710,7 +714,14 @@ class Http2ClientSession final : public ClientSession,
             codec::hpack_append_literal(block, ":method", method);
         }
         codec::hpack_append_indexed(block, m_target.use_tls ? 7 : 6);
-        codec::hpack_append_literal(block, ":authority", m_authority);
+        // RFC 9113 §8.3.1: :authority is Host's HTTP/2 spelling. A `host` field
+        // on the Request is an explicit override (reverse proxy preserve_host);
+        // otherwise the connection target owns it.
+        if (const auto host_override = request.header("host")) {
+            codec::hpack_append_literal(block, ":authority", *host_override);
+        } else {
+            codec::hpack_append_literal(block, ":authority", m_authority);
+        }
         if (target == "/") {
             codec::hpack_append_indexed(block, 4);
         } else {

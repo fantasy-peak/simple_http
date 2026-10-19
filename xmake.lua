@@ -64,14 +64,6 @@ target("server")
             target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete", "-Wno-type-limits")
         end
         -- xmake f --toolchain=llvm --runtimes=c++_static -c -v
-        if target:toolchain("llvm") then
-            target:add("files", "include/simple_http.cppm", {public = true})
-            target:add("defines", "SIMPLE_HTTP_USE_MODULES")
-            target:add("cxflags", "-fuse-ld=mold", "-stdlib=libc++")
-            target:add("ldflags", "-fuse-ld=mold", "-stdlib=libc++")
-            target:set("policy", "build.c++.modules", true)
-            target:set("policy", "build.c++.modules.std", true)
-        end
     end)
     add_deps("simple_http")
     add_files("test/server.cpp")

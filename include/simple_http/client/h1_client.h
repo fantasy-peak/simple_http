@@ -453,7 +453,11 @@ class Http1ClientSession final : public ClientSession,
         "connection: Upgrade, HTTP2-Settings\r\nupgrade: h2c\r\nhttp2-settings: ";
 
     error_code build_request_head(std::string &out) {
-        const std::string_view method = to_string(m_spec->method());
+        // The raw token carries extension methods (PROPFIND, PURGE, …) that the
+        // enum cannot name; set_method() keeps it in sync for the common verbs.
+        std::string_view method = m_spec->method_token();
+        if (method.empty())
+            method = to_string(m_spec->method());
         if (method.empty())
             return make_error_code(client_errc::protocol_error);
         const std::string_view target = m_spec->target();
@@ -464,8 +468,12 @@ class Http1ClientSession final : public ClientSession,
         out.push_back(' ');
         out.append(target.empty() ? "/" : target);
         out.append(" HTTP/1.1\r\n");
+        // A `host` field on the Request is an explicit authority override (the
+        // reverse proxy's preserve_host mode); otherwise the connection target
+        // owns the authority.
+        const auto host_override = m_spec->header("host");
         out.append("host: ");
-        out.append(m_authority);
+        out.append(host_override ? *host_override : std::string_view{m_authority});
         out.append("\r\n");
 
         bool saw_agent = false;

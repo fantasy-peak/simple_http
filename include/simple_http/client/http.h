@@ -489,8 +489,9 @@ class Client {
         const std::size_t cap = max_body_bytes != 0 ? max_body_bytes : m_cfg.limits.max_body_bytes;
         const std::chrono::milliseconds limit = timeout.count() != 0 ? timeout : m_cfg.request_timeout;
         co_return co_await follow_redirects(m_impl, m_cfg, std::move(target), request->method(),
-                                            Headers{request->headers()}, request->body_source(), std::move(url_target),
-                                            cap, limit, m_cfg.max_redirects, std::move(current_url));
+                                            std::string{request->method_token()}, Headers{request->headers()},
+                                            request->body_source(), std::move(url_target), cap, limit,
+                                            m_cfg.max_redirects, std::move(current_url));
     }
 
     // --- explicit streaming (full-duplex) ---
@@ -592,7 +593,11 @@ class Client {
         if (!opened) {
             co_return std::unexpected{opened.error()};
         }
-        co_return OpenTargetStream{std::make_shared<Stream>(std::move(opened->stream))};
+        // open_target is the reverse proxy's entry point: apply the same layered
+        // budgets the public open_stream() path uses, or the proxy would wait for
+        // an upstream response head with a zero (unbounded) timeout.
+        co_return OpenTargetStream{
+            std::make_shared<Stream>(std::move(opened->stream), m_cfg.response_head_timeout, m_cfg.body_idle_timeout)};
     }
 
   private:
@@ -697,13 +702,15 @@ class Client {
     // the Request per hop — Go's http.Request.GetBody, concretely.
     static asio::awaitable<std::expected<Response, error_code>>
     follow_redirects(std::shared_ptr<detail::ClientEngine> impl, const ClientConfig &cfg, detail::ClientTarget target,
-                     Method method, Headers headers, std::string body, std::string url_target, std::size_t cap,
-                     std::chrono::milliseconds limit, std::size_t remaining, std::string current_url) {
+                     Method method, std::string method_token, Headers headers, std::string body, std::string url_target,
+                     std::size_t cap, std::chrono::milliseconds limit, std::size_t remaining, std::string current_url) {
         // Saved before target is moved into the exchange: the next hop's origin
         // comparison needs the current authority.
         const std::string current_host = target.host;
         auto request = std::make_shared<Request>(Version::Http11, co_await asio::this_coro::executor);
-        request->set_method(method);
+        // The raw token carries extension methods through the convenience path;
+        // set_method_token() also refreshes the enum.
+        request->set_method_token(method_token.empty() ? std::string{to_string(method)} : std::move(method_token));
         request->mutable_headers() = std::move(headers);
         request->set_target(url_target.empty() ? "/" : url_target);
         if (!body.empty())
@@ -746,6 +753,7 @@ class Client {
             ((response->status() == status::moved_permanently || response->status() == status::found) &&
              !get_like(method))) {
             method = Method::Get;
+            method_token = "GET";
             body.clear();
             headers.erase("content-type"); // an empty GET carries no entity
             headers.erase("content-length");
@@ -772,9 +780,9 @@ class Client {
         // The next hop's origin-form target supersedes the old one; exchange_once
         // only fills an empty one.
         url_target = hop->url_target;
-        co_return co_await follow_redirects(std::move(impl), cfg, std::move(hop->target), method, std::move(headers),
-                                            std::move(body), std::move(url_target), cap, limit, remaining - 1,
-                                            std::move(hop->url));
+        co_return co_await follow_redirects(std::move(impl), cfg, std::move(hop->target), method,
+                                            std::move(method_token), std::move(headers), std::move(body),
+                                            std::move(url_target), cap, limit, remaining - 1, std::move(hop->url));
     }
 
     // Reads the response of one exchange: head, then whole body, both under the

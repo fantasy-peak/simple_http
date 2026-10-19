@@ -1,7 +1,7 @@
 #pragma once
 
-// HTTP reverse proxy — request-level, standard forward-proxy behaviour, driven
-// by the client layer.
+// HTTP reverse proxy — request-level, modelled on Go's
+// net/http/httputil.ReverseProxy, driven by the client layer.
 //
 // Unlike the byte-level WebSocket tunnel (engine/h1/ws_proxy.h), this operates
 // on the parsed Request/Response abstraction, one request at a time, and the
@@ -10,16 +10,18 @@
 // as a head plus body chunks. So the backend may be plaintext or TLS,
 // HTTP/1.1 or HTTP/2 — see HttpProxyTarget.
 //
-// Standard reverse-proxy header handling (RFC 7230 §5.7.1 / §6.1):
-//   * append the client address to X-Forwarded-For, set X-Forwarded-Proto and
-//     X-Forwarded-Host;
-//   * the Host header (and, on HTTP/2, :authority) is the backend's — the
-//   client
-//     layer writes the origin's authority, so a `host` field from the frontend
-//     is dropped rather than forwarded;
-//   * strip hop-by-hop headers (Connection, Keep-Alive, Proxy-*, TE, Trailer,
-//     Transfer-Encoding, Upgrade) plus any field named in the Connection
-//     header, on both the request and the response.
+// The shape follows Go's ReverseProxy:
+//   * hop-by-hop fields are removed on both legs, including every field named
+//     by any Connection header (RFC 9110 §7.6.1), and HTTP2-Settings;
+//   * X-Forwarded-For / -Proto / -Host are authored by the proxy (the inbound
+//     forwarding fields are stripped first, Go's Rewrite mode; preserve the
+//     inbound X-Forwarded-For chain with preserve_inbound_forwarding);
+//   * TE: trailers is kept alive (gRPC), and upstream trailers are relayed;
+//   * Rewrite / ModifyResponse / ErrorHandler hooks are available per route;
+//   * CONNECT is rejected (Go answers 405), never forwarded;
+//   * only replay-safe requests are retried after anything reached the wire,
+//     and request-body failures abort the upstream leg instead of sending a
+//     truncated body as if it were complete.
 //
 // Connection shape: per request. The handler runs on the connection executor,
 // so the client it builds is pinned to that executor and all I/O for the
@@ -29,22 +31,39 @@
 // request, trading a handshake per request for a cache-free, lock-free,
 // head-of-line-free proxy. A backend behind a tunnel that needs reuse would
 // want a pool instead.
+//
+// Deliberate limits relative to Go (documented rather than hidden):
+//   * HTTP/1.1 request bodies are streamed as chunked; a known Content-Length
+//     is not preserved (the proxy never buffers the body);
+//   * generic 101 Switching Protocols is not tunnelled here — WebSocket has its
+//     own byte-level route (ws_proxy), and HTTP/1.1 Upgrade requests that reach
+//     this handler are rejected with 501 rather than silently downgraded;
+//   * informational responses other than the local 100-continue handshake are
+//     not relayed by the client layer; request trailers have no upstream
+//     client API yet. `Expect: 100-continue` is answered locally (RFC 9110
+//     §10.1.1 permits an intermediary to), so a backend cannot reject the body
+//     before it arrives.
 
 #include <array>
 #include <boost/asio.hpp>
+#include <boost/asio/experimental/awaitable_operators.hpp>
 #include <cctype>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "../client/http.h" // simple_http::Client — the upstream leg lives on the new API
+#include "../core/http_status.h"
 #include "../core/logging.h"
 #include "../core/types.h"
-#include "../engine/dispatcher.h" // HttpProxyTarget
+#include "../engine/dispatcher.h" // HttpProxyTarget / HttpProxyHooks
 #include "../proto/headers.h"
 #include "../proto/request.h"
 #include "../proto/response.h"
@@ -55,12 +74,21 @@ namespace asio = boost::asio;
 
 namespace detail {
 
-// Hop-by-hop headers that must not be forwarded (RFC 7230 §6.1). Field names
+// Hop-by-hop headers that must not be forwarded (RFC 9110 §7.6.1). Field names
 // are compared lowercased (Headers stores them lowercased already).
 inline bool is_hop_by_hop(std::string_view name) {
     static constexpr std::string_view kHop[] = {
-        "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-        "te",         "trailer",    "transfer-encoding",  "upgrade",
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        // RFC 7540 §3.2.2.2: only meaningful for the h2c Upgrade request.
+        "http2-settings",
     };
     for (auto h : kHop) {
         if (name == h)
@@ -76,28 +104,31 @@ inline std::string to_lower(std::string_view s) {
     return out;
 }
 
-// Splits a comma-separated Connection header value into lowercased tokens,
-// which name additional per-connection headers that must also be stripped.
+// Every value of the Connection header names a field that is hop-by-hop for
+// this connection. Multiple Connection fields are legal in HTTP/1.x (Go's
+// removeHopByHopHeaders iterates all of them), so reading only the first one
+// would leave a second field's nominated headers attached to the upstream
+// message.
 inline std::vector<std::string> connection_tokens(const Headers &headers) {
     std::vector<std::string> tokens;
-    auto conn = headers.get("connection");
-    if (!conn)
-        return tokens;
-    std::string_view v{*conn};
-    std::size_t pos = 0;
-    while (pos < v.size()) {
-        std::size_t comma = v.find(',', pos);
-        std::string_view tok = v.substr(pos, comma == std::string_view::npos ? std::string_view::npos : comma - pos);
-        // trim OWS
-        while (!tok.empty() && (tok.front() == ' ' || tok.front() == '\t'))
-            tok.remove_prefix(1);
-        while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\t'))
-            tok.remove_suffix(1);
-        if (!tok.empty())
-            tokens.push_back(to_lower(tok));
-        if (comma == std::string_view::npos)
-            break;
-        pos = comma + 1;
+    for (auto conn : headers.get_all("connection")) {
+        std::string_view v{conn};
+        std::size_t pos = 0;
+        while (pos < v.size()) {
+            std::size_t comma = v.find(',', pos);
+            std::string_view tok =
+                v.substr(pos, comma == std::string_view::npos ? std::string_view::npos : comma - pos);
+            // trim OWS
+            while (!tok.empty() && (tok.front() == ' ' || tok.front() == '\t'))
+                tok.remove_prefix(1);
+            while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\t'))
+                tok.remove_suffix(1);
+            if (!tok.empty())
+                tokens.push_back(to_lower(tok));
+            if (comma == std::string_view::npos)
+                break;
+            pos = comma + 1;
+        }
     }
     return tokens;
 }
@@ -110,6 +141,56 @@ inline bool contains_token(const std::vector<std::string> &tokens, std::string_v
     return false;
 }
 
+// Whether a single comma-separated field value contains `lower_token`
+// (case-insensitively). Go's httpguts.HeaderValuesContainsToken, used to keep
+// `TE: trailers` alive across the proxy.
+inline bool value_has_token(std::string_view value, std::string_view lower_token) {
+    std::size_t pos = 0;
+    while (pos <= value.size()) {
+        std::size_t comma = value.find(',', pos);
+        std::string_view tok =
+            value.substr(pos, comma == std::string_view::npos ? std::string_view::npos : comma - pos);
+        while (!tok.empty() && (tok.front() == ' ' || tok.front() == '\t'))
+            tok.remove_prefix(1);
+        while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\t'))
+            tok.remove_suffix(1);
+        if (to_lower(tok) == lower_token)
+            return true;
+        if (comma == std::string_view::npos)
+            break;
+        pos = comma + 1;
+    }
+    return false;
+}
+
+// Fences one client awaitable against the request-scoped cancellation token.
+// operator|| waits for the loser to finish before returning, so the caller can
+// safely abort the upstream stream afterwards. Returns operation_aborted when
+// the request was cancelled (the caller then returns without touching the
+// frontend response).
+template <typename T>
+asio::awaitable<std::expected<T, error_code>> await_cancelable(const std::shared_ptr<Request> &req,
+                                                               asio::awaitable<std::expected<T, error_code>> op) {
+    if (req->cancelled())
+        co_return std::unexpected{make_error_code(asio::error::operation_aborted)};
+    using namespace asio::experimental::awaitable_operators;
+    auto outcome = co_await (std::move(op) || req->wait_cancelled());
+    if (auto *value = std::get_if<std::expected<T, error_code>>(&outcome))
+        co_return std::move(*value);
+    co_return std::unexpected{make_error_code(asio::error::operation_aborted)};
+}
+
+inline asio::awaitable<error_code> await_cancelable(const std::shared_ptr<Request> &req,
+                                                    asio::awaitable<error_code> op) {
+    if (req->cancelled())
+        co_return make_error_code(asio::error::operation_aborted);
+    using namespace asio::experimental::awaitable_operators;
+    auto outcome = co_await (std::move(op) || req->wait_cancelled());
+    if (auto *value = std::get_if<error_code>(&outcome))
+        co_return *value;
+    co_return make_error_code(asio::error::operation_aborted);
+}
+
 } // namespace detail
 
 // Runs one request-level HTTP reverse-proxy exchange: forwards `req` to the
@@ -119,12 +200,58 @@ inline bool contains_token(const std::vector<std::string> &tokens, std::string_v
 // response instead (a truncated body must never look complete).
 inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res,
                                             bool client_is_tls, HttpProxyTarget target, simple_http::Client &client) {
-    auto fail_502 = [&res]() -> asio::awaitable<void> {
-        if (co_await res->connected()) {
-            (void)co_await res->status(502).content_type("text/plain").send("Bad Gateway");
+    auto send_error = [&](int status, error_code ec) -> asio::awaitable<void> {
+        if (req->cancelled() || res->started())
+            co_return;
+        if (!co_await res->connected())
+            co_return;
+        if (target.hooks.error_handler) {
+            try {
+                co_await target.hooks.error_handler(res, *req, ec);
+            } catch (const std::exception &e) {
+                SIMPLE_HTTP_ERROR_LOG("http-proxy: error handler threw: {}", e.what());
+            } catch (...) {
+                SIMPLE_HTTP_ERROR_LOG("http-proxy: error handler threw an unknown exception");
+            }
+            if (res->started())
+                co_return;
         }
+        (void)co_await res->status(status).content_type("text/plain").send(std::string{reason_phrase(status)});
         co_return;
     };
+
+    // RFC 9110 §9.3.6: CONNECT turns the connection into a tunnel; this
+    // request-level proxy cannot honour that. Go answers 405 rather than
+    // forwarding a half-understood request.
+    if (req->method() == Method::Connect) {
+        SIMPLE_HTTP_ERROR_LOG("http-proxy: refusing CONNECT (not a tunnel proxy)");
+        co_await send_error(status::method_not_allowed, make_error_code(asio::error::operation_not_supported));
+        co_return;
+    }
+
+    // RFC 9110 §7.8: an Upgrade reaches this handler only when no WebSocket
+    // route claimed it. A generic 101 tunnel is not implemented here (the
+    // byte-level ws_proxy is the WebSocket path), so reject it explicitly
+    // instead of stripping Upgrade and letting the backend answer as 200.
+    // h2c is the exception Go makes too: a frontend may use the h2c Upgrade
+    // handshake on its leg to *this* proxy; the proxy answers it as an ordinary
+    // HTTP/1.1 request and forwards a plain request, never the upgrade itself.
+    {
+        bool connection_upgrade = false;
+        for (auto conn : req->headers().get_all("connection")) {
+            if (detail::value_has_token(conn, "upgrade")) {
+                connection_upgrade = true;
+                break;
+            }
+        }
+        if (connection_upgrade) {
+            if (auto upgrade = req->header("upgrade"); upgrade && !detail::value_has_token(*upgrade, "h2c")) {
+                SIMPLE_HTTP_ERROR_LOG("http-proxy: refusing unsupported Upgrade '{}'", *upgrade);
+                co_await send_error(status::not_implemented, make_error_code(asio::error::operation_not_supported));
+                co_return;
+            }
+        }
+    }
 
     // --- the request to forward ---
     // The rewrite template operates on the path only (Router matches req->path(),
@@ -146,45 +273,93 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
     // header we synthesize. The engines reject such bytes at parse time (h1
     // cannot produce them, h2 validates them), but a proxy must not rely on its
     // caller.
-    if (contains_ctl(req->method_token()) || contains_ctl(forwarded_target)) {
-        SIMPLE_HTTP_ERROR_LOG("http-proxy: refusing request line with CR/LF/NUL");
-        co_await fail_502();
+    const std::string_view method_token = req->method_token();
+    if (method_token.empty() || contains_ctl(method_token) || contains_ctl(forwarded_target)) {
+        SIMPLE_HTTP_ERROR_LOG("http-proxy: refusing request line with an empty method or CR/LF/NUL");
+        co_await send_error(status::bad_request, make_error_code(asio::error::invalid_argument));
         co_return;
     }
 
     auto spec =
         std::make_shared<simple_http::Request>(simple_http::Version::Http11, co_await asio::this_coro::executor);
-    spec->set_method(req->method());
+    spec->set_method_token(std::string{method_token});
     spec->set_target(std::move(forwarded_target));
 
     // Copy the frontend's fields, minus what the client layer owns (Host,
-    // Content-Length, the connection's own headers) and minus anything the
-    // Connection header lists.
+    // Content-Length, the connection's own headers), minus anything the
+    // Connection header lists, and minus the forwarding fields this proxy
+    // authors itself. Go's Rewrite mode strips the latter before the hook runs;
+    // the hook can copy them back from `in` when a deployment needs that.
     auto req_conn_tokens = detail::connection_tokens(req->headers());
-    std::string xff;
-    bool saw_xff = false;
+    std::vector<std::string_view> prior_xff;
     for (const auto &[name, value] : req->headers()) {
         if (detail::is_hop_by_hop(name) || detail::contains_token(req_conn_tokens, name))
             continue;
         if (name == "host" || name == "expect" || name == "content-length")
             continue;
+        if (name == "forwarded" || name == "x-forwarded-host" || name == "x-forwarded-proto")
+            continue;
         if (name == "x-forwarded-for") {
-            saw_xff = true;
-            xff = value; // will append the client address below
+            if (target.preserve_inbound_forwarding)
+                prior_xff.push_back(value);
             continue;
         }
         if (contains_ctl(name) || contains_ctl(value)) {
             SIMPLE_HTTP_ERROR_LOG("http-proxy: refusing header with CR/LF/NUL: {}", name);
-            co_await fail_502();
+            co_await send_error(status::bad_request, make_error_code(asio::error::invalid_argument));
             co_return;
         }
         spec->mutable_headers().add_lower(name, value);
     }
-    spec->mutable_headers().add_lower("x-forwarded-for",
-                                      saw_xff && !xff.empty() ? xff + ", " + req->peer_address() : req->peer_address());
+
+    // X-Forwarded-For: by default only the real peer (Go's Rewrite mode); the
+    // legacy Director-style chain is available explicitly.
+    std::string xff;
+    if (target.preserve_inbound_forwarding) {
+        for (const auto &prior : prior_xff) {
+            if (!xff.empty())
+                xff.append(", ");
+            xff.append(prior);
+        }
+    }
+    if (!xff.empty())
+        xff.append(", ");
+    xff.append(req->peer_address());
+    spec->mutable_headers().add_lower("x-forwarded-for", std::move(xff));
     spec->mutable_headers().add_lower("x-forwarded-proto", client_is_tls ? "https" : "http");
     if (auto host = req->header("host"))
         spec->mutable_headers().add_lower("x-forwarded-host", std::string{*host});
+
+    // Host policy: the client layer writes the backend authority unless the
+    // Request carries an explicit `host` field (h1 and h2 honour it).
+    if (!target.host_header.empty()) {
+        if (contains_ctl(target.host_header)) {
+            SIMPLE_HTTP_ERROR_LOG("http-proxy: refusing configured host header with CR/LF/NUL");
+            co_await send_error(status::bad_gateway, make_error_code(asio::error::invalid_argument));
+            co_return;
+        }
+        spec->mutable_headers().add_lower("host", target.host_header);
+    } else if (target.preserve_host) {
+        if (auto host = req->header("host"))
+            spec->mutable_headers().add_lower("host", std::string{*host});
+    }
+
+    // `TE` is hop-by-hop, but RFC 9110 §6.1 / Go's ReverseProxy keep exactly
+    // `TE: trailers` alive: it is how an HTTP/2-capable peer (gRPC in particular)
+    // is told the response may end in a trailer section, which the proxy then
+    // forwards. Dropping it silently breaks grpc-status trailers.
+    for (auto te : req->headers().get_all("te")) {
+        if (detail::value_has_token(te, "trailers")) {
+            spec->mutable_headers().add_lower("te", "trailers");
+            break;
+        }
+    }
+
+    // Go suppresses net/http's default User-Agent by setting an empty value.
+    // The client engines here have their own default, so an empty field is the
+    // equivalent: a transparent proxy must not invent an identity.
+    if (!spec->headers().contains("user-agent"))
+        spec->mutable_headers().add_lower("user-agent", "");
 
     // Does the request carry a body? Header hints work for HTTP/1.x but NOT for
     // HTTP/2, which frames the body with END_STREAM and carries neither header,
@@ -200,14 +375,41 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
     std::string first_chunk;
     bool has_body = false;
     {
-        auto frame = co_await req->body().read();
-        if (frame && !frame->eof) {
+        auto frame = co_await detail::await_cancelable(req, req->body().read());
+        if (req->cancelled())
+            co_return;
+        if (!frame) {
+            // The frontend's body stream failed (disconnect/reset). It must not
+            // become a bodyless or truncated request at the backend: nothing has
+            // been sent there yet, so answer the frontend and stop.
+            SIMPLE_HTTP_ERROR_LOG("http-proxy: reading the request body failed: {}", frame.error().message());
+            co_await send_error(status::bad_request, frame.error());
+            co_return;
+        }
+        if (!frame->eof) {
             has_body = true;
             first_chunk = std::move(frame->data);
         }
-        // else: no body (immediate EOF), or a read error — forward with no body.
     }
     spec->set_stream_body(has_body);
+
+    // Rewrite hook runs after the standard rewrite and before the body is sent,
+    // like Go's ProxyRequest.Rewrite. A throwing hook is a proxy fault (500).
+    if (target.hooks.rewrite) {
+        std::string hook_error;
+        try {
+            target.hooks.rewrite(*req, *spec);
+        } catch (const std::exception &e) {
+            hook_error = e.what();
+        } catch (...) {
+            hook_error = "unknown exception";
+        }
+        if (!hook_error.empty()) {
+            SIMPLE_HTTP_ERROR_LOG("http-proxy: rewrite hook threw: {}", hook_error);
+            co_await send_error(status::internal_server_error, make_error_code(asio::error::invalid_argument));
+            co_return;
+        }
+    }
 
     // --- the backend this target names ---
     simple_http::detail::ClientTarget upstream;
@@ -216,87 +418,102 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
     upstream.use_tls = target.tls;
     if (target.tls) {
         upstream.version = simple_http::HttpVersionPolicy::Auto; // ALPN: h2 when the backend offers it
-    } else if (target.h2c) {
+    } else if (target.h2c || target.h2c_prior_knowledge) {
         upstream.version = simple_http::HttpVersionPolicy::Http2;
-        upstream.h2c = simple_http::H2cMode::Upgrade;
+        upstream.h2c =
+            target.h2c_prior_knowledge ? simple_http::H2cMode::PriorKnowledge : simple_http::H2cMode::Upgrade;
     } else {
         upstream.version = simple_http::HttpVersionPolicy::Http11; // the historical default: plain HTTP/1.1
         upstream.h2c = simple_http::H2cMode::Off;
     }
 
-    // Each request dials a fresh upstream connection. A transport drop can
-    // still lose the request: the dial may fail, or the connection may drop
-    // before the response head arrives. A bodyless request that never reached
-    // the wire may be re-sent (nothing of a duplicate can have been acted on if
-    // no response head was produced); a bodied request cannot be rebuilt, so it
-    // is never retried here. Retry a small bounded number of times rather than
-    // turning a transient transport error into a 502. A client-side timeout is
-    // a real answer to the caller, not a race, so it is not multiplied here.
+    // A request may be replayed only when nothing it says can have been acted
+    // on twice. A body that has been streamed cannot be rebuilt; a POST/PATCH —
+    // even a bodyless one — is not idempotent. This is the same rule the client
+    // layer uses (detail::retry_allowed), applied to the proxy's own retry loop.
     auto transport_drop = [](const error_code &ec) {
         return simple_http::detail::transport_failure(ec) || simple_http::is_retryable(ec);
     };
-    constexpr int kMaxAttempts = 3;
-    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
-        const bool last_attempt = attempt + 1 == kMaxAttempts;
-        auto opened = co_await client.open_target(upstream, spec);
+    const bool replayable = !has_body && is_idempotent(req->method());
+    const std::size_t max_attempts = target.max_attempts == 0 ? 1 : target.max_attempts;
+    for (std::size_t attempt = 0; attempt < max_attempts; ++attempt) {
+        const bool last_attempt = attempt + 1 == max_attempts;
+        auto opened = co_await detail::await_cancelable(req, client.open_target(upstream, spec));
+        if (req->cancelled())
+            co_return;
         if (!opened) {
             const error_code ec = opened.error();
             // Nothing of the request has reached the wire when the open itself
-            // failed (the body is forwarded only after a stream exists), so a
-            // bodyless request can be re-opened.
-            if (!last_attempt && !has_body && transport_drop(ec)) {
+            // failed, but a bodyless POST is still not safe to replay: the
+            // client may have sent the head before the failure (h2c upgrade).
+            if (!last_attempt && replayable && transport_drop(ec)) {
                 SIMPLE_HTTP_ERROR_LOG("http-proxy: opening {}:{} failed ({}), retrying", target.host, target.port,
                                       ec.message());
                 continue;
             }
             SIMPLE_HTTP_ERROR_LOG("http-proxy: no upstream connection to {}:{} ({})", target.host, target.port,
                                   ec.message());
-            co_await fail_502();
+            co_await send_error(status::bad_gateway, ec);
             co_return;
         }
         auto &stream = opened->stream;
 
         // --- request body ---
         if (has_body) {
-            bool body_sent = true;
-            if (!first_chunk.empty()) {
-                if (auto ec = co_await stream->write(first_chunk); ec)
-                    body_sent = false;
-            }
-            for (; body_sent;) {
-                auto frame = co_await req->body().read();
-                if (!frame || frame->eof)
-                    break; // a body read error just ends what we forward
+            error_code body_ec;
+            if (!first_chunk.empty())
+                body_ec = co_await detail::await_cancelable(req, stream->write(std::move(first_chunk)));
+            for (; !body_ec;) {
+                auto frame = co_await detail::await_cancelable(req, req->body().read());
+                if (req->cancelled()) {
+                    (void)co_await stream->abort();
+                    co_return;
+                }
+                if (!frame) {
+                    // A failed inbound body cannot be presented upstream as a
+                    // complete body: abort instead of finish(), otherwise the
+                    // backend acts on a silently shortened request.
+                    SIMPLE_HTTP_ERROR_LOG("http-proxy: request body failed mid-stream: {}", frame.error().message());
+                    (void)co_await stream->abort();
+                    co_await send_error(status::bad_request, frame.error());
+                    co_return;
+                }
+                if (frame->eof)
+                    break;
                 if (frame->data.empty())
                     continue;
-                if (auto ec = co_await stream->write(std::move(frame->data)); ec) {
-                    SIMPLE_HTTP_ERROR_LOG("http-proxy: upstream {}:{} rejected the body ({})", target.host, target.port,
-                                          ec.message());
-                    body_sent = false;
-                    break;
-                }
+                body_ec = co_await detail::await_cancelable(req, stream->write(std::move(frame->data)));
             }
-            if (body_sent) {
-                if (auto ec = co_await stream->finish(std::string{}); ec)
-                    body_sent = false;
+            if (req->cancelled()) {
+                (void)co_await stream->abort();
+                co_return;
             }
-            if (!body_sent) {
+            if (!body_ec)
+                body_ec = co_await detail::await_cancelable(req, stream->finish(std::string{}));
+            if (req->cancelled()) {
+                (void)co_await stream->abort();
+                co_return;
+            }
+            if (body_ec) {
                 // The request is half-sent: it cannot be replayed, and the
                 // frontend has not seen a response yet.
+                SIMPLE_HTTP_ERROR_LOG("http-proxy: upstream {}:{} rejected the body ({})", target.host, target.port,
+                                      body_ec.message());
                 (void)co_await stream->abort();
-                co_await fail_502();
+                co_await send_error(status::bad_gateway, body_ec);
                 co_return;
             }
         }
 
         // --- the backend's response head ---
-        auto head = co_await stream->read_head();
+        auto head = co_await detail::await_cancelable(req, stream->read_head());
+        if (req->cancelled()) {
+            (void)co_await stream->abort();
+            co_return;
+        }
         if (!head) {
             const error_code ec = head.error();
-            // A transport drop before the response head is the stale-kept /
-            // re-dial race; a bodyless request can be re-sent. A streamed body
-            // cannot be rebuilt, so a bodied request is never retried here.
-            if (!last_attempt && !has_body && transport_drop(ec)) {
+            if (!last_attempt && replayable && transport_drop(ec)) {
                 SIMPLE_HTTP_ERROR_LOG("http-proxy: {}:{} dropped the connection before answering ({}), retrying",
                                       target.host, target.port, ec.message());
                 (void)co_await stream->abort();
@@ -305,27 +522,78 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
             SIMPLE_HTTP_ERROR_LOG("http-proxy: no response head from {}:{} ({})", target.host, target.port,
                                   ec.message());
             (void)co_await stream->abort();
-            co_await fail_502();
+            co_await send_error(status::bad_gateway, ec);
             co_return;
         }
 
-        // --- stream it back through the version-agnostic Response ---
-        res->status(head->status);
-        auto resp_conn_tokens = detail::connection_tokens(head->headers);
+        // --- response head: strip hop-by-hop fields, then let the hook adjust ---
+        Headers out_headers;
+        const auto resp_conn_tokens = detail::connection_tokens(head->headers);
         for (const auto &[name, value] : head->headers) {
             if (detail::is_hop_by_hop(name) || detail::contains_token(resp_conn_tokens, name))
                 continue;
-            // We stream the body, so the upstream Content-Length is replaced by our
-            // own framing — except for HEAD, whose response carries the headers a
-            // GET would have produced and no body at all.
-            if (name == "content-length" && req->method() != Method::Head)
+            // We stream the body, so the upstream Content-Length is replaced by
+            // our own framing — except for HEAD (and 304, where it describes the
+            // selected representation), whose response carries the headers a GET
+            // would have produced and no body at all.
+            if (name == "content-length" && (head->status == status::no_content ||
+                                             (req->method() != Method::Head && head->status != status::not_modified))) {
                 continue;
-            res->header(name, value);
+            }
+            if (contains_ctl(name) || contains_ctl(value)) {
+                SIMPLE_HTTP_ERROR_LOG("http-proxy: dropping upstream header with CR/LF/NUL: {}", name);
+                continue;
+            }
+            out_headers.add_lower(name, value);
         }
 
-        if (head->bodyless) {
+        int out_status = head->status;
+        if (target.hooks.modify_response) {
+            error_code ec;
+            try {
+                ec = target.hooks.modify_response(out_status, out_headers, *req);
+            } catch (const std::exception &e) {
+                SIMPLE_HTTP_ERROR_LOG("http-proxy: modify-response hook threw: {}", e.what());
+                ec = make_error_code(asio::error::invalid_argument);
+            } catch (...) {
+                SIMPLE_HTTP_ERROR_LOG("http-proxy: modify-response hook threw an unknown exception");
+                ec = make_error_code(asio::error::invalid_argument);
+            }
+            if (ec) {
+                (void)co_await stream->abort();
+                co_await send_error(status::bad_gateway, ec);
+                co_return;
+            }
+        }
+        if (out_status < 200 || out_status > 599) {
+            SIMPLE_HTTP_ERROR_LOG("http-proxy: invalid final status {} from {}:{}", out_status, target.host,
+                                  target.port);
+            (void)co_await stream->abort();
+            co_await send_error(status::bad_gateway, make_error_code(asio::error::invalid_argument));
+            co_return;
+        }
+
+        res->status(out_status);
+        for (const auto &[name, value] : out_headers)
+            res->header(name, value);
+
+        // HTTP/1.1 chunked framing: announce the trailer names the backend
+        // promised, as Go's ReverseProxy does. HTTP/2/3 do not need the field.
+        if (res->version() == Version::Http11) {
+            for (auto trailer : head->headers.get_all("trailer"))
+                res->header("trailer", std::string{trailer});
+        }
+
+        const bool bodyless =
+            req->method() == Method::Head || out_status == status::no_content || out_status == status::not_modified;
+        if (bodyless) {
             // Nothing follows the head (HEAD, 204/304): no framing, no terminator.
             (void)co_await res->send_bodyless();
+            // If a ModifyResponse hook turned a bodied response into a bodyless
+            // one, the upstream body is now unread; abort it rather than leave
+            // the exchange half-finished.
+            if (!head->bodyless)
+                (void)co_await stream->abort();
             co_return;
         }
         if (auto ec = co_await res->begin(); ec) {
@@ -334,7 +602,11 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
         }
 
         for (;;) {
-            auto chunk = co_await stream->read();
+            auto chunk = co_await detail::await_cancelable(req, stream->read());
+            if (req->cancelled()) {
+                (void)co_await stream->abort();
+                co_return;
+            }
             if (!chunk) {
                 // An upstream that stops mid-body must not be reported to the
                 // frontend as a complete response: abort instead of finishing
@@ -346,7 +618,10 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
             }
             if (chunk->eof)
                 break;
-            if (auto ec = co_await res->write(std::move(chunk->data)); ec) {
+            // No cancellation race here: a cancelled/reset frontend makes the
+            // writer itself fail, and each extra wait_cancelled() branch would
+            // allocate a channel per body chunk on the hot path.
+            if (auto ec = co_await res->write(std::move(chunk->data))) {
                 (void)co_await stream->abort();
                 co_return;
             }

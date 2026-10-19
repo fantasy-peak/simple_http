@@ -7,6 +7,7 @@
 // the engines depend only on this narrow type, not on the whole handler layer.
 
 #include <boost/asio/awaitable.hpp>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -78,10 +79,35 @@ struct WsProxyTarget {
 // handler, but loses to a local exact one.
 using WsProxyLookup = std::function<std::optional<WsProxyTarget>(std::string_view path)>;
 
+// Go httputil.ReverseProxy-shaped policy hooks. They run on the connection
+// executor (model A), so they may touch the outbound Request/Headers directly
+// without locking.
+struct HttpProxyHooks {
+    // Rewrite: after the standard outbound request has been built (hop-by-hop
+    // fields removed, forwarding fields stripped), before it is sent. `out` is
+    // a client-side Request: it may change the target, method, headers or body
+    // framing. This is Go's ReverseProxy.Rewrite / ProxyRequest.Out.
+    std::function<void(const Request &in, Request &out)> rewrite;
+
+    // ModifyResponse: after the backend response head arrived and hop-by-hop
+    // fields were removed, before it is relayed. May change the status and the
+    // header section (Location, Set-Cookie, extra fields, …). Returning an
+    // error invokes the error handler and aborts the exchange. This is Go's
+    // ReverseProxy.ModifyResponse.
+    std::function<error_code(int &status, Headers &headers, const Request &in)> modify_response;
+
+    // ErrorHandler: an upstream exchange failed before the response started.
+    // It may send its own response through `res`; if it returns without
+    // starting one, the proxy falls back to 502. Mid-body failures are not
+    // routed here: once bytes are flowing the only honest action is aborting
+    // the frontend response (Go's ErrAbortHandler behaviour).
+    std::function<asio::awaitable<void>(std::shared_ptr<ResponseWriter>, const Request &, error_code)> error_handler;
+};
+
 // A backend a plain HTTP request should be reverse-proxied to (request-level
 // proxy). Unlike WsProxyTarget this is per-request: for each matching request
-// the proxy takes an upstream connection to host:port (from the client layer's
-// pool), forwards the request (with the standard X-Forwarded-* headers added
+// the proxy takes an upstream connection to host:port (a fresh client each
+// time), forwards the request (with the standard X-Forwarded-* headers added
 // and hop-by-hop headers stripped), then streams the backend's response back to
 // the client. rewrite_path works like WsProxyTarget's: a substitution template
 // ($0/$1..$9/$$) for regex routes, or a verbatim replacement for exact routes;
@@ -97,6 +123,29 @@ struct HttpProxyTarget {
     // carries `Upgrade: h2c` (one extra round trip); a backend that ignores it
     // answers over HTTP/1.1 as usual. Ignored when `tls` is set.
     bool h2c{false};
+    // Prior-knowledge h2c: send the HTTP/2 preface directly instead of the
+    // Upgrade round trip. Only for backends known to speak h2c.
+    bool h2c_prior_knowledge{false};
+
+    // Host policy. By default the client layer writes the backend's authority
+    // (nginx's proxy_set_header Host $proxy_host). preserve_host keeps the
+    // frontend's Host (Go's NewSingleHostReverseProxy default); host_header is
+    // an explicit override and wins over preserve_host.
+    bool preserve_host{false};
+    std::string host_header;
+
+    // Go's Rewrite mode strips client-supplied forwarding headers by default
+    // (Forwarded and X-Forwarded-*). Set this to append the inbound
+    // X-Forwarded-For chain instead of replacing it with the real peer; the
+    // other X-Forwarded-* fields are always authored by the proxy.
+    bool preserve_inbound_forwarding{false};
+
+    // Upper bound on attempts for a request that is safe to replay (no body and
+    // an idempotent method). 0/1 disables the proxy's own retry; the client
+    // layer's RetryPolicy still applies independently.
+    std::size_t max_attempts{3};
+
+    HttpProxyHooks hooks;
 };
 
 // Looks up an HTTP proxy backend for a request path; empty if the path is not a

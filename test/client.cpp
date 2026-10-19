@@ -321,6 +321,12 @@ void register_routes(sh::Server &server) {
         }
         co_await res->status(200).send(std::move(out));
     });
+    // Echoes the raw method token, so extension methods (PROPFIND, …) can be
+    // asserted end to end through the reverse proxy.
+    server.route(sh::any_methods, "/method-token",
+                 [](sh::RequestPtr req, sh::ResponsePtr res) -> asio::awaitable<void> {
+                     co_await res->status(200).send(std::string{req->method_token()});
+                 });
     // Echoes the raw query string, for the new API's query() builder assertion.
     server.route(sh::any_methods, "/query-echo", [](sh::RequestPtr req, sh::ResponsePtr res) -> asio::awaitable<void> {
         co_await res->status(200).send(std::string{req->query()});
@@ -427,6 +433,46 @@ asio::awaitable<void> suite_reverse_proxy(std::uint16_t plain_port) {
               (headers ? headers->body : describe(headers.error())));
 
     {
+        // Header hygiene of the forwarded request, matching Go's Rewrite mode:
+        // the proxy's own X-Forwarded-Proto/-Host win over a caller's, the
+        // caller's X-Forwarded-For is stripped (only the real peer remains),
+        // `TE: trailers` is kept (gRPC), and Proxy-Connection is hop-by-hop.
+        // Pinned to HTTP/1.1 because those are connection-specific headers an
+        // HTTP/2 frontend could not carry.
+        auto cfg = base_config();
+        cfg.default_version = sh::HttpVersionPolicy::Http11;
+        cfg.default_h2c = sh::H2cMode::Off;
+        h::Client h1_http{co_await asio::this_coro::executor, cfg};
+        auto r = co_await fetch(h1_http, h1_http.get(front + "/rp/headers")
+                                             .header("x-forwarded-proto", "https")
+                                             .header("x-forwarded-host", "evil.example")
+                                             .header("x-forwarded-for", "1.1.1.1")
+                                             .header("x-forwarded-for", "2.2.2.2")
+                                             .header("te", "trailers")
+                                             .header("proxy-connection", "keep-alive"));
+        const std::string b = r ? r->body : std::string{};
+        check(r && b.find("x-forwarded-proto: http") != std::string::npos &&
+                  b.find("x-forwarded-proto: https") == std::string::npos,
+              "proxy overwrites a caller's X-Forwarded-Proto -> " + b);
+        check(r && b.find("x-forwarded-host: 127.0.0.1") != std::string::npos &&
+                  b.find("evil.example") == std::string::npos,
+              "proxy overwrites a caller's X-Forwarded-Host -> " + b);
+        check(r && b.find("x-forwarded-for: 127.0.0.1\n") != std::string::npos &&
+                  b.find("1.1.1.1") == std::string::npos && b.find("2.2.2.2") == std::string::npos,
+              "proxy strips a caller's X-Forwarded-For by default -> " + b);
+        check(r && b.find("te: trailers") != std::string::npos, "proxy preserves TE: trailers -> " + b);
+        check(r && b.find("proxy-connection") == std::string::npos, "proxy strips Proxy-Connection -> " + b);
+
+        // Legacy/Director mode: preserve the inbound chain and append the peer.
+        auto chain = co_await fetch(h1_http, h1_http.get(front + "/rpxff/headers")
+                                                 .header("x-forwarded-for", "1.1.1.1")
+                                                 .header("x-forwarded-for", "2.2.2.2"));
+        const std::string chain_body = chain ? chain->body : std::string{};
+        check(chain && chain_body.find("x-forwarded-for: 1.1.1.1, 2.2.2.2, 127.0.0.1") != std::string::npos,
+              "preserve_inbound_forwarding appends to the whole chain -> " + chain_body);
+    }
+
+    {
         // Pinned to HTTP/1.1 so the response really is chunked on the wire (over
         // HTTP/2 the same route is DATA frames, which would not exercise the
         // chunked decoder at all).
@@ -488,6 +534,61 @@ asio::awaitable<void> suite_reverse_proxy(std::uint16_t plain_port) {
                   "a proxied response's trailers reach an h1 client -> " +
                       std::string{s->trailers().get("x-checksum").value_or("<none>")});
         }
+    }
+
+    {
+        auto cfg = base_config();
+        cfg.default_version = sh::HttpVersionPolicy::Http11;
+        cfg.default_h2c = sh::H2cMode::Off;
+        h::Client h1_http{co_await asio::this_coro::executor, cfg};
+        auto host = co_await fetch(h1_http, h1_http.get(front + "/rphost").header("host", "front.example"));
+        check(host && host->status == 200 && host->body.find("host: front.example") != std::string::npos,
+              "preserve_host forwards the frontend Host -> " + (host ? host->body : describe(host.error())));
+    }
+
+    {
+        auto hooked = co_await fetch(http, http.get(front + "/rphook"));
+        check(hooked && hooked->status == 203 && hooked->header("x-proxy-hook") == "yes" &&
+                  hooked->body == "hello from HTTP/1.1",
+              "Rewrite and ModifyResponse hooks run -> " +
+                  (hooked ? std::to_string(hooked->status) + " " + hooked->body : describe(hooked.error())));
+    }
+
+    {
+        auto h2c = co_await fetch(http, http.get(front + "/rph2c"));
+        check(h2c && h2c->status == 200 && h2c->body == "hello from HTTP/2",
+              "h2c prior-knowledge backend -> " + (h2c ? h2c->body : describe(h2c.error())));
+    }
+
+    {
+        auto cfg = base_config();
+        cfg.default_version = sh::HttpVersionPolicy::Http11;
+        cfg.default_h2c = sh::H2cMode::Off;
+        h::Client h1_http{co_await asio::this_coro::executor, cfg};
+        auto req = std::make_shared<sh::Request>(sh::Version::Http11, co_await asio::this_coro::executor);
+        req->set_method_token("PROPFIND");
+        req->set_target("/rpmethod");
+        auto sent = co_await h1_http.send(std::move(req), front + "/rpmethod");
+        std::string body;
+        if (sent) {
+            auto text = co_await sent->text();
+            if (text)
+                body = *text;
+        }
+        check(sent && sent->status() == 200 && body == "PROPFIND",
+              "an extension method survives the proxy -> " +
+                  (sent ? std::to_string(sent->status()) + " " + body : describe(sent.error())));
+    }
+
+    {
+        auto cfg = base_config();
+        cfg.default_version = sh::HttpVersionPolicy::Http11;
+        cfg.default_h2c = sh::H2cMode::Off;
+        h::Client h1_http{co_await asio::this_coro::executor, cfg};
+        auto connect = co_await fetch(h1_http, h1_http.request(sh::Method::Connect, front + "/rp/world"));
+        check(connect && connect->status == 405,
+              "CONNECT is refused by the reverse proxy -> " +
+                  (connect ? std::to_string(connect->status) : describe(connect.error())));
     }
 
     auto tls_backend = co_await fetch(http, http.get(front + "/rptls/world"));
@@ -1982,6 +2083,53 @@ int main() {
     // behaviour: a plaintext backend stays HTTP/1.1) and one to the TLS listener
     // (the backend leg is HTTPS, so ALPN decides — and offers h2).
     plain.http_proxy_regex("/rp/(.*)", "127.0.0.1", kPlainPort, "/$1");
+    {
+        sh::HttpProxyTarget backend;
+        backend.host = "127.0.0.1";
+        backend.port = kPlainPort;
+        backend.rewrite_path = "/$1";
+        backend.preserve_inbound_forwarding = true;
+        plain.http_proxy_regex("/rpxff/(.*)", std::move(backend));
+    }
+    {
+        // Host policy: keep the frontend's Host instead of the backend authority.
+        sh::HttpProxyTarget backend;
+        backend.host = "127.0.0.1";
+        backend.port = kPlainPort;
+        backend.rewrite_path = "/headers";
+        backend.preserve_host = true;
+        plain.http_proxy("/rphost", std::move(backend));
+    }
+    {
+        sh::HttpProxyTarget backend;
+        backend.host = "127.0.0.1";
+        backend.port = kPlainPort;
+        backend.rewrite_path = "/method-token";
+        plain.http_proxy("/rpmethod", std::move(backend));
+    }
+    {
+        // Plaintext backend that speaks h2c: prior knowledge skips the Upgrade
+        // round trip.
+        sh::HttpProxyTarget backend;
+        backend.host = "127.0.0.1";
+        backend.port = kPlainPort;
+        backend.rewrite_path = "/world";
+        backend.h2c_prior_knowledge = true;
+        plain.http_proxy("/rph2c", std::move(backend));
+    }
+    {
+        // Go's Rewrite / ModifyResponse hooks.
+        sh::HttpProxyTarget backend;
+        backend.host = "127.0.0.1";
+        backend.port = kPlainPort;
+        backend.hooks.rewrite = [](const sh::Request &, sh::Request &out) { out.set_target("/world"); };
+        backend.hooks.modify_response = [](int &status, sh::Headers &headers, const sh::Request &) {
+            status = 203;
+            headers.add("x-proxy-hook", "yes");
+            return sh::error_code{};
+        };
+        plain.http_proxy("/rphook", std::move(backend));
+    }
     {
         sh::HttpProxyTarget backend;
         backend.host = "127.0.0.1";
