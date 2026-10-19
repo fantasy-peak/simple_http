@@ -204,11 +204,11 @@ int main() {
             // correlation id that is also echoed back as a
             // response header, so the round trip is visible.
             const auto trace = req->header("x-trace-id");
-            auto out = res->status(200).content_type(mime::app_json);
+            res->status(200).content_type(mime::app_json);
             if (trace) {
-                out.header("x-trace-id", std::string{*trace});
+                res->header("x-trace-id", std::string{*trace});
             }
-            co_await out.send(to_json(Pet{.id = p->id, .name = "rex", .status = "available"}));
+            co_await res->send(to_json(Pet{.id = p->id, .name = "rex", .status = "available"}));
         },
         // The `id` path parameter comes from PetParams: name from
         // the field, schema from its type, required. Nothing to

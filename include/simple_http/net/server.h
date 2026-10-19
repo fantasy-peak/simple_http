@@ -705,7 +705,13 @@ class Server {
     friend class QuicListenerBuilder;
 #endif
 
-    TcpListenerConfig &tcp_at(std::size_t index) { return std::get<TcpListenerConfig>(m_config.listeners[index]); }
+    TcpListenerConfig &tcp_at(std::size_t index) {
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+        return std::get<TcpListenerConfig>(m_config.listeners[index]);
+#else
+        return m_config.listeners[index];
+#endif
+    }
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
     QuicListenerConfig &quic_at(std::size_t index) { return std::get<QuicListenerConfig>(m_config.listeners[index]); }
 #endif
