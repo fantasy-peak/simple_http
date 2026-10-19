@@ -730,7 +730,7 @@ int main() {
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
     // Started last and reported separately: a QUIC bind failure is its own
     // answer, not a reason for the TCP listeners to report failure.
-    const bool dual_ok = dual.start();
+    const bool dual_ok = static_cast<bool>(dual.start());
     std::println("dual-transport :7792 tcp+udp started (ok={}), http/3 also on udp :7789", dual_ok);
     ok = ok && dual_ok;
 #endif

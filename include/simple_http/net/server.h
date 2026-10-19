@@ -146,6 +146,59 @@ using ListenerConfig = std::variant<TcpListenerConfig, QuicListenerConfig>;
 using ListenerConfig = TcpListenerConfig;
 #endif
 
+// --- startup results ---------------------------------------------------------
+//
+// Starting is fallible per listener, and a caller needs to know which one
+// failed. AllOrNothing rolls the whole server back; BestEffort keeps what
+// bound and reports the rest.
+enum class StartPolicy { AllOrNothing, BestEffort };
+
+enum class server_errc { bind_failed = 1, tls_setup_failed, invalid_config };
+
+inline const boost::system::error_category &server_category() {
+    static const struct : boost::system::error_category {
+        const char *name() const noexcept override { return "simple_http.server"; }
+        std::string message(int ev) const override {
+            switch (static_cast<server_errc>(ev)) {
+            case server_errc::bind_failed:
+                return "listener bind failed";
+            case server_errc::tls_setup_failed:
+                return "listener TLS setup failed";
+            case server_errc::invalid_config:
+            default:
+                return "invalid listener configuration";
+            }
+        }
+    } category;
+    return category;
+}
+
+inline error_code make_error_code(server_errc e) { return {static_cast<int>(e), server_category()}; }
+
+struct BoundEndpoint {
+    std::string name;
+    std::string scheme; // http / https / h2c / h3 / unix
+    std::string host;
+    std::uint16_t port{0};
+    bool tls{false};
+    std::size_t acceptors{1};
+    bool reuse_port{false};
+};
+
+struct ListenerFailure {
+    std::string name;
+    error_code error;
+};
+
+struct StartupError {
+    std::vector<ListenerFailure> failures;
+};
+
+struct StartReport {
+    std::vector<BoundEndpoint> bound;
+    std::vector<ListenerFailure> failures; // BestEffort only
+};
+
 struct ServerConfig {
     // Explicit listener list. When non-empty, the single-listener fields below
     // are ignored: the vector is the whole configuration.
@@ -419,12 +472,18 @@ class Server {
         return *this;
     }
 
-    // Start the listener. Resolves true if the socket bound successfully.
-    asio::awaitable<bool> run() { co_return start_listeners(); }
+    // Start every configured listener. AllOrNothing (default) rolls the whole
+    // server back on the first failure; BestEffort keeps what bound and reports
+    // the rest in StartReport::failures.
+    std::expected<StartReport, StartupError> start(StartPolicy policy = StartPolicy::AllOrNothing) {
+        return start_listeners(policy);
+    }
+    asio::awaitable<std::expected<StartReport, StartupError>> run(StartPolicy policy = StartPolicy::AllOrNothing) {
+        co_return start_listeners(policy);
+    }
 
-    // Synchronous convenience: start the listener and block until bound.
-    // Returns true if it bound successfully.
-    bool start() { return start_listeners(); }
+    // The route table, exposed so several Servers can share one Router.
+    std::shared_ptr<Router> router() { return m_router; }
 
     void stop() {
         if (m_stopped.exchange(true))
@@ -834,18 +893,115 @@ class Server {
         return true;
     }
 
-    bool start_listeners() {
-        bool ok = true;
+    // Closes everything a failed start bound, without touching the pool: a
+    // caller may fix the config and start() again. stop() is the full teardown.
+    void close_listeners() {
+        for (auto &listener : m_acceptors) {
+            if (!listener.ctx->stopped()) {
+                auto acceptor = listener.acceptor;
+                asio::post(*listener.ctx, [acceptor] {
+                    std::visit(
+                        [](const auto &socket) {
+                            error_code ec;
+                            socket->close(ec);
+                        },
+                        acceptor);
+                });
+            } else {
+                std::visit(
+                    [](const auto &socket) {
+                        error_code ec;
+                        socket->close(ec);
+                    },
+                    listener.acceptor);
+            }
+        }
+        m_acceptors.clear();
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+        for (auto &rt : m_quic_runtimes) {
+            for (auto &endpoint : rt->endpoints)
+                endpoint->close();
+        }
+        m_quic_runtimes.clear();
+#endif
+        m_metas.clear();
+    }
+
+    BoundEndpoint make_bound(std::size_t first, std::size_t count) const {
+        BoundEndpoint out;
+        if (first >= m_acceptors.size())
+            return out;
+        const auto &listener = m_acceptors[first];
+        out.name = listener.meta->name;
+        out.tls = static_cast<bool>(listener.meta->tls);
+        out.acceptors = count;
+        out.reuse_port = listener.meta->cfg.reuse_port;
+        if (const auto *inet = std::get_if<InetAddress>(&listener.meta->cfg.address)) {
+            (void)inet;
+            std::visit(
+                [&](const auto &acceptor) {
+                    using Acceptor = std::remove_reference_t<decltype(*acceptor)>;
+                    if constexpr (std::is_same_v<Acceptor, asio::ip::tcp::acceptor>) {
+                        error_code ec;
+                        const auto ep = acceptor->local_endpoint(ec);
+                        out.host = ep.address().to_string();
+                        out.port = ep.port();
+                        out.scheme = out.tls ? "https" : "http";
+                    } else {
+                        out.scheme = "unix";
+                    }
+                },
+                listener.acceptor);
+        } else {
+            out.scheme = "unix";
+            out.host = std::get<UnixAddress>(listener.meta->cfg.address).path;
+        }
+        return out;
+    }
+
+    std::expected<StartReport, StartupError> start_listeners(StartPolicy policy) {
+        StartReport report;
+        std::vector<ListenerFailure> failures;
         for (auto &cfg : m_tcp_configs) {
-            ok = start_tcp_listener(std::move(cfg)) && ok;
+            std::string name = cfg.name;
+            const std::size_t before = m_acceptors.size();
+            if (!start_tcp_listener(std::move(cfg))) {
+                failures.push_back(ListenerFailure{name, make_error_code(server_errc::bind_failed)});
+                if (policy == StartPolicy::AllOrNothing) {
+                    close_listeners();
+                    return std::unexpected{StartupError{failures}};
+                }
+                continue;
+            }
+            report.bound.push_back(make_bound(before, m_acceptors.size() - before));
         }
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
         for (auto &cfg : m_quic_configs) {
-            ok = start_quic_listener(std::move(cfg)) && ok;
+            std::string name = cfg.name;
+            const std::size_t before = m_quic_runtimes.size();
+            if (!start_quic_listener(std::move(cfg))) {
+                failures.push_back(ListenerFailure{name, make_error_code(server_errc::bind_failed)});
+                if (policy == StartPolicy::AllOrNothing) {
+                    close_listeners();
+                    return std::unexpected{StartupError{failures}};
+                }
+                continue;
+            }
+            const auto &rt = m_quic_runtimes[before];
+            BoundEndpoint bound;
+            bound.name = rt->name;
+            bound.scheme = "h3";
+            bound.host = rt->cfg.address.host;
+            bound.port = rt->endpoints.empty() ? rt->cfg.address.port : rt->endpoints.front()->port();
+            bound.tls = true;
+            bound.acceptors = rt->endpoints.size();
+            bound.reuse_port = rt->cfg.reuse_port;
+            report.bound.push_back(std::move(bound));
         }
         apply_alt_svc();
 #endif
-        return ok;
+        report.failures = std::move(failures);
+        return report;
     }
 
     bool start_tcp_listener(TcpListenerConfig cfg) {
