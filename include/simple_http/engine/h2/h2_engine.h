@@ -53,6 +53,7 @@
 #include "../../proto/response_writer.h"
 #include "../../transport/transport.h" // SslHandle, TransportLike
 #include "../dispatcher.h"
+#include "../ws_proxy_common.h"
 #include "h2_frame.h"
 #include "h2_ws_transport.h"
 #include "hpack_decode.h"
@@ -2227,17 +2228,6 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
 
     // --- HTTP/2 WebSocket reverse proxy (RFC 8441 frontend, HTTP/1.1 backend) ---
 
-    // A Sec-WebSocket-Key the way a client makes one (base64 of 16 random
-    // bytes). The proxy is the client to the backend, so it presents its own key;
-    // the frontend's extended CONNECT carries none.
-    static std::string make_ws_client_key() {
-        std::array<unsigned char, 16> nonce{};
-        std::random_device rd;
-        for (auto &b : nonce)
-            b = static_cast<unsigned char>(rd());
-        return base64_encode(std::string_view{reinterpret_cast<const char *>(nonce.data()), nonce.size()});
-    }
-
     // Byte-level WebSocket reverse proxy over HTTP/2. The frontend handshake is
     // an extended CONNECT (already matched), so we synthesize an ordinary
     // HTTP/1.1 upgrade to the backend, wait for its 101, answer the h2 stream
@@ -2253,29 +2243,28 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         auto sink = it->second.writer;
         const auto idle = m_limits.idle_timeout;
 
-        auto fail = [this, sink, stream_id](int status) -> asio::awaitable<void> {
-            (void)co_await sink->send_bodyless(status, Headers{});
+        const auto peer = m_transport->peer();
+        std::string peer_address;
+        if (!peer.address().is_unspecified())
+            peer_address = address_string(peer.address());
+        const bool client_is_tls = m_transport->tls_handle().has_value();
+
+        auto fail = [this, sink, stream_id](int status, Headers headers = {}) -> asio::awaitable<void> {
+            (void)co_await sink->send_bodyless(status, std::move(headers));
             // The tunnel is not happening, whatever the reason: close its read
             // side so inbound DATA is credited back rather than banked (on_data).
             ws_stream_close(stream_id);
             co_return;
         };
 
-        auto backend = std::make_shared<asio::ip::tcp::socket>(m_executor);
-        asio::ip::tcp::resolver resolver{m_executor};
-        auto [rec, endpoints] = co_await resolver.async_resolve(target.host, std::to_string(target.port),
-                                                                asio::as_tuple(asio::use_awaitable));
-        if (rec || endpoints.empty()) {
-            SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy resolve {}:{} failed: {}", target.host, target.port, rec.message());
+        auto connected = co_await detail::ws_proxy_connect(m_executor, target);
+        if (!connected) {
+            const error_code ec = connected.error();
+            SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy connect {}:{} failed: {}", target.host, target.port, ec.message());
             co_await fail(502);
             co_return false;
         }
-        auto [cec, _] = co_await asio::async_connect(*backend, endpoints, asio::as_tuple(asio::use_awaitable));
-        if (cec) {
-            SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy connect {}:{} failed: {}", target.host, target.port, cec.message());
-            co_await fail(502);
-            co_return false;
-        }
+        auto backend = std::move(*connected);
 
         auto close_backend = [backend]() {
             error_code sec;
@@ -2295,32 +2284,11 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         if (replay_target.empty())
             replay_target = "/";
 
-        const std::string key = make_ws_client_key();
-        // Forward the client's own Host (HTTP/2's :authority, synthesized into a
-        // `host` header by the engine). The h1 proxy replays the client's request
-        // verbatim, so the backend sees Host == Origin; a backend that validates
-        // Origin against Host (code-server, many others) rejects the upgrade
-        // otherwise. Synthesizing the backend's address here was exactly that bug.
-        const auto client_host = request->header("host");
-        std::string head;
-        head += "GET " + replay_target + " HTTP/1.1\r\n";
-        head += "Host: ";
-        head += client_host ? std::string{*client_host} : (target.host + ":" + std::to_string(target.port));
-        head += "\r\n";
-        head += "Upgrade: websocket\r\n";
-        head += "Connection: Upgrade\r\n";
-        head += "Sec-WebSocket-Key: " + key + "\r\n";
-        head += "Sec-WebSocket-Version: 13\r\n";
-        for (const auto &[name, value] : request->headers()) {
-            if (name == "host" || name == "upgrade" || name == "connection" || name == "sec-websocket-key" ||
-                name == "sec-websocket-version" || name == "content-length" || name == "transfer-encoding")
-                continue;
-            head += name;
-            head += ": ";
-            head += value;
-            head += "\r\n";
-        }
-        head += "\r\n";
+        const std::string key = detail::make_ws_client_key();
+        const auto inbound_host = request->header("host");
+        std::string head =
+            detail::build_ws_upgrade_head(request->headers(), inbound_host ? *inbound_host : std::string_view{},
+                                          replay_target, target, peer_address, client_is_tls, key);
         {
             auto [wec, w] = co_await asio::async_write(*backend, asio::buffer(head.data(), head.size()),
                                                        asio::as_tuple(asio::use_awaitable));
@@ -2333,39 +2301,37 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
             }
         }
 
-        // Read the backend's response head (bounded), plus any bytes it already
-        // sent after it (the first tunnel bytes).
-        std::string reply;
-        std::array<std::byte, 4096> rbuf{};
-        while (reply.find("\r\n\r\n") == std::string::npos) {
-            if (reply.size() > m_limits.max_header_bytes) {
-                close_backend();
-                co_await fail(502);
-                co_return false;
-            }
-            auto [rec2, n] = co_await backend->async_read_some(asio::buffer(rbuf.data(), rbuf.size()),
-                                                               asio::as_tuple(asio::use_awaitable));
-            if (rec2 || n == 0) {
-                close_backend();
-                co_await fail(502);
-                co_return false;
-            }
-            reply.append(reinterpret_cast<const char *>(rbuf.data()), n);
-        }
-        const std::size_t head_end = reply.find("\r\n\r\n") + 4;
-        const std::string_view response_head{reply.data(), head_end};
-        // The backend refused the upgrade. Surface its own status to the h2
-        // client instead of inventing a 502 — the h1 proxy splices the backend's
-        // response verbatim, so a browser behind an HTTP/2 frontend should see
-        // the same 401/403/302 the backend actually answered.
-        if (!response_head.starts_with("HTTP/1.1 101") && !response_head.starts_with("HTTP/1.0 101")) {
-            SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy backend refused the upgrade");
+        auto reply = co_await detail::ws_proxy_read_reply(*backend, m_limits.max_header_bytes);
+        if (!reply) {
+            SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy backend handshake failed: {}", reply.error().message());
             close_backend();
-            int status = 502;
-            if (const std::size_t sp = response_head.find(' '); sp != std::string_view::npos) {
-                std::from_chars(response_head.data() + sp + 1, response_head.data() + response_head.size(), status);
+            co_await fail(502);
+            co_return false;
+        }
+
+        if (reply->head.status != 101) {
+            // Surface the backend's actual refusal status and end-to-end fields
+            // (WWW-Authenticate, Location, …), not an invented 502. The body is
+            // not relayed: an h2 extended-CONNECT response is terminated at the
+            // headers here, and the peer's status is the actionable part.
+            Headers response_headers;
+            for (const auto &[name, value] : reply->head.headers) {
+                if (detail::ws_is_hop_by_hop(name) || name == "content-length" || name == "transfer-encoding")
+                    continue;
+                if (contains_ctl(name) || contains_ctl(value))
+                    continue;
+                response_headers.add_lower(name, value);
             }
-            co_await fail(status);
+            SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy backend refused the upgrade with {}", reply->head.status);
+            close_backend();
+            co_await fail(reply->head.status, std::move(response_headers));
+            co_return false;
+        }
+
+        if (!detail::ws_validate_101(reply->head, ws_accept_key(key))) {
+            SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy backend answered 101 with a mismatched Upgrade/accept");
+            close_backend();
+            co_await fail(502);
             co_return false;
         }
 
@@ -2373,33 +2339,20 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         // HTTP/1.1-only / hop-by-hop ones (the h2 client must not see Upgrade,
         // Connection or Sec-WebSocket-Accept).
         Headers response_headers;
-        const std::size_t line1 = response_head.find("\r\n") + 2;
-        const std::string_view fields = response_head.substr(line1, head_end - 4 - line1);
-        for (std::size_t pos = 0; pos < fields.size();) {
-            const auto nl = fields.find("\r\n", pos);
-            const std::string_view line =
-                fields.substr(pos, nl == std::string_view::npos ? fields.size() - pos : nl - pos);
-            pos = (nl == std::string_view::npos) ? fields.size() : nl + 2;
-            const auto colon = line.find(':');
-            if (colon == std::string_view::npos)
+        for (const auto &[name, value] : reply->head.headers) {
+            if (detail::ws_is_hop_by_hop(name) || name == "sec-websocket-accept" || name == "content-length" ||
+                name == "transfer-encoding")
                 continue;
-            std::string name;
-            for (char c : line.substr(0, colon))
-                name.push_back(ascii_lower(c));
-            std::string_view value = line.substr(colon + 1);
-            while (!value.empty() && (value.front() == ' ' || value.front() == '\t'))
-                value.remove_prefix(1);
-            if (name == "upgrade" || name == "connection" || name == "sec-websocket-accept" ||
-                name == "content-length" || name == "transfer-encoding")
+            if (contains_ctl(name) || contains_ctl(value))
                 continue;
-            response_headers.add_lower(std::move(name), std::string{value});
+            response_headers.add_lower(name, value);
         }
         if (auto ec = co_await sink->send_headers(200, std::move(response_headers)); ec) {
             close_backend();
             co_return false;
         }
 
-        std::string initial{reply.substr(head_end)};
+        std::string initial{std::move(reply->initial)};
         auto deadline = std::chrono::steady_clock::now() + idle;
 
         auto backend_to_client = [&]() -> asio::awaitable<void> {

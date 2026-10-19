@@ -1786,6 +1786,21 @@ asio::awaitable<void> suite_websocket(std::uint16_t port) {
     auto after = co_await (*ws)->read();
     check(!after, "read after close returns an error (not an infinite loop)");
     check(!(*ws)->is_open(), "is_open() is false after close");
+
+    // Byte-level reverse proxy: the frontend handshake is rebuilt with the
+    // route's header policy, then the tunnel is spliced to the backend.
+    auto proxied = co_await client.open_websocket(base + "/wsproxy-h1");
+    if (!proxied) {
+        check(false, "open_websocket through ws_proxy -> " + std::string{proxied.error().message()});
+        co_return;
+    }
+    if (auto ec = co_await (*proxied)->write_text("via proxy"); ec) {
+        check(false, "ws_proxy write_text -> " + ec.message());
+    } else {
+        auto echo = co_await (*proxied)->read();
+        check(echo && echo->text && echo->data == "via proxy", "ws_proxy echoes through the tunnel");
+    }
+    (void)co_await (*proxied)->close();
 }
 
 asio::awaitable<void> suite_multipart(std::uint16_t port) {
@@ -2083,6 +2098,10 @@ int main() {
     // behaviour: a plaintext backend stays HTTP/1.1) and one to the TLS listener
     // (the backend leg is HTTPS, so ALPN decides — and offers h2).
     plain.http_proxy_regex("/rp/(.*)", "127.0.0.1", kPlainPort, "/$1");
+    // Byte-level WebSocket proxy (h1 frontend): /wsproxy-h1 is spliced to this
+    // same listener's /wsecho, so the client-side suite exercises the upstream
+    // handshake and tunnel end to end.
+    plain.ws_proxy("/wsproxy-h1", "127.0.0.1", kPlainPort, "/wsecho");
     {
         sh::HttpProxyTarget backend;
         backend.host = "127.0.0.1";

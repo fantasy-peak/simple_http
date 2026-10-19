@@ -7,6 +7,7 @@
 // the engines depend only on this narrow type, not on the whole handler layer.
 
 #include <boost/asio/awaitable.hpp>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -71,6 +72,21 @@ struct WsProxyTarget {
     // $$ = a literal '$'. For an exact route (no groups) it is used verbatim.
     // Everything after the handshake is still spliced byte-for-byte.
     std::string rewrite_path;
+
+    // Host policy for the backend handshake. preserve_host (the default) keeps
+    // the frontend's Host, which is what Go's NewSingleHostReverseProxy does
+    // and what backends validating Origin against Host expect. host_header is
+    // an explicit override and wins over preserve_host.
+    bool preserve_host{true};
+    std::string host_header;
+
+    // Go Rewrite mode strips inbound Forwarded/X-Forwarded-* and authors the
+    // three standard fields. Set this to append the inbound X-Forwarded-For
+    // chain instead of replacing it with the real peer.
+    bool preserve_inbound_forwarding{false};
+
+    // Resolve + TCP connect budget for the backend leg. 0 disables the timer.
+    std::chrono::milliseconds connect_timeout{10000};
 };
 
 // Looks up a proxy backend for a request path; empty if the path is not a proxy

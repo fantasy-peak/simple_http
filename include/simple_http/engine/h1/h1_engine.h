@@ -568,8 +568,13 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
                 if (m_ws_proxy_lookup) {
                     if (auto target = m_ws_proxy_lookup(ws_path)) {
                         m_upgraded = true; // stop the watchdog from closing the transport
+                        const auto peer = m_transport->peer();
+                        std::string peer_address;
+                        if (!peer.address().is_unspecified())
+                            peer_address = address_string(peer.address());
                         co_await run_ws_proxy(m_transport, head, std::string{parser.remainder()}, std::move(*target),
-                                              m_limits.idle_timeout);
+                                              m_limits.idle_timeout, m_limits.max_header_bytes, std::move(peer_address),
+                                              m_transport->tls_handle().has_value());
                         co_return; // tunnel finished; run() must not touch the transport
                     }
                 }

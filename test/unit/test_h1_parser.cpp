@@ -273,6 +273,62 @@ TEST_CASE("ws proxy: the replayed upgrade request keeps its shape", "[h1]") {
     CHECK(rebuild_request_head(http10).starts_with("GET /chat?reconnectionToken=abc HTTP/1.0\r\n"));
 }
 
+TEST_CASE("ws proxy: the shared handshake applies the Go-style header policy", "[h1]") {
+    Headers in;
+    in.add("host", "front.example");
+    in.add("upgrade", "websocket");
+    in.add("connection", "keep-alive, Upgrade");
+    in.add("x-forwarded-for", "1.1.1.1");
+    in.add("x-forwarded-proto", "https");
+    in.add("x-forwarded-host", "evil.example");
+    in.add("proxy-authorization", "secret");
+    in.add("cookie", "a=b");
+
+    WsProxyTarget target;
+    target.host = "backend.internal";
+    target.port = 9000;
+    const std::string built = detail::build_ws_upgrade_head(in, "front.example", "/chat?x=1", target, "203.0.113.9",
+                                                            /*client_is_tls=*/false, "key");
+    CHECK(built.starts_with("GET /chat?x=1 HTTP/1.1\r\n"));
+    CHECK(built.find("host: front.example\r\n") != std::string::npos);
+    CHECK(built.find("upgrade: websocket\r\n") != std::string::npos);
+    CHECK(built.find("connection: Upgrade\r\n") != std::string::npos);
+    CHECK(built.find("sec-websocket-key: key\r\n") != std::string::npos);
+    CHECK(built.find("x-forwarded-for: 203.0.113.9\r\n") != std::string::npos);
+    CHECK(built.find("1.1.1.1") == std::string::npos);
+    CHECK(built.find("x-forwarded-proto: http\r\n") != std::string::npos);
+    CHECK(built.find("x-forwarded-host: front.example\r\n") != std::string::npos);
+    CHECK(built.find("evil.example") == std::string::npos);
+    CHECK(built.find("proxy-authorization") == std::string::npos);
+    CHECK(built.find("cookie: a=b\r\n") != std::string::npos);
+
+    WsProxyTarget override;
+    override.host = "backend.internal";
+    override.port = 9000;
+    override.host_header = "api.example";
+    const std::string overridden = detail::build_ws_upgrade_head(in, "front.example", "/", override, {}, false, "key");
+    CHECK(overridden.find("host: api.example\r\n") != std::string::npos);
+
+    WsProxyTarget legacy;
+    legacy.host = "backend.internal";
+    legacy.port = 9000;
+    legacy.preserve_inbound_forwarding = true;
+    const std::string chained =
+        detail::build_ws_upgrade_head(in, "front.example", "/", legacy, "203.0.113.9", false, "key");
+    CHECK(chained.find("x-forwarded-for: 1.1.1.1, 203.0.113.9\r\n") != std::string::npos);
+
+    ParsedResponseHead ok;
+    ok.status = 101;
+    ok.headers.add("connection", "Upgrade");
+    ok.headers.add("upgrade", "websocket");
+    ok.headers.add("sec-websocket-accept", ws_accept_key("key"));
+    CHECK(detail::ws_validate_101(ok, ws_accept_key("key")));
+    ParsedResponseHead wrong = ok;
+    wrong.headers.erase("upgrade");
+    wrong.headers.add("upgrade", "h2c");
+    CHECK_FALSE(detail::ws_validate_101(wrong, ws_accept_key("key")));
+}
+
 TEST_CASE("h1/parser: forbidden field-value bytes, SWAR fast path matches the naive "
           "check",
           "[h1]") {

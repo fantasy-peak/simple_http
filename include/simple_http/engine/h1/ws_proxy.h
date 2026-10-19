@@ -4,49 +4,57 @@
 //
 // When an Upgrade: websocket request matches a registered proxy route, the H1
 // engine does NOT enter the WebSocket message abstraction. Instead it hands the
-// connection here: we open a plain TCP connection to the backend, replay the
-// client's *raw* upgrade request onto it (reconstructed request line + headers,
-// plus any bytes already read past the head), and then splice the two byte
-// streams verbatim in both directions until either side closes.
+// connection here: we open a plain TCP connection to the backend, build the
+// backend Upgrade request from the inbound fields (same header policy as the
+// request-level proxy), wait for and validate the backend's 101, then splice
+// the two byte streams verbatim in both directions until either side closes.
 //
-// Because nothing is decoded, everything passes through untouched: the 101
-// handshake response the backend produces, WebSocket frame boundaries,
-// fragmentation, client-side masking, and control frames (Ping/Pong/Close).
-// There is no per-message size cap and no re-framing — this is a transparent
-// tunnel, not a message-level proxy.
+// Because nothing is decoded, everything passes through untouched: WebSocket
+// frame boundaries, fragmentation, client-side masking, control frames and
+// permessage-deflate. There is no per-message size cap and no re-framing — this
+// is a transparent tunnel, not a message-level proxy.
+//
+// The handshake half is shared with the HTTP/2 extended-CONNECT path
+// (engine/ws_proxy_common.h); only the tunnel loops differ, because one side is
+// a Transport and the other is an h2 stream.
 //
 // Concurrency (model A): the tunnel runs on the connection's own executor. The
 // backend socket is created on that same executor, so both halves of the splice
-// are single-threaded and need no locks. The two copy directions run
-// concurrently via awaitable_operators (||); when either finishes (EOF/error)
-// both sockets are shut down, which unblocks the other direction.
+// are single-threaded and need no locks.
 
+#include <algorithm>
 #include <array>
 #include <boost/asio.hpp>
 #include <boost/asio/experimental/awaitable_operators.hpp>
+#include <charconv>
+#include <chrono>
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <utility>
 
+#include "../../core/address.h"
 #include "../../core/http_status.h" // reason_phrase (the 502 body/status line)
 #include "../../core/logging.h"
 #include "../../core/types.h"
 #include "../../proto/headers.h"
+#include "../../proto/ws_frame.h" // ws_accept_key
 #include "../../transport/transport.h"
-#include "../dispatcher.h" // WsProxyTarget
-#include "h1_parser.h"     // ParsedHead
+#include "../dispatcher.h"      // WsProxyTarget
+#include "../ws_proxy_common.h" // shared handshake / header policy
+#include "h1_parser.h"          // ParsedHead
 
 namespace simple_http {
 
 namespace asio = boost::asio;
 
 // Reconstructs the raw HTTP/1.x request head (request line + headers + blank
-// line) from a ParsedHead, so it can be replayed to the backend verbatim.
-// Header field names were lowercased by the parser; that is wire-legal and
-// preserves the WebSocket upgrade semantics.
+// line) from a ParsedHead. Kept as the low-level spelling used by the parser
+// tests; the live proxy uses build_ws_upgrade_head(), which also applies the
+// Go-style forwarding-header policy.
 inline std::string rebuild_request_head(const ParsedHead &head, std::string_view target_override = {}) {
     std::string out;
     out.append(head.method_token);
@@ -96,58 +104,118 @@ inline asio::awaitable<void> ws_proxy_fail(const std::shared_ptr<Transport> &cli
 template <typename Transport>
 inline asio::awaitable<bool>
 run_ws_proxy(std::shared_ptr<Transport> client, const ParsedHead &head, std::string initial, WsProxyTarget target,
-             std::chrono::steady_clock::duration idle_timeout = std::chrono::seconds(120)) {
+             std::chrono::steady_clock::duration idle_timeout = std::chrono::seconds(120),
+             std::size_t max_header_bytes = 64 * 1024, std::string peer_address = {}, bool client_is_tls = false) {
     using namespace asio::experimental::awaitable_operators;
 
     auto executor = client->get_executor();
-    auto backend = std::make_shared<asio::ip::tcp::socket>(executor);
-
-    // Resolve + connect the backend on this connection's executor.
-    asio::ip::tcp::resolver resolver{executor};
-    auto [rec, endpoints] =
-        co_await resolver.async_resolve(target.host, std::to_string(target.port), asio::as_tuple(asio::use_awaitable));
-    if (rec) {
-        SIMPLE_HTTP_ERROR_LOG("ws-proxy resolve {}:{} failed: {}", target.host, target.port, rec.message());
+    auto connected = co_await detail::ws_proxy_connect(executor, target);
+    if (!connected) {
+        const error_code ec = connected.error();
+        SIMPLE_HTTP_ERROR_LOG("ws-proxy connect {}:{} failed: {}", target.host, target.port, ec.message());
         co_await ws_proxy_fail(client, 502);
         co_return false;
     }
-    auto [cec, _] = co_await asio::async_connect(*backend, endpoints, asio::as_tuple(asio::use_awaitable));
-    if (cec) {
-        SIMPLE_HTTP_ERROR_LOG("ws-proxy connect {}:{} failed: {}", target.host, target.port, cec.message());
-        co_await ws_proxy_fail(client, 502);
-        co_return false;
-    }
+    auto backend = std::move(*connected);
 
-    // Replay the client's raw upgrade request (rebuilt head + any buffered body
-    // bytes) to the backend. The backend answers with its own 101, which we
-    // splice straight back to the client below.
-    //
-    // The rewrite template replaces the *path* only. The query string is not part
-    // of the path, and it can carry data the endpoint needs — code-server's
-    // WebSocket endpoint puts its session token there
-    // (/…/stable-<hash>?reconnectionToken=…). Dropping it left the backend unable
-    // to associate the socket with a session, so the client waited forever for a
-    // handshake that could never complete. (http_proxy has always re-appended the
-    // query; this path did not.)
+    auto close_backend = [backend]() {
+        error_code sec;
+        backend->shutdown(asio::ip::tcp::socket::shutdown_both, sec);
+        backend->close(sec);
+    };
+
+    // Replay target: rewrite_path replaces the path, but the query string from
+    // the inbound target is preserved (session tokens and code-server's
+    // reconnectionToken live there). If no rewrite is configured, keep the
+    // inbound target as-is.
     std::string replay_target{target.rewrite_path};
-    if (!replay_target.empty()) {
-        if (const auto q = head.target.find('?'); q != std::string_view::npos) {
-            replay_target.append(head.target.substr(q));
-        }
+    if (replay_target.empty()) {
+        replay_target.assign(head.target);
+    } else if (const auto q = head.target.find('?'); q != std::string_view::npos) {
+        replay_target.append(head.target.substr(q));
     }
-    std::string preamble = rebuild_request_head(head, replay_target);
+
+    const auto inbound_host = head.headers.get("host");
+    std::string key;
+    if (auto inbound_key = head.headers.get("sec-websocket-key"); inbound_key && !inbound_key->empty()) {
+        key.assign(*inbound_key);
+    } else {
+        key = detail::make_ws_client_key();
+    }
+
+    std::string preamble =
+        detail::build_ws_upgrade_head(head.headers, inbound_host ? *inbound_host : std::string_view{}, replay_target,
+                                      target, peer_address, client_is_tls, key);
+    // Bytes the client already sent after its handshake travel behind the
+    // upstream request, exactly as before.
     preamble.append(initial);
     {
-        // Composed async_write: writes the whole preamble or returns an error.
         auto [ec, n] = co_await asio::async_write(*backend, asio::buffer(preamble.data(), preamble.size()),
                                                   asio::as_tuple(asio::use_awaitable));
         (void)n;
         if (ec) {
             SIMPLE_HTTP_ERROR_LOG("ws-proxy write preamble failed: {}", ec.message());
-            error_code sec;
-            backend->shutdown(asio::ip::tcp::socket::shutdown_both, sec);
-            backend->close(sec);
+            close_backend();
             co_await ws_proxy_fail(client, 502);
+            co_return false;
+        }
+    }
+
+    auto reply = co_await detail::ws_proxy_read_reply(*backend, max_header_bytes);
+    if (!reply) {
+        SIMPLE_HTTP_ERROR_LOG("ws-proxy backend handshake failed: {}", reply.error().message());
+        close_backend();
+        co_await ws_proxy_fail(client, 502);
+        co_return false;
+    }
+
+    if (reply->head.status != 101) {
+        // The backend refused the upgrade. Relay its actual response (head plus
+        // whatever body bytes already arrived) instead of inventing a 502; the
+        // h1 client sees the same 401/403/302 a direct connection would have
+        // produced. A Content-Length body is drained up to the announced size.
+        std::string out = reply->raw;
+        out.append(reply->initial);
+        std::size_t body_sent = reply->initial.size();
+        std::size_t want = 0;
+        if (auto cl = reply->head.headers.get("content-length")) {
+            (void)std::from_chars(cl->data(), cl->data() + cl->size(), want);
+        }
+        while (body_sent < want) {
+            std::array<std::byte, 8192> buf{};
+            const std::size_t left = want - body_sent;
+            auto [rec, n] = co_await backend->async_read_some(asio::buffer(buf.data(), std::min(buf.size(), left)),
+                                                              asio::as_tuple(asio::use_awaitable));
+            if (rec || n == 0)
+                break;
+            out.append(reinterpret_cast<const char *>(buf.data()), n);
+            body_sent += n;
+        }
+        (void)co_await client->async_write(
+            std::span<const std::byte>{reinterpret_cast<const std::byte *>(out.data()), out.size()});
+        close_backend();
+        client->close();
+        co_return false;
+    }
+
+    if (!detail::ws_validate_101(reply->head, ws_accept_key(key))) {
+        SIMPLE_HTTP_ERROR_LOG("ws-proxy backend answered 101 with a mismatched Upgrade/accept");
+        close_backend();
+        co_await ws_proxy_fail(client, 502);
+        co_return false;
+    }
+
+    // Relay the backend's 101 head verbatim (Sec-WebSocket-Accept, negotiated
+    // extensions/subprotocol, any Set-Cookie) and any tunnel bytes that arrived
+    // in the same read.
+    std::string opening = reply->raw;
+    opening.append(reply->initial);
+    {
+        auto [ec, n] = co_await client->async_write(
+            std::span<const std::byte>{reinterpret_cast<const std::byte *>(opening.data()), opening.size()});
+        (void)n;
+        if (ec) {
+            close_backend();
             co_return false;
         }
     }
@@ -160,7 +228,6 @@ run_ws_proxy(std::shared_ptr<Transport> client, const ParsedHead &head, std::str
     // only a genuinely idle tunnel is reaped.
     auto deadline = std::chrono::steady_clock::now() + idle_timeout;
 
-    // Shut both sockets down so a finished direction unblocks the other.
     auto teardown = [client, backend]() {
         client->close();
         error_code sec;
@@ -173,10 +240,14 @@ run_ws_proxy(std::shared_ptr<Transport> client, const ParsedHead &head, std::str
         std::array<std::byte, 16384> buf; // no init: read_some fills [0,n)
         for (;;) {
             auto [rec2, n] = co_await client->async_read_some(std::span<std::byte>{buf});
-            if (rec2 || n == 0)
+            if (rec2 || n == 0) {
+                // Half-close: the client will send no more, but the backend may
+                // still have its Close frame to deliver.
+                error_code sec;
+                backend->shutdown(asio::ip::tcp::socket::shutdown_send, sec);
                 break;
+            }
             deadline = std::chrono::steady_clock::now() + idle_timeout;
-            // Composed async_write: writes all n bytes or errors, no inner loop.
             auto [wec, w] =
                 co_await asio::async_write(*backend, asio::buffer(buf.data(), n), asio::as_tuple(asio::use_awaitable));
             (void)w;
@@ -193,10 +264,13 @@ run_ws_proxy(std::shared_ptr<Transport> client, const ParsedHead &head, std::str
         for (;;) {
             auto [rec2, n] = co_await backend->async_read_some(asio::buffer(buf.data(), buf.size()),
                                                                asio::as_tuple(asio::use_awaitable));
-            if (rec2 || n == 0)
+            if (rec2 || n == 0) {
+                // Backend is done: closing the client also unblocks the other
+                // direction (there is nothing left for it to deliver to).
+                client->close();
                 break;
+            }
             deadline = std::chrono::steady_clock::now() + idle_timeout;
-            // Transport::async_write is composed: writes all n bytes or errors.
             auto [wec, w] = co_await client->async_write(std::span<const std::byte>{buf.data(), n});
             (void)w;
             if (wec)
@@ -209,9 +283,6 @@ run_ws_proxy(std::shared_ptr<Transport> client, const ParsedHead &head, std::str
     // Reaps a tunnel that has seen no traffic in either direction for
     // idle_timeout.
     auto idle_check = [&]() -> asio::awaitable<void> {
-        if (idle_timeout.count() <= 0) {
-            co_return; // disabled: do not take part in the race
-        }
         for (;;) {
             if (std::chrono::steady_clock::now() >= deadline) {
                 SIMPLE_HTTP_ERROR_LOG("ws-proxy tunnel idle for {}s; closing",
@@ -226,10 +297,14 @@ run_ws_proxy(std::shared_ptr<Transport> client, const ParsedHead &head, std::str
         }
     };
 
-    // Run both directions plus the idle check concurrently; the first to finish
-    // (EOF/error/idle) tears both sockets down, which unblocks the pending read
-    // in the other direction so it also completes.
-    co_await (client_to_backend() || backend_to_client() || idle_check());
+    // Wait for both directions (Go's io.Copy pair), with the idle watchdog as
+    // the only early exit. When one direction half-closes, it shuts down only
+    // the opposite write side and lets the other finish.
+    if (idle_timeout.count() > 0) {
+        co_await ((client_to_backend() && backend_to_client()) || idle_check());
+    } else {
+        co_await (client_to_backend() && backend_to_client());
+    }
     teardown();
     co_return true;
 }
