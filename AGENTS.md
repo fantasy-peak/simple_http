@@ -99,7 +99,8 @@ include/
       protocol.h / connection.h / endpoint.h / ngtcp2_config.h / ngtcp2_crypto.h / tls.h
     net/                   监听与连接协议检测
       connection.h         serve_plaintext / serve_tls（协议检测）
-      server.h             Server 门面 + ServerConfig / Listen / InetAddress / UnixAddress / QuicAddress
+      server.h             Server 门面 + ServerConfig / 多监听 TcpListenerConfig / QuicListenerConfig /
+                           Listen / InetAddress / UnixAddress / QuicAddress；StartReport/StartupError
     client/                出站 HTTP 客户端（与 server 对称的一层）
       http.h               公共客户端 API（平铺在 `simple_http::` 顶层）：Client / RequestBuilder /
                            Stream / Response / StreamSpec / WebSocketSpec
@@ -143,10 +144,10 @@ include/
    socket 类型（TCP 明文 / TLS / QUIC 流）。
 4. **并发模型 A（单线程 io_context 绑定）**：每个连接在 accept 时被绑定到
    `IoCtxPool` 中一个单线程 `io_context`，该连接的所有引擎/writer 工作都只在这一个
-   线程上运行，因此天然串行、无需锁。绑定的方式取决于 `ServerConfig::reuse_port`：
-   默认（false）由唯一的 acceptor 在 `accept_loop` 里用 `m_pool->next_ptr()`
-   轮转分配；开启时每个 worker context 各持一个 acceptor（SO_REUSEPORT），连接留在
-   accept 它的那个 context 上。`Response`/`WebSocket` 可被 handler 用
+   线程上运行，因此天然串行、无需锁。绑定的方式取决于每个 listener 的
+   `reuse_port`（默认 true）：关闭时由该 listener 的唯一 acceptor 在 `accept_loop`
+   里用 `m_pool->next_ptr()` 轮转分配；开启时每个 worker context 各持一个 acceptor
+   （SO_REUSEPORT），连接留在 accept 它的那个 context 上。`Response`/`WebSocket` 可被 handler 用
    `shared_ptr` 捕获并跨线程/跨协程使用，写操作会先 hop 回连接所属 executor。
    四层（h1 / h2 / h3 / WebSocket）遵守的是**同一套**约束，机制逐字一致：sink 的每个
    操作先 `co_await asio::dispatch(asio::bind_executor(m_executor, asio::use_awaitable))`
@@ -262,7 +263,12 @@ server.route_regex({Method::Get}, "/api/.*", handler);
 server.ws_route("/chat", ws_handler);
 server.fallback(not_found_handler);
 
-server.start();      // 同步：启动所有监听并阻塞至绑定完成，返回 bool
+// 同步启动所有监听；AllOrNothing（默认）失败整体回滚。
+auto started = server.start();
+if (!started) {
+    for (const auto &failure : started.error().failures)
+        log("{}: {}", failure.name, failure.error.message());
+}
 // 或 co_await server.run();  // 协程版
 server.stop();
 ```
