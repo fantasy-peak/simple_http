@@ -284,6 +284,51 @@ struct ServerConfig {
 #endif
 };
 
+class Server;
+
+// Fluent per-listener configuration. The builder writes through to the
+// ServerConfig::listeners entry it was created for, so it is safe to keep
+// adding other listeners in between.
+class TcpListenerBuilder {
+  public:
+    TcpListenerBuilder &name(std::string value);
+    TcpListenerBuilder &tls(TlsConfig value);
+    TcpListenerBuilder &plaintext(PlaintextHttp value);
+    TcpListenerBuilder &alpn(TlsHttp value);
+    TcpListenerBuilder &reuse_port(bool value);
+    TcpListenerBuilder &acceptors(std::size_t value);
+    TcpListenerBuilder &max_connections(std::size_t value);
+    TcpListenerBuilder &limits(EngineLimits value);
+    TcpListenerBuilder &socket_setup(std::function<void(asio::ip::tcp::socket &)> value);
+    TcpListenerBuilder &listener_setup(std::function<void(asio::ip::tcp::acceptor &)> value);
+
+  private:
+    friend class Server;
+    TcpListenerBuilder(Server *server, std::size_t index) : m_server(server), m_index(index) {}
+    Server *m_server;
+    std::size_t m_index;
+};
+
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+class QuicListenerBuilder {
+  public:
+    QuicListenerBuilder &name(std::string value);
+    QuicListenerBuilder &tls(TlsConfig value);
+    QuicListenerBuilder &sockets(std::size_t value);
+    QuicListenerBuilder &reuse_port(bool value);
+    QuicListenerBuilder &max_connections(std::size_t value);
+    QuicListenerBuilder &limits(EngineLimits value);
+    QuicListenerBuilder &options(quic::QuicEndpointConfig value);
+    QuicListenerBuilder &advertise_alt_svc(bool value);
+
+  private:
+    friend class Server;
+    QuicListenerBuilder(Server *server, std::size_t index) : m_server(server), m_index(index) {}
+    Server *m_server;
+    std::size_t m_index;
+};
+#endif
+
 class Server {
   public:
     explicit Server(ServerConfig config, std::shared_ptr<Router> router = std::make_shared<Router>())
@@ -472,6 +517,43 @@ class Server {
         return *this;
     }
 
+    // --- listener registration (multi-listener form) ---
+    TcpListenerBuilder listen(InetAddress address) {
+        TcpListenerConfig cfg;
+        cfg.address = std::move(address);
+        m_config.listeners.push_back(std::move(cfg));
+        m_configs_dirty = true;
+        return TcpListenerBuilder{this, m_config.listeners.size() - 1};
+    }
+    TcpListenerBuilder listen(UnixAddress address) {
+        TcpListenerConfig cfg;
+        cfg.address = std::move(address);
+        m_config.listeners.push_back(std::move(cfg));
+        m_configs_dirty = true;
+        return TcpListenerBuilder{this, m_config.listeners.size() - 1};
+    }
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+    QuicListenerBuilder listen(QuicAddress address) {
+        QuicListenerConfig cfg;
+        cfg.address = std::move(address);
+        m_config.listeners.push_back(std::move(cfg));
+        m_configs_dirty = true;
+        return QuicListenerBuilder{this, m_config.listeners.size() - 1};
+    }
+#endif
+    Server &add_listener(TcpListenerConfig cfg) {
+        m_config.listeners.push_back(std::move(cfg));
+        m_configs_dirty = true;
+        return *this;
+    }
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+    Server &add_listener(QuicListenerConfig cfg) {
+        m_config.listeners.push_back(std::move(cfg));
+        m_configs_dirty = true;
+        return *this;
+    }
+#endif
+
     // Start every configured listener. AllOrNothing (default) rolls the whole
     // server back on the first failure; BestEffort keeps what bound and reports
     // the rest in StartReport::failures.
@@ -618,6 +700,16 @@ class Server {
     std::shared_ptr<IoCtxPool> pool() { return m_pool; }
 
   private:
+    friend class TcpListenerBuilder;
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+    friend class QuicListenerBuilder;
+#endif
+
+    TcpListenerConfig &tcp_at(std::size_t index) { return std::get<TcpListenerConfig>(m_config.listeners[index]); }
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+    QuicListenerConfig &quic_at(std::size_t index) { return std::get<QuicListenerConfig>(m_config.listeners[index]); }
+#endif
+
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
     // The QUIC types the listener and the HTTP/3 engine are built from. Declared
     // here rather than beside the members because `make_h3_serve` names them and
@@ -704,6 +796,10 @@ class Server {
     // Turns the two public config shapes (explicit `listeners`, or the
     // single-listener sugar) into the per-listener plans the start path uses.
     void normalize_configs() {
+        m_tcp_configs.clear();
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+        m_quic_configs.clear();
+#endif
         if (!m_config.listeners.empty()) {
             for (auto &entry : m_config.listeners) {
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
@@ -960,6 +1056,8 @@ class Server {
     }
 
     std::expected<StartReport, StartupError> start_listeners(StartPolicy policy) {
+        if (m_configs_dirty)
+            normalize_configs();
         StartReport report;
         std::vector<ListenerFailure> failures;
         for (auto &cfg : m_tcp_configs) {
@@ -1392,6 +1490,7 @@ class Server {
     std::vector<std::shared_ptr<QuicRuntime>> m_quic_runtimes;
 #endif
     std::vector<std::shared_ptr<ListenerMeta>> m_metas;
+    bool m_configs_dirty{false};
     std::vector<Listener> m_acceptors;
     // Connections still being served, so stop() can take them down. Guarded by a
     // mutex because accept loops run on several threads and each registers its
@@ -1402,5 +1501,81 @@ class Server {
     // any business calling, and double-stopping must not race.
     std::atomic<bool> m_stopped{false};
 };
+
+inline TcpListenerBuilder &TcpListenerBuilder::name(std::string value) {
+    m_server->tcp_at(m_index).name = std::move(value);
+    return *this;
+}
+inline TcpListenerBuilder &TcpListenerBuilder::tls(TlsConfig value) {
+    m_server->tcp_at(m_index).tls = std::move(value);
+    return *this;
+}
+inline TcpListenerBuilder &TcpListenerBuilder::plaintext(PlaintextHttp value) {
+    m_server->tcp_at(m_index).plaintext = value;
+    return *this;
+}
+inline TcpListenerBuilder &TcpListenerBuilder::alpn(TlsHttp value) {
+    m_server->tcp_at(m_index).alpn = value;
+    return *this;
+}
+inline TcpListenerBuilder &TcpListenerBuilder::reuse_port(bool value) {
+    m_server->tcp_at(m_index).reuse_port = value;
+    return *this;
+}
+inline TcpListenerBuilder &TcpListenerBuilder::acceptors(std::size_t value) {
+    m_server->tcp_at(m_index).acceptors = value;
+    return *this;
+}
+inline TcpListenerBuilder &TcpListenerBuilder::max_connections(std::size_t value) {
+    m_server->tcp_at(m_index).max_connections = value;
+    return *this;
+}
+inline TcpListenerBuilder &TcpListenerBuilder::limits(EngineLimits value) {
+    m_server->tcp_at(m_index).limits = std::move(value);
+    return *this;
+}
+inline TcpListenerBuilder &TcpListenerBuilder::socket_setup(std::function<void(asio::ip::tcp::socket &)> value) {
+    m_server->tcp_at(m_index).socket_setup = std::move(value);
+    return *this;
+}
+inline TcpListenerBuilder &TcpListenerBuilder::listener_setup(std::function<void(asio::ip::tcp::acceptor &)> value) {
+    m_server->tcp_at(m_index).listener_setup = std::move(value);
+    return *this;
+}
+
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+inline QuicListenerBuilder &QuicListenerBuilder::name(std::string value) {
+    m_server->quic_at(m_index).name = std::move(value);
+    return *this;
+}
+inline QuicListenerBuilder &QuicListenerBuilder::tls(TlsConfig value) {
+    m_server->quic_at(m_index).tls = std::move(value);
+    return *this;
+}
+inline QuicListenerBuilder &QuicListenerBuilder::sockets(std::size_t value) {
+    m_server->quic_at(m_index).sockets = value;
+    return *this;
+}
+inline QuicListenerBuilder &QuicListenerBuilder::reuse_port(bool value) {
+    m_server->quic_at(m_index).reuse_port = value;
+    return *this;
+}
+inline QuicListenerBuilder &QuicListenerBuilder::max_connections(std::size_t value) {
+    m_server->quic_at(m_index).max_connections = value;
+    return *this;
+}
+inline QuicListenerBuilder &QuicListenerBuilder::limits(EngineLimits value) {
+    m_server->quic_at(m_index).limits = std::move(value);
+    return *this;
+}
+inline QuicListenerBuilder &QuicListenerBuilder::options(quic::QuicEndpointConfig value) {
+    m_server->quic_at(m_index).options = std::move(value);
+    return *this;
+}
+inline QuicListenerBuilder &QuicListenerBuilder::advertise_alt_svc(bool value) {
+    m_server->quic_at(m_index).advertise_alt_svc = value;
+    return *this;
+}
+#endif
 
 } // namespace simple_http

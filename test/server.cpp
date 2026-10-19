@@ -621,12 +621,6 @@ int main() {
     TcpListenerConfig plain_listener;
     plain_listener.address = InetAddress{"0.0.0.0", 7788, false};
     plain_cfg.listeners.push_back(std::move(plain_listener));
-    // A second TCP listener on the same Server: different port, explicit
-    // protocol policy, exercising the multi-listener configuration.
-    TcpListenerConfig secondary;
-    secondary.address = InetAddress{"0.0.0.0", 7794, false};
-    secondary.plaintext = PlaintextHttp::Http1Only;
-    plain_cfg.listeners.push_back(std::move(secondary));
     plain_cfg.worker_threads = 4;
     // permessage-deflate (RFC 7692) on: the Autobahn and third-party Python
     // suites drive this listener, so the extension's whole wire surface
@@ -635,6 +629,9 @@ int main() {
     plain_cfg.limits.ws_compression = true;
     Server plain{plain_cfg};
     register_routes(plain);
+    // A second TCP listener on the same Server, configured through the fluent
+    // builder: different port, h1-only (no h2c upgrade), its own name.
+    plain.listen(InetAddress{"0.0.0.0", 7794, false}).name("h1-only").plaintext(PlaintextHttp::Http1Only);
 
     // TLS server: HTTP/1.1 and HTTP/2 selected by ALPN, with mutual TLS.
     ServerConfig tls_cfg;
