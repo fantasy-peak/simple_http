@@ -503,6 +503,14 @@ asio::awaitable<std::expected<std::shared_ptr<asio::ip::tcp::socket>, error_code
 ws_proxy_connect(const Executor &executor, const WsProxyTarget &target) {
     using namespace asio::experimental::awaitable_operators;
     auto socket = std::make_shared<asio::ip::tcp::socket>(executor);
+    // Same policy as the client layer (ClientConfig::tcp_nodelay): on by
+    // default, best-effort, applied before the dial. A WebSocket tunnel is
+    // latency-sensitive and often writes small frames, so Nagle would add a
+    // delayed-ACK stall per message.
+    if (target.tcp_nodelay) {
+        error_code ne;
+        socket->set_option(asio::ip::tcp::no_delay(true), ne);
+    }
 
     auto connect_op = [&]() -> asio::awaitable<error_code> {
         auto [rec, endpoints] = co_await resolve_endpoints(target.resolve, target.host, target.port, executor);

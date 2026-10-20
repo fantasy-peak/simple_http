@@ -519,6 +519,9 @@ The WebSocket side is byte-level on both frontends: `ws_proxy*` builds the
 backend Upgrade request with the same header policy, validates the 101
 (including `Sec-WebSocket-Accept`), then splices bytes verbatim — no frame
 parsing, no size cap. The upstream leg is HTTP/1.1 over plaintext TCP today.
+Its backend socket follows `ClientConfig::tcp_nodelay`: `TCP_NODELAY` is on by
+default (`WsProxyTarget::tcp_nodelay`), and the same field also carries the
+connect budget (`connect_timeout`), Host/forwarding policy and resolver hook.
 
 ---
 

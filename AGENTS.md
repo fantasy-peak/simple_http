@@ -74,6 +74,7 @@ include/
                            WsProxyTarget / HttpProxyTarget（反代路由与钩子）
       ws_proxy_common.h    h1 Upgrade 与 h2 extended CONNECT 共用的 WS 后端握手：
                            构建 Upgrade 请求、hop-by-hop/转发头策略、101 校验、连接预算
+                           （上游 socket 与 ClientConfig::tcp_nodelay 同策略：默认开 TCP_NODELAY）
       h1/                  HTTP/1.x 引擎 + 请求头解析器 h1_parser.h（含 WebSocket 升级握手、
                            h2c 升级）；ws_proxy.h 是字节级 WebSocket 隧道（半关闭 + 响应校验）
       h2/                  HTTP/2 引擎 + 帧层 + HPACK（h2_frame / hpack_*）；读/写分离

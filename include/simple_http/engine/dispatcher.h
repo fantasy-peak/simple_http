@@ -95,6 +95,12 @@ struct WsProxyTarget {
     // system resolver. Same contract as ClientConfig::resolve: return the
     // endpoints to try, in order, from the connection executor.
     ResolveFn resolve;
+
+    // Disable Nagle's algorithm on the backend leg, with the same default and
+    // meaning as ClientConfig::tcp_nodelay (which the HTTP proxy route uses).
+    // The byte tunnel is latency-sensitive and writes small frames, so leaving
+    // it on would add up to a delayed-ACK worth of latency per message.
+    bool tcp_nodelay{true};
 };
 
 // Looks up a proxy backend for a request path; empty if the path is not a proxy
