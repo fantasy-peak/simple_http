@@ -36,7 +36,12 @@ namespace asio = boost::asio;
 
 class ResponseWriter {
   public:
-    explicit ResponseWriter(std::shared_ptr<ResponseSink> writer) : m_writer(std::move(writer)) {}
+    explicit ResponseWriter(std::shared_ptr<ResponseSink> writer) : m_writer(std::move(writer)) {
+        // Date + Content-Type + Server are filled in by apply_defaults; a
+        // handler usually adds one or two more. Reserving up front keeps the
+        // common case at one vector allocation instead of log2(n) growth moves.
+        m_headers.reserve(4);
+    }
 
     // --- fluent setters (return *this for chaining) ---
     ResponseWriter &status(int code) {
@@ -348,7 +353,7 @@ class ResponseWriter {
     // protocol (h1/h2/h3 all go through this ResponseWriter).
     void apply_defaults() {
         if (!m_headers.contains("date")) {
-            m_headers.add_lower("date", http_date(now_unix()));
+            m_headers.add_lower("date", std::string{http_date_now()});
         }
         if (!m_headers.contains("content-type")) {
             m_headers.add_lower("content-type", "text/plain");

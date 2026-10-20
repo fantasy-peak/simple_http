@@ -90,7 +90,7 @@ template <TransportLike Transport> class Http1ResponseSink : public ResponseSink
             co_return co_await send_bodyless(status, std::move(headers));
         }
         if (!headers.contains("date")) {
-            headers.add_lower("date", http_date(now_unix()));
+            headers.add_lower("date", std::string{http_date_now()});
         }
 
         // Erase first: add_lower appends, so a handler that set its own
@@ -127,7 +127,7 @@ template <TransportLike Transport> class Http1ResponseSink : public ResponseSink
         if (!m_open)
             co_return make_error_code(asio::error::not_connected);
         if (!headers.contains("date")) {
-            headers.add_lower("date", http_date(now_unix()));
+            headers.add_lower("date", std::string{http_date_now()});
         }
         std::string out;
         out.reserve(kResponseOverhead + headers_bytes_with_alt_svc(headers));
@@ -155,7 +155,7 @@ template <TransportLike Transport> class Http1ResponseSink : public ResponseSink
         if (!m_open)
             co_return make_error_code(asio::error::not_connected);
         if (!headers.contains("date")) {
-            headers.add_lower("date", http_date(now_unix()));
+            headers.add_lower("date", std::string{http_date_now()});
         }
 
         // A streamed response is chunked (HTTP/1.1) or close-delimited

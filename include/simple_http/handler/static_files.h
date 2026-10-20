@@ -103,7 +103,7 @@ inline void apply_common_headers(const std::string &server_header, const Respons
     if (!server_header.empty()) {
         res->header(field::server, server_header);
     }
-    res->header(field::date, http_date(now_unix()));
+    res->header(field::date, std::string{http_date_now()});
     res->header(field::cache_control, std::string{cache_control});
     if (etag)
         res->header(field::etag, *etag);
@@ -207,7 +207,7 @@ inline asio::awaitable<bool> StaticFiles::try_serve(const RequestPtr &req, const
         res->status(status::method_not_allowed);
         if (!m_config.server_header.empty())
             res->header(field::server, m_config.server_header);
-        res->header(field::date, http_date(now_unix()));
+        res->header(field::date, std::string{http_date_now()});
         res->header(field::allow, "GET, HEAD");
         res->header(field::cache_control, "no-store");
         res->content_type("text/plain; charset=utf-8");
@@ -374,7 +374,7 @@ inline asio::awaitable<void> StaticFiles::serve_not_found(const RequestPtr &req,
     res->status(status::not_found);
     if (!m_config.server_header.empty())
         res->header(field::server, m_config.server_header);
-    res->header(field::date, http_date(now_unix()));
+    res->header(field::date, std::string{http_date_now()});
     res->header(field::cache_control, "no-cache");
 
     const StaticEntry *page = m_table.not_found_entry();

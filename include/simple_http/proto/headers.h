@@ -21,6 +21,11 @@ class Headers {
 
     Headers() = default;
 
+    // Reserve room for fields without changing the contents. The response
+    // writer uses this so Date/Content-Type/Server do not each grow the vector
+    // (and move every string) on the hot path.
+    void reserve(std::size_t count) { m_fields.reserve(count); }
+
     // Adds a field. The name is lowercased for consistent lookup.
     void add(std::string name, std::string value) {
         to_lower(name);

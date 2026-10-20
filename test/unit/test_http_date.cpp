@@ -10,7 +10,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <cstdint>
+#include <limits>
 #include <string>
+#include <string_view>
 
 #include "simple_http.h"
 
@@ -70,6 +72,27 @@ TEST_CASE("http_date: parsing rejects what it should not accept", "[http_date]")
     // redundant, and refusing it would reject dates from clients that compute it
     // differently.
     CHECK(parse_http_date("Mon, 06 Nov 1994 08:49:37 GMT").has_value());
+}
+
+TEST_CASE("http_date: pre-epoch values and the four-digit-year range", "[http_date]") {
+    // The civil-date arithmetic floors negative timestamps; truncating division
+    // would put -1s on 01 Jan 1970 and get the weekday wrong too.
+    CHECK(http_date(-1) == "Wed, 31 Dec 1969 23:59:59 GMT");
+    CHECK(http_date(-86400) == "Wed, 31 Dec 1969 00:00:00 GMT");
+    CHECK(http_date(951782400) == "Tue, 29 Feb 2000 00:00:00 GMT");
+    CHECK(http_date(253402300799) == "Fri, 31 Dec 9999 23:59:59 GMT");
+
+    // IMF-fixdate is 4DIGIT (RFC 9110 §5.6.7), so values outside that range
+    // saturate instead of growing past 29 bytes.
+    CHECK(http_date(std::numeric_limits<std::int64_t>::min()) == "Sat, 01 Jan 0000 00:00:00 GMT");
+    CHECK(http_date(std::numeric_limits<std::int64_t>::max()) == "Fri, 31 Dec 9999 23:59:59 GMT");
+
+    // The allocation-free entry points agree with the owning one.
+    char buf[29];
+    http_date_to(buf, 784111777);
+    CHECK(std::string_view{buf, sizeof(buf)} == "Sun, 06 Nov 1994 08:49:37 GMT");
+    CHECK(http_date_fmt(784111777).view() == "Sun, 06 Nov 1994 08:49:37 GMT");
+    CHECK(std::string_view{http_date_fmt(784111777)} == "Sun, 06 Nov 1994 08:49:37 GMT");
 }
 
 TEST_CASE("http_date: now_unix is in the right epoch", "[http_date]") {

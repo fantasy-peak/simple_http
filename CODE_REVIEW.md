@@ -225,6 +225,29 @@ h1/h2 每次读都刷新 idle deadline，没有“从首字节起算”的绝对
 | `xmake run python-tests` | 113 checks，0 failed |
 | 手工 stop | `/delay?ms=5000` 在 SIGTERM 后完整返回 200 |
 
+## 性能：h2（:7790）回归排查
+
+现象：`test/stress/run.sh cpp --no-conformance h2` 的 2 KiB 档有时只有 143k req/s，
+而基线（c7b902e）在 16–18 万。机器负载波动很大（单次 1M 请求的 h2load 实测可在
+155k–190k 之间浮动），所以先把测量改成多轮、同 toolchain（LLVM 24）、同参数：
+
+- 300k × 3 档：基线首档约 162–168k；修改前首档 143k/155k/169k 波动。
+- 1M 请求、5 轮中位数：基线约 175k；修改后约 174k；差异落在噪声内。
+- `perf record`：`gmtime_r`/`snprintf` 不是主因（约 0.1%），但每个响应多一次 Date
+  字符串分配 + HPACK 编码；分配器（malloc/free）本来就占 ~30%。
+
+修复（`http_date.h` + 各 ResponseSink）：
+
+- 用 Howard Hinnant 的 `civil_from_days` 直接写 29 字节 IMF-fixdate，去掉
+  `gmtime_r` + `snprintf`；
+- `http_date_now()` 按线程、按秒缓存，Date 有 1 秒分辨率，不需要每响应格式化；
+- `ResponseWriter` 预留 4 个 header 槽位，避免 Date/Content-Type/Server 逐个触发
+  vector 扩容。
+
+结果：`test/stress/run.sh cpp --no-conformance h2` 首档回到 **169k req/s**（p99
+38ms），与基线同量级；剩余差异主要是多出的 Date 头本身的字节/HPACK 成本，属于
+RFC 9110 要求的固定开销。
+
 
 ## 复现片段
 
