@@ -3,7 +3,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <memory>
+#include <optional>
 #include <string>
+#include <vector>
 
 #include "simple_http.h"
 #include "test_support.h"
@@ -146,5 +148,57 @@ TEST_CASE("middleware: basic_auth accepts the right pair and 401s the rest", "[m
         auto writer = dispatch(ctx, router, req);
         CHECK(writer->last_status == status::unauthorized);
         CHECK_FALSE(handler_ran);
+    }
+}
+
+TEST_CASE("middleware: real_ip trusts forwarded headers only from a trusted peer", "[middleware]") {
+    asio::io_context ctx;
+
+    auto make_from = [&](const char *peer, std::string_view name, std::string_view value) {
+        auto req = std::make_shared<Request>(Version::Http11, ctx.get_executor(),
+                                             asio::ip::tcp::endpoint{asio::ip::make_address(peer), 4444});
+        req->set_target("/");
+        req->mutable_headers().add_lower(std::string{name}, std::string{value});
+        return req;
+    };
+    auto run_mw = [](RequestPtr req, std::vector<std::string> trusted) -> asio::awaitable<std::optional<std::string>> {
+        auto mw = middleware::real_ip(std::move(trusted));
+        std::optional<std::string> seen;
+        Next next = [&seen](RequestPtr r, ResponsePtr, SslHandle) -> asio::awaitable<void> {
+            if (auto *ip = r->get_state<middleware::ClientIp>()) {
+                seen = ip->value;
+            }
+            co_return;
+        };
+        co_await mw(std::move(req), nullptr, std::nullopt, std::move(next));
+        co_return seen;
+    };
+    auto run = [&](RequestPtr req, std::vector<std::string> trusted) -> std::optional<std::string> {
+        auto out = run_on(ctx, run_mw(std::move(req), std::move(trusted)));
+        REQUIRE(out.has_value());
+        return std::move(*out);
+    };
+
+    const std::vector<std::string> trusted{"10.0.0.0/8"};
+    // A direct, untrusted peer cannot speak for anyone else — even on loopback,
+    // and even with the header a proxy would have written.
+    CHECK_FALSE(run(make_from("127.0.0.1", "x-real-ip", "1.2.3.4"), trusted).has_value());
+    CHECK_FALSE(run(make_from("127.0.0.1", "x-forwarded-for", "1.2.3.4"), trusted).has_value());
+    // An empty trust list means "trust no proxy" (fail closed).
+    CHECK_FALSE(run(make_from("127.0.0.1", "x-real-ip", "1.2.3.4"), {}).has_value());
+
+    // From a trusted proxy, X-Real-IP wins...
+    CHECK(run(make_from("10.1.2.3", "x-real-ip", "1.2.3.4"), trusted) == std::optional<std::string>{"1.2.3.4"});
+    // ...otherwise XFF is walked right-to-left and the first non-proxy is the
+    // client.
+    CHECK(run(make_from("10.1.2.3", "x-forwarded-for", "1.2.3.4, 10.0.0.5"), trusted) ==
+          std::optional<std::string>{"1.2.3.4"});
+    CHECK(run(make_from("10.1.2.3", "x-forwarded-for", "1.2.3.4, 8.8.8.8"), trusted) ==
+          std::optional<std::string>{"8.8.8.8"});
+
+    {
+        auto req = make_from("10.1.2.3", "x-real-ip", "9.9.9.9");
+        req->mutable_headers().add_lower("x-forwarded-for", "1.2.3.4");
+        CHECK(run(std::move(req), trusted) == std::optional<std::string>{"9.9.9.9"});
     }
 }

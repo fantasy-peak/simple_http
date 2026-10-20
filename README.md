@@ -458,6 +458,8 @@ server.use(simple_http::middleware::access_log());
 server.use(simple_http::middleware::timeout(std::chrono::seconds(5))); // per-request deadline (see below)
 
 // Trusted-proxy awareness and path normalization, like chi/tower-http:
+// Only a direct peer in this list may supply X-Real-IP / X-Forwarded-For;
+// an empty list trusts no proxy (the peer address stays the identity).
 server.use(simple_http::middleware::real_ip({"127.0.0.1", "10.0.0.0"})); // X-Forwarded-For → ClientIp state
 server.use(simple_http::middleware::clean_path()); // %XX / "//" / "/./" normalized; ".." → 400
 server.use(simple_http::middleware::strip_prefix("/api")); // mount a sub-app registered from "/"

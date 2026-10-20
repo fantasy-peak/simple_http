@@ -503,22 +503,91 @@ TEST_CASE("regression/h1: a body larger than the cap is refused with 413", "[reg
     client.close();
 }
 
-TEST_CASE("regression/h1: Content-Length with Transfer-Encoding frames as chunked", "[regression][h1]") {
+TEST_CASE("regression/h1: Content-Length with Transfer-Encoding is refused", "[regression][h1]") {
     plain_server();
     asio::io_context ctx;
     RawClient client{ctx};
     REQUIRE(client.connect(kPlainPort));
 
-    // RFC 9112 §6.3: when both are present, Transfer-Encoding wins (and the
-    // Content-Length must not be believed — otherwise a smuggled message slips
-    // past a front-end that framed it differently).
+    // RFC 9112 §6.3 allows TE to override CL, but a message carrying both is
+    // the classic CL.TE request-smuggling shape: a front-end that framed by CL
+    // and this server framing by TE disagree about where the next request
+    // starts. Refusing the ambiguity (nginx does the same) is the only answer
+    // that cannot be desynchronized.
     client.send("POST /echo HTTP/1.1\r\nHost: x\r\ncontent-length: "
                 "5\r\ntransfer-encoding: chunked\r\n\r\n"
                 "4\r\nabcd\r\n0\r\n\r\n");
-    REQUIRE(client.wait_for("len="));
-    CHECK(status_of(client.received()) == 200);
-    CHECK(body_of(client.received()) == "len=4:abcd");
+    REQUIRE(client.wait_head());
+    CHECK(status_of(client.received()) == 400);
+    CHECK(client.wait_eof());
     client.close();
+}
+
+TEST_CASE("regression/h1: unsupported transfer codings are refused with 501", "[regression][h1]") {
+    plain_server();
+    asio::io_context ctx;
+
+    SECTION("a token that merely contains 'chunked' is not chunked") {
+        RawClient client{ctx};
+        REQUIRE(client.connect(kPlainPort));
+        client.send("POST /echo HTTP/1.1\r\nHost: x\r\ntransfer-encoding: notchunked\r\n"
+                    "content-length: 4\r\n\r\nabcd");
+        REQUIRE(client.wait_head());
+        CHECK(status_of(client.received()) == 501);
+        CHECK(client.wait_eof());
+        client.close();
+    }
+    SECTION("a coding we do not decode is not silently passed through") {
+        RawClient client{ctx};
+        REQUIRE(client.connect(kPlainPort));
+        client.send("POST /echo HTTP/1.1\r\nHost: x\r\ntransfer-encoding: gzip, chunked\r\n\r\n"
+                    "4\r\nabcd\r\n0\r\n\r\n");
+        REQUIRE(client.wait_head());
+        CHECK(status_of(client.received()) == 501);
+        CHECK(client.wait_eof());
+        client.close();
+    }
+    SECTION("chunked must be the final coding") {
+        RawClient client{ctx};
+        REQUIRE(client.connect(kPlainPort));
+        client.send("POST /echo HTTP/1.1\r\nHost: x\r\ntransfer-encoding: chunked, gzip\r\n\r\n"
+                    "4\r\nabcd\r\n0\r\n\r\n");
+        REQUIRE(client.wait_head());
+        CHECK(status_of(client.received()) == 400);
+        CHECK(client.wait_eof());
+        client.close();
+    }
+}
+
+TEST_CASE("regression/h1: Connection is parsed as a token list", "[regression][h1]") {
+    plain_server();
+    asio::io_context ctx;
+
+    SECTION("a value containing 'close' is not the close token") {
+        RawClient client{ctx};
+        REQUIRE(client.connect(kPlainPort));
+        client.send("GET /world HTTP/1.1\r\nHost: x\r\nConnection: not-close\r\n\r\n");
+        REQUIRE(client.wait_for("hello"));
+
+        // The connection must still be usable for a second request.
+        client.send("GET /world HTTP/1.1\r\nHost: x\r\n\r\n");
+        CHECK(client.pump_until(
+            [&] {
+                const auto &r = client.received();
+                const auto first = r.find("hello");
+                return first != std::string::npos && r.find("hello", first + 1) != std::string::npos;
+            },
+            std::chrono::seconds(5)));
+        client.close();
+    }
+    SECTION("a value containing 'keep-alive' is not the keep-alive token") {
+        RawClient client{ctx};
+        REQUIRE(client.connect(kPlainPort));
+        client.send("GET /world HTTP/1.0\r\nHost: x\r\nConnection: xkeep-alive\r\n\r\n");
+        REQUIRE(client.wait_for("hello"));
+        CHECK(client.wait_eof());
+        client.close();
+    }
 }
 
 TEST_CASE("regression/h1: a malformed chunk size is answered then dropped", "[regression][h1]") {

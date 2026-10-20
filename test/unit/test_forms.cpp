@@ -19,8 +19,10 @@ using namespace simple_http::test;
 
 namespace {
 
-RequestPtr make_request(asio::io_context &ctx, std::string target, Method method = Method::Get) {
-    auto req = std::make_shared<Request>(Version::Http11, ctx.get_executor(), asio::ip::tcp::endpoint{});
+RequestPtr make_request(asio::io_context &ctx, std::string target, Method method = Method::Get,
+                        const char *peer = "0.0.0.0") {
+    auto req = std::make_shared<Request>(Version::Http11, ctx.get_executor(),
+                                         asio::ip::tcp::endpoint{asio::ip::make_address(peer), 4444});
     req->set_target(std::move(target));
     req->set_method(method);
     req->body().finish();
@@ -338,7 +340,7 @@ TEST_CASE("proto/response: SSE frames are well-formed events", "[forms]") {
 TEST_CASE("middleware: real_ip resolves from X-Forwarded-For", "[forms]") {
     Router router;
     std::string seen;
-    router.use(middleware::real_ip());
+    router.use(middleware::real_ip({"10.0.0.1"}));
     router.route(any_methods, "/ip", [&](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
         const auto *ip = req->get_state<middleware::ClientIp>();
         seen = ip ? ip->value : "";
@@ -347,14 +349,14 @@ TEST_CASE("middleware: real_ip resolves from X-Forwarded-For", "[forms]") {
 
     asio::io_context ctx;
     {
-        auto req = make_request(ctx, "/ip");
+        auto req = make_request(ctx, "/ip", Method::Get, "10.0.0.1");
         req->mutable_headers().add_lower("x-forwarded-for", "203.0.113.7, 10.0.0.1");
         auto writer = dispatch(ctx, router, req);
         CHECK(seen == "203.0.113.7"); // original client, not the proxy
     }
     // No forwarded header: no ClientIp state, and the route still runs.
     seen = "cleared";
-    dispatch(ctx, router, make_request(ctx, "/ip"));
+    dispatch(ctx, router, make_request(ctx, "/ip", Method::Get, "10.0.0.1"));
     CHECK(seen.empty()); // handler saw no ClientIp and stored ""
 }
 
@@ -369,13 +371,13 @@ TEST_CASE("middleware: real_ip skips trusted proxies right-to-left", "[forms]") 
     });
 
     asio::io_context ctx;
-    auto req = make_request(ctx, "/ip");
+    auto req = make_request(ctx, "/ip", Method::Get, "10.0.0.1");
     req->mutable_headers().add_lower("x-real-ip", "203.0.113.9"); // X-Real-IP wins
     auto writer = dispatch(ctx, router, req);
     CHECK(seen == "203.0.113.9");
 
     seen = "";
-    auto req2 = make_request(ctx, "/ip");
+    auto req2 = make_request(ctx, "/ip", Method::Get, "10.0.0.1");
     req2->mutable_headers().add_lower("x-forwarded-for", "203.0.113.7, 10.0.0.1");
     dispatch(ctx, router, req2);
     CHECK(seen == "203.0.113.7"); // 10.0.0.1 is trusted, so the hop before it wins

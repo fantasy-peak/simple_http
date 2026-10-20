@@ -3,17 +3,22 @@
 // An in-memory cookie jar for the convenience layer — the Go http.CookieJar /
 // reqwest cookie_store equivalent. Cookies are collected from Set-Cookie
 // response headers and returned as a Cookie request header, filtered by the
-// usual rules: Domain (host suffix, defaults to the host itself), Path (prefix,
+// usual rules: Domain (host suffix, defaults to the host itself), host-only
+// (a cookie without Domain is never sent to a subdomain), Path (prefix,
 // defaults to the request's directory), Secure (https only) and Expires /
-// Max-Age. HttpOnly and SameSite are accepted and stored, but ignored for
+// Max-Age. A Set-Cookie with the same (name, domain, path) replaces the old
+// one; an expired cookie (Max-Age in the past / Max-Age=0 / a past Expires)
+// deletes it. HttpOnly and SameSite are accepted and stored, but ignored for
 // sending (there is no script context here to protect).
 //
 // The jar is thread-safe; a HttpClient shares one across its redirect hops by
 // default. It is advisory storage, not a spec-complete user agent: a single
-// jar, no partitioning, no rejection of suspicious Domain attributes.
+// jar, no partitioning, and no public-suffix list (a Domain attribute is only
+// checked against the request host, not against the PSL).
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -35,13 +40,36 @@ class CookieJar {
     void store(std::string_view url, const Headers &headers) {
         std::lock_guard<std::mutex> lock(m_mutex);
         const detail::Url parsed = detail::parse_url(url).value_or(detail::Url{});
+        if (parsed.host.empty()) {
+            return; // no host to scope a cookie to
+        }
         for (const auto &[name, value] : headers) {
             if (name != "set-cookie") {
                 continue;
             }
-            const auto cookie = parse_set_cookie(value, parsed);
-            if (cookie && !expired(*cookie)) {
-                m_cookies.push_back(*cookie);
+            auto cookie = parse_set_cookie(value, parsed);
+            if (!cookie) {
+                continue;
+            }
+            // RFC 6265 §5.3 step 6: a Domain attribute that does not cover the
+            // request host makes the whole cookie invalid (it is not silently
+            // broadened to the host).
+            if (!cookie->host_only && !domain_matches(cookie->domain, parsed.host)) {
+                continue;
+            }
+            // Same (name, domain, path) replaces the previous cookie. An
+            // expired cookie is the deletion form: remove the old one and do
+            // not store the tombstone.
+            const Cookie &incoming = *cookie;
+            m_cookies.erase(std::remove_if(m_cookies.begin(), m_cookies.end(),
+                                           [&](const Cookie &existing) {
+                                               return existing.name == incoming.name &&
+                                                      iequals_ci(existing.domain, incoming.domain) &&
+                                                      existing.path == incoming.path;
+                                           }),
+                            m_cookies.end());
+            if (!expired(incoming)) {
+                m_cookies.push_back(std::move(*cookie));
             }
         }
         drop_expired_locked();
@@ -81,8 +109,9 @@ class CookieJar {
     struct Cookie {
         std::string name;
         std::string value;
-        std::string domain; // host-only when it equals host; otherwise a suffix
-        std::string path;   // request-directory prefix by default
+        std::string domain;   // canonicalized host, or the Domain attribute
+        std::string path;     // request-directory prefix by default
+        bool host_only{true}; // no Domain attribute: exact host only
         bool secure{false};
         // Unix seconds; std::nullopt = session cookie (never ages out here).
         std::optional<std::int64_t> expires{};
@@ -102,7 +131,11 @@ class CookieJar {
         if (url.scheme != "https" && cookie.secure) {
             return false;
         }
-        if (!domain_matches(cookie.domain, url.host)) {
+        if (cookie.host_only) {
+            if (!iequals_ci(cookie.domain, url.host)) {
+                return false;
+            }
+        } else if (!domain_matches(cookie.domain, url.host)) {
             return false;
         }
         if (!path_matches(cookie.path, url.path().empty() ? "/" : url.path())) {
@@ -115,7 +148,7 @@ class CookieJar {
         if (cookie_domain.empty()) {
             return false;
         }
-        if (host == cookie_domain) {
+        if (iequals_ci(host, cookie_domain)) {
             return true;
         }
         if (host.size() > cookie_domain.size() && host.ends_with(cookie_domain) &&
@@ -155,6 +188,7 @@ class CookieJar {
         out.path = request_directory(url.path());
 
         // Attributes follow the first ';'-separated segment.
+        bool max_age_seen = false;
         std::size_t pos = semi == std::string_view::npos ? header.size() : semi + 1;
         for (;;) {
             const std::size_t next = header.find(';', pos);
@@ -164,27 +198,34 @@ class CookieJar {
             const std::string_view key = trim(attr.substr(0, attr_eq));
             std::string_view val =
                 attr_eq == std::string_view::npos ? std::string_view{} : trim(attr.substr(attr_eq + 1));
-            if (key == "domain" || key == "Domain") {
+            if (iequals_ci(key, "domain")) {
                 if (!val.empty() && val.front() == '.') {
                     val.remove_prefix(1);
                 }
-                if (!val.empty()) {
-                    out.domain = std::string{val};
+                if (!val.empty() && val.back() == '.') {
+                    val.remove_suffix(1); // RFC 6265 §5.1.3: trailing dot is ignored
                 }
-            } else if (key == "path" || key == "Path") {
                 if (!val.empty()) {
-                    out.path = std::string{val};
-                    if (out.path.front() != '/') {
-                        out.path.insert(out.path.begin(), '/');
-                    }
+                    out.domain = lowered(val);
+                    out.host_only = false;
                 }
-            } else if (key == "secure" || key == "Secure" || key == "Secure;") {
+            } else if (iequals_ci(key, "path")) {
+                // RFC 6265 §5.3 step 7: a Path that is missing or does not
+                // start with '/' falls back to the default-path; it is not
+                // prefixed into a different path.
+                out.path = !val.empty() && val.front() == '/' ? std::string{val} : request_directory(url.path());
+            } else if (iequals_ci(key, "secure")) {
                 out.secure = true;
-            } else if (key == "max-age" || key == "Max-Age") {
-                (void)parse_int(val, out.expires, /*relative=*/true);
-            } else if (key == "expires" || key == "Expires") {
-                if (const auto unix = parse_http_date(val)) {
-                    out.expires = *unix;
+            } else if (iequals_ci(key, "max-age")) {
+                // Max-Age wins over Expires regardless of attribute order.
+                if (parse_max_age(val, out.expires)) {
+                    max_age_seen = true;
+                }
+            } else if (iequals_ci(key, "expires")) {
+                if (!max_age_seen) {
+                    if (const auto unix = parse_http_date(val)) {
+                        out.expires = *unix;
+                    }
                 }
             }
             if (next == std::string_view::npos) {
@@ -218,19 +259,55 @@ class CookieJar {
         return s;
     }
 
-    // Parses a number into `out`; `relative` turns it into expires = now + n.
-    static bool parse_int(std::string_view s, std::optional<std::int64_t> &out, bool relative) {
+    static std::string lowered(std::string_view s) {
+        std::string out{s};
+        for (auto &c : out) {
+            if (c >= 'A' && c <= 'Z') {
+                c = static_cast<char>(c - 'A' + 'a');
+            }
+        }
+        return out;
+    }
+
+    static bool parse_unsigned(std::string_view s, std::int64_t &value) {
         if (s.empty()) {
             return false;
         }
-        std::int64_t value = 0;
+        std::int64_t v = 0;
         for (char c : s) {
             if (c < '0' || c > '9') {
                 return false;
             }
-            value = value * 10 + (c - '0');
+            const auto digit = static_cast<std::int64_t>(c - '0');
+            if (v > (std::numeric_limits<std::int64_t>::max() - digit) / 10) {
+                return false; // overflow: ignore the malformed attribute
+            }
+            v = v * 10 + digit;
         }
-        out = relative ? now_unix() + value : value;
+        value = v;
+        return true;
+    }
+
+    // Max-Age accepts a leading '-' (a negative lifetime means "expire now").
+    // Zero and negative both map to an already-expired timestamp.
+    static bool parse_max_age(std::string_view s, std::optional<std::int64_t> &out) {
+        const bool negative = !s.empty() && s.front() == '-';
+        if (negative) {
+            s.remove_prefix(1);
+        }
+        std::int64_t value = 0;
+        if (!parse_unsigned(s, value)) {
+            return false;
+        }
+        if (negative || value == 0) {
+            out = 0;
+            return true;
+        }
+        const std::int64_t now = now_unix();
+        if (value > std::numeric_limits<std::int64_t>::max() - now) {
+            return false;
+        }
+        out = now + value;
         return true;
     }
 

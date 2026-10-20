@@ -569,7 +569,8 @@ class Client {
         const std::string path = std::string{parsed->target};
         co_return co_await std::visit(
             [&](auto &typed) -> asio::awaitable<std::expected<std::shared_ptr<WebSocket>, error_code>> {
-                co_return co_await detail::ws_upgrade(typed, authority, path, spec, m_cfg.idle_timeout);
+                co_return co_await detail::ws_upgrade(typed, authority, path, spec, m_cfg.idle_timeout,
+                                                      m_cfg.response_head_timeout);
             },
             *transport);
     }

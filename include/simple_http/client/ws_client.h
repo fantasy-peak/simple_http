@@ -20,6 +20,8 @@
 
 #include <array>
 #include <boost/asio.hpp>
+#include <boost/asio/experimental/awaitable_operators.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <cctype> // std::tolower (accept-key header scan)
 #include <cstddef>
 #include <cstring>
@@ -80,8 +82,8 @@ inline std::string ws_client_key() {
 // started). `path` is the origin-form target; extra headers arrived in `spec`.
 template <typename Transport>
 asio::awaitable<std::expected<std::shared_ptr<WebSocket>, error_code>>
-ws_upgrade(std::shared_ptr<Transport> transport, std::string authority, std::string path, const WebSocketSpec &spec,
-           std::chrono::milliseconds idle_timeout) {
+ws_upgrade_impl(std::shared_ptr<Transport> transport, std::string authority, std::string path,
+                const WebSocketSpec &spec, std::chrono::milliseconds idle_timeout) {
     using asio::as_tuple;
     using asio::use_awaitable;
 
@@ -186,6 +188,33 @@ ws_upgrade(std::shared_ptr<Transport> transport, std::string authority, std::str
     auto ws = std::make_shared<WebSocket>(std::move(backend));
     asio::co_spawn(transport->get_executor(), ws->run_writer(), asio::detached);
     co_return ws;
+}
+
+// The handshake read is bounded by the caller's response-head budget. Without
+// it a peer that accepts the TCP/TLS connection and then says nothing keeps
+// open_websocket() parked forever: the WebSocket idle watchdog only starts
+// after the 101, and connect_timeout covers the dial, not this read.
+template <typename Transport>
+asio::awaitable<std::expected<std::shared_ptr<WebSocket>, error_code>>
+ws_upgrade(std::shared_ptr<Transport> transport, std::string authority, std::string path, const WebSocketSpec &spec,
+           std::chrono::milliseconds idle_timeout, std::chrono::milliseconds handshake_timeout) {
+    if (handshake_timeout.count() <= 0) {
+        co_return co_await ws_upgrade_impl(std::move(transport), std::move(authority), std::move(path), spec,
+                                           idle_timeout);
+    }
+    using namespace asio::experimental::awaitable_operators;
+    auto deadline = [handshake_timeout]() -> asio::awaitable<void> {
+        asio::steady_timer timer{co_await asio::this_coro::executor};
+        timer.expires_after(handshake_timeout);
+        co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+    };
+    auto outcome =
+        co_await (ws_upgrade_impl(transport, std::move(authority), std::move(path), spec, idle_timeout) || deadline());
+    if (auto *value = std::get_if<std::expected<std::shared_ptr<WebSocket>, error_code>>(&outcome)) {
+        co_return std::move(*value);
+    }
+    transport->close();
+    co_return std::unexpected{make_error_code(client_errc::response_head_timeout)};
 }
 
 } // namespace detail

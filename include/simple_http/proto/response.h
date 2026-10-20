@@ -21,6 +21,7 @@
 #include <string_view>
 #include <utility>
 
+#include "../core/http_date.h"
 #include "../core/http_field.h"
 #include "../core/http_status.h"
 #include "../core/logging.h"
@@ -338,8 +339,17 @@ class ResponseWriter {
         co_return co_await m_writer->send_trailers(std::move(trailers));
     }
 
-    // Fill in Server and Content-Type headers if the handler did not set them.
+    // Fill in Date, Server and Content-Type if the handler did not set them.
+    //
+    // Date is not cosmetic: RFC 9110 §6.6.1 requires an origin server to send it
+    // on every response except the 1xx/5xx cases it exempts, and caches use it
+    // for freshness/age calculations. The static-file layer already set it by
+    // hand; doing it here makes the guarantee hold for every route and every
+    // protocol (h1/h2/h3 all go through this ResponseWriter).
     void apply_defaults() {
+        if (!m_headers.contains("date")) {
+            m_headers.add_lower("date", http_date(now_unix()));
+        }
         if (!m_headers.contains("content-type")) {
             m_headers.add_lower("content-type", "text/plain");
         }

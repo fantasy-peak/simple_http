@@ -33,6 +33,7 @@
 #include <span>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "../../core/http_method.h"
 #include "../../core/http_status.h"
@@ -88,6 +89,9 @@ template <TransportLike Transport> class Http1ResponseSink : public ResponseSink
             // Neither a body nor a Content-Length (RFC 9110 §15.3.5/§15.4.5).
             co_return co_await send_bodyless(status, std::move(headers));
         }
+        if (!headers.contains("date")) {
+            headers.add_lower("date", http_date(now_unix()));
+        }
 
         // Erase first: add_lower appends, so a handler that set its own
         // content-length would otherwise put two conflicting ones on the wire —
@@ -122,6 +126,9 @@ template <TransportLike Transport> class Http1ResponseSink : public ResponseSink
         co_await hop();
         if (!m_open)
             co_return make_error_code(asio::error::not_connected);
+        if (!headers.contains("date")) {
+            headers.add_lower("date", http_date(now_unix()));
+        }
         std::string out;
         out.reserve(kResponseOverhead + headers_bytes_with_alt_svc(headers));
         append_status_line(out, status);
@@ -147,6 +154,9 @@ template <TransportLike Transport> class Http1ResponseSink : public ResponseSink
         co_await hop();
         if (!m_open)
             co_return make_error_code(asio::error::not_connected);
+        if (!headers.contains("date")) {
+            headers.add_lower("date", http_date(now_unix()));
+        }
 
         // A streamed response is chunked (HTTP/1.1) or close-delimited
         // (HTTP/1.0 / HEAD): a handler-supplied Content-Length must not survive
@@ -510,11 +520,12 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
                     co_return;
                 }
             }
+            const auto framing = parse_body_framing(head);
+            if (framing.error_status != 0) {
+                co_await send_error_response(framing.error_status);
+                co_return;
+            }
             bool keep_alive = connection_keep_alive(head, version);
-            // The Upgrade field, fetched once: both the WebSocket and the h2c
-            // checks below read it, and on a normal request neither applies —
-            // so a single lookup (often a full miss) replaces two.
-            const auto upgrade = head.headers.get("upgrade");
 
             // WebSocket upgrade: an Upgrade: websocket request with a
             // Sec-WebSocket-Key. A path registered as a proxy route is spliced
@@ -522,7 +533,13 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
             // a matched local ws route hands the connection to the WebSocket
             // layer, through the middleware chain. On success serve_loop returns
             // (the transport is no longer owned by this engine).
-            if (upgrade && is_websocket_upgrade(head, *upgrade)) {
+            if (is_websocket_upgrade(head)) {
+                // RFC 6455 §4.1: the handshake is a GET with no body. Any body
+                // bytes would otherwise be read as the peer's first frames.
+                if (framing.has_body) {
+                    co_await send_error_response(400);
+                    co_return;
+                }
                 std::string_view ws_path = request_path(head.target);
 
                 // RFC 6455 §4.2.1: the handshake demands Sec-WebSocket-Version:
@@ -605,45 +622,10 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
             // continue the connection as HTTP/2, replaying this request as
             // stream 1 (RFC 7540 §3.2). The transport is then owned by the h2
             // engine, so serve_loop returns.
-            if (m_allow_h2c && upgrade && is_h2c_upgrade(head, *upgrade)) {
+            if (m_allow_h2c && is_h2c_upgrade(head)) {
                 m_buf.assign(parser.remainder());
-                co_await do_h2c_upgrade(dispatch, head);
+                co_await do_h2c_upgrade(dispatch, head, framing);
                 co_return;
-            }
-
-            // Body framing fields, read once: the validation below and
-            // setup_body_framing() need them, and each was looked up separately
-            // before (two more full header scans per request on top of this one).
-            auto te = head.headers.get("transfer-encoding");
-            const bool chunked_body = te && icontains(*te, "chunked");
-            auto cl = head.headers.get("content-length");
-
-            // Reject an oversized or malformed Content-Length before running the
-            // handler (chunked bodies, which have no declared length, are bounded
-            // incrementally in read_chunked_body instead).
-            {
-                // Duplicate Content-Length is a request-smuggling split (CL.CL):
-                // a front-end that keeps the other copy frames a different body
-                // than we do, and both sides then disagree about where the next
-                // request starts. Rejecting is the only answer that cannot
-                // disagree — matching the Host rule elsewhere in this engine.
-                if (head.headers.count("content-length") > 1) {
-                    co_await send_error_response(400); // Bad Request
-                    co_return;
-                }
-                if (!chunked_body && cl) {
-                    std::uint64_t len = 0;
-                    switch (parse_uint(*cl, 10, m_limits.max_body_bytes, len)) {
-                    case NumParse::Invalid:
-                        co_await send_error_response(400); // Bad Request
-                        co_return;
-                    case NumParse::Overflow:
-                        co_await send_error_response(413); // Payload Too Large
-                        co_return;
-                    case NumParse::Ok:
-                        break;
-                    }
-                }
             }
 
             auto request = std::make_shared<Request>(version, exec, m_transport->peer());
@@ -665,7 +647,7 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
             // is the same pattern Http2ResponseSink uses for the h2 engine: the
             // read succeeds while the engine (and hence the connection) is alive,
             // and reports a clean end-of-life error once it is gone.
-            setup_body_framing(chunked_body, cl);
+            setup_body_framing(framing.chunked, framing.content_length);
             // Move the parsed header fields into the request: setup_body_framing
             // above was the last thing that read `head.headers`, so from here the
             // per-request copy of every field (name + value string each) is gone.
@@ -902,37 +884,131 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
         return NumParse::Ok;
     }
 
+    static std::string_view trim_ows(std::string_view s) {
+        while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) {
+            s.remove_prefix(1);
+        }
+        while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) {
+            s.remove_suffix(1);
+        }
+        return s;
+    }
+
+    // Exact, case-insensitive token match over every occurrence of `name`.
+    // `Connection` and `Upgrade` are comma-separated token lists, not opaque
+    // strings: substring matching made "not-close" close the connection and
+    // "xkeep-alive" keep an HTTP/1.0 one open.
+    static bool header_has_token(const Headers &headers, std::string_view name, std::string_view token) {
+        for (auto value : headers.get_all(name)) {
+            while (true) {
+                const std::size_t comma = value.find(',');
+                const std::string_view part = trim_ows(value.substr(0, comma));
+                if (iequals_ci(part, token)) {
+                    return true;
+                }
+                if (comma == std::string_view::npos) {
+                    break;
+                }
+                value.remove_prefix(comma + 1);
+            }
+        }
+        return false;
+    }
+
     static bool connection_keep_alive(const ParsedHead &head, Version version) {
-        auto conn = head.headers.get("connection");
-        if (conn) {
-            if (icontains(*conn, "close"))
-                return false;
-            if (icontains(*conn, "keep-alive"))
-                return true;
+        if (header_has_token(head.headers, "connection", "close")) {
+            return false;
+        }
+        if (header_has_token(head.headers, "connection", "keep-alive")) {
+            return true;
         }
         return version != Version::Http1; // HTTP/1.1 defaults to keep-alive, 1.0 to close
     }
 
-    // Allocation-free ASCII case-insensitive substring test. Called per request
-    // for keep-alive detection and body framing, so it avoids the temporary
-    // lowercased copies the previous implementation made.
-    static bool icontains(std::string_view haystack, std::string_view needle) {
-        if (needle.empty())
-            return true;
-        if (needle.size() > haystack.size())
-            return false;
-        auto lower = [](char c) { return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c; };
-        const std::size_t last = haystack.size() - needle.size();
-        for (std::size_t i = 0; i <= last; ++i) {
-            std::size_t j = 0;
-            for (; j < needle.size(); ++j) {
-                if (lower(haystack[i + j]) != lower(needle[j]))
-                    break;
-            }
-            if (j == needle.size())
-                return true;
+    // The validated framing of this request. `error_status` is 0 when the
+    // fields are usable; otherwise it is the status to answer with before any
+    // handler (or upgrade) runs.
+    struct BodyFraming {
+        int error_status{0};
+        bool chunked{false};
+        bool has_body{false};
+        std::optional<std::string_view> content_length;
+    };
+
+    // RFC 9112 §6: Transfer-Encoding is a list of transfer codings, and only
+    // chunked is implemented here. Rejecting unknown codings (501) is the only
+    // safe answer: silently passing the body through would hand gzip/… bytes to
+    // the handler, and a front-end that framed the request differently would
+    // desync. `chunked` has to be the last coding. A request carrying both TE
+    // and CL is refused (400): TE-wins is legal but is exactly the CL.TE split
+    // nginx and others reject outright.
+    BodyFraming parse_body_framing(const ParsedHead &head) const {
+        BodyFraming out;
+        if (head.headers.count("content-length") > 1) {
+            out.error_status = 400;
+            return out;
         }
-        return false;
+        out.content_length = head.headers.get("content-length");
+
+        const auto te_values = head.headers.get_all("transfer-encoding");
+        if (!te_values.empty()) {
+            std::vector<std::string_view> codings;
+            for (auto value : te_values) {
+                while (true) {
+                    const std::size_t comma = value.find(',');
+                    const std::string_view token = trim_ows(value.substr(0, comma));
+                    if (token.empty()) {
+                        out.error_status = 400;
+                        return out;
+                    }
+                    codings.push_back(token);
+                    if (comma == std::string_view::npos) {
+                        break;
+                    }
+                    value.remove_prefix(comma + 1);
+                }
+            }
+            for (std::size_t i = 0; i < codings.size(); ++i) {
+                if (!iequals_ci(codings[i], "chunked")) {
+                    continue;
+                }
+                if (i + 1 != codings.size()) {
+                    out.error_status = 400; // chunked must be the final coding
+                    return out;
+                }
+                if (codings.size() != 1) {
+                    out.error_status = 501; // another coding we do not decode
+                    return out;
+                }
+                out.chunked = true;
+            }
+            if (!out.chunked) {
+                out.error_status = 501;
+                return out;
+            }
+            if (out.content_length) {
+                out.error_status = 400; // TE + CL: refuse the ambiguity
+                return out;
+            }
+            out.has_body = true;
+            return out;
+        }
+
+        if (out.content_length) {
+            std::uint64_t len = 0;
+            switch (parse_uint(*out.content_length, 10, m_limits.max_body_bytes, len)) {
+            case NumParse::Invalid:
+                out.error_status = 400;
+                return out;
+            case NumParse::Overflow:
+                out.error_status = 413;
+                return out;
+            case NumParse::Ok:
+                break;
+            }
+            out.has_body = len > 0;
+        }
+        return out;
     }
 
     // Reads one CRLF- or LF-terminated line from m_buf (topping up from the
@@ -999,14 +1075,14 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
 
     // Detects a WebSocket upgrade handshake: a GET carrying
     // `Upgrade: websocket`, `Connection: Upgrade` and a Sec-WebSocket-Key.
-    // `upgrade` is the already-fetched Upgrade field (serve_loop reads it once
-    // for both this check and the h2c check, so neither re-scans the headers).
-    static bool is_websocket_upgrade(const ParsedHead &head, std::string_view upgrade) {
-        if (!icontains(upgrade, "websocket"))
+    // Both fields are token lists, so they are matched exactly.
+    static bool is_websocket_upgrade(const ParsedHead &head) {
+        if (!header_has_token(head.headers, "upgrade", "websocket")) {
             return false;
-        auto connection = head.headers.get("connection");
-        if (!connection || !icontains(*connection, "upgrade"))
+        }
+        if (!header_has_token(head.headers, "connection", "upgrade")) {
             return false;
+        }
         return head.headers.get("sec-websocket-key").has_value();
     }
 
@@ -1134,24 +1210,24 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
         co_return true;
     }
 
-    // Detects an h2c cleartext upgrade: Upgrade: h2c, Connection listing both
-    // "Upgrade" and "HTTP2-Settings", and the HTTP2-Settings header itself
-    // (RFC 7540 §3.2). `upgrade` is the already-fetched Upgrade field.
-    static bool is_h2c_upgrade(const ParsedHead &head, std::string_view upgrade) {
-        if (!icontains(upgrade, "h2c"))
+    // Detects an h2c cleartext upgrade: Upgrade: h2c, Connection: Upgrade, and
+    // the HTTP2-Settings header itself (RFC 7540 §3.2).
+    static bool is_h2c_upgrade(const ParsedHead &head) {
+        if (!header_has_token(head.headers, "upgrade", "h2c")) {
             return false;
-        auto connection = head.headers.get("connection");
-        if (!connection || !icontains(*connection, "upgrade"))
+        }
+        if (!header_has_token(head.headers, "connection", "upgrade")) {
             return false;
+        }
         return head.headers.get("http2-settings").has_value();
     }
 
     // Performs the h2c upgrade: reads any request body, sends 101, then hands the
     // connection to an Http2Engine that replays this request as stream 1.
-    asio::awaitable<void> do_h2c_upgrade(const Dispatcher &dispatch, const ParsedHead &head) {
+    asio::awaitable<void> do_h2c_upgrade(const Dispatcher &dispatch, const ParsedHead &head,
+                                         const BodyFraming &framing) {
         // Drain the (small) upgrade-request body so it can be replayed on stream 1.
-        auto h2c_te = head.headers.get("transfer-encoding");
-        setup_body_framing(h2c_te && icontains(*h2c_te, "chunked"), head.headers.get("content-length"));
+        setup_body_framing(framing.chunked, framing.content_length);
         std::string body;
         while (!m_body_done) {
             auto r = co_await pull_body_chunk();

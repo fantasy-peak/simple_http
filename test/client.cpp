@@ -1801,6 +1801,30 @@ asio::awaitable<void> suite_websocket(std::uint16_t port) {
         check(echo && echo->text && echo->data == "via proxy", "ws_proxy echoes through the tunnel");
     }
     (void)co_await (*proxied)->close();
+
+    // A peer that accepts the connection and then never answers the Upgrade
+    // must not park open_websocket() forever: the handshake shares the
+    // response-head budget with ordinary requests.
+    {
+        asio::io_context peer_ctx;
+        auto silent = std::make_shared<FakeServer>(peer_ctx, "", /*close_after=*/false);
+        std::thread peer_thread([&peer_ctx] { peer_ctx.run(); });
+
+        auto cfg = base_config();
+        cfg.response_head_timeout = std::chrono::milliseconds(150);
+        h::Client slow{co_await asio::this_coro::executor, cfg};
+        const auto start = std::chrono::steady_clock::now();
+        auto r = co_await slow.open_websocket("ws://127.0.0.1:" + std::to_string(silent->port()) + "/silent");
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
+        check(!r && r.error() == sh::client_errc::response_head_timeout,
+              "open_websocket times out when the peer never answers the Upgrade -> " +
+                  (r ? std::string{"unexpected success"} : describe(r.error())));
+        check(elapsed < std::chrono::seconds(2), "the WebSocket handshake timeout is bounded");
+
+        peer_ctx.stop();
+        peer_thread.join();
+    }
 }
 
 asio::awaitable<void> suite_multipart(std::uint16_t port) {

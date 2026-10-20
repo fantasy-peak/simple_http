@@ -270,53 +270,71 @@ inline bool ip_covered(std::string_view entry, std::string_view ip) {
     return true;
 }
 
+// The direct peer has to be one of the configured proxies before anything it
+// says about a forwarded address is believed. An empty list trusts nobody.
+inline bool peer_is_trusted(std::string_view peer, const std::vector<std::string> &trusted) {
+    for (const auto &entry : trusted) {
+        if (ip_covered(entry, peer)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 } // namespace real_ip_detail
 
-// real_ip: resolves the client's real address behind a proxy. X-Real-IP wins if
-// present (chi's precedence); otherwise X-Forwarded-For is walked — with an
-// empty `trusted_proxies` the leftmost (original) address is taken, with a
-// list the first address walking right-to-left that is not a trusted proxy
-// (tower-http's SetXForwarded semantics). Entries in `trusted_proxies` are
-// exact addresses or CIDR prefixes ("10.0.0.0/8", "2001:db8::/32"), IPv4 and
-// IPv6. The result is published as ClientIp on the request; it is never used
-// as authorization — forwards can be spoofed, so treat it as advisory.
+// real_ip: resolves the client's real address behind a proxy. The forwarded
+// fields are consulted only when the *direct peer* itself is covered by
+// `trusted_proxies`; otherwise they are ignored entirely (fail closed). With a
+// trusted peer, X-Real-IP wins if present (chi's precedence); otherwise
+// X-Forwarded-For is walked right-to-left and the first address that is not a
+// trusted proxy is taken (tower-http's SetXForwarded semantics). Entries in
+// `trusted_proxies` are exact addresses or CIDR prefixes ("10.0.0.0/8",
+// "2001:db8::/32"), IPv4 and IPv6.
+//
+// An empty list means "no proxy is trusted": the peer address remains the only
+// identity, and `rate_limit`'s default key falls back to it. This is deliberate
+// — only a peer we already trust may speak for someone else. The result is
+// still advisory for authorization (a trusted proxy can be misconfigured), but
+// it is no longer trivially spoofable by a direct client.
 inline Middleware real_ip(std::vector<std::string> trusted_proxies = {}) {
     return [trusted = std::move(trusted_proxies)](RequestPtr req, ResponsePtr res, SslHandle ssl,
                                                   Next next) -> asio::awaitable<void> {
-        if (const auto x_real = req->header("x-real-ip"); x_real && !x_real->empty()) {
-            req->set_state(ClientIp{std::string{*x_real}});
-            co_await next(std::move(req), std::move(res), ssl);
-            co_return;
-        }
-        if (const auto xff = req->header("x-forwarded-for")) {
-            // Split into trimmed segments, left (original client) to right
-            // (closest proxy).
-            std::vector<std::string_view> hops;
-            std::size_t pos = 0;
-            while (pos <= xff->size()) {
-                const std::size_t comma = xff->find(',', pos);
-                std::string_view hop =
-                    xff->substr(pos, comma == std::string_view::npos ? std::string_view::npos : comma - pos);
-                while (!hop.empty() && hop.front() == ' ') {
-                    hop.remove_prefix(1);
-                }
-                while (!hop.empty() && hop.back() == ' ') {
-                    hop.remove_suffix(1);
-                }
-                if (!hop.empty()) {
-                    hops.push_back(hop);
-                }
-                if (comma == std::string_view::npos) {
-                    break;
-                }
-                pos = comma + 1;
+        if (real_ip_detail::peer_is_trusted(req->peer_address(), trusted)) {
+            if (const auto x_real = req->header("x-real-ip"); x_real && !x_real->empty()) {
+                req->set_state(ClientIp{std::string{*x_real}});
+                co_await next(std::move(req), std::move(res), ssl);
+                co_return;
             }
-            if (!hops.empty()) {
-                std::string_view chosen;
-                if (trusted.empty()) {
-                    chosen = hops.front();
-                } else {
-                    chosen = hops.front();
+            if (const auto xff = req->header("x-forwarded-for")) {
+                // Split into trimmed segments, left (original client) to right
+                // (closest proxy).
+                std::vector<std::string_view> hops;
+                std::size_t pos = 0;
+                while (pos <= xff->size()) {
+                    const std::size_t comma = xff->find(',', pos);
+                    std::string_view hop =
+                        xff->substr(pos, comma == std::string_view::npos ? std::string_view::npos : comma - pos);
+                    while (!hop.empty() && hop.front() == ' ') {
+                        hop.remove_prefix(1);
+                    }
+                    while (!hop.empty() && hop.back() == ' ') {
+                        hop.remove_suffix(1);
+                    }
+                    if (!hop.empty()) {
+                        hops.push_back(hop);
+                    }
+                    if (comma == std::string_view::npos) {
+                        break;
+                    }
+                    pos = comma + 1;
+                }
+                if (!hops.empty()) {
+                    // The peer is trusted, so `trusted` is non-empty. Walk from
+                    // the closest proxy outward; the first untrusted hop is the
+                    // client, and if every hop is a trusted proxy the leftmost
+                    // (original) entry is the best answer available.
+                    std::string_view chosen = hops.front();
                     for (auto it = hops.rbegin(); it != hops.rend(); ++it) {
                         bool is_trusted = false;
                         for (const auto &t : trusted) {
@@ -330,8 +348,8 @@ inline Middleware real_ip(std::vector<std::string> trusted_proxies = {}) {
                             break;
                         }
                     }
+                    req->set_state(ClientIp{std::string{chosen}});
                 }
-                req->set_state(ClientIp{std::string{chosen}});
             }
         }
         co_await next(std::move(req), std::move(res), ssl);

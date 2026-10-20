@@ -307,13 +307,20 @@ TEST_CASE("proto/response: defaults are filled in but never override", "[proto]"
         CHECK(writer->last_body == "created");
         CHECK(writer->header("content-type") == "text/plain"); // default
         CHECK(writer->header("server") == std::string{server_version});
+        // RFC 9110 §6.6.1: an origin server sends Date on ordinary responses.
+        CHECK_FALSE(writer->header("date").empty());
     }
     {
         auto w2 = std::make_shared<FakeResponseSink>();
         ResponseWriter res{w2};
-        REQUIRE(run_on(ctx, res.status(200).content_type("application/json").header("server", "mine").send("{}")));
+        REQUIRE(run_on(ctx, res.status(200)
+                                .content_type("application/json")
+                                .header("server", "mine")
+                                .header("date", "Sun, 06 Nov 1994 08:49:37 GMT")
+                                .send("{}")));
         CHECK(w2->header("content-type") == "application/json");
         CHECK(w2->header("server") == "mine"); // explicit values win
+        CHECK(w2->header("date") == "Sun, 06 Nov 1994 08:49:37 GMT");
     }
 }
 

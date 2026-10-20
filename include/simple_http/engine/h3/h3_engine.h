@@ -114,6 +114,9 @@ template <typename Connection> class Http3ResponseSink : public ResponseSink {
         if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
             co_return make_error_code(asio::error::not_connected);
         }
+        if (!headers.contains("date")) {
+            headers.add_lower("date", http_date(now_unix()));
+        }
         // A response to HEAD has no body: the HEADERS frame ends the stream, and
         // the headers still carry the Content-Length a GET would have produced.
         const bool head = eng->method_is_head(m_stream_id);
@@ -130,6 +133,9 @@ template <typename Connection> class Http3ResponseSink : public ResponseSink {
         if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
             co_return make_error_code(asio::error::not_connected);
         }
+        if (!headers.contains("date")) {
+            headers.add_lower("date", http_date(now_unix()));
+        }
         // No DATA frame follows, not even an empty one: the FIN that ends the
         // HEADERS frame is what tells the client the message is over (§4.1).
         eng->begin_response(m_stream_id, status, headers, /*end_stream=*/true,
@@ -142,6 +148,9 @@ template <typename Connection> class Http3ResponseSink : public ResponseSink {
         auto eng = m_engine.lock();
         if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
             co_return make_error_code(asio::error::not_connected);
+        }
+        if (!headers.contains("date")) {
+            headers.add_lower("date", http_date(now_unix()));
         }
         const bool head = eng->method_is_head(m_stream_id);
         // The body may follow, so the reader is installed even though nothing is

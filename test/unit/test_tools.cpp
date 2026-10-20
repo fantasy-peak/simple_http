@@ -16,8 +16,9 @@ using namespace simple_http::test;
 namespace {
 
 RequestPtr make_request(asio::io_context &ctx, std::string target,
-                        std::vector<std::pair<std::string, std::string>> headers = {}) {
-    auto req = std::make_shared<Request>(Version::Http11, ctx.get_executor(), asio::ip::tcp::endpoint{});
+                        std::vector<std::pair<std::string, std::string>> headers = {}, const char *peer = "0.0.0.0") {
+    auto req = std::make_shared<Request>(Version::Http11, ctx.get_executor(),
+                                         asio::ip::tcp::endpoint{asio::ip::make_address(peer), 4444});
     req->set_target(std::move(target));
     req->set_method(Method::Get);
     req->body().finish();
@@ -140,20 +141,20 @@ TEST_CASE("real_ip: trusted entries accept CIDR prefixes", "[tools]") {
     asio::io_context ctx;
     {
         // "10.5.5.5" is inside 10.0.0.0/8, so the hop before it (the real
-        // client) is chosen.
-        auto req = make_request(ctx, "/ip", {{"x-forwarded-for", "203.0.113.7, 10.5.5.5"}});
+        // client) is chosen. The direct peer itself is inside the trusted CIDR.
+        auto req = make_request(ctx, "/ip", {{"x-forwarded-for", "203.0.113.7, 10.5.5.5"}}, "10.5.5.5");
         dispatch(ctx, router, req);
         CHECK(seen == "203.0.113.7");
     }
     {
         // "11.5.5.5" is outside the CIDR: it is the first untrusted hop itself.
-        auto req = make_request(ctx, "/ip", {{"x-forwarded-for", "203.0.113.7, 11.5.5.5"}});
+        auto req = make_request(ctx, "/ip", {{"x-forwarded-for", "203.0.113.7, 11.5.5.5"}}, "10.5.5.5");
         dispatch(ctx, router, req);
         CHECK(seen == "11.5.5.5");
     }
     {
         // An exact trusted address still works (regression for the old form).
-        auto req = make_request(ctx, "/ip", {{"x-forwarded-for", "203.0.113.7, 192.168.1.1"}});
+        auto req = make_request(ctx, "/ip", {{"x-forwarded-for", "203.0.113.7, 192.168.1.1"}}, "10.5.5.5");
         dispatch(ctx, router, req);
         CHECK(seen == "203.0.113.7");
     }

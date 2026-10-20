@@ -130,6 +130,9 @@ template <TransportLike Transport> class Http2ResponseSink : public ResponseSink
         // sent, so without this a `HEAD /world` over HTTP/2 answered `200 +
         // content-type + server` where the same route over HTTP/1.1 answered
         // `content-length: 1024` (h1_engine.h send() sets it for HEAD too).
+        if (!headers.contains("date")) {
+            headers.add_lower("date", http_date(now_unix()));
+        }
         const bool head = eng->method_is_head(m_stream_id);
         if (head) {
             headers.erase("content-length");
@@ -147,6 +150,9 @@ template <TransportLike Transport> class Http2ResponseSink : public ResponseSink
         if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
             co_return make_error_code(asio::error::not_connected);
         }
+        if (!headers.contains("date")) {
+            headers.add_lower("date", http_date(now_unix()));
+        }
         // Nothing follows the HEADERS frame: END_STREAM ends the stream (RFC 9113
         // §8.1).
         eng->submit_headers(m_stream_id, status, headers, /*end_stream=*/true);
@@ -158,6 +164,9 @@ template <TransportLike Transport> class Http2ResponseSink : public ResponseSink
         auto eng = m_engine.lock();
         if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
             co_return make_error_code(asio::error::not_connected);
+        }
+        if (!headers.contains("date")) {
+            headers.add_lower("date", http_date(now_unix()));
         }
         // A streamed response has no length it can promise - END_STREAM delimits
         // it - so a handler-supplied Content-Length must not survive next to it.
