@@ -2,7 +2,10 @@
 // Retry-After, the tower-http RateLimitLayer / golang.org/x/time/rate shape.
 
 #include <catch2/catch_test_macros.hpp>
+#include <chrono>
+#include <cmath>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 
@@ -65,8 +68,34 @@ TEST_CASE("rate limit: a hostile key space cannot grow the map past max_keys", "
     for (int i = 0; i < 100; ++i)
         (void)limiter->try_acquire("hostile-" + std::to_string(i));
     CHECK(limiter->bucket_count() <= 4);
-    CHECK_FALSE(limiter->try_acquire("a-brand-new-key")); // over the cap
+
+    // At the cap a new key evicts the least-recently-used bucket instead of
+    // being refused forever. This is what keeps a busy proxy from locking out
+    // every client that arrives after the first max_keys distinct addresses.
+    CHECK(limiter->try_acquire("a-brand-new-key"));
     CHECK(limiter->bucket_count() <= 4);
+}
+
+TEST_CASE("rate limit: idle buckets are reclaimed at the cap", "[rate_limit]") {
+    // One key, 20 ms TTL: after it goes idle, a second key must be admitted
+    // without evicting a *live* bucket.
+    middleware::RateLimiter limiter(/*rate=*/0.01, /*burst=*/1, /*max_keys=*/1, std::chrono::milliseconds(20));
+    CHECK(limiter.try_acquire("alice"));
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    CHECK(limiter.try_acquire("bob"));
+    CHECK(limiter.bucket_count() == 1);
+}
+
+TEST_CASE("rate limit: invalid token-bucket configuration is rejected", "[rate_limit]") {
+    CHECK_THROWS_AS(middleware::TokenBucket(0.0, 1), std::invalid_argument);
+    CHECK_THROWS_AS(middleware::TokenBucket(-1.0, 1), std::invalid_argument);
+    CHECK_THROWS_AS(middleware::TokenBucket(std::nan(""), 1), std::invalid_argument);
+    CHECK_THROWS_AS(middleware::TokenBucket(1.0, 0), std::invalid_argument);
+
+    CHECK_THROWS_AS(middleware::RateLimiter(0.0, 1, 1), std::invalid_argument);
+    CHECK_THROWS_AS(middleware::RateLimiter(1.0, 0, 1), std::invalid_argument);
+    CHECK_THROWS_AS(middleware::RateLimiter(1.0, 1, 0), std::invalid_argument);
+    CHECK_THROWS_AS(middleware::RateLimiter(1.0, 1, 1, std::chrono::milliseconds(-1)), std::invalid_argument);
 }
 
 TEST_CASE("rate limit: a refused request is 429 and never reaches the route", "[rate_limit]") {

@@ -27,6 +27,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -246,6 +247,13 @@ struct ServerConfig {
     bool reuse_port{true};
     // Cap on the TCP fan-out when reuse_port is on (0 = one per worker).
     std::size_t acceptors{0};
+    // How long stop() lets already-dispatched requests finish after the
+    // listeners close. Only requests that have entered the handler count: an
+    // idle keep-alive connection is closed immediately after the wait, and a
+    // WebSocket (which is long-lived by nature) is bounded by this same grace.
+    // 0 restores the historical immediate shutdown. Go's Server.Shutdown waits
+    // for active requests; this is the bounded equivalent.
+    std::chrono::milliseconds shutdown_grace{5000};
     // Derive Alt-Svc for same-port TLS listeners from a QUIC listener.
     bool auto_alt_svc{true};
     // Disable Nagle's algorithm on every accepted connection (TCP_NODELAY).
@@ -584,6 +592,10 @@ class Server {
     // The route table, exposed so several Servers can share one Router.
     std::shared_ptr<Router> router() { return m_router; }
 
+    // Stop accepting, let in-flight requests finish (bounded by
+    // ServerConfig::shutdown_grace), then close every remaining connection and
+    // join the worker pool. Call from a control thread, never from inside a
+    // handler: it waits for handlers and joins their threads.
     void stop() {
         if (m_stopped.exchange(true))
             return;
@@ -642,18 +654,34 @@ class Server {
             }
         }
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
-        // Take the QUIC connections down, but do not close the sockets yet: a
+        // Stop admitting new QUIC connections without disturbing the ones
+        // already running: an unknown Destination Connection ID is dropped from
+        // here on, while existing connections keep their CID entries and can
+        // finish the requests they already have.
+        for (auto &rt : m_quic_runtimes) {
+            for (auto &endpoint : rt->endpoints)
+                endpoint->begin_drain();
+        }
+#endif
+        // Let already-dispatched handlers finish before the transports are torn
+        // down. This is what makes stop() a drain rather than an abort: the
+        // listener is closed (no new connections), but a request that reached
+        // the handler gets up to shutdown_grace to produce its response.
+        drain_active_requests();
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+        // Now wind the QUIC connections down. Do not close the sockets yet: a
         // CONNECTION_CLOSE has to leave through the socket its connection
         // arrived on, so closing the listener first would leave the peer with a
         // port that merely stopped answering — it would wait for its own
-        // timeout instead of being told. The sockets go after the drain, below.
+        // timeout instead of being told. The sockets go after the pool drains.
         for (auto &rt : m_quic_runtimes) {
             for (auto &endpoint : rt->endpoints)
                 endpoint->shutdown_connections();
         }
 #endif
-        // The same for TCP: close what is in flight so those coroutines finish
-        // and the pool drains rather than abandoning their frames.
+        // The same for TCP: close whatever is left (idle keep-alive connections,
+        // WebSockets, and any request that outlived the grace) so those
+        // coroutines finish and the pool drains rather than abandoning frames.
         shutdown_connections();
         m_pool->stop();
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
@@ -708,6 +736,11 @@ class Server {
     // when no limit is configured. Readable from any thread; useful for a
     // readiness/health endpoint or for checking that a limit is in effect.
     std::size_t active_connections() const { return m_active_connections->load(std::memory_order_relaxed); }
+
+    // Requests that have entered the dispatch chain and not returned yet.
+    // stop() drains these (bounded by ServerConfig::shutdown_grace); a health
+    // endpoint can expose it as a "busy" gauge.
+    std::size_t active_requests() const { return m_active_requests->load(std::memory_order_relaxed); }
 
     std::shared_ptr<IoCtxPool> pool() { return m_pool; }
 
@@ -909,10 +942,20 @@ class Server {
 #endif
     }
 
+    // Decrements the active-request gauge on every exit path, including a
+    // cancelled/exception-unwound dispatch.
+    struct ActiveRequestGuard {
+        std::atomic<std::size_t> *count;
+        ~ActiveRequestGuard() { count->fetch_sub(1, std::memory_order_relaxed); }
+    };
+
     Dispatcher make_dispatcher() {
         auto router = m_router;
-        return [router](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res,
-                        SslHandle ssl) -> asio::awaitable<void> {
+        auto active = m_active_requests;
+        return [router, active](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res,
+                                SslHandle ssl) -> asio::awaitable<void> {
+            active->fetch_add(1, std::memory_order_relaxed);
+            ActiveRequestGuard guard{active.get()};
             co_await router->dispatch(std::move(req), std::move(res), ssl);
         };
     }
@@ -1406,6 +1449,27 @@ class Server {
         return live;
     }
 
+    // Wait for requests that already entered the dispatch chain. Polling is
+    // deliberate: the gauge is updated on worker threads, and stop() is a
+    // control-plane call (normally the main thread), so a 1 ms tick is both
+    // cheap and enough to notice a request finishing. A handler that outlives
+    // the grace is cut off by the transport shutdown that follows.
+    void drain_active_requests() {
+        if (m_config.shutdown_grace.count() <= 0) {
+            return;
+        }
+        const auto deadline = std::chrono::steady_clock::now() + m_config.shutdown_grace;
+        while (m_active_requests->load(std::memory_order_acquire) != 0) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                SIMPLE_HTTP_ERROR_LOG("server: shutdown grace of {}ms elapsed with {} request(s) still running",
+                                      m_config.shutdown_grace.count(),
+                                      m_active_requests->load(std::memory_order_relaxed));
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
     // Ask every live connection to close. Returns immediately: the closes land
     // on their own executors, and the drain in IoCtxPool::stop() is what waits
     // for them to be processed.
@@ -1631,6 +1695,8 @@ class Server {
     // the accept loops. Always counted, so active_connections() is meaningful
     // even when no limit is configured.
     std::shared_ptr<std::atomic<std::size_t>> m_active_connections = std::make_shared<std::atomic<std::size_t>>(0);
+    // One gauge shared by every listener's dispatcher; see active_requests().
+    std::shared_ptr<std::atomic<std::size_t>> m_active_requests = std::make_shared<std::atomic<std::size_t>>(0);
     std::vector<TcpListenerConfig> m_tcp_configs;
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
     std::vector<QuicListenerConfig> m_quic_configs;

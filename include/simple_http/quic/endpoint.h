@@ -211,6 +211,12 @@ template <typename Executor> class QuicEndpoint {
         asio::co_spawn(m_executor, send_loop(), asio::detached);
     }
 
+    // Stop admitting new connections while leaving the established ones
+    // running. The server calls this when it starts draining: packets for a
+    // known CID still reach their connection, but an Initial for a new one is
+    // dropped instead of allocating state and a handler.
+    void begin_drain() { m_draining.store(true, std::memory_order_release); }
+
     // Stop listening. Connections are left alone; use shutdown_connections()
     // first to wind them down.
     void close() {
@@ -339,7 +345,11 @@ template <typename Executor> class QuicEndpoint {
 
         // No connection owns this Destination Connection ID. Either it is a new
         // Initial (which is how connections are born), or it is a stale packet
-        // for a connection that is gone.
+        // for a connection that is gone. During a drain we refuse to give a
+        // new connection a handler slot: existing CIDs were handled above.
+        if (m_draining.load(std::memory_order_acquire)) {
+            return;
+        }
         ngtcp2_pkt_hd hd{};
         if (ngtcp2_accept(&hd, data.data(), data.size()) != 0) {
             // A packet we cannot accept. If it is a short-header packet long
@@ -740,6 +750,7 @@ template <typename Executor> class QuicEndpoint {
     asio::experimental::concurrent_channel<void(error_code)> m_send_wake{m_executor, 128};
     bool m_started{false};
     bool m_closed{false};
+    std::atomic<bool> m_draining{false};
 };
 
 } // namespace simple_http::quic

@@ -7,8 +7,9 @@
 //   server.use(simple_http::middleware::rate_limit(
 //       simple_http::middleware::make_token_bucket(100, 200))); // 100 req/s, 200 burst
 //
-//   // Per-client buckets (key = client address by default — pair with real_ip()
-//   // for the forwarded address — or any key the handler can derive):
+//   // Per-client buckets (key = client address by default — pair with
+//   // real_ip({"10.0.0.0/8"}) for the forwarded address behind a trusted proxy
+//   // — or any key the handler can derive):
 //   server.use(simple_http::middleware::rate_limit(
 //       std::make_shared<simple_http::middleware::RateLimiter>(10, 20), // per-IP: 10/s, burst 20
 //       [](const RequestPtr &req) { return std::string{req->peer_address()}; }));
@@ -22,8 +23,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
+#include <list>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -41,8 +45,18 @@ namespace middleware {
 // burst-sized capacity; try_acquire() consumes one token or fails when empty.
 class TokenBucket {
   public:
+    // A non-positive/non-finite rate and a zero burst are configuration
+    // errors, not "block every request": without this, seconds_until_token()
+    // divided by zero and a burst of 0 could never admit anything while
+    // promising a finite Retry-After. Fail at construction instead.
     TokenBucket(double rate, std::size_t burst)
         : m_rate(rate), m_burst(burst), m_tokens(static_cast<double>(burst)), m_last(std::chrono::steady_clock::now()) {
+        if (!(rate > 0.0) || !std::isfinite(rate)) {
+            throw std::invalid_argument("TokenBucket: rate must be positive and finite");
+        }
+        if (burst == 0) {
+            throw std::invalid_argument("TokenBucket: burst must be positive");
+        }
     }
 
     bool try_acquire() {
@@ -64,7 +78,11 @@ class TokenBucket {
         if (m_tokens >= 1.0) {
             return 0;
         }
-        return static_cast<std::int64_t>(std::ceil((1.0 - m_tokens) / m_rate));
+        const double seconds = std::ceil((1.0 - m_tokens) / m_rate);
+        if (!std::isfinite(seconds) || seconds >= static_cast<double>(std::numeric_limits<std::int64_t>::max())) {
+            return std::numeric_limits<std::int64_t>::max();
+        }
+        return static_cast<std::int64_t>(seconds);
     }
 
   private:
@@ -89,43 +107,115 @@ inline std::shared_ptr<TokenBucket> make_token_bucket(double rate, std::size_t b
     return std::make_shared<TokenBucket>(rate, burst);
 }
 
-// A per-key limiter: an independent token bucket per key, capped at max_keys so
-// a hostile key space cannot grow memory without bound (new keys past the cap
-// are refused, which reads as overload).
+// A per-key limiter: an independent token bucket per key. The key space is
+// bounded by max_keys; when a new key arrives at the cap, idle buckets older
+// than `idle_ttl` are reclaimed first and then the least-recently-used bucket is
+// evicted. That keeps memory bounded without turning the cap into a permanent
+// 429 for every client that arrives after the first max_keys distinct keys.
 class RateLimiter {
   public:
-    RateLimiter(double rate, std::size_t burst, std::size_t max_keys = 10000)
-        : m_rate(rate), m_burst(burst), m_max_keys(max_keys) {}
+    // idle_ttl = 0 disables time-based reclamation (LRU eviction still applies
+    // at the cap). A negative TTL, a non-positive/non-finite rate, a zero burst
+    // or max_keys=0 are configuration errors.
+    RateLimiter(double rate, std::size_t burst, std::size_t max_keys = 10000,
+                std::chrono::milliseconds idle_ttl = std::chrono::minutes(10))
+        : m_rate(rate), m_burst(burst), m_max_keys(max_keys), m_idle_ttl(idle_ttl) {
+        if (!(rate > 0.0) || !std::isfinite(rate)) {
+            throw std::invalid_argument("RateLimiter: rate must be positive and finite");
+        }
+        if (burst == 0) {
+            throw std::invalid_argument("RateLimiter: burst must be positive");
+        }
+        if (max_keys == 0) {
+            throw std::invalid_argument("RateLimiter: max_keys must be positive");
+        }
+        if (idle_ttl.count() < 0) {
+            throw std::invalid_argument("RateLimiter: idle_ttl must not be negative");
+        }
+    }
 
     bool try_acquire(std::string_view key) {
         std::lock_guard<std::mutex> lock(m_mutex);
-        const std::string owned{key}; // the map is keyed by std::string
+        const auto now = std::chrono::steady_clock::now();
+        std::string owned{key};
         auto it = m_buckets.find(owned);
         if (it == m_buckets.end()) {
-            // Check the cap *before* inserting: operator[] added the node first
-            // and only then consulted max_keys, so a hostile key space grew the
-            // map without bound even though new keys were "refused".
-            if (m_buckets.size() >= m_max_keys) {
-                return false;
-            }
-            it = m_buckets.emplace(owned, std::make_shared<TokenBucket>(m_rate, m_burst)).first;
+            make_room_locked(now);
+            m_lru.push_front(std::move(owned));
+            auto lru_it = m_lru.begin();
+            auto [inserted, ok] =
+                m_buckets.emplace(*lru_it, Entry{std::make_shared<TokenBucket>(m_rate, m_burst), lru_it, now});
+            (void)ok;
+            it = inserted;
+        } else {
+            // Promote to most-recently-used; m_lru is ordered by recency and
+            // therefore also by last_used, which is what the idle sweep relies
+            // on.
+            m_lru.splice(m_lru.begin(), m_lru, it->second.lru);
+            it->second.last_used = now;
         }
-        return it->second->try_acquire();
+        return it->second.bucket->try_acquire();
     }
 
     // How many keys currently hold a bucket. Read-only introspection for tests
-    // and metrics; never grows past max_keys once try_acquire() is fixed.
+    // and metrics; never grows past max_keys.
     std::size_t bucket_count() const {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_buckets.size();
     }
 
   private:
+    struct Entry {
+        std::shared_ptr<TokenBucket> bucket;
+        std::list<std::string>::iterator lru;
+        std::chrono::steady_clock::time_point last_used;
+    };
+
+    // Called with the mutex held, before inserting a new key.
+    void make_room_locked(std::chrono::steady_clock::time_point now) {
+        if (m_buckets.size() < m_max_keys) {
+            return;
+        }
+        // m_lru is most-recent first, so expired entries — if any — are at the
+        // back. Reclaim them before touching a live bucket.
+        if (m_idle_ttl.count() > 0) {
+            while (!m_lru.empty()) {
+                auto it = m_buckets.find(m_lru.back());
+                if (it == m_buckets.end()) {
+                    m_lru.pop_back();
+                    continue;
+                }
+                if (now - it->second.last_used < m_idle_ttl) {
+                    break;
+                }
+                m_buckets.erase(it);
+                m_lru.pop_back();
+                if (m_buckets.size() < m_max_keys) {
+                    return;
+                }
+            }
+        }
+        // Still full (every bucket is active, or TTL is disabled): evict the
+        // least-recently-used one. A new client gets a fresh burst instead of a
+        // permanent 429; the evicted client simply starts over on its next
+        // request, which is the only bounded-memory policy that keeps the
+        // limiter usable under key churn.
+        if (!m_lru.empty()) {
+            auto victim = m_buckets.find(m_lru.back());
+            if (victim != m_buckets.end()) {
+                m_buckets.erase(victim);
+            }
+            m_lru.pop_back();
+        }
+    }
+
     double m_rate;
     std::size_t m_burst;
     std::size_t m_max_keys;
+    std::chrono::milliseconds m_idle_ttl;
     mutable std::mutex m_mutex;
-    std::unordered_map<std::string, std::shared_ptr<TokenBucket>> m_buckets;
+    std::unordered_map<std::string, Entry> m_buckets;
+    std::list<std::string> m_lru; // front = most recently used
 };
 
 namespace detail {

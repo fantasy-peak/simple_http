@@ -39,6 +39,7 @@ namespace {
 
 constexpr std::uint16_t kPlainPort = 27920;
 constexpr std::uint16_t kTlsPort = 27921;
+constexpr std::uint16_t kShutdownPort = 27930;
 constexpr std::size_t kMaxHeaderBytes = 4096;
 constexpr std::size_t kMaxBodyBytes = 64 * 1024;
 
@@ -1425,6 +1426,69 @@ TEST_CASE("regression/server: a UNIX-domain listener serves over its socket file
     CHECK(restarted.start());
     restarted.stop();
     std::filesystem::remove(path, ignored);
+}
+
+// stop() closes the listeners first, then lets a request that already reached
+// the handler finish. Closing the transports immediately (the old behavior)
+// turned every in-flight response into an empty reply.
+TEST_CASE("regression/server: stop drains an in-flight request", "[regression][server]") {
+    sh::ServerConfig cfg;
+    cfg.listen = sh::InetAddress{"127.0.0.1", kShutdownPort, false};
+    cfg.worker_threads = 2;
+    cfg.limits.idle_timeout = std::chrono::seconds(5);
+    cfg.shutdown_grace = std::chrono::seconds(2);
+    sh::Server server{cfg};
+
+    std::atomic<bool> started{false};
+    server.route(sh::any_methods, "/slow-stop", [&](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+        started.store(true, std::memory_order_release);
+        asio::steady_timer timer{co_await asio::this_coro::executor};
+        timer.expires_after(std::chrono::milliseconds(300));
+        co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+        co_await res->status(200).send("drained");
+    });
+    REQUIRE(server.start());
+
+    std::string response;
+    std::thread client([&] {
+        asio::io_context io;
+        asio::ip::tcp::socket socket{io};
+        sh::error_code ec;
+        socket.connect(asio::ip::tcp::endpoint{asio::ip::make_address("127.0.0.1"), kShutdownPort}, ec);
+        if (ec)
+            return;
+        const std::string request = "GET /slow-stop HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        asio::write(socket, asio::buffer(request), ec);
+        if (ec)
+            return;
+        std::array<char, 4096> buf{};
+        for (;;) {
+            const auto n = socket.read_some(asio::buffer(buf), ec);
+            if (ec || n == 0)
+                break;
+            response.append(buf.data(), n);
+        }
+        socket.close(ec);
+    });
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!started.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(started.load(std::memory_order_acquire));
+    CHECK(server.active_requests() == 1); // the handler is inside the dispatch chain
+
+    const auto begin = std::chrono::steady_clock::now();
+    server.stop();
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin);
+    client.join();
+
+    CHECK(response.find("200 OK") != std::string::npos);
+    CHECK(response.find("drained") != std::string::npos);
+    CHECK(elapsed >= std::chrono::milliseconds(250)); // it waited for the handler
+    CHECK(elapsed < std::chrono::seconds(2));         // ... and not for the full grace
+    CHECK(server.active_requests() == 0);
 }
 
 // TLS over a UNIX-domain socket. The transport is templated on the socket type,

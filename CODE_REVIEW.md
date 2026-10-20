@@ -110,7 +110,7 @@ after deletion:    [sid=one; sid=two]                # Max-Age=0 未删除
 
 建议：可配置 drain（先停 accept → 等在途请求完成或超时 → 再关连接）；h2/h3 先发 GOAWAY。
 
-**状态：待修复（下一批）。**
+**状态：✅ 已修复（见文末第二批验证）。**
 
 ### 7. 静态大文件阻塞 + Range 整文件读
 
@@ -140,7 +140,7 @@ h1/h2 每次读都刷新 idle deadline，没有“从首字节起算”的绝对
 - `max_keys` 满后新 key 永久 429，空闲 bucket 不淘汰；
 - `TokenBucket::seconds_until_token()` 在 `rate=0` 时除零（浮点 inf 转 int64）。
 
-**状态：待修复。**
+**状态：✅ 已修复（见文末第二批验证）。**
 
 ## P1：API / 语义改进
 
@@ -191,6 +191,39 @@ h1/h2 每次读都刷新 idle deadline，没有“从首字节起算”的绝对
 | `xmake run client` | 177 checks，0 failed |
 | `xmake run python-tests` | 113 checks，0 failed |
 | 手工 h1/h2/h3 | `Date` 均存在；TE 各分支为 501/400/200；h2c Upgrade 与 prior-knowledge 正常 |
+
+## 第二批修复（6、10，已完成）
+
+### 6. `Server::stop()` 优雅 drain
+
+- `ServerConfig::shutdown_grace`（默认 5s，0 = 旧的立即关闭语义）。
+- `Server::active_requests()`：只统计已经进入 dispatch 链的请求；idle keep-alive 不计数。
+- `stop()` 顺序：关闭 acceptors → QUIC `begin_drain()`（拒绝新连接、保留已建立连接）→ 等
+  `active_requests` 归零或 grace 到期 → 发送 QUIC CONNECTION_CLOSE → 关闭剩余 TCP 连接
+  → join worker pool。
+- `quic/endpoint.h` 新增 `begin_drain()`：未知 CID 的 Initial 不再创建连接，已有 CID 仍可
+  完成在途请求。
+- 实测：`GET /delay?ms=5000` 发出 1s 后 `SIGTERM`，curl 现在收到完整的 `200` +
+  `"waited 5000 ms"`，而不再是 `Empty reply`。
+
+### 10. `RateLimiter` 回收与配置校验
+
+- 每个 key 记录 `last_used`，`m_lru` 维护 LRU 顺序。
+- 达到 `max_keys` 时先回收超过 `idle_ttl`（默认 10min，0 = 关闭 TTL）的 bucket，再淘汰
+  LRU；新 key 不再被永久 429。
+- `rate` 必须为正有限值、`burst > 0`、`max_keys > 0`、`idle_ttl >= 0`，否则构造时抛
+  `std::invalid_argument`。
+- `seconds_until_token()` 对非有限/溢出的秒数 clamp 到 `int64` 上限，不再有除零 UB。
+
+第二批验证：
+
+| 套件 | 结果 |
+|---|---|
+| `xmake run unittest` | 307 test cases / 64438 assertions，全过 |
+| `xmake run regression` | 62 test cases / 337 assertions，全过 |
+| `xmake run client` | 177 checks，0 failed |
+| `xmake run python-tests` | 113 checks，0 failed |
+| 手工 stop | `/delay?ms=5000` 在 SIGTERM 后完整返回 200 |
 
 
 ## 复现片段
