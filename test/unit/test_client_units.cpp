@@ -4,6 +4,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
 #include <string>
+#include <vector>
 
 #include "simple_http.h"
 #include "test_support.h"
@@ -351,3 +352,34 @@ TEST_CASE("client/h2: a stream outcome is terminal and never rewritten", "[clien
 //
 // The old per-host limiter (HostConnectionLimiter) is gone: each Client keeps a
 // single connection per origin, so there is nothing to limit per host anymore.
+
+// --- resolve hook ------------------------------------------------------------
+
+TEST_CASE("client/resolve: the hook wins, an empty hook falls back to asio", "[client]") {
+    asio::io_context ctx;
+    auto ex = ctx.get_executor();
+
+    ResolveFn hook =
+        [](std::string,
+           std::string port) -> asio::awaitable<std::pair<error_code, std::vector<asio::ip::tcp::endpoint>>> {
+        const auto p = static_cast<std::uint16_t>(std::stoul(port));
+        co_return std::pair<error_code, std::vector<asio::ip::tcp::endpoint>>{
+            {}, {asio::ip::tcp::endpoint{asio::ip::make_address("192.0.2.1"), p}}};
+    };
+
+    auto hooked = run_on(ctx, resolve_endpoints(hook, "example.com", 443, ex));
+    REQUIRE(hooked);
+    CHECK(hooked->first == error_code{});
+    REQUIRE(hooked->second.size() == 1);
+    CHECK(hooked->second[0].address() == asio::ip::make_address("192.0.2.1"));
+    CHECK(hooked->second[0].port() == 443);
+
+    // No hook: the same call still resolves through asio (a numeric host needs
+    // no network, which keeps this test hermetic).
+    auto fallback = run_on(ctx, resolve_endpoints(ResolveFn{}, "127.0.0.1", 80, ex));
+    REQUIRE(fallback);
+    CHECK(fallback->first == error_code{});
+    REQUIRE_FALSE(fallback->second.empty());
+    CHECK(fallback->second[0].address() == asio::ip::make_address("127.0.0.1"));
+    CHECK(fallback->second[0].port() == 80);
+}

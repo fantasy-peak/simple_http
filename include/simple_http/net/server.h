@@ -468,6 +468,16 @@ class Server {
         m_router->ws_proxy_regex(pattern, WsProxyTarget{std::move(host), port, std::move(rewrite_path)});
         return *this;
     }
+    // Full target form: lets the route carry an external ResolveFn (and the
+    // other WsProxyTarget policies) instead of only host/port/rewrite_path.
+    Server &ws_proxy(std::string path, WsProxyTarget target) {
+        m_router->ws_proxy(std::move(path), std::move(target));
+        return *this;
+    }
+    Server &ws_proxy_regex(const std::string &pattern, WsProxyTarget target) {
+        m_router->ws_proxy_regex(pattern, std::move(target));
+        return *this;
+    }
 
     // --- HTTP reverse-proxy route registration (request-level) ---
     // A matching request on `path` is forwarded to the backend host:port with the

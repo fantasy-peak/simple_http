@@ -813,23 +813,11 @@ class ClientEngine {
 
     asio::awaitable<std::expected<std::vector<asio::ip::tcp::endpoint>, error_code>>
     resolve(const ClientTarget &target, const asio::any_io_executor &ex) {
-        if (m_config.resolve) {
-            auto [ec, endpoints] = co_await m_config.resolve(target.host, std::to_string(target.effective_port()));
-            if (ec)
-                co_return std::unexpected{ec};
-            if (endpoints.empty())
-                co_return std::unexpected{make_error_code(asio::error::host_not_found)};
-            co_return endpoints;
-        }
-        auto resolver = std::make_shared<asio::ip::tcp::resolver>(ex);
-        auto [ec, results] = co_await resolver->async_resolve(target.host, std::to_string(target.effective_port()),
-                                                              asio::as_tuple(asio::use_awaitable));
+        auto [ec, endpoints] = co_await resolve_endpoints(m_config.resolve, target.host, target.effective_port(), ex);
         if (ec)
             co_return std::unexpected{ec};
-        std::vector<asio::ip::tcp::endpoint> endpoints;
-        endpoints.reserve(results.size());
-        for (const auto &entry : results)
-            endpoints.push_back(entry.endpoint());
+        if (endpoints.empty())
+            co_return std::unexpected{make_error_code(asio::error::host_not_found)};
         co_return endpoints;
     }
 

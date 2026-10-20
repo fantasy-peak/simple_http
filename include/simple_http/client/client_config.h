@@ -28,6 +28,7 @@
 
 #include "../core/http_method.h" // RetryPolicy::condition names Method
 #include "../core/limits.h"
+#include "../core/resolve.h" // ResolveFn (shared with the WebSocket proxy)
 #include "../core/types.h"
 
 namespace simple_http {
@@ -269,11 +270,10 @@ struct ClientConfig {
     std::shared_ptr<CookieJar> cookie_jar{};
 
     // Optional name-resolution override: return the endpoints to try, in order.
-    // Lets an application plug in its own DNS (cache, DoH, …) instead of the
-    // built-in asio resolver. Empty = asio::ip::tcp::resolver.
-    std::function<asio::awaitable<std::pair<error_code, std::vector<asio::ip::tcp::endpoint>>>(std::string host,
-                                                                                               std::string port)>
-        resolve;
+    // Lets an application plug in its own DNS (cache, DoH, c-ares, a private
+    // upstream, …) instead of the built-in asio resolver. Empty =
+    // asio::ip::tcp::resolver. The same hook is accepted by WsProxyTarget.
+    ResolveFn resolve;
 
     // Applied to the freshly-connected socket, before TLS starts.
     std::function<void(asio::ip::tcp::socket &)> socket_setup;

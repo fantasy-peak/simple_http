@@ -636,6 +636,10 @@ TEST_CASE("router: websocket proxy routes and their rewrite", "[router]") {
     exact.host = "127.0.0.1";
     exact.port = 7788;
     exact.rewrite_path = "/chat";
+    exact.resolve = [](std::string,
+                       std::string) -> asio::awaitable<std::pair<error_code, std::vector<asio::ip::tcp::endpoint>>> {
+        co_return std::pair<error_code, std::vector<asio::ip::tcp::endpoint>>{};
+    };
     router.ws_proxy("/wsproxy", exact);
 
     WsProxyTarget templated;
@@ -648,6 +652,7 @@ TEST_CASE("router: websocket proxy routes and their rewrite", "[router]") {
     REQUIRE(found.has_value());
     CHECK(found->port == 7788);
     CHECK(found->rewrite_path == "/chat");
+    CHECK(static_cast<bool>(found->resolve)); // route lookup keeps the DNS hook
 
     auto other = router.find_ws_proxy("/proxy/chat");
     REQUIRE(other.has_value());

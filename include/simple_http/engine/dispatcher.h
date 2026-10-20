@@ -16,6 +16,7 @@
 #include <string>
 #include <string_view>
 
+#include "../core/resolve.h" // ResolveFn (optional external DNS)
 #include "../proto/request.h"
 #include "../proto/response.h"
 #include "../proto/websocket.h"
@@ -89,6 +90,11 @@ struct WsProxyTarget {
     // the Upgrade handshake (a backend that accepts and then never answers is
     // bounded by this, not left to the idle watchdog). 0 disables the timer.
     std::chrono::milliseconds connect_timeout{10000};
+
+    // Optional name-resolution override for the backend leg. Empty = asio's
+    // system resolver. Same contract as ClientConfig::resolve: return the
+    // endpoints to try, in order, from the connection executor.
+    ResolveFn resolve;
 };
 
 // Looks up a proxy backend for a request path; empty if the path is not a proxy

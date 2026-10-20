@@ -505,9 +505,7 @@ ws_proxy_connect(const Executor &executor, const WsProxyTarget &target) {
     auto socket = std::make_shared<asio::ip::tcp::socket>(executor);
 
     auto connect_op = [&]() -> asio::awaitable<error_code> {
-        asio::ip::tcp::resolver resolver{executor};
-        auto [rec, endpoints] = co_await resolver.async_resolve(target.host, std::to_string(target.port),
-                                                                asio::as_tuple(asio::use_awaitable));
+        auto [rec, endpoints] = co_await resolve_endpoints(target.resolve, target.host, target.port, executor);
         if (rec)
             co_return rec;
         if (endpoints.empty())

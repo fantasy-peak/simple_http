@@ -28,6 +28,7 @@
 #include "simple_http/core/logging.h"
 #include "simple_http/core/logging_json.h" // make_json_sink (glaze)
 #include "simple_http/core/mime.h"
+#include "simple_http/core/resolve.h" // ResolveFn (client + WS proxy DNS hook)
 #include "simple_http/core/static_table.h"
 #include "simple_http/core/types.h"
 #include "simple_http/core/url_encoding.h" // query_escape / path_escape (Go net/url)
