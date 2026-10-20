@@ -1,6 +1,6 @@
 -- add_rules("mode.debug", "mode.release")
 
-set_languages("c++23")
+set_languages("c++26")
 
 -- set_warnings("all", "error")
 
@@ -14,14 +14,13 @@ set_policy("package.librarydeps.strict_compatibility", true)
 -- HTTP/3 的 QUIC 与帧层来自 ngtcp2 + nghttp3（都是 C 库，只有 h3 路径用）。
 -- 上游 xmake-repo 的 ngtcp2 包是 `-DENABLE_OPENSSL=OFF` 构建的，不产 crypto
 -- helper——没有它就没有 TLS，QUIC 无从谈起。私有仓库里那份把它改成了
--- `-DENABLE_OPENSSL=ON`（openssl3 >= 3.5 才有上游 CMake 探测的
+-- `-DENABLE_OPENSSL=ON`（openssl4 >= 3.5 才有上游 CMake 探测的
 -- SSL_set_quic_tls_cbs，从而构建 libngtcp2_crypto_ossl），nghttp3 那份也在。
 -- 注意：这里不能用 /opt/h3/lib 的预编译库——那是对系统 OpenSSL 3.5.5 编的，
--- 而本仓库用的是 openssl3 3.6.3，混链是 ABI 风险。让 xmake 从源码构建。
+-- 而本仓库用的是 openssl4 3.6.3，混链是 ABI 风险。让 xmake 从源码构建。
 add_repositories("my_private_repo https://github.com/fantasy-peak/xmake-repo.git")
 add_requires("boost", {configs = {cmake = true, asio=true, regex=true}})
-add_requires("openssl3")
-add_requires("nghttp2 1.70.0")
+add_requires("openssl4", {system = false})
 add_requires("ngtcp2", "nghttp3")
 add_requires("catch2")  -- unit tests only (target `unittest`)
 add_requires("glaze")  -- OpenAPI schemas + JSON helpers; header-only, always compiled
@@ -43,10 +42,9 @@ target("simple_http")
     add_includedirs("include", { public = true })
     add_packages(
         "ngtcp2",
-        "nghttp2",
         "nghttp3",
         "boost",
-        "openssl3",
+        "openssl4",
         "glaze",
         -- Compression codecs are compiled in unconditionally, so zlib and
         -- brotli are normal public dependencies alongside boost.asio and
