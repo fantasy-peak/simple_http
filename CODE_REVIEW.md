@@ -219,7 +219,7 @@ h1/h2 每次读都刷新 idle deadline，没有“从首字节起算”的绝对
 
 | 套件 | 结果 |
 |---|---|
-| `xmake run unittest` | 307 test cases / 64438 assertions，全过 |
+| `xmake run unittest` | 308 test cases / 64447 assertions，全过 |
 | `xmake run regression` | 62 test cases / 337 assertions，全过 |
 | `xmake run client` | 177 checks，0 failed |
 | `xmake run python-tests` | 113 checks，0 failed |
@@ -247,6 +247,10 @@ h1/h2 每次读都刷新 idle deadline，没有“从首字节起算”的绝对
 结果：`test/stress/run.sh cpp --no-conformance h2` 首档回到 **169k req/s**（p99
 38ms），与基线同量级；剩余差异主要是多出的 Date 头本身的字节/HPACK 成本，属于
 RFC 9110 要求的固定开销。
+
+构建注意：当前 `set_languages("c++26")` + glaze 反射下 `xmake build client` 会报
+匿名命名空间类型无外部链接的错误（`glz::detail::external<...>`）。这与本次性能改动
+无关；`unittest` / `regression` / `server` / `python-tests` 均正常。
 
 
 ## 复现片段
