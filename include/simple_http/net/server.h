@@ -136,7 +136,7 @@ struct QuicListenerConfig {
     TlsConfig tls;
     std::size_t sockets{0}; // 0 = one per worker
     bool reuse_port{true};
-    std::size_t max_connections{0};
+    std::size_t max_connections{0}; // additional per-listener cap; 0 = none
     std::optional<EngineLimits> limits;
     quic::QuicEndpointConfig options;
     bool advertise_alt_svc{true};
@@ -213,14 +213,20 @@ struct ServerConfig {
     // Threads serving connections. Without reuse_port the pool also carries a
     // dedicated acceptor thread, so the process runs one more than this.
     unsigned worker_threads{4};
-    // Upper bound on simultaneously served connections; 0 (the default) means
-    // unlimited. Modelled on Go's netutil.LimitListener: when the limit is
-    // reached the acceptor stops calling async_accept, so the kernel's listen
-    // backlog holds new connections (bounded by the listen queue) instead of the
-    // server accepting and immediately closing them. A connection is counted
-    // from just before accept until its connection coroutine finishes. Reaching
-    // the limit is backpressure, not rejection — a client simply waits for the
-    // next free slot, exactly as it would for a busy worker.
+    // Upper bound on simultaneously served connections across every listener
+    // and transport; 0 (the default) means unlimited. Modelled on Go's
+    // netutil.LimitListener: when the limit is reached the acceptor stops
+    // calling async_accept, so the kernel's listen backlog holds new TCP
+    // connections (bounded by the listen queue) instead of the server accepting
+    // and immediately closing them. A connection is counted from just before
+    // accept until its connection coroutine finishes. Reaching the limit is
+    // backpressure, not rejection — a client simply waits for the next free
+    // slot, exactly as it would for a busy worker.
+    //
+    // QUIC has no accept backlog, so it applies the same budget differently: an
+    // Initial that would exceed it is dropped, and the client's PTO
+    // retransmission is admitted once a slot frees. A listener's own
+    // max_connections is an additional cap.
     std::size_t max_connections{0};
     // Fan the listener out to one acceptor per worker context, so each worker
     // accepts on its own thread: accept capacity scales with the pool and a
@@ -757,6 +763,9 @@ class Server {
         QuicListenerConfig cfg;
         EngineLimits limits;
         std::shared_ptr<quic::QuicTlsContext> tls;
+        // One per-listener budget shared by every endpoint of this runtime
+        // (SO_REUSEPORT fan-out must not multiply the listener's cap).
+        std::shared_ptr<std::atomic<std::size_t>> active;
         std::vector<std::shared_ptr<QuicEndpointType>> endpoints;
     };
 #endif
@@ -797,6 +806,39 @@ class Server {
                 }
             },
             address);
+    }
+
+    // Two TCP listeners cannot share an address, even with SO_REUSEPORT: the
+    // kernel would split connections between them, so a TLS client could land
+    // on the plaintext listener (and vice versa). This is an exact-address
+    // check; port 0 is excluded because each bind gets its own ephemeral port.
+    std::optional<ListenerFailure> validate_configs() const {
+        std::unordered_map<std::string, std::string> seen;
+        for (const auto &cfg : m_tcp_configs) {
+            std::string key;
+            if (const auto *inet = std::get_if<InetAddress>(&cfg.address)) {
+                if (inet->port == 0)
+                    continue;
+                key = "tcp:" + inet->host + ":" + std::to_string(inet->port);
+            } else {
+                key = "unix:" + std::get<UnixAddress>(cfg.address).path;
+            }
+            if (auto [it, inserted] = seen.emplace(key, cfg.name); !inserted) {
+                return ListenerFailure{cfg.name, make_error_code(server_errc::invalid_config)};
+            }
+        }
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+        std::unordered_map<std::string, std::string> seen_quic;
+        for (const auto &cfg : m_quic_configs) {
+            if (cfg.address.port == 0)
+                continue;
+            const std::string key = "udp:" + cfg.address.host + ":" + std::to_string(cfg.address.port);
+            if (auto [it, inserted] = seen_quic.emplace(key, cfg.name); !inserted) {
+                return ListenerFailure{cfg.name, make_error_code(server_errc::invalid_config)};
+            }
+        }
+#endif
+        return std::nullopt;
     }
 
     // Turns the two public config shapes (explicit `listeners`, or the
@@ -987,10 +1029,15 @@ class Server {
         return fallback;
     }
 
+    // Why a fan-out stopped short. "Unavailable" is the documented platform
+    // fallback (one acceptor still serves); "Failed" is a real bind error and
+    // must fail the listener rather than silently shrink its capacity.
+    enum class FanOut { Full, Unavailable, Failed };
+
     // Adds the remaining SO_REUSEPORT sockets for one listener, on the endpoint
     // the probe resolved. `first_new` is the index of the probe's entry.
-    bool fan_out(const TcpListenerConfig &cfg, const std::shared_ptr<ListenerMeta> &meta, const std::string &host,
-                 std::uint16_t port, bool v6_only, std::size_t first_new) {
+    FanOut fan_out(const TcpListenerConfig &cfg, const std::shared_ptr<ListenerMeta> &meta, const std::string &host,
+                   std::uint16_t port, bool v6_only, std::size_t first_new) {
         const std::size_t wanted = cfg.acceptors == 0 ? m_pool->size() : std::min(cfg.acceptors, m_pool->size());
         for (std::size_t i = 1; i < wanted; ++i) {
             auto &ctx = m_pool->at(i);
@@ -998,7 +1045,12 @@ class Server {
             auto acceptor = bind_acceptor(*ctx, cfg, host, port, v6_only, ec);
             if (!acceptor) {
                 SIMPLE_HTTP_ERROR_LOG("reuse_port bind({}:{}) [{}]: {}", host, port, i, ec.message());
-                while (m_acceptors.size() > first_new) {
+                // Unavailable is the platform fallback: keep the probe so the
+                // listener still serves single-acceptor. Anything else is a
+                // real failure and rolls the whole listener back, probe included.
+                const bool unavailable = ec == asio::error::operation_not_supported;
+                const std::size_t keep = first_new + (unavailable ? 1 : 0);
+                while (m_acceptors.size() > keep) {
                     const auto extra = m_acceptors.back().acceptor;
                     std::visit(
                         [](const auto &socket) {
@@ -1008,11 +1060,11 @@ class Server {
                         extra);
                     m_acceptors.pop_back();
                 }
-                return false;
+                return unavailable ? FanOut::Unavailable : FanOut::Failed;
             }
             m_acceptors.push_back(Listener{std::move(acceptor), ctx, meta});
         }
-        return true;
+        return FanOut::Full;
     }
 
     // Closes everything a failed start bound, without touching the pool: a
@@ -1084,6 +1136,9 @@ class Server {
     std::expected<StartReport, StartupError> start_listeners(StartPolicy policy) {
         if (m_configs_dirty)
             normalize_configs();
+        if (auto invalid = validate_configs()) {
+            return std::unexpected{StartupError{{*invalid}}};
+        }
         StartReport report;
         std::vector<ListenerFailure> failures;
         // The plans stay in m_tcp_configs/m_quic_configs: start_tcp_listener
@@ -1172,8 +1227,17 @@ class Server {
                     auto ctx = meta->cfg.reuse_port ? m_pool->at(0) : m_pool->main_context();
                     m_acceptors.push_back(Listener{acceptor, ctx, meta});
                     if (meta->cfg.reuse_port) {
-                        meta->partitioned =
+                        const auto fan =
                             fan_out(meta->cfg, meta, host, port, address.v6 && is_ipv6_host(host), first_new);
+                        if (fan == FanOut::Failed) {
+                            // A real bind error (fd exhaustion, ...), not the
+                            // platform fallback: report it instead of silently
+                            // serving with reduced accept capacity. fan_out has
+                            // already closed and removed every socket this
+                            // listener bound, including the probe.
+                            return server_errc::bind_failed;
+                        }
+                        meta->partitioned = fan == FanOut::Full;
                         if (!meta->partitioned) {
                             SIMPLE_HTTP_INFO_LOG("SO_REUSEPORT unavailable; serving {}:{} with a single acceptor", host,
                                                  port);
@@ -1229,13 +1293,19 @@ class Server {
             return server_errc::invalid_config;
         }
         const asio::ip::udp::endpoint endpoint{addr, rt->cfg.address.port};
+        rt->active = std::make_shared<std::atomic<std::size_t>>(0);
+        auto endpoint_config = rt->cfg.options;
+        endpoint_config.max_connections = rt->cfg.max_connections;
+        endpoint_config.global_max_connections = m_config.max_connections;
+        endpoint_config.active = rt->active;
+        endpoint_config.global_active = m_active_connections;
         const std::size_t sockets =
             rt->cfg.reuse_port ? (rt->cfg.sockets == 0 ? m_pool->size() : std::min(rt->cfg.sockets, m_pool->size()))
                                : 1;
         for (std::size_t i = 0; i < sockets; ++i) {
             const auto &ctx = rt->cfg.reuse_port ? m_pool->at(i) : m_pool->main_context();
             auto quic = std::make_shared<QuicEndpointType>(ctx->get_executor(), rt->tls->native_handle(),
-                                                           rt->cfg.options, make_h3_serve(rt->limits));
+                                                           endpoint_config, make_h3_serve(rt->limits));
             if (!quic->open(endpoint, rt->cfg.reuse_port, ec)) {
                 SIMPLE_HTTP_ERROR_LOG("QUIC bind({}:{}) [{}]: {}", rt->cfg.address.host, rt->cfg.address.port, i,
                                       ec.message());
@@ -1493,12 +1563,13 @@ class Server {
                 auto live = track_connection(ctx_ptr, [transport] { transport->close(); });
                 // The handler is not `detached`: it holds the registry handle, so
                 // the entry lives exactly as long as the connection does.
-                asio::co_spawn(
-                    ctx, serve_tls(transport, dispatch, ws_lookup, meta->limits, ws_proxy_lookup, ws_regex_lookup),
-                    [this, live, meta](std::exception_ptr) {
-                        meta->active.fetch_sub(1, std::memory_order_acq_rel);
-                        meta->global_active->fetch_sub(1, std::memory_order_acq_rel);
-                    });
+                asio::co_spawn(ctx,
+                               serve_tls(transport, dispatch, ws_lookup, meta->limits, ws_proxy_lookup, ws_regex_lookup,
+                                         meta->cfg.alpn == TlsHttp::Http2Only),
+                               [this, live, meta](std::exception_ptr) {
+                                   meta->active.fetch_sub(1, std::memory_order_acq_rel);
+                                   meta->global_active->fetch_sub(1, std::memory_order_acq_rel);
+                               });
             } else {
                 auto sock_ptr = std::make_shared<Socket>(std::move(socket));
                 auto transport = std::make_shared<TcpTransport<Socket>>(std::move(sock_ptr), peer);

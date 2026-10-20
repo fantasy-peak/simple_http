@@ -140,10 +140,16 @@ serve_plaintext(std::shared_ptr<Transport> transport, Dispatcher dispatch, WsLoo
 }
 
 // Serve a TLS transport: handshake, then ALPN selects the engine.
+//
+// `require_h2` enforces a TlsHttp::Http2Only listener. ALPN is advisory unless
+// the server makes it binding: with no overlap SSL_select_next_proto returns
+// NOACK, which is a successful handshake with an empty protocol, and the old
+// dispatch then treated that as HTTP/1.1. An h2-only listener must not do that.
 template <typename TlsTransportT>
 inline asio::awaitable<void> serve_tls(std::shared_ptr<TlsTransportT> transport, Dispatcher dispatch,
                                        WsLookup ws_lookup = {}, EngineLimits limits = {},
-                                       WsProxyLookup ws_proxy_lookup = {}, WsLookup ws_regex_lookup = {}) {
+                                       WsProxyLookup ws_proxy_lookup = {}, WsLookup ws_regex_lookup = {},
+                                       bool require_h2 = false) {
     using namespace asio::experimental::awaitable_operators;
 
     // The handshake is bounded for exactly the reason the plaintext detection
@@ -173,6 +179,11 @@ inline asio::awaitable<void> serve_tls(std::shared_ptr<TlsTransportT> transport,
         const auto peer = transport->peer();
         SIMPLE_HTTP_ERROR_LOG("TLS handshake failed from {}:{}: {}", address_string(peer.address()), peer.port(),
                               ec.message());
+        transport->close();
+        co_return;
+    }
+    if (require_h2 && transport->alpn_selected() != "h2") {
+        SIMPLE_HTTP_ERROR_LOG("TLS listener is h2-only but ALPN negotiated '{}'; closing", transport->alpn_selected());
         transport->close();
         co_return;
     }

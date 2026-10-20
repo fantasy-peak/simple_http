@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <boost/asio.hpp>
 #include <cerrno>
 #include <chrono>
@@ -126,6 +127,20 @@ struct QuicEndpointConfig {
     // The versions we will speak, advertised in Version Negotiation and offered
     // to ngtcp2.
     std::vector<std::uint32_t> supported_versions{kQuicVersion1};
+
+    // Connection admission, mirroring the TCP listener. Both counters are
+    // shared across every endpoint that belongs to the same listener/server,
+    // so SO_REUSEPORT fan-out does not multiply the budget. 0 means "no cap".
+    //
+    // QUIC has no accept queue to leave connections in: when an Initial
+    // arrives while saturated it is dropped. The client's PTO retransmission
+    // is admitted as soon as a slot frees, which is the transport's natural
+    // backpressure. Both pointers are optional; when absent, admission is
+    // unlimited and connections are not counted.
+    std::size_t max_connections{0};        // this listener's own cap
+    std::size_t global_max_connections{0}; // ServerConfig::max_connections
+    std::shared_ptr<std::atomic<std::size_t>> active;
+    std::shared_ptr<std::atomic<std::size_t>> global_active;
 };
 
 template <typename Executor> class QuicEndpoint {
@@ -398,10 +413,19 @@ template <typename Executor> class QuicEndpoint {
         if (local_ec)
             local = asio::ip::udp::endpoint{};
 
+        // The Initial is well-formed and all stateless work is done: only now
+        // does accepting it allocate connection state, so this is the point the
+        // cap has to gate.
+        if (!try_acquire_connection()) {
+            SIMPLE_HTTP_DEBUG_LOG("quic: connection limit reached; dropping Initial");
+            return;
+        }
+
         auto conn = std::make_shared<Connection>(m_executor, m_ssl_ctx, m_config.connection, bootstrap,
                                                  m_config.supported_versions, local, remote,
                                                  [self](SendItem &&item) { self->queue_datagram(std::move(item)); });
         if (conn->init_failed()) {
+            release_connection();
             SIMPLE_HTTP_ERROR_LOG("quic: could not set up TLS for a new connection");
             return;
         }
@@ -415,6 +439,7 @@ template <typename Executor> class QuicEndpoint {
             [self](std::span<const std::uint8_t> cid) { self->dissociate_cid(cid); });
 
         if (!conn->init()) {
+            release_connection();
             SIMPLE_HTTP_ERROR_LOG("quic: ngtcp2 could not create a connection");
             return;
         }
@@ -437,7 +462,42 @@ template <typename Executor> class QuicEndpoint {
         // Its IDs are dead with it: nothing can route to this connection again,
         // and the weak entries would otherwise outlive it by the process.
         forget_cids(conn.get());
+        release_connection();
         co_return;
+    }
+
+    // --- connection admission ---------------------------------------------
+    //
+    // Mirrors the TCP accept loop: the server-wide budget and this listener's
+    // own budget are checked against counters shared by every endpoint of the
+    // same runtime. An Initial over the limit is dropped (no connection state,
+    // no handshake) and the client retries on PTO.
+    bool try_acquire_connection() {
+        const auto &listener = m_config.active;
+        const auto &global = m_config.global_active;
+        if (!listener || !global)
+            return true; // standalone endpoint: no budget configured
+        for (;;) {
+            std::size_t current = global->load(std::memory_order_acquire);
+            if (m_config.global_max_connections != 0 && current >= m_config.global_max_connections)
+                return false;
+            if (global->compare_exchange_weak(current, current + 1, std::memory_order_acq_rel))
+                break;
+        }
+        const std::size_t here = listener->fetch_add(1, std::memory_order_acq_rel);
+        if (m_config.max_connections != 0 && here >= m_config.max_connections) {
+            listener->fetch_sub(1, std::memory_order_acq_rel);
+            global->fetch_sub(1, std::memory_order_acq_rel);
+            return false;
+        }
+        return true;
+    }
+
+    void release_connection() {
+        if (!m_config.active || !m_config.global_active)
+            return;
+        m_config.active->fetch_sub(1, std::memory_order_acq_rel);
+        m_config.global_active->fetch_sub(1, std::memory_order_acq_rel);
     }
 
     // --- CID table ---------------------------------------------------------

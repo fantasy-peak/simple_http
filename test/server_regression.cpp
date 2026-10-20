@@ -2349,3 +2349,60 @@ TEST_CASE("regression/server: a QUIC listener can opt out of Alt-Svc", "[regress
     CHECK_FALSE(head_value(response, "alt-svc").has_value());
     server.stop();
 }
+
+TEST_CASE("regression/server: an h2-only TLS listener refuses a non-h2 client", "[regression][server][tls]") {
+    constexpr std::uint16_t port = 27971;
+    sh::ServerConfig cfg;
+    cfg.worker_threads = 1;
+    sh::TcpListenerConfig listener;
+    listener.address = sh::InetAddress{"127.0.0.1", port, false};
+    listener.reuse_port = false;
+    listener.tls = test_tls_config();
+    listener.alpn = sh::TlsHttp::Http2Only;
+    cfg.listeners = {listener};
+    sh::Server server{cfg};
+    server.route({sh::Method::Get}, "/world", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(200).send("hello");
+    });
+    REQUIRE(server.start());
+
+    // Offering h2 selects h2, as the policy says.
+    CHECK(negotiated_alpn(port, {"h2"}) == "h2");
+
+    // Offering only http/1.1 negotiates nothing. An h2-only listener must not
+    // quietly fall back to serving HTTP/1.1.
+    const auto response =
+        tls_http_get(port, "GET /world HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", {"http/1.1"});
+    INFO("response: " << printable(response));
+    CHECK(response.find("hello") == std::string::npos);
+    server.stop();
+}
+
+TEST_CASE("regression/server: a real fan-out bind failure fails start()", "[regression][server]") {
+    constexpr std::uint16_t port = 27972;
+    sh::ServerConfig cfg;
+    cfg.listen = sh::InetAddress{"127.0.0.1", port, false};
+    cfg.worker_threads = 4;
+    cfg.reuse_port = true;
+    // The hook runs per acceptor, after bind and before listen. Breaking the
+    // second socket makes the fan-out fail for a real reason (not "SO_REUSEPORT
+    // unavailable"), which must fail the listener rather than report success
+    // with zero or reduced accept capacity.
+    std::atomic<int> calls{0};
+    cfg.listener_setup = [&](asio::ip::tcp::acceptor &acceptor) {
+        if (calls.fetch_add(1) >= 1) {
+            sh::error_code ec;
+            acceptor.close(ec);
+        }
+    };
+    sh::Server server{cfg};
+    server.route({sh::Method::Get}, "/hello", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(200).send("hello");
+    });
+    const auto started = server.start();
+    INFO("acceptor hook calls: " << calls.load());
+    REQUIRE_FALSE(started);
+    REQUIRE(started.error().failures.size() == 1);
+    CHECK(started.error().failures[0].error == sh::make_error_code(sh::server_errc::bind_failed));
+    server.stop();
+}
