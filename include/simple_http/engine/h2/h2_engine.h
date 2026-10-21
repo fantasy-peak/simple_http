@@ -2269,7 +2269,8 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         auto connected = co_await detail::ws_proxy_connect(m_executor, target);
         if (!connected) {
             const error_code ec = connected.error();
-            SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy connect {}:{} failed: {}", target.host, target.port, ec.message());
+            SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy connect {}:{} failed (client {}): {}", target.host, target.port,
+                                  address_string(peer.address()), ec.message());
             co_await fail(502);
             co_return false;
         }
@@ -2296,7 +2297,8 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         // proxy must not rely on its caller before splicing this into a request
         // line (the same guard the h1 proxy applies).
         if (contains_ctl(replay_target)) {
-            SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy: refusing a request target with CR/LF/NUL");
+            SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy: refusing a request target with CR/LF/NUL (client {})",
+                                  address_string(peer.address()));
             close_backend();
             co_await fail(400);
             co_return false;
@@ -2312,7 +2314,8 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                                                        asio::as_tuple(asio::use_awaitable));
             (void)w;
             if (wec) {
-                SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy backend handshake write failed: {}", wec.message());
+                SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy backend handshake write failed (client {}): {}",
+                                      address_string(peer.address()), wec.message());
                 close_backend();
                 co_await fail(502);
                 co_return false;
@@ -2321,7 +2324,8 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
 
         auto reply = co_await detail::ws_proxy_read_reply(*backend, m_limits.max_header_bytes, target.connect_timeout);
         if (!reply) {
-            SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy backend handshake failed: {}", reply.error().message());
+            SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy backend handshake failed (client {}): {}",
+                                  address_string(peer.address()), reply.error().message());
             close_backend();
             co_await fail(502);
             co_return false;
@@ -2340,14 +2344,16 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                     continue;
                 response_headers.add_lower(name, value);
             }
-            SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy backend refused the upgrade with {}", reply->head.status);
+            SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy backend refused the upgrade with {} (client {})", reply->head.status,
+                                  address_string(peer.address()));
             close_backend();
             co_await fail(reply->head.status, std::move(response_headers));
             co_return false;
         }
 
         if (!detail::ws_validate_101(reply->head, ws_accept_key(key))) {
-            SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy backend answered 101 with a mismatched Upgrade/accept");
+            SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy backend answered 101 with a mismatched Upgrade/accept (client {})",
+                                  address_string(peer.address()));
             close_backend();
             co_await fail(502);
             co_return false;

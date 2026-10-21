@@ -112,7 +112,8 @@ run_ws_proxy(std::shared_ptr<Transport> client, const ParsedHead &head, std::str
     auto connected = co_await detail::ws_proxy_connect(executor, target);
     if (!connected) {
         const error_code ec = connected.error();
-        SIMPLE_HTTP_ERROR_LOG("ws-proxy connect {}:{} failed: {}", target.host, target.port, ec.message());
+        SIMPLE_HTTP_ERROR_LOG("ws-proxy connect {}:{} failed (client {}): {}", target.host, target.port,
+                              address_string(client->peer().address()), ec.message());
         co_await ws_proxy_fail(client, 502);
         co_return false;
     }
@@ -138,7 +139,8 @@ run_ws_proxy(std::shared_ptr<Transport> client, const ParsedHead &head, std::str
     // target, but a proxy must not rely on its caller. Anything here would be
     // spliced verbatim into the backend's request line.
     if (contains_ctl(replay_target)) {
-        SIMPLE_HTTP_ERROR_LOG("ws-proxy: refusing a request target with CR/LF/NUL");
+        SIMPLE_HTTP_ERROR_LOG("ws-proxy: refusing a request target with CR/LF/NUL (client {})",
+                              address_string(client->peer().address()));
         close_backend();
         co_await ws_proxy_fail(client, status::bad_request);
         co_return false;
@@ -163,7 +165,8 @@ run_ws_proxy(std::shared_ptr<Transport> client, const ParsedHead &head, std::str
                                                   asio::as_tuple(asio::use_awaitable));
         (void)n;
         if (ec) {
-            SIMPLE_HTTP_ERROR_LOG("ws-proxy write preamble failed: {}", ec.message());
+            SIMPLE_HTTP_ERROR_LOG("ws-proxy write preamble failed (client {}): {}",
+                                  address_string(client->peer().address()), ec.message());
             close_backend();
             co_await ws_proxy_fail(client, 502);
             co_return false;
@@ -172,7 +175,8 @@ run_ws_proxy(std::shared_ptr<Transport> client, const ParsedHead &head, std::str
 
     auto reply = co_await detail::ws_proxy_read_reply(*backend, max_header_bytes, target.connect_timeout);
     if (!reply) {
-        SIMPLE_HTTP_ERROR_LOG("ws-proxy backend handshake failed: {}", reply.error().message());
+        SIMPLE_HTTP_ERROR_LOG("ws-proxy backend handshake failed (client {}): {}",
+                              address_string(client->peer().address()), reply.error().message());
         close_backend();
         co_await ws_proxy_fail(client, 502);
         co_return false;
@@ -197,7 +201,8 @@ run_ws_proxy(std::shared_ptr<Transport> client, const ParsedHead &head, std::str
     }
 
     if (!detail::ws_validate_101(reply->head, ws_accept_key(key))) {
-        SIMPLE_HTTP_ERROR_LOG("ws-proxy backend answered 101 with a mismatched Upgrade/accept");
+        SIMPLE_HTTP_ERROR_LOG("ws-proxy backend answered 101 with a mismatched Upgrade/accept (client {})",
+                              address_string(client->peer().address()));
         close_backend();
         co_await ws_proxy_fail(client, 502);
         co_return false;
@@ -283,8 +288,9 @@ run_ws_proxy(std::shared_ptr<Transport> client, const ParsedHead &head, std::str
     auto idle_check = [&]() -> asio::awaitable<void> {
         for (;;) {
             if (std::chrono::steady_clock::now() >= deadline) {
-                SIMPLE_HTTP_ERROR_LOG("ws-proxy tunnel idle for {}s; closing",
-                                      std::chrono::duration_cast<std::chrono::seconds>(idle_timeout).count());
+                SIMPLE_HTTP_ERROR_LOG("ws-proxy tunnel idle for {}s (client {}); closing",
+                                      std::chrono::duration_cast<std::chrono::seconds>(idle_timeout).count(),
+                                      address_string(client->peer().address()));
                 co_return;
             }
             asio::steady_timer timer{executor};
