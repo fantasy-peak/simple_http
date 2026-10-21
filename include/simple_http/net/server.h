@@ -624,22 +624,12 @@ class Server {
                 // That loop is already gone, so no handler can be running there:
                 // closing from this thread is safe, and a posted close would
                 // never execute at all.
-                std::visit(
-                    [](const auto &socket) {
-                        error_code ec;
-                        socket->close(ec);
-                    },
-                    acceptor);
+                close_acceptor(acceptor);
                 mark_done();
                 continue;
             }
             asio::post(*listener.ctx, [acceptor, mark_done] {
-                std::visit(
-                    [](const auto &socket) {
-                        error_code ec;
-                        socket->close(ec);
-                    },
-                    acceptor);
+                close_acceptor(acceptor);
                 mark_done();
             });
         }
@@ -777,6 +767,17 @@ class Server {
     // std::visit over it still compiles.
     using AnyAcceptor =
         std::variant<std::shared_ptr<asio::ip::tcp::acceptor>, std::shared_ptr<asio::local::stream_protocol::acceptor>>;
+
+    // Best-effort close of whichever acceptor family is held. Every teardown
+    // path goes through this so the two socket types are spelled once.
+    static void close_acceptor(const AnyAcceptor &acceptor) {
+        std::visit(
+            [](const auto &socket) {
+                error_code ec;
+                socket->close(ec);
+            },
+            acceptor);
+    }
 
     // Everything an accept loop needs that is not the socket itself: the
     // resolved TLS context (null = plaintext), the protocol policy, the limits,
@@ -1105,12 +1106,7 @@ class Server {
                 const std::size_t keep = first_new + (unavailable ? 1 : 0);
                 while (m_acceptors.size() > keep) {
                     const auto extra = m_acceptors.back().acceptor;
-                    std::visit(
-                        [](const auto &socket) {
-                            error_code ignored;
-                            socket->close(ignored);
-                        },
-                        extra);
+                    close_acceptor(extra);
                     m_acceptors.pop_back();
                 }
                 return unavailable ? FanOut::Unavailable : FanOut::Failed;
@@ -1126,21 +1122,9 @@ class Server {
         for (auto &listener : m_acceptors) {
             if (!listener.ctx->stopped()) {
                 auto acceptor = listener.acceptor;
-                asio::post(*listener.ctx, [acceptor] {
-                    std::visit(
-                        [](const auto &socket) {
-                            error_code ec;
-                            socket->close(ec);
-                        },
-                        acceptor);
-                });
+                asio::post(*listener.ctx, [acceptor] { close_acceptor(acceptor); });
             } else {
-                std::visit(
-                    [](const auto &socket) {
-                        error_code ec;
-                        socket->close(ec);
-                    },
-                    listener.acceptor);
+                close_acceptor(listener.acceptor);
             }
         }
         m_acceptors.clear();

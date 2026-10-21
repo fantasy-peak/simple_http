@@ -428,33 +428,6 @@ inline Middleware redirect_slashes() {
     };
 }
 
-namespace middleware_detail {
-
-// Case-insensitive substring test (the upgrade header is `Upgrade: websocket`
-// or `WebSocket`, both common).
-inline bool contains_ci(std::string_view haystack, std::string_view needle) {
-    if (needle.size() > haystack.size()) {
-        return false;
-    }
-    for (std::size_t i = 0; i + needle.size() <= haystack.size(); ++i) {
-        bool match = true;
-        for (std::size_t j = 0; j < needle.size(); ++j) {
-            const char a = haystack[i + j];
-            const char b = needle[j];
-            if (a != b && ascii_lower(a) != ascii_lower(b)) {
-                match = false;
-                break;
-            }
-        }
-        if (match) {
-            return true;
-        }
-    }
-    return false;
-}
-
-} // namespace middleware_detail
-
 // Rejects WebSocket upgrades whose Origin is not on the allow list — the
 // Cross-Site WebSocket Hijacking defense (RFC 6455 §1.3 / OWASP). Only upgrade
 // handshakes are in scope; every other request passes through untouched, so the
@@ -474,8 +447,8 @@ inline Middleware ws_origin(std::vector<std::string> allowed_origins, bool allow
         // A WebSocket handshake is either an HTTP/1.1 Upgrade (Upgrade +
         // Sec-WebSocket-Key) or an HTTP/2 RFC 8441 extended CONNECT (no Upgrade
         // header at all, so the method is the marker).
-        const bool is_h1_ws = upgrade && middleware_detail::contains_ci(*upgrade, "websocket") &&
-                              req->header("sec-websocket-key").has_value();
+        const bool is_h1_ws =
+            upgrade && icontains_ci(*upgrade, "websocket") && req->header("sec-websocket-key").has_value();
         const bool is_h2_ws = req->method() == Method::Connect;
         if (!is_h1_ws && !is_h2_ws) {
             co_await next(std::move(req), std::move(res), ssl);
@@ -551,9 +524,9 @@ inline Middleware timeout(std::chrono::milliseconds deadline) {
         // WebSocket (h1 Upgrade, or the h2 RFC 8441 extended CONNECT): out of
         // scope — a tunnel has no "one request" deadline.
         const auto upgrade = req->header(field::upgrade);
-        const bool ws = (upgrade && middleware_detail::contains_ci(*upgrade, "websocket") &&
-                         req->header("sec-websocket-key").has_value()) ||
-                        req->method() == Method::Connect;
+        const bool ws =
+            (upgrade && icontains_ci(*upgrade, "websocket") && req->header("sec-websocket-key").has_value()) ||
+            req->method() == Method::Connect;
         if (ws) {
             co_await next(std::move(req), std::move(res), ssl);
             co_return;

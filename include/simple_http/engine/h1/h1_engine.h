@@ -89,9 +89,7 @@ template <TransportLike Transport> class Http1ResponseSink : public ResponseSink
             // Neither a body nor a Content-Length (RFC 9110 §15.3.5/§15.4.5).
             co_return co_await send_bodyless(status, std::move(headers));
         }
-        if (!headers.contains("date")) {
-            headers.add_lower("date", std::string{http_date_now()});
-        }
+        ensure_date(headers);
 
         // Erase first: add_lower appends, so a handler that set its own
         // content-length would otherwise put two conflicting ones on the wire —
@@ -126,9 +124,7 @@ template <TransportLike Transport> class Http1ResponseSink : public ResponseSink
         co_await hop();
         if (!m_open)
             co_return make_error_code(asio::error::not_connected);
-        if (!headers.contains("date")) {
-            headers.add_lower("date", std::string{http_date_now()});
-        }
+        ensure_date(headers);
         std::string out;
         out.reserve(kResponseOverhead + headers_bytes_with_alt_svc(headers));
         append_status_line(out, status);
@@ -154,9 +150,7 @@ template <TransportLike Transport> class Http1ResponseSink : public ResponseSink
         co_await hop();
         if (!m_open)
             co_return make_error_code(asio::error::not_connected);
-        if (!headers.contains("date")) {
-            headers.add_lower("date", std::string{http_date_now()});
-        }
+        ensure_date(headers);
 
         // A streamed response is chunked (HTTP/1.1) or close-delimited
         // (HTTP/1.0 / HEAD): a handler-supplied Content-Length must not survive
@@ -590,10 +584,7 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
                 if (m_ws_proxy_lookup) {
                     if (auto target = m_ws_proxy_lookup(ws_path)) {
                         m_upgraded = true; // stop the watchdog from closing the transport
-                        const auto peer = m_transport->peer();
-                        std::string peer_address;
-                        if (!peer.address().is_unspecified())
-                            peer_address = address_string(peer.address());
+                        std::string peer_address = address_string_if_specified(m_transport->peer().address());
                         co_await run_ws_proxy(m_transport, head, std::string{parser.remainder()}, std::move(*target),
                                               m_limits.idle_timeout, m_limits.max_header_bytes, std::move(peer_address),
                                               m_transport->tls_handle().has_value());
@@ -882,37 +873,6 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
             return NumParse::Invalid;
         out = v;
         return NumParse::Ok;
-    }
-
-    static std::string_view trim_ows(std::string_view s) {
-        while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) {
-            s.remove_prefix(1);
-        }
-        while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) {
-            s.remove_suffix(1);
-        }
-        return s;
-    }
-
-    // Exact, case-insensitive token match over every occurrence of `name`.
-    // `Connection` and `Upgrade` are comma-separated token lists, not opaque
-    // strings: substring matching made "not-close" close the connection and
-    // "xkeep-alive" keep an HTTP/1.0 one open.
-    static bool header_has_token(const Headers &headers, std::string_view name, std::string_view token) {
-        for (auto value : headers.get_all(name)) {
-            while (true) {
-                const std::size_t comma = value.find(',');
-                const std::string_view part = trim_ows(value.substr(0, comma));
-                if (iequals_ci(part, token)) {
-                    return true;
-                }
-                if (comma == std::string_view::npos) {
-                    break;
-                }
-                value.remove_prefix(comma + 1);
-            }
-        }
-        return false;
     }
 
     static bool connection_keep_alive(const ParsedHead &head, Version version) {

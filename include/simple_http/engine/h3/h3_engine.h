@@ -114,9 +114,7 @@ template <typename Connection> class Http3ResponseSink : public ResponseSink {
         if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
             co_return make_error_code(asio::error::not_connected);
         }
-        if (!headers.contains("date")) {
-            headers.add_lower("date", std::string{http_date_now()});
-        }
+        ensure_date(headers);
         // A response to HEAD has no body: the HEADERS frame ends the stream, and
         // the headers still carry the Content-Length a GET would have produced.
         const bool head = eng->method_is_head(m_stream_id);
@@ -133,9 +131,7 @@ template <typename Connection> class Http3ResponseSink : public ResponseSink {
         if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
             co_return make_error_code(asio::error::not_connected);
         }
-        if (!headers.contains("date")) {
-            headers.add_lower("date", std::string{http_date_now()});
-        }
+        ensure_date(headers);
         // No DATA frame follows, not even an empty one: the FIN that ends the
         // HEADERS frame is what tells the client the message is over (§4.1).
         eng->begin_response(m_stream_id, status, headers, /*end_stream=*/true,
@@ -149,9 +145,7 @@ template <typename Connection> class Http3ResponseSink : public ResponseSink {
         if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
             co_return make_error_code(asio::error::not_connected);
         }
-        if (!headers.contains("date")) {
-            headers.add_lower("date", std::string{http_date_now()});
-        }
+        ensure_date(headers);
         const bool head = eng->method_is_head(m_stream_id);
         // The body may follow, so the reader is installed even though nothing is
         // queued yet: an absent reader means "this response has no body at all",
@@ -1219,10 +1213,8 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         }
     }
 
-    static bool is_connection_specific_field(std::string_view name) noexcept {
-        return name == "connection" || name == "keep-alive" || name == "proxy-connection" ||
-               name == "transfer-encoding" || name == "upgrade";
-    }
+    // RFC 9114 §4.2 prohibits the same connection-specific fields HTTP/2 does;
+    // the predicate is core/http_field.h's, shared with the h2 engine.
 
     // --- members (touched only on the connection executor) ---
     std::shared_ptr<Connection> m_conn;

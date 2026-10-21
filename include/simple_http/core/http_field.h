@@ -10,6 +10,8 @@
 
 #include <string_view>
 
+#include "types.h" // iequals_ci
+
 namespace simple_http {
 
 namespace field {
@@ -75,6 +77,65 @@ inline constexpr std::string_view x_request_id = "x-request-id";
 inline constexpr std::string_view x_xss_protection = "x-xss-protection";
 
 } // namespace field
+
+// RFC 9110 §5.6.3: optional whitespace (SP / HTAB) around a field value or a
+// list element. Every parser and header utility trims the same two bytes.
+inline std::string_view trim_ows(std::string_view s) noexcept {
+    while (!s.empty() && (s.front() == ' ' || s.front() == '\t'))
+        s.remove_prefix(1);
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\t'))
+        s.remove_suffix(1);
+    return s;
+}
+
+// Whether a comma-separated field value contains `token`. The comparison is
+// case-insensitive and each element is OWS-trimmed: `Connection`, `Upgrade`,
+// `Vary` and `Cache-Control` are token lists, where a substring test would make
+// "not-close" close a connection.
+inline bool value_has_token(std::string_view value, std::string_view token) noexcept {
+    std::size_t pos = 0;
+    for (;;) {
+        const std::size_t comma = value.find(',', pos);
+        const std::string_view item =
+            trim_ows(value.substr(pos, comma == std::string_view::npos ? std::string_view::npos : comma - pos));
+        if (iequals_ci(item, token))
+            return true;
+        if (comma == std::string_view::npos)
+            return false;
+        pos = comma + 1;
+    }
+}
+
+// Hop-by-hop fields that must not be forwarded (RFC 9110 §7.6.1), plus the
+// h2c upgrade's `http2-settings` (RFC 7540 §3.2.2.2). Field names are expected
+// lowercased, which is how Headers stores them.
+[[nodiscard]] inline bool is_hop_by_hop_field(std::string_view name) noexcept {
+    static constexpr std::string_view kHop[] = {
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "http2-settings",
+    };
+    for (auto h : kHop) {
+        if (name == h)
+            return true;
+    }
+    return false;
+}
+
+// HTTP/1.1 connection-specific fields, prohibited in HTTP/2 (RFC 9113 §8.2.2)
+// and HTTP/3 (RFC 9114 §4.2). Kept separate from is_hop_by_hop_field: this is
+// the narrower validator set, and it excludes proxy-authenticate/trailer.
+[[nodiscard]] inline bool is_connection_specific_field(std::string_view name) noexcept {
+    return name == field::connection || name == "keep-alive" || name == "proxy-connection" ||
+           name == field::transfer_encoding || name == field::upgrade;
+}
 
 // Whether a field must be kept out of a trailer section (RFC 9110 §6.5.1): a
 // pseudo-header, a field needed for framing (Content-Length, Transfer-Encoding)

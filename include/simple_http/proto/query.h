@@ -21,6 +21,8 @@
 #include <utility>
 #include <vector>
 
+#include "../core/types.h" // hex_digit_value
+
 namespace simple_http {
 
 // Parsed parameters, kept in appearance order. Values are decoded and owned; a
@@ -97,8 +99,8 @@ class QueryParams {
                 continue;
             }
             if (c == '%' && i + 2 < s.size()) {
-                const int hi = hex(s[i + 1]);
-                const int lo = hex(s[i + 2]);
+                const int hi = hex_digit_value(s[i + 1]);
+                const int lo = hex_digit_value(s[i + 2]);
                 if (hi >= 0 && lo >= 0) {
                     out.push_back(static_cast<char>((hi << 4) | lo));
                     i += 2;
@@ -108,19 +110,6 @@ class QueryParams {
             out.push_back(c);
         }
         return out;
-    }
-
-    static int hex(char c) noexcept {
-        if (c >= '0' && c <= '9') {
-            return c - '0';
-        }
-        if (c >= 'a' && c <= 'f') {
-            return c - 'a' + 10;
-        }
-        if (c >= 'A' && c <= 'F') {
-            return c - 'A' + 10;
-        }
-        return -1;
     }
 
     std::vector<Item> m_items;

@@ -179,12 +179,19 @@ inline std::string_view content_encoding_of(const StaticEntry &entry, const Stat
     return {};
 }
 
-// Hash and equality that accept string_view, so a lookup never has to build a
-// std::string key. Same technique as handler/router.h.
-struct StringHash {
-    using is_transparent = void;
-    std::size_t operator()(std::string_view sv) const noexcept { return std::hash<std::string_view>{}(sv); }
-};
+// Reads exactly `size` bytes, or reports failure. Both the preloader and the
+// on-demand path need the same "short read is not a body" rule.
+inline std::optional<std::string> read_file_exact(const std::string &path, std::uint64_t size) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+        return std::nullopt;
+    std::string out;
+    out.resize(static_cast<std::size_t>(size));
+    in.read(out.data(), static_cast<std::streamsize>(size));
+    if (in.gcount() != static_cast<std::streamsize>(size))
+        return std::nullopt;
+    return out;
+}
 
 } // namespace detail
 
@@ -250,7 +257,7 @@ class StaticTable {
     // worker thread reads it concurrently; nothing mutates it, so no lock is
     // needed — and none may be added without also revisiting the serving half,
     // which deliberately holds no lock across any co_await.
-    std::unordered_map<std::string, EntryPtr, detail::StringHash, std::equal_to<>> m_table;
+    std::unordered_map<std::string, EntryPtr, StringHash, std::equal_to<>> m_table;
 
     EntryPtr m_not_found;
 
@@ -345,17 +352,11 @@ inline bool StaticTable::load(std::string &error) {
         rep.etag = make_etag(mtime_s, rep.size, suffix);
 
         if (rep.size <= m_preload_max && rep.size <= budget) {
-            std::ifstream in(rep.disk_path, std::ios::binary);
-            if (in) {
-                auto buf = std::make_shared<std::string>();
-                buf->resize(static_cast<std::size_t>(rep.size));
-                in.read(buf->data(), static_cast<std::streamsize>(rep.size));
-                if (in.gcount() == static_cast<std::streamsize>(rep.size)) {
-                    rep.body = std::move(buf);
-                    budget -= rep.size;
-                    ++m_stats.preloaded;
-                    m_stats.preloaded_bytes += rep.size;
-                }
+            if (auto body = detail::read_file_exact(rep.disk_path, rep.size)) {
+                rep.body = std::make_shared<std::string>(std::move(*body));
+                budget -= rep.size;
+                ++m_stats.preloaded;
+                m_stats.preloaded_bytes += rep.size;
             }
         }
         return rep;
@@ -487,15 +488,7 @@ inline std::string StaticTable::cache_control_for(const StaticEntry &entry) cons
 inline std::optional<std::string> StaticTable::read_body(const StaticRepresentation &rep) const {
     if (rep.body)
         return *rep.body; // preloaded: copy only
-    std::ifstream in(rep.disk_path, std::ios::binary);
-    if (!in)
-        return std::nullopt;
-    std::string out;
-    out.resize(static_cast<std::size_t>(rep.size));
-    in.read(out.data(), static_cast<std::streamsize>(rep.size));
-    if (in.gcount() != static_cast<std::streamsize>(rep.size))
-        return std::nullopt;
-    return out;
+    return detail::read_file_exact(rep.disk_path, rep.size);
 }
 
 } // namespace simple_http

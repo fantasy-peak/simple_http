@@ -280,17 +280,23 @@ struct ParamOptions {
     std::string description;
 };
 
+namespace detail {
+template <typename T> Param make_param(std::string name, ParamIn in, ParamOptions opts) {
+    return {std::move(name), in, opts.required, std::move(opts.description), schema_json<T>()};
+}
+} // namespace detail
+
 template <typename T> Param query(std::string name, ParamOptions opts = {}) {
-    return {std::move(name), ParamIn::Query, opts.required, std::move(opts.description), schema_json<T>()};
+    return detail::make_param<T>(std::move(name), ParamIn::Query, std::move(opts));
 }
 template <typename T> Param path(std::string name, ParamOptions opts = {}) {
-    return {std::move(name), ParamIn::Path, opts.required, std::move(opts.description), schema_json<T>()};
+    return detail::make_param<T>(std::move(name), ParamIn::Path, std::move(opts));
 }
 template <typename T> Param header(std::string name, ParamOptions opts = {}) {
-    return {std::move(name), ParamIn::Header, opts.required, std::move(opts.description), schema_json<T>()};
+    return detail::make_param<T>(std::move(name), ParamIn::Header, std::move(opts));
 }
 template <typename T> Param cookie(std::string name, ParamOptions opts = {}) {
-    return {std::move(name), ParamIn::Cookie, opts.required, std::move(opts.description), schema_json<T>()};
+    return detail::make_param<T>(std::move(name), ParamIn::Cookie, std::move(opts));
 }
 
 // Security scheme factories for OpenApiSpec::security_scheme(name, scheme):

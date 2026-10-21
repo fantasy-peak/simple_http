@@ -639,7 +639,7 @@ class Http2ClientSession final : public ClientSession,
             // Per-stream windows ride in SETTINGS; the connection-level window has
             // no setting, only a WINDOW_UPDATE, so open it up explicitly.
             std::string wu;
-            append_u32(wu, static_cast<std::uint32_t>(initial - kClientInitialWindow));
+            codec::append_u32(wu, static_cast<std::uint32_t>(initial - kClientInitialWindow));
             append_frame(out, codec::H2FrameType::WindowUpdate, 0, 0, wu);
         }
         m_conn_recv_window = initial;
@@ -839,13 +839,6 @@ class Http2ClientSession final : public ClientSession,
 
     // --- frame output ---
 
-    static void append_u32(std::string &out, std::uint32_t v) {
-        out.push_back(static_cast<char>((v >> 24) & 0xFF));
-        out.push_back(static_cast<char>((v >> 16) & 0xFF));
-        out.push_back(static_cast<char>((v >> 8) & 0xFF));
-        out.push_back(static_cast<char>(v & 0xFF));
-    }
-
     static void append_frame(std::string &out, codec::H2FrameType type, std::uint8_t flags, std::uint32_t stream_id,
                              std::string_view payload) {
         codec::serialize_frame_header(out, static_cast<std::uint32_t>(payload.size()), static_cast<std::uint8_t>(type),
@@ -875,13 +868,13 @@ class Http2ClientSession final : public ClientSession,
 
     void send_rst_stream(std::uint32_t id, std::uint32_t error) {
         std::string payload;
-        append_u32(payload, error);
+        codec::append_u32(payload, error);
         append_frame(m_out, codec::H2FrameType::RstStream, 0, id, payload);
     }
 
     void send_window_update(std::uint32_t id, std::uint32_t delta) {
         std::string payload;
-        append_u32(payload, delta);
+        codec::append_u32(payload, delta);
         append_frame(m_out, codec::H2FrameType::WindowUpdate, 0, id, payload);
     }
 
@@ -889,8 +882,8 @@ class Http2ClientSession final : public ClientSession,
         if (m_goaway_sent)
             return;
         std::string payload;
-        append_u32(payload, m_last_stream_id);
-        append_u32(payload, error);
+        codec::append_u32(payload, m_last_stream_id);
+        codec::append_u32(payload, error);
         append_frame(m_out, codec::H2FrameType::Goaway, 0, 0, payload);
         m_goaway_sent = true;
         m_alive = false;

@@ -35,6 +35,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 
 #include "../../core/address.h"
 #include "../../core/http_status.h" // reason_phrase (the 502 body/status line)
@@ -119,32 +120,27 @@ run_ws_proxy(std::shared_ptr<Transport> client, const ParsedHead &head, std::str
     }
     auto backend = std::move(*connected);
 
-    auto close_backend = [backend]() {
-        error_code sec;
-        backend->shutdown(asio::ip::tcp::socket::shutdown_both, sec);
-        backend->close(sec);
-    };
+    auto close_backend = [backend]() { detail::ws_proxy_close(*backend); };
 
     // Replay target: rewrite_path replaces the path, but the query string from
     // the inbound target is preserved (session tokens and code-server's
     // reconnectionToken live there). If no rewrite is configured, keep the
     // inbound target as-is.
-    std::string replay_target{target.rewrite_path};
-    if (replay_target.empty()) {
-        replay_target.assign(head.target);
-    } else if (const auto q = head.target.find('?'); q != std::string_view::npos) {
-        replay_target.append(head.target.substr(q));
-    }
-    // Defence in depth: the h1 parser already rejects control bytes in the
-    // target, but a proxy must not rely on its caller. Anything here would be
-    // spliced verbatim into the backend's request line.
-    if (contains_ctl(replay_target)) {
+    const auto qmark = head.target.find('?');
+    const std::string_view inbound_path = qmark == std::string_view::npos
+                                              ? std::string_view{head.target}
+                                              : std::string_view{head.target}.substr(0, qmark);
+    const std::string_view inbound_query =
+        qmark == std::string_view::npos ? std::string_view{} : std::string_view{head.target}.substr(qmark + 1);
+    auto replay = detail::ws_proxy_replay_target(target.rewrite_path, inbound_path, inbound_query);
+    if (!replay) {
         SIMPLE_HTTP_ERROR_LOG("ws-proxy: refusing a request target with CR/LF/NUL (client {})",
                               address_string(client->peer().address()));
         close_backend();
         co_await ws_proxy_fail(client, status::bad_request);
         co_return false;
     }
+    std::string replay_target = std::move(*replay);
 
     const auto inbound_host = head.headers.get("host");
     std::string key;
@@ -283,29 +279,17 @@ run_ws_proxy(std::shared_ptr<Transport> client, const ParsedHead &head, std::str
         co_return;
     };
 
-    // Reaps a tunnel that has seen no traffic in either direction for
-    // idle_timeout.
-    auto idle_check = [&]() -> asio::awaitable<void> {
-        for (;;) {
-            if (std::chrono::steady_clock::now() >= deadline) {
-                SIMPLE_HTTP_ERROR_LOG("ws-proxy tunnel idle for {}s (client {}); closing",
-                                      std::chrono::duration_cast<std::chrono::seconds>(idle_timeout).count(),
-                                      address_string(client->peer().address()));
-                co_return;
-            }
-            asio::steady_timer timer{executor};
-            timer.expires_at(deadline);
-            auto [ec] = co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
-            if (ec)
-                co_return; // cancelled: the tunnel already finished
-        }
-    };
-
     // Wait for both directions (Go's io.Copy pair), with the idle watchdog as
     // the only early exit. When one direction half-closes, it shuts down only
     // the opposite write side and lets the other finish.
     if (idle_timeout.count() > 0) {
-        co_await ((client_to_backend() && backend_to_client()) || idle_check());
+        auto outcome =
+            co_await ((client_to_backend() && backend_to_client()) || detail::ws_tunnel_idle_guard(executor, deadline));
+        if (const auto *timed_out = std::get_if<bool>(&outcome); timed_out && *timed_out) {
+            SIMPLE_HTTP_ERROR_LOG("ws-proxy tunnel idle for {}s (client {}); closing",
+                                  std::chrono::duration_cast<std::chrono::seconds>(idle_timeout).count(),
+                                  address_string(client->peer().address()));
+        }
     } else {
         co_await (client_to_backend() && backend_to_client());
     }

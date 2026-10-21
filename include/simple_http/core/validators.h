@@ -17,6 +17,8 @@
 #include <string>
 #include <string_view>
 
+#include "http_field.h" // trim_ows
+
 namespace simple_http {
 
 // nginx's shape: `"<mtime-hex>-<size-hex>"`, plus a representation suffix so
@@ -50,10 +52,7 @@ inline std::string make_etag(std::int64_t mtime_unix, std::uint64_t size, std::s
 // Accepts a comma-separated list and the "*" wildcard.
 inline bool etag_matches(std::string_view header_value, std::string_view etag) {
     auto strip = [](std::string_view v) {
-        while (!v.empty() && (v.front() == ' ' || v.front() == '\t'))
-            v.remove_prefix(1);
-        while (!v.empty() && (v.back() == ' ' || v.back() == '\t'))
-            v.remove_suffix(1);
+        v = trim_ows(v);
         if (v.starts_with("W/"))
             v.remove_prefix(2);
         return v;
@@ -97,10 +96,7 @@ inline std::optional<ByteRange> parse_range(std::string_view header, std::uint64
         return std::nullopt;
     std::string_view spec = header.substr(kPrefix.size());
 
-    while (!spec.empty() && (spec.front() == ' ' || spec.front() == '\t'))
-        spec.remove_prefix(1);
-    while (!spec.empty() && (spec.back() == ' ' || spec.back() == '\t'))
-        spec.remove_suffix(1);
+    spec = trim_ows(spec);
 
     if (spec.find(',') != std::string_view::npos)
         return std::nullopt; // multi-range: not supported

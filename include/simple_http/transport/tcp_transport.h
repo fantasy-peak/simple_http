@@ -20,73 +20,25 @@ namespace simple_http {
 
 namespace asio = boost::asio;
 
-// Orderly shutdown+close, selected by socket type via overloading (no
-// if-constexpr chains).
-inline void shutdown_socket(asio::ip::tcp::socket &s) {
-    if (s.is_open()) {
-        error_code ec;
-        s.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
-        s.close(ec);
-    }
-}
-
-// Compiles in wherever the platform has AF_UNIX. asio is the one that knows, so
-// there is no switch for a consumer to set (and none to forget).
-#ifdef BOOST_ASIO_HAS_LOCAL_SOCKETS
-inline void shutdown_socket(asio::local::stream_protocol::socket &s) {
-    if (s.is_open()) {
-        error_code ec;
-        s.shutdown(asio::local::stream_protocol::socket::shutdown_both, ec);
-        s.close(ec);
-    }
-}
-#endif
-
-// Most buffers one scatter-gather write accepts; see async_write_seq.
-inline constexpr std::size_t kMaxWriteBuffers = 8;
-
 template <typename Socket> class TcpTransport {
   public:
     explicit TcpTransport(std::shared_ptr<Socket> socket, asio::ip::tcp::endpoint peer = {})
         : m_socket(std::move(socket)), m_peer(std::move(peer)) {}
 
     asio::awaitable<IoResult> async_read_some(ByteSpan buffer) {
-        auto [ec, n] = co_await m_socket->async_read_some(asio::buffer(buffer.data(), buffer.size()),
-                                                          asio::as_tuple(asio::use_awaitable));
-        co_return IoResult{ec, n};
+        co_return co_await detail::stream_read_some(*m_socket, buffer);
     }
 
-    // Reads exactly `buffer.size()` bytes. Composed operation: it completes when
-    // the buffer is full, or with an error (EOF included) after a partial read -
-    // the result still reports the bytes read.
     asio::awaitable<IoResult> async_read(ByteSpan buffer) {
-        auto [ec, n] = co_await asio::async_read(*m_socket, asio::buffer(buffer.data(), buffer.size()),
-                                                 asio::as_tuple(asio::use_awaitable));
-        co_return IoResult{ec, n};
+        co_return co_await detail::stream_read_exact(*m_socket, buffer);
     }
 
     asio::awaitable<IoResult> async_write(ConstByteSpan buffer) {
-        auto [ec, n] = co_await asio::async_write(*m_socket, asio::buffer(buffer.data(), buffer.size()),
-                                                  asio::as_tuple(asio::use_awaitable));
-        co_return IoResult{ec, n};
+        co_return co_await detail::stream_write_all(*m_socket, buffer);
     }
-    // Writes several buffers as one operation (one writev), so a frame header and
-    // its payload need not be concatenated first. Like async_write this is a
-    // composed operation: it completes only once every byte has been written.
+
     asio::awaitable<IoResult> async_write_seq(std::span<const ConstByteSpan> buffers) {
-        // Bounded by the iovec this builds. Callers pass a handful at most (a head
-        // and a body, a frame header and its payload), so the cap is a backstop
-        // rather than a real limit — dropping buffers past it would write a
-        // *shorter* message and still report success, which is silent truncation.
-        assert(buffers.size() <= kMaxWriteBuffers);
-        const std::size_t count = std::min<std::size_t>(buffers.size(), kMaxWriteBuffers);
-        std::array<asio::const_buffer, 8> bufs{};
-        for (std::size_t i = 0; i < count; ++i) {
-            bufs[i] = asio::buffer(buffers[i].data(), buffers[i].size());
-        }
-        auto [ec, n] = co_await asio::async_write(*m_socket, std::span<const asio::const_buffer>{bufs.data(), count},
-                                                  asio::as_tuple(asio::use_awaitable));
-        co_return IoResult{ec, n};
+        co_return co_await detail::stream_write_seq(*m_socket, buffers);
     }
 
     auto get_executor() { return m_socket->get_executor(); }

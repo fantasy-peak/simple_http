@@ -7,6 +7,8 @@
 
 #include <boost/system/error_code.hpp>
 #include <cstdint>
+#include <functional>
+#include <string>
 #include <string_view>
 
 namespace simple_http {
@@ -77,6 +79,28 @@ inline bool is_http_token(std::string_view s) noexcept {
 // each.
 inline char ascii_lower(char c) noexcept { return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c; }
 
+// A lowercased copy, for callers that need to keep the folded spelling (field
+// token lists, header-name comparisons against a stored value).
+inline std::string ascii_lower_copy(std::string_view s) {
+    std::string out{s};
+    for (auto &c : out)
+        c = ascii_lower(c);
+    return out;
+}
+
+// Value of one hexadecimal digit, or -1 when `c` is not one. Shared by the
+// percent-decoders and by the chunked/HPACK scanners so every layer spells the
+// same digit the same way.
+inline int hex_digit_value(char c) noexcept {
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
 // Symmetric: either side may be mixed case. (proto/headers.h has a
 // lower-`rhs`-only variant that is faster, but it is only valid where the other
 // side is a stored, already-folded name — which is why it is private there.)
@@ -91,6 +115,32 @@ inline bool iequals_ci(std::string_view a, std::string_view b) noexcept {
     }
     return true;
 }
+
+// ASCII case-insensitive substring test (allocation-free).
+inline bool icontains_ci(std::string_view haystack, std::string_view needle) noexcept {
+    if (needle.empty())
+        return true;
+    if (needle.size() > haystack.size())
+        return false;
+    const std::size_t last = haystack.size() - needle.size();
+    for (std::size_t i = 0; i <= last; ++i) {
+        std::size_t j = 0;
+        for (; j < needle.size(); ++j) {
+            if (ascii_lower(haystack[i + j]) != ascii_lower(needle[j]))
+                break;
+        }
+        if (j == needle.size())
+            return true;
+    }
+    return false;
+}
+
+// Transparent string hashing, so a lookup by std::string_view never has to
+// build a std::string key. Used by the router and the static-file table.
+struct StringHash {
+    using is_transparent = void;
+    std::size_t operator()(std::string_view s) const noexcept { return std::hash<std::string_view>{}(s); }
+};
 
 // The wire protocol a request/response is being served over.
 enum class Version : std::uint8_t {

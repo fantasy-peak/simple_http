@@ -229,7 +229,7 @@ class CompressingResponseSink final : public ResponseSink {
             return false;
         }
         if (m_config.respect_no_transform) {
-            if (auto cc = headers.get("cache-control"); cc && header_has_token(*cc, "no-transform")) {
+            if (auto cc = headers.get("cache-control"); cc && value_has_token(*cc, "no-transform")) {
                 return false;
             }
         }
@@ -267,7 +267,7 @@ class CompressingResponseSink final : public ResponseSink {
             headers.add_lower("vary", "Accept-Encoding");
             return;
         }
-        if (header_has_token(*existing, "*") || header_has_token(*existing, "accept-encoding")) {
+        if (value_has_token(*existing, "*") || value_has_token(*existing, "accept-encoding")) {
             return;
         }
         std::string merged{*existing};

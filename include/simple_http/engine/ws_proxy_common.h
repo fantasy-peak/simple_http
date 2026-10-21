@@ -47,87 +47,6 @@ namespace asio = boost::asio;
 
 namespace detail {
 
-inline std::string ws_lower(std::string_view s) {
-    std::string out{s};
-    for (auto &c : out)
-        c = ascii_lower(c);
-    return out;
-}
-
-inline bool ws_ci_equal(std::string_view a, std::string_view b) {
-    if (a.size() != b.size())
-        return false;
-    for (std::size_t i = 0; i < a.size(); ++i) {
-        if (ascii_lower(a[i]) != ascii_lower(b[i]))
-            return false;
-    }
-    return true;
-}
-
-// Whether a comma-separated field value contains `token` (case-insensitive).
-inline bool ws_value_has_token(std::string_view value, std::string_view token) {
-    std::size_t pos = 0;
-    while (pos <= value.size()) {
-        const std::size_t comma = value.find(',', pos);
-        std::string_view item =
-            value.substr(pos, comma == std::string_view::npos ? std::string_view::npos : comma - pos);
-        while (!item.empty() && (item.front() == ' ' || item.front() == '\t'))
-            item.remove_prefix(1);
-        while (!item.empty() && (item.back() == ' ' || item.back() == '\t'))
-            item.remove_suffix(1);
-        if (ws_ci_equal(item, token))
-            return true;
-        if (comma == std::string_view::npos)
-            break;
-        pos = comma + 1;
-    }
-    return false;
-}
-
-inline std::vector<std::string> ws_connection_tokens(const Headers &headers) {
-    std::vector<std::string> tokens;
-    for (auto conn : headers.get_all("connection")) {
-        std::size_t pos = 0;
-        while (pos < conn.size()) {
-            const std::size_t comma = conn.find(',', pos);
-            std::string_view item =
-                conn.substr(pos, comma == std::string_view::npos ? std::string_view::npos : comma - pos);
-            while (!item.empty() && (item.front() == ' ' || item.front() == '\t'))
-                item.remove_prefix(1);
-            while (!item.empty() && (item.back() == ' ' || item.back() == '\t'))
-                item.remove_suffix(1);
-            if (!item.empty())
-                tokens.push_back(ws_lower(item));
-            if (comma == std::string_view::npos)
-                break;
-            pos = comma + 1;
-        }
-    }
-    return tokens;
-}
-
-// Hop-by-hop fields that must not be copied to the backend. Connection and
-// Upgrade are written by the builder itself; the rest are dropped entirely.
-inline bool ws_is_hop_by_hop(std::string_view name) {
-    static constexpr std::string_view kHop[] = {
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "proxy-connection",
-        "te",
-        "trailer",
-        "transfer-encoding",
-        "upgrade",
-        "http2-settings",
-    };
-    for (auto h : kHop) {
-        if (name == h)
-            return true;
-    }
-    return false;
-}
-
 inline std::string ws_authority(const WsProxyTarget &target) {
     std::string out;
     if (target.host.find(':') != std::string::npos) {
@@ -198,9 +117,9 @@ inline std::string build_ws_upgrade_head(const Headers &in, std::string_view inb
         out.append("sec-websocket-version: 13\r\n");
     }
 
-    const auto conn_tokens = ws_connection_tokens(in);
+    const auto conn_tokens = connection_tokens(in);
     for (const auto &[name, value] : in) {
-        if (ws_is_hop_by_hop(name) || contains_ctl(name) || contains_ctl(value))
+        if (is_hop_by_hop_field(name) || contains_ctl(name) || contains_ctl(value))
             continue;
         if (name == "host" || name == "content-length" || name == "expect" || name == "sec-websocket-key" ||
             name == "sec-websocket-version")
@@ -260,6 +179,48 @@ struct WsProxyReplyHead {
     std::string raw;     // the raw head, including the terminating CRLFCRLF
     std::string initial; // bytes the backend sent after the head
 };
+
+// Best-effort teardown of the backend socket, shared by both tunnel frontends.
+template <typename Socket> void ws_proxy_close(Socket &backend) {
+    error_code ec;
+    backend.shutdown(asio::socket_base::shutdown_both, ec);
+    backend.close(ec);
+}
+
+// The target the backend sees: the route's rewrite path when configured,
+// otherwise the frontend's path, always carrying the frontend's query string
+// (session tokens and code-server's reconnectionToken live there). Returns
+// nullopt when the result contains CR/LF/NUL — the caller answers 400 and must
+// not splice it into a request line.
+inline std::optional<std::string> ws_proxy_replay_target(std::string_view rewrite_path, std::string_view path,
+                                                         std::string_view query) {
+    std::string target{rewrite_path.empty() ? path : rewrite_path};
+    if (target.empty())
+        target = "/";
+    if (!query.empty()) {
+        target.push_back('?');
+        target.append(query);
+    }
+    if (contains_ctl(target))
+        return std::nullopt;
+    return target;
+}
+
+// Idle watchdog for a byte-level tunnel: returns true when `deadline` has
+// passed without the tunnel finishing, false when the competing transfer
+// cancelled it. The deadline is refreshed by every successful read/write.
+template <typename Executor>
+asio::awaitable<bool> ws_tunnel_idle_guard(const Executor &executor, std::chrono::steady_clock::time_point deadline) {
+    for (;;) {
+        if (std::chrono::steady_clock::now() >= deadline)
+            co_return true;
+        asio::steady_timer timer{executor};
+        timer.expires_at(deadline);
+        auto [ec] = co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+        if (ec)
+            co_return false; // cancelled: the tunnel already finished
+    }
+}
 
 // One bounded read from the backend. `timeout == 0` means no deadline (the
 // route's connect budget disabled); otherwise the operation is cancelled with
@@ -327,7 +288,7 @@ class H1ChunkedEndScanner {
                     m_state = State::SizeLf;
                 } else if (c == ';') {
                     m_state = State::SizeExt;
-                } else if (int digit = hex_value(c); digit >= 0) {
+                } else if (int digit = hex_digit_value(c); digit >= 0) {
                     m_size = m_size * 16 + static_cast<std::uint64_t>(digit);
                 } else {
                     m_state = State::Done; // malformed: stop relaying, never spin
@@ -396,16 +357,6 @@ class H1ChunkedEndScanner {
         Done
     };
 
-    static int hex_value(char c) {
-        if (c >= '0' && c <= '9')
-            return c - '0';
-        if (c >= 'a' && c <= 'f')
-            return c - 'a' + 10;
-        if (c >= 'A' && c <= 'F')
-            return c - 'A' + 10;
-        return -1;
-    }
-
     State m_state{State::Size};
     std::uint64_t m_size{0};
     std::uint64_t m_remaining{0};
@@ -430,7 +381,7 @@ asio::awaitable<void> ws_proxy_relay_refusal_body(Socket &backend, std::string &
     }
     bool chunked = false;
     for (auto value : headers.get_all("transfer-encoding")) {
-        if (ws_value_has_token(value, "chunked"))
+        if (value_has_token(value, "chunked"))
             chunked = true;
     }
     // RFC 9112 §6.3: Transfer-Encoding overrides Content-Length. Honoring both
@@ -478,7 +429,7 @@ inline bool ws_validate_101(const ParsedResponseHead &head, std::string_view exp
         return false;
     bool connection_upgrade = false;
     for (auto conn : head.headers.get_all("connection")) {
-        if (ws_value_has_token(conn, "upgrade")) {
+        if (value_has_token(conn, "upgrade")) {
             connection_upgrade = true;
             break;
         }
@@ -486,7 +437,7 @@ inline bool ws_validate_101(const ParsedResponseHead &head, std::string_view exp
     if (!connection_upgrade)
         return false;
     const auto upgrade = head.headers.get("upgrade");
-    if (!upgrade || !ws_ci_equal(*upgrade, "websocket"))
+    if (!upgrade || !iequals_ci(*upgrade, "websocket"))
         return false;
     if (!expected_accept.empty()) {
         const auto accept = head.headers.get("sec-websocket-accept");

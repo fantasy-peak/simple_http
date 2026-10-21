@@ -367,7 +367,7 @@ class Http1ClientSession final : public ClientSession,
         // it, so the caller can send the body only once the peer agreed.
         m_expect_continue = false;
         if (auto expect = m_spec->headers().get("expect")) {
-            m_expect_continue = icontains(*expect, "100-continue");
+            m_expect_continue = icontains_ci(*expect, "100-continue");
         }
     }
 
@@ -762,11 +762,11 @@ class Http1ClientSession final : public ClientSession,
         const auto &head = m_parser.head();
         // What the response says about keep-alive, plus what we asked for.
         auto conn = head.headers.get("connection");
-        if (conn && icontains(*conn, "close"))
+        if (conn && icontains_ci(*conn, "close"))
             m_close_after = true;
         if (head.version == Version::Http1) {
             // HTTP/1.0 closes unless the peer opted in explicitly.
-            m_close_after = !(conn && icontains(*conn, "keep-alive"));
+            m_close_after = !(conn && icontains_ci(*conn, "keep-alive"));
         }
 
         // A response to HEAD, or to any request whose response carries no body
@@ -781,7 +781,7 @@ class Http1ClientSession final : public ClientSession,
         }
 
         auto te = head.headers.get("transfer-encoding");
-        if (te && icontains(*te, "chunked")) {
+        if (te && icontains_ci(*te, "chunked")) {
             m_body_mode = BodyMode::Chunked;
             m_body_total = 0;
             m_explicit_length = true;
@@ -1135,27 +1135,6 @@ class Http1ClientSession final : public ClientSession,
         }
         out = v;
         return true;
-    }
-
-    // Allocation-free ASCII case-insensitive substring test (as in the h1
-    // engine).
-    static bool icontains(std::string_view haystack, std::string_view needle) {
-        if (needle.empty())
-            return true;
-        if (needle.size() > haystack.size())
-            return false;
-        auto lower = [](char c) { return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c; };
-        const std::size_t last = haystack.size() - needle.size();
-        for (std::size_t i = 0; i <= last; ++i) {
-            std::size_t j = 0;
-            for (; j < needle.size(); ++j) {
-                if (lower(haystack[i + j]) != lower(needle[j]))
-                    break;
-            }
-            if (j == needle.size())
-                return true;
-        }
-        return false;
     }
 
     // --- members ---

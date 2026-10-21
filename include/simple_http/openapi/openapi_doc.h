@@ -388,14 +388,7 @@ class OpenApiSpec {
                         j.begin_object();
                         j.key("required");
                         j.boolean(op.info.request_required);
-                        j.key("content");
-                        j.begin_object();
-                        j.key(op.info.request_content_type);
-                        j.begin_object();
-                        j.key("schema");
-                        emit_schema_ref(j, op.request_schema, component_names);
-                        j.end_object();
-                        j.end_object();
+                        render_content(j, op.info.request_content_type, op.request_schema, component_names);
                         j.end_object();
                     }
                     j.key("responses");
@@ -461,16 +454,23 @@ class OpenApiSpec {
         j.key("description");
         j.str(description);
         if (!schema.empty()) {
-            j.key("content");
-            j.begin_object();
-            j.key(content_type);
-            j.begin_object();
-            j.key("schema");
-            emit_schema_ref(j, schema, component_names);
-            j.end_object();
-            j.end_object();
+            render_content(j, content_type, schema, component_names);
         }
         render_headers(j, headers);
+        j.end_object();
+    }
+
+    // Emits OAS's content map for one media type: {"content":{"<type>":{"schema":...}}}.
+    // Shared by requestBody and response rendering.
+    static void render_content(JsonOut &j, std::string_view content_type, const std::string &schema,
+                               const std::map<std::string, std::string> &component_names) {
+        j.key("content");
+        j.begin_object();
+        j.key(content_type);
+        j.begin_object();
+        j.key("schema");
+        emit_schema_ref(j, schema, component_names);
+        j.end_object();
         j.end_object();
     }
 

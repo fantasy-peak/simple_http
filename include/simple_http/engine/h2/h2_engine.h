@@ -130,9 +130,7 @@ template <TransportLike Transport> class Http2ResponseSink : public ResponseSink
         // sent, so without this a `HEAD /world` over HTTP/2 answered `200 +
         // content-type + server` where the same route over HTTP/1.1 answered
         // `content-length: 1024` (h1_engine.h send() sets it for HEAD too).
-        if (!headers.contains("date")) {
-            headers.add_lower("date", std::string{http_date_now()});
-        }
+        ensure_date(headers);
         const bool head = eng->method_is_head(m_stream_id);
         if (head) {
             headers.erase("content-length");
@@ -150,9 +148,7 @@ template <TransportLike Transport> class Http2ResponseSink : public ResponseSink
         if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
             co_return make_error_code(asio::error::not_connected);
         }
-        if (!headers.contains("date")) {
-            headers.add_lower("date", std::string{http_date_now()});
-        }
+        ensure_date(headers);
         // Nothing follows the HEADERS frame: END_STREAM ends the stream (RFC 9113
         // §8.1).
         eng->submit_headers(m_stream_id, status, headers, /*end_stream=*/true);
@@ -165,9 +161,7 @@ template <TransportLike Transport> class Http2ResponseSink : public ResponseSink
         if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
             co_return make_error_code(asio::error::not_connected);
         }
-        if (!headers.contains("date")) {
-            headers.add_lower("date", std::string{http_date_now()});
-        }
+        ensure_date(headers);
         // A streamed response has no length it can promise - END_STREAM delimits
         // it - so a handler-supplied Content-Length must not survive next to it.
         // HTTP/1.1's sink erases it for the same reason (h1_engine.h,
@@ -383,11 +377,8 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         std::string block;
         codec::hpack_append_status(block, status);
         for (const auto &[name, value] : headers) {
-            if (name == "connection" || name == "transfer-encoding" || name == "keep-alive" || name == "upgrade" ||
-                name == "proxy-connection") {
-                continue; // hop-by-hop headers are forbidden in HTTP/2 (RFC 7540
-                          // §8.1.2.2)
-            }
+            if (is_connection_specific_field(name))
+                continue; // hop-by-hop headers are forbidden in HTTP/2 (RFC 7540 §8.1.2.2)
             codec::hpack_append_literal(block, name, value);
         }
         // Alt-Svc: how a browser learns this origin also speaks HTTP/3
@@ -527,7 +518,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
     // Abort a stream with the given error code (RST_STREAM).
     void reset_stream(std::uint32_t stream_id, std::uint32_t error_code_value) {
         std::string payload;
-        append_u32(payload, error_code_value);
+        codec::append_u32(payload, error_code_value);
         append_frame(codec::H2FrameType::RstStream, 0, stream_id, payload);
         // A handler may already be parked in body().read() (dispatch runs at
         // END_HEADERS, before the body is complete). The stream is going away
@@ -656,13 +647,6 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
 
     // --- byte helpers ---
 
-    static void append_u32(std::string &out, std::uint32_t v) {
-        out.push_back(static_cast<char>((v >> 24) & 0xFF));
-        out.push_back(static_cast<char>((v >> 16) & 0xFF));
-        out.push_back(static_cast<char>((v >> 8) & 0xFF));
-        out.push_back(static_cast<char>(v & 0xFF));
-    }
-
     // Serialize a complete frame (9-octet header + payload) into the output
     // buffer, splitting nothing (payload must already be within max frame size;
     // HEADERS blocks that big are not expected for typical responses — a future
@@ -680,7 +664,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         auto add = [&](std::uint16_t id, std::uint32_t value) {
             payload.push_back(static_cast<char>((id >> 8) & 0xFF));
             payload.push_back(static_cast<char>(id & 0xFF));
-            append_u32(payload, value);
+            codec::append_u32(payload, value);
         };
         add(codec::H2_SETTINGS_MAX_CONCURRENT_STREAMS, m_limits.h2_max_concurrent_streams);
         add(codec::H2_SETTINGS_INITIAL_WINDOW_SIZE, static_cast<std::uint32_t>(m_limits.h2_initial_window));
@@ -845,8 +829,8 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         if (m_goaway_sent) {
             m_out.clear(); // queued DATA is moot on a connection error
             std::string payload;
-            append_u32(payload, m_next_peer_stream_id);
-            append_u32(payload, m_goaway_error);
+            codec::append_u32(payload, m_next_peer_stream_id);
+            codec::append_u32(payload, m_goaway_error);
             append_frame(codec::H2FrameType::Goaway, 0, 0, payload);
         }
         // Flush with a deadline: a peer that stopped reading must not keep the
@@ -1256,10 +1240,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
     // must not send in HTTP/2. A hop downstream that acted on one — say
     // `transfer-encoding: chunked` replayed through a proxy route — would be
     // framing a message the sender never described.
-    static bool is_connection_specific_field(std::string_view name) noexcept {
-        return name == "connection" || name == "keep-alive" || name == "proxy-connection" ||
-               name == "transfer-encoding" || name == "upgrade";
-    }
+    // (The predicate itself is core/http_field.h's, shared with the h3 engine.)
 
     bool finish_header_block(std::uint32_t stream_id, Stream &st) {
         std::vector<codec::HpackHeader> fields;
@@ -1757,7 +1738,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
     // octets back to the peer.
     void send_window_update(std::uint32_t stream_id, std::uint32_t delta) {
         std::string payload;
-        append_u32(payload, delta);
+        codec::append_u32(payload, delta);
         append_frame(codec::H2FrameType::WindowUpdate, /*flags=*/0, stream_id, payload);
     }
 
@@ -1849,8 +1830,8 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         // write loop was cancelled before it reached the wire.
         m_goaway_error = error_code_value;
         std::string payload;
-        append_u32(payload, m_next_peer_stream_id); // last stream id we processed
-        append_u32(payload, error_code_value);
+        codec::append_u32(payload, m_next_peer_stream_id); // last stream id we processed
+        codec::append_u32(payload, error_code_value);
         append_frame(codec::H2FrameType::Goaway, 0, 0, payload);
         m_goaway_sent = true;
         flush();
@@ -2253,9 +2234,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         const auto idle = m_limits.idle_timeout;
 
         const auto peer = m_transport->peer();
-        std::string peer_address;
-        if (!peer.address().is_unspecified())
-            peer_address = address_string(peer.address());
+        std::string peer_address = address_string_if_specified(peer.address());
         const bool client_is_tls = m_transport->tls_handle().has_value();
 
         auto fail = [this, sink, stream_id](int status, Headers headers = {}) -> asio::awaitable<void> {
@@ -2276,33 +2255,19 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         }
         auto backend = std::move(*connected);
 
-        auto close_backend = [backend]() {
-            error_code sec;
-            backend->shutdown(asio::ip::tcp::socket::shutdown_both, sec);
-            backend->close(sec);
-        };
+        auto close_backend = [backend]() { detail::ws_proxy_close(*backend); };
 
         // Rewrite the path and keep the client's query string — see run_ws_proxy
         // (h1) for why dropping it breaks session-carrying endpoints.
-        std::string replay_target{target.rewrite_path};
-        if (replay_target.empty())
-            replay_target.assign(request->path());
-        if (const auto q = request->query(); !q.empty()) {
-            replay_target.push_back('?');
-            replay_target.append(q);
-        }
-        if (replay_target.empty())
-            replay_target = "/";
-        // The h2 engine rejects control bytes in :path/the field set, but the
-        // proxy must not rely on its caller before splicing this into a request
-        // line (the same guard the h1 proxy applies).
-        if (contains_ctl(replay_target)) {
+        auto replay = detail::ws_proxy_replay_target(target.rewrite_path, request->path(), request->query());
+        if (!replay) {
             SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy: refusing a request target with CR/LF/NUL (client {})",
                                   address_string(peer.address()));
             close_backend();
             co_await fail(400);
             co_return false;
         }
+        std::string replay_target = std::move(*replay);
 
         const std::string key = detail::make_ws_client_key();
         const auto inbound_host = request->header("host");
@@ -2338,7 +2303,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
             // headers here, and the peer's status is the actionable part.
             Headers response_headers;
             for (const auto &[name, value] : reply->head.headers) {
-                if (detail::ws_is_hop_by_hop(name) || name == "content-length" || name == "transfer-encoding")
+                if (is_hop_by_hop_field(name) || name == "content-length" || name == "transfer-encoding")
                     continue;
                 if (contains_ctl(name) || contains_ctl(value))
                     continue;
@@ -2364,7 +2329,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         // Connection or Sec-WebSocket-Accept).
         Headers response_headers;
         for (const auto &[name, value] : reply->head.headers) {
-            if (detail::ws_is_hop_by_hop(name) || name == "sec-websocket-accept" || name == "content-length" ||
+            if (is_hop_by_hop_field(name) || name == "sec-websocket-accept" || name == "content-length" ||
                 name == "transfer-encoding")
                 continue;
             if (contains_ctl(name) || contains_ctl(value))
@@ -2425,25 +2390,12 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                 deadline = std::chrono::steady_clock::now() + idle;
             }
         };
-        auto idle_check = [&]() -> asio::awaitable<void> {
-            if (idle.count() <= 0)
-                co_return;
-            for (;;) {
-                if (std::chrono::steady_clock::now() >= deadline)
-                    co_return;
-                asio::steady_timer timer{m_executor};
-                timer.expires_at(deadline);
-                auto [ec] = co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
-                if (ec)
-                    co_return;
-            }
-        };
-
         // Go's io.Copy pair: both directions run to completion (a half-close in
         // one does not cancel the other), with the idle watchdog as the only
         // early exit. This matches the h1 tunnel, which fixed the same mistake.
         if (idle.count() > 0) {
-            co_await ((backend_to_client() && client_to_backend()) || idle_check());
+            co_await ((backend_to_client() && client_to_backend()) ||
+                      detail::ws_tunnel_idle_guard(m_executor, deadline));
         } else {
             co_await (backend_to_client() && client_to_backend());
         }

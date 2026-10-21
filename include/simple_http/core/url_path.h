@@ -30,6 +30,8 @@
 #include <string_view>
 #include <vector>
 
+#include "types.h" // hex_digit_value
+
 namespace simple_http {
 
 // Why a path was refused. Callers log it and pick a status code; nothing
@@ -51,19 +53,7 @@ inline constexpr std::size_t kMaxPathBytes = 2048;
 inline constexpr std::size_t kMaxSegmentBytes = 255;
 inline constexpr std::size_t kMaxSegments = 32;
 
-namespace detail {
-
-inline int hex_digit(char c) noexcept {
-    if (c >= '0' && c <= '9')
-        return c - '0';
-    if (c >= 'a' && c <= 'f')
-        return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F')
-        return c - 'A' + 10;
-    return -1;
-}
-
-} // namespace detail
+namespace detail {} // namespace detail
 
 // Decodes a request path and reduces it to a canonical lookup key.
 //
@@ -138,8 +128,8 @@ inline std::optional<std::string> decode_and_normalize(std::string_view raw, Pat
             err = PathError::Malformed;
             return std::nullopt;
         }
-        const int hi = detail::hex_digit(raw[i + 1]);
-        const int lo = detail::hex_digit(raw[i + 2]);
+        const int hi = hex_digit_value(raw[i + 1]);
+        const int lo = hex_digit_value(raw[i + 2]);
         if (hi < 0 || lo < 0) {
             err = PathError::Malformed;
             return std::nullopt;

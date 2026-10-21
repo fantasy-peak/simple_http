@@ -15,18 +15,20 @@
 // *encoder* layer, with zlib and brotli behind a build macro. A caller that
 // only wants to parse a header should not pull in the encoders to do it.
 //
-// NAMES THIS FILE MUST NOT DEFINE: `trim_ascii`, `starts_with_ci` and
-// `parse_qvalue` already exist in core/content_encoding.h, and `iequals_ci` in
-// core/types.h. Same-named `inline` functions in one namespace are a
-// redefinition error, and the umbrella header pulls both in — so a duplicate
-// here fails to compile across the whole library. Reuse them; the case-folding
-// used below is `iequals_ci` from types.h.
+// NAMES THIS FILE MUST NOT DEFINE: `trim_ows` and `iequals_ci` already exist in
+// core/http_field.h / core/types.h, and `starts_with_ci` / `parse_qvalue` in
+// core/content_encoding.h. Same-named
+// `inline` functions in one namespace are a redefinition error, and the
+// umbrella header pulls both in — so a duplicate here fails to compile across
+// the whole library. Reuse them; the case-folding used below is `iequals_ci`
+// from types.h.
 
 #include <cstddef>
 #include <string>
 #include <string_view>
 
-#include "types.h" // iequals_ci
+#include "http_field.h" // trim_ows
+#include "types.h"      // iequals_ci
 
 namespace simple_http {
 
@@ -89,10 +91,7 @@ inline AcceptEncoding parse_accept_encoding(std::string_view header) {
         }
         // Trim the coding token. Content-coding names are case-insensitive
         // (RFC 9110 §8.4.1), so "GZIP" and "gzip" are the same coding.
-        while (!coding.empty() && (coding.front() == ' ' || coding.front() == '\t'))
-            coding.remove_prefix(1);
-        while (!coding.empty() && (coding.back() == ' ' || coding.back() == '\t'))
-            coding.remove_suffix(1);
+        coding = trim_ows(coding);
 
         if (iequals_ci(coding, "br")) {
             ae.br = q;

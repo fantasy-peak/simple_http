@@ -18,8 +18,9 @@
 #include <string_view>
 #include <vector>
 
-#include "../core/mime.h"  // MultipartForm::file() defaults content type by extension
-#include "../core/types.h" // iequals_ci (header names arrive in original case)
+#include "../core/http_field.h" // trim_ows
+#include "../core/mime.h"       // MultipartForm::file() defaults content type by extension
+#include "../core/types.h"      // iequals_ci (header names arrive in original case)
 
 namespace simple_http {
 
@@ -33,16 +34,6 @@ struct MultipartPart {
 };
 
 namespace multipart_detail {
-
-inline std::string_view trim(std::string_view s) {
-    while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) {
-        s.remove_prefix(1);
-    }
-    while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) {
-        s.remove_suffix(1);
-    }
-    return s;
-}
 
 inline std::string unquote(std::string_view s) {
     if (s.size() >= 2 && s.front() == '"' && s.back() == '"') {
@@ -63,19 +54,19 @@ inline void parse_part_head(std::string_view head, MultipartPart &part) {
         }
         const std::size_t colon = line.find(':');
         if (colon != std::string_view::npos) {
-            const std::string_view name = trim(line.substr(0, colon));
-            std::string_view value = trim(line.substr(colon + 1));
+            const std::string_view name = trim_ows(line.substr(0, colon));
+            std::string_view value = trim_ows(line.substr(colon + 1));
             if (iequals_ci(name, "content-disposition")) {
                 // form-data; name="field"; filename="f.txt" — scan the
                 // semi-colon-separated parameters.
                 while (!value.empty()) {
                     const std::size_t semi = value.find(';');
                     const std::string_view param =
-                        trim(value.substr(0, semi == std::string_view::npos ? std::string_view::npos : semi));
+                        trim_ows(value.substr(0, semi == std::string_view::npos ? std::string_view::npos : semi));
                     const std::size_t peq = param.find('=');
                     if (!param.empty() && peq != std::string_view::npos) {
-                        std::string pvalue = unquote(trim(param.substr(peq + 1)));
-                        const std::string_view pname = trim(param.substr(0, peq));
+                        std::string pvalue = unquote(trim_ows(param.substr(peq + 1)));
+                        const std::string_view pname = trim_ows(param.substr(0, peq));
                         if (pname == "name") {
                             part.name = std::move(pvalue);
                         } else if (pname == "filename") {
@@ -88,7 +79,7 @@ inline void parse_part_head(std::string_view head, MultipartPart &part) {
                     value.remove_prefix(semi + 1);
                 }
             } else if (iequals_ci(name, "content-type")) {
-                part.content_type = std::string{trim(value)};
+                part.content_type = std::string{trim_ows(value)};
             }
         }
         if (nl == std::string_view::npos) {

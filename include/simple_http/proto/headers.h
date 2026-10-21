@@ -11,7 +11,9 @@
 #include <utility>
 #include <vector>
 
-#include "../core/types.h" // ascii_lower / iequals_ci: used below, and this header must stand alone
+#include "../core/http_date.h"  // ensure_date
+#include "../core/http_field.h" // trim_ows / value_has_token
+#include "../core/types.h"      // ascii_lower / iequals_ci: used below, and this header must stand alone
 
 namespace simple_http {
 
@@ -104,7 +106,7 @@ class Headers {
     // private for exactly that reason — it used to be public and static, so a
     // caller comparing two names, or passing a mixed-case `lhs`, got a silent
     // mismatch instead of a compile error. The symmetric version, for anyone who
-    // needs one, is core/content_encoding.h's iequals_ci.
+    // needs one, is core/types.h's iequals_ci.
     static bool iequals_ascii(std::string_view lhs, std::string_view rhs) {
         if (lhs.size() != rhs.size()) {
             return false;
@@ -124,5 +126,45 @@ class Headers {
 
     std::vector<value_type> m_fields;
 };
+
+// Whether any occurrence of field `name` contains `token` in its
+// comma-separated value list (case-insensitive, OWS-trimmed). `Connection` and
+// `Upgrade` are token lists, not opaque strings, and both may legally repeat.
+inline bool header_has_token(const Headers &headers, std::string_view name, std::string_view token) {
+    for (auto value : headers.get_all(name)) {
+        if (value_has_token(value, token))
+            return true;
+    }
+    return false;
+}
+
+// Every value nominated by the Connection field(s), lowercased. Those fields
+// are hop-by-hop for this connection (RFC 9110 §7.6.1); reading only the first
+// Connection occurrence would leave a second field's nominated headers
+// attached to a proxied message.
+inline std::vector<std::string> connection_tokens(const Headers &headers) {
+    std::vector<std::string> tokens;
+    for (auto conn : headers.get_all("connection")) {
+        std::size_t pos = 0;
+        while (pos < conn.size()) {
+            const std::size_t comma = conn.find(',', pos);
+            const std::string_view item =
+                trim_ows(conn.substr(pos, comma == std::string_view::npos ? std::string_view::npos : comma - pos));
+            if (!item.empty())
+                tokens.push_back(ascii_lower_copy(item));
+            if (comma == std::string_view::npos)
+                break;
+            pos = comma + 1;
+        }
+    }
+    return tokens;
+}
+
+// Adds a Date field unless the handler already supplied one. Every response
+// path in every engine needs this, so the rule lives in one place.
+inline void ensure_date(Headers &headers) {
+    if (!headers.contains("date"))
+        headers.add_lower("date", std::string{http_date_now()});
+}
 
 } // namespace simple_http

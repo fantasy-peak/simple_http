@@ -26,4 +26,11 @@ inline std::string address_string(const boost::asio::ip::address &a) {
     return a.to_string();
 }
 
+// The peer's IP for logs and forwarding headers, or an empty string for a
+// peerless transport (UNIX socket). The emptiness is meaningful: X-Forwarded-For
+// must not gain a bogus "::" for a local socket.
+inline std::string address_string_if_specified(const boost::asio::ip::address &a) {
+    return a.is_unspecified() ? std::string{} : address_string(a);
+}
+
 } // namespace simple_http

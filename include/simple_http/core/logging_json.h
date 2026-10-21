@@ -58,25 +58,11 @@ inline std::string format_json(const LogRecord &record) {
 
 // Line-delimited JSON, one object per record. The production sink for log
 // pipelines (Loki/ELK/Datadog/CloudWatch): fields stay typed and queryable.
-class JsonSink final : public LogSink {
+class JsonSink final : public FileSinkBase {
   public:
-    JsonSink(LogLevel minimum, std::FILE *stream) : m_minimum(minimum), m_stream(stream) {}
+    using FileSinkBase::FileSinkBase;
 
-    bool enabled(LogLevel level) const noexcept override {
-        return static_cast<std::uint8_t>(level) >= static_cast<std::uint8_t>(m_minimum);
-    }
-
-    void log(const LogRecord &record) override {
-        const std::string line = format_json(record);
-        const std::lock_guard lock{m_mutex};
-        std::fwrite(line.data(), 1, line.size(), m_stream);
-        std::fflush(m_stream);
-    }
-
-  private:
-    LogLevel m_minimum;
-    std::FILE *m_stream;
-    std::mutex m_mutex;
+    void log(const LogRecord &record) override { write_line(format_json(record)); }
 };
 
 } // namespace detail

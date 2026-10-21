@@ -108,4 +108,12 @@ inline uint32_t read_u32(std::string_view buf, std::size_t off) {
            static_cast<uint32_t>(static_cast<unsigned char>(buf[off + 3]));
 }
 
+// Appends a 32-bit big-endian integer, the write-side counterpart of read_u32.
+inline void append_u32(std::string &out, uint32_t v) {
+    out.push_back(static_cast<char>((v >> 24) & 0xFF));
+    out.push_back(static_cast<char>((v >> 16) & 0xFF));
+    out.push_back(static_cast<char>((v >> 8) & 0xFF));
+    out.push_back(static_cast<char>(v & 0xFF));
+}
+
 } // namespace simple_http::codec

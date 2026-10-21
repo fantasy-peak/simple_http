@@ -50,41 +50,21 @@ template <typename Socket> class TlsTransport {
     }
 
     asio::awaitable<IoResult> async_read_some(ByteSpan buffer) {
-        auto [ec, n] = co_await m_stream->async_read_some(asio::buffer(buffer.data(), buffer.size()),
-                                                          asio::as_tuple(asio::use_awaitable));
-        co_return IoResult{ec, n};
+        co_return co_await detail::stream_read_some(*m_stream, buffer);
     }
 
-    // Reads exactly `buffer.size()` bytes. Composed operation: it completes when
-    // the buffer is full, or with an error (EOF included) after a partial read -
-    // the result still reports the bytes read.
     asio::awaitable<IoResult> async_read(ByteSpan buffer) {
-        auto [ec, n] = co_await asio::async_read(*m_stream, asio::buffer(buffer.data(), buffer.size()),
-                                                 asio::as_tuple(asio::use_awaitable));
-        co_return IoResult{ec, n};
+        co_return co_await detail::stream_read_exact(*m_stream, buffer);
     }
 
     asio::awaitable<IoResult> async_write(ConstByteSpan buffer) {
-        auto [ec, n] = co_await asio::async_write(*m_stream, asio::buffer(buffer.data(), buffer.size()),
-                                                  asio::as_tuple(asio::use_awaitable));
-        co_return IoResult{ec, n};
+        co_return co_await detail::stream_write_all(*m_stream, buffer);
     }
-    // Writes several buffers as one operation (one TLS record batch), so a frame
-    // header and its payload need not be concatenated first. Like async_write
-    // this is a composed operation: it completes only once every byte has been
-    // written.
+
+    // Writes several buffers as one TLS record batch, so a frame header and its
+    // payload need not be concatenated first.
     asio::awaitable<IoResult> async_write_seq(std::span<const ConstByteSpan> buffers) {
-        // See TcpTransport::async_write_seq: the cap is a backstop against silent
-        // truncation, not a limit any caller in this library approaches.
-        assert(buffers.size() <= kMaxWriteBuffers);
-        const std::size_t count = std::min<std::size_t>(buffers.size(), kMaxWriteBuffers);
-        std::array<asio::const_buffer, 8> bufs{};
-        for (std::size_t i = 0; i < count; ++i) {
-            bufs[i] = asio::buffer(buffers[i].data(), buffers[i].size());
-        }
-        auto [ec, n] = co_await asio::async_write(*m_stream, std::span<const asio::const_buffer>{bufs.data(), count},
-                                                  asio::as_tuple(asio::use_awaitable));
-        co_return IoResult{ec, n};
+        co_return co_await detail::stream_write_seq(*m_stream, buffers);
     }
 
     auto get_executor() { return m_stream->get_executor(); }
@@ -93,14 +73,7 @@ template <typename Socket> class TlsTransport {
 
     SslHandle tls_handle() const { return m_stream->native_handle(); }
 
-    void close() {
-        auto &lowest = m_stream->lowest_layer();
-        if (lowest.is_open()) {
-            error_code ec;
-            lowest.shutdown(asio::socket_base::shutdown_both, ec);
-            lowest.close(ec);
-        }
-    }
+    void close() { shutdown_socket(m_stream->lowest_layer()); }
 
     Stream &stream() { return *m_stream; }
     const std::shared_ptr<Stream> &stream_ptr() const { return m_stream; }

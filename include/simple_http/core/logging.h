@@ -197,16 +197,35 @@ inline std::string attr_text(const Attr &attr) {
     return out;
 }
 
-// A one-line-per-record text sink on a stdio stream. Enough for examples, tests
-// and small tools; a deployment usually installs its own. Attributes are
-// appended as ` key=value`.
-class StreamSink final : public LogSink {
+// Shared tail of the stdio-backed sinks: the level gate and one locked,
+// flushed fwrite per record. Subclasses supply only the formatted line.
+class FileSinkBase : public LogSink {
   public:
-    StreamSink(LogLevel minimum, std::FILE *stream) : m_minimum(minimum), m_stream(stream) {}
+    FileSinkBase(LogLevel minimum, std::FILE *stream) : m_minimum(minimum), m_stream(stream) {}
 
     bool enabled(LogLevel level) const noexcept override {
         return static_cast<std::uint8_t>(level) >= static_cast<std::uint8_t>(m_minimum);
     }
+
+  protected:
+    void write_line(std::string_view line) {
+        const std::lock_guard lock{m_mutex};
+        std::fwrite(line.data(), 1, line.size(), m_stream);
+        std::fflush(m_stream);
+    }
+
+  private:
+    LogLevel m_minimum;
+    std::FILE *m_stream;
+    std::mutex m_mutex;
+};
+
+// A one-line-per-record text sink on a stdio stream. Enough for examples, tests
+// and small tools; a deployment usually installs its own. Attributes are
+// appended as ` key=value`.
+class StreamSink final : public FileSinkBase {
+  public:
+    using FileSinkBase::FileSinkBase;
 
     void log(const LogRecord &record) override {
         // One string, one fwrite, under a lock: concurrent records must not
@@ -220,15 +239,8 @@ class StreamSink final : public LogSink {
             line += attr_text(attr);
         }
         line.push_back('\n');
-        const std::lock_guard lock{m_mutex};
-        std::fwrite(line.data(), 1, line.size(), m_stream);
-        std::fflush(m_stream);
+        write_line(line);
     }
-
-  private:
-    LogLevel m_minimum;
-    std::FILE *m_stream;
-    std::mutex m_mutex;
 };
 
 // Line-delimited JSON, one object per record. The production sink for log

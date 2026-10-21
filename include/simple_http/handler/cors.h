@@ -32,7 +32,7 @@
 #include <utility>
 #include <vector>
 
-#include "../core/content_encoding.h" // trim_ascii
+#include "../core/http_field.h" // trim_ows
 #include "../core/http_field.h"
 #include "../core/http_method.h"
 #include "../core/http_status.h"
@@ -203,7 +203,7 @@ inline bool all_headers_allowed(const std::vector<std::string> &allowed, std::st
     for (;;) {
         const auto comma = requested.find(',', pos);
         const auto len = comma == std::string_view::npos ? std::string_view::npos : comma - pos;
-        const std::string_view name = trim_ascii(requested.substr(pos, len));
+        const std::string_view name = trim_ows(requested.substr(pos, len));
         if (!name.empty() && !list_contains(allowed, name)) {
             return false;
         }
@@ -230,7 +230,7 @@ inline void apply_preflight(const CorsConfig &cfg, const RequestPtr &req, const 
     if (!cfg.allow_methods.empty()) {
         res->header(field::access_control_allow_methods, join(cfg.allow_methods, ", "));
     } else if (auto requested = req->header(field::access_control_request_method)) {
-        const auto method = trim_ascii(*requested);
+        const auto method = trim_ows(*requested);
         if (is_http_token(method) && method.size() <= kMaxEchoedMethodBytes) {
             res->header(field::access_control_allow_methods, std::string{method});
         }
@@ -238,7 +238,7 @@ inline void apply_preflight(const CorsConfig &cfg, const RequestPtr &req, const 
 
     // Configured means enforced; unconfigured means echo, bounded.
     if (auto requested = req->header(field::access_control_request_headers)) {
-        const auto value = trim_ascii(*requested);
+        const auto value = trim_ows(*requested);
         if (value.empty()) {
             if (!cfg.allow_headers.empty()) {
                 res->header(field::access_control_allow_headers, join(cfg.allow_headers, ", "));

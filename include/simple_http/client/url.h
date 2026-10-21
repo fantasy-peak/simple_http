@@ -78,15 +78,6 @@ inline bool url_scheme_char(char c) {
            c == '.';
 }
 
-inline std::string url_lower(std::string_view s) {
-    std::string out{s};
-    for (auto &c : out) {
-        if (c >= 'A' && c <= 'Z')
-            c = static_cast<char>(c - 'A' + 'a');
-    }
-    return out;
-}
-
 inline bool url_valid_port(std::string_view s, std::uint16_t &out) {
     if (s.empty() || s.size() > 5)
         return false;
@@ -111,7 +102,7 @@ inline std::expected<Url, error_code> parse_url(std::string_view url) {
     if (sep == std::string_view::npos || sep == 0) {
         return std::unexpected{make_error_code(client_errc::bad_url)};
     }
-    std::string scheme = detail::url_lower(url.substr(0, sep));
+    std::string scheme = ascii_lower_copy(url.substr(0, sep));
     for (char c : scheme) {
         if (!detail::url_scheme_char(c))
             return std::unexpected{make_error_code(client_errc::bad_url)};

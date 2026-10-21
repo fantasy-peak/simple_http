@@ -71,31 +71,23 @@ inline std::string base64_encode(std::string_view in) {
     return detail::base64_encode_alphabet(base64_std_alphabet, in, true);
 }
 
-// Decodes standard base64 (RFC 4648 §4): '=' padding is accepted and ignored,
-// and decoding stops at the first character outside the alphabet, exactly like
-// the base64url decoder below.
-inline std::string base64_decode(std::string_view in) {
-    static constexpr std::array<int, 256> rev = [] {
-        std::array<int, 256> table{};
-        table.fill(-1);
-        for (int i = 0; i < 64; ++i) {
-            table[static_cast<unsigned char>(base64_std_alphabet[i])] = i;
-        }
-        return table;
-    }();
+namespace detail {
 
+// Shared decoder core. Both alphabets are 64 characters with no '=' entry, so
+// the first character outside the table (including padding) ends the payload;
+// the two public decoders differ only in the reverse table they pass.
+inline std::string base64_decode_alphabet(const std::array<int, 256> &rev, std::string_view in) {
     std::string out;
     out.reserve(in.size() * 3 / 4);
+    // Masked to the bits not yet emitted, exactly as in the encoder: left
+    // unmasked, `val << 6` walks into the sign bit and the shift becomes
+    // undefined behaviour rather than merely wrong output.
     std::uint32_t val = 0;
     int bits = -8;
     for (unsigned char c : in) {
-        if (c == '=') {
-            break; // padding ends the payload
-        }
         const int mapped = rev[c];
-        if (mapped == -1) {
+        if (mapped == -1)
             break;
-        }
         val = ((val << 6) | static_cast<std::uint32_t>(mapped)) & 0xFFFFFFu;
         bits += 6;
         if (bits >= 0) {
@@ -106,42 +98,42 @@ inline std::string base64_decode(std::string_view in) {
     return out;
 }
 
+inline const std::array<int, 256> &base64_std_reverse() {
+    static constexpr std::array<int, 256> rev = [] {
+        std::array<int, 256> table{};
+        table.fill(-1);
+        for (int i = 0; i < 64; ++i)
+            table[static_cast<unsigned char>(base64_std_alphabet[i])] = i;
+        return table;
+    }();
+    return rev;
+}
+
+inline const std::array<int, 256> &base64_url_reverse() {
+    static constexpr std::array<int, 256> rev = [] {
+        std::array<int, 256> table{};
+        table.fill(-1);
+        for (int i = 0; i < 64; ++i)
+            table[static_cast<unsigned char>(base64_url_alphabet[i])] = i;
+        return table;
+    }();
+    return rev;
+}
+
+} // namespace detail
+
+// Decodes standard base64 (RFC 4648 §4): '=' padding is accepted and ignored,
+// and decoding stops at the first character outside the alphabet, exactly like
+// the base64url decoder below.
+inline std::string base64_decode(std::string_view in) {
+    return detail::base64_decode_alphabet(detail::base64_std_reverse(), in);
+}
+
 // Decodes standard base64url, stopping at the first character outside the
 // alphabet (see the test that pins that: a stray '=' or space ends the
 // payload).
 inline std::string base64_url_decode(std::string_view in) {
-    // Character -> 6-bit value, or -1. Constant-initialized at compile time:
-    // this used to be a 1 KiB array filled on every call, and then a
-    // runtime-initialized function-local static with a first-call guard.
-    static constexpr std::array<int, 256> rev = [] {
-        std::array<int, 256> table{};
-        table.fill(-1);
-        for (int i = 0; i < 64; ++i) {
-            table[static_cast<unsigned char>(base64_url_alphabet[i])] = i;
-        }
-        return table;
-    }();
-
-    std::string out;
-    out.reserve(in.size() * 3 / 4);
-    // Masked to the bits not yet emitted, exactly as in the encoder: left
-    // unmasked, `val << 6` walks into the sign bit and the shift becomes
-    // undefined behaviour rather than merely wrong output.
-    std::uint32_t val = 0;
-    int bits = -8;
-    for (unsigned char c : in) {
-        const int mapped = rev[c];
-        if (mapped == -1) {
-            break;
-        }
-        val = ((val << 6) | static_cast<std::uint32_t>(mapped)) & 0xFFFFFFu;
-        bits += 6;
-        if (bits >= 0) {
-            out.push_back(static_cast<char>((val >> bits) & 0xFF));
-            bits -= 8;
-        }
-    }
-    return out;
+    return detail::base64_decode_alphabet(detail::base64_url_reverse(), in);
 }
 
 } // namespace simple_http

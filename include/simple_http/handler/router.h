@@ -1194,16 +1194,11 @@ class Router {
         return out;
     }
 
-    struct string_hash {
-        using is_transparent = void;
-        std::size_t operator()(std::string_view s) const { return std::hash<std::string_view>{}(s); }
-    };
-
     // A path's handlers, keyed by HTTP method: one slot per Method (indexed by
     // the enum value), plus an any-method slot for `any_methods`. GET's implied
     // HEAD is expanded into the HEAD slot here, so an explicit HEAD registration
     // simply overrides it. This is the "store by (method, path)" shape.
-    std::unordered_map<std::string, MethodTable, string_hash, std::equal_to<>> m_exact;
+    std::unordered_map<std::string, MethodTable, StringHash, std::equal_to<>> m_exact;
     // Path-template routes, indexed in a segment trie (see TrieNode); each
     // terminal holds the same per-method table. Literal templates stay in
     // `m_exact`; only paths containing `{name}` land here.
@@ -1237,13 +1232,13 @@ class Router {
     mutable std::atomic<bool> m_chain_built{false};
     mutable std::mutex m_chain_mutex;
 
-    std::unordered_map<std::string, WsRouteEntry, string_hash, std::equal_to<>> m_ws_exact;
+    std::unordered_map<std::string, WsRouteEntry, StringHash, std::equal_to<>> m_ws_exact;
     std::vector<std::pair<RegexRoute, WsRouteEntry>> m_ws_regex;
 
-    std::unordered_map<std::string, WsProxyTarget, string_hash, std::equal_to<>> m_ws_proxy_exact;
+    std::unordered_map<std::string, WsProxyTarget, StringHash, std::equal_to<>> m_ws_proxy_exact;
     std::vector<std::pair<RegexRoute, WsProxyTarget>> m_ws_proxy_regex;
 
-    std::unordered_map<std::string, HttpProxyRoute, string_hash, std::equal_to<>> m_http_proxy_exact;
+    std::unordered_map<std::string, HttpProxyRoute, StringHash, std::equal_to<>> m_http_proxy_exact;
     std::vector<std::pair<RegexRoute, HttpProxyRoute>> m_http_proxy_regex;
 };
 

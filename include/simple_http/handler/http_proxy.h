@@ -44,6 +44,7 @@
 //     §10.1.1 permits an intermediary to), so a backend cannot reject the body
 //     before it arrives.
 
+#include <algorithm>
 #include <array>
 #include <boost/asio.hpp>
 #include <boost/asio/experimental/awaitable_operators.hpp>
@@ -73,95 +74,6 @@ namespace simple_http {
 namespace asio = boost::asio;
 
 namespace detail {
-
-// Hop-by-hop headers that must not be forwarded (RFC 9110 §7.6.1). Field names
-// are compared lowercased (Headers stores them lowercased already).
-inline bool is_hop_by_hop(std::string_view name) {
-    static constexpr std::string_view kHop[] = {
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "proxy-connection",
-        "te",
-        "trailer",
-        "transfer-encoding",
-        "upgrade",
-        // RFC 7540 §3.2.2.2: only meaningful for the h2c Upgrade request.
-        "http2-settings",
-    };
-    for (auto h : kHop) {
-        if (name == h)
-            return true;
-    }
-    return false;
-}
-
-inline std::string to_lower(std::string_view s) {
-    std::string out{s};
-    for (auto &c : out)
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return out;
-}
-
-// Every value of the Connection header names a field that is hop-by-hop for
-// this connection. Multiple Connection fields are legal in HTTP/1.x (Go's
-// removeHopByHopHeaders iterates all of them), so reading only the first one
-// would leave a second field's nominated headers attached to the upstream
-// message.
-inline std::vector<std::string> connection_tokens(const Headers &headers) {
-    std::vector<std::string> tokens;
-    for (auto conn : headers.get_all("connection")) {
-        std::string_view v{conn};
-        std::size_t pos = 0;
-        while (pos < v.size()) {
-            std::size_t comma = v.find(',', pos);
-            std::string_view tok =
-                v.substr(pos, comma == std::string_view::npos ? std::string_view::npos : comma - pos);
-            // trim OWS
-            while (!tok.empty() && (tok.front() == ' ' || tok.front() == '\t'))
-                tok.remove_prefix(1);
-            while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\t'))
-                tok.remove_suffix(1);
-            if (!tok.empty())
-                tokens.push_back(to_lower(tok));
-            if (comma == std::string_view::npos)
-                break;
-            pos = comma + 1;
-        }
-    }
-    return tokens;
-}
-
-inline bool contains_token(const std::vector<std::string> &tokens, std::string_view name) {
-    for (const auto &t : tokens) {
-        if (t == name)
-            return true;
-    }
-    return false;
-}
-
-// Whether a single comma-separated field value contains `lower_token`
-// (case-insensitively). Go's httpguts.HeaderValuesContainsToken, used to keep
-// `TE: trailers` alive across the proxy.
-inline bool value_has_token(std::string_view value, std::string_view lower_token) {
-    std::size_t pos = 0;
-    while (pos <= value.size()) {
-        std::size_t comma = value.find(',', pos);
-        std::string_view tok =
-            value.substr(pos, comma == std::string_view::npos ? std::string_view::npos : comma - pos);
-        while (!tok.empty() && (tok.front() == ' ' || tok.front() == '\t'))
-            tok.remove_prefix(1);
-        while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\t'))
-            tok.remove_suffix(1);
-        if (to_lower(tok) == lower_token)
-            return true;
-        if (comma == std::string_view::npos)
-            break;
-        pos = comma + 1;
-    }
-    return false;
-}
 
 // Fences one client awaitable against the request-scoped cancellation token.
 // operator|| waits for the loser to finish before returning, so the caller can
@@ -239,13 +151,13 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
     {
         bool connection_upgrade = false;
         for (auto conn : req->headers().get_all("connection")) {
-            if (detail::value_has_token(conn, "upgrade")) {
+            if (value_has_token(conn, "upgrade")) {
                 connection_upgrade = true;
                 break;
             }
         }
         if (connection_upgrade) {
-            if (auto upgrade = req->header("upgrade"); upgrade && !detail::value_has_token(*upgrade, "h2c")) {
+            if (auto upgrade = req->header("upgrade"); upgrade && !value_has_token(*upgrade, "h2c")) {
                 SIMPLE_HTTP_ERROR_LOG("http-proxy: refusing unsupported Upgrade '{}'", *upgrade);
                 co_await send_error(status::not_implemented, make_error_code(asio::error::operation_not_supported));
                 co_return;
@@ -290,10 +202,11 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
     // Connection header lists, and minus the forwarding fields this proxy
     // authors itself. Go's Rewrite mode strips the latter before the hook runs;
     // the hook can copy them back from `in` when a deployment needs that.
-    auto req_conn_tokens = detail::connection_tokens(req->headers());
+    auto req_conn_tokens = connection_tokens(req->headers());
     std::vector<std::string_view> prior_xff;
     for (const auto &[name, value] : req->headers()) {
-        if (detail::is_hop_by_hop(name) || detail::contains_token(req_conn_tokens, name))
+        if (is_hop_by_hop_field(name) ||
+            std::find(req_conn_tokens.begin(), req_conn_tokens.end(), name) != req_conn_tokens.end())
             continue;
         if (name == "host" || name == "expect" || name == "content-length")
             continue;
@@ -349,7 +262,7 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
     // is told the response may end in a trailer section, which the proxy then
     // forwards. Dropping it silently breaks grpc-status trailers.
     for (auto te : req->headers().get_all("te")) {
-        if (detail::value_has_token(te, "trailers")) {
+        if (value_has_token(te, "trailers")) {
             spec->mutable_headers().add_lower("te", "trailers");
             break;
         }
@@ -369,7 +282,7 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
     // allows an intermediary to), otherwise this read would block until the
     // client gives up.
     if (auto expect = req->header("expect");
-        expect && detail::to_lower(*expect).find("100-continue") != std::string::npos) {
+        expect && ascii_lower_copy(*expect).find("100-continue") != std::string::npos) {
         (void)co_await res->writer().send_continue();
     }
     std::string first_chunk;
@@ -528,9 +441,10 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
 
         // --- response head: strip hop-by-hop fields, then let the hook adjust ---
         Headers out_headers;
-        const auto resp_conn_tokens = detail::connection_tokens(head->headers);
+        const auto resp_conn_tokens = connection_tokens(head->headers);
         for (const auto &[name, value] : head->headers) {
-            if (detail::is_hop_by_hop(name) || detail::contains_token(resp_conn_tokens, name))
+            if (is_hop_by_hop_field(name) ||
+                std::find(resp_conn_tokens.begin(), resp_conn_tokens.end(), name) != resp_conn_tokens.end())
                 continue;
             // We stream the body, so the upstream Content-Length is replaced by
             // our own framing — except for HEAD (and 304, where it describes the

@@ -36,6 +36,9 @@
 
 #include <zlib.h>
 
+#include "../core/http_field.h" // trim_ows
+#include "../core/types.h"      // iequals_ci
+
 namespace simple_http {
 
 // The accepted permessage-deflate parameters, named from the *server's* point
@@ -58,42 +61,11 @@ struct WsDeflateConfig {
 
 namespace detail {
 
-// The one search within a Sec-WebSocket-Extensions offer we back: nothing is
-// case-sensitive in there except the parameter values.
-inline bool ws_ieq(std::string_view a, std::string_view name) {
-    if (a.size() != name.size()) {
-        return false;
-    }
-    for (std::size_t i = 0; i < a.size(); ++i) {
-        const char x = a[i];
-        const char y = name[i];
-        if (x >= 'A' && x <= 'Z') {
-            if (x - 'A' + 'a' != y) {
-                return false;
-            }
-        } else if (x != y) {
-            return false;
-        }
-    }
-    return true;
-}
-
-// Trims RFC 7230 optional whitespace (SP / HTAB).
-inline std::string_view trim_ows(std::string_view s) {
-    while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) {
-        s.remove_prefix(1);
-    }
-    while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) {
-        s.remove_suffix(1);
-    }
-    return s;
-}
-
 // Whether one comma-separated part of Sec-WebSocket-Extensions names
 // permessage-deflate (its parameters, if any, follow the first ';').
 inline bool ws_part_is_permessage_deflate(std::string_view part) {
     const std::size_t semi = part.find(';');
-    return ws_ieq(trim_ows(part.substr(0, semi)), "permessage-deflate");
+    return iequals_ci(trim_ows(part.substr(0, semi)), "permessage-deflate");
 }
 
 } // namespace detail
@@ -119,8 +91,8 @@ inline std::optional<WsDeflateConfig> ws_parse_deflate_offer(std::string_view ex
     std::size_t pos = 0;
     while (pos <= extensions.size()) {
         const std::size_t comma = extensions.find(',', pos);
-        const std::string_view part = detail::trim_ows(
-            extensions.substr(pos, comma == std::string_view::npos ? std::string_view::npos : comma - pos));
+        const std::string_view part =
+            trim_ows(extensions.substr(pos, comma == std::string_view::npos ? std::string_view::npos : comma - pos));
         if (comma == std::string_view::npos) {
             pos = extensions.size() + 1;
         } else {
@@ -154,8 +126,8 @@ inline std::optional<WsDeflateConfig> ws_parse_one_deflate_part(std::string_view
     std::size_t p = semi == std::string_view::npos ? part.size() : semi + 1;
     while (p <= part.size()) {
         const std::size_t next_semi = part.find(';', p);
-        const std::string_view token = detail::trim_ows(
-            part.substr(p, next_semi == std::string_view::npos ? std::string_view::npos : next_semi - p));
+        const std::string_view token =
+            trim_ows(part.substr(p, next_semi == std::string_view::npos ? std::string_view::npos : next_semi - p));
         if (next_semi == std::string_view::npos) {
             p = part.size() + 1;
         } else {
@@ -165,10 +137,10 @@ inline std::optional<WsDeflateConfig> ws_parse_one_deflate_part(std::string_view
             continue;
         }
         const std::size_t eq = token.find('=');
-        const std::string_view pname = detail::trim_ows(token.substr(0, eq));
+        const std::string_view pname = trim_ows(token.substr(0, eq));
         std::string_view pvalue{};
         if (eq != std::string_view::npos) {
-            pvalue = detail::trim_ows(token.substr(eq + 1));
+            pvalue = trim_ows(token.substr(eq + 1));
         }
 
         const auto bits8_15 = [](std::string_view v) -> std::optional<int> {
@@ -181,7 +153,7 @@ inline std::optional<WsDeflateConfig> ws_parse_one_deflate_part(std::string_view
             return std::nullopt;
         };
 
-        if (detail::ws_ieq(pname, "server_no_context_takeover")) {
+        if (iequals_ci(pname, "server_no_context_takeover")) {
             if (offered_snct) {
                 return std::nullopt; // duplicate
             }
@@ -189,7 +161,7 @@ inline std::optional<WsDeflateConfig> ws_parse_one_deflate_part(std::string_view
                 return std::nullopt; // a value is not allowed here
             }
             offered_snct = true;
-        } else if (detail::ws_ieq(pname, "client_no_context_takeover")) {
+        } else if (iequals_ci(pname, "client_no_context_takeover")) {
             if (offered_cnct) {
                 return std::nullopt;
             }
@@ -197,7 +169,7 @@ inline std::optional<WsDeflateConfig> ws_parse_one_deflate_part(std::string_view
                 return std::nullopt;
             }
             offered_cnct = true;
-        } else if (detail::ws_ieq(pname, "server_max_window_bits")) {
+        } else if (iequals_ci(pname, "server_max_window_bits")) {
             if (offered_server_bits) {
                 return std::nullopt;
             }
@@ -206,7 +178,7 @@ inline std::optional<WsDeflateConfig> ws_parse_one_deflate_part(std::string_view
                 return std::nullopt;
             }
             offered_server_bits = bits;
-        } else if (detail::ws_ieq(pname, "client_max_window_bits")) {
+        } else if (iequals_ci(pname, "client_max_window_bits")) {
             if (offered_client_bits || client_bits_bare) {
                 return std::nullopt;
             }

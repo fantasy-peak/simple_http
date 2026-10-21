@@ -23,6 +23,7 @@
 #include <string_view>
 
 #include "compression.h"
+#include "http_field.h" // trim_ows / value_has_token
 
 #include <brotli/decode.h>
 #include <brotli/encode.h>
@@ -44,48 +45,20 @@ inline bool ends_with_ci(std::string_view s, std::string_view suffix) {
     return s.size() >= suffix.size() && iequals_ci(s.substr(s.size() - suffix.size()), suffix);
 }
 
-inline std::string_view trim_ascii(std::string_view s) {
-    while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) {
-        s.remove_prefix(1);
-    }
-    while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) {
-        s.remove_suffix(1);
-    }
-    return s;
-}
-
-// True when a comma-separated header value contains `token` (case-insensitive).
-// Used for `Vary` and `Cache-Control` membership tests.
-inline bool header_has_token(std::string_view value, std::string_view token) {
-    std::size_t pos = 0;
-    for (;;) {
-        const auto comma = value.find(',', pos);
-        const std::string_view item =
-            trim_ascii(value.substr(pos, comma == std::string_view::npos ? std::string_view::npos : comma - pos));
-        if (iequals_ci(item, token)) {
-            return true;
-        }
-        if (comma == std::string_view::npos) {
-            return false;
-        }
-        pos = comma + 1;
-    }
-}
-
 // "text/html; charset=utf-8" -> "text/html"
 inline std::string_view mime_essence(std::string_view content_type) {
     const auto semi = content_type.find(';');
     if (semi != std::string_view::npos) {
         content_type = content_type.substr(0, semi);
     }
-    return trim_ascii(content_type);
+    return trim_ows(content_type);
 }
 
 // Parses the value of an Accept-Encoding q parameter ("0", "1", "0.8", ".5").
 // Anything unparseable yields 0, which reads as "not acceptable" - the safe
 // direction, since it only ever suppresses compression.
 inline double parse_qvalue(std::string_view s) {
-    s = trim_ascii(s);
+    s = trim_ows(s);
     double value = 0.0;
     bool seen_dot = false;
     double scale = 0.1;
@@ -465,12 +438,12 @@ inline std::optional<std::string> negotiate_encoding(std::string_view accept_enc
             accept_encoding.substr(pos, comma == std::string_view::npos ? std::string_view::npos : comma - pos);
         pos = (comma == std::string_view::npos) ? accept_encoding.size() + 1 : comma + 1;
 
-        token = trim_ascii(token);
+        token = trim_ows(token);
         if (token.empty()) {
             continue;
         }
         const auto semi = token.find(';');
-        const std::string_view name = trim_ascii(semi == std::string_view::npos ? token : token.substr(0, semi));
+        const std::string_view name = trim_ows(semi == std::string_view::npos ? token : token.substr(0, semi));
         double q = 1.0;
         if (semi != std::string_view::npos) {
             std::string_view params = token.substr(semi + 1);

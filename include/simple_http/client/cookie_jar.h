@@ -177,13 +177,13 @@ class CookieJar {
             return std::nullopt;
         }
         Cookie out;
-        out.name = std::string{trim(header.substr(0, eq))};
+        out.name = std::string{trim_ows(header.substr(0, eq))};
         if (out.name.empty()) {
             return std::nullopt;
         }
         const std::string_view first_value =
             header.substr(eq + 1, semi == std::string_view::npos ? std::string_view::npos : semi - eq - 1);
-        out.value = std::string{trim(first_value)};
+        out.value = std::string{trim_ows(first_value)};
         out.domain = url.host; // host-only default
         out.path = request_directory(url.path());
 
@@ -193,11 +193,11 @@ class CookieJar {
         for (;;) {
             const std::size_t next = header.find(';', pos);
             const std::string_view attr =
-                trim(header.substr(pos, next == std::string_view::npos ? std::string_view::npos : next - pos));
+                trim_ows(header.substr(pos, next == std::string_view::npos ? std::string_view::npos : next - pos));
             const std::size_t attr_eq = attr.find('=');
-            const std::string_view key = trim(attr.substr(0, attr_eq));
+            const std::string_view key = trim_ows(attr.substr(0, attr_eq));
             std::string_view val =
-                attr_eq == std::string_view::npos ? std::string_view{} : trim(attr.substr(attr_eq + 1));
+                attr_eq == std::string_view::npos ? std::string_view{} : trim_ows(attr.substr(attr_eq + 1));
             if (iequals_ci(key, "domain")) {
                 if (!val.empty() && val.front() == '.') {
                     val.remove_prefix(1);
@@ -206,7 +206,7 @@ class CookieJar {
                     val.remove_suffix(1); // RFC 6265 §5.1.3: trailing dot is ignored
                 }
                 if (!val.empty()) {
-                    out.domain = lowered(val);
+                    out.domain = ascii_lower_copy(val);
                     out.host_only = false;
                 }
             } else if (iequals_ci(key, "path")) {
@@ -247,26 +247,6 @@ class CookieJar {
             return "/";
         }
         return std::string{path.substr(0, slash)};
-    }
-
-    static std::string_view trim(std::string_view s) {
-        while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) {
-            s.remove_prefix(1);
-        }
-        while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) {
-            s.remove_suffix(1);
-        }
-        return s;
-    }
-
-    static std::string lowered(std::string_view s) {
-        std::string out{s};
-        for (auto &c : out) {
-            if (c >= 'A' && c <= 'Z') {
-                c = static_cast<char>(c - 'A' + 'a');
-            }
-        }
-        return out;
     }
 
     static bool parse_unsigned(std::string_view s, std::int64_t &value) {
