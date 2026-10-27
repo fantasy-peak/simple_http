@@ -30,6 +30,16 @@
 namespace asio = boost::asio;
 namespace sh = simple_http;
 
+namespace client_test {
+// A glaze-reflectable body for the .json() builder test. It must have external
+// linkage: glaze derives field names from glz::detail::external<T>, which
+// clang rejects for types in an anonymous namespace.
+struct HttpApiPet {
+    std::int64_t id{};
+    std::string name;
+};
+} // namespace client_test
+
 namespace {
 
 int g_failed = 0;
@@ -1438,14 +1448,6 @@ asio::awaitable<void> suite_raw_peer(asio::io_context &ctx);
 
 // --- the new http:: client API (client/http.h) -------------------------------
 
-namespace {
-// A glaze-reflectable body for the .json() builder test.
-struct HttpApiPet {
-    std::int64_t id{};
-    std::string name;
-};
-} // namespace
-
 asio::awaitable<void> suite_http_api(std::uint16_t port) {
     namespace h = sh;
     const std::string base = "http://127.0.0.1:" + std::to_string(port);
@@ -1483,7 +1485,7 @@ asio::awaitable<void> suite_http_api(std::uint16_t port) {
     // json() posts a glaze-serialized body with app/json.
     {
         h::Client client{co_await asio::this_coro::executor, base_config()};
-        auto r = co_await client.post(base + "/echo").json(HttpApiPet{7, "rex"}).send();
+        auto r = co_await client.post(base + "/echo").json(client_test::HttpApiPet{7, "rex"}).send();
         std::string body;
         if (r) {
             if (auto text = co_await r->text())

@@ -48,7 +48,6 @@
 #include <array>
 #include <boost/asio.hpp>
 #include <boost/asio/experimental/awaitable_operators.hpp>
-#include <cctype>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -61,6 +60,7 @@
 #include <vector>
 
 #include "../client/http.h" // simple_http::Client — the upstream leg lives on the new API
+#include "../core/address.h"
 #include "../core/http_status.h"
 #include "../core/logging.h"
 #include "../core/types.h"
@@ -235,10 +235,18 @@ inline asio::awaitable<void> run_http_proxy(std::shared_ptr<Request> req, std::s
             xff.append(prior);
         }
     }
+    // A UNIX-socket frontend has no peer IP (the endpoint stays unspecified);
+    // forwarding "0.0.0.0" would poison per-IP policy and rate-limit keys at the
+    // backend. Leave it out — including the separator — when there is nothing
+    // real to say, so a forwarded chain never ends in an empty element.
+    const auto peer_ip = address_string_if_specified(req->peer().address());
+    if (!peer_ip.empty()) {
+        if (!xff.empty())
+            xff.append(", ");
+        xff.append(peer_ip);
+    }
     if (!xff.empty())
-        xff.append(", ");
-    xff.append(req->peer_address());
-    spec->mutable_headers().add_lower("x-forwarded-for", std::move(xff));
+        spec->mutable_headers().add_lower("x-forwarded-for", std::move(xff));
     spec->mutable_headers().add_lower("x-forwarded-proto", client_is_tls ? "https" : "http");
     if (auto host = req->header("host"))
         spec->mutable_headers().add_lower("x-forwarded-host", std::string{*host});

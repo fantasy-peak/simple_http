@@ -130,8 +130,12 @@ run_ws_proxy(std::shared_ptr<Transport> client, const ParsedHead &head, std::str
     const std::string_view inbound_path = qmark == std::string_view::npos
                                               ? std::string_view{head.target}
                                               : std::string_view{head.target}.substr(0, qmark);
-    const std::string_view inbound_query =
-        qmark == std::string_view::npos ? std::string_view{} : std::string_view{head.target}.substr(qmark + 1);
+    // An empty view (target ends in '?') is distinct from no '?' at all; the h1
+    // proxy replayed the bare '?' verbatim before this was factored out.
+    const std::optional<std::string_view> inbound_query =
+        qmark == std::string_view::npos
+            ? std::nullopt
+            : std::optional<std::string_view>{std::string_view{head.target}.substr(qmark + 1)};
     auto replay = detail::ws_proxy_replay_target(target.rewrite_path, inbound_path, inbound_query);
     if (!replay) {
         SIMPLE_HTTP_ERROR_LOG("ws-proxy: refusing a request target with CR/LF/NUL (client {})",
@@ -229,9 +233,7 @@ run_ws_proxy(std::shared_ptr<Transport> client, const ParsedHead &head, std::str
 
     auto teardown = [client, backend]() {
         client->close();
-        error_code sec;
-        backend->shutdown(asio::ip::tcp::socket::shutdown_both, sec);
-        backend->close(sec);
+        detail::ws_proxy_close(*backend);
     };
 
     // client -> backend: raw bytes off the transport, straight to the backend.

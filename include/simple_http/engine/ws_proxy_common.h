@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <optional>
 #include <random>
 #include <span>
 #include <string>
@@ -189,17 +190,19 @@ template <typename Socket> void ws_proxy_close(Socket &backend) {
 
 // The target the backend sees: the route's rewrite path when configured,
 // otherwise the frontend's path, always carrying the frontend's query string
-// (session tokens and code-server's reconnectionToken live there). Returns
-// nullopt when the result contains CR/LF/NUL — the caller answers 400 and must
-// not splice it into a request line.
+// (session tokens and code-server's reconnectionToken live there). `query` is
+// nullopt when the inbound target had no '?' at all; an engaged empty view means
+// the target ended in a bare '?', which is replayed verbatim (an h1 proxy
+// historically preserved it). Returns nullopt when the result contains
+// CR/LF/NUL — the caller answers 400 and must not splice it into a request line.
 inline std::optional<std::string> ws_proxy_replay_target(std::string_view rewrite_path, std::string_view path,
-                                                         std::string_view query) {
+                                                         std::optional<std::string_view> query) {
     std::string target{rewrite_path.empty() ? path : rewrite_path};
     if (target.empty())
         target = "/";
-    if (!query.empty()) {
+    if (query) {
         target.push_back('?');
-        target.append(query);
+        target.append(*query);
     }
     if (contains_ctl(target))
         return std::nullopt;
@@ -208,9 +211,14 @@ inline std::optional<std::string> ws_proxy_replay_target(std::string_view rewrit
 
 // Idle watchdog for a byte-level tunnel: returns true when `deadline` has
 // passed without the tunnel finishing, false when the competing transfer
-// cancelled it. The deadline is refreshed by every successful read/write.
+// cancelled it. The deadline is refreshed by every successful read/write, so it
+// is taken by reference and re-read on each wake-up: copying it would freeze the
+// first value and turn the idle timeout into a hard lifetime cap. The referent
+// lives in the calling coroutine's frame, which stays alive until the `||` race
+// returns.
 template <typename Executor>
-asio::awaitable<bool> ws_tunnel_idle_guard(const Executor &executor, std::chrono::steady_clock::time_point deadline) {
+asio::awaitable<bool> ws_tunnel_idle_guard(const Executor &executor,
+                                           const std::chrono::steady_clock::time_point &deadline) {
     for (;;) {
         if (std::chrono::steady_clock::now() >= deadline)
             co_return true;

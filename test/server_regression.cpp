@@ -2078,14 +2078,18 @@ constexpr std::string_view kUpgradeRequest = "GET /wsproxy HTTP/1.1\r\n"
 // Starts a one-listener server whose router proxies `path` to `target`.
 struct ProxyServer {
     sh::Server server;
-    explicit ProxyServer(std::uint16_t port, std::string path, sh::WsProxyTarget target) : server(make_cfg(port)) {
+    explicit ProxyServer(std::uint16_t port, std::string path, sh::WsProxyTarget target,
+                         std::chrono::seconds idle = std::chrono::seconds{0})
+        : server(make_cfg(port, idle)) {
         server.router()->ws_proxy(std::move(path), std::move(target));
     }
-    static sh::ServerConfig make_cfg(std::uint16_t port) {
+    static sh::ServerConfig make_cfg(std::uint16_t port, std::chrono::seconds idle) {
         sh::ServerConfig cfg;
         cfg.listen = sh::InetAddress{"127.0.0.1", port, false};
         cfg.worker_threads = 1;
         cfg.reuse_port = false;
+        if (idle.count() > 0)
+            cfg.limits.idle_timeout = idle;
         return cfg;
     }
 };
@@ -2192,6 +2196,65 @@ TEST_CASE("regression/ws-proxy: a chunked refusal body is relayed in full", "[re
     client.send(kUpgradeRequest);
     CHECK(client.wait_for("hello", std::chrono::seconds(2)));
     CHECK(client.wait_for("0\r\n\r\n", std::chrono::seconds(1)));
+    client.close();
+    front.server.stop();
+}
+
+// The idle watchdog has to be refreshed by traffic in either direction: if it
+// snapshots the deadline once, the "idle timeout" becomes a hard lifetime cap
+// and an actively used tunnel is cut at the same moment an idle one would be.
+TEST_CASE("regression/ws-proxy: an active tunnel outlives the idle timeout", "[regression][wsproxy]") {
+    constexpr std::uint16_t port = 27966;
+    RawBackend backend([](asio::ip::tcp::socket &socket, std::string_view request, const std::atomic<bool> &) {
+        // The proxy synthesizes its own Sec-WebSocket-Key, so the Accept has to
+        // be derived from what actually arrived.
+        constexpr std::string_view prefix{"sec-websocket-key: "};
+        std::string key;
+        if (const auto at = request.find(prefix); at != std::string_view::npos) {
+            const auto begin = at + prefix.size();
+            const auto end = request.find("\r\n", begin);
+            key.assign(request.substr(begin, end == std::string_view::npos ? end : end - begin));
+        }
+        backend_write(socket, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                              "Sec-WebSocket-Accept: " +
+                                  sh::ws_accept_key(key) + "\r\n\r\n");
+        // Byte-level echo: whatever the tunnel carries comes straight back.
+        std::array<char, 512> buf{};
+        for (;;) {
+            sh::error_code ec;
+            const auto n = socket.read_some(asio::buffer(buf), ec);
+            if (ec)
+                return;
+            backend_write(socket, std::string_view{buf.data(), static_cast<std::size_t>(n)});
+        }
+    });
+    sh::WsProxyTarget target{"127.0.0.1", backend.port(), {}};
+    target.connect_timeout = std::chrono::seconds(2);
+    ProxyServer front{port, "/wsproxy", std::move(target), std::chrono::seconds(1)};
+    REQUIRE(front.server.start());
+
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(port));
+    client.send(kUpgradeRequest);
+    REQUIRE(client.wait_for("101", std::chrono::seconds(2)));
+
+    // Keep the tunnel busy for well over its 1s idle timeout: ten pings, each
+    // followed by a 250ms slice (2.5s of traffic). Fixed counts instead of a
+    // wall-clock loop keep the assertion stable on a loaded machine.
+    constexpr std::size_t kPings = 10;
+    std::size_t pings = 0;
+    for (; pings < kPings && !client.eof(); ++pings) {
+        client.send("<ping>");
+        client.pump(std::chrono::milliseconds(250));
+    }
+    CHECK(pings == kPings);
+    CHECK_FALSE(client.eof());
+    std::size_t echoes = 0;
+    for (auto at = client.received().find("<ping>"); at != std::string::npos;
+         at = client.received().find("<ping>", at + 6))
+        ++echoes;
+    CHECK(echoes + 1 >= kPings); // the last echo may still be in flight
     client.close();
     front.server.stop();
 }

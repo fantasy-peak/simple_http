@@ -52,6 +52,7 @@
 #include <vector>
 
 #include "../core/base64.h"
+#include "../core/http_field.h" // is_connection_specific_field
 #include "../core/http_method.h"
 #include "../core/limits.h"
 #include "../core/logging.h"
@@ -751,10 +752,10 @@ class Http2ClientSession final : public ClientSession,
     }
 
     // Fields HTTP/2 forbids (RFC 9113 §8.2.2): connection-specific ones, plus
-    // `host`, whose job `:authority` does.
+    // `host`, whose job `:authority` does. The connection-specific set is the
+    // shared one the h2/h3 engines validate against.
     static bool is_connection_specific(std::string_view name) {
-        return name == "connection" || name == "keep-alive" || name == "proxy-connection" ||
-               name == "transfer-encoding" || name == "upgrade" || name == "host";
+        return is_connection_specific_field(name) || name == "host";
     }
 
     // --- serve loops ---

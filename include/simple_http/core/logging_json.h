@@ -15,7 +15,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <string_view>
 #include <variant>

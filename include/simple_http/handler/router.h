@@ -47,6 +47,7 @@
 #include "../core/http_method.h"
 #include "../core/http_status.h"
 #include "../core/logging.h"
+#include "../core/types.h"        // StringHash
 #include "../engine/dispatcher.h" // WsProxyTarget, HttpProxyTarget
 #include "cors.h"                 // CorsConfig (built-in CORS -> a Middleware)
 #include "handler.h"

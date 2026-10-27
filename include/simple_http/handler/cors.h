@@ -33,7 +33,6 @@
 #include <vector>
 
 #include "../core/http_field.h" // trim_ows
-#include "../core/http_field.h"
 #include "../core/http_method.h"
 #include "../core/http_status.h"
 #include "../core/logging.h"

@@ -53,8 +53,6 @@ inline constexpr std::size_t kMaxPathBytes = 2048;
 inline constexpr std::size_t kMaxSegmentBytes = 255;
 inline constexpr std::size_t kMaxSegments = 32;
 
-namespace detail {} // namespace detail
-
 // Decodes a request path and reduces it to a canonical lookup key.
 //
 // The result always starts with '/', never ends with '/' except for the root

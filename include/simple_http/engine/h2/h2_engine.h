@@ -33,14 +33,17 @@
 #include <cstring>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "../../core/base64.h"
+#include "../../core/http_field.h" // is_connection_specific_field / is_hop_by_hop_field
 #include "../../core/http_method.h"
 #include "../../core/limits.h"
 #include "../../core/logging.h"
@@ -2259,7 +2262,11 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
 
         // Rewrite the path and keep the client's query string — see run_ws_proxy
         // (h1) for why dropping it breaks session-carrying endpoints.
-        auto replay = detail::ws_proxy_replay_target(target.rewrite_path, request->path(), request->query());
+        // The h2 frontend only ever had a '?' when the query was non-empty.
+        const auto inbound_query = request->query();
+        auto replay = detail::ws_proxy_replay_target(
+            target.rewrite_path, request->path(),
+            inbound_query.empty() ? std::nullopt : std::optional<std::string_view>{inbound_query});
         if (!replay) {
             SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy: refusing a request target with CR/LF/NUL (client {})",
                                   address_string(peer.address()));
@@ -2394,8 +2401,12 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         // one does not cancel the other), with the idle watchdog as the only
         // early exit. This matches the h1 tunnel, which fixed the same mistake.
         if (idle.count() > 0) {
-            co_await ((backend_to_client() && client_to_backend()) ||
-                      detail::ws_tunnel_idle_guard(m_executor, deadline));
+            auto outcome = co_await ((backend_to_client() && client_to_backend()) ||
+                                     detail::ws_tunnel_idle_guard(m_executor, deadline));
+            if (const auto *timed_out = std::get_if<bool>(&outcome); timed_out && *timed_out) {
+                SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy tunnel idle for {}s (client {})",
+                                      std::chrono::duration_cast<std::chrono::seconds>(idle).count(), peer_address);
+            }
         } else {
             co_await (backend_to_client() && client_to_backend());
         }

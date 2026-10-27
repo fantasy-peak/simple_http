@@ -62,6 +62,7 @@
 #include <utility>
 #include <vector>
 
+#include "../../core/http_field.h" // is_connection_specific_field
 #include "../../core/http_method.h"
 #include "../../core/limits.h"
 #include "../../core/logging.h"

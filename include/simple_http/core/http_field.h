@@ -92,6 +92,11 @@ inline std::string_view trim_ows(std::string_view s) noexcept {
 // case-insensitive and each element is OWS-trimmed: `Connection`, `Upgrade`,
 // `Vary` and `Cache-Control` are token lists, where a substring test would make
 // "not-close" close a connection.
+// Compatibility aliases for the pre-consolidation spellings. New code should
+// use trim_ows / value_has_token; these keep downstream sources compiling after
+// the helpers moved here.
+inline std::string_view trim_ascii(std::string_view s) noexcept { return trim_ows(s); }
+
 inline bool value_has_token(std::string_view value, std::string_view token) noexcept {
     std::size_t pos = 0;
     for (;;) {
@@ -104,6 +109,13 @@ inline bool value_has_token(std::string_view value, std::string_view token) noex
             return false;
         pos = comma + 1;
     }
+}
+
+// Compatibility alias for the pre-consolidation two-argument spelling that
+// content_encoding.h exposed. proto/headers.h keeps the `Headers`-based overload
+// of the same name, so both call shapes resolve.
+inline bool header_has_token(std::string_view value, std::string_view token) noexcept {
+    return value_has_token(value, token);
 }
 
 // Hop-by-hop fields that must not be forwarded (RFC 9110 §7.6.1), plus the

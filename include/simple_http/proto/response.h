@@ -21,7 +21,6 @@
 #include <string_view>
 #include <utility>
 
-#include "../core/http_date.h"
 #include "../core/http_field.h"
 #include "../core/http_status.h"
 #include "../core/logging.h"
@@ -352,9 +351,7 @@ class ResponseWriter {
     // hand; doing it here makes the guarantee hold for every route and every
     // protocol (h1/h2/h3 all go through this ResponseWriter).
     void apply_defaults() {
-        if (!m_headers.contains("date")) {
-            m_headers.add_lower("date", std::string{http_date_now()});
-        }
+        ensure_date(m_headers);
         if (!m_headers.contains("content-type")) {
             m_headers.add_lower("content-type", "text/plain");
         }

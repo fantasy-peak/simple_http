@@ -43,6 +43,7 @@
 #include "accept_encoding.h" // AcceptEncoding, coding_q, identity_q
 #include "logging.h"
 #include "mime.h"     // by_extension
+#include "types.h"    // StringHash (the lookup's transparent hash)
 #include "url_path.h" // under_prefix
 #include "validators.h"
 
