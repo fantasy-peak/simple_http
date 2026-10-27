@@ -431,7 +431,15 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
         m_ws_proxy_lookup = std::move(ws_proxy_lookup);
         m_ws_regex_lookup = std::move(ws_regex_lookup);
         *m_deadline = std::chrono::steady_clock::now() + m_limits.idle_timeout;
-        co_await (serve_loop(dispatch, std::move(initial)) || watchdog());
+        if (m_limits.idle_timeout.count() > 0) {
+            co_await (serve_loop(dispatch, std::move(initial)) || watchdog());
+        } else {
+            // net/connection.h treats <= 0 as "no deadline" while detecting and
+            // handshaking; the engine must agree. Racing the zero-length
+            // watchdog here would complete it immediately and close every
+            // connection the moment the engine starts.
+            co_await serve_loop(dispatch, std::move(initial));
+        }
         if (!m_upgraded) {
             m_transport->close();
         }
@@ -697,6 +705,7 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
     // §3.3.3); a request with neither has no body.
     void setup_body_framing(bool chunked, std::optional<std::string_view> content_length) {
         m_body_done = false;
+        m_body_error = false;
         m_body_remaining = 0;
         m_body_total = 0;
         if (chunked) {
@@ -720,6 +729,13 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
     // Pull one body chunk on demand (Body::read calls this via the provider).
     // Returns a data chunk, end-of-body, or an error_code.
     asio::awaitable<std::expected<ReadResult, error_code>> pull_body_chunk() {
+        auto result = co_await pull_body_chunk_impl();
+        if (!result)
+            m_body_error = true; // see drain_body(): a consumed error still poisons the connection
+        co_return result;
+    }
+
+    asio::awaitable<std::expected<ReadResult, error_code>> pull_body_chunk_impl() {
         if (m_body_done)
             co_return ReadResult::end();
         switch (m_body_mode) {
@@ -841,7 +857,12 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
             if (!r)
                 co_return false; // error mid-body: cannot reuse the connection
         }
-        co_return true;
+        // A handler that reads the body can consume the error itself (read_all
+        // then answers 400). m_body_done is already set by the failing pull, so
+        // the loop above never sees it — but the connection is just as poisoned:
+        // the byte stream is no longer at a request boundary, and parsing the
+        // next request from the residual bytes is the smuggling shape.
+        co_return !m_body_error;
     }
 
     // Parses an unsigned integer (base 10 or 16) with explicit overflow and
@@ -1245,6 +1266,7 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
     std::uint64_t m_body_remaining = 0; // Fixed: bytes left to read
     std::uint64_t m_body_total = 0;     // Chunked: running total (bounded by kMaxBodyBytes)
     bool m_body_done = false;           // body fully delivered (EOF reached)
+    bool m_body_error = false;          // a pull failed: the connection is not at a request boundary
 
     std::shared_ptr<Transport> m_transport;
     decltype(std::declval<Transport &>().get_executor()) m_executor;

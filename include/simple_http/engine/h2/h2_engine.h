@@ -805,7 +805,13 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         using namespace asio::experimental::awaitable_operators;
         m_deadline = std::chrono::steady_clock::now() + m_limits.idle_timeout;
         flush(); // push our initial SETTINGS
-        co_await (read_loop() || write_loop() || watchdog());
+        if (m_limits.idle_timeout.count() > 0) {
+            co_await (read_loop() || write_loop() || watchdog());
+        } else {
+            // Same convention as h1 and net/connection.h: <= 0 disables the
+            // idle deadline (racing a zero-length timer would close instantly).
+            co_await (read_loop() || write_loop());
+        }
         m_alive = false;
         // Release every producer still parked on outbound backpressure: the write
         // loop is gone, so nothing will ever drain their queues. Also fail the

@@ -20,7 +20,9 @@ namespace simple_http {
 struct EngineLimits {
     // --- shared ---
     // Idle timeout: a connection with no bytes for this long is closed (Slowloris
-    // defense). Applies to both HTTP/1.x and HTTP/2.
+    // defense). Applies to both HTTP/1.x and HTTP/2. <= 0 disables it (the same
+    // convention net/connection.h uses for protocol detection and the TLS
+    // handshake), so no engine starts a zero-length watchdog.
     std::chrono::seconds idle_timeout{120};
 
     // --- HTTP/1.x ---

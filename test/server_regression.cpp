@@ -606,6 +606,30 @@ TEST_CASE("regression/h1: a malformed chunk size is answered then dropped", "[re
     client.close();
 }
 
+TEST_CASE("regression/h1: a chunk terminator error consumed by the handler still closes", "[regression][h1]") {
+    plain_server();
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(kPlainPort));
+
+    // The chunk data arrives, but the two bytes after it are not CRLF. /echo
+    // reads the body, consumes the framing error itself and answers 200. The
+    // engine must still close instead of parsing the pipelined GET that follows
+    // as a new request (which used to yield a second response on one connection).
+    client.send("POST /echo HTTP/1.1\r\nHost: x\r\ntransfer-encoding: chunked\r\n\r\n"
+                "5\r\nhelloXX"
+                "GET /world HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    REQUIRE(client.wait_head());
+    CHECK(client.wait_eof());
+    const std::string got = client.received();
+    CHECK(got.find("hello") == std::string::npos); // /world's body was not served
+    std::size_t status_lines = 0;
+    for (std::size_t pos = 0; (pos = got.find("HTTP/1.1 ", pos)) != std::string::npos; pos += 9)
+        ++status_lines;
+    CHECK(status_lines == 1);
+    client.close();
+}
+
 TEST_CASE("regression/h1: chunked trailers are consumed", "[regression][h1]") {
     plain_server();
     asio::io_context ctx;
@@ -698,6 +722,38 @@ TEST_CASE("regression/h1: an idle connection is closed by the watchdog", "[regre
     // reaped.
     CHECK(client.wait_eof(std::chrono::seconds(6)));
     client.close();
+}
+
+TEST_CASE("regression/h1: idle_timeout=0 disables the watchdog", "[regression][h1]") {
+    // net/connection.h treats <= 0 as "no deadline" while detecting and
+    // handshaking; the engines must agree, or a config that disables the probe
+    // timeout closes every connection the moment it is accepted.
+    constexpr std::uint16_t port = 27931;
+    sh::ServerConfig cfg = make_config(port, std::nullopt);
+    cfg.limits.idle_timeout = std::chrono::seconds(0);
+    sh::Server server{cfg};
+    register_routes(server);
+    REQUIRE(server.start().has_value());
+
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(port));
+    // A zero-length deadline fires as soon as the first exchange has been
+    // processed (the engine is running by then); a disabled one keeps the
+    // connection at a keep-alive boundary for the next request.
+    client.send("GET /world HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(client.wait_for("hello"));
+    CHECK_FALSE(client.wait_eof(std::chrono::milliseconds(500)));
+    client.send("GET /world HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    const auto hellos = [&] {
+        std::size_t n = 0;
+        for (std::size_t pos = 0; (pos = client.received().find("hello", pos)) != std::string::npos; pos += 5)
+            ++n;
+        return n;
+    };
+    CHECK(client.pump_until([&] { return hellos() >= 2; }, std::chrono::seconds(5)));
+    client.close();
+    server.stop();
 }
 
 TEST_CASE("regression/h1: Expect: 100-continue is not answered by default", "[regression][h1]") {
