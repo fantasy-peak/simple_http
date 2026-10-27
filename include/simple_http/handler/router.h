@@ -1033,7 +1033,13 @@ class Router {
     }
 
     // Walks the trie against the request path, segment by segment. A literal
-    // edge beats a param edge at each level (the more specific route wins).
+    // edge beats a param edge at each level (the more specific route wins), but
+    // a literal subtree that cannot finish the path must not kill the request:
+    // the walk backs up and tries the anonymous `{param}` sibling (the
+    // backtracking Go 1.22 ServeMux and httprouter do). Without that, a literal
+    // edge that matches the next segment but dead-ends later shadows every
+    // template that would capture it.
+    //
     // `term` points at the terminal and `values` holds the captures in path
     // order (views into the request path, valid for the request's lifetime);
     // the terminal's param_names pair them up. Returns false when no template
@@ -1044,46 +1050,68 @@ class Router {
             return false;
         }
         std::vector<std::string_view> found;
-        std::size_t node = 0;
-        std::size_t pos = 0;
-        for (;;) {
-            const TrieNode &n = trie[node];
-            const std::size_t end = path.find('/', pos);
-            const std::string_view part =
-                path.substr(pos, end == std::string_view::npos ? std::string_view::npos : end - pos);
-            const auto lit = n.literals.find(part);
-            if (lit != n.literals.end()) {
-                node = lit->second;
-            } else if (n.param_child != TrieNode::npos && !part.empty()) {
-                found.push_back(part); // anonymous edge: the value only; the
-                node = n.param_child;  // terminal remaps it to this route's names
-            } else {
-                return false;
+        term = nullptr;
+        if (!walk_template(trie, 0, path, 0, found, term))
+            return false;
+        values = std::move(found);
+        return true;
+    }
+
+    // One DFS step of match_template. `node` consumes the segment at `pos`.
+    bool walk_template(const std::vector<TrieNode> &trie, std::size_t node, std::string_view path, std::size_t pos,
+                       std::vector<std::string_view> &found, const TrieTerminal *&term) const {
+        if (node >= trie.size())
+            return false;
+        const TrieNode &n = trie[node];
+        const std::size_t end = path.find('/', pos);
+        const std::string_view part =
+            path.substr(pos, end == std::string_view::npos ? std::string_view::npos : end - pos);
+        const bool last = end == std::string_view::npos;
+
+        // Literal edge first: the more specific route wins. A terminal that
+        // matches the shape but has no handler for any method is not a hit, so
+        // fall through to the param edge instead of returning 404 here.
+        if (const auto lit = n.literals.find(part); lit != n.literals.end()) {
+            if (last) {
+                if (terminal_ready(trie, lit->second, term))
+                    return true;
+            } else if (walk_template(trie, lit->second, path, end + 1, found, term)) {
+                return true;
             }
-            if (end == std::string_view::npos) {
-                break;
-            }
-            pos = end + 1;
         }
-        // Only a *terminal* node (the walk's last segment lands where a route
-        // actually ends) is a hit; an empty table means the path is a strict
-        // prefix of a longer template and must fall through to 404. The table
-        // of a true terminal is never empty (insert_template fills it).
-        term = &trie[node].terminal;
-        if (!term->tbl.any) {
+
+        if (n.param_child != TrieNode::npos && !part.empty()) {
+            found.push_back(part); // anonymous edge: the value only; the terminal
+                                   // remaps it to this route's names
+            const bool hit = last ? terminal_ready(trie, n.param_child, term)
+                                  : walk_template(trie, n.param_child, path, end + 1, found, term);
+            if (hit)
+                return true;
+            found.pop_back(); // this branch failed: leave the captures as they were
+        }
+        return false;
+    }
+
+    // Only a *terminal* node (the walk's last segment lands where a route
+    // actually ends) with at least one handler is a hit; an empty table means
+    // the path is a strict prefix of a longer template and must fall through.
+    // The table of a true terminal is never empty (insert_template fills it).
+    static bool terminal_ready(const std::vector<TrieNode> &trie, std::size_t node, const TrieTerminal *&term) {
+        if (node >= trie.size())
+            return false;
+        const TrieTerminal &candidate = trie[node].terminal;
+        if (!candidate.tbl.any) {
             bool has_handler = false;
-            for (const auto &slot : term->tbl.by_method) {
+            for (const auto &slot : candidate.tbl.by_method) {
                 if (slot) {
                     has_handler = true;
                     break;
                 }
             }
-            if (!has_handler) {
-                term = nullptr;
+            if (!has_handler)
                 return false;
-            }
         }
-        values = std::move(found);
+        term = &candidate;
         return true;
     }
 

@@ -65,6 +65,33 @@ TEST_CASE("router: exact, regex and fallback matching", "[router]") {
     CHECK(dispatch("/exact")->last_status == 200);
 }
 
+TEST_CASE("router: a literal dead end falls back to a template sibling", "[router]") {
+    Router router;
+    // Both are template routes (each contains a {param}), so both live in the
+    // trie: /a has a literal "b" edge and a {x} edge.
+    router.route({Method::Get}, "/a/b/d/{z}", body_handler("literal"));
+    router.route({Method::Get}, "/a/{x}/c", body_handler("template"));
+
+    asio::io_context ctx;
+    // The literal "b" edge is tried first; it wants "d" next and dead-ends at
+    // "c", so the walk must back up and take {x}=b instead of answering 404.
+    CHECK(dispatch(ctx, router, make_request(ctx, "/a/b/c"))->last_body == "template");
+    // The literal route still wins where it matches.
+    CHECK(dispatch(ctx, router, make_request(ctx, "/a/b/d/q"))->last_body == "literal");
+}
+
+TEST_CASE("router: a literal node without a handler falls back to the template", "[router]") {
+    Router router;
+    router.route({Method::Get}, "/a/{x}", body_handler("template"));
+    router.route({Method::Get}, "/a/b/c/{z}", body_handler("literal"));
+
+    asio::io_context ctx;
+    // /a/b is an intermediate node for /a/b/c/{z}, not a terminal; the template
+    // sibling must still match it.
+    CHECK(dispatch(ctx, router, make_request(ctx, "/a/b"))->last_body == "template");
+    CHECK(dispatch(ctx, router, make_request(ctx, "/a/b/c/q"))->last_body == "literal");
+}
+
 TEST_CASE("router: dispatch without a fallback answers 404", "[router]") {
     Router router;
     router.route({Method::Get}, "/only", body_handler("only"));
