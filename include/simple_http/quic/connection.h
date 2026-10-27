@@ -106,6 +106,11 @@ struct QuicBootstrap {
     // client's DCID is the Retry's SCID and has to be echoed as
     // retry_source_connection_id.
     bool retried{false};
+    // The Retry packet's Source Connection ID (= the second Initial's DCID).
+    // Distinct from original_dcid, which is the *first* Initial's DCID carried
+    // inside the token; §7.3 requires echoing both, each in its own parameter.
+    std::array<std::uint8_t, NGTCP2_MAX_CIDLEN> retry_scid{};
+    std::size_t retry_scid_len{0};
     // The version the client chose (already validated against our list).
     std::uint32_t version{0};
     // The Retry token the client echoed back, if any, and ngtcp2's
@@ -507,7 +512,9 @@ template <typename Executor> bool QuicConnection<Executor>::init() {
     params.transport.original_dcid = original_dcid;
     params.transport.original_dcid_present = 1;
     if (m_bootstrap.retried) {
-        params.transport.retry_scid = original_dcid;
+        ngtcp2_cid retry_scid{};
+        ngtcp2_cid_init(&retry_scid, m_bootstrap.retry_scid.data(), m_bootstrap.retry_scid_len);
+        params.transport.retry_scid = retry_scid;
         params.transport.retry_scid_present = 1;
     }
 

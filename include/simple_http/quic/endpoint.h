@@ -402,6 +402,12 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
         ngtcp2_token_type token_type = NGTCP2_TOKEN_TYPE_UNKNOWN;
         std::array<std::uint8_t, NGTCP2_MAX_CIDLEN> original_dcid{};
         std::size_t original_dcid_len = 0;
+        // After a Retry this is the Retry packet's SCID, which the client put in
+        // the second Initial's DCID. It has to come back as
+        // retry_source_connection_id (§7.3), separately from the ODCID the token
+        // carried.
+        std::array<std::uint8_t, NGTCP2_MAX_CIDLEN> retry_scid_bytes{};
+        std::size_t retry_scid_len = 0;
         bool retried = false;
 
         if (m_config.retry) {
@@ -432,6 +438,8 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
             // *original* DCID is what the token carried.
             original_dcid_len = std::min<std::size_t>(odcid.datalen, original_dcid.size());
             std::copy(odcid.data, odcid.data + original_dcid_len, original_dcid.begin());
+            retry_scid_len = std::min<std::size_t>(vc.dcidlen, retry_scid_bytes.size());
+            std::copy(vc.dcid, vc.dcid + retry_scid_len, retry_scid_bytes.begin());
             retried = true;
             token.assign(hd.token, hd.token + hd.tokenlen);
             token_type = NGTCP2_TOKEN_TYPE_RETRY;
@@ -439,10 +447,13 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
             // Address validation off: the client's DCID is the original one.
             original_dcid_len = std::min<std::size_t>(vc.dcidlen, original_dcid.size());
             std::copy(vc.dcid, vc.dcid + original_dcid_len, original_dcid.begin());
-            if (hd.tokenlen > 0) {
-                token.assign(hd.token, hd.token + hd.tokenlen);
-                token_type = NGTCP2_TOKEN_TYPE_NEW_TOKEN;
-            }
+            // Do not classify a client-supplied token as NEW_TOKEN. This server
+            // never issues NEW_TOKEN frames, so it cannot have issued this one;
+            // ngtcp2 treats a NEW_TOKEN as proof the address was validated and
+            // lifts the 3x anti-amplification limit, which a forged source could
+            // otherwise use to reflect traffic. Drop it and stay unvalidated.
+            token.clear();
+            token_type = NGTCP2_TOKEN_TYPE_UNKNOWN;
         }
 
         QuicBootstrap bootstrap;
@@ -450,6 +461,8 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
         std::copy(hd.scid.data, hd.scid.data + bootstrap.client_scid_len, bootstrap.client_scid.begin());
         bootstrap.original_dcid = original_dcid;
         bootstrap.original_dcid_len = original_dcid_len;
+        bootstrap.retry_scid = retry_scid_bytes;
+        bootstrap.retry_scid_len = retry_scid_len;
         bootstrap.retried = retried;
         bootstrap.version = hd.version;
         bootstrap.token = std::move(token);
