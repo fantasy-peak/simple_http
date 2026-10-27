@@ -58,6 +58,12 @@ std::string rst_frame(std::uint32_t id) {
     return out;
 }
 
+std::string data_frame(std::uint32_t id, std::string_view payload) {
+    std::string out;
+    append_frame(out, H2FrameType::Data, 0, id, payload);
+    return out;
+}
+
 // Whether the server's recorded output contains a GOAWAY carrying `error_code`.
 bool has_goaway(std::string_view written, std::uint32_t error_code) {
     for (std::size_t i = 0; i + kH2FrameHeaderSize <= written.size();) {
@@ -159,6 +165,61 @@ TEST_CASE("h2/engine: a request body above max_body_bytes is refused", "[h2]") {
     REQUIRE(run_on(ctx, engine->run(dispatcher)));
 
     CHECK(has_rst_stream(transport->written(), 1, codec::H2_ENHANCE_YOUR_CALM));
+}
+
+TEST_CASE("h2/engine: DATA already in flight for a refused stream is not a connection error", "[h2]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+
+    EngineLimits limits;
+    limits.h2_max_concurrent_streams = 1;
+
+    // Stream 1 fills the table; stream 3 is refused. Its HEADERS carried
+    // END_HEADERS, so a DATA frame the client had already pipelined behind it
+    // must be treated as a frame on a closed stream, not as an idle stream
+    // (which would GOAWAY the whole connection).
+    std::string in{codec::kH2ClientPreface};
+    append_frame(in, H2FrameType::Settings, 0, 0, "");
+    in += headers_frame(1, /*end_stream=*/false);
+    in += headers_frame(3, /*end_stream=*/false);
+    in += data_frame(3, "x");
+    transport->push(std::move(in));
+
+    auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter>,
+                         SslHandle) -> asio::awaitable<void> { co_return; };
+    auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, limits);
+    REQUIRE(run_on(ctx, engine->run(dispatcher)));
+
+    CHECK(has_rst_stream(transport->written(), 3, codec::H2_REFUSED_STREAM));
+    CHECK_FALSE(has_goaway(transport->written(), codec::H2_PROTOCOL_ERROR));
+}
+
+TEST_CASE("h2/engine: a refused split head still drains its CONTINUATION frames", "[h2]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+
+    EngineLimits limits;
+    limits.h2_max_concurrent_streams = 1;
+    limits.max_header_bytes = 1024;
+
+    // The refused HEADERS has no END_HEADERS, so the peer's CONTINUATION is
+    // still in flight. The engine must consume it (without buffering or
+    // decoding) and only then treat later frames on stream 3 as closed.
+    std::string in{codec::kH2ClientPreface};
+    append_frame(in, H2FrameType::Settings, 0, 0, "");
+    in += headers_frame(1, /*end_stream=*/false);
+    append_frame(in, H2FrameType::Headers, 0, 3, "a"); // no END_HEADERS
+    append_frame(in, H2FrameType::Continuation, H2_FLAG_END_HEADERS, 3, "b");
+    in += data_frame(3, "x");
+    transport->push(std::move(in));
+
+    auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter>,
+                         SslHandle) -> asio::awaitable<void> { co_return; };
+    auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, limits);
+    REQUIRE(run_on(ctx, engine->run(dispatcher)));
+
+    CHECK(has_rst_stream(transport->written(), 3, codec::H2_REFUSED_STREAM));
+    CHECK_FALSE(has_goaway(transport->written(), codec::H2_PROTOCOL_ERROR));
 }
 
 TEST_CASE("h2/engine: well-behaved concurrency below the cap still runs", "[h2]") {

@@ -1087,6 +1087,25 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         return payload.substr(off, payload.size() - off - pad_len);
     }
 
+    // Refuses a stream while still recording it as seen: its id must advance
+    // m_next_peer_stream_id, otherwise a DATA/RST_STREAM/WINDOW_UPDATE that was
+    // already in flight on it is classified as "idle stream" and turns into a
+    // connection error (RFC 9113 §5.1). If the refused HEADERS did not carry
+    // END_HEADERS, the peer's CONTINUATION frames still have to be consumed;
+    // they are discarded (bounded by max_header_bytes) rather than treated as a
+    // header block for a stream that no longer exists.
+    bool refuse_stream(const codec::H2FrameHeader &hdr, std::size_t payload_size, std::uint32_t error_code_value) {
+        if (hdr.stream_id > m_next_peer_stream_id)
+            m_next_peer_stream_id = hdr.stream_id;
+        reset_stream(hdr.stream_id, error_code_value);
+        if (!hdr.has_flag(codec::H2_FLAG_END_HEADERS)) {
+            m_continuation_stream = hdr.stream_id;
+            m_continuation_discard = true;
+            m_continuation_discard_bytes = payload_size;
+        }
+        return true;
+    }
+
     bool on_headers(const codec::H2FrameHeader &hdr, std::string_view payload) {
         if (hdr.stream_id == 0) {
             go_away(codec::H2_PROTOCOL_ERROR);
@@ -1115,8 +1134,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         if (hdr.has_flag(codec::H2_FLAG_PRIORITY)) {
             const std::size_t off = hdr.has_flag(codec::H2_FLAG_PADDED) ? 1 : 0;
             if ((codec::read_u32(payload, off) & 0x7FFFFFFFu) == hdr.stream_id) {
-                reset_stream(hdr.stream_id, codec::H2_PROTOCOL_ERROR);
-                return true;
+                return refuse_stream(hdr, payload.size(), codec::H2_PROTOCOL_ERROR);
             }
         }
 
@@ -1128,8 +1146,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
             m_streams.size() >= m_limits.h2_max_concurrent_streams) {
             SIMPLE_HTTP_ERROR_LOG("h2: refusing stream {} ({} open, limit {})", hdr.stream_id, m_streams.size(),
                                   m_limits.h2_max_concurrent_streams);
-            reset_stream(hdr.stream_id, codec::H2_REFUSED_STREAM);
-            return true;
+            return refuse_stream(hdr, payload.size(), codec::H2_REFUSED_STREAM);
         }
         if (header_block_too_big(m_streams.contains(hdr.stream_id) ? m_streams.at(hdr.stream_id).header_block.size()
                                                                    : 0,
@@ -1196,6 +1213,26 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         if (hdr.stream_id == 0 || hdr.stream_id != m_continuation_stream) {
             go_away(codec::H2_PROTOCOL_ERROR);
             return false;
+        }
+        if (m_continuation_discard) {
+            // The stream was refused at its HEADERS: consume the rest of the
+            // split head without buffering or decoding it. The byte bound keeps
+            // a peer from turning the discard path into a CONTINUATION flood.
+            const bool too_big = payload.size() > m_limits.max_header_bytes ||
+                                 m_continuation_discard_bytes > m_limits.max_header_bytes - payload.size();
+            if (too_big) {
+                SIMPLE_HTTP_ERROR_LOG("h2: refused header block exceeds {} bytes (stream={})",
+                                      m_limits.max_header_bytes, hdr.stream_id);
+                go_away(codec::H2_ENHANCE_YOUR_CALM);
+                return false;
+            }
+            m_continuation_discard_bytes += payload.size();
+            if (hdr.has_flag(codec::H2_FLAG_END_HEADERS)) {
+                m_continuation_stream = 0;
+                m_continuation_discard = false;
+                m_continuation_discard_bytes = 0;
+            }
+            return true;
         }
         auto it = m_streams.find(hdr.stream_id);
         if (it == m_streams.end()) {
@@ -2577,6 +2614,11 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
 
     std::uint32_t m_next_peer_stream_id = 0; // highest client stream id seen
     std::uint32_t m_continuation_stream = 0; // stream awaiting CONTINUATION, or 0
+    // A refused stream's split head is drained rather than decoded: the stream
+    // was already reset, but RFC 9113 §6.10 still requires its CONTINUATION
+    // frames to be consumed (and forbids interleaving anything else).
+    bool m_continuation_discard = false;
+    std::size_t m_continuation_discard_bytes = 0;
 
     bool m_alive = true;
     bool m_goaway_sent = false;
