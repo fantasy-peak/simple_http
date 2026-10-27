@@ -2658,3 +2658,30 @@ TEST_CASE("regression/server: a real fan-out bind failure fails start()", "[regr
     CHECK(started.error().failures[0].error == sh::make_error_code(sh::server_errc::bind_failed));
     server.stop();
 }
+
+TEST_CASE("regression/quic: stop tears the endpoint down before the pool grace", "[regression][quic]") {
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+    sh::TlsConfig tls;
+    tls.cert_chain_file = "./test/tls_certificates/server_cert.pem";
+    tls.private_key_file = "./test/tls_certificates/server_key.pem";
+    sh::ServerConfig cfg = make_config(27932, tls);
+    cfg.quic = sh::QuicAddress{"127.0.0.1", 27933, false};
+    sh::Server server{cfg};
+    server.route({sh::Method::Get}, "/hello", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(200).send("hello");
+    });
+    REQUIRE(server.start().has_value());
+
+    const auto started = std::chrono::steady_clock::now();
+    server.stop();
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started);
+    // receive_loop is parked on the UDP socket and send_loop on its wake
+    // channel. If they are not released before IoCtxPool::stop(), the pool waits
+    // out its 2s drain grace on every shutdown.
+    INFO("stop() took " << elapsed.count() << " ms");
+    CHECK(elapsed.count() < 1500);
+#else
+    SUCCEED("HTTP/3 is not compiled in");
+#endif
+}

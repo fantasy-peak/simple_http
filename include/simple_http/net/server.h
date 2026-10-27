@@ -659,15 +659,31 @@ class Server {
         // the handler gets up to shutdown_grace to produce its response.
         drain_active_requests();
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
-        // Now wind the QUIC connections down. Do not close the sockets yet: a
-        // CONNECTION_CLOSE has to leave through the socket its connection
-        // arrived on, so closing the listener first would leave the peer with a
-        // port that merely stopped answering — it would wait for its own
-        // timeout instead of being told. The sockets go after the pool drains.
+        // Wind every QUIC endpoint down on its own executor, and wait for it.
+        // The CID table, the live connections, the send queue and m_closed are
+        // endpoint-thread state: walking them from this control thread races the
+        // receive loop and ngtcp2. The endpoint also flushes the CONNECTION_CLOSE
+        // packets it just generated before closing its socket, so the peer is
+        // told rather than left to time out.
+        //
+        // Doing this before m_pool->stop() also lets receive_loop (parked on the
+        // UDP socket) and send_loop (parked on its wake channel) return; closing
+        // them after the pool stop is what made every stop() wait out the full
+        // drain grace.
+        std::vector<std::future<void>> quic_teardown;
         for (auto &rt : m_quic_runtimes) {
-            for (auto &endpoint : rt->endpoints)
-                endpoint->shutdown_connections();
+            for (auto &endpoint : rt->endpoints) {
+                auto ep = endpoint;
+                auto done = std::make_shared<std::promise<void>>();
+                quic_teardown.push_back(done->get_future());
+                asio::post(ep->get_executor(), [ep, done] {
+                    ep->shutdown_on_executor();
+                    done->set_value();
+                });
+            }
         }
+        for (auto &future : quic_teardown)
+            future.wait();
 #endif
         // The same for TCP: close whatever is left (idle keep-alive connections,
         // WebSockets, and any request that outlived the grace) so those
@@ -675,10 +691,6 @@ class Server {
         shutdown_connections();
         m_pool->stop();
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
-        for (auto &rt : m_quic_runtimes) {
-            for (auto &endpoint : rt->endpoints)
-                endpoint->close();
-        }
         m_quic_runtimes.clear();
 #endif
         m_acceptors.clear();

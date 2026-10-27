@@ -143,7 +143,7 @@ struct QuicEndpointConfig {
     std::shared_ptr<std::atomic<std::size_t>> global_active;
 };
 
-template <typename Executor> class QuicEndpoint {
+template <typename Executor> class QuicEndpoint : public std::enable_shared_from_this<QuicEndpoint<Executor>> {
   public:
     using Connection = QuicConnection<Executor>;
 
@@ -217,22 +217,38 @@ template <typename Executor> class QuicEndpoint {
     // dropped instead of allocating state and a handler.
     void begin_drain() { m_draining.store(true, std::memory_order_release); }
 
+    Executor get_executor() const { return m_executor; }
+
     // Stop listening. Connections are left alone; use shutdown_connections()
-    // first to wind them down.
+    // first to wind them down. Safe from any thread: the socket and the send
+    // queue are only ever touched on this endpoint's executor.
     void close() {
-        if (m_closed)
-            return;
-        m_closed = true;
-        error_code ec;
-        (void)m_socket.close(ec);
-        (void)m_send_wake.try_send(error_code{});
-        (void)ec;
+        auto self = this->shared_from_this();
+        asio::dispatch(m_executor, [self] { self->close_on_executor(); });
     }
 
     // Ask every live connection to close. This is the shutdown path the Server
     // uses: it is not a connection error, so each connection gets a proper
-    // application close rather than a silent socket drop.
+    // application close rather than a silent socket drop. The CID table is
+    // endpoint-thread state, so the work is posted there rather than walked from
+    // the caller's thread.
     void shutdown_connections() {
+        auto self = this->shared_from_this();
+        asio::dispatch(m_executor, [self] { self->shutdown_connections_on_executor(); });
+    }
+
+    // Both of the above, on the endpoint's executor, with the socket closed only
+    // after the datagrams the closes just queued (CONNECTION_CLOSE) have been
+    // flushed. The Server posts this and waits before stopping its io_context
+    // pool — otherwise receive_loop stays parked on the UDP socket and every
+    // stop() pays the pool's full drain grace.
+    void shutdown_on_executor() {
+        shutdown_connections_on_executor();
+        close_on_executor();
+    }
+
+  private:
+    void shutdown_connections_on_executor() {
         // The CID table holds weak references, so each entry has to be promoted
         // — and a connection may legitimately be gone already.
         for (auto &[id, weak] : m_by_cid) {
@@ -241,7 +257,26 @@ template <typename Executor> class QuicEndpoint {
         }
     }
 
-  private:
+    void close_on_executor() {
+        if (m_closed)
+            return;
+        m_closed = true;
+        if (m_socket.is_open()) {
+            // Connection::close() built CONNECTION_CLOSE synchronously and queued
+            // it; the send loop is parked on m_send_wake, so flush here before
+            // the socket goes. Best-effort, like every other send on this path:
+            // a full socket buffer means the peer gets the timeout instead.
+            while (!m_send_queue.empty()) {
+                SendItem item = std::move(m_send_queue.front());
+                m_send_queue.pop_front();
+                (void)raw_send(m_socket.native_handle(), item);
+            }
+            error_code ec;
+            (void)m_socket.close(ec);
+        }
+        (void)m_send_wake.try_send(error_code{});
+    }
+
     using ConnectionPtr = std::shared_ptr<Connection>;
 
     // --- datagram in -------------------------------------------------------
