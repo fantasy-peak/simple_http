@@ -152,6 +152,12 @@ class Stream {
     // credit), h1 closes the connection.
     [[nodiscard]] asio::awaitable<void> abort() {
         (void)co_await m_stream->cancel();
+        // Release the engine's single-connection h1 gate now. Waiting for the
+        // destructor would let a caller that keeps this handle alive block every
+        // later request to the same origin on acquire() forever (the aborted
+        // session is dead, so the next request dials a new connection and then
+        // parks on a gate nobody holds).
+        m_stream->run_destroy_hook();
         co_return;
     }
 

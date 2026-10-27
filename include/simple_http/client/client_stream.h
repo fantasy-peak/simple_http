@@ -79,6 +79,17 @@ class ClientStream {
         // exchange gate (so the next request can proceed) and to close a
         // throwaway connection for a different origin. Must not touch the
         // stream — the derived members are already gone when this runs.
+        run_destroy_hook();
+    }
+
+    // Fires the destruction hook now instead of waiting for the destructor.
+    // Client::Stream::abort() uses this: an aborted exchange no longer needs
+    // the connection, and a caller that keeps the Stream handle alive must not
+    // keep the engine's HTTP/1.1 one-exchange gate with it. The hook is
+    // one-shot, so the destructor will not run it a second time.
+    void run_destroy_hook() {
+        if (m_destroy_hook_fired.exchange(true, std::memory_order_acq_rel))
+            return;
         if (m_on_destroy)
             m_on_destroy();
     }
@@ -191,6 +202,9 @@ class ClientStream {
     ResponseHead m_no_head{};
     Headers m_trailers;
     std::function<void()> m_on_destroy;
+    // Atomic: the hook may be fired early from abort() on a caller thread and
+    // again from the destructor (which can run anywhere), exactly once.
+    std::atomic<bool> m_destroy_hook_fired{false};
     std::shared_ptr<void> m_gate_token;
 };
 

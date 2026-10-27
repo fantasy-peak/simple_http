@@ -859,6 +859,39 @@ asio::awaitable<void> suite_streaming(std::uint16_t plain) {
     co_return;
 }
 
+asio::awaitable<void> suite_abort_gate(std::uint16_t plain) {
+    std::printf("\n== abort releases the h1 gate ==\n");
+    auto cfg = base_config();
+    cfg.default_version = sh::HttpVersionPolicy::Http11;
+    h::Client http{co_await asio::this_coro::executor, cfg};
+    const std::string target = url(plain, "/world");
+
+    auto opened = co_await http.open_stream(target, {.method = sh::Method::Get});
+    if (!opened) {
+        check(false, "abort: open_stream failed: " + describe(opened.error()));
+        co_return;
+    }
+    co_await opened->abort();
+
+    // Keep `opened` alive across the next request. Before the fix the aborted
+    // exchange kept the single-connection gate, so this second request parked on
+    // acquire() forever (the old session is dead, so it dials a new one first).
+    bool completed = false;
+    auto second = [&]() -> asio::awaitable<void> {
+        auto response = co_await http.get(target).send();
+        completed = response.has_value();
+    };
+    auto timer = [&]() -> asio::awaitable<void> {
+        asio::steady_timer deadline{co_await asio::this_coro::executor};
+        deadline.expires_after(std::chrono::seconds(2));
+        co_await deadline.async_wait(asio::as_tuple(asio::use_awaitable));
+    };
+    using namespace asio::experimental::awaitable_operators;
+    co_await (second() || timer());
+    check(completed, "a request after Stream::abort() completes while the aborted Stream is still alive");
+    co_return;
+}
+
 asio::awaitable<void> suite_h2_multiplex(std::uint16_t plain) {
     std::printf("\n== HTTP/2 multiplexing ==\n");
     auto cfg = base_config();
@@ -2031,6 +2064,7 @@ asio::awaitable<void> run_all_suites(asio::io_context &ctx, std::uint16_t plain,
     co_await suite_protocol_matrix(plain, tls_port);
     co_await suite_framing(plain, ctx);
     co_await suite_streaming(plain);
+    co_await suite_abort_gate(plain);
     co_await suite_h2_multiplex(plain);
     co_await suite_errors(plain);
     co_await suite_spec_validation(plain);
