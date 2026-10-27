@@ -1481,13 +1481,17 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                 // each — killing every legitimate stream on the connection with
                 // GOAWAY(FLOW_CONTROL_ERROR). (The client's on_data is the
                 // mirror: "hand the connection credit straight back".)
-                m_conn_recv_window += frame_len;
+                replenish_conn(frame_len);
                 reset_stream(hdr.stream_id, codec::H2_STREAM_CLOSED);
                 return true;
             }
             st.recv_window -= frame_len;
             if (st.recv_window < 0) {
-                // Stream-level overrun: reset just this stream, keep the connection.
+                // Stream-level overrun: reset just this stream, keep the
+                // connection. The frame was debited from the connection window
+                // above but is never delivered, so hand that credit back now
+                // rather than leaking it with the stream.
+                replenish_conn(frame_len);
                 reset_stream(hdr.stream_id, codec::H2_FLOW_CONTROL_ERROR);
                 return true;
             }
@@ -1538,7 +1542,24 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                     SIMPLE_HTTP_ERROR_LOG("h2: request body overruns content-length (stream={}, "
                                           "declared={}, seen={})",
                                           hdr.stream_id, st.declared_content_length, st.body_received);
+                    // These bytes were debited from the connection window but
+                    // never delivered; the stream is going away, so return the
+                    // connection credit the erase path cannot see.
+                    replenish_conn(static_cast<std::int64_t>(data.size()));
                     reset_stream(hdr.stream_id, codec::H2_PROTOCOL_ERROR);
+                    return true;
+                }
+                // The same bound h1 enforces from the declared length/chunk
+                // size: a peer must not be able to make the handler (or this
+                // engine's parking queue) hold an arbitrary request body. The
+                // handler was already dispatched at END_HEADERS, so a 413 is not
+                // available here; refuse the stream and stop accepting body.
+                if (m_limits.max_body_bytes != 0 &&
+                    st.body_received > static_cast<std::int64_t>(m_limits.max_body_bytes)) {
+                    SIMPLE_HTTP_ERROR_LOG("h2: request body exceeds max_body_bytes (stream={}, limit={})",
+                                          hdr.stream_id, m_limits.max_body_bytes);
+                    replenish_conn(static_cast<std::int64_t>(data.size()));
+                    reset_stream(hdr.stream_id, codec::H2_ENHANCE_YOUR_CALM);
                     return true;
                 }
                 // These delivered bytes owe connection-level credit until the
@@ -1808,6 +1829,11 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         if (!m_recv_buf.empty()) {
             (void)parse_available();
         }
+        // Now that the parked tail has actually been handed over (and the body
+        // ended), a stream whose response already finished is truly complete.
+        // maybe_complete_stream refused to retire it while finish_pending was
+        // set, precisely so this call can do it.
+        maybe_complete_stream(stream_id);
     }
 
     // Reclaims a fully-completed stream: once both the request body has ended
@@ -1821,6 +1847,13 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         auto it = m_streams.find(stream_id);
         if (it == m_streams.end())
             return;
+        // finish_pending means END_STREAM arrived while DATA was still parked
+        // for this stream: erasing now would destroy those frames without ever
+        // calling Body::finish(), leaving the handler blocked on an EOF that
+        // can never arrive. Wait for on_body_consumed() to drain them.
+        if (it->second.finish_pending) {
+            return;
+        }
         if (it->second.half_closed_remote && it->second.end_stream_sent) {
             erase_stream(stream_id);
         }

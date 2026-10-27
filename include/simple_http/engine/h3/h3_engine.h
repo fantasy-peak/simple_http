@@ -44,6 +44,7 @@
 
 #include <nghttp3/nghttp3.h>
 
+#include <algorithm>
 #include <array>
 #include <boost/asio.hpp>
 #include <boost/asio/experimental/awaitable_operators.hpp>
@@ -497,6 +498,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         if (it == m_streams.end())
             return;
         it->second->end_stream_sent = true;
+        it->second->reset = true;
         if (it->second->request)
             it->second->request->cancel(); // our own reset: signal the handler's token
         m_conn->reset_stream(stream_id, app_error_code);
@@ -671,6 +673,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         auto it = m_streams.find(stream_id);
         if (it != m_streams.end()) {
             it->second->reset_by_peer = true;
+            it->second->reset = true; // a queued stream must not be dispatched
             if (it->second->request) {
                 (void)it->second->request->body().fail(make_error_code(asio::error::connection_reset));
                 it->second->request->cancel(); // peer reset: signal the handler's token
@@ -876,10 +879,28 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
             return;
         Stream &stream = *it->second;
 
+        // The same bound h1 enforces from the declared length/chunk size. The
+        // handler was already dispatched at HEADERS, so answer by refusing the
+        // request rather than buffering an unbounded body; the bytes in this
+        // frame are not handed to anyone, so return their connection-level
+        // flow-control credit first.
+        stream.body_received += data.size();
+        if (m_limits.max_body_bytes != 0 && stream.body_received > m_limits.max_body_bytes) {
+            SIMPLE_HTTP_ERROR_LOG("h3: request body exceeds max_body_bytes (stream={}, limit={})", stream_id,
+                                  m_limits.max_body_bytes);
+            m_conn->extend_connection_offset(data.size());
+            reset_stream(stream_id, kH3ExcessiveLoad);
+            return;
+        }
+
         // Hand the bytes to the Body, honouring its own bound: a peer that sends
         // more than the handler will read must not be able to grow this queue
         // without limit.
         if (!stream.request->body().feed(std::string{reinterpret_cast<const char *>(data.data()), data.size()})) {
+            // The payload is never delivered, so it must not stay debited
+            // against the connection window (nghttp3 does not count DATA
+            // payload as consumed for us).
+            m_conn->extend_connection_offset(data.size());
             reset_stream(stream_id, kH3RequestCancelled);
             return;
         }
@@ -1168,9 +1189,29 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         if (it == m_streams.end())
             return;
         Stream &stream = *it->second;
-        if (stream.dispatched)
+        if (stream.dispatched || stream.queued || stream.reset)
             return;
+
+        // Rapid Reset (CVE-2023-44487) defense, the same shape the h2 engine
+        // uses: a stream that opens and is immediately reset frees its QUIC
+        // stream slot while its handler keeps running. Bound the handlers that
+        // actually execute and queue the excess; a queue beyond its own bound
+        // is excessive load.
+        const std::size_t handler_limit = m_limits.effective_h3_max_concurrent_streams();
+        if (handler_limit != 0 && m_active_handlers >= handler_limit) {
+            if (m_pending_dispatch.size() >= m_limits.effective_max_queued_streams()) {
+                SIMPLE_HTTP_ERROR_LOG("h3: dispatch queue full ({} handlers, {} queued); refusing stream {}",
+                                      m_active_handlers, m_pending_dispatch.size(), stream_id);
+                reset_stream(stream_id, kH3ExcessiveLoad);
+                return;
+            }
+            stream.queued = true;
+            m_pending_dispatch.push_back(stream_id);
+            return;
+        }
+
         stream.dispatched = true;
+        ++m_active_handlers;
 
         auto writer = std::make_shared<Http3ResponseSink<Connection>>(this->weak_from_this(), stream_id, m_executor);
         writer->set_head_request(stream.is_head); // cached before the response can retire the stream entry
@@ -1192,15 +1233,42 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
                     SIMPLE_HTTP_ERROR_LOG("h3 handler(stream={}) threw unknown exception", stream_id);
                     self->reset_stream(stream_id, kH3InternalError);
                 }
+                // The stream may already be gone (peer reset, connection
+                // close); the slot belongs to the handler, not the stream, so
+                // it is released here regardless.
+                self->handler_finished();
                 co_return;
             },
             asio::detached);
+    }
+
+    void handler_finished() {
+        if (m_active_handlers > 0)
+            --m_active_handlers;
+        pump_dispatch();
+    }
+
+    void pump_dispatch() {
+        const std::size_t handler_limit = m_limits.effective_h3_max_concurrent_streams();
+        while (!m_pending_dispatch.empty() && (handler_limit == 0 || m_active_handlers < handler_limit)) {
+            const std::int64_t stream_id = m_pending_dispatch.front();
+            m_pending_dispatch.pop_front();
+            auto it = m_streams.find(stream_id);
+            if (it == m_streams.end())
+                continue; // reset while queued
+            it->second->queued = false;
+            spawn_handler(stream_id);
+        }
     }
 
     void erase_stream(std::int64_t stream_id) {
         auto it = m_streams.find(stream_id);
         if (it == m_streams.end())
             return;
+        // A reset stream waiting for a handler slot must not be dispatched
+        // later; drop it from the queue (a running handler keeps its slot and
+        // releases it in handler_finished()).
+        std::erase(m_pending_dispatch, stream_id);
         StreamPtr stream = std::move(it->second);
         m_streams.erase(it);
         // Unpark anything waiting on this stream: nothing will ever feed these
@@ -1228,6 +1296,11 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
     // rather than nulling it because ~Http3Engine still has to free the object.
     bool m_h3_dead{false};
     std::unordered_map<std::int64_t, StreamPtr> m_streams;
+
+    // Rapid Reset bound: handlers actually running, and streams waiting for a
+    // slot (FIFO). Both are touched only on the connection executor.
+    std::size_t m_active_handlers{0};
+    std::deque<std::int64_t> m_pending_dispatch;
 
     // Scratch for `begin_response`, reused across calls so the header path does
     // not allocate a vector per response. Owned strings back the `nghttp3_nv`

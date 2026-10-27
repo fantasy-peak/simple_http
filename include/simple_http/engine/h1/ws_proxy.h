@@ -100,8 +100,9 @@ inline asio::awaitable<void> ws_proxy_fail(const std::shared_ptr<Transport> &cli
 // and must not close it before this returns).
 //
 // `initial` holds bytes the H1 engine read past the request head (the start of
-// the client->backend WebSocket stream); they are forwarded to the backend
-// right after the replayed request head.
+// the client->backend WebSocket stream). They are forwarded only after the
+// backend has answered a validated 101: sending them with the replayed request
+// would hand client bytes to a backend that has not agreed to switch protocols.
 template <typename Transport>
 inline asio::awaitable<bool>
 run_ws_proxy(std::shared_ptr<Transport> client, const ParsedHead &head, std::string initial, WsProxyTarget target,
@@ -157,9 +158,11 @@ run_ws_proxy(std::shared_ptr<Transport> client, const ParsedHead &head, std::str
     std::string preamble =
         detail::build_ws_upgrade_head(head.headers, inbound_host ? *inbound_host : std::string_view{}, replay_target,
                                       target, peer_address, client_is_tls, key);
-    // Bytes the client already sent after its handshake travel behind the
-    // upstream request, exactly as before.
-    preamble.append(initial);
+    // `initial` (bytes the client sent behind its handshake) must NOT travel
+    // with the replayed request: at this point the backend has not accepted the
+    // upgrade yet, so forwarding client bytes would let a client smuggle a
+    // second request past the proxy whenever the backend rejects the Upgrade.
+    // They are forwarded only after a validated 101, below.
     {
         auto [ec, n] = co_await asio::async_write(*backend, asio::buffer(preamble.data(), preamble.size()),
                                                   asio::as_tuple(asio::use_awaitable));
@@ -206,6 +209,23 @@ run_ws_proxy(std::shared_ptr<Transport> client, const ParsedHead &head, std::str
         close_backend();
         co_await ws_proxy_fail(client, 502);
         co_return false;
+    }
+
+    // The backend accepted the upgrade: only now is the tunnel real, so the
+    // bytes the client sent behind its handshake may be forwarded. Doing this
+    // earlier would smuggle them to a backend that never agreed to switch
+    // protocols (and, on a refusal, turn its response into a readable channel).
+    if (!initial.empty()) {
+        auto [iec, in] = co_await asio::async_write(*backend, asio::buffer(initial.data(), initial.size()),
+                                                    asio::as_tuple(asio::use_awaitable));
+        (void)in;
+        if (iec) {
+            SIMPLE_HTTP_ERROR_LOG("ws-proxy write initial tunnel bytes failed (client {}): {}",
+                                  address_string(client->peer().address()), iec.message());
+            close_backend();
+            co_await ws_proxy_fail(client, 502);
+            co_return false;
+        }
     }
 
     // Relay the backend's 101 head verbatim (Sec-WebSocket-Accept, negotiated

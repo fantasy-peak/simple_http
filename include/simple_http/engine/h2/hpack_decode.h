@@ -261,16 +261,22 @@ inline bool HpackDecoder::decode(std::string_view block, std::vector<HpackHeader
     m_list_size = 0;
     std::size_t pos = 0;
     // Appends one decoded field, enforcing the decoded-size cap as it grows so a
-    // small block cannot allocate an unbounded list.
-    auto emit = [&](std::string name, std::string value) -> bool {
+    // small block cannot allocate an unbounded list. Once the cap is crossed we
+    // keep decoding the rest of the block but stop collecting fields: HPACK
+    // inserts into the dynamic table as it goes, so aborting here would leave
+    // the table out of sync with the peer's encoder and poison every later
+    // header block on the connection. The caller sees the failure (and resets
+    // the stream) after the block has been fully consumed.
+    auto emit = [&](std::string name, std::string value) {
+        if (m_list_too_large)
+            return;
         m_list_size += name.size() + value.size() + 32;
         if (m_list_size > m_max_list_size) {
             m_error = 40170;
             m_list_too_large = true;
-            return false;
+            return;
         }
         out.push_back({std::move(name), std::move(value)});
-        return true;
     };
     // Whether any field representation has been decoded yet. Only a dynamic
     // table size update that opens the block is legal (RFC 7541 §4.2).
@@ -289,8 +295,7 @@ inline bool HpackDecoder::decode(std::string_view block, std::vector<HpackHeader
                 m_error = 40150;
                 return false;
             }
-            if (!emit(std::move(name), std::move(value)))
-                return false;
+            emit(std::move(name), std::move(value));
             seen_field = true;
         } else if (c & 0x40) {
             // 6.2.1 Literal Header Field with Incremental Indexing: 01xxxxxx
@@ -311,8 +316,7 @@ inline bool HpackDecoder::decode(std::string_view block, std::vector<HpackHeader
             }
             if (!decode_string(block, pos, value))
                 return false;
-            if (!emit(name, value))
-                return false;
+            emit(name, value);
             dynamic_insert(std::move(name), std::move(value));
             seen_field = true;
         } else if (c & 0x20) {
@@ -356,12 +360,13 @@ inline bool HpackDecoder::decode(std::string_view block, std::vector<HpackHeader
             }
             if (!decode_string(block, pos, value))
                 return false;
-            if (!emit(std::move(name), std::move(value)))
-                return false;
+            emit(std::move(name), std::move(value));
             seen_field = true;
         }
     }
-    return true;
+    // The block was decoded to the end either way, so the dynamic table is in
+    // sync. Report the size violation only after that.
+    return !m_list_too_large;
 }
 
 } // namespace simple_http::codec

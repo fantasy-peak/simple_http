@@ -111,10 +111,15 @@ inline Ngtcp2Params make_ngtcp2_params(const QuicConnectionConfig &cfg, ngtcp2_t
     out.transport.ack_delay_exponent = cfg.ack_delay_exponent;
     out.transport.max_ack_delay = cfg.max_ack_delay_ms * NGTCP2_MILLISECONDS;
     out.transport.disable_active_migration = cfg.disable_active_migration ? 1 : 0;
-    // The server always has a token to hand out: stateless reset is how a
-    // connection that has lost its state answers a peer that still believes in
-    // it, and the token is what makes the answer unforgeable.
-    out.transport.stateless_reset_token_present = 1;
+    // Do not advertise a stateless reset token. The transport parameter must
+    // carry the token for the Source Connection ID the peer will actually
+    // address, and this layer does not have that per-CID token (the endpoint
+    // discards the tokens ngtcp2 hands to cb_get_new_connection_id and derives
+    // resets from a different input — see the stateless-reset follow-up). An
+    // all-zero token is worse than none: RFC 9000 §10.3 requires it to be
+    // unpredictable, and a predictable one lets an off-path attacker forge a
+    // reset and kill the connection. Omitting the parameter is legal (§18.2).
+    out.transport.stateless_reset_token_present = 0;
     out.transport.grease_quic_bit = 1;
 
     // No ngtcp2 counterpart:

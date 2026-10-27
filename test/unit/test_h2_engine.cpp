@@ -75,6 +75,24 @@ bool has_goaway(std::string_view written, std::uint32_t error_code) {
     return false;
 }
 
+// Whether the server's recorded output contains an RST_STREAM for `stream_id`
+// carrying `error_code`.
+bool has_rst_stream(std::string_view written, std::uint32_t stream_id, std::uint32_t error_code) {
+    for (std::size_t i = 0; i + kH2FrameHeaderSize <= written.size();) {
+        H2FrameHeader hdr;
+        if (!parse_frame_header(written.substr(i), hdr))
+            return false;
+        const std::size_t end = i + kH2FrameHeaderSize + hdr.length;
+        if (end > written.size())
+            return false;
+        if (hdr.type == static_cast<std::uint8_t>(H2FrameType::RstStream) && hdr.stream_id == stream_id &&
+            hdr.length == 4 && read_u32(written, i + kH2FrameHeaderSize) == error_code)
+            return true;
+        i = end;
+    }
+    return false;
+}
+
 TEST_CASE("h2/engine: a reset flood cannot outrun the executing-handler cap", "[h2]") {
     asio::io_context ctx;
     auto transport = std::make_shared<MockTransport>(ctx.get_executor());
@@ -120,6 +138,27 @@ TEST_CASE("h2/engine: a reset flood cannot outrun the executing-handler cap", "[
     CHECK(peak.load() >= 1); // handlers really ran
     CHECK(peak.load() <= static_cast<int>(limits.h2_max_concurrent_streams));
     CHECK(has_goaway(transport->written(), codec::H2_ENHANCE_YOUR_CALM));
+}
+
+TEST_CASE("h2/engine: a request body above max_body_bytes is refused", "[h2]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+
+    EngineLimits limits;
+    limits.max_body_bytes = 16;
+
+    std::string in{codec::kH2ClientPreface};
+    append_frame(in, H2FrameType::Settings, 0, 0, "");
+    in += headers_frame(1, /*end_stream=*/false);                    // handler dispatched at END_HEADERS
+    append_frame(in, H2FrameType::Data, 0, 1, std::string(32, 'x')); // 32 > 16
+    transport->push(std::move(in));
+
+    auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter>,
+                         SslHandle) -> asio::awaitable<void> { co_return; };
+    auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, limits);
+    REQUIRE(run_on(ctx, engine->run(dispatcher)));
+
+    CHECK(has_rst_stream(transport->written(), 1, codec::H2_ENHANCE_YOUR_CALM));
 }
 
 TEST_CASE("h2/engine: well-behaved concurrency below the cap still runs", "[h2]") {

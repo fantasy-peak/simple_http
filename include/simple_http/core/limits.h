@@ -100,6 +100,16 @@ struct EngineLimits {
         return h2_max_queued_streams != 0 ? h2_max_queued_streams : h2_max_concurrent_streams;
     }
 
+    // HTTP/3 counterpart of the Rapid Reset bound above: how many handlers may
+    // run at once (and, via effective_max_queued_streams(), how many streams may
+    // wait for a slot). 0 follows h2_max_concurrent_streams, so the two
+    // protocols share one policy unless a deployment wants them apart.
+    std::size_t h3_max_concurrent_streams{0};
+
+    [[nodiscard]] std::size_t effective_h3_max_concurrent_streams() const {
+        return h3_max_concurrent_streams != 0 ? h3_max_concurrent_streams : h2_max_concurrent_streams;
+    }
+
     // --- HTTP/3 advertisement ---
     // Whether to advertise this origin's HTTP/3 endpoint in its HTTP/1.x,
     // HTTP/2 and HTTP/3 responses (RFC 7838). Alt-Svc is the only way a

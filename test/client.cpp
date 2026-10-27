@@ -1600,6 +1600,18 @@ asio::awaitable<void> suite_redirect(std::uint16_t port) {
         auto r = co_await fetch(client, client.get(base + "/redir/cookie"));
         check(r && r->body == "sid=abc123", "a Set-Cookie from a redirect is replayed on the next hop");
     }
+    // The jar is consulted before the *first* request of a send() too, not only
+    // on redirect hops. max_redirects=0 stops at the 302 but still stores its
+    // Set-Cookie; the next independent call must replay it.
+    {
+        sh::ClientConfig cfg;
+        cfg.cookie_jar = std::make_shared<sh::CookieJar>();
+        h::Client client{co_await asio::this_coro::executor, cfg};
+        auto set = co_await fetch(client, client.get(base + "/redir/cookie"));
+        check(set && set->status == 302, "the cookie-setting response is returned");
+        auto echo = co_await fetch(client, client.get(base + "/redir/cookie-check"));
+        check(echo && echo->body == "sid=abc123", "the jar is replayed on a later independent request");
+    }
     // A hop to a different host drops the Authorization header (Go's rule).
     {
         sh::ClientConfig cfg;

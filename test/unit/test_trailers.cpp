@@ -52,6 +52,36 @@ TEST_CASE("proto/response: trailer() is emitted by finish_trailers()", "[proto]"
     CHECK(writer->last_trailers.get("server-timing").value_or("") == "db;dur=3");
 }
 
+TEST_CASE("proto/response: finish_trailers(Headers) rejects CR/LF/NUL", "[proto]") {
+    asio::io_context ctx;
+    auto writer = std::make_shared<FakeResponseSink>();
+    ResponseWriter res{writer};
+    REQUIRE(run_on(ctx, res.status(200).begin()));
+
+    Headers trailers;
+    trailers.add("x-ok", "fine");
+    trailers.add("x-bad", "a\r\nInjected: 1");
+    auto ec = run_on(ctx, res.finish_trailers(std::move(trailers)));
+    REQUIRE(ec.has_value());
+    CHECK(*ec == make_error_code(asio::error::invalid_argument));
+    CHECK_FALSE(writer->sent_trailers);
+}
+
+TEST_CASE("proto/response: a second response is refused", "[proto]") {
+    asio::io_context ctx;
+    auto writer = std::make_shared<FakeResponseSink>();
+    ResponseWriter res{writer};
+
+    REQUIRE(run_on(ctx, res.status(200).send("one")));
+    CHECK(res.started());
+    auto second = run_on(ctx, res.status(500).send("two"));
+    REQUIRE(second.has_value());
+    CHECK(*second == make_error_code(asio::error::invalid_argument));
+    CHECK(writer->calls == 1);
+    CHECK(writer->last_status == 200);
+    CHECK(writer->last_body == "one");
+}
+
 TEST_CASE("proto/response: finish() delivers accumulated trailers", "[proto]") {
     asio::io_context ctx;
     auto writer = std::make_shared<FakeResponseSink>();

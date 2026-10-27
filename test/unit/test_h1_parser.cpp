@@ -52,6 +52,30 @@ TEST_CASE("h1/parser: bare LF line endings are tolerated", "[h1]") {
     CHECK(parser.remainder() == "abc");
 }
 
+TEST_CASE("h1/parser: a head that mixes CRLF and LF is rejected", "[h1]") {
+    // A front end that splits the head on one line-ending form must not
+    // disagree with this parser about where the head ends — that is the
+    // request-smuggling differential. Mixed styles are refused outright; pure
+    // CRLF and pure LF are still accepted (the test above).
+    for (const std::string_view request : {
+             "GET / HTTP/1.1\r\nHost: a\r\n\nX: y\r\n\r\n",
+             "GET / HTTP/1.1\nHost: a\r\nX: y\r\n\n",
+             "GET / HTTP/1.1\r\nHost: a\nX: y\r\n\r\n",
+             "GET / HTTP/1.1\nHost: a\r\n\r\n",
+         }) {
+        H1Parser parser;
+        parser.feed(request);
+        CHECK(parser.parse_head() == H1Parser::State::Error);
+        CHECK(parser.error() == 40007);
+    }
+}
+
+TEST_CASE("h1/parser: a lone CR inside the head is rejected", "[h1]") {
+    H1Parser parser;
+    parser.feed("GET / HTTP/1.1\r\nX: a\rb\r\n\r\n");
+    CHECK(parser.parse_head() == H1Parser::State::Error);
+}
+
 TEST_CASE("h1/parser: feeding one byte at a time finds the head end", "[h1]") {
     const std::string request = "GET /byte HTTP/1.1\r\nHost: h\r\n\r\nrest";
     H1Parser parser;

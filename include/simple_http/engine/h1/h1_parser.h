@@ -20,6 +20,7 @@
 // consumed() bytes have been taken from the buffer (the remainder is the start
 // of the body). On Error the line was malformed.
 
+#include <array>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
@@ -27,6 +28,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "../../core/http_method.h"
 #include "../../core/types.h"
@@ -184,18 +186,74 @@ class H1Parser {
         // straddle the old end. Without this cursor a peer dribbling a head
         // byte-by-byte made every parse_head re-scan the whole buffer (O(n^2),
         // up to max_header_bytes — a Slowloris amplifier).
-        std::size_t end = m_buf.find("\r\n\r\n", m_scan_from);
-        std::size_t sep = 4;
-        if (end == std::string::npos) {
-            // Tolerate bare-LF line endings (some minimal clients / tests).
-            end = m_buf.find("\n\n", m_scan_from);
-            sep = 2;
-            if (end == std::string::npos) {
-                m_scan_from = m_buf.size() >= 3 ? m_buf.size() - 3 : 0;
-                return State::NeedMore;
+        // The head ends at the first blank line, and a blank line is two
+        // consecutive line endings: CRLF or LF in either position. Tolerating
+        // bare LF is deliberate (minimal clients and tests use it), but the two
+        // forms must not be *mixed*: a front end that splits the head on one
+        // form while this parser picks the other is a request-smuggling
+        // differential (a header after the earlier blank line is body to the
+        // front end and a header here). So find the earliest of the four
+        // forms, then reject a head that mixes the two line-ending styles.
+        struct Terminator {
+            std::size_t pos{std::string::npos};
+            std::size_t sep{0};
+            bool crlf{false};
+            bool lf{false};
+        };
+        Terminator term;
+        const std::array<std::pair<std::string_view, Terminator>, 4> terminators{{
+            {"\r\n\r\n", {std::string::npos, 4, true, false}},
+            {"\r\n\n", {std::string::npos, 3, true, true}},
+            {"\n\r\n", {std::string::npos, 4, true, true}},
+            {"\n\n", {std::string::npos, 2, false, true}},
+        }};
+        for (auto [pattern, candidate] : terminators) {
+            candidate.pos = m_buf.find(pattern, m_scan_from);
+            if (candidate.pos == std::string::npos)
+                continue;
+            if (term.pos == std::string::npos || candidate.pos < term.pos)
+                term = candidate;
+        }
+        if (term.pos == std::string::npos) {
+            m_scan_from = m_buf.size() >= 3 ? m_buf.size() - 3 : 0;
+            return State::NeedMore;
+        }
+
+        // Classify every line ending inside the block, then fold in the two the
+        // terminator itself contributes (the last field line's ending is the
+        // terminator's first half). Any CRLF alongside any bare LF is refused:
+        // the pair of interpretations must not disagree about where the head
+        // ended.
+        bool saw_crlf = term.crlf;
+        bool saw_lf = term.lf;
+        for (std::size_t i = 0; i < term.pos; ++i) {
+            if (m_buf[i] != '\n')
+                continue;
+            if (i > 0 && m_buf[i - 1] == '\r')
+                saw_crlf = true;
+            else
+                saw_lf = true;
+        }
+        if (saw_crlf && saw_lf) {
+            m_error = 40007; // mixed CRLF/LF line endings
+            return State::Error;
+        }
+        // A CR that is not immediately followed by LF is not a line ending at
+        // all; it would be smuggled into the next field. The request line is
+        // excluded: a bare CR in the target is a control byte there and is
+        // reported by parse_request_line (40006), not as a line-ending error.
+        const std::size_t first_lf = m_buf.find('\n');
+        const std::size_t fields_from =
+            (first_lf == std::string::npos || first_lf >= term.pos) ? term.pos : first_lf + 1;
+        for (std::size_t i = fields_from; i < term.pos; ++i) {
+            if (m_buf[i] == '\r' && (i + 1 == term.pos || m_buf[i + 1] != '\n')) {
+                m_error = 40007;
+                return State::Error;
             }
         }
 
+        const std::size_t end = term.pos;
+        const std::size_t sep = term.sep;
         std::string_view block{m_buf.data(), end};
         if (!parse_block(block)) {
             return State::Error;

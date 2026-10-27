@@ -160,6 +160,10 @@ inline Middleware recovery() {
         // layer's own references — needed to answer the 500 — must be kept
         // separately (same pattern as invoke_handler's fallback).
         const ResponsePtr fallback = res;
+        // A cancelled chain (request deadline, peer gone) owns no reply: the
+        // layer that cancelled it answers. Answering 500 here would race that
+        // reply and turn an intended 504 into a 500.
+        const RequestPtr req_keep = req;
         bool threw = false;
         // maybe_unused: consumed only by the log call below, which compiles
         // away when SIMPLE_HTTP_ENABLE_LOG=0.
@@ -176,8 +180,15 @@ inline Middleware recovery() {
         // The catch blocks only record — co_await is not permitted inside a
         // coroutine's handler (same discipline as invoke_handler).
         if (threw) {
+            if (req_keep && req_keep->cancelled()) {
+                co_return;
+            }
             SIMPLE_HTTP_ERROR_LOG("middleware chain threw: {}", why);
-            (void)co_await fallback->status(status::internal_server_error).send("");
+            if (fallback->started()) {
+                (void)co_await fallback->close();
+            } else {
+                (void)co_await fallback->status(status::internal_server_error).send("");
+            }
         }
     };
 }

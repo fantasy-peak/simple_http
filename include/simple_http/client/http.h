@@ -488,8 +488,31 @@ class Client {
 
         const std::size_t cap = max_body_bytes != 0 ? max_body_bytes : m_cfg.limits.max_body_bytes;
         const std::chrono::milliseconds limit = timeout.count() != 0 ? timeout : m_cfg.request_timeout;
+        // Go's http.Client feeds the jar before *every* request, including the
+        // first one. The redirect loop used to be the only place that asked the
+        // jar, so a session established by an earlier send() was silently
+        // dropped on the next independent send(). Merge with an explicit Cookie
+        // header the caller set (Go's AddCookie appends as well).
+        Headers headers{request->headers()};
+        if (m_cfg.cookie_jar) {
+            std::string jar_cookie = m_cfg.cookie_jar->cookie_header(current_url);
+            if (!jar_cookie.empty()) {
+                // Copy before erase: get() returns a view into the header store.
+                std::string explicit_cookie;
+                if (const auto current = headers.get("cookie"); current && !current->empty())
+                    explicit_cookie.assign(*current);
+                headers.erase("cookie");
+                if (!explicit_cookie.empty()) {
+                    explicit_cookie += "; ";
+                    explicit_cookie += jar_cookie;
+                    headers.add("cookie", std::move(explicit_cookie));
+                } else {
+                    headers.add("cookie", std::move(jar_cookie));
+                }
+            }
+        }
         co_return co_await follow_redirects(m_impl, m_cfg, std::move(target), request->method(),
-                                            std::string{request->method_token()}, Headers{request->headers()},
+                                            std::string{request->method_token()}, std::move(headers),
                                             request->body_source(), std::move(url_target), cap, limit,
                                             m_cfg.max_redirects, std::move(current_url));
     }
@@ -668,7 +691,12 @@ class Client {
             // request provably never arrived. Give it one free re-dial (like the
             // old rule that a stale pooled connection earns a replay) before the
             // policy retries come into play. Not counting against max_retries.
-            if (opened->reused &&
+            // Replaying is only safe when the request can be reconstructed and
+            // re-executing it is harmless. A reused connection tells us the
+            // failure *may* be a stale drop, but it does not prove the request
+            // never arrived: a POST whose response head was already received
+            // and whose body read then failed would still be executed twice.
+            if (opened->reused && !request->stream_body() && is_idempotent(request->method()) &&
                 (detail::transport_failure(ec) || ec == make_error_code(client_errc::session_closed)) &&
                 !stale_redialed) {
                 SIMPLE_HTTP_ERROR_LOG("client: reading {} on the kept connection failed ({}), re-dialing once",

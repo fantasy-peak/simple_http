@@ -81,12 +81,23 @@ struct H3Stream {
     bool seen_authority{false};
     bool headers_done{false};
     bool dispatched{false};
+    // Waiting in the engine's dispatch queue for a handler slot (Rapid Reset
+    // bound). Distinct from dispatched so a second on_end_stream does not
+    // enqueue the same stream twice.
+    bool queued{false};
     bool request_complete{false};
     bool reset_by_peer{false};
+    // The engine (not the peer) reset this stream. A queued stream must not be
+    // dispatched after that.
+    bool reset{false};
 
     // --- inbound body -------------------------------------------------------
     std::deque<std::string> in_q;
     std::size_t in_bytes{0};
+    // Total DATA bytes received for this request, whether already consumed or
+    // still queued. Bounds the request body the same way h1's max_body_bytes
+    // does; in_bytes alone cannot, because a consuming handler keeps it small.
+    std::uint64_t body_received{0};
     bool in_fin{false};
     Signal in_space;
 

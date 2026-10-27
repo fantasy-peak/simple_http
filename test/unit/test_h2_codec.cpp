@@ -210,6 +210,39 @@ TEST_CASE("h2/hpack: literal fields, with and without indexing", "[h2]") {
     CHECK(decoder.dynamic_table_size() == 7 + 6 + 32);
 }
 
+TEST_CASE("h2/hpack: an oversized list still keeps the dynamic table in sync", "[h2]") {
+    // The decoded list is bounded, but the block must be decoded to the end:
+    // every incremental-indexed field is inserted into the dynamic table as it
+    // is decoded. Aborting on the size limit used to leave the table out of
+    // sync with the peer's encoder, so a later block referencing the inserted
+    // entry resolved to the wrong field (or failed).
+    HpackDecoder decoder;
+    decoder.set_max_list_size(64);
+
+    std::string block;
+    block.push_back('\x40'); // literal with incremental indexing
+    hpack_append_string(block, "x-a");
+    hpack_append_string(block, "1");
+    block.push_back('\x40');
+    hpack_append_string(block, "x-b");
+    hpack_append_string(block, std::string(80, 'b')); // crosses the 64-byte list cap
+
+    std::vector<HpackHeader> fields;
+    CHECK_FALSE(decoder.decode(block, fields));
+    CHECK(decoder.header_list_too_large());
+
+    // Index 62 is the newest dynamic entry: x-b. If the decoder had aborted at
+    // the cap, it would not be there (x-a would be at 62 instead). Raise the
+    // list cap for this block so the single referenced field itself fits.
+    decoder.set_max_list_size(4096);
+    std::string reference;
+    hpack_append_indexed(reference, 62);
+    std::vector<HpackHeader> second;
+    REQUIRE(decoder.decode(reference, second));
+    REQUIRE(second.size() == 1);
+    CHECK(second[0].name == "x-b");
+}
+
 TEST_CASE("h2/hpack: dynamic table entries resolve by index 62+", "[h2]") {
     HpackDecoder decoder;
     std::string insert;

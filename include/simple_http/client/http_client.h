@@ -219,6 +219,9 @@ inline bool retry_allowed(RetryBudget &budget, const Request &spec, const error_
 // coroutine is gone (a use-after-free).
 class ExchangeGate {
   public:
+    // The engine's pinned executor: release() defers a waiter onto it instead
+    // of resuming it inline (see below).
+    explicit ExchangeGate(asio::any_io_executor executor) : m_executor(std::move(executor)) {}
     // Acquires the gate, returning a *holder token*. Every release is scoped to
     // that token and no-ops when the gate has since been re-acquired, which is
     // what makes the release idempotent across the many places an exchange can
@@ -278,7 +281,13 @@ class ExchangeGate {
         if (!m_waiters.empty()) {
             Waiter wake = std::move(m_waiters.front());
             m_waiters.pop_front();
-            wake.done(error_code{});
+            // Resume the waiter on its own executor, never inline. An inline
+            // completion resumes the parked acquire() coroutine (and everything
+            // it does next, including reset_exchange() for this session) inside
+            // release()'s caller — i.e. inside the *previous* exchange's read
+            // stack, which is about to touch the state the new exchange just
+            // reset. Posting lets that stack unwind first.
+            asio::post(m_executor, [handler = std::move(wake.done)]() mutable { handler(error_code{}); });
         }
     }
 
@@ -293,6 +302,7 @@ class ExchangeGate {
     bool m_busy{false};
     std::shared_ptr<void> m_holder;
     std::deque<Waiter> m_waiters;
+    asio::any_io_executor m_executor;
 };
 
 // Wraps an awaitable in a deadline. The awaitable's own I/O is cancelled when
@@ -868,7 +878,7 @@ class ClientEngine {
     asio::any_io_executor m_executor;
     ClientConfig m_config;
     std::shared_ptr<asio::ssl::context> m_ssl_context; // outlives every stream using it
-    std::shared_ptr<ExchangeGate> m_h1_gate{std::make_shared<ExchangeGate>()};
+    std::shared_ptr<ExchangeGate> m_h1_gate{std::make_shared<ExchangeGate>(m_executor)};
     // The single kept connection and its identity, touched only on m_executor
     // (start_exchange runs there; the destructor moves the session out for
     // release_session before this member dies).

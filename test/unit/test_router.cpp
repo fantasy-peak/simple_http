@@ -556,6 +556,60 @@ TEST_CASE("router: regex routes are scoped to a group prefix", "[router]") {
     }
 }
 
+TEST_CASE("router: a proxy route in a group keeps the prefix and group middleware", "[router]") {
+    Router router;
+    std::size_t middleware_runs = 0;
+    Middleware mw = [&](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
+        ++middleware_runs;
+        co_await next(std::move(req), std::move(res), ssl);
+    };
+    HttpProxyTarget target;
+    target.host = "127.0.0.1";
+    target.port = 9;
+
+    router.group("/api", {mw}, [&](Router &api) {
+        api.http_proxy("/users", target);
+        api.http_proxy_regex(R"(/items/(\w+))", target);
+    });
+
+    {
+        auto found = router.find_http_proxy("/api/users");
+        REQUIRE(found.has_value());
+        CHECK(found->middlewares.size() == 1);
+        CHECK_FALSE(router.find_http_proxy("/users").has_value()); // prefix not dropped
+    }
+    {
+        auto found = router.find_http_proxy("/api/items/42");
+        REQUIRE(found.has_value());
+        CHECK(found->middlewares.size() == 1);
+        CHECK(found->target.rewrite_path.empty());
+        CHECK_FALSE(router.find_http_proxy("/items/42").has_value());
+    }
+    // Registration captures the chain; it must not run it.
+    CHECK(middleware_runs == 0);
+}
+
+TEST_CASE("router: ws_proxy scopes its path, and refuses a group with middleware", "[router]") {
+    {
+        Router router;
+        router.group("/api", [&](Router &api) { api.ws_proxy("/ws", WsProxyTarget{}); });
+        CHECK(router.find_ws_proxy("/api/ws").has_value());
+        CHECK_FALSE(router.find_ws_proxy("/ws").has_value());
+    }
+    {
+        // Byte-level ws proxying has no way to run the group chain, so
+        // registering it there is failed closed instead of silently dropping
+        // auth middleware.
+        Router router;
+        Middleware mw = [](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
+            co_await next(std::move(req), std::move(res), ssl);
+        };
+        router.group("/api", {mw}, [&](Router &api) { api.ws_proxy("/ws", WsProxyTarget{}); });
+        CHECK_FALSE(router.find_ws_proxy("/api/ws").has_value());
+        CHECK_FALSE(router.find_ws_proxy("/ws").has_value());
+    }
+}
+
 TEST_CASE("router: reverse-proxy routes are found and rewritten", "[router]") {
     Router router;
     HttpProxyTarget exact;

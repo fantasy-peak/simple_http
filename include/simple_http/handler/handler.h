@@ -163,10 +163,16 @@ inline asio::awaitable<void> invoke_handler(const Handler &handler, RequestPtr r
         }
         SIMPLE_HTTP_ERROR_LOG("handler threw: {}", why);
         if (fallback) {
-            // A handler that throws has usually not answered yet. If it already
-            // did, the writer refuses the second send, which is the right outcome
-            // — better than dropping the connection either way.
-            co_await fallback->status(status::internal_server_error).send("");
+            // A handler that throws has usually not answered yet. If the head
+            // already went out (SSE or a streamed proxy that failed mid-body),
+            // sending another status line would splice a second response onto
+            // the wire; close instead. A fresh response refuses the second send
+            // itself, so this is the only place the distinction has to be made.
+            if (fallback->started()) {
+                (void)co_await fallback->close();
+            } else {
+                co_await fallback->status(status::internal_server_error).send("");
+            }
         }
     }
     co_return;

@@ -534,6 +534,15 @@ class Http2ClientSession final : public ClientSession,
                 flush();
                 co_return ReadResult::chunk(std::move(data));
             }
+            // A terminal outcome may have been set by the connection teardown
+            // while DATA was still queued; the queue above is drained first, so
+            // a complete body survives a normal close. Only then report why the
+            // stream ended.
+            if (st.outcome->get() != StreamState::Open) {
+                auto terminal = outcome_result(*st.outcome);
+                erase_stream(it);
+                co_return terminal;
+            }
             if (st.failed || st.reset) {
                 auto terminal = outcome_result(*st.outcome);
                 erase_stream(it);
@@ -556,7 +565,10 @@ class Http2ClientSession final : public ClientSession,
             auto outcome = st.outcome;
             auto [ec] = co_await notify->async_receive(asio::as_tuple(asio::use_awaitable));
             if (ec) {
-                co_return outcome_result(*outcome);
+                // The channel was closed by teardown. Loop so the queue is
+                // drained before the terminal outcome is reported; the next
+                // pass observes a terminal state and cannot wait again.
+                continue;
             }
         }
     }
@@ -769,11 +781,23 @@ class Http2ClientSession final : public ClientSession,
         for (auto &[id, st] : m_streams) {
             if (st.out_space)
                 st.out_space->close();
-            st.outcome->set(StreamState::Disconnect, make_error_code(asio::error::eof));
+            if (st.remote_end) {
+                // END_STREAM already arrived: the response is complete, even if
+                // the application has not drained the queued DATA yet. Mark it
+                // Eof and keep the entry so stream_read() can hand over what is
+                // already buffered instead of reporting a reset and dropping a
+                // complete body.
+                st.outcome->set(StreamState::Eof);
+            } else {
+                st.failed = true;
+                st.outcome->set(StreamState::Disconnect, make_error_code(asio::error::eof));
+            }
             if (st.in_notify)
                 st.in_notify->close();
         }
-        m_streams.clear();
+        // Deliberately NOT m_streams.clear(): the entries above still own the
+        // buffered tail a reader may be about to consume. They are erased by
+        // stream_read() once drained; the map dies with the session otherwise.
         m_active_streams.store(0, std::memory_order_release);
         if (m_transport)
             m_transport->close();

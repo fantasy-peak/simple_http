@@ -375,8 +375,11 @@ template <typename Executor> class QuicEndpoint {
                 return;
             }
             ngtcp2_cid odcid{};
+            // The Retry's SCID is the DCID of this (second) Initial. Passing
+            // the Initial's *SCID* here makes the token's AAD differ from the
+            // one the Retry was issued with, so every legitimate token fails.
             ngtcp2_cid retry_scid{};
-            ngtcp2_cid_init(&retry_scid, vc.scid, vc.scidlen);
+            ngtcp2_cid_init(&retry_scid, vc.dcid, vc.dcidlen);
             const int vrv = ngtcp2_crypto_verify_retry_token2(
                 &odcid, hd.token, hd.tokenlen, m_secret.data(), m_secret.size(), hd.version,
                 reinterpret_cast<const ngtcp2_sockaddr *>(remote.data()), static_cast<ngtcp2_socklen>(remote.size()),

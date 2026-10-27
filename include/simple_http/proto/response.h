@@ -141,6 +141,12 @@ class ResponseWriter {
         if (m_field_rejected) {
             co_return make_error_code(asio::error::invalid_argument);
         }
+        // A response has exactly one head. Refusing a second one here is what
+        // lets invoke_handler's 500 fallback check started() instead of
+        // splicing a second status line onto the wire.
+        if (m_started) {
+            co_return make_error_code(asio::error::invalid_argument);
+        }
         note_activity();
         apply_defaults();
         m_started = true;
@@ -238,6 +244,16 @@ class ResponseWriter {
     [[nodiscard]] asio::awaitable<error_code> finish_trailers(Headers trailers) {
         if (m_field_rejected) {
             co_return make_error_code(asio::error::invalid_argument);
+        }
+        // Same boundary rule as trailer(name, value): a CR/LF/NUL in either
+        // part would splice bytes into the trailer section and split the
+        // response. The bulk overload used to skip this check entirely.
+        for (const auto &[name, value] : trailers) {
+            if (contains_ctl(name) || contains_ctl(value)) {
+                SIMPLE_HTTP_ERROR_LOG("response trailer with CR/LF/NUL rejected");
+                m_field_rejected = true;
+                co_return make_error_code(asio::error::invalid_argument);
+            }
         }
         note_activity();
         co_return co_await m_writer->send_trailers(std::move(trailers));

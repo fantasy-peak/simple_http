@@ -80,6 +80,11 @@ namespace asio = boost::asio;
 struct HttpProxyRoute {
     HttpProxyTarget target;
     simple_http::ClientConfig client_cfg;
+    // Group middleware captured at registration (outermost first). Composed
+    // around the proxy terminal at dispatch time, exactly like a RouteEntry's
+    // per-route chain — previously a proxy registered inside group() silently
+    // ignored both the prefix and the group's middleware (auth included).
+    std::vector<Middleware> middlewares;
 };
 
 // A registered WebSocket route: the ws handler plus its middleware chain, i.e.
@@ -385,14 +390,31 @@ class Router {
 
     // --- WebSocket proxy-route registration (byte-level pass-through) ---
     Router &ws_proxy(std::string path, WsProxyTarget target) {
-        m_ws_proxy_exact.emplace(std::move(path), std::move(target));
+        auto scoped_registration = scoped(std::move(path), {});
+        // Byte-level ws proxying bypasses the HTTP middleware chain (the engine
+        // tunnels bytes before a Response handles the upgrade), so a group's
+        // middleware cannot be applied here. Registering anyway would silently
+        // drop auth; refuse instead, so the misconfiguration is fail-closed.
+        if (!scoped_registration.second.empty()) {
+            SIMPLE_HTTP_ERROR_LOG("ws_proxy [{}] registered inside a group with middleware; refusing (unsupported)",
+                                  scoped_registration.first);
+            return *this;
+        }
+        m_ws_proxy_exact.emplace(std::move(scoped_registration.first), std::move(target));
         return *this;
     }
 
     Router &ws_proxy_regex(const std::string &pattern, WsProxyTarget target) {
+        if (!m_scopes.empty() && !m_scopes.back().mws.empty()) {
+            SIMPLE_HTTP_ERROR_LOG("ws_proxy_regex [{}] registered inside a group with middleware; refusing "
+                                  "(unsupported)",
+                                  pattern);
+            return *this;
+        }
+        const std::string full_pattern = m_scopes.empty() ? pattern : scope_regex(pattern);
         try {
-            m_ws_proxy_regex.emplace_back(RegexRoute{simple_http_regex::regex{pattern}, literal_prefix(pattern)},
-                                          std::move(target));
+            m_ws_proxy_regex.emplace_back(
+                RegexRoute{simple_http_regex::regex{full_pattern}, literal_prefix(full_pattern)}, std::move(target));
         } catch (const std::exception &e) {
             SIMPLE_HTTP_ERROR_LOG("invalid ws proxy regex [{}]: {}", pattern, e.what());
         }
@@ -401,15 +423,21 @@ class Router {
 
     // --- HTTP reverse-proxy route registration (request-level) ---
     Router &http_proxy(std::string path, HttpProxyTarget target, simple_http::ClientConfig client_cfg = {}) {
-        m_http_proxy_exact.emplace(std::move(path), HttpProxyRoute{std::move(target), std::move(client_cfg)});
+        auto scoped_registration = scoped(std::move(path), {});
+        m_http_proxy_exact.emplace(
+            std::move(scoped_registration.first),
+            HttpProxyRoute{std::move(target), std::move(client_cfg), std::move(scoped_registration.second)});
         return *this;
     }
 
     Router &http_proxy_regex(const std::string &pattern, HttpProxyTarget target,
                              simple_http::ClientConfig client_cfg = {}) {
+        auto scoped_registration = scoped(pattern, {});
+        const std::string full_pattern = m_scopes.empty() ? pattern : scope_regex(pattern);
         try {
-            m_http_proxy_regex.emplace_back(RegexRoute{simple_http_regex::regex{pattern}, literal_prefix(pattern)},
-                                            HttpProxyRoute{std::move(target), std::move(client_cfg)});
+            m_http_proxy_regex.emplace_back(
+                RegexRoute{simple_http_regex::regex{full_pattern}, literal_prefix(full_pattern)},
+                HttpProxyRoute{std::move(target), std::move(client_cfg), std::move(scoped_registration.second)});
         } catch (const std::exception &e) {
             SIMPLE_HTTP_ERROR_LOG("invalid http proxy regex [{}]: {}", pattern, e.what());
         }
@@ -664,7 +692,19 @@ class Router {
             // head-of-line blocking between requests on the same worker context.
             auto ex = co_await asio::this_coro::executor;
             simple_http::Client client{ex, std::move(proxy->client_cfg)};
-            co_await run_http_proxy(std::move(req), std::move(res), client_is_tls, std::move(proxy->target), client);
+            Next terminal = [&client, client_is_tls, target = std::move(proxy->target)](
+                                RequestPtr r, ResponsePtr w, SslHandle s) mutable -> asio::awaitable<void> {
+                co_await run_http_proxy(std::move(r), std::move(w), client_is_tls, std::move(target), client);
+            };
+            // Group middleware (registered with the route) wraps the proxy
+            // terminal, so auth/rate-limit/etc. run before an upstream request
+            // is even dialed.
+            if (proxy->middlewares.empty()) {
+                co_await terminal(std::move(req), std::move(res), ssl);
+            } else {
+                Next chain = compose_middleware(std::move(proxy->middlewares), std::move(terminal));
+                co_await chain(std::move(req), std::move(res), ssl);
+            }
             co_return;
         }
 
