@@ -42,8 +42,9 @@ class Request {
         : m_version(other.m_version), m_peer(std::move(other.m_peer)), m_body(std::move(other.m_body)),
           m_method(other.m_method), m_method_token(std::move(other.m_method_token)),
           m_target(std::move(other.m_target)), m_headers(std::move(other.m_headers)),
-          m_params(std::move(other.m_params)), m_query_params(std::move(other.m_query_params)), m_close(other.m_close),
-          m_stream_body(other.m_stream_body), m_content_length(other.m_content_length), m_url(std::move(other.m_url)),
+          m_params(std::move(other.m_params)), m_query_params(std::move(other.m_query_params)),
+          m_query_parsed(other.m_query_parsed), m_close(other.m_close), m_stream_body(other.m_stream_body),
+          m_content_length(other.m_content_length), m_url(std::move(other.m_url)),
           m_body_source(std::move(other.m_body_source)), m_state(std::move(other.m_state)),
           m_stop(std::move(other.m_stop)) {
         rebind_views();
@@ -60,6 +61,7 @@ class Request {
         m_headers = std::move(other.m_headers);
         m_params = std::move(other.m_params);
         m_query_params = std::move(other.m_query_params);
+        m_query_parsed = other.m_query_parsed;
         m_close = other.m_close;
         m_stream_body = other.m_stream_body;
         m_content_length = other.m_content_length;
@@ -91,7 +93,7 @@ class Request {
     // (the source of `X-Forwarded-For` and friend).
     template <typename Executor>
     Request(Version version, const Executor &exec, asio::ip::tcp::endpoint peer)
-        : m_version(version), m_peer(std::move(peer)), m_body(std::make_unique<Body>(exec)) {}
+        : m_version(version), m_peer(std::move(peer)), m_body(exec) {}
 
     // Client-side construction: the caller builds a request to send and the
     // engine reads it back. No peer exists yet; one is only meaningful on the
@@ -99,8 +101,7 @@ class Request {
     // handing the request to the client, or set stream_body(true) to write it
     // as the exchange goes (Go's http.Request.Body with Close semantics).
     template <typename Executor>
-    explicit Request(Version version, const Executor &exec)
-        : m_version(version), m_body(std::make_unique<Body>(exec)) {}
+    explicit Request(Version version, const Executor &exec) : m_version(version), m_body(exec) {}
 
     // --- request line / metadata ---
     Method method() const { return m_method; }
@@ -112,8 +113,16 @@ class Request {
     std::string_view query() const { return m_query; }
     // The URL query, parsed and decoded (Go's r.URL.Query() / axum Query<T>).
     // Values live on the Request, so the views stay valid for the request's
-    // whole life.
-    const QueryParams &query_params() const { return m_query_params; }
+    // whole life. Parsing is lazy: `query()` (the raw view) is what most hot
+    // handlers use, and eagerly parsing every target cost a vector plus one
+    // string per parameter for requests that never asked for the decoded form.
+    const QueryParams &query_params() const {
+        if (!m_query_parsed) {
+            m_query_params = QueryParams::parse(m_query);
+            m_query_parsed = true;
+        }
+        return m_query_params;
+    }
     asio::ip::tcp::endpoint peer() const { return m_peer; }
     // Presents the peer address the way it will be read: an IPv4 client on a
     // dual-stack listener arrives v4-mapped and is unmapped (see core/address.h).
@@ -155,8 +164,8 @@ class Request {
         }
     }
 
-    Body &body() { return *m_body; }
-    const Body &body() const { return *m_body; }
+    Body &body() { return m_body; }
+    const Body &body() const { return m_body; }
 
     // Convenience for the client side: sets the whole body up front, as one
     // chunk, and signals the end. Equivalent to feeding the body directly.
@@ -167,8 +176,8 @@ class Request {
     void set_body(std::string data) {
         m_body_source = std::move(data);
         m_content_length = static_cast<std::int64_t>(m_body_source.size());
-        (void)m_body->feed(std::string{m_body_source}); // copy: m_body_source is kept for replay
-        m_body->finish();
+        (void)m_body.feed(std::string{m_body_source}); // copy: m_body_source is kept for replay
+        m_body.finish();
     }
 
     // A fresh shared request carrying the same method/target/headers and a re-fed
@@ -371,7 +380,8 @@ class Request {
     void set_target(std::string target) {
         m_target = std::move(target);
         rebind_views();
-        m_query_params = QueryParams::parse(m_query);
+        m_query_parsed = false; // parsed on first query_params() access
+        m_query_params = QueryParams{};
     }
 
     Headers &mutable_headers() { return m_headers; }
@@ -379,7 +389,10 @@ class Request {
   private:
     Version m_version;
     asio::ip::tcp::endpoint m_peer;
-    std::unique_ptr<Body> m_body;
+    // Inline rather than behind a unique_ptr: the Body is owned for the
+    // Request's whole life anyway, and the indirection cost a heap allocation
+    // (plus its free) on every request the engines construct.
+    Body m_body;
 
     bool m_close{false};
     bool m_stream_body{false};
@@ -396,8 +409,10 @@ class Request {
     // dispatch. Values are views into m_target (stable after set_target).
     std::vector<std::pair<std::string, std::string_view>> m_params;
 
-    // The request URL query, parsed whenever the target is set.
-    QueryParams m_query_params;
+    // The request URL query, parsed lazily on first query_params() access.
+    // Mutable because query_params() is a const observer (like Headers::get).
+    mutable QueryParams m_query_params;
+    mutable bool m_query_parsed{false};
 
     // Per-request state set by middleware (see set_state/get_state). Stored
     // type-erased; lookups scan from the back so the most recent set wins.

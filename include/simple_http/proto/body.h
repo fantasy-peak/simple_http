@@ -68,6 +68,20 @@ class Body {
                 m_eof = true;
             co_return r;
         }
+        // A channel that was never created means no byte was ever fed, so a
+        // terminator recorded before the first read can be answered without
+        // building one (the common GET/response path). Only a stream that is
+        // still waiting for data needs the channel as its wait point.
+        if (!m_channel) {
+            if (m_pending_error) {
+                m_eof = true;
+                co_return std::unexpected(*m_pending_error);
+            }
+            if (m_pending_eof) {
+                m_eof = true;
+                co_return ReadResult::end();
+            }
+        }
         error_code ec;
         Frame frame;
         // Fast path: a frame is already queued.
@@ -111,6 +125,7 @@ class Body {
     // Reads and concatenates the entire remaining body.
     asio::awaitable<std::expected<std::string, error_code>> read_all() {
         std::string out;
+        bool first = true;
         for (;;) {
             auto r = co_await read();
             if (!r) {
@@ -119,7 +134,15 @@ class Body {
             if (r->eof) {
                 co_return out;
             }
-            out.append(r->data);
+            // The first chunk is moved, not appended: read() already hands its
+            // buffer over, so appending it into an empty string was a second
+            // allocation plus a copy of the whole (usually the only) chunk.
+            if (first) {
+                out = std::move(r->data);
+                first = false;
+            } else {
+                out.append(r->data);
+            }
         }
     }
 
@@ -166,7 +189,13 @@ class Body {
             return; // first terminator wins (see fail())
         m_terminated = true;
         m_pending_eof = true;
-        (void)channel().try_send(error_code{}, Frame{Eof{}});
+        // A body-less request (the common GET) never touches the channel:
+        // creating it here only to enqueue the terminator cost a shared_ptr
+        // allocation plus the channel object for every such request. read()
+        // reports m_pending_eof as soon as it finds the queue empty, so the
+        // terminator does not need to be on the channel at all.
+        if (m_channel)
+            (void)m_channel->try_send(error_code{}, Frame{Eof{}});
     }
 
     // Signals a stream failure (reset/disconnect) to the consumer. Same
@@ -182,7 +211,8 @@ class Body {
             return;
         m_terminated = true;
         m_pending_error = ec;
-        (void)channel().try_send(ec, Frame{Eof{}});
+        if (m_channel)
+            (void)m_channel->try_send(ec, Frame{Eof{}});
     }
 
     // Installs a consumption hook invoked (from the consumer's context) with the

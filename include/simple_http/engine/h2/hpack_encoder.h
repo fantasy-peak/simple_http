@@ -54,7 +54,13 @@ inline void hpack_append_integer(std::string &out, unsigned char prefix_byte, un
 // Huffman table never expands ASCII header text, so this is never larger than
 // the raw encoding and is simpler to always take).
 inline void hpack_append_string(std::string &out, std::string_view value) {
-    std::string huff;
+    // The Huffman buffer is scratch space, not output: encoding it into a fresh
+    // local string cost one malloc/free per header *field* (Date, Content-Type,
+    // Content-Length, Server, ...), which is several allocations per response.
+    // A thread_local keeps its capacity across calls, and the encode itself
+    // never calls back into this function, so one buffer per thread is enough.
+    static thread_local std::string huff;
+    huff.clear();
     http_huffman_encode(reinterpret_cast<unsigned char *>(const_cast<char *>(value.data())),
                         static_cast<unsigned int>(value.size()), huff);
     hpack_append_integer(out, 0x80, 7, huff.size());

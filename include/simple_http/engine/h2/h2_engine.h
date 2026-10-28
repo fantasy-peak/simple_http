@@ -37,6 +37,7 @@
 #include <random>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <variant>
@@ -377,7 +378,12 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         // writers check first, this guards any other caller.
         if (!stream_writable(stream_id))
             return;
-        std::string block;
+        // Reuse one serialization buffer across responses: submit_headers() is
+        // synchronous on the connection executor, so no other producer can be
+        // using it. `append_field_block` copies the finished block into m_out
+        // before this returns.
+        std::string &block = m_response_block;
+        block.clear();
         codec::hpack_append_status(block, status);
         for (const auto &[name, value] : headers) {
             if (is_connection_specific_field(name))
@@ -580,7 +586,21 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         // Outbound response body: a queue of chunks the write loop drains into
         // flow-controlled DATA frames. out_offset marks how much of the front
         // chunk has already been framed (so partial sends need no substr copy).
-        std::deque<std::string> out_queue;
+        // A vector with a read cursor, not a deque: a default-constructed
+        // std::deque allocates its block map, and every stream paid that (plus
+        // paused_frames') for the life of the request. The cursor resets when
+        // the queue empties, so the capacity is reused.
+        std::vector<std::string> out_queue;
+        std::size_t out_head = 0;
+        bool out_empty() const { return out_head >= out_queue.size(); }
+        std::string &out_front() { return out_queue[out_head]; }
+        std::size_t out_size() const { return out_queue.size() - out_head; }
+        void out_pop_front() {
+            if (++out_head >= out_queue.size()) {
+                out_queue.clear();
+                out_head = 0;
+            }
+        }
         std::size_t out_offset = 0;
         bool out_finished = false; // handler signalled end-of-body (send/send_last)
         // Compressed trailer field block, emitted as a trailing HEADERS frame
@@ -628,7 +648,16 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         // stream must not stop the connection from parsing frames for its
         // siblings. The connection receive window - not replenished for these
         // bytes until they are consumed - is what bounds the total across streams.
-        std::deque<std::string> paused_frames;
+        std::vector<std::string> paused_frames;
+        std::size_t paused_head = 0;
+        bool paused_empty() const { return paused_head >= paused_frames.size(); }
+        std::string &paused_front() { return paused_frames[paused_head]; }
+        void paused_pop_front() {
+            if (++paused_head >= paused_frames.size()) {
+                paused_frames.clear();
+                paused_head = 0;
+            }
+        }
         // END_STREAM arrived while frames were still parked. Body::read() reports
         // EOF as soon as the channel drains, so body().finish() must wait until the
         // parked queue is empty or the consumer would see a truncated body; see
@@ -645,7 +674,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         bool ws_closed = false;                                                 // we tore the tunnel down
         std::shared_ptr<asio::experimental::channel<void(error_code)>> ws_wake; // wakes a parked reader
 
-        bool out_drained() const { return out_finished && out_queue.empty(); }
+        bool out_drained() const { return out_finished && out_empty(); }
     };
 
     // --- byte helpers ---
@@ -770,7 +799,18 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
             // window closed, bounding in-flight memory (no unbounded backlog).
             std::weak_ptr<Http2Engine> weak = this->weak_from_this();
             auto exec = m_executor;
-            st.request->body().set_on_consumed([weak, exec, stream_id](std::size_t n) {
+            // The common case is a handler reading its body on the connection
+            // executor, where on_body_consumed() may run inline. Posting for
+            // every body chunk cost an executor operation (and its allocation)
+            // per request. A reader on any other thread still hops, which is
+            // what keeps this correct for a Body handed to another executor.
+            const std::thread::id connection_thread = m_thread_id;
+            st.request->body().set_on_consumed([weak, exec, stream_id, connection_thread](std::size_t n) {
+                if (std::this_thread::get_id() == connection_thread) {
+                    if (auto eng = weak.lock())
+                        eng->on_body_consumed(stream_id, n);
+                    return;
+                }
                 asio::post(exec, [weak, stream_id, n]() {
                     if (auto eng = weak.lock())
                         eng->on_body_consumed(stream_id, n);
@@ -1173,12 +1213,22 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
             reset_stream(hdr.stream_id, codec::H2_STREAM_CLOSED);
             return true;
         }
-        st.header_block.append(block);
-        if (hdr.stream_id > m_next_peer_stream_id)
-            m_next_peer_stream_id = hdr.stream_id;
-
         // If END_STREAM is set, the client sends no request body.
         bool end_stream = hdr.has_flag(codec::H2_FLAG_END_STREAM);
+
+        // A whole header block in one frame (the overwhelmingly common shape) is
+        // decoded straight out of the receive buffer. Appending it to
+        // st.header_block first copied every request head and allocated a new
+        // buffer per request; the accumulated form is only needed when
+        // CONTINUATION frames follow.
+        const bool single_frame_block = hdr.has_flag(codec::H2_FLAG_END_HEADERS) && st.header_block.empty();
+        std::string_view decoded_block = block;
+        if (!single_frame_block) {
+            st.header_block.append(block);
+            decoded_block = st.header_block;
+        }
+        if (hdr.stream_id > m_next_peer_stream_id)
+            m_next_peer_stream_id = hdr.stream_id;
 
         if (hdr.has_flag(codec::H2_FLAG_END_HEADERS)) {
             // A trailing header block completes the request, so it must also end
@@ -1190,7 +1240,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                 reset_stream(hdr.stream_id, codec::H2_PROTOCOL_ERROR);
                 return true;
             }
-            if (!finish_header_block(hdr.stream_id, st))
+            if (!finish_header_block(hdr.stream_id, st, decoded_block))
                 return false;
             // finish_header_block may have reset (and erased) a malformed stream, so
             // `st` must not be used again: re-look it up before dispatching.
@@ -1255,7 +1305,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         it->second.header_block.append(payload);
         if (hdr.has_flag(codec::H2_FLAG_END_HEADERS)) {
             m_continuation_stream = 0;
-            if (!finish_header_block(hdr.stream_id, it->second))
+            if (!finish_header_block(hdr.stream_id, it->second, it->second.header_block))
                 return false;
             auto it2 = m_streams.find(hdr.stream_id); // may have been reset+erased
             if (it2 == m_streams.end())
@@ -1288,9 +1338,14 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
     // framing a message the sender never described.
     // (The predicate itself is core/http_field.h's, shared with the h3 engine.)
 
-    bool finish_header_block(std::uint32_t stream_id, Stream &st) {
-        std::vector<codec::HpackHeader> fields;
-        if (!m_decoder.decode(st.header_block, fields)) {
+    bool finish_header_block(std::uint32_t stream_id, Stream &st, std::string_view block) {
+        // `fields` is connection-scoped scratch: clear() keeps the vector's
+        // capacity (and the small-string storage of its entries) so a request
+        // head no longer allocates a fresh vector every time. Decoding is not
+        // re-entrant, so one buffer per engine is enough.
+        auto &fields = m_decode_fields;
+        fields.clear();
+        if (!m_decoder.decode(block, fields)) {
             if (m_decoder.header_list_too_large()) {
                 // The decoded list exceeded the bound advertised as
                 // SETTINGS_MAX_HEADER_LIST_SIZE. RFC 9113 §6.5.2 makes that a
@@ -1323,6 +1378,11 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         bool seen_regular_field = false;
         // RFC 8441 extended CONNECT selector, present only when `:protocol` was.
         bool seen_protocol = false;
+
+        // The decoder already knows how many fields the block held. Reserving
+        // once keeps the request's header vector from growing 1 -> 2 -> 4 -> 8
+        // (each growth reallocating and moving every stored string) per request.
+        st.request->mutable_headers().reserve(fields.size());
 
         // Every rejection below is a *stream* error (§8.1.1): the connection stays
         // usable and only the offending stream is reset. Returning true then means
@@ -1608,7 +1668,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                 // These delivered bytes owe connection-level credit until the
                 // handler consumes them (or the stream is torn down).
                 st.recv_owed_conn += static_cast<std::int64_t>(data.size());
-                if (!st.paused_frames.empty() || !st.request->body().feed(std::string{data})) {
+                if (!st.paused_empty() || !st.request->body().feed(std::string{data})) {
                     // The handler has not drained the body, so the channel is full.
                     // Park the frame on this stream rather than dropping it (the
                     // bytes are already counted against the connection window, so
@@ -1638,7 +1698,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                 // Body::read() reports EOF as soon as the channel drains, so
                 // finishing here with frames parked would truncate the body. Record
                 // it and let on_body_consumed() finish once the parked queue drains.
-                if (st.paused_frames.empty()) {
+                if (st.paused_empty()) {
                     st.request->body().finish();
                 } else {
                     st.finish_pending = true;
@@ -1857,15 +1917,15 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         //
         // feed() leaves its argument intact when it refuses, so moving the front
         // is safe: it is popped only once the channel has actually taken it.
-        while (!it->second.paused_frames.empty()) {
-            if (!it->second.request->body().feed(std::move(it->second.paused_frames.front())))
+        while (!it->second.paused_empty()) {
+            if (!it->second.request->body().feed(std::move(it->second.paused_front())))
                 break; // still full: try again on the next consume
-            it->second.paused_frames.pop_front();
+            it->second.paused_pop_front();
         }
         // If END_STREAM arrived while frames were parked, hand the end over now
         // that the queue is empty (see on_data): only then may Body::read() report
         // EOF without cutting the body short.
-        if (it->second.finish_pending && it->second.paused_frames.empty()) {
+        if (it->second.finish_pending && it->second.paused_empty()) {
             it->second.finish_pending = false;
             it->second.request->body().finish();
         }
@@ -1922,7 +1982,8 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         // HEADERS always precede DATA: submit_headers() runs synchronously on
         // this executor when the handler replies, appending the HEADERS frame to
         // m_out before any body bytes are queued here.
-        std::vector<std::uint32_t> finished; // streams that just emitted END_STREAM
+        auto &finished = m_finished_streams; // streams that just emitted END_STREAM
+        finished.clear();                    // keeps capacity across passes
 
         // The connection window is shared, so this walk has to share it too. A
         // stream that always has bytes queued would otherwise take every refill
@@ -1935,7 +1996,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         // what is currently available, per pass.
         std::size_t active = 0;
         for (const auto &[sid, st] : m_streams) {
-            if (!st.end_stream_sent && (!st.out_queue.empty() || st.out_finished))
+            if (!st.end_stream_sent && (!st.out_empty() || st.out_finished))
                 ++active;
         }
         const std::int64_t share =
@@ -1953,7 +2014,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
 
             // Emit DATA while the connection and stream windows both allow it.
             for (;;) {
-                if (st.out_queue.empty()) {
+                if (st.out_empty()) {
                     // No queued bytes. If the body is done, end the stream once:
                     // with a trailing HEADERS frame carrying the trailer section
                     // when one was submitted, otherwise the terminating empty
@@ -1974,7 +2035,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                 if (window <= 0)
                     break; // blocked on flow control; resume on WINDOW_UPDATE
 
-                std::string &front = st.out_queue.front();
+                std::string &front = st.out_front();
                 std::size_t available = front.size() - st.out_offset;
                 // Bound a DATA frame by the *peer's* SETTINGS_MAX_FRAME_SIZE:
                 // that is what it accepts. Our own advertised value limits what
@@ -2000,7 +2061,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                 bool front_done = (st.out_offset >= front.size());
                 // A pending trailer section carries END_STREAM itself, so the
                 // final DATA frame must not (the trailer HEADERS follows it).
-                bool last = front_done && st.out_queue.size() == 1 && st.out_finished && !st.out_trailers_set;
+                bool last = front_done && st.out_size() == 1 && st.out_finished && !st.out_trailers_set;
 
                 std::uint8_t flags = last ? codec::H2_FLAG_END_STREAM : 0;
                 append_frame(codec::H2FrameType::Data, flags, stream_id, piece);
@@ -2015,7 +2076,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                 }
 
                 if (front_done) {
-                    st.out_queue.pop_front();
+                    st.out_pop_front();
                     st.out_offset = 0;
                 }
                 if (last) {
@@ -2590,6 +2651,9 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
     // --- members (touched only on the connection executor) ---
     std::shared_ptr<Transport> m_transport;
     Executor m_executor;
+    // Thread the connection is bound to (model A). Used to run body-consumption
+    // bookkeeping inline instead of posting it when the reader is already here.
+    const std::thread::id m_thread_id{std::this_thread::get_id()};
     asio::experimental::channel<void(error_code)> m_notify;
     EngineLimits m_limits;
     std::chrono::steady_clock::time_point m_deadline{};
@@ -2599,6 +2663,12 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
     WsLookup m_ws_regex_lookup;      // local regex ws routes, empty if none
     WsProxyLookup m_ws_proxy_lookup; // byte-level ws reverse-proxy routes, empty if none
     codec::HpackDecoder m_decoder;   // connection-scoped (read loop only)
+    // Connection-scoped scratch buffers. Every write path already runs on the
+    // connection executor (model A), so one buffer each is enough; they keep
+    // their capacity between requests instead of per-request allocations.
+    std::vector<codec::HpackHeader> m_decode_fields; // decoded request head
+    std::string m_response_block;                    // serialized response head
+    std::vector<std::uint32_t> m_finished_streams;   // END_STREAM emitters per pass
     std::unordered_map<std::uint32_t, Stream> m_streams;
 
     // Rapid Reset defense: handlers currently executing on this connection, and

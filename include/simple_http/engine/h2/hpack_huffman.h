@@ -8,6 +8,7 @@
 // standard-library code: no Asio, no OpenSSL, no framework coupling.
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 
 namespace simple_http::codec {
@@ -4271,54 +4272,34 @@ inline int http_huffman_decode_bits(unsigned char *state, unsigned char *ending,
 }
 
 inline int http_huffman_encode(unsigned char *src, unsigned int len, std::string &outstr) {
-    huffman_static_encode_t temp;
-    unsigned int subchar_int, new_char;
-    unsigned char temp_char = 0x00, pre_char_length = 0, cur_char_length = 0;
-    for (unsigned int i = 0; i < len; i++) {
-        temp = huffman_encode_table[src[i]];
-        subchar_int = temp.code;
-        cur_char_length = temp.nbits;
-        if (pre_char_length > 0) {
-            if ((pre_char_length + cur_char_length) < 8) {
-                new_char = subchar_int >> pre_char_length | new_char;
-                pre_char_length = pre_char_length + cur_char_length;
-                continue;
-            }
-            unsigned char subchar_length = 8 - pre_char_length;
-            temp_char = (unsigned char)((new_char >> 24) & 0xFF);
-            unsigned char a = 0x00;
-            for (int j = 0; j < subchar_length; j++) {
-                if ((subchar_int & 0x80000000) == 0x80000000) {
-                    a = (a << 1) | 0x01;
-                } else {
-                    a = a << 1;
-                }
-                subchar_int = subchar_int << 1;
-            }
-            temp_char = temp_char | a;
-            outstr.push_back(temp_char);
-            cur_char_length -= subchar_length;
-        }
-        if (cur_char_length >= 8) {
-            for (; cur_char_length >= 8; cur_char_length -= 8) {
-                temp_char = (unsigned char)((subchar_int >> 24) & 0xFF);
-                outstr.push_back(temp_char);
-                subchar_int = subchar_int << 8;
-            }
-        }
-        if (cur_char_length > 0) {
-            new_char = subchar_int;
-            pre_char_length = cur_char_length;
-        } else {
-            new_char = 0x00;
-            pre_char_length = 0x00;
+    // Size first, then write through a pointer into the string's own storage.
+    // The old implementation appended one byte at a time while shifting the
+    // code bit-by-bit, which showed up as ~2% of the CPU in the response writer.
+    // Header values are short (a Date is 29 bytes), so a 64-bit accumulator can
+    // hold the pending bits for each code (max 30) without spilling.
+    std::size_t bits = 0;
+    for (unsigned int i = 0; i < len; ++i)
+        bits += huffman_encode_table[src[i]].nbits;
+    const std::size_t start = outstr.size();
+    outstr.resize(start + (bits + 7) / 8);
+    char *out = outstr.data() + start;
+    std::uint64_t acc = 0;
+    unsigned pending = 0;
+    std::size_t written = 0;
+    for (unsigned int i = 0; i < len; ++i) {
+        const huffman_static_encode_t &t = huffman_encode_table[src[i]];
+        // The table stores each code left-aligned in 32 bits; right-align it.
+        acc = (acc << t.nbits) | (t.code >> (32 - t.nbits));
+        pending += t.nbits;
+        while (pending >= 8) {
+            pending -= 8;
+            out[written++] = static_cast<char>((acc >> pending) & 0xFF);
         }
     }
-    if (pre_char_length > 0) {
-        unsigned char codes = 0xFF;
-        temp_char = (unsigned char)((new_char >> 24) & 0xFF);
-        temp_char |= (unsigned char)(codes >> pre_char_length);
-        outstr.push_back(temp_char);
+    if (pending > 0) {
+        // Pad the final partial byte with EOS bits (all ones), RFC 7541 §5.2.
+        const unsigned pad = 8 - pending;
+        out[written++] = static_cast<char>(((acc & ((1ull << pending) - 1)) << pad) | ((1u << pad) - 1));
     }
     return 0;
 }
