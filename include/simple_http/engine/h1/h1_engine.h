@@ -441,6 +441,9 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
             co_await serve_loop(dispatch, std::move(initial));
         }
         if (!m_upgraded) {
+            // TLS gets a close_notify before the socket goes; plaintext's
+            // shutdown() is a no-op.
+            co_await m_transport->shutdown();
             m_transport->close();
         }
         co_return;

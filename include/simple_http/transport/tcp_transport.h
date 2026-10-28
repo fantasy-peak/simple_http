@@ -47,6 +47,8 @@ template <typename Socket> class TcpTransport {
 
     SslHandle tls_handle() const { return std::nullopt; }
 
+    // TCP's FIN is its close notification; nothing to flush first.
+    asio::awaitable<void> shutdown() { co_return; }
     void close() { shutdown_socket(*m_socket); }
 
     Socket &socket() { return *m_socket; }

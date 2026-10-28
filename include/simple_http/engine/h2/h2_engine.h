@@ -889,6 +889,9 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         // Flush with a deadline: a peer that stopped reading must not keep the
         // connection (and this coroutine) alive.
         co_await (flush_pending_output() || flush_deadline());
+        // TLS gets a close_notify before the socket goes; plaintext's
+        // shutdown() is a no-op.
+        co_await m_transport->shutdown();
         m_transport->close();
         co_return;
     }

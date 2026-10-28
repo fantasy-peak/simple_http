@@ -11,7 +11,9 @@
 #include <algorithm>
 #include <array>
 #include <boost/asio.hpp>
+#include <boost/asio/experimental/awaitable_operators.hpp>
 #include <boost/asio/ssl.hpp>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <memory>
@@ -72,6 +74,28 @@ template <typename Socket> class TlsTransport {
     asio::ip::tcp::endpoint peer() const { return m_peer; }
 
     SslHandle tls_handle() const { return m_stream->native_handle(); }
+
+    // Send close_notify before the TCP socket goes away. Without it the peer
+    // sees a bare FIN and reports a truncated TLS stream (Python: SSLEOFError,
+    // OpenSSL: stream_truncated) instead of a clean end of data.
+    //
+    // Bounded because asio's async_shutdown also waits for the peer's
+    // close_notify; a peer that never sends one must not delay teardown.
+    asio::awaitable<void> shutdown(std::chrono::milliseconds limit = std::chrono::milliseconds(250)) {
+        if (!m_stream)
+            co_return;
+        using namespace asio::experimental::awaitable_operators;
+        auto close_notify = [this]() -> asio::awaitable<void> {
+            error_code ec;
+            co_await m_stream->async_shutdown(asio::redirect_error(asio::use_awaitable, ec));
+        };
+        auto deadline = [limit]() -> asio::awaitable<void> {
+            asio::steady_timer timer{co_await asio::this_coro::executor};
+            timer.expires_after(limit);
+            co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+        };
+        co_await (close_notify() || deadline());
+    }
 
     void close() { shutdown_socket(m_stream->lowest_layer()); }
 

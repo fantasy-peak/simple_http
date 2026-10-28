@@ -2799,3 +2799,30 @@ TEST_CASE("regression/static: a 405 survives an unread request body", "[regressi
     client.close();
     server.stop();
 }
+
+TEST_CASE("regression/tls: a normal close sends close_notify", "[regression][tls]") {
+    tls_server();
+    asio::io_context ctx;
+    asio::ssl::context client_ctx{asio::ssl::context::tls_client};
+    client_ctx.set_verify_mode(asio::ssl::verify_none);
+    client_ctx.use_certificate_chain_file("./test/tls_certificates/client_cert.pem");
+    client_ctx.use_private_key_file("./test/tls_certificates/client_key.pem", asio::ssl::context::pem);
+    asio::ssl::stream<asio::ip::tcp::socket> stream{ctx, client_ctx};
+
+    sh::error_code ec;
+    stream.next_layer().connect(asio::ip::tcp::endpoint(asio::ip::make_address("127.0.0.1"), kTlsPort), ec);
+    REQUIRE_FALSE(ec);
+    stream.handshake(asio::ssl::stream_base::client, ec);
+    REQUIRE_FALSE(ec);
+
+    const std::string req = "GET /world HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    asio::write(stream, asio::buffer(req), ec);
+    REQUIRE_FALSE(ec);
+
+    asio::streambuf buf;
+    ec = {};
+    asio::read(stream, buf, ec); // until maybe_eof
+    // A clean close_notify is eof; a bare TCP FIN is stream_truncated.
+    CHECK(ec == asio::error::eof);
+    CHECK(ec != asio::ssl::error::stream_truncated);
+}

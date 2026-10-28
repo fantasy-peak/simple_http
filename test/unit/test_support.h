@@ -217,6 +217,7 @@ class MockTransport {
 
     SslHandle tls_handle() const { return std::nullopt; }
 
+    asio::awaitable<void> shutdown() { co_return; }
     void close() { m_closed = true; }
 
   private:
