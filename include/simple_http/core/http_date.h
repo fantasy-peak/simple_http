@@ -228,23 +228,43 @@ inline std::optional<std::int64_t> parse_http_date(std::string_view s) {
     if (mon < 0)
         return std::nullopt;
 
+    // timegm normalises `tm` in place, so keep the parsed fields: the round-trip
+    // check below must compare against what the request said, not the normalised
+    // struct timegm left behind.
+    const int in_mday = *day;
+    const int in_mon = mon;
+    const int in_year = *year;
+    const int in_hour = *hour;
+    const int in_min = *minute;
+    const int in_sec = *second;
+
     std::tm tm{};
-    tm.tm_mday = *day;
-    tm.tm_mon = mon;
-    tm.tm_year = *year - 1900;
-    tm.tm_hour = *hour;
-    tm.tm_min = *minute;
-    tm.tm_sec = *second;
+    tm.tm_mday = in_mday;
+    tm.tm_mon = in_mon;
+    tm.tm_year = in_year - 1900;
+    tm.tm_hour = in_hour;
+    tm.tm_min = in_min;
+    tm.tm_sec = in_sec;
     // timegm is not ISO C++ (it is POSIX and glibc); the Windows spelling is
     // _mkgmtime. Both treat the fields as UTC, which is what the "GMT" in an
     // IMF-fixdate means -- mktime would apply the process timezone and shift
     // every validator by the local offset.
 #if defined(_WIN32)
     const std::time_t t = _mkgmtime(&tm);
+    std::tm back{};
+    if (gmtime_s(&back, &t) != 0)
+        return std::nullopt;
 #else
     const std::time_t t = timegm(&tm);
+    std::tm back{};
+    // timegm normalises impossible fields (31 Feb becomes 2 Mar) and also uses
+    // -1 for both errors and the real 1969-12-31T23:59:59Z timestamp. Comparing
+    // the round trip tells the two apart and rejects the normalised dates.
+    if (gmtime_r(&t, &back) == nullptr)
+        return std::nullopt;
 #endif
-    if (t == static_cast<std::time_t>(-1))
+    if (back.tm_mday != in_mday || back.tm_mon != in_mon || back.tm_year != in_year - 1900 || back.tm_hour != in_hour ||
+        back.tm_min != in_min || back.tm_sec != in_sec)
         return std::nullopt;
     return static_cast<std::int64_t>(t);
 }

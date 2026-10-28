@@ -128,3 +128,11 @@ TEST_CASE("validators: unsatisfiable and unparseable are different answers", "[v
         CHECK_FALSE(bad); // "no range", not "unsatisfiable"
     }
 }
+
+TEST_CASE("validators: Range numbers that overflow uint64 are refused", "[validators]") {
+    bool bad = false;
+    // 2^64, one past the maximum: wrapping it to 0 would turn a nonsense range
+    // into a valid-looking one.
+    CHECK_FALSE(parse_range("bytes=18446744073709551616-", 10, bad).has_value());
+    CHECK_FALSE(parse_range("bytes=0-18446744073709551616", 10, bad).has_value());
+}

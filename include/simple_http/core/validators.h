@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -112,7 +113,12 @@ inline std::optional<ByteRange> parse_range(std::string_view header, std::uint64
         for (char c : v) {
             if (c < '0' || c > '9')
                 return std::nullopt;
-            out = out * 10 + static_cast<std::uint64_t>(c - '0');
+            const auto d = static_cast<std::uint64_t>(c - '0');
+            // 20 digits can exceed uint64_t (max 18446744073709551615).
+            // Wrapping would turn a nonsense number into a small valid one.
+            if (out > (std::numeric_limits<std::uint64_t>::max() - d) / 10)
+                return std::nullopt;
+            out = out * 10 + d;
         }
         return out;
     };

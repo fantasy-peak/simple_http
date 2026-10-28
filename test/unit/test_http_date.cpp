@@ -102,3 +102,14 @@ TEST_CASE("http_date: now_unix is in the right epoch", "[http_date]") {
     CHECK(now > 1700000000); // after Nov 2023
     CHECK(now < 4102444800); // before 2100
 }
+
+TEST_CASE("http_date: impossible dates are refused, not normalised by timegm", "[http_date]") {
+    CHECK_FALSE(parse_http_date("Sun, 31 Feb 2020 00:00:00 GMT").has_value());
+    CHECK_FALSE(parse_http_date("Sun, 06 Nov 1994 99:99:99 GMT").has_value());
+    CHECK_FALSE(parse_http_date("Sun, 06 Nov 1994 24:00:00 GMT").has_value());
+
+    // -1 is a real timestamp (1969-12-31T23:59:59Z), not only timegm's error.
+    auto epoch = parse_http_date("Wed, 31 Dec 1969 23:59:59 GMT");
+    REQUIRE(epoch.has_value());
+    CHECK(*epoch == -1);
+}
