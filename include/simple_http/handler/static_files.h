@@ -331,7 +331,12 @@ inline asio::awaitable<bool> StaticFiles::try_serve(const RequestPtr &req, const
     if (range) {
         res->header(field::content_range, std::format("bytes {}-{}/{}", range->first, range->last, rep->size));
     }
-    if (spa_hit) {
+    if (range) {
+        // A 206 describes only the bytes being sent, including when the
+        // representation is the SPA fallback page: the full-file length here
+        // makes HTTP/2/3 clients wait for bytes that never come.
+        res->header(field::content_length, std::to_string(range->length()));
+    } else if (spa_hit) {
         // The fallback page is answered under a URL that may later name a real
         // file; revalidating it is the only way to notice. Its own ETag is
         // deliberately absent (see above), so the length is the only thing to
@@ -347,9 +352,7 @@ inline asio::awaitable<bool> StaticFiles::try_serve(const RequestPtr &req, const
         // HEAD carries the headers a GET would produce, and no body. Its length
         // must be set by hand: the engine writes headers only, and the one-shot
         // send() would compute the length of the empty body instead.
-        res->header(field::content_length, std::to_string(range ? range->length() : rep->size));
-    } else if (range) {
-        res->header(field::content_length, std::to_string(range->length()));
+        res->header(field::content_length, std::to_string(rep->size));
     } else if (!encoding.empty()) {
         // HTTP/1.1 recomputes content-length from the body we hand it; HTTP/2
         // forwards the header block untouched. Setting it makes both protocols

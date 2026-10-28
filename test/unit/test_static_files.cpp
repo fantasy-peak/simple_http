@@ -810,3 +810,51 @@ TEST_CASE("static: SPA fallback never swallows a reserved prefix", "[static]") {
     // And a route outside the reserved prefix still falls back.
     CHECK(get(*site, ctx, "/elsewhere").handled);
 }
+
+TEST_CASE("static: the index file is matched as a path component, not a suffix", "[static]") {
+    StaticFixture fx;
+    fx.write("index.html", "root");
+    fx.write("my.html", "real my");
+    fx.write("myindex.html", "myindex");
+    auto site = load_standard(fx);
+
+    // myindex.html is not an index file; it answers /myindex (its .html alias),
+    // not /my.
+    CHECK(site->find("/myindex") == site->find("/myindex.html"));
+    CHECK(site->find("/my") == site->find("/my.html"));
+}
+
+TEST_CASE("static: a pre-compressed sibling attaches to the real base file only", "[static]") {
+    StaticFixture fx;
+    fx.write("blog/index.html", "blog");
+    fx.write("blog.gz", "GZIP:blog");
+    fx.write("app.js", "app");
+    fx.write("app.js.gz", "GZIP:app");
+    auto site = load_standard(fx);
+
+    const StaticEntry *blog = site->find("/blog");
+    REQUIRE(blog != nullptr);
+    CHECK_FALSE(blog->gz.has_value()); // blog.gz is not the gzip of blog/index.html
+
+    const StaticEntry *app = site->find("/app.js");
+    REQUIRE(app != nullptr);
+    CHECK(app->gz.has_value());
+}
+
+TEST_CASE("static: a SPA fallback with Range reports the range length", "[static]") {
+    StaticFixture fx;
+    fx.make_standard_tree();
+    StaticFilesConfig cfg = standard_config(fx);
+    cfg.spa_fallback = "index.html";
+    auto site = load_standard(fx, cfg);
+
+    asio::io_context ctx;
+    auto req = make_request(ctx, "/spa/missing");
+    add_header(req, "range", "bytes=0-1");
+    auto r = serve(*site, ctx, req);
+
+    REQUIRE(r.handled);
+    CHECK(r.writer->last_status == status::partial_content);
+    CHECK(r.writer->header(field::content_length) == "2");
+    CHECK(r.writer->last_body.size() == 2);
+}

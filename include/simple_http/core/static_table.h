@@ -365,6 +365,12 @@ inline bool StaticTable::load(std::string &error) {
 
     std::uint64_t budget = m_preload_budget;
 
+    // Pass 2 attaches a .br/.gz sibling to the *real* file with that base name.
+    // Looking the base up in m_table would also match an alias key (a directory
+    // index or the extensionless .html spelling), which is how blog.gz used to
+    // become the gzip representation of /blog's index.html.
+    std::unordered_map<std::string, std::shared_ptr<StaticEntry>> direct;
+
     // Pass 1: the base files.
     for (const auto &rel : rels) {
         if (is_precompressed(rel))
@@ -387,6 +393,7 @@ inline bool StaticTable::load(std::string &error) {
         }
 
         EntryPtr shared = entry;
+        direct.emplace(rel, shared);
         auto insert_keys = [&](const std::string &key) {
             auto [pos, inserted] = m_table.emplace(key, shared);
             if (!inserted) {
@@ -400,10 +407,16 @@ inline bool StaticTable::load(std::string &error) {
         insert_keys(url);
 
         // index.html also answers its directory: "" for the root, "blog" for
-        // blog/index.html.
-        if (rel.size() >= m_config.index_file.size() &&
-            rel.compare(rel.size() - m_config.index_file.size(), m_config.index_file.size(), m_config.index_file) ==
-                0) {
+        // blog/index.html. It must be a full path component: a bare suffix match
+        // made "myindex.html" answer "/my" (and collide with my.html), when its
+        // only URL is the .html alias "/myindex".
+        const bool is_index =
+            !m_config.index_file.empty() &&
+            (rel == m_config.index_file || (rel.size() > m_config.index_file.size() &&
+                                            rel.compare(rel.size() - m_config.index_file.size(),
+                                                        m_config.index_file.size(), m_config.index_file) == 0 &&
+                                            rel[rel.size() - m_config.index_file.size() - 1] == '/'));
+        if (is_index) {
             std::string dir = rel.substr(0, rel.size() - m_config.index_file.size());
             while (!dir.empty() && dir.back() == '/')
                 dir.pop_back();
@@ -434,8 +447,8 @@ inline bool StaticTable::load(std::string &error) {
         } else {
             continue;
         }
-        auto it2 = m_table.find("/" + base);
-        if (it2 == m_table.end()) {
+        auto it2 = direct.find(base);
+        if (it2 == direct.end()) {
             SIMPLE_HTTP_WARN_LOG("static: {} has no base file, ignoring", rel);
             continue;
         }
