@@ -477,3 +477,19 @@ TEST_CASE("middleware: strip_prefix re-mounts a sub-application at its root", "[
         CHECK(req->path() == "/health");
     }
 }
+TEST_CASE("proto/response: set_cookie can delete with a negative Max-Age", "[forms]") {
+    asio::io_context ctx;
+    // 0 is the default ("unspecified"), matching Go, so it emits no Max-Age.
+    auto writer = std::make_shared<FakeResponseSink>();
+    auto res = std::make_shared<ResponseWriter>(writer);
+    res->set_cookie("sid", "", std::chrono::seconds{0}, "/");
+    REQUIRE(run_on(ctx, res->status(200).send("")));
+    CHECK(writer->header(field::set_cookie) == "sid=; Path=/");
+
+    // Go's http.SetCookie: a negative MaxAge is "delete now" and emits 0.
+    auto writer2 = std::make_shared<FakeResponseSink>();
+    auto res2 = std::make_shared<ResponseWriter>(writer2);
+    res2->set_cookie("old", "", std::chrono::seconds{-5}, "/");
+    REQUIRE(run_on(ctx, res2->status(200).send("")));
+    CHECK(writer2->header(field::set_cookie) == "old=; Path=/; Max-Age=0");
+}

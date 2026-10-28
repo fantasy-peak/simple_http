@@ -119,7 +119,11 @@ class ResponseWriter {
             field_value += "; Path=";
             field_value += path;
         }
-        if (max_age.count() > 0) {
+        if (max_age.count() < 0) {
+            // Go's http.SetCookie: a negative MaxAge means "delete now" and is
+            // serialized as Max-Age=0 (0 itself means "unspecified").
+            field_value += "; Max-Age=0";
+        } else if (max_age.count() > 0) {
             field_value += "; Max-Age=";
             field_value += std::to_string(max_age.count());
         }

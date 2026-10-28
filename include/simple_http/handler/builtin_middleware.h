@@ -193,6 +193,20 @@ inline Middleware recovery() {
     };
 }
 
+namespace basic_auth_detail {
+// Compares without an early exit on the first differing byte, so a remote peer
+// cannot recover the configured credentials byte by byte from response timing.
+// The length is still observable; it is fixed by the configuration, not secret.
+inline bool constant_time_equal(std::string_view a, std::string_view b) noexcept {
+    if (a.size() != b.size())
+        return false;
+    unsigned char diff = 0;
+    for (std::size_t i = 0; i < a.size(); ++i)
+        diff |= static_cast<unsigned char>(a[i]) ^ static_cast<unsigned char>(b[i]);
+    return diff == 0;
+}
+} // namespace basic_auth_detail
+
 // HTTP Basic authentication (RFC 7617): accepts only credentials equal to the
 // configured pair, answers 401 + WWW-Authenticate (which invites a browser's
 // credential prompt) and short-circuits otherwise. The compare is done on the
@@ -207,7 +221,7 @@ inline Middleware basic_auth(std::string username, std::string password) {
             constexpr std::string_view scheme = "Basic ";
             if (auth->size() > scheme.size() && iequals_ci(auth->substr(0, scheme.size()), scheme)) {
                 const std::string decoded = base64_decode(std::string{auth->substr(scheme.size())});
-                ok = decoded == expected;
+                ok = basic_auth_detail::constant_time_equal(decoded, expected);
             }
         }
         if (!ok) {
