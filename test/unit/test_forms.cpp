@@ -125,6 +125,34 @@ TEST_CASE("proto/multipart: a leading CRLF is tolerated and framing errors are n
     CHECK_FALSE(parse_multipart(body, "B", /*max_part_bytes=*/0, /*max_parts=*/100).has_value());
 }
 
+TEST_CASE("proto/multipart: a part whose content ends with CRLF keeps it", "[forms]") {
+    // The break delimiter is "\r\n--B": the CRLF it matches is the framing one,
+    // so the content's own trailing CRLF must survive.
+    const std::string body = "--B\r\n"
+                             "Content-Disposition: form-data; name=\"t\"\r\n"
+                             "\r\n"
+                             "line1\r\n"
+                             "\r\n"
+                             "--B--\r\n";
+    auto parts = parse_multipart(body, "B");
+    REQUIRE(parts.has_value());
+    REQUIRE(parts->size() == 1);
+    CHECK((*parts)[0].data == "line1\r\n");
+}
+
+TEST_CASE("proto/multipart: a quoted filename may contain a semicolon", "[forms]") {
+    const std::string body = "--B\r\n"
+                             "Content-Disposition: form-data; name=\"up\"; filename=\"a; name=evil\"\r\n"
+                             "\r\n"
+                             "x\r\n"
+                             "--B--\r\n";
+    auto parts = parse_multipart(body, "B");
+    REQUIRE(parts.has_value());
+    REQUIRE(parts->size() == 1);
+    CHECK((*parts)[0].name == "up");
+    CHECK((*parts)[0].filename == "a; name=evil");
+}
+
 TEST_CASE("proto/multipart: MultipartForm encodes what parse_multipart decodes", "[forms]") {
     // The encoder and parser round-trip each other byte for byte on clean names.
     const std::string expected = "--B\r\n"

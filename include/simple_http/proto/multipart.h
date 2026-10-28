@@ -37,7 +37,18 @@ namespace multipart_detail {
 
 inline std::string unquote(std::string_view s) {
     if (s.size() >= 2 && s.front() == '"' && s.back() == '"') {
-        return std::string{s.substr(1, s.size() - 2)};
+        // A quoted-string may escape the quote and the backslash itself.
+        std::string out;
+        out.reserve(s.size() - 2);
+        for (std::size_t i = 1; i + 1 < s.size(); ++i) {
+            if (s[i] == '\\' && i + 2 < s.size()) {
+                ++i;
+                out.push_back(s[i]);
+            } else {
+                out.push_back(s[i]);
+            }
+        }
+        return out;
     }
     return std::string{s};
 }
@@ -57,26 +68,46 @@ inline void parse_part_head(std::string_view head, MultipartPart &part) {
             const std::string_view name = trim_ows(line.substr(0, colon));
             std::string_view value = trim_ows(line.substr(colon + 1));
             if (iequals_ci(name, "content-disposition")) {
-                // form-data; name="field"; filename="f.txt" — scan the
-                // semi-colon-separated parameters.
-                while (!value.empty()) {
-                    const std::size_t semi = value.find(';');
-                    const std::string_view param =
-                        trim_ows(value.substr(0, semi == std::string_view::npos ? std::string_view::npos : semi));
+                // form-data; name="field"; filename="f.txt" — split on
+                // semicolons *outside* quoted strings. RFC 7578 makes filename a
+                // quoted-string, and a legal filename may contain ';'; splitting
+                // naively truncates it and lets the tail look like another
+                // parameter (which used to overwrite `name`).
+                std::size_t p = 0;
+                while (p < value.size()) {
+                    while (p < value.size() && (value[p] == ';' || value[p] == ' ' || value[p] == '\t'))
+                        ++p;
+                    if (p >= value.size())
+                        break;
+                    const std::size_t start = p;
+                    bool quoted = false;
+                    for (; p < value.size(); ++p) {
+                        const char c = value[p];
+                        if (quoted) {
+                            if (c == '\\' && p + 1 < value.size()) {
+                                ++p; // escaped character inside the quoted-string
+                            } else if (c == '"') {
+                                quoted = false;
+                            }
+                        } else if (c == '"') {
+                            quoted = true;
+                        } else if (c == ';') {
+                            break;
+                        }
+                    }
+                    const std::string_view param = trim_ows(value.substr(start, p - start));
                     const std::size_t peq = param.find('=');
                     if (!param.empty() && peq != std::string_view::npos) {
                         std::string pvalue = unquote(trim_ows(param.substr(peq + 1)));
                         const std::string_view pname = trim_ows(param.substr(0, peq));
-                        if (pname == "name") {
+                        if (iequals_ci(pname, "name")) {
                             part.name = std::move(pvalue);
-                        } else if (pname == "filename") {
+                        } else if (iequals_ci(pname, "filename")) {
                             part.filename = std::move(pvalue);
                         }
                     }
-                    if (semi == std::string_view::npos) {
-                        break;
-                    }
-                    value.remove_prefix(semi + 1);
+                    // p is at the separating ';' (or the end); the loop's skip
+                    // consumes it.
                 }
             } else if (iequals_ci(name, "content-type")) {
                 part.content_type = std::string{trim_ows(value)};
@@ -176,12 +207,11 @@ inline std::optional<std::vector<MultipartPart>> parse_multipart(std::string_vie
         if (body_end == std::string_view::npos) {
             return std::nullopt;
         }
+        // break_delim is "\r\n" + delim, so `body_end` already points *at* the
+        // framing CRLF: content ends one byte earlier. Stripping another CRLF
+        // here removed one that actually belongs to the part (a textarea value
+        // ending in a newline).
         std::string_view data = body.substr(pos, body_end - pos);
-        // The CRLF immediately before the delimiter belongs to the framing, not
-        // the part.
-        if (data.size() >= 2 && data.substr(data.size() - 2) == "\r\n") {
-            data.remove_suffix(2);
-        }
         if (data.size() > max_part_bytes) {
             return std::nullopt;
         }
