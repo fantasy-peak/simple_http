@@ -473,6 +473,29 @@ class Client {
     send(std::shared_ptr<Request> request, std::string url = {}, std::size_t max_body_bytes = 0,
          std::chrono::milliseconds timeout = {}) const {
         co_await hop(); // everything below (incl. the request's Body channel) runs on the pinned executor
+        // A directly fed body lives in the Request's Body channel, not in
+        // body_source(). The redirect/retry loop rebuilds each hop from the
+        // source, so collect the fed bytes here (the documented client-side
+        // workflow is feed()+finish() before handing the request over). Without
+        // this, such a request went out with an empty body while still claiming
+        // its original framing.
+        std::string direct_body = request->body_source();
+        if (request->stream_body()) {
+            // This is the buffered path: there is no write side to service a
+            // streaming request. Answering it silently with no body is data
+            // loss, so refuse it instead.
+            co_return std::unexpected{make_error_code(asio::error::invalid_argument)};
+        }
+        if (direct_body.empty() && request->body().fed()) {
+            // Reading an unfinished body would wait forever; the caller must
+            // finish() what it fed.
+            if (!request->body().finished())
+                co_return std::unexpected{make_error_code(asio::error::invalid_argument)};
+            auto collected = co_await request->body().read_all();
+            if (!collected)
+                co_return std::unexpected{collected.error()};
+            direct_body = std::move(*collected);
+        }
         std::string current_url = url;
         detail::ClientTarget target;
         std::string url_target;
@@ -519,7 +542,7 @@ class Client {
         }
         co_return co_await follow_redirects(m_impl, m_cfg, std::move(target), request->method(),
                                             std::string{request->method_token()}, std::move(headers),
-                                            request->body_source(), std::move(url_target), cap, limit,
+                                            std::move(direct_body), request->close(), std::move(url_target), cap, limit,
                                             m_cfg.max_redirects, std::move(current_url));
     }
 
@@ -737,8 +760,9 @@ class Client {
     // the Request per hop — Go's http.Request.GetBody, concretely.
     static asio::awaitable<std::expected<Response, error_code>>
     follow_redirects(std::shared_ptr<detail::ClientEngine> impl, const ClientConfig &cfg, detail::ClientTarget target,
-                     Method method, std::string method_token, Headers headers, std::string body, std::string url_target,
-                     std::size_t cap, std::chrono::milliseconds limit, std::size_t remaining, std::string current_url) {
+                     Method method, std::string method_token, Headers headers, std::string body, bool close,
+                     std::string url_target, std::size_t cap, std::chrono::milliseconds limit, std::size_t remaining,
+                     std::string current_url) {
         // Saved before target is moved into the exchange: the next hop's origin
         // comparison needs the current authority.
         const std::string current_host = target.host;
@@ -748,6 +772,7 @@ class Client {
         request->set_method_token(method_token.empty() ? std::string{to_string(method)} : std::move(method_token));
         request->mutable_headers() = std::move(headers);
         request->set_target(url_target.empty() ? "/" : url_target);
+        request->set_close(close); // Go's Request.Close survives the redirect loop
         if (!body.empty())
             request->set_body(body);
         auto response =
@@ -816,7 +841,7 @@ class Client {
         // only fills an empty one.
         url_target = hop->url_target;
         co_return co_await follow_redirects(std::move(impl), cfg, std::move(hop->target), method,
-                                            std::move(method_token), std::move(headers), std::move(body),
+                                            std::move(method_token), std::move(headers), std::move(body), close,
                                             std::move(url_target), cap, limit, remaining - 1, std::move(hop->url));
     }
 

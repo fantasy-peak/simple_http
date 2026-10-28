@@ -124,6 +124,12 @@ class Body {
     }
 
     bool eof() const { return m_eof; }
+    // Whether any chunk was handed to feed() (set_body included). Lets a client
+    // tell "no body was ever supplied" from "a body was fed but not finished".
+    bool fed() const { return m_fed; }
+    // Whether finish()/fail() has been called. A directly-fed body must be
+    // finished before it can be handed to the buffered client send().
+    bool finished() const { return m_terminated; }
 
     // --- producer API (protocol engine side) ---
 
@@ -142,7 +148,12 @@ class Body {
     // asio moves its arguments into the queued frame only on success, so a refused
     // send leaves `data` intact. Wrapping it first would move it unconditionally
     // and lose it on failure.
-    [[nodiscard]] bool feed(std::string &&data) { return channel().try_send(error_code{}, std::move(data)); }
+    [[nodiscard]] bool feed(std::string &&data) {
+        if (!channel().try_send(error_code{}, std::move(data)))
+            return false;
+        m_fed = true;
+        return true;
+    }
 
     // Signals normal end-of-body.
     //
@@ -212,6 +223,7 @@ class Body {
     bool m_pending_eof{false};
     // A terminator (finish or fail) has been recorded; only the first one wins.
     bool m_terminated{false};
+    bool m_fed{false};
     std::optional<error_code> m_pending_error;
     std::function<void(std::size_t)> m_on_consumed;
     PullProvider m_pull; // set in pull mode (HTTP/1.x); unset = pushed channel (HTTP/2)

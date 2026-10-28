@@ -1527,6 +1527,27 @@ asio::awaitable<void> suite_http_api(std::uint16_t port) {
         check(r && body.find("\"id\":7") != std::string::npos && body.find("\"name\":\"rex\"") != std::string::npos,
               "http::json() sends a glaze body that echoes back");
     }
+    // Client::send(shared_ptr<Request>): the documented client-side workflow is
+    // to feed()+finish() the request's Body. That body is not body_source(), and
+    // the redirect/retry loop rebuilds each hop from the source, so it used to be
+    // dropped (an empty body went out).
+    {
+        h::Client client{co_await asio::this_coro::executor, base_config()};
+        auto req = std::make_shared<sh::Request>(sh::Version::Http11, co_await asio::this_coro::executor);
+        req->set_method(sh::Method::Post);
+        req->set_target("/echo");
+        req->mutable_headers().add("content-type", "text/plain");
+        (void)req->body().feed("direct-body");
+        req->body().finish();
+        req->set_close(true); // must survive the send path too
+        auto r = co_await client.send(req, base + "/echo");
+        std::string body;
+        if (r) {
+            if (auto text = co_await r->text())
+                body = *text;
+        }
+        check(r && body == "direct-body", "Client::send(Request): a feed()+finish() body is not dropped");
+    }
     // basic/bearer auth produce the Authorization header.
     {
         h::Client client{co_await asio::this_coro::executor, base_config()};
