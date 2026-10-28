@@ -249,6 +249,13 @@ void register_routes(sh::Server &server) {
     server.route(sh::any_methods, "/world", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
         co_await res->status(200).send(std::string{"hello from "} + std::string{sh::to_string(res->version())});
     });
+    // A HEAD/bodyless response that still advertises the Content-Encoding a GET
+    // would have used. With auto_decompress on, the client must not install a
+    // decoder for a body that does not exist.
+    server.route(sh::any_methods, "/gzip-head", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+        res->header(sh::field::content_encoding, "gzip");
+        co_await res->status(200).send(std::string(32, 'x'));
+    });
     server.route(sh::any_methods, "/echo", [](sh::RequestPtr req, sh::ResponsePtr res) -> asio::awaitable<void> {
         auto body = co_await req->body().read_all();
         co_await res->status(200).send(body ? *body : std::string{});
@@ -1526,6 +1533,23 @@ asio::awaitable<void> suite_http_api(std::uint16_t port) {
         }
         check(r && body.find("\"id\":7") != std::string::npos && body.find("\"name\":\"rex\"") != std::string::npos,
               "http::json() sends a glaze body that echoes back");
+    }
+    // request_timeout=0 means "no limit" (ClientConfig documents it).
+    {
+        auto cfg = base_config();
+        cfg.request_timeout = std::chrono::seconds(0);
+        h::Client client{co_await asio::this_coro::executor, cfg};
+        auto r = co_await client.get(base + "/world").send();
+        check(r && r->status() == 200, "request_timeout=0 means no limit");
+    }
+    // auto_decompress must not install a decoder for a bodyless response that
+    // still carries Content-Encoding (HEAD, and 204/304).
+    {
+        auto cfg = base_config();
+        cfg.auto_decompress = true;
+        h::Client client{co_await asio::this_coro::executor, cfg};
+        auto r = co_await client.request(sh::Method::Head, base + "/gzip-head").send();
+        check(r && r->status() == 200, "auto_decompress: a bodyless HEAD response is not a decode error");
     }
     // Client::send(shared_ptr<Request>): the documented client-side workflow is
     // to feed()+finish() the request's Body. That body is not body_source(), and

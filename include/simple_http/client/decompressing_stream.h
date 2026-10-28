@@ -111,7 +111,12 @@ class DecompressingClientStream final : public ClientStream {
         if (!head) {
             co_return head.error();
         }
-        if (auto encoding = head->headers.get("content-encoding"); encoding && *encoding != kEncodingIdentity) {
+        // A HEAD response (and 204/304) may still carry the Content-Encoding a
+        // GET would have used, but there is no body to decode. Installing a
+        // decoder there makes read() call finish() with no input, which every
+        // codec reports as a truncated stream (body_decode_failed).
+        if (auto encoding = head->bodyless ? std::optional<std::string_view>{} : head->headers.get("content-encoding");
+            encoding && *encoding != kEncodingIdentity) {
             m_decoder = make_decoder(*encoding);
             if (m_decoder) {
                 head->headers.erase("content-encoding");

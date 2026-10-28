@@ -698,7 +698,9 @@ class Client {
             auto &stream = opened->stream;
 
             const auto remaining = remaining_budget();
-            if (remaining.count() <= 0)
+            // 0 is the documented "no limit" (ClientConfig::request_timeout and
+            // the RequestBuilder override); only an actual budget can expire.
+            if (limit.count() > 0 && remaining.count() <= 0)
                 co_return std::unexpected{make_error_code(client_errc::request_timeout)};
             auto response = co_await read_exchange(stream, cap, remaining);
             if (response)

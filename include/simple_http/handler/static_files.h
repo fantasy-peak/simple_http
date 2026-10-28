@@ -181,7 +181,9 @@ inline asio::awaitable<bool> StaticFiles::try_serve(const RequestPtr &req, const
         detail::apply_common_headers(m_config.server_header, res, "text/plain; charset=utf-8", "no-store", std::nullopt,
                                      0);
         (void)co_await res->send("400 Bad Request");
-        (void)co_await res->close();
+        // Do NOT close here: the request body may still be unread, and closing a
+        // socket with unread data sends RST, which can discard this response.
+        // The engine drains (bounded by max_body_bytes) and closes/reuses.
         co_return true;
     }
 
@@ -212,9 +214,8 @@ inline asio::awaitable<bool> StaticFiles::try_serve(const RequestPtr &req, const
         res->header(field::cache_control, "no-store");
         res->content_type("text/plain; charset=utf-8");
         (void)co_await res->send("405 Method Not Allowed");
-        // Closing keeps the engine from draining a request body that was never
-        // going to be used.
-        (void)co_await res->close();
+        // Same as the 400 above: closing with an unread body resets the
+        // connection and can lose the response. Let the engine drain it.
         co_return true;
     }
 

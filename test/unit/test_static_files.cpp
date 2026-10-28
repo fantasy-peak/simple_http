@@ -530,7 +530,7 @@ TEST_CASE("static: an unsatisfiable range is a 416 that does not hang the client
     CHECK(r.writer->header("content-length") == "0");
 }
 
-TEST_CASE("static: a malformed path is answered here, with the connection closed", "[static]") {
+TEST_CASE("static: a malformed path is answered here, not served", "[static]") {
     StaticFixture fx;
     fx.make_standard_tree();
     auto site = load_standard(fx);
@@ -542,7 +542,9 @@ TEST_CASE("static: a malformed path is answered here, with the connection closed
         CHECK(r.handled); // answered, not passed on
         CHECK(r.writer->last_status == 400);
         CHECK(r.writer->header("cache-control") == "no-store");
-        CHECK_FALSE(r.writer->open);
+        // The handler answers; the engine drains the (unread) request body and
+        // owns the connection. Closing here would RST the response away.
+        CHECK(r.writer->last_body == "400 Bad Request");
     }
 }
 
@@ -559,7 +561,7 @@ TEST_CASE("static: a method other than GET/HEAD is resolved before it is rejecte
         CHECK(r.handled);
         CHECK(r.writer->last_status == 405);
         CHECK(r.writer->header("allow") == "GET, HEAD");
-        CHECK_FALSE(r.writer->open);
+        CHECK(r.writer->last_body == "405 Method Not Allowed");
     }
     {
         // A path that does not: 404, not 405 — which is what a static file

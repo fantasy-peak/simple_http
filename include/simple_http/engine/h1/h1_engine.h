@@ -646,6 +646,8 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
             // is the same pattern Http2ResponseSink uses for the h2 engine: the
             // read succeeds while the engine (and hence the connection) is alive,
             // and reports a clean end-of-life error once it is gone.
+            // Read before the header map is moved into the Request below.
+            const bool expect_continue = framing.has_body && header_has_token(head.headers, "expect", "100-continue");
             setup_body_framing(framing.chunked, framing.content_length);
             // Move the parsed header fields into the request: setup_body_framing
             // above was the last thing that read `head.headers`, so from here the
@@ -660,9 +662,16 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
                     co_return co_await eng->pull_body_chunk();
                 });
 
+            // A request that asked for 100-continue is waiting for an interim
+            // response before it sends its body, and this engine deliberately
+            // never sends one (handlers that want it can). If the handler
+            // answers without reading the body, draining would block until the
+            // client gives up — and bytes of the *next* pipelined request would
+            // be consumed as this body. Announce Connection: close up front and
+            // skip the drain below; the exchange ends at the response.
             auto writer = std::make_shared<Http1ResponseSink<Transport>>(
                 m_transport, version, m_deadline, m_limits.idle_timeout, m_limits.alt_svc_value());
-            writer->set_keep_alive(keep_alive);
+            writer->set_keep_alive(keep_alive && !expect_continue);
             const bool head_request = head.method == Method::Head;
             writer->set_head_request(head_request);
             // Compression wraps the writer, not the Response, so that every
@@ -681,8 +690,10 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
             // Drain any request body the handler did not read, so the connection
             // is positioned at the next pipelined request. If draining fails or
             // the body was oversized/malformed, we cannot safely reuse the
-            // connection.
-            bool drained = co_await drain_body();
+            // connection. An Expect: 100-continue body is the exception: the
+            // peer is waiting for a 100 this engine will not send, so there is
+            // nothing to drain and the connection is closing anyway.
+            const bool drained = (expect_continue && !m_body_done) ? false : co_await drain_body();
 
             const bool still_open = co_await writer->connected();
             // `keep_alive_out` is what the *response* announced: a streamed
@@ -810,7 +821,18 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
         if (chunk_len == 0) {
             // Last chunk: consume trailers up to the blank line, then EOF.
             std::string trailer;
-            while (co_await read_line(trailer) && !trailer.empty()) {
+            for (;;) {
+                if (!co_await read_line(trailer)) {
+                    // An EOF or an over-long trailer line is not a well-formed end
+                    // of body: the remaining bytes are not a request boundary, so
+                    // the handler must see the error and the connection must close.
+                    m_body_done = true;
+                    if (m_line_overflow)
+                        co_return std::unexpected(make_error_code(asio::error::message_size));
+                    co_return std::unexpected(make_error_code(asio::error::eof));
+                }
+                if (trailer.empty())
+                    break; // the blank line that terminates the trailer section
                 // Trailers are part of the body volume: count them so a peer cannot
                 // stream trailers forever (each line is itself bounded by read_line).
                 m_body_total += trailer.size() + 2;
@@ -995,6 +1017,7 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
     // Reads one CRLF- or LF-terminated line from m_buf (topping up from the
     // transport as needed), stripping the terminator. Returns false on EOF.
     asio::awaitable<bool> read_line(std::string &out) {
+        m_line_overflow = false;
         for (;;) {
             std::size_t nl = m_buf.find('\n');
             if (nl != std::string::npos) {
@@ -1009,6 +1032,7 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
             // would otherwise grow m_buf until the process runs out of memory.
             if (m_buf.size() >= m_limits.max_header_bytes) {
                 SIMPLE_HTTP_ERROR_LOG("h1 line longer than {} bytes; closing", m_limits.max_header_bytes);
+                m_line_overflow = true; // distinguish from EOF for the trailer section
                 co_return false;
             }
             auto [ec, n] = co_await read_some(std::span<std::byte>{m_read_scratch});
@@ -1267,6 +1291,7 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
     std::uint64_t m_body_total = 0;     // Chunked: running total (bounded by kMaxBodyBytes)
     bool m_body_done = false;           // body fully delivered (EOF reached)
     bool m_body_error = false;          // a pull failed: the connection is not at a request boundary
+    bool m_line_overflow = false;       // the last read_line() stopped at the size bound (not EOF)
 
     std::shared_ptr<Transport> m_transport;
     decltype(std::declval<Transport &>().get_executor()) m_executor;

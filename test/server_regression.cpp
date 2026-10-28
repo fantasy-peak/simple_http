@@ -226,9 +226,15 @@ class RawClient {
         return true;
     }
 
-    void send(std::string_view bytes) {
+    void send(std::string_view bytes) { (void)send_checked(bytes); }
+
+    // Writes the whole buffer and reports whether the peer accepted it. A peer
+    // that answers and closes while the request body is still unread resets the
+    // connection, which surfaces here as a write failure.
+    bool send_checked(std::string_view bytes) {
         sh::error_code ec;
         asio::write(*m_state->socket, asio::buffer(bytes.data(), bytes.size()), ec);
+        return !ec;
     }
 
     // Runs the context until `done()` holds or the budget runs out.
@@ -2730,5 +2736,66 @@ TEST_CASE("regression/server: a specific IPv6 bind failure is not widened to 0.0
     });
     const auto started = server.start();
     CHECK_FALSE(started.has_value());
+    server.stop();
+}
+
+TEST_CASE("regression/h1: Expect + early response closes instead of eating the next request", "[regression][h1]") {
+    plain_server();
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(kPlainPort));
+
+    // No 100 is sent, so the body never arrives; the handler answers /world
+    // without reading it. The pipelined GET must not be consumed as that body.
+    client.send("POST /world HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n"
+                "GET /world HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    REQUIRE(client.wait_head());
+    CHECK(client.wait_eof());
+    const std::string got = client.received();
+    CHECK(got.find("connection: close") != std::string::npos);
+    std::size_t status_lines = 0;
+    for (std::size_t pos = 0; (pos = got.find("HTTP/1.1 ", pos)) != std::string::npos; pos += 9)
+        ++status_lines;
+    CHECK(status_lines == 1);
+}
+
+TEST_CASE("regression/h1: an over-long chunked trailer closes instead of ending the body", "[regression][h1]") {
+    plain_server();
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(kPlainPort));
+
+    std::string req = "POST /echo HTTP/1.1\r\nHost: x\r\ntransfer-encoding: chunked\r\n\r\n0\r\n";
+    req.append(5000, 'x'); // no newline: read_line hits max_header_bytes
+    client.send(req);
+    REQUIRE(client.wait_head()); // /echo answers len=0 despite the body error
+    CHECK(client.wait_eof());
+    const std::string got = client.received();
+    CHECK(got.find("hello") == std::string::npos);
+    std::size_t status_lines = 0;
+    for (std::size_t pos = 0; (pos = got.find("HTTP/1.1 ", pos)) != std::string::npos; pos += 9)
+        ++status_lines;
+    CHECK(status_lines == 1);
+}
+
+TEST_CASE("regression/static: a 405 survives an unread request body", "[regression][static]") {
+    constexpr std::uint16_t port = 27935;
+    sh::ServerConfig cfg = make_config(port, std::nullopt);
+    // The static stage answers 405 without reading the body; the engine must
+    // drain it (or close gracefully) instead of closing with an unread body,
+    // which makes the kernel send RST and can discard the response.
+    cfg.limits.max_body_bytes = 32 * 1024 * 1024;
+    sh::Server server{cfg};
+    server.static_files(static_site());
+    REQUIRE(server.start().has_value());
+
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(port));
+    std::string req = "POST /app.js HTTP/1.1\r\nHost: x\r\nContent-Length: 16777216\r\n\r\n";
+    req.append(16 * 1024 * 1024, 'z');
+    CHECK(client.send_checked(req));
+    CHECK(client.wait_for("405 Method Not Allowed", std::chrono::seconds(10)));
+    client.close();
     server.stop();
 }
