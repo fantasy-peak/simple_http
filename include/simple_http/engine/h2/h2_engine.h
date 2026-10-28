@@ -2180,7 +2180,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                     self->reset_stream(sid, codec::H2_INTERNAL_ERROR);
                 }
                 self->flush();
-                self->handler_finished();
+                self->handler_finished(sid);
                 co_return;
             },
             asio::detached);
@@ -2188,9 +2188,22 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
 
     // A dispatched handler (ordinary or WebSocket) has returned: free its slot
     // and start whatever the cap made wait. Runs on the connection executor.
-    void handler_finished() {
+    void handler_finished(std::uint32_t stream_id) {
         if (m_active_handlers > 0)
             --m_active_handlers;
+        // The handler was this stream's only consumer and producer. If it
+        // returned before the peer ended its request body (the early
+        // 401/429/405 shape) or before the response ended, nothing will drain
+        // what is left: those DATA frames keep debiting the connection window
+        // and can stall every stream on the connection. Tell the peer to stop
+        // and retire the stream; erase_stream returns the outstanding credit.
+        if (auto it = m_streams.find(stream_id); it != m_streams.end()) {
+            // out_finished means the handler queued its terminating bytes; the
+            // write loop may not have framed them yet, so end_stream_sent is the
+            // wrong test here (it would discard a just-finished response).
+            if (!it->second.half_closed_remote || !it->second.out_finished)
+                reset_stream(stream_id, codec::H2_NO_ERROR);
+        }
         pump_dispatch();
     }
 
@@ -2248,7 +2261,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         if (it == m_streams.end()) {
             // The stream vanished between start_handler and here: release the slot
             // taken for it, or the leak would stall the dispatch queue.
-            handler_finished();
+            handler_finished(stream_id);
             return;
         }
         auto request = it->second.request;
@@ -2266,7 +2279,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                     m_executor,
                     [self, request, stream_id, target = std::move(*target)]() mutable -> asio::awaitable<void> {
                         (void)co_await self->run_h2_ws_proxy(stream_id, std::move(request), std::move(target));
-                        self->handler_finished();
+                        self->handler_finished(stream_id);
                     },
                     asio::detached);
                 return;
@@ -2284,7 +2297,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                     // being banked for a reader that will never exist (see
                     // on_data).
                     self->ws_stream_close(stream_id);
-                    self->handler_finished();
+                    self->handler_finished(stream_id);
                 },
                 asio::detached);
             return;
@@ -2306,7 +2319,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                     SIMPLE_HTTP_ERROR_LOG("h2 ws handler(stream={}) threw unknown exception", stream_id);
                     self->reset_stream(stream_id, codec::H2_INTERNAL_ERROR);
                 }
-                self->handler_finished();
+                self->handler_finished(stream_id);
                 co_return;
             },
             asio::detached);

@@ -64,6 +64,8 @@ std::string data_frame(std::uint32_t id, std::string_view payload) {
     return out;
 }
 
+
+
 // Whether the server's recorded output contains a GOAWAY carrying `error_code`.
 bool has_goaway(std::string_view written, std::uint32_t error_code) {
     for (std::size_t i = 0; i + kH2FrameHeaderSize <= written.size();) {
@@ -97,6 +99,15 @@ bool has_rst_stream(std::string_view written, std::uint32_t stream_id, std::uint
         i = end;
     }
     return false;
+}
+
+// A handler that stays alive long enough for the read loop to process the rest
+// of a pre-pushed frame burst. A handler that returns immediately now releases
+// its stream (and its concurrency slot) — see handler_finished(stream_id).
+asio::awaitable<void> park_briefly() {
+    asio::steady_timer timer{co_await asio::this_coro::executor};
+    timer.expires_after(std::chrono::milliseconds(20));
+    co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
 }
 
 TEST_CASE("h2/engine: a reset flood cannot outrun the executing-handler cap", "[h2]") {
@@ -160,7 +171,7 @@ TEST_CASE("h2/engine: a request body above max_body_bytes is refused", "[h2]") {
     transport->push(std::move(in));
 
     auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter>,
-                         SslHandle) -> asio::awaitable<void> { co_return; };
+                         SslHandle) -> asio::awaitable<void> { co_await park_briefly(); };
     auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, limits);
     REQUIRE(run_on(ctx, engine->run(dispatcher)));
 
@@ -186,7 +197,7 @@ TEST_CASE("h2/engine: DATA already in flight for a refused stream is not a conne
     transport->push(std::move(in));
 
     auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter>,
-                         SslHandle) -> asio::awaitable<void> { co_return; };
+                         SslHandle) -> asio::awaitable<void> { co_await park_briefly(); };
     auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, limits);
     REQUIRE(run_on(ctx, engine->run(dispatcher)));
 
@@ -214,7 +225,7 @@ TEST_CASE("h2/engine: a refused split head still drains its CONTINUATION frames"
     transport->push(std::move(in));
 
     auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter>,
-                         SslHandle) -> asio::awaitable<void> { co_return; };
+                         SslHandle) -> asio::awaitable<void> { co_await park_briefly(); };
     auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, limits);
     REQUIRE(run_on(ctx, engine->run(dispatcher)));
 
@@ -255,3 +266,27 @@ TEST_CASE("h2/engine: well-behaved concurrency below the cap still runs", "[h2]"
 }
 
 } // namespace
+
+TEST_CASE("h2/engine: a handler that returns early releases the unread request body", "[h2]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+
+    EngineLimits limits;
+    std::string in{codec::kH2ClientPreface};
+    append_frame(in, H2FrameType::Settings, 0, 0, "");
+    // The peer has not ended its side: a request body is still expected.
+    in += headers_frame(1, /*end_stream=*/false);
+    transport->push(std::move(in));
+
+    // An auth/limit-style handler: answer without ever reading the body.
+    auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res,
+                         SslHandle) -> asio::awaitable<void> {
+        co_await res->status(200).send("denied");
+    };
+    auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, limits);
+    REQUIRE(run_on(ctx, engine->run(dispatcher)));
+
+    // Nobody will read the remaining DATA; the stream must be reset so those
+    // bytes stop holding connection-window credit.
+    CHECK(has_rst_stream(transport->written(), 1, codec::H2_NO_ERROR));
+}
