@@ -25,6 +25,7 @@
 // library uses: a nudge that arrives when the waiter is already runnable is not
 // information, so dropping it is correct.
 
+#include <atomic>
 #include <boost/asio/experimental/channel.hpp>
 #include <cstddef>
 #include <cstdint>
@@ -98,6 +99,13 @@ struct H3Stream {
     // still queued. Bounds the request body the same way h1's max_body_bytes
     // does; in_bytes alone cannot, because a consuming handler keeps it small.
     std::uint64_t body_received{0};
+    // Body bytes the handler actually read (and for which credit was already
+    // extended). Shared with the consume hook, which can run on any thread.
+    // erase_stream/release_unread_body credit the difference.
+    std::shared_ptr<std::atomic<std::uint64_t>> body_consumed{std::make_shared<std::atomic<std::uint64_t>>(0)};
+    // We told ngtcp2 to stop reading this request (STOP_SENDING): the handler
+    // returned without consuming the body, so nobody will ever read it.
+    bool read_stopped{false};
     bool in_fin{false};
     Signal in_space;
 

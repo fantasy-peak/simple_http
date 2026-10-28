@@ -889,6 +889,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
             SIMPLE_HTTP_ERROR_LOG("h3: request body exceeds max_body_bytes (stream={}, limit={})", stream_id,
                                   m_limits.max_body_bytes);
             m_conn->extend_connection_offset(data.size());
+            stream.body_consumed->fetch_add(data.size(), std::memory_order_acq_rel);
             reset_stream(stream_id, kH3ExcessiveLoad);
             return;
         }
@@ -901,6 +902,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
             // against the connection window (nghttp3 does not count DATA
             // payload as consumed for us).
             m_conn->extend_connection_offset(data.size());
+            stream.body_consumed->fetch_add(data.size(), std::memory_order_acq_rel);
             reset_stream(stream_id, kH3RequestCancelled);
             return;
         }
@@ -1172,7 +1174,12 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         // window state and pokes its wake-up.
         std::weak_ptr<Http3Engine> weak = this->weak_from_this();
         auto exec = m_executor;
-        stream->request->body().set_on_consumed([weak, exec, stream_id](std::size_t n) {
+        auto consumed = stream->body_consumed;
+        stream->request->body().set_on_consumed([weak, exec, stream_id, consumed](std::size_t n) {
+            // Recorded synchronously: the hook may run on any thread, and
+            // erase_stream/release_unread_body on the connection executor must
+            // not double-credit bytes the handler already read.
+            consumed->fetch_add(n, std::memory_order_acq_rel);
             asio::post(exec, [weak, stream_id, n]() {
                 if (auto eng = weak.lock()) {
                     eng->m_conn->extend_stream_offset(stream_id, n);
@@ -1236,15 +1243,31 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
                 // The stream may already be gone (peer reset, connection
                 // close); the slot belongs to the handler, not the stream, so
                 // it is released here regardless.
-                self->handler_finished();
+                self->handler_finished(stream_id);
                 co_return;
             },
             asio::detached);
     }
 
-    void handler_finished() {
+    void handler_finished(std::int64_t stream_id) {
         if (m_active_handlers > 0)
             --m_active_handlers;
+        if (auto it = m_streams.find(stream_id); it != m_streams.end()) {
+            Stream &stream = *it->second;
+            // The handler is the only reader of the request body. Return the
+            // delivered-but-unread bytes to the connection window now: waiting
+            // for the stream to close leaves later requests blocked once the
+            // 1 MiB connection window is spent.
+            release_unread_body(stream);
+            if (!stream.request_complete && !stream.read_stopped) {
+                stream.read_stopped = true;
+                m_conn->shutdown_stream_read(stream_id, kH3RequestCancelled);
+            }
+            // No response was ever ended: nobody will write it either, and the
+            // peer would wait forever.
+            if (!stream.end_stream_sent && !stream.out_eof)
+                reset_stream(stream_id, kH3InternalError);
+        }
         pump_dispatch();
     }
 
@@ -1261,6 +1284,19 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         }
     }
 
+    // Returns the connection-level receive window for body bytes that reached
+    // the application but were never read by the handler. body_consumed is
+    // advanced, so calling this again (handler + erase) is a no-op.
+    void release_unread_body(Stream &stream) noexcept {
+        if (!stream.body_consumed)
+            return;
+        const std::uint64_t consumed = stream.body_consumed->load(std::memory_order_acquire);
+        if (stream.body_received > consumed) {
+            m_conn->extend_connection_offset(stream.body_received - consumed);
+            stream.body_consumed->store(stream.body_received, std::memory_order_release);
+        }
+    }
+
     void erase_stream(std::int64_t stream_id) {
         auto it = m_streams.find(stream_id);
         if (it == m_streams.end())
@@ -1271,6 +1307,9 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         std::erase(m_pending_dispatch, stream_id);
         StreamPtr stream = std::move(it->second);
         m_streams.erase(it);
+        // Nobody will read the remaining request body. Return its connection
+        // -level credit (the handler may have been reset before it started).
+        release_unread_body(*stream);
         // Unpark anything waiting on this stream: nothing will ever feed these
         // channels again.
         if (stream->in_space)
