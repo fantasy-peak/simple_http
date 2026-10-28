@@ -195,6 +195,10 @@ inline asio::awaitable<void> serve_tls(std::shared_ptr<TlsTransportT> transport,
         // Shared-owned like the h2 branch: the request bodies' pull providers
         // hold a weak_ptr to the engine (h1_engine.h serve_loop).
         auto engine = std::make_shared<Http1Engine<TlsTransportT>>(transport, limits);
+        // h2c is a cleartext upgrade. On TLS the protocol is chosen by ALPN, so
+        // honouring `Upgrade: h2c` here would let a client switch to h2 on a
+        // listener configured Http1Only (and is a protocol violation regardless).
+        engine->allow_h2c_upgrade(false);
         co_await engine->run(dispatch, {}, std::move(ws_lookup), std::move(ws_proxy_lookup),
                              std::move(ws_regex_lookup));
     }

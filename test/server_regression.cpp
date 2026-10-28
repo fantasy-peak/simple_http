@@ -1190,6 +1190,37 @@ TEST_CASE("regression/tls: a TLS 1.2-only client is refused", "[regression][tls]
     stream->next_layer().close(ignored);
 }
 
+TEST_CASE("regression/tls: an h2c Upgrade is not honoured over TLS", "[regression][tls]") {
+    tls_server();
+    asio::io_context ctx;
+    asio::ssl::context client_ctx{asio::ssl::context::tls_client};
+    client_ctx.set_verify_mode(asio::ssl::verify_none);
+    client_ctx.use_certificate_chain_file("./test/tls_certificates/client_cert.pem");
+    client_ctx.use_private_key_file("./test/tls_certificates/client_key.pem", asio::ssl::context::pem);
+    asio::ssl::stream<asio::ip::tcp::socket> stream{ctx, client_ctx};
+
+    sh::error_code ec;
+    stream.next_layer().connect(asio::ip::tcp::endpoint(asio::ip::make_address("127.0.0.1"), kTlsPort), ec);
+    REQUIRE_FALSE(ec);
+    const std::vector<unsigned char> alpn{8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+    REQUIRE(SSL_set_alpn_protos(stream.native_handle(), alpn.data(), static_cast<unsigned int>(alpn.size())) == 0);
+    stream.handshake(asio::ssl::stream_base::client, ec);
+    REQUIRE_FALSE(ec);
+
+    const std::string req = "GET /world HTTP/1.1\r\nHost: x\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\n"
+                            "HTTP2-Settings: AAMAAABkAAQAoAAAAAIAAAAA\r\n\r\n";
+    asio::write(stream, asio::buffer(req), ec);
+    REQUIRE_FALSE(ec);
+
+    asio::streambuf buf;
+    asio::read_until(stream, buf, "\r\n\r\n", ec);
+    const std::string status_line(asio::buffers_begin(buf.data()),
+                                  asio::buffers_begin(buf.data()) + static_cast<std::ptrdiff_t>(buf.size()));
+    // h2 over TLS is selected by ALPN, never by a cleartext Upgrade.
+    CHECK(status_line.find(" 101 ") == std::string::npos);
+    CHECK(status_line.rfind("HTTP/1.1 200", 0) == 0);
+}
+
 // --- accept topology ---------------------------------------------------------
 //
 // The endpoint is a single value and reuse_port turns it into one acceptor per
@@ -2684,4 +2715,20 @@ TEST_CASE("regression/quic: stop tears the endpoint down before the pool grace",
 #else
     SUCCEED("HTTP/3 is not compiled in");
 #endif
+}
+
+TEST_CASE("regression/server: a specific IPv6 bind failure is not widened to 0.0.0.0", "[regression][server]") {
+    // 2001:db8::/32 is documentation-only and is not assigned to any local
+    // interface, so binding it must fail. Falling back to 0.0.0.0 would expose
+    // the service on every IPv4 interface instead.
+    sh::ServerConfig cfg;
+    cfg.listen = sh::InetAddress{"2001:db8::1", 27934, false};
+    cfg.worker_threads = 1;
+    sh::Server server{cfg};
+    server.route({sh::Method::Get}, "/world", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(200).send("hello");
+    });
+    const auto started = server.start();
+    CHECK_FALSE(started.has_value());
+    server.stop();
 }

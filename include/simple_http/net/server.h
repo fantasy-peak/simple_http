@@ -1086,6 +1086,12 @@ class Server {
         auto acceptor = bind_acceptor(ctx, cfg, address.host, address.port, address.v6, ec);
         if (acceptor || address.v6 || !is_ipv6_host(address.host))
             return acceptor;
+        // Only the IPv6 wildcard may fall back to IPv4. A *specific* address
+        // (::1, 2001:db8::1, ...) that is not local must fail the listener:
+        // silently binding 0.0.0.0 instead would expose the service on every
+        // IPv4 interface, the opposite of what the config asked for.
+        if (!is_ipv6_unspecified(address.host))
+            return acceptor;
         SIMPLE_HTTP_ERROR_LOG("bind({}:{}): {}; retrying on 0.0.0.0", address.host, address.port, ec.message());
         error_code ipv4_ec;
         auto fallback = bind_acceptor(ctx, cfg, "0.0.0.0", address.port, false, ipv4_ec);
@@ -1682,6 +1688,12 @@ class Server {
         error_code ec;
         auto addr = asio::ip::make_address(host, ec);
         return !ec && addr.is_v6();
+    }
+
+    static bool is_ipv6_unspecified(const std::string &host) {
+        error_code ec;
+        auto addr = asio::ip::make_address(host, ec);
+        return !ec && addr.is_v6() && addr.to_v6().is_unspecified();
     }
 
     ServerConfig m_config;
