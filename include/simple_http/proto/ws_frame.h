@@ -17,6 +17,7 @@
 // It depends only on the standard library, OpenSSL (SHA1 for the handshake) and
 // simple_http core base64 — no Beast, no Asio.
 
+#include <openssl/rand.h>
 #include <openssl/sha.h>
 
 #include <algorithm>
@@ -46,6 +47,14 @@ enum class WsOpcode : std::uint8_t {
 inline constexpr std::string_view ws_handshake_guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 // Computes the Sec-WebSocket-Accept response value: base64(SHA1(key + GUID)).
+// Fills the 4-byte mask key a client must send (RFC 6455 §5.3). The key has to
+// come from a source of strong entropy: std::rand() is a predictable,
+// process-global sequence, and a predictable mask defeats its purpose against a
+// cache-poisoning intermediary. Returns false only if the platform RNG failed.
+inline bool ws_fill_mask_key(unsigned char (&key)[4]) noexcept {
+    return ::RAND_bytes(key, static_cast<int>(sizeof key)) == 1;
+}
+
 inline std::string ws_accept_key(std::string_view client_key) {
     std::string material;
     material.reserve(client_key.size() + ws_handshake_guid.size());

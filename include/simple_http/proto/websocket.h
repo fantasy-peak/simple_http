@@ -72,6 +72,7 @@
 #include <expected>
 #include <memory>
 #include <optional>
+#include <random>
 #include <span>
 #include <string>
 #include <string_view>
@@ -229,8 +230,13 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
             // rebuilt here rather than patched, because the key has to land
             // after the length octets whatever width they are (2, 4 or 10).
             unsigned char mask_key[4];
-            for (auto &b : mask_key)
-                b = static_cast<unsigned char>(std::rand() & 0xFF);
+            if (!ws_fill_mask_key(mask_key)) {
+                // Should not happen; an unmasked client frame is a protocol
+                // violation, so fall back to the OS entropy source.
+                std::random_device rd;
+                for (auto &b : mask_key)
+                    b = static_cast<unsigned char>(rd() & 0xFF);
+            }
             char rebuilt[14];
             rebuilt[0] = req.header[0]; // FIN+opcode, as ws_encode_header wrote it
             std::uint64_t l = payload.size();

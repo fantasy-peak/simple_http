@@ -3,6 +3,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string>
 
@@ -908,4 +909,13 @@ TEST_CASE("ws/deflate: per-connection compression controls", "[ws][ws-deflate]")
         REQUIRE(!written.empty());
         CHECK(static_cast<unsigned char>(written[0]) == 0x81); // never compressed
     }
+}
+
+TEST_CASE("ws: client mask keys come from the CSPRNG", "[ws]") {
+    unsigned char a[4]{};
+    unsigned char b[4]{};
+    REQUIRE(ws_fill_mask_key(a));
+    REQUIRE(ws_fill_mask_key(b));
+    // std::rand() with a seeded/global sequence can repeat; RAND_bytes must not.
+    CHECK(std::memcmp(a, b, sizeof a) != 0);
 }
