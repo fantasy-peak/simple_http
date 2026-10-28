@@ -64,8 +64,6 @@ std::string data_frame(std::uint32_t id, std::string_view payload) {
     return out;
 }
 
-
-
 // Whether the server's recorded output contains a GOAWAY carrying `error_code`.
 bool has_goaway(std::string_view written, std::uint32_t error_code) {
     for (std::size_t i = 0; i + kH2FrameHeaderSize <= written.size();) {
@@ -267,7 +265,7 @@ TEST_CASE("h2/engine: well-behaved concurrency below the cap still runs", "[h2]"
 
 } // namespace
 
-TEST_CASE("h2/engine: a handler that returns early releases the unread request body", "[h2]") {
+TEST_CASE("h2/engine: an early response does not abort the rest of the request body", "[h2]") {
     asio::io_context ctx;
     auto transport = std::make_shared<MockTransport>(ctx.get_executor());
 
@@ -280,13 +278,15 @@ TEST_CASE("h2/engine: a handler that returns early releases the unread request b
 
     // An auth/limit-style handler: answer without ever reading the body.
     auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res,
-                         SslHandle) -> asio::awaitable<void> {
-        co_await res->status(200).send("denied");
-    };
+                         SslHandle) -> asio::awaitable<void> { co_await res->status(200).send("denied"); };
     auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, limits);
     REQUIRE(run_on(ctx, engine->run(dispatcher)));
 
-    // Nobody will read the remaining DATA; the stream must be reset so those
-    // bytes stop holding connection-window credit.
-    CHECK(has_rst_stream(transport->written(), 1, codec::H2_NO_ERROR));
+    // The response is complete while the peer's side is still open. The engine
+    // must keep the exchange alive (the client may still be sending) and drop
+    // the tail as it arrives; a RST here would tell a client holding the
+    // response that the exchange failed.
+    CHECK_FALSE(has_rst_stream(transport->written(), 1, codec::H2_NO_ERROR));
+    CHECK_FALSE(has_goaway(transport->written(), codec::H2_PROTOCOL_ERROR));
+    CHECK_FALSE(has_goaway(transport->written(), codec::H2_FLOW_CONTROL_ERROR));
 }

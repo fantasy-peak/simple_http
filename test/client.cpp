@@ -993,6 +993,22 @@ asio::awaitable<void> suite_h2_multiplex(std::uint16_t plain) {
                                       std::to_string(wide_failures) + " failed (" + first_error + ")");
     }
 
+    // Deliver more request-body bytes than the connection window to a handler
+    // that answers without reading them (`/big`). The engine must discard and
+    // credit the tail; otherwise the connection stalls after ~64 KiB.
+    {
+        constexpr int kRequests = 8;
+        constexpr std::size_t kBody = 100 * 1024;
+        int answered = 0;
+        for (int i = 0; i < kRequests; ++i) {
+            auto r = co_await http.post(url(plain, "/big?n=16")).body(std::string(kBody, 'x')).send();
+            if (r && r->status() == 200)
+                ++answered;
+        }
+        check(answered == kRequests, "unread request bodies return their connection-window credit (" +
+                                         std::to_string(answered) + "/" + std::to_string(kRequests) + ")");
+    }
+
     // A stream that is abandoned mid-body must not take the connection down: on
     // HTTP/2 the session resets just that stream.
     auto st = co_await http.open_stream(url(plain, "/big?n=400000"));

@@ -629,7 +629,11 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         // handler from one queued behind the executing-handler cap (Rapid Reset).
         bool handler_started = false;
         bool half_closed_remote = false; // client sent END_STREAM
-        bool end_stream_sent = false;    // our terminating DATA (END_STREAM) emitted
+        // The handler returned before the client's side ended. Its response is
+        // complete, so keep the exchange alive but drop (and credit) the rest of
+        // the request body instead of buffering it for a reader that is gone.
+        bool body_discarded = false;
+        bool end_stream_sent = false; // our terminating DATA (END_STREAM) emitted
 
         // close() was called while this stream's response was already complete
         // but not yet framed. The response is delivered first (END_STREAM), and
@@ -1598,6 +1602,21 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                 reset_stream(hdr.stream_id, codec::H2_FLOW_CONTROL_ERROR);
                 return true;
             }
+            // The handler returned without reading the body. Discard each frame
+            // and give its credit straight back — do not reset: the response is
+            // already in flight, and a RST here tells a client that has the
+            // complete response in hand that the exchange failed (our own h2
+            // client treats it as an error). The stream retires when the peer
+            // ends it.
+            if (st.body_discarded) {
+                credit_consumed(st, frame_len);
+                if (hdr.has_flag(codec::H2_FLAG_END_STREAM)) {
+                    st.half_closed_remote = true;
+                    maybe_complete_stream(hdr.stream_id);
+                }
+                return true;
+            }
+
             // Padding counts against flow control but is not delivered to the
             // handler, so it is never "consumed" via the Body hook — replenish
             // its credit immediately (both stream and connection level).
@@ -2201,8 +2220,16 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
             // out_finished means the handler queued its terminating bytes; the
             // write loop may not have framed them yet, so end_stream_sent is the
             // wrong test here (it would discard a just-finished response).
-            if (!it->second.half_closed_remote || !it->second.out_finished)
+            if (!it->second.out_finished) {
+                // No complete response to preserve: tell the peer instead of
+                // leaving it waiting forever.
                 reset_stream(stream_id, codec::H2_NO_ERROR);
+            } else if (!it->second.half_closed_remote) {
+                // The response is complete but the request body is still
+                // arriving. Keep answering, drop the tail as it arrives, and
+                // return its connection credit (see on_data).
+                it->second.body_discarded = true;
+            }
         }
         pump_dispatch();
     }
