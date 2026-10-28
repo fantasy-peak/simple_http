@@ -13,13 +13,20 @@
 // Router::serve_openapi().
 
 #include <algorithm>
+#include <array>
 #include <boost/asio/awaitable.hpp>
+#include <cstddef>
 #include <glaze/glaze.hpp>
 #include <glaze/json/schema.hpp>
+#include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <unordered_map>
+#include <utility>
+#include <variant>
 #include <vector>
 
 #include "../proto/params.h"  // simple_http::path_params (openapi:: aliases it)
@@ -78,60 +85,142 @@ template <typename T> void render_field_annotations(JsonOut &j, std::string_view
     }
 }
 
+// The types already on the current expansion path. A recursive type
+// (`struct Node { std::vector<Node> children; }`) would otherwise expand until
+// the stack dies; stopping at the first repeat emits the permissive `{}` for
+// the self-reference instead. The list is a template parameter, so this is
+// decided at compile time and costs nothing at runtime.
+template <typename... Ts> struct type_list {};
+
+template <typename T, typename List> struct type_in_list;
+template <typename T, typename... Ts>
+struct type_in_list<T, type_list<Ts...>> : std::bool_constant<(std::is_same_v<T, Ts> || ...)> {};
+
+template <typename T> struct is_shared_ptr : std::false_type {};
+template <typename T> struct is_shared_ptr<std::shared_ptr<T>> : std::true_type {};
+template <typename T> struct is_unique_ptr : std::false_type {};
+template <typename T> struct is_unique_ptr<std::unique_ptr<T>> : std::true_type {};
+
+template <typename T> struct is_std_array : std::false_type {};
+template <typename E, std::size_t N> struct is_std_array<std::array<E, N>> : std::true_type {};
+
+template <typename T> struct is_map : std::false_type {};
+template <typename K, typename V> struct is_map<std::map<K, V>> : std::true_type {};
+template <typename K, typename V> struct is_map<std::unordered_map<K, V>> : std::true_type {};
+
+template <typename T> struct is_variant : std::false_type {};
+template <typename... A> struct is_variant<std::variant<A...>> : std::true_type {};
+
+template <typename T, typename... Seen> void emit_type(JsonOut &j, type_list<Seen...> seen = {}, std::size_t depth = 0);
+
+// The value-or-null shape used by optional and the owning pointers.
+template <typename V, typename... Seen> void emit_nullable(JsonOut &j, type_list<Seen...> seen, std::size_t depth) {
+    j.key("anyOf");
+    j.begin_array();
+    j.begin_object();
+    emit_type<V>(j, seen, depth + 1);
+    j.end_object();
+    j.begin_object();
+    j.key("type");
+    j.str("null");
+    j.end_object();
+    j.end_array();
+}
+
+template <typename D, typename... Seen, std::size_t... I>
+void emit_variant(JsonOut &j, type_list<Seen...> seen, std::size_t depth, std::index_sequence<I...>) {
+    j.key("anyOf");
+    j.begin_array();
+    ((j.begin_object(), emit_type<std::variant_alternative_t<I, D>>(j, seen, depth + 1), j.end_object()), ...);
+    j.end_array();
+}
+
 // Writes the JSON Schema *content* of an already-open object for type T: the
 // "type"/"anyOf"/"items"/"properties" keys, never the enclosing braces.
 // Nothing here relies on glaze's schema output — only its reflection.
-template <typename T> void emit_type(JsonOut &j) {
+template <typename T, typename... Seen> void emit_type(JsonOut &j, type_list<Seen...> seen, std::size_t depth) {
     using D = std::remove_cvref_t<T>;
-    if constexpr (std::is_same_v<D, bool>) {
-        j.key("type");
-        j.str("boolean");
-    } else if constexpr (std::is_integral_v<D>) {
-        j.key("type");
-        j.str("integer");
-    } else if constexpr (std::is_floating_point_v<D>) {
-        j.key("type");
-        j.str("number");
-    } else if constexpr (std::is_same_v<D, std::string>) {
-        j.key("type");
-        j.str("string");
-    } else if constexpr (is_optional<D>::value) {
-        // optional: the value or null — swagger renders this fine.
-        j.key("anyOf");
-        j.begin_array();
-        j.begin_object();
-        emit_type<typename D::value_type>(j);
-        j.end_object();
-        j.begin_object();
-        j.key("type");
-        j.str("null");
-        j.end_object();
-        j.end_array();
-    } else if constexpr (is_vector<D>::value) {
-        j.key("type");
-        j.str("array");
-        j.key("items");
-        j.begin_object();
-        emit_type<typename D::value_type>(j);
-        j.end_object();
+    // A type already on this path is recursive: close it as "any" rather than
+    // expanding forever. The depth check is a backstop for pathologically deep
+    // (but non-cyclic) types.
+    if constexpr (type_in_list<D, type_list<Seen...>>::value) {
+        // Must be an `else`, not a plain `return`: `if constexpr` only discards
+        // the branch it is in, and the rest of the body would still instantiate
+        // the recursive emit_type<> call.
+        return;
     } else {
-        // An aggregate: object with one property per reflected field.
-        j.key("type");
-        j.str("object");
-        j.key("properties");
-        j.begin_object();
-        T dummy{};
-        std::size_t field_index = 0;
-        glz::for_each_field(dummy, [&](auto &field) {
-            using F = std::remove_cvref_t<decltype(field)>;
-            j.key(std::string_view{glz::reflect<T>::keys[field_index]});
+        if (depth > 64)
+            return;
+
+        using next_list = type_list<Seen..., D>;
+        if constexpr (std::is_same_v<D, bool>) {
+            j.key("type");
+            j.str("boolean");
+        } else if constexpr (std::is_same_v<D, char>) {
+            j.key("type");
+            j.str("string");
+        } else if constexpr (std::is_integral_v<D>) {
+            j.key("type");
+            j.str("integer");
+        } else if constexpr (std::is_floating_point_v<D>) {
+            j.key("type");
+            j.str("number");
+        } else if constexpr (std::is_same_v<D, std::string> || std::is_same_v<D, std::string_view>) {
+            j.key("type");
+            j.str("string");
+        } else if constexpr (std::is_enum_v<D>) {
+            // The enumerators are not recoverable without per-type glaze metadata;
+            // a string schema is still valid and, unlike the old aggregate branch,
+            // compiles.
+            j.key("type");
+            j.str("string");
+        } else if constexpr (is_optional<D>::value) {
+            emit_nullable<typename D::value_type>(j, next_list{}, depth);
+        } else if constexpr (is_shared_ptr<D>::value || is_unique_ptr<D>::value) {
+            emit_nullable<typename D::element_type>(j, next_list{}, depth);
+        } else if constexpr (is_vector<D>::value || is_std_array<D>::value) {
+            j.key("type");
+            j.str("array");
+            j.key("items");
             j.begin_object();
-            emit_type<F>(j);
-            render_field_annotations<T>(j, std::string_view{glz::reflect<T>::keys[field_index]});
+            emit_type<typename D::value_type>(j, next_list{}, depth + 1);
             j.end_object();
-            ++field_index;
-        });
-        j.end_object();
+        } else if constexpr (is_map<D>::value) {
+            j.key("type");
+            j.str("object");
+            j.key("additionalProperties");
+            j.begin_object();
+            emit_type<typename D::mapped_type>(j, next_list{}, depth + 1);
+            j.end_object();
+        } else if constexpr (is_variant<D>::value) {
+            emit_variant<D>(j, next_list{}, depth, std::make_index_sequence<std::variant_size_v<D>>{});
+        } else if constexpr (std::is_aggregate_v<D>) {
+            j.key("type");
+            j.str("object");
+            if constexpr (std::is_default_constructible_v<D>) {
+                // One property per reflected field.
+                j.key("properties");
+                j.begin_object();
+                D dummy{};
+                std::size_t field_index = 0;
+                glz::for_each_field(dummy, [&](auto &field) {
+                    using F = std::remove_cvref_t<decltype(field)>;
+                    j.key(std::string_view{glz::reflect<D>::keys[field_index]});
+                    j.begin_object();
+                    emit_type<F>(j, next_list{}, depth + 1);
+                    render_field_annotations<D>(j, std::string_view{glz::reflect<D>::keys[field_index]});
+                    j.end_object();
+                    ++field_index;
+                });
+                j.end_object();
+            }
+            // A non-default-constructible aggregate is documented as an open object:
+            // reflection needs an instance, and refusing to compile would be worse.
+        } else {
+            // A type whose JSON shape only glaze's serializer knows (a custom
+            // to_json, a chrono type, ...): the permissive schema is the honest one.
+            // Emitting nothing here leaves `{}` inside the caller's object.
+        }
     }
 }
 } // namespace schema_detail

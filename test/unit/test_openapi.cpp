@@ -2,10 +2,14 @@
 // per-route operation descriptors (openapi::doc() -> OpenApiSpec) plus the
 // served endpoints.
 
+#include <array>
 #include <catch2/catch_test_macros.hpp>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
+#include <variant>
+#include <vector>
 
 #include "simple_http.h"
 #include "test_support.h"
@@ -30,6 +34,25 @@ struct CreateUserReq {
 
 struct ErrorBody {
     std::string error;
+};
+
+// Self-referential: documenting this used to recurse until the stack died.
+struct RecursiveNode {
+    int value{};
+    std::vector<RecursiveNode> children;
+};
+
+enum class Color { red, green, blue };
+
+// The common shapes the schema emitter used to fall through to aggregate
+// reflection, which either failed to compile or produced the wrong JSON type.
+struct CommonTypes {
+    Color color{};
+    std::map<std::string, std::int64_t> counts;
+    std::array<int, 3> triple{};
+    std::variant<int, std::string> choice;
+    std::shared_ptr<ErrorBody> owner;
+    char letter{};
 };
 
 } // namespace openapi_types
@@ -144,6 +167,27 @@ TEST_CASE("openapi: routes carrying operation descriptors register and collect s
     CHECK(doc.find("\"properties\"") != std::string::npos);
     CHECK(doc.find(R"("name")") != std::string::npos);
     CHECK(doc.find(R"("age")") != std::string::npos);
+}
+
+TEST_CASE("openapi: a recursive type is documented without recursing forever", "[openapi]") {
+    const std::string schema = openapi::schema_json<openapi_types::RecursiveNode>();
+    CHECK(schema.find(R"("type":"object")") != std::string::npos);
+    CHECK(schema.find(R"("value")") != std::string::npos);
+    CHECK(schema.find(R"("children")") != std::string::npos);
+    // The self-reference collapses to the permissive {} instead of expanding.
+    CHECK(schema.size() < 4096);
+}
+
+TEST_CASE("openapi: enum, map, array, variant, shared_ptr and char get real schemas", "[openapi]") {
+    const std::string schema = openapi::schema_json<openapi_types::CommonTypes>();
+    CHECK(schema.find(R"("color":{"type":"string"})") != std::string::npos);
+    CHECK(schema.find(R"("counts":{"type":"object","additionalProperties":{"type":"integer"}})") != std::string::npos);
+    CHECK(schema.find(R"("triple":{"type":"array","items":{"type":"integer"}})") != std::string::npos);
+    CHECK(schema.find(R"("choice":{"anyOf":[{"type":"integer"},{"type":"string"}]})") != std::string::npos);
+    CHECK(schema.find(
+              R"("owner":{"anyOf":[{"type":"object","properties":{"error":{"type":"string"}}},{"type":"null"}]})") !=
+          std::string::npos);
+    CHECK(schema.find(R"("letter":{"type":"string"})") != std::string::npos);
 }
 
 TEST_CASE("openapi: success status and multiple error responses render", "[openapi]") {
