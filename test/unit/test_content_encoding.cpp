@@ -132,6 +132,15 @@ TEST_CASE("content_encoding: round-trips shrink and restore", "[compression]") {
     }
 }
 
+TEST_CASE("content_encoding: gzip concatenated members are all decoded", "[compression]") {
+    // RFC 1952: a gzip file may be a series of members (`cat a.gz b.gz`). The
+    // decoder used to stop at the first Z_STREAM_END and silently drop the rest.
+    const CompressionConfig config = compression_on();
+    const std::string a = compress_all(kEncodingGzip, "aaaa", config);
+    const std::string b = compress_all(kEncodingGzip, "bbbb", config);
+    CHECK(decompress_all(kEncodingGzip, a + b) == "aaaabbbb");
+}
+
 TEST_CASE("content_encoding: streaming equals one-shot", "[compression]") {
     const CompressionConfig config = compression_on();
     const std::string body = repetitive_body();

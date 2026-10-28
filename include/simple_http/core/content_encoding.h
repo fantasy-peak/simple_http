@@ -276,7 +276,31 @@ class GzipDecoder final : public ContentDecoder {
             out.append(buf, sizeof(buf) - m_zs.avail_out);
             if (rc == Z_STREAM_END) {
                 m_stream_end = true;
-                break;
+                if (m_zs.avail_in == 0)
+                    break;
+                // RFC 1952 allows a gzip file to be a series of concatenated
+                // members (`cat a.gz b.gz`). Trailing zero padding is common and
+                // is not another member; anything else starts one, so reset the
+                // inflate state (preserving the input cursor) and continue.
+                bool padding_only = true;
+                for (uInt i = 0; i < m_zs.avail_in; ++i) {
+                    if (m_zs.next_in[i] != 0) {
+                        padding_only = false;
+                        break;
+                    }
+                }
+                if (padding_only)
+                    break;
+                Bytef *next_in = m_zs.next_in;
+                const uInt avail_in = m_zs.avail_in;
+                if (::inflateReset(&m_zs) != Z_OK) {
+                    m_failed = true;
+                    break;
+                }
+                m_zs.next_in = next_in;
+                m_zs.avail_in = avail_in;
+                m_stream_end = false; // more members still to decode
+                continue;
             }
             if (rc == Z_OK) {
                 if (m_zs.avail_in == 0 && m_zs.avail_out != 0) {
