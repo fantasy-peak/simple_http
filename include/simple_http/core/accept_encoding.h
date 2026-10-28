@@ -61,17 +61,21 @@ inline AcceptEncoding parse_accept_encoding(std::string_view header) {
             header.substr(pos, comma == std::string_view::npos ? std::string_view::npos : comma - pos);
 
         auto semi = item.find(';');
-        std::string_view coding = item.substr(0, semi);
+        std::string_view coding = trim_ows(item.substr(0, semi));
         double q = 1.0;
         if (semi != std::string_view::npos) {
+            // Parameters are `;`-separated name=value pairs; q is the one whose
+            // *name* is q (case-insensitive). Searching for the letter 'q'
+            // mistook `Q=0`, `quality=0` and `mode=q=0` for the qvalue.
             std::string_view params = item.substr(semi + 1);
-            auto qpos = params.find('q');
-            if (qpos != std::string_view::npos) {
-                auto eq = params.find('=', qpos);
-                if (eq != std::string_view::npos) {
-                    std::string_view v = params.substr(eq + 1);
+            while (!params.empty()) {
+                const auto next = params.find(';');
+                const auto param = trim_ows(params.substr(0, next));
+                const auto eq = param.find('=');
+                if (eq != std::string_view::npos && iequals_ci(trim_ows(param.substr(0, eq)), "q")) {
+                    std::string_view value = trim_ows(param.substr(eq + 1));
                     std::string tmp;
-                    for (char c : v) {
+                    for (char c : value) {
                         if (c == ' ' || c == '\t')
                             continue;
                         if ((c >= '0' && c <= '9') || c == '.') {
@@ -86,7 +90,11 @@ inline AcceptEncoding parse_accept_encoding(std::string_view header) {
                     } catch (const std::exception &) {
                         q = 0.0;
                     }
+                    break;
                 }
+                if (next == std::string_view::npos)
+                    break;
+                params.remove_prefix(next + 1);
             }
         }
         // Trim the coding token. Content-coding names are case-insensitive

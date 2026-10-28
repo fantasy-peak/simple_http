@@ -470,10 +470,20 @@ inline std::optional<std::string> negotiate_encoding(std::string_view accept_enc
         const std::string_view name = trim_ows(semi == std::string_view::npos ? token : token.substr(0, semi));
         double q = 1.0;
         if (semi != std::string_view::npos) {
+            // See accept_encoding.h: q must be a parameter *name*, matched
+            // case-insensitively — not the first "q=" substring.
             std::string_view params = token.substr(semi + 1);
-            const auto qpos = params.find("q=");
-            if (qpos != std::string_view::npos) {
-                q = parse_qvalue(params.substr(qpos + 2));
+            while (!params.empty()) {
+                const auto next = params.find(';');
+                const auto param = trim_ows(params.substr(0, next));
+                const auto eq = param.find('=');
+                if (eq != std::string_view::npos && iequals_ci(trim_ows(param.substr(0, eq)), "q")) {
+                    q = parse_qvalue(trim_ows(param.substr(eq + 1)));
+                    break;
+                }
+                if (next == std::string_view::npos)
+                    break;
+                params.remove_prefix(next + 1);
             }
         }
 

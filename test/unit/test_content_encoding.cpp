@@ -231,3 +231,11 @@ TEST_CASE("content_encoding: unknown encodings and codecs", "[compression]") {
     // decompress_all passes unknown encodings through.
     CHECK(decompress_all("deflate", "payload") == "payload");
 }
+
+TEST_CASE("content_encoding: negotiation reads the q parameter, not any letter q", "[compression]") {
+    const CompressionConfig config = compression_on();
+    CHECK_FALSE(negotiate_encoding("br;Q=0", config).has_value());
+    CHECK_FALSE(negotiate_encoding("gzip;Q=0", config).has_value());
+    CHECK(negotiate_encoding("gzip;quality=0", config).value_or("") == "gzip");
+    CHECK(negotiate_encoding("gzip;mode=q=0", config).value_or("") == "gzip");
+}

@@ -94,3 +94,17 @@ TEST_CASE("accept_encoding: a malformed qvalue", "[accept_encoding]") {
     // reaches the catch and produces 0.
     CHECK(parse_accept_encoding("br;q=.").br == 0.0);
 }
+
+TEST_CASE("accept_encoding: q is a parameter name, matched case-insensitively", "[accept_encoding]") {
+    // 'Q' is the same parameter (HTTP field values are case-insensitive).
+    const auto upper = parse_accept_encoding("br;Q=0");
+    CHECK(coding_q(upper.br, upper) == 0.0);
+
+    // 'quality' is a different parameter; the old "find any q" mistook it for q.
+    const auto named = parse_accept_encoding("gzip;quality=0");
+    CHECK(coding_q(named.gzip, named) == 1.0);
+
+    // A q inside another parameter's value is not the q parameter either.
+    const auto embedded = parse_accept_encoding("gzip;mode=q=0");
+    CHECK(coding_q(embedded.gzip, embedded) == 1.0);
+}
