@@ -1400,13 +1400,14 @@ class Server {
     }
 
     typename QuicEndpointType::ServeFn make_h3_serve(EngineLimits limits) {
-        auto router = m_router;
-        return [router, limits](std::shared_ptr<QuicConnectionType> conn) -> asio::awaitable<void> {
+        // Same dispatcher as TCP: it brackets the request with the active-request
+        // counter, so active_requests() sees h3 work and stop()'s
+        // shutdown_grace waits for it instead of cutting the handler off.
+        auto dispatch = make_dispatcher();
+        return [dispatch = std::move(dispatch),
+                limits](std::shared_ptr<QuicConnectionType> conn) -> asio::awaitable<void> {
             auto engine = std::make_shared<Http3Engine<QuicConnectionType>>(conn, limits);
-            co_await engine->run([router](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res,
-                                          SslHandle ssl) -> asio::awaitable<void> {
-                co_await router->dispatch(std::move(req), std::move(res), ssl);
-            });
+            co_await engine->run(dispatch);
             co_return;
         };
     }
