@@ -311,6 +311,13 @@ inline Middleware make_cors_middleware(CorsConfig cfg) {
             }
 
             if (preflight) {
+                // The preflight answer is a function of the requested method
+                // and headers (they are echoed when unconfigured), so a shared
+                // cache must key on them too, not just on Origin.
+                std::string vary = "Access-Control-Request-Method, Access-Control-Request-Headers";
+                if (mirror)
+                    vary.insert(0, "Origin, ");
+                res->replace_header(field::vary, std::move(vary));
                 cors_detail::apply_preflight(cfg, req, res);
                 // Bodyless: no body, no Content-Length, no chunked terminator. A
                 // framed empty body on a keep-alive connection desynchronizes the
@@ -336,6 +343,10 @@ inline Middleware make_cors_middleware(CorsConfig cfg) {
         // by the real one. Answering every path alike also leaks nothing about
         // which paths exist.
         if (preflight) {
+            // A refused-origin preflight carries no CORS headers, but the
+            // answer still depends on Origin: a shared cache must not replay it
+            // for an allowed origin.
+            res->replace_header(field::vary, "Origin");
             res->status(status::no_content);
             (void)co_await res->send_bodyless();
             co_return;

@@ -568,3 +568,40 @@ TEST_CASE("cors: allow_origin_fn is consulted and ORs with the list", "[cors]") 
         CHECK_FALSE(route_ran);
     }
 }
+
+TEST_CASE("cors: a preflight varies on the echoed request method and headers", "[cors]") {
+    Router router;
+    router.cors(CorsConfig{}); // default: echo the request's method/headers
+    bool ran = false;
+    router.route(any_methods, "/api", flag_handler(ran));
+
+    asio::io_context ctx;
+    auto req = make_request(ctx, "/api");
+    make_preflight(req);
+    req->mutable_headers().add_lower("access-control-request-headers", "x-token");
+    auto writer = dispatch(ctx, router, req);
+
+    const std::string vary{writer->header(field::vary)};
+    CHECK(vary.find("Access-Control-Request-Method") != std::string_view::npos);
+    CHECK(vary.find("Access-Control-Request-Headers") != std::string_view::npos);
+}
+
+TEST_CASE("cors: a refused-origin preflight varies on Origin", "[cors]") {
+    Router router;
+    CorsConfig cfg;
+    cfg.allow_origins = {"https://allowed.example"};
+    router.cors(cfg);
+    bool ran = false;
+    router.route(any_methods, "/api", flag_handler(ran));
+
+    asio::io_context ctx;
+    auto req = make_request(ctx, "/api");
+    req->set_method(Method::Options);
+    add_origin(req, "https://evil.example");
+    req->mutable_headers().add_lower("access-control-request-method", "POST");
+    auto writer = dispatch(ctx, router, req);
+
+    CHECK(writer->last_status == status::no_content);
+    const std::string vary{writer->header(field::vary)};
+    CHECK(vary.find("Origin") != std::string_view::npos);
+}
