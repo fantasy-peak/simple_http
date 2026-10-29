@@ -856,6 +856,16 @@ class Client {
         auto head = co_await detail::await_with_deadline(stream->read_head(), limit);
         if (!head || !*head)
             co_return std::unexpected{head ? (*head).error() : head.error()};
+        // An asked-for 100-continue is an *interim* head. read_head() hands it to
+        // a streaming caller so it can send its body, but the buffered path is
+        // already past that point and must report the final response (its body
+        // is what read() returns). read_head() caches nothing for the interim, so
+        // the next call parses the final head.
+        while ((*head)->status == 100) {
+            head = co_await detail::await_with_deadline(stream->read_head(), limit);
+            if (!head || !*head)
+                co_return std::unexpected{head ? (*head).error() : head.error()};
+        }
 
         std::string body;
         for (;;) {

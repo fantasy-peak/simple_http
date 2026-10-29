@@ -1133,6 +1133,18 @@ asio::awaitable<void> suite_raw_peer(asio::io_context &ctx) {
         auto r = co_await fetch(http, http.get(url(fake.port(), "/x")));
         check(r && r->status == 200 && r->body == "ok", "1xx is skipped, the final head is used");
     }
+    { // an asked-for 100-continue on the buffered path
+        FakeServer &fake = make_fake(ctx,
+                                     "HTTP/1.1 100 Continue\r\n\r\n"
+                                     "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+                                     /*close_after=*/false);
+        auto cfg = base_config();
+        cfg.default_version = sh::HttpVersionPolicy::Http11; // exercise the plain h1 path
+        h::Client http{co_await asio::this_coro::executor, cfg};
+        auto r = co_await fetch(http, http.post(url(fake.port(), "/x")).header("expect", "100-continue").body("hi"));
+        check(r && r->status == 200 && r->body == "ok",
+              "an asked-for 100 is interim: the buffered path returns the final response");
+    }
     { // a body delimited by the close
         FakeServer &fake = make_fake(ctx, "HTTP/1.1 200 OK\r\n\r\nuntil eof");
         h::Client http{co_await asio::this_coro::executor, base_config()};
