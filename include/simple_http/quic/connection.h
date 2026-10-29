@@ -168,10 +168,12 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
 
     QuicConnection(Executor exec, SSL_CTX *ssl_ctx, QuicConnectionConfig config, QuicBootstrap bootstrap,
                    std::vector<std::uint32_t> versions, asio::ip::udp::endpoint local, asio::ip::udp::endpoint remote,
-                   DatagramSink sink)
+                   std::span<const std::uint8_t> reset_secret, DatagramSink sink)
         : m_executor(exec), m_timer(exec), m_wake(exec, 1), m_closed_signal(exec, 1), m_config(config),
           m_bootstrap(bootstrap), m_versions(std::move(versions)), m_local(std::move(local)),
           m_remote(std::move(remote)), m_sink(std::move(sink)), m_crypto(this) {
+        m_reset_secret_len = std::min(reset_secret.size(), m_reset_secret.size());
+        std::copy_n(reset_secret.begin(), m_reset_secret_len, m_reset_secret.begin());
         ngtcp2_ccerr_default(&m_last_error);
         if (!m_crypto.init(ssl_ctx)) {
             m_init_failed = true;
@@ -426,6 +428,10 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
     bool m_close_deferred{false};
     ngtcp2_ccerr m_last_error{};
     ngtcp2_cid m_scid{};
+    // The endpoint's reset secret. The advertised stateless reset token and the
+    // endpoint's answers to stale packets must both be derived from it.
+    std::array<std::uint8_t, 32> m_reset_secret{};
+    std::size_t m_reset_secret_len{0};
 
     // Held *weakly*, and that is load-bearing. The engine owns this connection
     // (it holds a shared_ptr to it), so a strong reference here would close the
@@ -496,6 +502,17 @@ template <typename Executor> bool QuicConnection<Executor>::init() {
                              static_cast<ngtcp2_socklen>(m_remote.size()), nullptr);
 
     auto params = make_ngtcp2_params(m_config, now());
+    // Advertise the stateless reset token for our Source Connection ID, derived
+    // from the endpoint's secret — the same input send_stateless_reset() uses
+    // when it answers a stale packet after this connection is gone.
+    if (m_reset_secret_len != 0) {
+        ngtcp2_cid scid{};
+        ngtcp2_cid_init(&scid, m_scid.data, m_scid.datalen);
+        if (ngtcp2_crypto_generate_stateless_reset_token(params.transport.stateless_reset_token, m_reset_secret.data(),
+                                                         m_reset_secret_len, &scid) == 0) {
+            params.transport.stateless_reset_token_present = 1;
+        }
+    }
     params.settings.available_versions = m_versions.data();
     params.settings.available_versionslen = m_versions.size();
     // The client's Retry token, if it presented one. ngtcp2 validates it
@@ -1145,8 +1162,15 @@ int QuicConnection<Executor>::cb_get_new_connection_id(ngtcp2_conn *, ngtcp2_cid
     if (RAND_bytes(cid->data, static_cast<int>(cidlen)) != 1)
         return NGTCP2_ERR_CALLBACK_FAILURE;
     cid->datalen = cidlen;
-    if (RAND_bytes(token->data, sizeof(token->data)) != 1)
-        return NGTCP2_ERR_CALLBACK_FAILURE;
+    // The token must be the value the endpoint can derive from this CID and the
+    // shared secret when it later answers a stale packet; a random token here
+    // would never match the stateless reset (see send_stateless_reset).
+    if (self->m_reset_secret_len == 0 ||
+        ngtcp2_crypto_generate_stateless_reset_token(token->data, self->m_reset_secret.data(), self->m_reset_secret_len,
+                                                     cid) != 0) {
+        if (RAND_bytes(token->data, sizeof(token->data)) != 1)
+            return NGTCP2_ERR_CALLBACK_FAILURE;
+    }
     if (self->m_on_new_cid) {
         self->m_on_new_cid(std::span<const std::uint8_t>{cid->data, cid->datalen},
                            std::span<const std::uint8_t>{token->data, sizeof(token->data)});

@@ -484,6 +484,7 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
 
         auto conn = std::make_shared<Connection>(m_executor, m_ssl_ctx, m_config.connection, bootstrap,
                                                  m_config.supported_versions, local, remote,
+                                                 std::span<const std::uint8_t>{m_secret.data(), m_secret.size()},
                                                  [self](SendItem &&item) { self->queue_datagram(std::move(item)); });
         if (conn->init_failed()) {
             release_connection();
@@ -588,7 +589,22 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
     void dissociate_cid(std::span<const std::uint8_t> cid) {
         if (cid.empty())
             return;
-        m_by_cid.erase(cid_key(cid.data(), cid.size()));
+        const CidKey key = cid_key(cid.data(), cid.size());
+        auto it = m_by_cid.find(key);
+        if (it == m_by_cid.end())
+            return;
+        // Also drop it from the owning connection's list. Otherwise a
+        // long-lived connection that rotates IDs leaves one vector entry per
+        // retired CID until teardown.
+        if (auto conn = it->second.lock()) {
+            if (auto owned = m_cids_by_conn.find(conn.get()); owned != m_cids_by_conn.end()) {
+                auto &keys = owned->second;
+                keys.erase(std::remove(keys.begin(), keys.end(), key), keys.end());
+                if (keys.empty())
+                    m_cids_by_conn.erase(owned);
+            }
+        }
+        m_by_cid.erase(it);
     }
 
     // Drop everything the CID table still holds for a finished connection.
@@ -655,24 +671,34 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
             queue_datagram_copy(std::span<const std::uint8_t>{buf.data(), static_cast<std::size_t>(n)}, remote);
     }
 
-    void send_stateless_reset(std::size_t /*packet_len*/, const ngtcp2_version_cid &vc,
+    void send_stateless_reset(std::size_t packet_len, const ngtcp2_version_cid &vc,
                               const asio::ip::udp::endpoint &remote) {
+        // RFC 9000 §10.3: a reset is at least 21 octets (token + 5 random) and
+        // strictly smaller than the packet it answers. A packet too small to fit
+        // a valid reset is simply dropped.
+        constexpr std::size_t kTokenLen = NGTCP2_STATELESS_RESET_TOKENLEN;
+        constexpr std::size_t kMinTotal = kTokenLen + NGTCP2_MIN_STATELESS_RESET_RANDLEN;
+        if (packet_len <= kMinTotal)
+            return;
         std::array<std::uint8_t, kMaxDatagram> buf{};
         std::array<std::uint8_t, NGTCP2_STATELESS_RESET_TOKENLEN> token{};
         ngtcp2_cid cid{};
         // Derived from the DCID in the packet and our secret, so any observer of
         // that packet can compute it (RFC 9000 §10.3.1) — which is exactly what
         // makes it unforgeable by an attacker who cannot see the traffic, and
-        // verifiable by the peer that can.
+        // verifiable by the peer that can. conn::init advertises the same
+        // derivation for the connection's own CIDs.
         ngtcp2_cid_init(&cid, vc.dcid, vc.dcidlen);
         if (ngtcp2_crypto_generate_stateless_reset_token(token.data(), m_secret.data(), m_secret.size(), &cid) != 0) {
             return;
         }
-        std::array<std::uint8_t, NGTCP2_STATELESS_RESET_TOKENLEN> rand{};
-        if (RAND_bytes(rand.data(), static_cast<int>(rand.size())) != 1)
+        std::array<std::uint8_t, kMaxDatagram> rand{};
+        const std::size_t rand_len =
+            std::min(packet_len - 1 - kTokenLen, rand.size() - kTokenLen); // >= 5 by the check above
+        if (RAND_bytes(rand.data(), static_cast<int>(rand_len)) != 1)
             return;
         const ngtcp2_ssize n =
-            ngtcp2_pkt_write_stateless_reset(buf.data(), buf.size(), token.data(), rand.data(), rand.size());
+            ngtcp2_pkt_write_stateless_reset(buf.data(), buf.size(), token.data(), rand.data(), rand_len);
         if (n > 0)
             queue_datagram_copy(std::span<const std::uint8_t>{buf.data(), static_cast<std::size_t>(n)}, remote);
     }

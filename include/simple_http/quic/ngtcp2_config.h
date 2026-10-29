@@ -56,7 +56,10 @@ struct QuicConnectionConfig {
     // Inert under ngtcp2: the stream table is ngtcp2's now, and
     // `initial_max_streams_*` are the only limits that exist.
     std::size_t max_streams{512};
-    bool disable_active_migration{false};
+    // Reserved: connection migration is not implemented (on_datagram pins the
+    // connection to the address it was created on). The wire always advertises
+    // disable_active_migration=1; see make_ngtcp2_params.
+    bool disable_active_migration{true};
     bool enable_0rtt{false};
 };
 
@@ -110,15 +113,15 @@ inline Ngtcp2Params make_ngtcp2_params(const QuicConnectionConfig &cfg, ngtcp2_t
     out.transport.active_connection_id_limit = cfg.active_connection_id_limit;
     out.transport.ack_delay_exponent = cfg.ack_delay_exponent;
     out.transport.max_ack_delay = cfg.max_ack_delay_ms * NGTCP2_MILLISECONDS;
-    out.transport.disable_active_migration = cfg.disable_active_migration ? 1 : 0;
-    // Do not advertise a stateless reset token. The transport parameter must
-    // carry the token for the Source Connection ID the peer will actually
-    // address, and this layer does not have that per-CID token (the endpoint
-    // discards the tokens ngtcp2 hands to cb_get_new_connection_id and derives
-    // resets from a different input — see the stateless-reset follow-up). An
-    // all-zero token is worse than none: RFC 9000 §10.3 requires it to be
-    // unpredictable, and a predictable one lets an off-path attacker forge a
-    // reset and kill the connection. Omitting the parameter is legal (§18.2).
+    // Connection migration is not implemented: a datagram from a new address is
+    // still parsed against the path the connection was created on, and replies
+    // go to the original address. Advertising support we do not have makes a
+    // migrating client black-hole until its idle timeout, so say disabled.
+    out.transport.disable_active_migration = 1;
+    // The stateless reset token for our Source Connection ID is set by
+    // QuicConnection::init(), which has the endpoint's reset secret; the two
+    // sides must derive it from the same input or the client discards the
+    // reset (see endpoint's send_stateless_reset).
     out.transport.stateless_reset_token_present = 0;
     out.transport.grease_quic_bit = 1;
 
