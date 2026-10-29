@@ -24,7 +24,10 @@ inline constexpr int version_major = SIMPLE_HTTP_VERSION_MAJOR;
 inline constexpr int version_minor = SIMPLE_HTTP_VERSION_MINOR;
 inline constexpr int version_patch = SIMPLE_HTTP_VERSION_PATCH;
 
-inline constexpr std::string_view server_version = "simple_http_server/" SIMPLE_HTTP_VERSION_STR;
-inline constexpr std::string_view client_version = "simple_http_client/" SIMPLE_HTTP_VERSION_STR;
+// Product tokens for the Server / User-Agent fields (RFC 9110 §10.1.1).
+// Hyphenated because these are wire values: product tokens are conventionally
+// hyphenated (nginx/…, Go-http-client/…), unlike the C++ identifiers.
+inline constexpr std::string_view server_product = "simple-http-server/" SIMPLE_HTTP_VERSION_STR;
+inline constexpr std::string_view client_product = "simple-http-client/" SIMPLE_HTTP_VERSION_STR;
 
 } // namespace simple_http

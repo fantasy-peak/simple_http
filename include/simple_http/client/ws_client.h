@@ -36,7 +36,7 @@
 #include "../core/base64.h"  // ws key generation
 #include "../core/logging.h" // SIMPLE_HTTP_ERROR_LOG
 #include "../core/types.h"   // contains_ctl, client_errc
-#include "../core/version.h" // client_version
+#include "../core/version.h" // client_product
 #include "../proto/headers.h"
 #include "../proto/websocket.h" // WsBackendImpl / WebSocket / ws_accept_key
 #include "client_config.h"
@@ -109,7 +109,7 @@ ws_upgrade_impl(std::shared_ptr<Transport> transport, std::string authority, std
         request += "\r\n";
     }
     request += "user-agent: ";
-    request += client_version;
+    request += client_product;
     request += "\r\n\r\n";
 
     if (auto [ec, n] =

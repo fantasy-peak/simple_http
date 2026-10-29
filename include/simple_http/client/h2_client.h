@@ -755,7 +755,7 @@ class Http2ClientSession final : public ClientSession,
                                         value); // Headers keeps names lowercased
         }
         if (!saw_agent)
-            codec::hpack_append_literal(block, "user-agent", client_version);
+            codec::hpack_append_literal(block, "user-agent", client_product);
         if (!request.stream_body() && request.content_length() >= 0) {
             // A known length: harmless on h2, and some origins want it.
             codec::hpack_append_literal(block, "content-length", std::to_string(request.content_length()));

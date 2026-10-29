@@ -67,7 +67,7 @@ struct StaticFilesConfig {
     // The table this server answers from. Nested rather than flattened so the
     // scan limits stay in one place and cannot be half-copied.
     StaticTableConfig table{};
-    // Overrides the library's own `simple_http_server/x.y.z` Server header, which
+    // Overrides the library's own `simple-http-server/x.y.z` Server header, which
     // names the exact software the server is built from. Empty keeps the library
     // default: a library should not claim to be something else by default, so a
     // deployment that wants a different name has to say so.

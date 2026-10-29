@@ -376,7 +376,7 @@ class ResponseWriter {
             m_headers.add_lower("content-type", "text/plain");
         }
         if (!m_headers.contains("server")) {
-            m_headers.add_lower("server", std::string{server_version});
+            m_headers.add_lower("server", std::string{server_product});
         }
     }
 

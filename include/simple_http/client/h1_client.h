@@ -496,7 +496,7 @@ class Http1ClientSession final : public ClientSession,
         }
         if (!saw_agent) {
             out.append("user-agent: ");
-            out.append(client_version);
+            out.append(client_product);
             out.append("\r\n");
         }
 

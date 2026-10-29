@@ -306,7 +306,7 @@ TEST_CASE("proto/response: defaults are filled in but never override", "[proto]"
         CHECK(writer->last_status == 201);
         CHECK(writer->last_body == "created");
         CHECK(writer->header("content-type") == "text/plain"); // default
-        CHECK(writer->header("server") == std::string{server_version});
+        CHECK(writer->header("server") == std::string{server_product});
         // RFC 9110 §6.6.1: an origin server sends Date on ordinary responses.
         CHECK_FALSE(writer->header("date").empty());
     }
@@ -340,7 +340,7 @@ TEST_CASE("proto/response: bodyless, streaming and state forwarding", "[proto]")
     CHECK(writer->sent_bodyless);
     CHECK(writer->last_status == 204);
     CHECK(writer->last_body.empty());
-    CHECK(writer->header("server") == std::string{server_version}); // defaults apply here too
+    CHECK(writer->header("server") == std::string{server_product}); // defaults apply here too
 
     REQUIRE(run_on(ctx, res.status(200).begin()));
     CHECK(writer->begun);

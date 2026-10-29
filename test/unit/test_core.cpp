@@ -109,8 +109,8 @@ TEST_CASE("core/mime and version constants", "[core]") {
     CHECK(mime::text_plain == "text/plain");
     CHECK(mime::app_json == "application/json");
     CHECK(mime::app_octet_stream == "application/octet-stream");
-    CHECK(server_version.starts_with("simple_http_server/"));
-    CHECK(client_version.starts_with("simple_http_client/"));
+    CHECK(server_product.starts_with("simple-http-server/"));
+    CHECK(client_product.starts_with("simple-http-client/"));
     CHECK(version_major == SIMPLE_HTTP_VERSION_MAJOR);
 }
 
