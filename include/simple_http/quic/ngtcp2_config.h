@@ -56,10 +56,10 @@ struct QuicConnectionConfig {
     // Inert under ngtcp2: the stream table is ngtcp2's now, and
     // `initial_max_streams_*` are the only limits that exist.
     std::size_t max_streams{512};
-    // Reserved: connection migration is not implemented (on_datagram pins the
-    // connection to the address it was created on). The wire always advertises
-    // disable_active_migration=1; see make_ngtcp2_params.
-    bool disable_active_migration{true};
+    // Advertise that the peer may migrate (NAT rebinding, active migration).
+    // The endpoint routes migrated datagrams to the owning worker and the
+    // connection sends on the path ngtcp2 selects, so this is supported.
+    bool disable_active_migration{false};
     bool enable_0rtt{false};
 };
 
@@ -113,11 +113,11 @@ inline Ngtcp2Params make_ngtcp2_params(const QuicConnectionConfig &cfg, ngtcp2_t
     out.transport.active_connection_id_limit = cfg.active_connection_id_limit;
     out.transport.ack_delay_exponent = cfg.ack_delay_exponent;
     out.transport.max_ack_delay = cfg.max_ack_delay_ms * NGTCP2_MILLISECONDS;
-    // Connection migration is not implemented: a datagram from a new address is
-    // still parsed against the path the connection was created on, and replies
-    // go to the original address. Advertising support we do not have makes a
-    // migrating client black-hole until its idle timeout, so say disabled.
-    out.transport.disable_active_migration = 1;
+    // Connection migration: the endpoint forwards datagrams for a known CID to
+    // the owning worker even when they hash to another SO_REUSEPORT socket, and
+    // writes go to the path ngtcp2 selects (including the PATH_CHALLENGE probe
+    // on the new address).
+    out.transport.disable_active_migration = cfg.disable_active_migration ? 1 : 0;
     // The stateless reset token for our Source Connection ID is set by
     // QuicConnection::init(), which has the endpoint's reset secret; the two
     // sides must derive it from the same input or the client discards the

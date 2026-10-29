@@ -50,6 +50,13 @@
 #include <utility>
 #include <vector>
 
+#if defined(_WIN32)
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#endif
+
 #if defined(__linux__)
 // The GSO knobs (SOL_UDP, UDP_SEGMENT) come from the libc <netinet/udp.h>,
 // which exported UDP_SEGMENT since glibc 2.36. It has to be pulled in before
@@ -213,7 +220,7 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
     [[nodiscard]] bool init();
 
     // Feed one received datagram in. Runs on this connection's executor.
-    void on_datagram(std::span<const std::uint8_t> datagram);
+    void on_datagram(std::span<const std::uint8_t> datagram, const asio::ip::udp::endpoint &from);
 
     // Drive the connection until it is closed. The endpoint spawns this; when it
     // returns, the connection is finished and `closed()` is true.
@@ -412,6 +419,29 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
     QuicConnectionConfig m_config;
     QuicBootstrap m_bootstrap;
     std::vector<std::uint32_t> m_versions;
+    // Convert the path address ngtcp2 selected back into an asio endpoint.
+    static asio::ip::udp::endpoint endpoint_from_addr(const ngtcp2_addr &addr) {
+        asio::ip::udp::endpoint out;
+        if (addr.addr == nullptr || addr.addrlen == 0)
+            return out;
+        if (addr.addrlen == sizeof(sockaddr_in)) {
+            sockaddr_in sin{};
+            std::memcpy(&sin, addr.addr, sizeof sin);
+            asio::ip::address_v4::bytes_type bytes{};
+            std::memcpy(bytes.data(), &sin.sin_addr.s_addr, bytes.size());
+            out.address(asio::ip::address_v4(bytes));
+            out.port(ntohs(sin.sin_port));
+        } else if (addr.addrlen == sizeof(sockaddr_in6)) {
+            sockaddr_in6 sin6{};
+            std::memcpy(&sin6, addr.addr, sizeof sin6);
+            asio::ip::address_v6::bytes_type bytes{};
+            std::memcpy(bytes.data(), sin6.sin6_addr.s6_addr, bytes.size());
+            out.address(asio::ip::address_v6(bytes));
+            out.port(ntohs(sin6.sin6_port));
+        }
+        return out;
+    }
+
     asio::ip::udp::endpoint m_local;
     asio::ip::udp::endpoint m_remote;
     DatagramSink m_sink;
@@ -593,15 +623,19 @@ template <typename Executor> bool QuicConnection<Executor>::init() {
     return true;
 }
 
-template <typename Executor> void QuicConnection<Executor>::on_datagram(std::span<const std::uint8_t> datagram) {
+template <typename Executor>
+void QuicConnection<Executor>::on_datagram(std::span<const std::uint8_t> datagram,
+                                           const asio::ip::udp::endpoint &from) {
     if (m_closed || m_conn == nullptr)
         return;
 
+    // The path the datagram actually arrived on. Passing the source address is
+    // what lets ngtcp2 detect a migrated peer (and validate the new path) rather
+    // than pinning every packet to the address the connection was born on.
     ngtcp2_path_storage ps;
-    ngtcp2_path_storage_init(&ps, reinterpret_cast<const ngtcp2_sockaddr *>(m_local.data()),
-                             static_cast<ngtcp2_socklen>(m_local.size()),
-                             reinterpret_cast<const ngtcp2_sockaddr *>(m_remote.data()),
-                             static_cast<ngtcp2_socklen>(m_remote.size()), nullptr);
+    ngtcp2_path_storage_init(
+        &ps, reinterpret_cast<const ngtcp2_sockaddr *>(m_local.data()), static_cast<ngtcp2_socklen>(m_local.size()),
+        reinterpret_cast<const ngtcp2_sockaddr *>(from.data()), static_cast<ngtcp2_socklen>(from.size()), nullptr);
     ngtcp2_pkt_info pi{};
 
     // A callback that closes the connection can only record it (see
@@ -610,6 +644,13 @@ template <typename Executor> void QuicConnection<Executor>::on_datagram(std::spa
     m_in_read_pkt = true;
     const int rv = ngtcp2_conn_read_pkt(m_conn, &ps.path, &pi, datagram.data(), datagram.size(), now());
     m_in_read_pkt = false;
+    if (const ngtcp2_path *current = ngtcp2_conn_get_path(m_conn); current != nullptr) {
+        // Follow the path ngtcp2 settled on (a validated migration, or the same
+        // path as before). peer() and connection-close sends use m_remote.
+        auto remote = endpoint_from_addr(current->remote);
+        if (remote.port() != 0)
+            m_remote = remote;
+    }
     if (m_close_deferred) {
         m_close_deferred = false;
         finish_close();
@@ -946,7 +987,12 @@ template <typename Executor> bool QuicConnection<Executor>::flush_writes() {
         }
 
         SendItem item;
-        item.to = m_remote;
+        // ngtcp2 fills ps.path with the path this batch is for. During a path
+        // validation that is the *new* address, which is exactly where the
+        // PATH_CHALLENGE has to go.
+        item.to = endpoint_from_addr(ps.path.remote);
+        if (item.to.port() == 0)
+            item.to = m_remote;
         item.gso_size = static_cast<std::uint16_t>(gso_size);
         buf.resize(static_cast<std::size_t>(n));
         item.data = std::move(buf);
@@ -988,7 +1034,9 @@ template <typename Executor> void QuicConnection<Executor>::finish_close() {
             // per datagram, and not worth threading a buffer through.
             SendItem item;
             item.data.assign(buf.data(), buf.data() + n);
-            item.to = m_remote;
+            item.to = endpoint_from_addr(ps.path.remote);
+            if (item.to.port() == 0)
+                item.to = m_remote;
             m_sink(std::move(item));
         }
     }

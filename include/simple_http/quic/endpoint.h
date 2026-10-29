@@ -43,6 +43,7 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -141,6 +142,64 @@ struct QuicEndpointConfig {
     std::size_t global_max_connections{0}; // ServerConfig::max_connections
     std::shared_ptr<std::atomic<std::size_t>> active;
     std::shared_ptr<std::atomic<std::size_t>> global_active;
+    // Every endpoint of one SO_REUSEPORT listener must derive Retry and
+    // stateless-reset tokens from the same secret: a client that migrates (or a
+    // retried Initial) can land on a different socket, and a token issued by one
+    // socket has to verify/resolve on whichever socket receives it.
+    std::array<std::uint8_t, 32> shared_secret{};
+    bool use_shared_secret{false};
+};
+
+// Cross-endpoint CID routing for a SO_REUSEPORT listener. A connection lives on
+// one endpoint's executor (model A), but a peer that migrates to a new 4-tuple
+// can hash to a different socket. That socket forwards the datagram to the
+// owning endpoint instead of answering with a stateless reset.
+//
+// The local per-endpoint table stays the fast path; this one is consulted only
+// on a miss, so the common case pays no lock.
+template <typename ConnectionType> class SharedCidRegistry {
+  public:
+    using Executor = typename ConnectionType::executor_type;
+
+    void add(const CidKey &key, const std::weak_ptr<ConnectionType> &conn, const Executor &exec) {
+        std::lock_guard lock(m_mutex);
+        m_entries.insert_or_assign(key, Entry{conn, exec});
+    }
+
+    void remove(const CidKey &key) {
+        std::lock_guard lock(m_mutex);
+        m_entries.erase(key);
+    }
+
+    // Hands the datagram to the connection's executor. False means no live
+    // connection owns this CID (caller may answer a stateless reset).
+    bool route(const CidKey &key, std::string datagram, const asio::ip::udp::endpoint &from) {
+        std::lock_guard lock(m_mutex);
+        auto it = m_entries.find(key);
+        if (it == m_entries.end())
+            return false;
+        auto conn = it->second.conn.lock();
+        if (!conn) {
+            m_entries.erase(it);
+            return false;
+        }
+        // post() never runs the handler inline, so holding the lock here cannot
+        // re-enter this registry. Do not log per datagram: a migrated connection
+        // forwards every packet through here.
+        asio::post(it->second.exec, [conn = std::move(conn), data = std::move(datagram), from]() mutable {
+            conn->on_datagram(
+                std::span<const std::uint8_t>{reinterpret_cast<const std::uint8_t *>(data.data()), data.size()}, from);
+        });
+        return true;
+    }
+
+  private:
+    struct Entry {
+        std::weak_ptr<ConnectionType> conn;
+        Executor exec;
+    };
+    std::mutex m_mutex;
+    std::unordered_map<CidKey, Entry, CidKey::Hash> m_entries;
 };
 
 template <typename Executor> class QuicEndpoint : public std::enable_shared_from_this<QuicEndpoint<Executor>> {
@@ -152,10 +211,13 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
     // any knowledge of HTTP.
     using ServeFn = std::function<asio::awaitable<void>(std::shared_ptr<Connection>)>;
 
-    QuicEndpoint(Executor exec, SSL_CTX *ssl_ctx, QuicEndpointConfig config, ServeFn serve)
+    QuicEndpoint(Executor exec, SSL_CTX *ssl_ctx, QuicEndpointConfig config, ServeFn serve,
+                 std::shared_ptr<SharedCidRegistry<Connection>> shared_cids = nullptr)
         : m_executor(std::move(exec)), m_socket(m_executor), m_ssl_ctx(ssl_ctx), m_config(std::move(config)),
-          m_serve(std::move(serve)) {
-        if (RAND_bytes(m_secret.data(), static_cast<int>(m_secret.size())) != 1) {
+          m_serve(std::move(serve)), m_shared_cids(std::move(shared_cids)) {
+        if (m_config.use_shared_secret) {
+            m_secret = m_config.shared_secret;
+        } else if (RAND_bytes(m_secret.data(), static_cast<int>(m_secret.size())) != 1) {
             SIMPLE_HTTP_ERROR_LOG("quic: could not generate the endpoint secret");
         }
     }
@@ -371,10 +433,18 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
         auto it = m_by_cid.find(key);
         if (it != m_by_cid.end()) {
             if (auto conn = it->second.lock()) {
-                conn->on_datagram(data);
+                conn->on_datagram(data, remote);
             } else {
                 m_by_cid.erase(it);
             }
+            return;
+        }
+
+        // Not ours locally. A migrating peer can hash to a different
+        // SO_REUSEPORT socket even though the connection lives here; forward it
+        // to the owning endpoint before treating the CID as unknown.
+        if (m_shared_cids &&
+            m_shared_cids->route(key, std::string(reinterpret_cast<const char *>(data.data()), data.size()), remote)) {
             return;
         }
 
@@ -509,7 +579,7 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
         // ClientHello. Our own Source Connection ID is already in the table:
         // `init()` walks the IDs ngtcp2 pre-allocated and registers each one.
         m_live.push_back(conn);
-        conn->on_datagram(data);
+        conn->on_datagram(data, remote);
 
         asio::co_spawn(m_executor, serve(conn), asio::detached);
     }
@@ -576,6 +646,8 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
             return;
         const CidKey key = cid_key(cid.data(), cid.size());
         m_by_cid[key] = conn;
+        if (m_shared_cids)
+            m_shared_cids->add(key, conn, m_executor);
         // Remember which keys this connection owns. ngtcp2 retires an ID through
         // its `remove_connection_id` callback, but it does not call that on
         // teardown — `ngtcp2_conn_del` only frees memory. Without this list every
@@ -590,6 +662,8 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
         if (cid.empty())
             return;
         const CidKey key = cid_key(cid.data(), cid.size());
+        if (m_shared_cids)
+            m_shared_cids->remove(key);
         auto it = m_by_cid.find(key);
         if (it == m_by_cid.end())
             return;
@@ -612,8 +686,11 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
         const auto it = m_cids_by_conn.find(conn);
         if (it == m_cids_by_conn.end())
             return;
-        for (const CidKey &key : it->second)
+        for (const CidKey &key : it->second) {
             m_by_cid.erase(key);
+            if (m_shared_cids)
+                m_shared_cids->remove(key);
+        }
         m_cids_by_conn.erase(it);
     }
 
@@ -814,6 +891,7 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
     SSL_CTX *m_ssl_ctx;
     QuicEndpointConfig m_config;
     ServeFn m_serve;
+    std::shared_ptr<SharedCidRegistry<Connection>> m_shared_cids;
 
     std::array<std::uint8_t, 32> m_secret{};
 

@@ -823,6 +823,10 @@ class Server {
         // (SO_REUSEPORT fan-out must not multiply the listener's cap).
         std::shared_ptr<std::atomic<std::size_t>> active;
         std::vector<std::shared_ptr<QuicEndpointType>> endpoints;
+        // CIDs of every connection this listener owns, shared by all endpoints:
+        // a migrated 4-tuple can hash to a socket that did not accept the
+        // connection.
+        std::shared_ptr<quic::SharedCidRegistry<QuicConnectionType>> cid_registry;
     };
 #endif
 
@@ -1354,13 +1358,24 @@ class Server {
         endpoint_config.global_max_connections = m_config.max_connections;
         endpoint_config.active = rt->active;
         endpoint_config.global_active = m_active_connections;
+        // One secret for every socket of this listener: a Retry token or a
+        // stateless reset issued on one socket has to verify/resolve on
+        // whichever socket the peer's next 4-tuple hashes to.
+        if (RAND_bytes(endpoint_config.shared_secret.data(), static_cast<int>(endpoint_config.shared_secret.size())) !=
+            1) {
+            SIMPLE_HTTP_ERROR_LOG("QUIC: could not generate the listener secret");
+            return server_errc::tls_setup_failed;
+        }
+        endpoint_config.use_shared_secret = true;
+        rt->cid_registry = std::make_shared<quic::SharedCidRegistry<QuicConnectionType>>();
         const std::size_t sockets =
             rt->cfg.reuse_port ? (rt->cfg.sockets == 0 ? m_pool->size() : std::min(rt->cfg.sockets, m_pool->size()))
                                : 1;
         for (std::size_t i = 0; i < sockets; ++i) {
             const auto &ctx = rt->cfg.reuse_port ? m_pool->at(i) : m_pool->main_context();
-            auto quic = std::make_shared<QuicEndpointType>(ctx->get_executor(), rt->tls->native_handle(),
-                                                           endpoint_config, make_h3_serve(rt->limits));
+            auto quic =
+                std::make_shared<QuicEndpointType>(ctx->get_executor(), rt->tls->native_handle(), endpoint_config,
+                                                   make_h3_serve(rt->limits), rt->cid_registry);
             if (!quic->open(endpoint, rt->cfg.reuse_port, ec)) {
                 SIMPLE_HTTP_ERROR_LOG("QUIC bind({}:{}) [{}]: {}", rt->cfg.address.host, rt->cfg.address.port, i,
                                       ec.message());
