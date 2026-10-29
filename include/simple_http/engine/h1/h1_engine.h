@@ -1143,7 +1143,18 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
             resp += ws_deflate_response_value(deflate);
             resp += "\r\n";
         }
-        for (const auto &[name, value] : res->headers()) {
+        // Identify the server, as every other response does (ResponseWriter's
+        // apply_defaults). This head is assembled here rather than through
+        // send(), so that default never ran. Only Server belongs on a 101:
+        // Content-Type is meaningless without a body, and Date is not required
+        // for 1xx (RFC 9110 §6.6.1). A middleware that set its own Server wins.
+        const auto &fields = res->headers();
+        if (!fields.contains("server")) {
+            resp += "Server: ";
+            resp += server_product;
+            resp += "\r\n";
+        }
+        for (const auto &[name, value] : fields) {
             resp += name;
             resp += ": ";
             resp += value;

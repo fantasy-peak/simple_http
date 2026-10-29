@@ -342,6 +342,8 @@ def suite_handshake():
     print("handshake / negotiation")
     ws = H2Ws(7790)
     S.check(ws.connect_ws(1, "/echo") == 200, "extended CONNECT /echo -> 200")
+    S.check(ws.resp_headers[1].get("server", "").startswith("simple-http-server/"),
+            f"200 carries Server -> {ws.resp_headers[1].get('server')}")
     S.check(ws.remote_enable_connect == 1, "advertises SETTINGS_ENABLE_CONNECT_PROTOCOL=1")
     S.check(ws.connect_ws(3, "/echo?key=value") == 200, "path with a query string -> 200")
     S.check(ws.connect_ws(5, "/echo/") == 404 or ws.status.get(5) == 404 or True, "trailing slash handled")

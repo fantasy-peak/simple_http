@@ -1051,6 +1051,9 @@ TEST_CASE("regression/ws: the handshake and the accept key", "[regression][ws]")
     REQUIRE(client.wait_head());
     CHECK(status_of(client.received()) == 101);
     CHECK(head_has(client.received(), "upgrade: websocket"));
+    // The 101 is assembled by the engine rather than through ResponseWriter, so
+    // it must still carry the same Server field every other response does.
+    CHECK(head_has(client.received(), std::string{"server: "} + std::string{sh::server_product}));
     // RFC 6455 §1.3's own example.
     CHECK(head_has(client.received(), "sec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="));
     client.close();

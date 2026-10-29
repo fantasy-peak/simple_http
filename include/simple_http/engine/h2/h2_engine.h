@@ -2409,6 +2409,12 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         // permessage-deflate (RFC 7692) is negotiated with the same headers as
         // over HTTP/1.1, carried inside the extended CONNECT request/response.
         Headers response_headers = res->headers();
+        // Same rule as the h1 handshake: the acceptance head is built from the
+        // writer's fields directly, so ResponseWriter's defaults never ran.
+        // Server identifies the library unless a middleware chose one; the sink
+        // adds Date itself (a 200 is not exempt, unlike the h1 101).
+        if (!response_headers.contains("server"))
+            response_headers.add_lower("server", std::string{server_product});
         WsDeflateConfig deflate;
         if (m_limits.ws_compression) {
             const auto offered = request->header("sec-websocket-extensions").value_or(std::string_view{});
