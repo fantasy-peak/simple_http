@@ -2826,3 +2826,26 @@ TEST_CASE("regression/tls: a normal close sends close_notify", "[regression][tls
     CHECK(ec == asio::error::eof);
     CHECK(ec != asio::ssl::error::stream_truncated);
 }
+
+TEST_CASE("regression/h2c: rejected HTTP2-Settings still get a GOAWAY", "[regression][h2]") {
+    plain_server();
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(kPlainPort));
+
+    // "AAAAAA" is base64url for 4 zero bytes; a SETTINGS body must be a
+    // multiple of 6, so the h2c handshake is rejected after the 101.
+    client.send("GET /world HTTP/1.1\r\nHost: x\r\nConnection: Upgrade, HTTP2-Settings\r\n"
+                "Upgrade: h2c\r\nHTTP2-Settings: AAAAAA\r\n\r\n");
+    REQUIRE(client.wait_for("HTTP/1.1 101", std::chrono::seconds(5)));
+    // GOAWAY frame header: length 8, type 7.
+    REQUIRE(client.wait_for(std::string("\x00\x00\x08\x07", 4), std::chrono::seconds(5)));
+
+    const auto head_end = client.received().find("\r\n\r\n");
+    REQUIRE(head_end != std::string::npos);
+    auto frames = parse_frames(std::string_view{client.received()}.substr(head_end + 4));
+    auto goaway = find_frame(frames, sh::codec::H2FrameType::Goaway);
+    REQUIRE(goaway.has_value());
+    REQUIRE(goaway->payload.size() >= 8);
+    CHECK(sh::codec::read_u32(goaway->payload, 4) == sh::codec::H2_FRAME_SIZE_ERROR);
+}

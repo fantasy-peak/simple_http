@@ -290,3 +290,84 @@ TEST_CASE("h2/engine: an early response does not abort the rest of the request b
     CHECK_FALSE(has_goaway(transport->written(), codec::H2_PROTOCOL_ERROR));
     CHECK_FALSE(has_goaway(transport->written(), codec::H2_FLOW_CONTROL_ERROR));
 }
+
+TEST_CASE("h2/engine: a GOAWAY shorter than 8 bytes is FRAME_SIZE_ERROR", "[h2]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+
+    std::string in{codec::kH2ClientPreface};
+    append_frame(in, H2FrameType::Settings, 0, 0, "");
+    append_frame(in, H2FrameType::Goaway, 0, 0, ""); // length 0
+    transport->push(std::move(in));
+
+    auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter>,
+                         SslHandle) -> asio::awaitable<void> { co_return; };
+    auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, EngineLimits{});
+    REQUIRE(run_on(ctx, engine->run(dispatcher)));
+
+    CHECK(has_goaway(transport->written(), codec::H2_FRAME_SIZE_ERROR));
+}
+
+TEST_CASE("h2/engine: a self-dependent PRIORITY on an idle stream is a connection error", "[h2]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+
+    std::string in{codec::kH2ClientPreface};
+    append_frame(in, H2FrameType::Settings, 0, 0, "");
+    // PRIORITY on stream 3, which was never opened, depending on itself.
+    append_frame(in, H2FrameType::Priority, 0, 3, u32be(3) + std::string(1, '\x0f'));
+    transport->push(std::move(in));
+
+    auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter>,
+                         SslHandle) -> asio::awaitable<void> { co_return; };
+    auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, EngineLimits{});
+    REQUIRE(run_on(ctx, engine->run(dispatcher)));
+
+    // RST_STREAM on an idle stream is itself illegal (§5.4.2), so this is a
+    // connection error rather than a stream error.
+    CHECK(has_goaway(transport->written(), codec::H2_PROTOCOL_ERROR));
+    CHECK_FALSE(has_rst_stream(transport->written(), 3, codec::H2_PROTOCOL_ERROR));
+}
+
+TEST_CASE("h2/engine: a zero WINDOW_UPDATE on an idle stream is a connection error", "[h2]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+
+    std::string in{codec::kH2ClientPreface};
+    append_frame(in, H2FrameType::Settings, 0, 0, "");
+    append_frame(in, H2FrameType::WindowUpdate, 0, 3, u32be(0));
+    transport->push(std::move(in));
+
+    auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter>,
+                         SslHandle) -> asio::awaitable<void> { co_return; };
+    auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, EngineLimits{});
+    REQUIRE(run_on(ctx, engine->run(dispatcher)));
+
+    CHECK(has_goaway(transport->written(), codec::H2_PROTOCOL_ERROR));
+    CHECK_FALSE(has_rst_stream(transport->written(), 3, codec::H2_PROTOCOL_ERROR));
+}
+
+TEST_CASE("h2/engine: SETTINGS that push a stream window past 2^31-1 is FLOW_CONTROL_ERROR", "[h2]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+
+    std::string in{codec::kH2ClientPreface};
+    append_frame(in, H2FrameType::Settings, 0, 0, "");
+    in += headers_frame(1, /*end_stream=*/true); // handler parks below, keeping stream 1
+    // Raise stream 1's send window to the maximum with WINDOW_UPDATE...
+    append_frame(in, H2FrameType::WindowUpdate, 0, 1, u32be(0x7FFFFFFFu - 65535u));
+    // ...then a SETTINGS increase of 1 pushes it over.
+    std::string settings;
+    settings.push_back(0);
+    settings.push_back(4); // SETTINGS_INITIAL_WINDOW_SIZE
+    settings += u32be(65536);
+    append_frame(in, H2FrameType::Settings, 0, 0, settings);
+    transport->push(std::move(in));
+
+    auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter>,
+                         SslHandle) -> asio::awaitable<void> { co_await park_briefly(); };
+    auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, EngineLimits{});
+    REQUIRE(run_on(ctx, engine->run(dispatcher)));
+
+    CHECK(has_goaway(transport->written(), codec::H2_FLOW_CONTROL_ERROR));
+}

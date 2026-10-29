@@ -324,11 +324,17 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         // one bad byte truncates the payload instead of failing it.
         if (settings.size() % 6 != 0) {
             go_away(codec::H2_FRAME_SIZE_ERROR);
+            // serve_loops() has not started, so no write loop will flush this
+            // GOAWAY; send it directly before the connection goes.
+            co_await flush_out_directly();
             co_return;
         }
         apply_settings_payload(settings);
-        if (m_goaway_sent)
-            co_return; // the h2c HTTP2-Settings were rejected
+        if (m_goaway_sent) {
+            // The h2c HTTP2-Settings were rejected; same missing write loop.
+            co_await flush_out_directly();
+            co_return;
+        }
         queue_settings();
 
         // Seed stream 1 from the initial request and dispatch it.
@@ -742,8 +748,17 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                 }
                 std::int64_t delta = static_cast<std::int64_t>(value) - m_peer_initial_window;
                 m_peer_initial_window = static_cast<std::int32_t>(value);
-                for (auto &[sid, st] : m_streams)
+                for (auto &[sid, st] : m_streams) {
                     st.send_window += delta;
+                    // §6.9.1: a SETTINGS change that pushes an existing stream's
+                    // window past 2^31-1 is a FLOW_CONTROL_ERROR, not a value to
+                    // keep (a peer can first raise it with WINDOW_UPDATE, then
+                    // raise INITIAL_WINDOW_SIZE here).
+                    if (st.send_window > kH2MaxWindow) {
+                        go_away(codec::H2_FLOW_CONTROL_ERROR);
+                        return;
+                    }
+                }
             } else if (id == codec::H2_SETTINGS_ENABLE_PUSH) {
                 // §6.5.2: ENABLE_PUSH is a boolean. This endpoint never pushes, so
                 // the value is not acted on — but a peer sending anything but 0 or
@@ -894,6 +909,16 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         co_await m_transport->shutdown();
         m_transport->close();
         co_return;
+    }
+
+    // Write m_out synchronously, for phases where no write loop exists yet
+    // (the h2c handshake's GOAWAY before serve_loops()).
+    asio::awaitable<void> flush_out_directly() {
+        if (m_out.empty())
+            co_return;
+        auto bytes = std::as_bytes(std::span<const char>{m_out.data(), m_out.size()});
+        (void)co_await m_transport->async_write(bytes);
+        m_out.clear();
     }
 
     // Best-effort flush of the serialized output left behind by the write loop.
@@ -1076,6 +1101,11 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                 go_away(codec::H2_PROTOCOL_ERROR);
                 return false;
             }
+            // §6.8: a GOAWAY shorter than the two 32-bit fields is malformed.
+            if (hdr.length < 8) {
+                go_away(codec::H2_FRAME_SIZE_ERROR);
+                return false;
+            }
             return true; // peer is going away; let the read EOF close us
         case codec::H2FrameType::Priority:
             return on_priority(hdr, payload);
@@ -1105,8 +1135,18 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         }
         const std::uint32_t dependency = codec::read_u32(payload, 0) & 0x7FFFFFFFu;
         if (dependency == hdr.stream_id) {
-            reset_stream(hdr.stream_id, codec::H2_PROTOCOL_ERROR);
-            return true;
+            if (m_streams.contains(hdr.stream_id)) {
+                reset_stream(hdr.stream_id, codec::H2_PROTOCOL_ERROR);
+                return true;
+            }
+            if (hdr.stream_id > m_next_peer_stream_id) {
+                // An idle stream: RST_STREAM there is itself a protocol
+                // violation (§5.4.2), so the self-dependency is a connection
+                // error instead.
+                go_away(codec::H2_PROTOCOL_ERROR);
+                return false;
+            }
+            return true; // already closed: there is nothing left to reset
         }
         return true; // nothing to reorder: this engine sends one stream at a time
     }
@@ -1776,17 +1816,12 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
             return false;
         }
         const std::uint32_t increment = codec::read_u32(payload, 0) & 0x7FFFFFFFu;
-        // §6.9: a zero increment is a PROTOCOL_ERROR — a connection error on
-        // stream 0, a stream error anywhere else.
-        if (increment == 0) {
-            if (hdr.stream_id == 0) {
+        if (hdr.stream_id == 0) {
+            // §6.9: a zero increment is a connection PROTOCOL_ERROR on stream 0.
+            if (increment == 0) {
                 go_away(codec::H2_PROTOCOL_ERROR);
                 return false;
             }
-            reset_stream(hdr.stream_id, codec::H2_PROTOCOL_ERROR);
-            return true;
-        }
-        if (hdr.stream_id == 0) {
             m_conn_send_window += increment;
             // §6.9.1: a window may not exceed 2^31-1.
             if (m_conn_send_window > kH2MaxWindow) {
@@ -1798,11 +1833,18 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         auto it = m_streams.find(hdr.stream_id);
         if (it == m_streams.end()) {
             // §5.1: WINDOW_UPDATE on a stream that was never opened is a
-            // connection error, and on a closed one it is ignored.
+            // connection error, and on a closed one it is ignored. Checked
+            // before the zero-increment rule: resetting an idle stream would
+            // itself be an RST_STREAM on an idle stream (§5.4.2).
             if (hdr.stream_id > m_next_peer_stream_id) {
                 go_away(codec::H2_PROTOCOL_ERROR);
                 return false;
             }
+            return true;
+        }
+        // §6.9: a zero increment is a stream PROTOCOL_ERROR on an open stream.
+        if (increment == 0) {
+            reset_stream(hdr.stream_id, codec::H2_PROTOCOL_ERROR);
             return true;
         }
         it->second.send_window += increment;
