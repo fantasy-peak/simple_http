@@ -55,6 +55,11 @@ inline std::vector<unsigned char> alpn_wire_list(const ClientTarget &target, con
         case HttpVersionPolicy::Http2:
             protos.emplace_back("h2");
             break;
+        case HttpVersionPolicy::Http3:
+            // Only reachable through the QUIC path; there it is set explicitly
+            // (see dial_h3). Kept here so the switch stays exhaustive.
+            protos.emplace_back("h3");
+            break;
         case HttpVersionPolicy::Auto:
         default:
             // h2 first: the server picks the first protocol it supports.
@@ -134,13 +139,11 @@ struct ClientTlsHandshake {
     std::vector<unsigned char> alpn_wire;
 };
 
-// Performs the client-side TLS handshake on a ready transport: SNI, ALPN and
-// (optionally) host-name verification are set here, then asio's client
-// handshake runs. Returns the transport's error_code; a verification failure
-// arrives as its own error (e.g. asio::error::certificate_verify_failed).
-inline asio::awaitable<error_code> tls_client_handshake(TlsStreamTransport &transport, const ClientTlsHandshake &hs) {
-    SSL *ssl = transport.stream().native_handle();
-
+// Installs the client-side TLS policy on an SSL object: SNI, ALPN and
+// (optionally) host-name verification. Shared by the TCP handshake below and
+// the QUIC client (whose TLS handshake is driven by ngtcp2's helper, so it can
+// share this half but not the asio::ssl::stream driver).
+inline error_code apply_client_ssl_settings(SSL *ssl, const ClientTlsHandshake &hs) {
     // SNI: what the peer should match its certificate against.
     if (!hs.sni.empty() && !is_ip_literal(hs.sni)) {
         (void)SSL_set_tlsext_host_name(ssl, std::string{hs.sni}.c_str());
@@ -151,11 +154,11 @@ inline asio::awaitable<error_code> tls_client_handshake(TlsStreamTransport &tran
         X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
         if (is_ip_literal(hs.sni)) {
             if (X509_VERIFY_PARAM_set1_ip_asc(param, std::string{hs.sni}.c_str()) != 1) {
-                co_return make_error_code(asio::error::invalid_argument);
+                return make_error_code(asio::error::invalid_argument);
             }
         } else if (!hs.sni.empty()) {
             if (X509_VERIFY_PARAM_set1_host(param, hs.sni.data(), hs.sni.size()) != 1) {
-                co_return make_error_code(asio::error::invalid_argument);
+                return make_error_code(asio::error::invalid_argument);
             }
         }
     }
@@ -163,9 +166,21 @@ inline asio::awaitable<error_code> tls_client_handshake(TlsStreamTransport &tran
     if (!hs.alpn_wire.empty()) {
         // SSL_set_alpn_protos copies the list.
         if (SSL_set_alpn_protos(ssl, hs.alpn_wire.data(), static_cast<unsigned int>(hs.alpn_wire.size())) != 0) {
-            co_return make_error_code(asio::error::invalid_argument);
+            return make_error_code(asio::error::invalid_argument);
         }
     }
+    return {};
+}
+
+// Performs the client-side TLS handshake on a ready transport: SNI, ALPN and
+// (optionally) host-name verification are set here, then asio's client
+// handshake runs. Returns the transport's error_code; a verification failure
+// arrives as its own error (e.g. asio::error::certificate_verify_failed).
+inline asio::awaitable<error_code> tls_client_handshake(TlsStreamTransport &transport, const ClientTlsHandshake &hs) {
+    SSL *ssl = transport.stream().native_handle();
+
+    if (error_code ec = apply_client_ssl_settings(ssl, hs))
+        co_return ec;
 
     auto [ec] = co_await transport.stream().async_handshake(asio::ssl::stream_base::client,
                                                             asio::as_tuple(asio::use_awaitable));

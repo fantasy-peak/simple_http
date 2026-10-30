@@ -370,12 +370,45 @@ target("client_cross")
     set_rundir(".")
 target_end()
 
--- One-shot: build the two client cross-validation binaries and drive them
+-- Cross-validation of the HTTP/3 client against an independent h3 server
+-- (test/python/h3_server.py, aioquic). Needs SIMPLE_HTTP_ENABLE_HTTP3.
+target("h3_client_cross")
+    set_kind("binary")
+    set_default(false)
+    add_defines("SIMPLE_HTTP_ENABLE_HTTP3")
+    on_load(function (target)
+        if target:toolchain("gcc") then
+            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-type-limits")
+        end
+    end)
+    add_deps("simple_http")
+    add_files("test/h3_client_cross.cpp")
+    set_rundir(".")
+target_end()
+
+-- Manual smoke test: fetch a real public HTTP/3 origin with the system CA
+-- store. The network is the machine's, so this is not part of the suites.
+--   xmake run h3_public_check -- https://cloudflare-quic.com/
+target("h3_public_check")
+    set_kind("binary")
+    set_default(false)
+    add_defines("SIMPLE_HTTP_ENABLE_HTTP3")
+    on_load(function (target)
+        if target:toolchain("gcc") then
+            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-type-limits")
+        end
+    end)
+    add_deps("simple_http")
+    add_files("test/h3_public_check.cpp")
+    set_rundir(".")
+target_end()
+
+-- One-shot: build the client cross-validation binaries and drive them
 -- against the independent Python servers (test/python/run_client_cross.py).
 target("client-cross-python")
     set_kind("phony")
     set_default(false)
-    add_deps("client_cross", "ws_cross")
+    add_deps("client_cross", "ws_cross", "h3_client_cross")
     on_run(function ()
         local python = "test/python/.venv/bin/python"
         if not os.isfile(python) then

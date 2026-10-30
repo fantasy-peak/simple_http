@@ -31,6 +31,7 @@ VENV = HERE / ".venv/bin/python"
 
 HTTP_PORT = 27921
 WS_PORT = 27920
+H3_PORT = 27922
 
 CHECKED = 0
 FAILED = 0
@@ -54,6 +55,25 @@ def wait_port(port: int, timeout: float = 10.0) -> bool:
                 return True
         except OSError:
             time.sleep(0.1)
+    return False
+
+
+def wait_ready(proc: "subprocess.Popen[str]", timeout: float = 10.0) -> bool:
+    """Waits for a server script to print ``ready`` on stdout."""
+    import select
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        ready, _, _ = select.select([proc.stdout], [], [], 0.5)
+        if not ready:
+            if proc.poll() is not None:
+                return False
+            continue
+        line = proc.stdout.readline()
+        if not line:
+            return False
+        if line.strip() == "ready":
+            return True
     return False
 
 
@@ -86,12 +106,30 @@ def main() -> int:
         return 1
     check(True, f"independent WebSocket server up on :{WS_PORT}")
 
+    # HTTP/3 server (aioquic). UDP has no accept queue to probe, so the script
+    # announces readiness on stdout.
+    h3 = subprocess.Popen(
+        [str(VENV), str(HERE / "h3_server.py"), str(H3_PORT)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        cwd=str(REPO),
+    )
+    servers.append(h3)
+    if not wait_ready(h3):
+        check(False, f"independent HTTP/3 server up on udp :{H3_PORT}")
+        for p in servers:
+            p.kill()
+        return 1
+    check(True, f"independent HTTP/3 server up on udp :{H3_PORT}")
+
     try:
         for binary, arg in (
             (REPO / "build/linux/x86_64/release/client_cross", str(HTTP_PORT)),
             (REPO / "build/linux/x86_64/release/ws_cross", str(WS_PORT)),
+            (REPO / "build/linux/x86_64/release/h3_client_cross", str(H3_PORT)),
         ):
-            r = subprocess.run([str(binary), arg], text=True, capture_output=True)
+            r = subprocess.run([str(binary), arg], text=True, capture_output=True, cwd=str(REPO))
             print(r.stdout.rstrip())
             passed = r.returncode == 0
             for line in r.stdout.splitlines():

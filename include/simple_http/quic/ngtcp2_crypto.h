@@ -17,14 +17,16 @@
 //   per-connection
 //     OpenSSL state and which owns the `SSL*` for freeing.
 //
-// Only TLS 1.3 exists here, and only as a server: QUIC forbids anything else
-// (RFC 9001 §4.2), and this library has no HTTP/3 client.
+// Only TLS 1.3 exists here (RFC 9001 §4.2). Both QUIC roles are supported: the
+// server accepts a connection, the HTTP/3 client connects to one.
 
 #include <ngtcp2/ngtcp2.h>
+#include <ngtcp2/ngtcp2_crypto.h> // ngtcp2_crypto_conn_ref
 #include <ngtcp2/ngtcp2_crypto_ossl.h>
 #include <openssl/ssl.h>
 
 #include <cstdint>
+#include <functional>
 
 #include "../core/logging.h"
 #include "../core/types.h"
@@ -100,10 +102,18 @@ class QuicCrypto {
     QuicCrypto(QuicCrypto &&) = delete;
     QuicCrypto &operator=(QuicCrypto &&) = delete;
 
-    // Create this connection's SSL from the listener's context and put it in
+    // Create this connection's SSL from the context and put it in `client` or
     // server mode. Returns false if OpenSSL refuses — which at this point means
-    // the context itself is unusable, not that the peer did anything.
-    [[nodiscard]] bool init(SSL_CTX *ssl_ctx) {
+    // the context or the caller's configuration is unusable, not that the peer
+    // did anything.
+    //
+    // `configure` runs on the fresh SSL before the handshake can start: the
+    // client uses it to install SNI, host-name verification and the `h3` ALPN
+    // list. It is deliberately a hook rather than policy here — the QUIC layer
+    // knows nothing about TLS client configuration, and the client layer already
+    // has one implementation of it (client/tls_client.h).
+    [[nodiscard]] bool init(SSL_CTX *ssl_ctx, bool client = false,
+                            const std::function<error_code(SSL *)> &configure = {}) {
         if (m_ctx == nullptr)
             return false;
 
@@ -113,13 +123,28 @@ class QuicCrypto {
             return false;
         }
         ngtcp2_crypto_ossl_ctx_set_ssl(m_ctx, ssl);
-        if (ngtcp2_crypto_ossl_configure_server_session(ssl) != 0) {
+        if (client) {
+            if (ngtcp2_crypto_ossl_configure_client_session(ssl) != 0) {
+                SIMPLE_HTTP_ERROR_LOG("quic: ngtcp2_crypto_ossl_configure_client_session failed");
+                return false;
+            }
+        } else if (ngtcp2_crypto_ossl_configure_server_session(ssl) != 0) {
             SIMPLE_HTTP_ERROR_LOG("quic: ngtcp2_crypto_ossl_configure_server_session failed");
             return false;
         }
         // Where OpenSSL callbacks find their way back to the ngtcp2 connection.
         SSL_set_app_data(ssl, &m_conn_ref);
-        SSL_set_accept_state(ssl);
+        if (client) {
+            if (configure) {
+                if (error_code ec = configure(ssl)) {
+                    SIMPLE_HTTP_ERROR_LOG("quic: client TLS configuration failed: {}", ec.message());
+                    return false;
+                }
+            }
+            SSL_set_connect_state(ssl);
+        } else {
+            SSL_set_accept_state(ssl);
+        }
         return true;
     }
 

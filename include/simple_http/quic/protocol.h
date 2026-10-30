@@ -120,13 +120,23 @@ class Protocol {
     // The peer raised the number of bidirectional streams we may open.
     virtual void on_extend_max_remote_streams_bidi(std::uint64_t max_streams) noexcept = 0;
 
-    // The 1-RTT transmit keys are installed. This is the first moment the
-    // engine may open its unidirectional streams: nghttp3's control and QPACK
-    // streams have to be sent under application keys, and ngtcp2 has not handed
-    // out the stream credit for them before this point. Returning normally is
-    // the only option — a failure here means the connection dies, which the
-    // engine does by closing it directly.
+    // The 1-RTT transmit keys are installed. This is when a *server* engine may
+    // open its unidirectional streams: nghttp3's control and QPACK streams have
+    // to be sent under application keys, and ngtcp2 has not handed out the
+    // stream credit for them before this point. Returning normally is the only
+    // option — a failure here means the connection dies, which the engine does
+    // by closing it directly.
+    //
+    // A client should wait for `on_handshake_complete()` instead: its 1-RTT
+    // keys can be installed before the peer's transport parameters (and so its
+    // stream credit) are applied, which is observable as a zero
+    // `streams_uni_left()`.
     virtual void on_tx_keys_ready() noexcept = 0;
+
+    // The QUIC handshake completed. Optional to implement (the default does
+    // nothing); the HTTP/3 client uses it to create its nghttp3 connection once
+    // the peer's stream limits are in force.
+    virtual void on_handshake_complete() noexcept {}
 
     // The connection is finished and nothing will feed the engine again. Called
     // exactly once, from the connection's own teardown, so that a parked

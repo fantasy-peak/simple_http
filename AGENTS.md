@@ -7,8 +7,8 @@
 `simple_http` 是一个 **header-only 的 C++ HTTP 服务器 + 客户端库**，基于
 `boost.asio` C++23 协程实现。服务端支持 HTTP/1.0、HTTP/1.1、HTTP/2（h2 / h2c /
 prior-knowledge）、HTTP/3（QUIC，默认关闭）、WebSocket；客户端（`client/` 层）支持
-http/https × HTTP/1.1/HTTP/2，通过 ALPN（TLS）或 h2c（明文，Upgrade 或
-prior-knowledge）自动协商。
+http/https × HTTP/1.1/HTTP/2，以及显式开启的 HTTP/3（QUIC/UDP，编入宏门控），
+HTTP/1.1 与 HTTP/2 通过 ALPN（TLS）或 h2c（明文，Upgrade 或 prior-knowledge）自动协商。
 
 关键事实（来自代码）：
 
@@ -112,6 +112,8 @@ include/
       tls_client.h         客户端 ssl::context 与握手（SNI / ALPN / 主机名校验 / mTLS）
       h1_client.h          HTTP/1.1 会话（一次一交换，keep-alive、chunked、h2c Upgrade）
       h2_client.h          HTTP/2 会话（多路复用、流控、SETTINGS/PING/GOAWAY、h2c 播种流 1）
+      h3_client.h          HTTP/3 会话（QUIC/UDP + nghttp3；显式 HttpVersionPolicy::Http3，
+                           宏 SIMPLE_HTTP_ENABLE_HTTP3 门控）
       cookie_jar.h         CookieJar（Domain/Path/Secure/Expires 过滤）
       http_client.h        内部连接引擎 `detail::ClientEngine`（单连接模型核心）
       decompressing_stream.h  响应体解压装饰器（read() 层解码，重写 head）
@@ -448,6 +450,14 @@ auto ws = co_await client.open_websocket("wss://host/chat", {.origin = "https://
 - **单连接模型**：一个 `Client` 对它的第一个 origin 只保持一条 TCP 连接（h1 FIFO 门
   `ExchangeGate`，h2 多路复用）；打到其它 origin 用一次性连接。门在交换完成时释放，
   不依赖调用方何时丢弃 stream。
+- **HTTP/3**：设 `ClientConfig::default_version = HttpVersionPolicy::Http3`（URL 必须是
+  `https://`；QUIC 自带 TLS 1.3），客户端对同一 origin 保持一条 QUIC 连接、在其上多路
+  复用请求流（`Http3ClientSession`，`client/h3_client.h`）。只做显式启用——不做
+  Alt-Svc/HTTPS RR 自动发现、0-RTT 或 h3 WebSocket；未定义
+  `SIMPLE_HTTP_ENABLE_HTTP3` 时该策略在拨号处返回 `version_not_negotiated`。
+  验证：`test/python/h3_server.py`（aioquic）+ `test/h3_client_cross.cpp`；
+  公网冒烟用手工工具 `test/h3_public_check.cpp`
+  （`xmake run h3_public_check -- https://cloudflare-quic.com/`，需要外网 UDP/443）。
 - **读写形状**：请求体 `write()`/`finish()`（h1 chunked / h2 DATA）；响应体 `read()` 返回
   `ReadResult`（data 或 eof），失败是 error_code（`RST_STREAM` → `stream_reset`，
   中途断开 → `connection_reset`）。`read_head()` 幂等。

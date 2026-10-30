@@ -128,6 +128,11 @@ struct QuicBootstrap {
     ngtcp2_token_type token_type{NGTCP2_TOKEN_TYPE_UNKNOWN};
 };
 
+// QUIC version 1 (RFC 9000). The only one this library speaks. Lives here
+// rather than in endpoint.h because the client connection has no endpoint and
+// still needs a version to offer.
+inline constexpr std::uint32_t kQuicVersion1 = 0x00000001;
+
 // The largest datagram we will produce. QUIC's minimum MTU is 1200; 1500 covers
 // a stock Ethernet path without fragmentation, and ngtcp2 will not exceed the
 // peer's advertised limit or our own `max_udp_payload_size`.
@@ -166,6 +171,20 @@ struct PendingStreamData {
     std::vector<std::uint8_t> data{};
 };
 
+// How a client-side connection dials its peer. The server's counterpart is
+// QuicBootstrap: the two exist because the roles differ in what they must
+// remember, not because the transport logic differs.
+struct QuicClientOptions {
+    // The QUIC version to offer. Version negotiation is ngtcp2's business; this
+    // library only speaks v1.
+    std::uint32_t version{kQuicVersion1};
+    // Runs on the per-connection SSL before the handshake starts: SNI, host-name
+    // verification, ALPN. The QUIC layer deliberately has no TLS-client policy
+    // of its own — client/tls_client.h owns that, and its hook is shared with
+    // the TCP path.
+    std::function<error_code(SSL *)> configure_ssl;
+};
+
 template <typename Executor>
 class QuicConnection : public std::enable_shared_from_this<QuicConnection<Executor>>, public ConnectionCryptoBase {
   public:
@@ -182,7 +201,23 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
         m_reset_secret_len = std::min(reset_secret.size(), m_reset_secret.size());
         std::copy_n(reset_secret.begin(), m_reset_secret_len, m_reset_secret.begin());
         ngtcp2_ccerr_default(&m_last_error);
+        m_client = false;
         if (!m_crypto.init(ssl_ctx)) {
+            m_init_failed = true;
+        }
+    }
+
+    // The client role: dial `remote` from `local`. There is no retry token, no
+    // endpoint reset secret and no CID routing table — a client has one socket
+    // and one peer, so every datagram on it belongs to this connection.
+    QuicConnection(Executor exec, SSL_CTX *ssl_ctx, QuicConnectionConfig config, QuicClientOptions client,
+                   asio::ip::udp::endpoint local, asio::ip::udp::endpoint remote, DatagramSink sink)
+        : m_executor(exec), m_timer(exec), m_wake(exec, 1), m_closed_signal(exec, 1), m_config(config),
+          m_client_options(std::move(client)), m_local(std::move(local)), m_remote(std::move(remote)),
+          m_sink(std::move(sink)), m_crypto(this) {
+        ngtcp2_ccerr_default(&m_last_error);
+        m_client = true;
+        if (!m_crypto.init(ssl_ctx, /*client=*/true, m_client_options.configure_ssl)) {
             m_init_failed = true;
         }
     }
@@ -211,6 +246,28 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
         auto *self = const_cast<QuicConnection *>(this);
         SSL *ssl = self->m_crypto.ssl();
         return ssl != nullptr ? SslHandle{ssl} : SslHandle{};
+    }
+
+    // Whether the QUIC handshake completed (ngtcp2's view, which is what its
+    // stream limits are keyed to).
+    [[nodiscard]] bool handshake_completed() const noexcept {
+        return m_conn != nullptr && ngtcp2_conn_get_handshake_completed2(m_conn) != 0;
+    }
+
+    // ALPN the TLS handshake selected, or empty if none has been negotiated
+    // yet. QUIC mandates ALPN (§8.1), so an empty answer after the handshake
+    // means the peer refused every protocol we offered.
+    [[nodiscard]] std::string_view alpn_selected() const {
+        auto *self = const_cast<QuicConnection *>(this);
+        SSL *ssl = self->m_crypto.ssl();
+        if (ssl == nullptr)
+            return {};
+        const unsigned char *data = nullptr;
+        unsigned int len = 0;
+        SSL_get0_alpn_selected(ssl, &data, &len);
+        if (data == nullptr || len == 0)
+            return {};
+        return std::string_view{reinterpret_cast<const char *>(data), len};
     }
 
     // --- endpoint-facing -----------------------------------------------------
@@ -298,6 +355,11 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
     // reached — which for the three HTTP/3 critical streams is fatal, not a
     // retry.
     [[nodiscard]] std::optional<std::int64_t> open_uni_stream();
+
+    // Open a bidirectional stream — the HTTP/3 client's request stream. Returns
+    // nullopt when the peer's `initial_max_streams_bidi` (or a MAX_STREAMS it
+    // later raised) is exhausted.
+    [[nodiscard]] std::optional<std::int64_t> open_bidi_stream();
 
     // Credit the peer for `count` bytes the application consumed. Both halves
     // matter: the stream window and the connection window.
@@ -418,7 +480,12 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
 
     QuicConnectionConfig m_config;
     QuicBootstrap m_bootstrap;
+    QuicClientOptions m_client_options;
     std::vector<std::uint32_t> m_versions;
+    // Which side of the handshake this connection is. It decides how ngtcp2 is
+    // asked to build the connection, which callbacks are installed, and whether
+    // the send path may aggregate packets (the client's sink does not do GSO).
+    bool m_client{false};
     // Convert the path address ngtcp2 selected back into an asio endpoint.
     static asio::ip::udp::endpoint endpoint_from_addr(const ngtcp2_addr &addr) {
         asio::ip::udp::endpoint out;
@@ -507,6 +574,72 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
 template <typename Executor> bool QuicConnection<Executor>::init() {
     if (m_init_failed)
         return false;
+
+    if (m_client) {
+        // Both IDs are ours to choose and must not be predictable (RFC 9000
+        // §7.3). The client's *initial* Destination Connection ID is what the
+        // server echoes as original_destination_connection_id; 16 bytes is
+        // comfortably above the 8-byte minimum and what the reference client
+        // uses.
+        ngtcp2_cid dcid{};
+        std::array<std::uint8_t, 16> dcid_bytes{};
+        const std::size_t scid_len = std::min<std::size_t>(m_config.connection_id_length, NGTCP2_MAX_CIDLEN);
+        if (RAND_bytes(dcid_bytes.data(), static_cast<int>(dcid_bytes.size())) != 1 ||
+            RAND_bytes(m_scid.data, static_cast<int>(scid_len)) != 1) {
+            SIMPLE_HTTP_ERROR_LOG("quic: could not generate a client connection id");
+            return false;
+        }
+        ngtcp2_cid_init(&dcid, dcid_bytes.data(), dcid_bytes.size());
+        m_scid.datalen = scid_len;
+
+        ngtcp2_path_storage ps;
+        ngtcp2_path_storage_init(&ps, reinterpret_cast<const ngtcp2_sockaddr *>(m_local.data()),
+                                 static_cast<ngtcp2_socklen>(m_local.size()),
+                                 reinterpret_cast<const ngtcp2_sockaddr *>(m_remote.data()),
+                                 static_cast<ngtcp2_socklen>(m_remote.size()), nullptr);
+
+        auto params = make_ngtcp2_params(m_config, now());
+
+        static constexpr ngtcp2_callbacks callbacks = [] {
+            ngtcp2_callbacks cb{};
+            // The crypto helper drives the handshake both ways; only the two
+            // role-specific callbacks differ.
+            cb.client_initial = ngtcp2_crypto_client_initial_cb;
+            cb.recv_retry = ngtcp2_crypto_recv_retry_cb;
+            cb.recv_crypto_data = ngtcp2_crypto_recv_crypto_data_cb;
+            cb.encrypt = ngtcp2_crypto_encrypt_cb;
+            cb.decrypt = ngtcp2_crypto_decrypt_cb;
+            cb.hp_mask = ngtcp2_crypto_hp_mask_cb;
+            cb.update_key = ngtcp2_crypto_update_key_cb;
+            cb.delete_crypto_aead_ctx = ngtcp2_crypto_delete_crypto_aead_ctx_cb;
+            cb.delete_crypto_cipher_ctx = ngtcp2_crypto_delete_crypto_cipher_ctx_cb;
+            cb.get_path_challenge_data2 = ngtcp2_crypto_get_path_challenge_data2_cb;
+            cb.version_negotiation = ngtcp2_crypto_version_negotiation_cb;
+            cb.recv_stream_data = &QuicConnection::cb_recv_stream_data;
+            cb.acked_stream_data_offset = &QuicConnection::cb_acked_stream_data_offset;
+            cb.stream_close = &QuicConnection::cb_stream_close;
+            cb.stream_reset = &QuicConnection::cb_stream_reset;
+            cb.stream_stop_sending = &QuicConnection::cb_stream_stop_sending;
+            cb.extend_max_stream_data = &QuicConnection::cb_extend_max_stream_data;
+            cb.extend_max_remote_streams_bidi = &QuicConnection::cb_extend_max_remote_streams_bidi;
+            cb.recv_tx_key = &QuicConnection::cb_recv_tx_key;
+            cb.handshake_completed = &QuicConnection::cb_handshake_completed;
+            cb.get_new_connection_id2 = &QuicConnection::cb_get_new_connection_id;
+            cb.remove_connection_id = &QuicConnection::cb_remove_connection_id;
+            cb.rand = &QuicConnection::cb_rand;
+            return cb;
+        }();
+
+        const int rv = ngtcp2_conn_client_new(&m_conn, &dcid, &m_scid, &ps.path, m_client_options.version, &callbacks,
+                                              &params.settings, &params.transport, ngtcp2_mem_default(), this);
+        if (rv != 0) {
+            SIMPLE_HTTP_ERROR_LOG("quic: ngtcp2_conn_client_new: {}", ngtcp2_strerror(rv));
+            m_conn = nullptr;
+            return false;
+        }
+        ngtcp2_conn_set_tls_native_handle(m_conn, m_crypto.native_handle());
+        return true;
+    }
 
     // Our Source Connection ID: the name the client will use from now on. It is
     // ours to choose and must not be predictable (RFC 9000 §7.3), so it comes
@@ -730,6 +863,16 @@ template <typename Executor> std::optional<std::int64_t> QuicConnection<Executor
     return stream_id;
 }
 
+template <typename Executor> std::optional<std::int64_t> QuicConnection<Executor>::open_bidi_stream() {
+    if (m_closed || m_conn == nullptr)
+        return std::nullopt;
+    std::int64_t stream_id = -1;
+    const int rv = ngtcp2_conn_open_bidi_stream(m_conn, &stream_id, nullptr);
+    if (rv != 0)
+        return std::nullopt;
+    return stream_id;
+}
+
 template <typename Executor>
 void QuicConnection<Executor>::extend_stream_offset(std::int64_t stream_id, std::uint64_t count) noexcept {
     if (m_closed || m_conn == nullptr || count == 0)
@@ -913,7 +1056,12 @@ ngtcp2_ssize QuicConnection<Executor>::write_pkt(ngtcp2_path *path, ngtcp2_pkt_i
             // full-size. ngtcp2 itself excludes handshake-level packets, so the
             // anti-amplification limit is untouched; ACK-only packets are not
             // ack-eliciting and are likewise left alone.
-            flags |= NGTCP2_WRITE_STREAM_FLAG_PADDING;
+            //
+            // A client never aggregates: its sink is a plain UDP send, with no
+            // UDP_SEGMENT to split the batch, so padding would only waste
+            // bandwidth on every request.
+            if (!m_client)
+                flags |= NGTCP2_WRITE_STREAM_FLAG_PADDING;
         }
 
         ngtcp2_ssize datalen = -1;
@@ -961,7 +1109,12 @@ template <typename Executor> bool QuicConnection<Executor>::flush_writes() {
         // send queue and ends up at the socket un-copied; allocating it per
         // flush avoids threading a lifetime through (and the allocator's
         // per-thread cache keeps the cost of doing so negligible).
-        std::vector<std::uint8_t> buf(static_cast<std::size_t>(kMaxDatagram) * kPacketsPerFlush);
+        //
+        // The client asks ngtcp2 for one packet per flush: its sink has no GSO
+        // (see the PADDING note in write_pkt), so a batch would be sent as one
+        // malformed datagram.
+        const std::size_t packets_per_flush = m_client ? 1 : kPacketsPerFlush;
+        std::vector<std::uint8_t> buf(static_cast<std::size_t>(kMaxDatagram) * packets_per_flush);
         ngtcp2_path_storage ps;
         ngtcp2_path_storage_zero(&ps);
         ngtcp2_pkt_info pi{};
@@ -970,7 +1123,7 @@ template <typename Executor> bool QuicConnection<Executor>::flush_writes() {
 
         const ngtcp2_ssize n =
             ngtcp2_conn_write_aggregate_pkt2(m_conn, &ps.path, &pi, buf.data(), buf.size(), &gso_size,
-                                             &QuicConnection::cb_write_pkt, kPacketsPerFlush, ts);
+                                             &QuicConnection::cb_write_pkt, packets_per_flush, ts);
         if (n < 0) {
             // NGTCP2_ERR_CALLBACK_FAILURE means one of our callbacks already set
             // `m_last_error`; anything else — a TLS alert included — is
@@ -1056,6 +1209,8 @@ template <typename Executor> void QuicConnection<Executor>::fail(int liberr) {
     // A callback may already have recorded something more specific than
     // `liberr` says — an HTTP/3 or QPACK error code, say. That one wins.
     if (!m_has_error) {
+        SIMPLE_HTTP_DEBUG_LOG("quic: connection failed: {} (tls alert={})", ngtcp2_strerror(liberr),
+                              m_conn != nullptr ? ngtcp2_conn_get_tls_alert2(m_conn) : 0);
         if (liberr == NGTCP2_ERR_CRYPTO) {
             // RFC 9001 §4.8: a TLS alert is reported as CRYPTO_ERROR, whose
             // value *is* the alert description. Collapsing it into the generic
@@ -1196,7 +1351,10 @@ int QuicConnection<Executor>::cb_recv_tx_key(ngtcp2_conn *, ngtcp2_encryption_le
 
 template <typename Executor>
 int QuicConnection<Executor>::cb_handshake_completed(ngtcp2_conn *, void *user_data) noexcept {
-    from(user_data)->poke();
+    auto *self = from(user_data);
+    if (auto proto = self->protocol())
+        proto->on_handshake_complete();
+    self->poke();
     return 0;
 }
 

@@ -83,6 +83,10 @@
 #include "tls_client.h"
 #include "url.h"
 
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+#include "h3_client.h"
+#endif
+
 namespace simple_http::detail {
 
 namespace asio = boost::asio;
@@ -549,7 +553,9 @@ class ClientEngine {
             // HTTP/1.1: one exchange on the *kept* connection at a time — wait
             // for it. A throwaway (other-origin) exchange runs on its own
             // connection and never touches the gate.
-            const bool h1 = session->version() != Version::Http2;
+            // HTTP/1.1 is the only version with the one-exchange gate; h2 and
+            // h3 both multiplex (h3 used to fall into the h1 branch here).
+            const bool h1 = session->version() == Version::Http11;
             const bool keep_exchange = session == m_session && origin == m_origin;
             std::shared_ptr<void> gate_token;
             if (h1 && keep_exchange) {
@@ -657,6 +663,10 @@ class ClientEngine {
     asio::awaitable<std::expected<DialedTransport, error_code>> dial_transport(ClientTarget target,
                                                                                asio::any_io_executor ex) {
         co_await hop(); // the socket and every timer below bind to the pinned executor
+        if (target.version == HttpVersionPolicy::Http3) {
+            // QUIC is not a byte stream. Callers that want h3 go through dial().
+            co_return std::unexpected{make_error_code(client_errc::version_not_negotiated)};
+        }
         error_code ec;
         auto endpoints = co_await resolve(target, ex);
         if (!endpoints)
@@ -739,11 +749,44 @@ class ClientEngine {
         co_return co_await session->open_stream(std::move(spec));
     }
 
+    // Dials an HTTP/3 session: QUIC/UDP plus nghttp3. Its own path because the
+    // transport is not a byte stream — no dial_transport, no ALPN over TCP.
+    asio::awaitable<std::expected<std::shared_ptr<ClientSession>, error_code>> dial_h3(ClientTarget target,
+                                                                                       asio::any_io_executor ex) {
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+        if (!target.use_tls) {
+            // QUIC carries TLS 1.3 itself; there is no http:// form.
+            co_return std::unexpected{make_error_code(client_errc::version_not_negotiated)};
+        }
+        ClientTlsHandshake hs;
+        hs.sni = target.sni.empty() && !m_config.tls.sni_override.empty() ? m_config.tls.sni_override
+                                                                          : std::string{target.sni_host()};
+        hs.verify_host = m_config.tls.verify_host && m_config.tls.verify_peer;
+        // QUIC mandates ALPN; HTTP/3 offers exactly h3 (TlsClientConfig::alpn is
+        // a TCP-side override and does not apply here).
+        hs.alpn_wire.assign(quic::kHttp3AlpnWire.begin(), quic::kHttp3AlpnWire.end());
+
+        auto session = co_await Http3ClientSession<asio::any_io_executor>::connect(
+            ex, m_ssl_context->native_handle(), target, hs, m_config.limits, m_config.connect_timeout,
+            m_config.idle_timeout, m_config.resolve);
+        if (!session)
+            co_return std::unexpected{session.error()};
+        ++m_opened;
+        co_return std::shared_ptr<ClientSession>{*session};
+#else
+        (void)target;
+        (void)ex;
+        co_return std::unexpected{make_error_code(client_errc::version_not_negotiated)};
+#endif
+    }
+
     // Dials (resolving, connecting, handshaking, negotiating) and starts a
     // session. The session is handed straight to the caller: the engine either
     // keeps it as its single connection or the caller closes it.
     asio::awaitable<std::expected<std::shared_ptr<ClientSession>, error_code>> dial(ClientTarget target,
                                                                                     asio::any_io_executor ex) {
+        if (target.version == HttpVersionPolicy::Http3)
+            co_return co_await dial_h3(std::move(target), ex);
         auto transport = co_await dial_transport(target, ex);
         if (!transport)
             co_return std::unexpected{transport.error()};

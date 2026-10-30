@@ -52,6 +52,14 @@ class H3CallbackSink {
     // The field section ended. `fin` says the stream ends with it — for a
     // request that is a header-only request with no body.
     virtual void on_headers_end(std::int64_t stream_id, bool fin) noexcept = 0;
+    // A trailer field section (RFC 9114 §4.1). nghttp3 reports these through a
+    // separate callback trio, and not every engine surfaces them: the default
+    // here ignores the section, which is what the server engine wants (it does
+    // not expose request trailers). The HTTP/3 client overrides them.
+    [[nodiscard]] virtual bool on_trailers_begin(std::int64_t /*stream_id*/) noexcept { return true; }
+    virtual void on_trailer(std::int64_t /*stream_id*/, std::int32_t /*token*/, std::string_view /*name*/,
+                            std::string_view /*value*/) noexcept {}
+    virtual void on_trailers_end(std::int64_t /*stream_id*/, bool /*fin*/) noexcept {}
     // Request body bytes.
     virtual void on_data(std::int64_t stream_id, std::span<const std::uint8_t> data) noexcept = 0;
     // The request is complete: FIN and a well-formed message.
@@ -129,6 +137,25 @@ class H3CallbackSink {
         };
         cb.end_headers = [](nghttp3_conn *, std::int64_t stream_id, int fin, void *conn_user_data, void *) -> int {
             static_cast<H3CallbackSink *>(conn_user_data)->on_headers_end(stream_id, fin != 0);
+            return 0;
+        };
+        cb.begin_trailers = [](nghttp3_conn *, std::int64_t stream_id, void *conn_user_data, void *) -> int {
+            if (!static_cast<H3CallbackSink *>(conn_user_data)->on_trailers_begin(stream_id)) {
+                return NGHTTP3_ERR_CALLBACK_FAILURE;
+            }
+            return 0;
+        };
+        cb.recv_trailer = [](nghttp3_conn *, std::int64_t stream_id, std::int32_t token, nghttp3_rcbuf *name,
+                             nghttp3_rcbuf *value, std::uint8_t, void *conn_user_data, void *) -> int {
+            const nghttp3_vec n = nghttp3_rcbuf_get_buf(name);
+            const nghttp3_vec v = nghttp3_rcbuf_get_buf(value);
+            static_cast<H3CallbackSink *>(conn_user_data)
+                ->on_trailer(stream_id, token, std::string_view{reinterpret_cast<const char *>(n.base), n.len},
+                             std::string_view{reinterpret_cast<const char *>(v.base), v.len});
+            return 0;
+        };
+        cb.end_trailers = [](nghttp3_conn *, std::int64_t stream_id, int fin, void *conn_user_data, void *) -> int {
+            static_cast<H3CallbackSink *>(conn_user_data)->on_trailers_end(stream_id, fin != 0);
             return 0;
         };
         cb.end_stream = [](nghttp3_conn *, std::int64_t stream_id, void *conn_user_data, void *) -> int {

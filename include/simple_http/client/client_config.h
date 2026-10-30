@@ -49,6 +49,15 @@ enum class HttpVersionPolicy : std::uint8_t {
     // H2cMode, and a peer that will not speak h2 fails with
     // client_errc::version_not_negotiated.
     Http2 = 2,
+    // Require HTTP/3. The target must be an https:// URL: QUIC carries its own
+    // TLS 1.3, so there is no plaintext form. A peer that does not negotiate
+    // the `h3` ALPN fails with client_errc::version_not_negotiated.
+    //
+    // This is explicit, not discovered: the client does not read Alt-Svc or
+    // HTTPS resource records. Compiling without SIMPLE_HTTP_ENABLE_HTTP3 keeps
+    // the enumerator (source compatibility) but every dial fails with
+    // version_not_negotiated.
+    Http3 = 3,
 };
 
 // How plaintext HTTP/2 (h2c) is established.

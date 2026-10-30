@@ -70,9 +70,6 @@ namespace simple_http::quic {
 
 namespace asio = boost::asio;
 
-// QUIC version 1 (RFC 9000). The only one this server speaks.
-inline constexpr std::uint32_t kQuicVersion1 = 0x00000001;
-
 // How long a Retry token stays valid. Bounded because the token is what proves
 // the client owned its address at some point, and "some point" has to expire.
 inline constexpr ngtcp2_duration kRetryTokenTimeout = 30 * NGTCP2_SECONDS;

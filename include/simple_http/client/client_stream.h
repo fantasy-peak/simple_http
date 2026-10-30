@@ -69,6 +69,84 @@ struct ResponseHead {
     std::optional<std::string_view> header(std::string_view name) const { return headers.get(name); }
 };
 
+// How a stream ended, shared between a multiplexed session (which sets it) and
+// the stream handle (which reports it). It lives on the handle, not in the
+// session's stream table: the session erases that entry as soon as the stream is
+// over, so a handle kept a little longer still answers truthfully instead of
+// reporting a closed session. Shared by the HTTP/2 and HTTP/3 sessions.
+enum class StreamState : int {
+    Open = 0,
+    Eof,        // the response body ended normally
+    Reset,      // the peer reset the stream (RST_STREAM / RESET_STREAM)
+    Disconnect, // the connection went away mid-stream
+    Failed,     // a specific error_code (in StreamOutcome::ec)
+};
+
+struct StreamOutcome {
+    std::atomic<int> state{static_cast<int>(StreamState::Open)};
+    error_code ec;
+
+    StreamState get() const { return static_cast<StreamState>(state.load(std::memory_order_acquire)); }
+
+    // The first terminal transition wins; a later one is ignored. A terminal
+    // outcome must be stable: close() marks every stream Failed(session_closed)
+    // and the subsequent teardown used to overwrite each one with
+    // Disconnect(eof), so a caller could observe two different reasons for one
+    // stream. It also means `ec` is written exactly once, before the release
+    // store that publishes it — a foreign thread that observed the terminal
+    // state with acquire (finished()/read()'s pre-hop check) then reads a stable
+    // `ec`, with no concurrent write to race. Writers all run on the session
+    // executor (model A), so the relaxed guard needs no compare-exchange.
+    void set(StreamState s, error_code e = {}) {
+        if (state.load(std::memory_order_relaxed) != static_cast<int>(StreamState::Open))
+            return;
+        ec = std::move(e);
+        state.store(static_cast<int>(s), std::memory_order_release);
+    }
+
+    // The error a failed stream reports; Open/Eof/Rst/Disconnect have their own
+    // event or error at the call site.
+    error_code to_error() const { return ec ? ec : make_error_code(client_errc::session_closed); }
+};
+
+// Maps a terminal stream state to what the caller sees: a clean end-of-body, or
+// the error that ended it. A reset and a vanished connection are failures — the
+// body the caller got is a truncation, not a body.
+inline std::expected<ReadResult, error_code> outcome_result(const StreamOutcome &outcome) {
+    switch (outcome.get()) {
+    case StreamState::Eof:
+        return ReadResult::end();
+    case StreamState::Reset:
+        return std::unexpected{make_error_code(client_errc::stream_reset)};
+    case StreamState::Disconnect:
+        return std::unexpected{make_error_code(asio::error::connection_reset)};
+    case StreamState::Failed:
+        return std::unexpected{outcome.to_error()};
+    case StreamState::Open:
+    default:
+        return std::unexpected{make_error_code(client_errc::session_closed)};
+    }
+}
+
+// The error form, for the paths that only need to know why a stream ended (a
+// clean end-of-body is then reported as a protocol error: no head ever
+// arrived).
+inline error_code outcome_error(const StreamOutcome &outcome) {
+    switch (outcome.get()) {
+    case StreamState::Reset:
+        return make_error_code(client_errc::stream_reset);
+    case StreamState::Disconnect:
+        return make_error_code(asio::error::connection_reset);
+    case StreamState::Failed:
+        return outcome.to_error();
+    case StreamState::Eof:
+        return make_error_code(client_errc::protocol_error);
+    case StreamState::Open:
+    default:
+        return make_error_code(client_errc::session_closed);
+    }
+}
+
 // One request/response exchange. Lifetime: keep it alive until the exchange is
 // done; the session stays alive while any of its streams does.
 class ClientStream {

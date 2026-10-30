@@ -13,7 +13,7 @@ own: no Beast, no nghttp2, nothing between your handler and the socket but Asio.
 The whole thing is C++23 coroutines from the acceptor down, it serves and it
 fetches — one route table covers HTTP/1.x, HTTP/2 (ALPN, h2c upgrade, prior
 knowledge) and h2c, and the client speaks the same protocols outbound. HTTP/3
-(the QUIC listener) is opt-in and built on ngtcp2/nghttp3.
+(QUIC listener and client) is opt-in and built on ngtcp2/nghttp3.
 
 ---
 
@@ -46,7 +46,7 @@ knowledge) and h2c, and the client speaks the same protocols outbound. HTTP/3
 - **📦 Header-only** — include and go; the library links nothing but Boost.Asio and OpenSSL, with header-only glaze carrying the JSON helpers.
 - **🛡️ Modern C++** — C++23 coroutines (`asio::awaitable`), concepts, `std::expected`; no callbacks to thread through.
 - **🔄 One route table, every protocol** — HTTP/1.1, HTTP/2 (ALPN, h2c upgrade, prior knowledge) and h2c share handlers. Version differences live in the engines, not in your code.
-- **🔁 Server *and* client** — the client negotiates ALPN or h2c on its own, over `http://` and `https://`, with HTTP/2 stream multiplexing and one kept-alive connection per origin.
+- **🔁 Server *and* client** — the client negotiates ALPN or h2c on its own, over `http://` and `https://`, with HTTP/2 stream multiplexing and one kept-alive connection per origin. With `SIMPLE_HTTP_ENABLE_HTTP3`, `HttpVersionPolicy::Http3` speaks HTTP/3 over QUIC (multiplexed request streams on one connection).
 - **🔒 HTTPS & mTLS** — server and client side, including client-certificate inspection from a handler.
 - **🌊 Streaming both ways** — request and response bodies stream with flow-control backpressure; a large payload never has to be materialized.
 - **🧱 Backpressure that survives a hostile peer** — a request body that backs up is parked per stream (HTTP/2) or drained by a bounded internal reader (WebSocket), so one stream or one serial handler cannot stall the connection.
@@ -259,6 +259,18 @@ the whole retry chain including backoff). Sharing one `Client` across threads
 is supported — each thread's io_context must outlive the sessions bound to it,
 so a retiring thread drains its context before destroying it.
 
+HTTP/3 is explicit rather than discovered: build the client with
+`ClientConfig{.default_version = HttpVersionPolicy::Http3}` and use an
+`https://` URL (QUIC carries TLS 1.3 itself; `http://` is refused with
+`version_not_negotiated`). Everything above — the builder, `send()`,
+`open_stream()`, redirects, cookies, decompression — works unchanged; request
+streams multiplex over one QUIC connection per origin, and response trailers
+reach `Stream::trailers()`. The same `TlsClientConfig` (CA bundle, name
+verification, client certificate, SNI override) applies. This is compiled only
+when `SIMPLE_HTTP_ENABLE_HTTP3` is defined; without it the policy fails at dial
+time rather than silently downgrading. There is no Alt-Svc/HTTPS-RR discovery,
+no 0-RTT, and no HTTP/3 WebSocket.
+
 `Request` is the one request message type shared by both sides: build one with
 `set_method`/`set_url`/`set_target`/`set_body`/`basic_auth` and hand it to
 `client.send(shared_ptr<Request>)` (the Go `http.Client.Do` shape), or use the
@@ -287,7 +299,7 @@ documented public API.
 | `SIMPLE_HTTP_USE_BOOST_REGEX` | Uses `boost::regex` instead of `std::regex` for route matching. |
 | `SIMPLE_HTTP_ENABLE_LOG` | Master switch for the logging facade (`1` by default). Set to `0` and every `SIMPLE_HTTP_*_LOG` expands to `((void)0)`. |
 | `SIMPLE_HTTP_LOG_ACTIVE_LEVEL` | Compile-time floor, `0` (Trace) … `5` (Critical). Records below it are discarded at compile time, so they cost nothing at the call site. |
-| `SIMPLE_HTTP_ENABLE_HTTP3` | Compiles in the HTTP/3 engine and the QUIC listener (ngtcp2 + nghttp3). Off by default: without it `ServerConfig::quic` and the QUIC tunables do not exist, so a build that does not define it cannot ask for a UDP side at all. |
+| `SIMPLE_HTTP_ENABLE_HTTP3` | Compiles in the HTTP/3 engine, the QUIC listener and the HTTP/3 client (ngtcp2 + nghttp3). Off by default: without it `ServerConfig::quic` and the QUIC tunables do not exist, so a build that does not define it cannot ask for a UDP side at all — and `HttpVersionPolicy::Http3` fails at dial time. |
 
 WebSocket support, response-body compression (gzip/brotli), WebSocket
 permessage-deflate and OpenAPI have **no macro** — they are always compiled in,
