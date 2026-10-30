@@ -109,6 +109,8 @@ include/
       client_config.h      ClientConfig / TlsClientConfig / client_errc / HttpVersionPolicy / H2cMode
       url.h                绝对 URL 解析（parse_url；ws:// wss:// 归一后复用）
       client_stream.h      ResponseHead / ClientStream / ClientSession（内部引擎接口）
+      multiplexed_session.h  h2/h3 共用的多路复用会话骨架与流句柄
+                           （alive/reusable/keepable、计数、outcome gating、executor hop）
       tls_client.h         客户端 ssl::context 与握手（SNI / ALPN / 主机名校验 / mTLS）
       h1_client.h          HTTP/1.1 会话（一次一交换，keep-alive、chunked、h2c Upgrade）
       h2_client.h          HTTP/2 会话（多路复用、流控、SETTINGS/PING/GOAWAY、h2c 播种流 1）

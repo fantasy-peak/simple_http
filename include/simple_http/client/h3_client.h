@@ -61,6 +61,7 @@
 #include "../quic/connection.h"
 #include "client_config.h"
 #include "client_stream.h"
+#include "multiplexed_session.h"
 #include "tls_client.h"
 
 namespace simple_http::detail {
@@ -128,60 +129,31 @@ template <typename Executor> class QuicClientUdp : public std::enable_shared_fro
 
 template <typename Executor> class Http3ClientSession;
 
-// One HTTP/3 request, from the caller's side. Holds the shared outcome so a
-// handle kept past the session's table entry still reports the truth.
-template <typename Executor> class Http3ClientStream final : public ClientStream {
-  public:
-    Http3ClientStream(std::shared_ptr<Http3ClientSession<Executor>> session, std::int64_t id,
-                      std::shared_ptr<StreamOutcome> outcome)
-        : m_session(std::move(session)), m_id(id), m_outcome(std::move(outcome)) {}
-
-    asio::awaitable<error_code> write(std::string data) override {
-        if (m_outcome->get() != StreamState::Open)
-            co_return m_outcome->to_error();
-        co_return co_await m_session->stream_write(m_id, std::move(data), /*last=*/false);
-    }
-
-    asio::awaitable<error_code> finish(std::string data) override {
-        if (m_outcome->get() != StreamState::Open)
-            co_return m_outcome->to_error();
-        co_return co_await m_session->stream_write(m_id, std::move(data), /*last=*/true);
-    }
-
-    asio::awaitable<std::expected<ReadResult, error_code>> read() override {
-        if (m_outcome->get() != StreamState::Open)
-            co_return outcome_result(*m_outcome);
-        co_return co_await m_session->stream_read(m_id);
-    }
-
-    bool finished() const override { return m_outcome->get() != StreamState::Open; }
-
-    Version version() const override { return Version::Http3; }
-
-    std::uint32_t id() const override { return static_cast<std::uint32_t>(m_id); }
-
-    asio::awaitable<void> cancel() override {
-        co_await asio::dispatch(asio::bind_executor(m_session->get_executor(), asio::use_awaitable));
-        m_session->stream_cancel(m_id);
-    }
-
-  private:
-    friend class Http3ClientSession<Executor>; // publishes the head/trailers here
-
-    asio::awaitable<error_code> await_head() override { co_return co_await m_session->await_stream_head(m_id); }
-
-    // Strong: the caller's stream keeps the connection alive. The session refers
-    // back to its streams weakly, so there is no cycle.
-    std::shared_ptr<Http3ClientSession<Executor>> m_session;
-    std::int64_t m_id;
-    std::shared_ptr<StreamOutcome> m_outcome;
-};
+// One HTTP/3 request, from the caller's side. The shared multiplexed-stream
+// skeleton (outcome gating, executor hop, forwarders) lives in
+// multiplexed_session.h; the session supplies the protocol operations.
+template <typename Executor>
+using Http3ClientStream = MultiplexedClientStream<Http3ClientSession<Executor>, std::int64_t>;
 
 template <typename Executor>
-class Http3ClientSession final : public ClientSession,
+class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSession<Executor>>,
                                  public quic::Protocol,
-                                 public h3::H3CallbackSink,
-                                 public std::enable_shared_from_this<Http3ClientSession<Executor>> {
+                                 public h3::H3CallbackSink {
+  public:
+    using Base = MultiplexedClientSession<Http3ClientSession<Executor>>;
+
+  private:
+    // Dependent base: bring the shared helpers and state into scope.
+    using Base::hop;
+    using Base::m_active_streams;
+    using Base::m_alive;
+    using Base::m_authority;
+    using Base::m_close_requested;
+    using Base::m_executor;
+    using Base::m_goaway_received;
+    using Base::stream_closed;
+    using Base::stream_opened;
+
   public:
     using Connection = quic::QuicConnection<Executor>;
     using Udp = QuicClientUdp<Executor>;
@@ -318,8 +290,7 @@ class Http3ClientSession final : public ClientSession,
 
     Http3ClientSession(Executor ex, std::shared_ptr<Connection> conn, std::shared_ptr<Udp> udp,
                        const ClientTarget &target, const EngineLimits &limits)
-        : m_executor(std::move(ex)), m_conn(std::move(conn)), m_udp(std::move(udp)), m_authority(target.authority()),
-          m_limits(limits) {}
+        : Base(std::move(ex), target.authority()), m_conn(std::move(conn)), m_udp(std::move(udp)), m_limits(limits) {}
 
     ~Http3ClientSession() override {
         if (m_h3 != nullptr)
@@ -328,8 +299,6 @@ class Http3ClientSession final : public ClientSession,
 
     Http3ClientSession(const Http3ClientSession &) = delete;
     Http3ClientSession &operator=(const Http3ClientSession &) = delete;
-
-    [[nodiscard]] Executor get_executor() const { return m_executor; }
 
     // --- ClientSession ---
 
@@ -358,7 +327,7 @@ class Http3ClientSession final : public ClientSession,
         fresh->in_space = std::make_shared<Channel>(m_executor, 1);
         fresh->out_space = std::make_shared<Channel>(m_executor, 1);
         m_streams.emplace(*id, fresh);
-        m_active_streams.fetch_add(1, std::memory_order_release);
+        stream_opened();
 
         // The up-front body (a non-streaming request): nghttp3 pulls it from the
         // queue below, so read it before submitting the head. This awaits, so no
@@ -420,22 +389,7 @@ class Http3ClientSession final : public ClientSession,
         co_return handle;
     }
 
-    bool alive() const override { return m_alive; }
-
-    bool reusable() const override {
-        return m_alive && !m_goaway_received && !m_close_requested &&
-               m_active_streams.load(std::memory_order_acquire) == 0;
-    }
-
-    bool keepable() const override { return m_alive && !m_goaway_received && !m_close_requested; }
-
-    bool multiplexes() const override { return true; }
-
     Version version() const override { return Version::Http3; }
-
-    std::string_view authority() const override { return m_authority; }
-
-    asio::any_io_executor executor() const override { return m_executor; }
 
     void close() override {
         asio::post(m_executor, [self = this->shared_from_this()] { self->shutdown_now(); });
@@ -1056,8 +1010,6 @@ class Http3ClientSession final : public ClientSession,
         Signal out_space;
     };
 
-    asio::awaitable<void> hop() const { co_await asio::dispatch(asio::bind_executor(m_executor, asio::use_awaitable)); }
-
     // Start the connection and wait for the 1-RTT keys (when the HTTP/3 control
     // streams can be opened).
     asio::awaitable<error_code> start(std::chrono::milliseconds connect_timeout) {
@@ -1251,25 +1203,19 @@ class Http3ClientSession final : public ClientSession,
         h3::wake(it->second->in_space);
         h3::wake(it->second->out_space);
         m_streams.erase(it);
-        m_active_streams.fetch_sub(1, std::memory_order_release);
+        stream_closed();
     }
 
-    Executor m_executor;
     std::shared_ptr<Connection> m_conn;
     std::shared_ptr<Udp> m_udp;
-    std::string m_authority;
     EngineLimits m_limits;
     nghttp3_conn *m_h3{nullptr};
     bool m_h3_dead{false};
-    bool m_alive{false};
     bool m_conn_closed{false};
-    bool m_goaway_received{false};
-    bool m_close_requested{false};
     error_code m_failure{make_error_code(client_errc::version_not_negotiated)};
     bool m_failure_set{false};
     Signal m_ready;
     std::unordered_map<std::int64_t, std::shared_ptr<Stream>> m_streams;
-    std::atomic<std::size_t> m_active_streams{0};
     std::array<quic::ByteVec, 8> m_vec{};
     std::size_t m_vec_count{0};
 };

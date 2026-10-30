@@ -65,6 +65,7 @@
 #include "../transport/transport.h"
 #include "client_config.h"
 #include "client_stream.h"
+#include "multiplexed_session.h"
 
 namespace simple_http::detail {
 
@@ -110,77 +111,35 @@ inline std::string h2_settings_base64url(const EngineLimits &limits) {
 
 template <TransportLike Transport> class Http2ClientSession;
 
-// How a stream ended (StreamState / StreamOutcome and their mappings) lives in
-// client_stream.h now: the HTTP/3 session reports the same terminal states.
-
-// One HTTP/2 stream, from the caller's side. Holds the id, the shared outcome
-// and a weak reference to the session: a stream kept past the connection's
-// death reports that instead of touching a dead transport.
-template <TransportLike Transport> class Http2ClientStream final : public ClientStream {
-  public:
-    Http2ClientStream(std::shared_ptr<Http2ClientSession<Transport>> session, std::uint32_t id,
-                      std::shared_ptr<StreamOutcome> outcome)
-        : m_session(std::move(session)), m_id(id), m_outcome(std::move(outcome)) {}
-
-    asio::awaitable<error_code> write(std::string data) override {
-        // Terminal state first: the session may have dropped its table entry
-        // already, so the outcome is the only truthful source.
-        if (m_outcome->get() != StreamState::Open)
-            co_return m_outcome->to_error();
-        co_return co_await m_session->stream_write(m_id, std::move(data),
-                                                   /*last=*/false);
-    }
-
-    asio::awaitable<error_code> finish(std::string data) override {
-        if (m_outcome->get() != StreamState::Open)
-            co_return m_outcome->to_error();
-        co_return co_await m_session->stream_write(m_id, std::move(data),
-                                                   /*last=*/true);
-    }
-
-    asio::awaitable<std::expected<ReadResult, error_code>> read() override {
-        if (m_outcome->get() != StreamState::Open)
-            co_return outcome_result(*m_outcome);
-        co_return co_await m_session->stream_read(m_id);
-    }
-
-    bool finished() const override { return m_outcome->get() != StreamState::Open; }
-
-    Version version() const override { return Version::Http2; }
-
-    std::uint32_t id() const override { return m_id; }
-
-    asio::awaitable<void> cancel() override {
-        co_await asio::dispatch(asio::bind_executor(m_session->get_executor(), asio::use_awaitable));
-        m_session->stream_cancel(m_id);
-    }
-
-  private:
-    friend class Http2ClientSession<Transport>; // publishes the parsed head here
-
-    asio::awaitable<error_code> await_head() override { co_return co_await m_session->await_stream_head(m_id); }
-
-    // Strong: the caller's stream keeps the connection alive. The session refers
-    // back to its streams weakly, so there is no cycle.
-    std::shared_ptr<Http2ClientSession<Transport>> m_session;
-    std::uint32_t m_id;
-    std::shared_ptr<StreamOutcome> m_outcome;
-};
+// One HTTP/2 stream, from the caller's side. The shared multiplexed-stream
+// skeleton (outcome gating, executor hop, forwarders) lives in
+// multiplexed_session.h; the session supplies the protocol operations.
+template <TransportLike Transport>
+using Http2ClientStream = MultiplexedClientStream<Http2ClientSession<Transport>, std::uint32_t>;
 
 template <TransportLike Transport>
-class Http2ClientSession final : public ClientSession,
-                                 public std::enable_shared_from_this<Http2ClientSession<Transport>> {
+class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSession<Transport>> {
   public:
     using Executor = decltype(std::declval<Transport &>().get_executor());
+    using Base = MultiplexedClientSession<Http2ClientSession<Transport>>;
 
-    // The executor this session is pinned to. Streams dispatch onto it before
-    // touching session state, exactly as they do on the HTTP/1.1 side.
-    Executor get_executor() { return m_executor; }
+  private:
+    // Dependent base: bring the shared helpers and state into scope.
+    using Base::hop;
+    using Base::m_active_streams;
+    using Base::m_alive;
+    using Base::m_authority;
+    using Base::m_close_requested;
+    using Base::m_executor;
+    using Base::m_goaway_received;
+    using Base::stream_closed;
+    using Base::stream_opened;
 
+  public:
     Http2ClientSession(std::shared_ptr<Transport> transport, ClientTarget target, EngineLimits limits,
                        std::chrono::milliseconds idle_timeout)
-        : m_transport(std::move(transport)), m_executor(m_transport->get_executor()), m_target(std::move(target)),
-          m_limits(limits), m_idle_timeout(idle_timeout), m_notify(m_executor, 1) {
+        : Base(transport->get_executor(), target.authority()), m_transport(std::move(transport)),
+          m_target(std::move(target)), m_limits(limits), m_idle_timeout(idle_timeout), m_notify(m_executor, 1) {
         // What we advertise bounds what the peer may index into, so the decoder
         // is set to the same value. We advertise nothing, i.e. the 4096 default.
         m_decoder.set_max_table_size(4096);
@@ -253,7 +212,7 @@ class Http2ClientSession final : public ClientSession,
 
         auto [it, inserted] = m_streams.try_emplace(id);
         (void)inserted;
-        m_active_streams.fetch_add(1, std::memory_order_release);
+        stream_opened();
         Stream &st = it->second;
         init_stream(st, id);
 
@@ -293,33 +252,12 @@ class Http2ClientSession final : public ClientSession,
         co_return handle;
     }
 
-    bool alive() const override { return m_alive; }
-
-    bool reusable() const override {
-        // A request that asked to close (`Request::close`) keeps the session
-        // out of the pool even when the peer raised no objection: HTTP/2 has no
-        // `Connection: close` to send, so this flag is the whole of the mechanism.
-        // "No in-flight streams" comes from an atomic counter, not m_streams:
-        // reusable() is read from foreign threads (the engine's reuse check and
-        // its stream-destruction hook), and the map is only ever touched on the
-        // connection executor — reading empty() off-executor would race the
-        // loops' inserts/erases (UB, and a use-after-free across a rehash).
-        return m_alive && !m_goaway_received && !m_close_requested &&
-               m_active_streams.load(std::memory_order_acquire) == 0;
-    }
-
-    // Whether the connection can serve another request after the current one —
-    // alive, no GOAWAY, and no request asked to close. Busy-ness is ignored:
-    // HTTP/2 multiplexes, so an in-flight stream on the kept connection is
-    // never a reason to dial a fresh one.
-    bool keepable() const override { return m_alive && !m_goaway_received && !m_close_requested; }
-
-    bool multiplexes() const override { return true; }
+    // alive()/reusable()/keepable()/multiplexes()/authority()/executor() come
+    // from MultiplexedClientSession. A request that asked to close
+    // (`Request::close`) is what m_close_requested records: HTTP/2 has no
+    // `Connection: close`, so that flag is the whole of the mechanism.
 
     Version version() const override { return Version::Http2; }
-
-    std::string_view authority() const override { return m_authority; }
-    asio::any_io_executor executor() const override { return m_executor; }
 
     void close() override {
         asio::post(m_executor, [self = this->shared_from_this()] {
@@ -599,7 +537,7 @@ class Http2ClientSession final : public ClientSession,
         if (seed) {
             auto [it, inserted] = m_streams.try_emplace(1);
             (void)inserted;
-            m_active_streams.fetch_add(1, std::memory_order_release);
+            stream_opened();
             Stream &st = it->second;
             init_stream(st, 1);
             // The handle must be owned by *someone*: the session keeps only a weak
@@ -789,8 +727,6 @@ class Http2ClientSession final : public ClientSession,
     }
 
     void flush() { (void)m_notify.try_send(error_code{}); }
-
-    asio::awaitable<void> hop() { co_await asio::dispatch(asio::bind_executor(m_executor, asio::use_awaitable)); }
 
     // --- frame output ---
 
@@ -1407,7 +1343,7 @@ class Http2ClientSession final : public ClientSession,
         if (st.out_space)
             st.out_space->close();
         m_streams.erase(it);
-        m_active_streams.fetch_sub(1, std::memory_order_release);
+        stream_closed();
     }
 
     void fail_all_streams(client_errc code) {
@@ -1526,24 +1462,18 @@ class Http2ClientSession final : public ClientSession,
         }
     }
 
-    // --- members (touched only on the connection executor) ---
+    // --- members (touched only on the connection executor); the executor,
+    // authority, lifetime flags and active-stream counter live on the base ---
     std::shared_ptr<Transport> m_transport;
-    Executor m_executor;
     ClientTarget m_target;
     EngineLimits m_limits;
     std::chrono::milliseconds m_idle_timeout;
-    std::string m_authority;
 
     asio::experimental::concurrent_channel<void(error_code)> m_notify;
     std::chrono::steady_clock::time_point m_deadline{};
 
     codec::HpackDecoder m_decoder; // connection-scoped: the dynamic table is shared
     std::unordered_map<std::uint32_t, Stream> m_streams;
-    // Mirror of m_streams.size() that is safe to read off-executor (reusable()
-    // runs on whatever thread drives the engine, m_streams only here). Kept in
-    // step at the four points the map changes: both try_emplace()s, erase_stream
-    // and run_loops' clear().
-    std::atomic<std::size_t> m_active_streams{0};
 
     std::string m_recv_buf;
     std::string m_out;
@@ -1560,12 +1490,7 @@ class Http2ClientSession final : public ClientSession,
     std::uint32_t m_peer_max_concurrent_streams{0}; // announced limit; uncontrolled until announced
     bool m_peer_max_concurrent_announced{false};    // the peer sent a SETTINGS_MAX_CONCURRENT_STREAMS
 
-    std::atomic<bool> m_alive{false};
-    // Set by a stream whose Request::close asked for the connection to end
-    // after that exchange; keeps the session out of the pool (see reusable()).
-    std::atomic<bool> m_close_requested{false};
     bool m_goaway_sent{false};
-    std::atomic<bool> m_goaway_received{false};
 };
 
 } // namespace simple_http::detail
