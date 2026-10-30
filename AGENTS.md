@@ -449,7 +449,9 @@ auto ws = co_await client.open_websocket("wss://host/chat", {.origin = "https://
   Domain/Path/Secure/Expires 过滤回放。`basic_auth` / `bearer_auth`。
 - **单连接模型**：一个 `Client` 对它的第一个 origin 只保持一条 TCP 连接（h1 FIFO 门
   `ExchangeGate`，h2 多路复用）；打到其它 origin 用一次性连接。门在交换完成时释放，
-  不依赖调用方何时丢弃 stream。
+  不依赖调用方何时丢弃 stream。连接是否需要门由 `ClientSession::multiplexes()` 决定，
+  不再用 `version()==…` 推断（h1→h2c 升级后报告后继的能力）。版本策略可按请求覆盖
+  （`RequestBuilder::version()` / `StreamSpec::version`），策略是连接键的一部分。
 - **HTTP/3**：设 `ClientConfig::default_version = HttpVersionPolicy::Http3`（URL 必须是
   `https://`；QUIC 自带 TLS 1.3），客户端对同一 origin 保持一条 QUIC 连接、在其上多路
   复用请求流（`Http3ClientSession`，`client/h3_client.h`）。只做显式启用——不做
@@ -461,7 +463,10 @@ auto ws = co_await client.open_websocket("wss://host/chat", {.origin = "https://
   参数：URL、可选钉住地址、可选 `h1|h2|h3`；h3 需要外网 UDP/443）。
 - **读写形状**：请求体 `write()`/`finish()`（h1 chunked / h2 DATA）；响应体 `read()` 返回
   `ReadResult`（data 或 eof），失败是 error_code（`RST_STREAM` → `stream_reset`，
-  中途断开 → `connection_reset`）。`read_head()` 幂等。
+  中途断开 → `connection_reset`）。`read_head()` 幂等。超时由 `detail::deadline`
+  取消正在等待的会话操作；h2/h3 的等待循环在看到 `operation_aborted` 时立即返回，
+  不会在 terminal 取消状态下自旋（`test/h3_client_cross.cpp` 的 `/stall`、
+  `/stall-body` 用例覆盖 head/body 两种预算）。
 - **重试**：**免费透明重拨一次**（kept 连接传输层失败）与**策略重试**（`ClientConfig::retry`，
   退避 + 条件回调，默认只重试 stream_refused/幂等方法/免费重拨后仍失败）；引擎 open 与
   便捷层读响应共享一个 retry budget，整个请求受 `request_timeout` 总 deadline 约束。

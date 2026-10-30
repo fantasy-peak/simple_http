@@ -100,6 +100,11 @@ struct StreamSpec {
     // Per-stream budgets. 0 = the Client's defaults.
     std::chrono::milliseconds response_head_timeout{};
     std::chrono::milliseconds body_idle_timeout{};
+    // Per-request version policy. Empty = the Client's default_version. Lets
+    // one Client speak h2 to one origin and h3 to another without giving up
+    // its single kept connection per origin (the policy is part of the
+    // connection key).
+    std::optional<HttpVersionPolicy> version{};
 };
 
 // --- the explicit, full-duplex stream (hyper/tokio model) ---------------------
@@ -376,6 +381,11 @@ class RequestBuilder {
         m_idle_timeout = idle;
         return *this;
     }
+    // Per-request version policy, overriding ClientConfig::default_version.
+    RequestBuilder &version(HttpVersionPolicy policy) {
+        m_version = policy;
+        return *this;
+    }
 
     // --- delivery ---
     // Buffered convenience: writes the collected body, reads the whole
@@ -424,6 +434,7 @@ class RequestBuilder {
     std::size_t m_max_body_bytes{0};
     std::chrono::milliseconds m_head_timeout{};
     std::chrono::milliseconds m_idle_timeout{};
+    std::optional<HttpVersionPolicy> m_version{};
     bool m_json_failed{false};
 };
 
@@ -469,9 +480,11 @@ class Client {
     // travels alongside for replay (Request::clone_for_replay), so 307/308
     // redirects can resend it. `url` overrides the Request's own target when
     // the request only carries an origin-form target.
+    // `version` overrides ClientConfig::default_version for this request (and
+    // every redirect hop it follows).
     [[nodiscard]] asio::awaitable<std::expected<Response, error_code>>
     send(std::shared_ptr<Request> request, std::string url = {}, std::size_t max_body_bytes = 0,
-         std::chrono::milliseconds timeout = {}) const {
+         std::chrono::milliseconds timeout = {}, std::optional<HttpVersionPolicy> version = std::nullopt) const {
         co_await hop(); // everything below (incl. the request's Body channel) runs on the pinned executor
         // A directly fed body lives in the Request's Body channel, not in
         // body_source(). The redirect/retry loop rebuilds each hop from the
@@ -509,7 +522,8 @@ class Client {
         if (!parsed)
             co_return std::unexpected{parsed.error()};
         target = parsed->to_target();
-        target.version = m_cfg.default_version;
+        const HttpVersionPolicy effective_version = version.value_or(m_cfg.default_version);
+        target.version = effective_version;
         target.h2c = m_cfg.default_h2c;
         url_target = request->target().empty() ? std::string{parsed->target} : std::string{request->target()};
         if (request->target().empty())
@@ -543,7 +557,7 @@ class Client {
         co_return co_await follow_redirects(m_impl, m_cfg, std::move(target), request->method(),
                                             std::string{request->method_token()}, std::move(headers),
                                             std::move(direct_body), request->close(), std::move(url_target), cap, limit,
-                                            m_cfg.max_redirects, std::move(current_url));
+                                            m_cfg.max_redirects, std::move(current_url), effective_version);
     }
 
     // --- explicit streaming (full-duplex) ---
@@ -562,6 +576,12 @@ class Client {
         if (spec.target.empty()) {
             spec.target = std::string{parsed->target};
         }
+        // A per-StreamSpec policy overrides the Client's default; the policy is
+        // part of the engine's connection key, so different policies to the
+        // same origin get separate kept connections.
+        detail::ClientTarget target = parsed->to_target();
+        target.version = spec.version.value_or(m_cfg.default_version);
+        target.h2c = m_cfg.default_h2c;
         auto inner = std::make_shared<Request>(Version::Http11, co_await asio::this_coro::executor);
         inner->set_method(spec.method);
         inner->set_target(std::move(spec.target));
@@ -571,15 +591,15 @@ class Client {
         }
         inner->set_close(spec.close);
         inner->set_stream_body(true); // the write end stays open on the Stream
-        auto stream = co_await engine->stream(std::move(url), std::move(inner));
-        if (!stream) {
-            co_return std::unexpected{stream.error()};
+        auto opened = co_await engine->open_stream(std::move(target), std::move(inner));
+        if (!opened) {
+            co_return std::unexpected{opened.error()};
         }
         const std::chrono::milliseconds head =
             spec.response_head_timeout.count() > 0 ? spec.response_head_timeout : m_cfg.response_head_timeout;
         const std::chrono::milliseconds idle =
             spec.body_idle_timeout.count() > 0 ? spec.body_idle_timeout : m_cfg.body_idle_timeout;
-        co_return Stream{std::move(*stream), head, idle};
+        co_return Stream{std::move(opened->stream), head, idle};
     }
 
     // --- WebSocket client (RFC 6455) ---
@@ -764,7 +784,7 @@ class Client {
     follow_redirects(std::shared_ptr<detail::ClientEngine> impl, const ClientConfig &cfg, detail::ClientTarget target,
                      Method method, std::string method_token, Headers headers, std::string body, bool close,
                      std::string url_target, std::size_t cap, std::chrono::milliseconds limit, std::size_t remaining,
-                     std::string current_url) {
+                     std::string current_url, HttpVersionPolicy version) {
         // Saved before target is moved into the exchange: the next hop's origin
         // comparison needs the current authority.
         const std::string current_host = target.host;
@@ -805,7 +825,7 @@ class Client {
         if (!location || location->empty())
             co_return response;
 
-        auto hop = resolve_redirect(current_url, cfg.default_version, cfg.default_h2c, url_target, *location);
+        auto hop = resolve_redirect(current_url, version, cfg.default_h2c, url_target, *location);
         if (!hop)
             co_return std::unexpected{hop.error()};
 
@@ -842,9 +862,9 @@ class Client {
         // The next hop's origin-form target supersedes the old one; exchange_once
         // only fills an empty one.
         url_target = hop->url_target;
-        co_return co_await follow_redirects(std::move(impl), cfg, std::move(hop->target), method,
-                                            std::move(method_token), std::move(headers), std::move(body), close,
-                                            std::move(url_target), cap, limit, remaining - 1, std::move(hop->url));
+        co_return co_await follow_redirects(
+            std::move(impl), cfg, std::move(hop->target), method, std::move(method_token), std::move(headers),
+            std::move(body), close, std::move(url_target), cap, limit, remaining - 1, std::move(hop->url), version);
     }
 
     // Reads the response of one exchange: head, then whole body, both under the
@@ -955,7 +975,8 @@ inline asio::awaitable<std::expected<Stream, error_code>> RequestBuilder::send_s
                                                                      /*expect_100_continue=*/false,
                                                                      /*close=*/false,
                                                                      m_head_timeout,
-                                                                     m_idle_timeout});
+                                                                     m_idle_timeout,
+                                                                     m_version});
 }
 
 inline asio::awaitable<std::expected<Response, error_code>> RequestBuilder::send() const {
@@ -976,7 +997,7 @@ inline asio::awaitable<std::expected<Response, error_code>> RequestBuilder::send
         request->set_body(m_body);
     }
 
-    co_return co_await m_client->send(std::move(request), url, m_max_body_bytes, m_head_timeout);
+    co_return co_await m_client->send(std::move(request), url, m_max_body_bytes, m_head_timeout, m_version);
 }
 
 } // namespace simple_http

@@ -171,6 +171,48 @@ int main(int argc, char **argv) {
                 }
             }
 
+            // --- deadlines cancel the exchange (and must not spin) --------
+            {
+                auto stall = co_await client.open_stream(
+                    base + "/stall", StreamSpec{.response_head_timeout = std::chrono::milliseconds(500)});
+                check(stall.has_value(),
+                      stall ? "a stalled head opens" : "a stalled head opens: " + describe(stall.error()));
+                if (stall) {
+                    const auto began = std::chrono::steady_clock::now();
+                    auto head = co_await stall->read_head();
+                    const auto elapsed =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - began);
+                    check(!head && head.error() == client_errc::response_head_timeout,
+                          "a silent response head hits response_head_timeout");
+                    check(elapsed < std::chrono::milliseconds(3000),
+                          "the head deadline is prompt (" + std::to_string(elapsed.count()) + "ms)");
+                    (void)co_await stall->abort();
+                }
+            }
+            {
+                auto stall = co_await client.open_stream(
+                    base + "/stall-body", StreamSpec{.body_idle_timeout = std::chrono::milliseconds(500)});
+                check(stall.has_value(),
+                      stall ? "a stalled body opens" : "a stalled body opens: " + describe(stall.error()));
+                if (stall) {
+                    auto head = co_await stall->read_head();
+                    check(head && head->status == 200, "the stalled body's head arrives");
+                    const auto began = std::chrono::steady_clock::now();
+                    auto chunk = co_await stall->read();
+                    const auto elapsed =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - began);
+                    check(!chunk && chunk.error() == client_errc::body_idle_timeout,
+                          "a silent body hits body_idle_timeout");
+                    check(elapsed < std::chrono::milliseconds(3000),
+                          "the body-idle deadline is prompt (" + std::to_string(elapsed.count()) + "ms)");
+                    (void)co_await stall->abort();
+                }
+            }
+            {
+                auto after = co_await client.get(base + "/hello").send();
+                check(after && after->status() == 200, "the QUIC connection still works after deadline cancellations");
+            }
+
             // --- h3 requires https ----------------------------------------
             {
                 auto bad = co_await client.get("http://127.0.0.1:" + port + "/hello").send();

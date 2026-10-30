@@ -429,6 +429,8 @@ class Http3ClientSession final : public ClientSession,
 
     bool keepable() const override { return m_alive && !m_goaway_received && !m_close_requested; }
 
+    bool multiplexes() const override { return true; }
+
     Version version() const override { return Version::Http3; }
 
     std::string_view authority() const override { return m_authority; }
@@ -505,7 +507,12 @@ class Http3ClientSession final : public ClientSession,
 
             auto wake = st.in_space;
             auto [ec] = co_await wake->async_receive(asio::as_tuple(asio::use_awaitable));
-            (void)ec; // the channel closing is just another reason to re-check state
+            // A wake (state change) arrives with no error. Anything else is a
+            // cancelled/failed wait — typically the caller's deadline cancelling
+            // this coroutine — and re-waiting would spin under terminal
+            // cancellation, so report it.
+            if (ec)
+                co_return ec;
         }
     }
 
@@ -556,7 +563,8 @@ class Http3ClientSession final : public ClientSession,
 
             auto wake = st.in_space;
             auto [ec] = co_await wake->async_receive(asio::as_tuple(asio::use_awaitable));
-            (void)ec;
+            if (ec)
+                co_return std::unexpected{ec};
         }
     }
 
@@ -1226,7 +1234,8 @@ class Http3ClientSession final : public ClientSession,
                 co_return error_code{};
             auto space = st.out_space;
             auto [ec] = co_await space->async_receive(asio::as_tuple(asio::use_awaitable));
-            (void)ec;
+            if (ec)
+                co_return ec;
         }
     }
 

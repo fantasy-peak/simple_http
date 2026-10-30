@@ -205,6 +205,12 @@ class Http1ClientSession final : public ClientSession,
     // from a completed one.
     std::shared_ptr<std::atomic<bool>> exchange_done_flag() const override { return m_current_done; }
 
+    bool multiplexes() const override {
+        if (auto successor = m_successor.load().lock())
+            return successor->multiplexes();
+        return false;
+    }
+
     Version version() const override {
         if (auto successor = m_successor.load().lock())
             return successor->version();

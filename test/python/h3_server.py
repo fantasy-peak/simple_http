@@ -16,6 +16,8 @@ Routes:
     *    /echo       -> 200, the request body echoed; X-Method header
     POST /expect     -> a 100-continue interim, then echoes the body
     GET  /trailers   -> 200 "trailer body" followed by an X-Checksum trailer
+    GET  /stall      -> never answers (response-head deadline)
+    GET  /stall-body -> a head, then silence forever (body-idle deadline)
     HEAD anywhere    -> the headers a GET would return, no body
     anything else    -> 404 "not found"
 """
@@ -67,9 +69,23 @@ class H3ServerProtocol(QuicConnectionProtocol):
             }
             # /expect advertises 100-continue before the body arrives, so the
             # client's interim-head path has something to parse.
-            if headers.get(":path") == "/expect" and not event.stream_ended:
+            path = headers.get(":path")
+            if path == "/expect" and not event.stream_ended:
                 assert self._http is not None
                 self._http.send_headers(event.stream_id, [(b":status", b"100")], end_stream=False)
+                self.transmit()
+                return
+            # Deadline tests: /stall never answers at all (head timeout);
+            # /stall-body sends a head and then goes silent (body-idle timeout).
+            if path == "/stall":
+                return
+            if path == "/stall-body":
+                assert self._http is not None
+                self._http.send_headers(
+                    event.stream_id,
+                    [(b":status", b"200"), (b"content-type", b"text/plain"), (b"content-length", b"100")],
+                    end_stream=False,
+                )
                 self.transmit()
                 return
             if event.stream_ended:

@@ -671,6 +671,27 @@ asio::awaitable<void> suite_protocol_matrix(std::uint16_t plain, std::uint16_t t
         auto r = co_await fetch(http, http.get(url(plain, "/world")));
         check(r && r->version == sh::Version::Http11, "Auto with H2cMode::Off stays HTTP/1.1");
     }
+    {
+        // Per-request policy: the client default stays Auto, but one request can
+        // pin HTTP/1.1 (and so gets its own kept connection, because the policy
+        // is part of the connection key).
+        h::Client http{co_await asio::this_coro::executor, base_config()};
+        auto auto_r = co_await fetch(http, http.get(url(plain, "/world")));
+        check(auto_r && auto_r->version == sh::Version::Http2, "the default Auto still negotiates h2c");
+        auto h1_r = co_await fetch(http, http.get(url(plain, "/world")).version(sh::HttpVersionPolicy::Http11));
+        check(h1_r && h1_r->version == sh::Version::Http11 && h1_r->body == "hello from HTTP/1.1",
+              "a per-request Http11 policy overrides the client default");
+        auto stream =
+            co_await http.open_stream(url(plain, "/world"), sh::StreamSpec{.version = sh::HttpVersionPolicy::Http11});
+        check(stream.has_value(), stream ? "per-request policy on the stream path opens"
+                                         : "per-request policy on the stream path opens: " + describe(stream.error()));
+        if (stream) {
+            check(stream->version() == sh::Version::Http11, "the explicit stream honours the per-request policy");
+            check(!co_await stream->finish(), "finish the per-request stream");
+            auto body = co_await stream->read_all();
+            check(body && *body == "hello from HTTP/1.1", "the per-request stream body is correct");
+        }
+    }
     co_return;
 }
 

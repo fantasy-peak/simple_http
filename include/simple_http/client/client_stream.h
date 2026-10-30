@@ -313,6 +313,12 @@ class ClientSession {
     // close-requested one must be dropped and re-dialed. Read from foreign
     // threads (shared Client), so its inputs are atomics.
     virtual bool keepable() const = 0;
+    // True when one connection can serve several exchanges at the same time.
+    // The engine uses this capability — not `version() == …` — to decide
+    // whether an exchange must take the HTTP/1.1 one-exchange gate. An
+    // HTTP/1.1 session that completed an h2c upgrade reports the successor's
+    // capability (true) here.
+    virtual bool multiplexes() const = 0;
     virtual Version version() const = 0;
     // "host:port" this session is connected to, for diagnostics.
     virtual std::string_view authority() const = 0;

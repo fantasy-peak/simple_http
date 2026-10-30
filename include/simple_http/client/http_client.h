@@ -553,12 +553,15 @@ class ClientEngine {
             // HTTP/1.1: one exchange on the *kept* connection at a time — wait
             // for it. A throwaway (other-origin) exchange runs on its own
             // connection and never touches the gate.
-            // HTTP/1.1 is the only version with the one-exchange gate; h2 and
-            // h3 both multiplex (h3 used to fall into the h1 branch here).
-            const bool h1 = session->version() == Version::Http11;
+            // Only a connection that cannot multiplex needs the one-exchange
+            // gate. Ask the session for that capability rather than comparing
+            // versions: an h1 session that upgraded to h2c reports the
+            // successor's capability, and a future version cannot silently
+            // fall into the wrong branch.
+            const bool gated = !session->multiplexes();
             const bool keep_exchange = session == m_session && origin == m_origin;
             std::shared_ptr<void> gate_token;
-            if (h1 && keep_exchange) {
+            if (gated && keep_exchange) {
                 gate_token = co_await m_h1_gate->acquire();
                 // The gate is handed back exactly when this exchange completes —
                 // the session's exchange-done hook, re-armed per attempt with
@@ -572,14 +575,14 @@ class ClientEngine {
                 auto stream = maybe_decompressing_stream(*usable, m_config.auto_decompress);
                 stream->set_gate_token(gate_token);
                 if (keep_exchange) {
-                    if (h1) {
+                    if (gated) {
                         // A successful upgrade made the connection HTTP/2: the
                         // gate is no longer used. Otherwise, only drop the
                         // connection if the request asked to close (or the body
                         // did not end at a boundary) when the caller is done with
                         // the stream; the gate itself frees via the exchange-done
                         // hook above.
-                        if (stream->version() == Version::Http2)
+                        if (session->multiplexes())
                             m_h1_gate->release(gate_token);
                         else
                             stream->set_on_destroy([ex = m_executor, gate = m_h1_gate, token = gate_token,
@@ -621,7 +624,7 @@ class ClientEngine {
             }
 
             const error_code ec = usable.error();
-            if (h1 && keep_exchange && gate_token)
+            if (gated && keep_exchange && gate_token)
                 m_h1_gate->release(gate_token);
 
             // A throwaway connection (not the kept one) is discarded on any

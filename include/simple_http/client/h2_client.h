@@ -314,6 +314,8 @@ class Http2ClientSession final : public ClientSession,
     // never a reason to dial a fresh one.
     bool keepable() const override { return m_alive && !m_goaway_received && !m_close_requested; }
 
+    bool multiplexes() const override { return true; }
+
     Version version() const override { return Version::Http2; }
 
     std::string_view authority() const override { return m_authority; }
@@ -490,9 +492,12 @@ class Http2ClientSession final : public ClientSession,
             auto outcome = st.outcome;
             auto [ec] = co_await notify->async_receive(asio::as_tuple(asio::use_awaitable));
             if (ec) {
-                // The channel was closed by teardown. Loop so the queue is
-                // drained before the terminal outcome is reported; the next
-                // pass observes a terminal state and cannot wait again.
+                // A cancelled wait (the caller's deadline) must stop here:
+                // re-waiting under terminal cancellation would spin. A closed
+                // channel is teardown, where looping drains the queue before
+                // the terminal outcome is reported.
+                if (ec == asio::error::operation_aborted)
+                    co_return std::unexpected{ec};
                 continue;
             }
         }

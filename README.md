@@ -262,7 +262,11 @@ so a retiring thread drains its context before destroying it.
 HTTP/3 is explicit rather than discovered: build the client with
 `ClientConfig{.default_version = HttpVersionPolicy::Http3}` and use an
 `https://` URL (QUIC carries TLS 1.3 itself; `http://` is refused with
-`version_not_negotiated`). Everything above — the builder, `send()`,
+`version_not_negotiated`). A single request can override the client default —
+`client.get(url).version(HttpVersionPolicy::Http2).send()`, or
+`StreamSpec{.version = …}` on the explicit stream path; the policy is part of
+the connection key, so one Client can keep separate connections to the same
+origin for different policies. Everything above — the builder, `send()`,
 `open_stream()`, redirects, cookies, decompression — works unchanged; request
 streams multiplex over one QUIC connection per origin, and response trailers
 reach `Stream::trailers()`. The same `TlsClientConfig` (CA bundle, name
