@@ -61,11 +61,14 @@ inline void wake(const Signal &signal) noexcept {
 // and it also bounds how much of the queue one write loop pass can visit.
 inline constexpr std::size_t kMaxBodyPerRead = 32 * 1024;
 
-// Outbound backpressure watermarks, matching the h2 engine's and the previous
-// QUIC stack's. The measured quantity is *unacknowledged* bytes, so this bounds
-// per-stream memory to roughly the high mark however fast the handler produces.
-inline constexpr std::uint64_t kOutHighWatermark = 1u << 20;  // 1 MiB
-inline constexpr std::uint64_t kOutLowWatermark = 256u << 10; // 256 KiB
+// Outbound backpressure watermarks, matching the h2 engine's. The measured
+// quantity is `out_bytes`: everything enqueued and not yet acknowledged, which
+// includes data nghttp3 has not pulled because the peer's flow-control window
+// is full. That backlog is the one that can grow; an earlier version measured
+// only `out_write - out_ack`, leaving it unbounded (a 40 MiB download queued
+// 33 MiB of chunks while under 4 KiB was in flight).
+inline constexpr std::uint64_t kOutHighWatermark = 1u << 20;  // 1 MiB: park the producer
+inline constexpr std::uint64_t kOutLowWatermark = 256u << 10; // 256 KiB: wake it again
 
 struct H3Stream {
     std::int64_t id{-1};

@@ -439,14 +439,21 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         m_conn->flush();
     }
 
-    // Wait until this stream's unacknowledged bytes fall to the low mark.
+    // Wait until this stream's queued body falls back under the high mark.
     asio::awaitable<error_code> await_out_space(std::int64_t stream_id) {
         for (;;) {
             auto it = m_streams.find(stream_id);
             if (it == m_streams.end())
                 co_return make_error_code(asio::error::operation_aborted);
             Stream &stream = *it->second;
-            if (stream.out_write - stream.out_ack <= h3::kOutLowWatermark)
+            // The quantity that bounds memory is out_bytes: everything enqueued
+            // and not yet acknowledged - which includes bytes nghttp3 has *not
+            // pulled* because the peer's stream or connection window is full.
+            // Measuring only `out_write - out_ack` (handed over but
+            // unacknowledged) missed that backlog entirely: a 40 MiB download
+            // queued 33 MiB of chunks with under 4 KiB "in flight", so
+            // per-stream memory tracked the response size.
+            if (stream.out_bytes <= h3::kOutHighWatermark)
                 co_return error_code{};
             if (!stream.out_space)
                 stream.out_space = std::make_shared<Channel>(m_executor, 1);
@@ -937,8 +944,11 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
             stream.out_bytes -= stream.out_q.front().size();
             stream.out_q.pop_front();
         }
-        // Unpark a producer waiting on backpressure.
-        h3::wake(stream.out_space);
+        // Unpark a producer waiting on backpressure once the queue is back under
+        // the low mark. Waking on every ack while it is still above the high
+        // mark would only resume and re-park it once per packet.
+        if (stream.out_bytes <= kOutLowWatermark)
+            h3::wake(stream.out_space);
     }
 
     void on_stop_sending(std::int64_t stream_id, std::uint64_t app_error_code) noexcept override {
