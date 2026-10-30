@@ -95,6 +95,18 @@ inline constexpr std::size_t kH2MaxFrameSize = 16384;
 inline constexpr std::size_t kOutHighWatermark = 1u << 20;  // 1 MiB: park the producer
 inline constexpr std::size_t kOutLowWatermark = 256u << 10; // 256 KiB: wake it again
 
+// Minimum consumed prefix (in queue entries) before a vector-backed queue
+// compacts. Advancing a read cursor is not enough on its own: a queue that is
+// continuously refilled - any streaming response - never drains completely, so
+// the cursor never reaches the end and `clear()` never runs. Every chunk string
+// ever enqueued then stays alive until the response ends. Measured on the
+// XHTTP/HTTP2 video path: a 40 MiB response kept ~38 MiB of 64 KiB strings
+// resident even though the flow-control watermarks held the *unframed* queue at
+// 1 MiB. Compaction destroys the consumed prefix; the fraction below keeps the
+// cost amortized O(1) per pop while bounding the retained prefix.
+inline constexpr std::size_t kQueueCompactFloor = 8;
+inline constexpr std::size_t kQueueCompactDivisor = 3;
+
 // Upper bound on how many bytes of DATA one fill_data_frames() pass may frame
 // into the connection's output buffer (m_out). Without it, m_out grows to the
 // peer's whole flow-control window: a client that advertises a 4 MiB window
@@ -594,8 +606,10 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         // chunk has already been framed (so partial sends need no substr copy).
         // A vector with a read cursor, not a deque: a default-constructed
         // std::deque allocates its block map, and every stream paid that (plus
-        // paused_frames') for the life of the request. The cursor resets when
-        // the queue empties, so the capacity is reused.
+        // paused_frames') for the life of the request. Entries left of the
+        // cursor are destroyed by compaction (see kQueueCompactFloor) - without
+        // it a refilled queue never empties and every chunk string ever queued
+        // stayed resident until the stream ended.
         std::vector<std::string> out_queue;
         std::size_t out_head = 0;
         bool out_empty() const { return out_head >= out_queue.size(); }
@@ -604,6 +618,11 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         void out_pop_front() {
             if (++out_head >= out_queue.size()) {
                 out_queue.clear();
+                out_head = 0;
+                return;
+            }
+            if (out_head >= kQueueCompactFloor && out_head * kQueueCompactDivisor >= out_queue.size()) {
+                out_queue.erase(out_queue.begin(), out_queue.begin() + static_cast<std::ptrdiff_t>(out_head));
                 out_head = 0;
             }
         }
@@ -665,6 +684,14 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         void paused_pop_front() {
             if (++paused_head >= paused_frames.size()) {
                 paused_frames.clear();
+                paused_head = 0;
+                return;
+            }
+            // Same reason as out_pop_front(): drop the consumed prefix instead
+            // of pinning it until the whole queue happens to drain.
+            if (paused_head >= kQueueCompactFloor && paused_head * kQueueCompactDivisor >= paused_frames.size()) {
+                paused_frames.erase(paused_frames.begin(),
+                                    paused_frames.begin() + static_cast<std::ptrdiff_t>(paused_head));
                 paused_head = 0;
             }
         }
