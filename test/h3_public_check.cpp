@@ -1,13 +1,15 @@
-// A manual smoke test for the HTTP/3 client against a real, public origin.
+// A manual smoke test for the client against a real, public origin.
 //
 //   xmake build h3_public_check
 //   xmake run h3_public_check -- https://cloudflare-quic.com/
-//   xmake run h3_public_check -- https://www.cloudflare.com/
 //   xmake run h3_public_check -- https://www.cloudflare.com/ 104.16.124.96
+//   xmake run h3_public_check -- https://www.cloudflare.com/ "" h2
+//   xmake run h3_public_check -- https://www.google.com/ 127.0.0.1 h1
 //
-// The optional second argument pins name resolution to one address while the
-// URL (and therefore SNI / :authority / certificate checks) stays the host's —
-// useful when a broken IPv6 route would otherwise win the happy-eyeballs race.
+// Arguments: URL, optional pinned address ("" to resolve normally), optional
+// "h1" | "h2" | "h3" (default h3). Pinning keeps the URL's SNI / :authority /
+// certificate checks while dialing one address — useful for a broken IPv6 route,
+// or to point the client at a local proxy relay.
 //
 // It uses the system CA bundle and normal host-name verification, exactly like a
 // deployed client, and prints what came back. Public network reachability is a
@@ -32,6 +34,16 @@ int main(int argc, char **argv) {
     const std::string url = argc > 1 ? argv[1] : "https://cloudflare-quic.com/";
     // Optional: pin resolution to one address (SNI/authority stay the URL's).
     const std::string pinned_ip = argc > 2 ? argv[2] : "";
+    const std::string policy_arg = argc > 3 ? argv[3] : "h3";
+    HttpVersionPolicy policy = HttpVersionPolicy::Http3;
+    if (policy_arg == "h1" || policy_arg == "http/1.1")
+        policy = HttpVersionPolicy::Http11;
+    else if (policy_arg == "h2" || policy_arg == "http/2")
+        policy = HttpVersionPolicy::Http2;
+    else if (policy_arg != "h3" && policy_arg != "http/3") {
+        std::fprintf(stderr, "unknown version '%s' (expected h1|h2|h3)\n", policy_arg.c_str());
+        return 2;
+    }
     asio::io_context ctx;
 
     int exit_code = 1;
@@ -39,7 +51,7 @@ int main(int argc, char **argv) {
         ctx,
         [&]() -> asio::awaitable<void> {
             ClientConfig cfg;
-            cfg.default_version = HttpVersionPolicy::Http3;
+            cfg.default_version = policy;
             cfg.connect_timeout = std::chrono::seconds(10);
             cfg.request_timeout = std::chrono::seconds(60);
             cfg.response_head_timeout = std::chrono::seconds(10);

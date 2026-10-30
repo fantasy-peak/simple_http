@@ -386,9 +386,10 @@ target("h3_client_cross")
     set_rundir(".")
 target_end()
 
--- Manual smoke test: fetch a real public HTTP/3 origin with the system CA
+-- Manual smoke test: fetch a real public origin (h1/h2/h3) with the system CA
 -- store. The network is the machine's, so this is not part of the suites.
 --   xmake run h3_public_check -- https://cloudflare-quic.com/
+--   xmake run h3_public_check -- https://www.google.com/ 127.0.0.1 h2
 target("h3_public_check")
     set_kind("binary")
     set_default(false)

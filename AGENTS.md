@@ -456,8 +456,9 @@ auto ws = co_await client.open_websocket("wss://host/chat", {.origin = "https://
   Alt-Svc/HTTPS RR 自动发现、0-RTT 或 h3 WebSocket；未定义
   `SIMPLE_HTTP_ENABLE_HTTP3` 时该策略在拨号处返回 `version_not_negotiated`。
   验证：`test/python/h3_server.py`（aioquic）+ `test/h3_client_cross.cpp`；
-  公网冒烟用手工工具 `test/h3_public_check.cpp`
-  （`xmake run h3_public_check -- https://cloudflare-quic.com/`，需要外网 UDP/443）。
+  公网冒烟用手工工具 `test/h3_public_check.cpp`，可指定 h1/h2/h3
+  （`xmake run h3_public_check -- https://cloudflare-quic.com/ "" h3`；
+  参数：URL、可选钉住地址、可选 `h1|h2|h3`；h3 需要外网 UDP/443）。
 - **读写形状**：请求体 `write()`/`finish()`（h1 chunked / h2 DATA）；响应体 `read()` 返回
   `ReadResult`（data 或 eof），失败是 error_code（`RST_STREAM` → `stream_reset`，
   中途断开 → `connection_reset`）。`read_head()` 幂等。
