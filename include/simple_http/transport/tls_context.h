@@ -22,7 +22,8 @@
 #include <vector>
 
 #include "../core/logging.h"
-#include "../core/types.h" // error_code: used below, and this header must stand alone
+#include "../core/tls_version.h" // TlsMinVersion
+#include "../core/types.h"       // error_code: used below, and this header must stand alone
 
 namespace simple_http {
 
@@ -34,6 +35,9 @@ struct TlsConfig {
     bool mutual = false;                             // require & verify a client certificate
     std::optional<std::string> ca_file;              // CA bundle for mutual TLS (else system defaults)
     std::function<void(asio::ssl::context &)> setup; // optional customization hook
+    // Lowest accepted TLS version. Default 1.3; set Tls12 to also accept TLS 1.2
+    // (for clients that have not moved to 1.3). TLS 1.0/1.1 are never accepted.
+    TlsMinVersion min_version{TlsMinVersion::Tls13};
 };
 
 // The ALPN protocol list a TCP-TLS listener advertises, in TLS wire format
@@ -71,7 +75,14 @@ class TlsContext {
     // (`TlsHttp`) is translated here, so a listener configured as
     // HTTP/1.1-only really offers http/1.1 and no h2.
     explicit TlsContext(const TlsConfig &cfg, std::span<const std::string_view> alpn = {})
-        : m_ctx(asio::ssl::context::tlsv13_server) {
+        : m_ctx(cfg.min_version == TlsMinVersion::Tls13 ? asio::ssl::context::tlsv13_server
+                                                        : asio::ssl::context::tls_server) {
+        if (cfg.min_version == TlsMinVersion::Tls12) {
+            // tls_server spans 1.2/1.3; pin the floor so 1.0/1.1 remain off.
+            if (SSL_CTX_set_min_proto_version(m_ctx.native_handle(), TLS1_2_VERSION) != 1) {
+                throw std::runtime_error("TLS: cannot set the minimum protocol version to 1.2");
+            }
+        }
         configure(cfg, alpn);
     }
 
@@ -91,12 +102,10 @@ class TlsContext {
             throw std::runtime_error(std::format("TLS private key not found: {}", cfg.private_key_file));
         }
 
-        // TLS 1.3 only, expressed by the context flavour rather than by stacking
-        // no_tlsv1* option flags. `tlsv13_server` pins both bounds, which is the
-        // entire policy — and there is deliberately no knob to lower it: the
-        // previous one could not actually re-enable TLS 1.2 (removing an option
-        // flag re-enables nothing once the flavour has pinned the version), so it
-        // only ever produced silent handshake failures.
+        // Version policy is expressed by the context flavour chosen in the
+        // constructor: tlsv13_server for the default (TLS 1.3 only), or
+        // tls_server with a 1.2 floor when TlsConfig::min_version is Tls12.
+        // 1.0/1.1 are never accepted either way.
         m_ctx.set_options(asio::ssl::context::default_workarounds);
 
         // The hook customizes the context; it does not get to replace the

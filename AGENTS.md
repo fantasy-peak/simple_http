@@ -35,6 +35,7 @@ include/
     core/                  协议无关基础设施
       version.h            Version 枚举 (Http1/Http11/Http2/Http3)
       types.h              error_code、Version、WriteMode、StreamStatus、Eof/Rst/Disconnect
+      tls_version.h        TlsMinVersion（服务端默认 1.3；客户端默认 1.2，两端共用）
       http_method.h        Method 枚举
       http_status.h        状态码常量 + reason_phrase
       logging.h            日志 facade（LogSink / set_log_sink / make_stdout_sink / SIMPLE_HTTP_*_LOG）
@@ -67,7 +68,8 @@ include/
     transport/             字节流传输抽象
       transport.h          Transport concept + SslHandle
       tcp_transport.h      TcpStreamTransport（裸 TCP；async_write_seq 零拷贝 scatter-gather）
-      tls_context.h        TlsContext / TlsConfig（OpenSSL + ALPN）
+      tls_context.h        TlsContext / TlsConfig（OpenSSL + ALPN；默认 TLS 1.3，
+                           min_version=Tls12 可同时接受 1.2）
       tls_transport.h      TlsStreamTransport（ssl::stream）
     engine/                各版本协议引擎（实现 ResponseWriter）
       dispatcher.h         Dispatcher / WsLookup / WsHandlerFn 类型（引擎↔handler 的窄接缝）；
@@ -246,6 +248,8 @@ cfg.listen = InetAddress{"0.0.0.0", 7788, false};  // Listen = variant<InetAddre
 cfg.worker_threads = 4;
 // cfg.tls = TlsConfig{ .cert_chain_file=..., .private_key_file=...,
 //                      .mutual=true, .ca_file=... };  // 可选 TLS/mTLS
+// TLS 默认 1.3-only（tlsv13_server）；需要接受 1.2 时显式
+//   .min_version = TlsMinVersion::Tls12   // tls_server + TLS1.2 下界；1.0/1.1 永不允许
 // cfg.limits = EngineLimits{...};                     // 可选引擎调参
 // cfg.max_connections = 0;                            // 0=不限；到上限由内核 backlog 排队（Go netutil.LimitListener 形态）
 // cfg.reuse_port = true;  // 默认 true（明文/TLS/QUIC 共用；false = 独占端口）
@@ -660,6 +664,8 @@ test/conformance/run.sh h2spec   # 只跑指定的（h2spec / h1spec / autobahn 
 - **客户端 → 独立服务端**
   - `test/python/run_client_cross.py`：stdlib `http.server` / `websockets` / `aioquic` 驱动 C++ 客户端，43 + 6 checks（h1/WS/h3、超时、取消、复用）。
   - Go `net/http`：明文 h1 与 **TLS + h2**。`loadgen https://host/path -p h2 -B 0` 打 Go `ListenAndServeTLS`（默认 ALPN 协商 h2）。测试 CA 签发带 `IP:127.0.0.1` SAN 的证书，客户端 `SSL_CERT_FILE=test/tls_certificates/ca_cert.pem` 信任；本库 TLS 监听默认 ALPN 为 h2 + http/1.1。
+  - **TLS 矩阵**（openssl s_client + httpx，对 Go TLS 监听）：TLS 1.3/1.2、ALPN（h2 / http/1.1 / 无）、mTLS（缺证书、不可信证书、正确证书）、未知 SNI、h1-over-TLS、h2-over-TLS。本库默认 1.3-only，Go 允许 1.2，属策略差异；`TlsConfig::min_version=Tls12` 后可对齐。
+  - **HTTP/3**（aioquic 独立客户端对 quic-go 参考服务端）：GET/POST、204、404、响应 trailer；另跑 h3spec（基线 49 例 ≥47，2 个已知 TLS 8.2 假阳性）与 3% 丢包下的恢复（tc netem，单连接 200 请求全成）。
 
 **差分比对（与开源实现对照）**
 

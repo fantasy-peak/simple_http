@@ -125,6 +125,26 @@ int main() {
         return 1;
     }
     std::println("middleware server on 127.0.0.1:7796");
+
+    // Opt-in TLS 1.2: the default server policy is TLS 1.3 only; this listener
+    // explicitly lowers the floor, which is what TlsConfig::min_version is for.
+    ServerConfig tls12_cfg;
+    tls12_cfg.listen = InetAddress{"127.0.0.1", 7797, false};
+    tls12_cfg.tls = TlsConfig{
+        .cert_chain_file = "./test/tls_certificates/server_cert.pem",
+        .private_key_file = "./test/tls_certificates/server_key.pem",
+        .min_version = TlsMinVersion::Tls12,
+    };
+    Server tls12_server{tls12_cfg};
+    tls12_server.route(any_methods, "/world", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(200).content_type("text/plain").send(std::string(1024, 'a'));
+    });
+    if (auto started = tls12_server.start(); !started) {
+        std::println(std::cerr, "TLS1.2 listener failed to start");
+        return 1;
+    }
+    std::println("TLS1.2-enabled server on 127.0.0.1:7797");
+
     for (;;) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }

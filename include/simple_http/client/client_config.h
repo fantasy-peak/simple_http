@@ -29,7 +29,8 @@
 
 #include "../core/http_method.h" // RetryPolicy::condition names Method
 #include "../core/limits.h"
-#include "../core/resolve.h" // ResolveFn (shared with the WebSocket proxy)
+#include "../core/resolve.h"     // ResolveFn (shared with the WebSocket proxy)
+#include "../core/tls_version.h" // TlsMinVersion (shared with the server)
 #include "../core/types.h"
 
 namespace simple_http {
@@ -76,12 +77,8 @@ enum class H2cMode : std::uint8_t {
     Off = 2,
 };
 
-// Minimum accepted TLS version. Defaults to 1.2 — unlike the server, which pins
-// 1.3, a client still has to reach peers that have not moved to 1.3.
-enum class TlsMinVersion : std::uint8_t {
-    Tls12 = 0,
-    Tls13 = 1,
-};
+// TlsMinVersion lives in core/tls_version.h so the server's TlsConfig can share
+// it. The client's default is 1.2; the server's default is 1.3 (see TlsConfig).
 
 // Configurable request retry. Off by default: a `Client` still replays a
 // request once when its kept connection turned out stale (a transport loss on
