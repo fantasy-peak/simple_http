@@ -176,7 +176,12 @@ inline error_code apply_client_ssl_settings(SSL *ssl, const ClientTlsHandshake &
 // (optionally) host-name verification are set here, then asio's client
 // handshake runs. Returns the transport's error_code; a verification failure
 // arrives as its own error (e.g. asio::error::certificate_verify_failed).
-inline asio::awaitable<error_code> tls_client_handshake(TlsStreamTransport &transport, const ClientTlsHandshake &hs) {
+//
+// Templated on the transport, not hard-coded to TlsStreamTransport: an HTTPS
+// proxy needs a second TLS layer for the origin (NestedTlsTransport), and the
+// handshake is identical there.
+template <typename Transport>
+asio::awaitable<error_code> tls_client_handshake(Transport &transport, const ClientTlsHandshake &hs) {
     SSL *ssl = transport.stream().native_handle();
 
     if (error_code ec = apply_client_ssl_settings(ssl, hs))

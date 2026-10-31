@@ -77,7 +77,8 @@ int main(int argc, char **argv) {
             // Redirect following: 302 → /hello. Convenience layer follows by
             // default only when max_redirects > 0 — set it.
             {
-                Client following{co_await asio::this_coro::executor, ClientConfig{.max_redirects = 5}};
+                Client following{co_await asio::this_coro::executor,
+                                 ClientConfig{.proxy_from_env = false, .max_redirects = 5}};
                 auto redir = co_await following.get(base + "/redirect").send();
                 check(redir && redir->status() == 200, "a 302 redirect is followed");
                 if (redir) {
@@ -91,7 +92,8 @@ int main(int argc, char **argv) {
             // Cookies: the jar stores the Set-Cookie and replays it.
             {
                 auto jar = std::make_shared<CookieJar>();
-                Client with_jar{co_await asio::this_coro::executor, ClientConfig{.cookie_jar = jar}};
+                Client with_jar{co_await asio::this_coro::executor,
+                                ClientConfig{.proxy_from_env = false, .cookie_jar = jar}};
                 auto c = co_await with_jar.get(base + "/set-cookie").send();
                 check(c && c->status() == 200 && jar->size() == 1, "Set-Cookie is stored in the jar");
             }

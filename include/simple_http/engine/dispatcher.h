@@ -176,6 +176,12 @@ struct HttpProxyTarget {
     std::size_t max_attempts{3};
 
     HttpProxyHooks hooks;
+
+    // Let the upstream Client honor HTTP_PROXY / HTTPS_PROXY / ALL_PROXY. Off by
+    // default: a server's ambient proxy environment must not reroute its
+    // backends (usually loopback or private addresses). A ClientConfig::proxy
+    // set on the route applies regardless of this flag.
+    bool use_env_proxy{false};
 };
 
 // Looks up an HTTP proxy backend for a request path; empty if the path is not a

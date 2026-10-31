@@ -482,6 +482,7 @@ int main(int argc, char **argv) {
     std::vector<ThreadState> states(opts.threads);
     for (auto &ts : states) {
         sh::ClientConfig cfg;
+        cfg.proxy_from_env = false; // hermetic: the load generator must not follow ambient HTTP_PROXY
         cfg.default_version = sh::HttpVersionPolicy::Http11;
         cfg.default_h2c = sh::H2cMode::Off;
         if (opts.protocol == "h2") {

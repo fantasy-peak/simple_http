@@ -12,6 +12,8 @@
 
 #include <simple_http.h>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <boost/asio.hpp>
 #include <boost/asio/experimental/awaitable_operators.hpp>
@@ -20,8 +22,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <expected>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -217,6 +222,383 @@ std::vector<std::shared_ptr<FlakyPeer>> g_flaky;
 FlakyPeer &make_flaky(asio::io_context &ctx, std::size_t fails, std::string response) {
     g_flaky.push_back(std::make_shared<FlakyPeer>(ctx, fails, std::move(response)));
     return *g_flaky.back();
+}
+
+// --- in-process outbound proxies (CONNECT / HTTPS CONNECT / SOCKS5) ----------
+//
+// These are real TCP servers that speak just enough of each proxy protocol to
+// establish the tunnel, then splice bytes. The HTTPS proxy serves the test
+// certificate, so the client's nested-TLS path is a real TLS-over-TLS
+// connection. `http_status` / `malformed` inject the failure modes the client
+// must map to proxy_error / proxy_auth_failed.
+enum class TestProxyKind { Http, Https, Socks5 };
+
+class TestProxy {
+  public:
+    TestProxy(asio::io_context &ctx, TestProxyKind kind, std::string user = {}, std::string pass = {},
+              int http_status = 0, bool malformed = false)
+        : m_kind(kind), m_user(std::move(user)), m_pass(std::move(pass)), m_status(http_status), m_malformed(malformed),
+          m_acceptor(ctx, asio::ip::tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0)) {
+        if (kind == TestProxyKind::Https) {
+            m_tls = std::make_shared<asio::ssl::context>(asio::ssl::context::tls_server);
+            m_tls->set_options(asio::ssl::context::default_workarounds);
+            m_tls->use_certificate_chain_file("./test/tls_certificates/server_cert.pem");
+            m_tls->use_private_key_file("./test/tls_certificates/server_key.pem", asio::ssl::context::pem);
+        }
+        m_port = m_acceptor.local_endpoint().port();
+        accept();
+    }
+
+    std::uint16_t port() const { return m_port; }
+    std::size_t connections() const { return m_connections; }
+    std::size_t tunnels() const { return m_tunnels; }
+    std::size_t auth_failures() const { return m_auth_failures; }
+    const std::string &last_host() const { return m_last_host; }
+
+  private:
+    void accept() {
+        auto socket = std::make_shared<asio::ip::tcp::socket>(m_acceptor.get_executor());
+        m_acceptor.async_accept(*socket, [this, socket](const sh::error_code &ec) {
+            if (!ec) {
+                ++m_connections;
+                if (m_kind == TestProxyKind::Https) {
+                    auto tls = std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(std::move(*socket), *m_tls);
+                    asio::co_spawn(tls->get_executor(), serve_tls(tls), asio::detached);
+                } else if (m_kind == TestProxyKind::Socks5) {
+                    asio::co_spawn(socket->get_executor(), serve_socks(socket), asio::detached);
+                } else {
+                    asio::co_spawn(socket->get_executor(), serve_http(socket), asio::detached);
+                }
+            }
+            accept();
+        });
+    }
+
+    asio::awaitable<void> serve_tls(std::shared_ptr<asio::ssl::stream<asio::ip::tcp::socket>> tls) {
+        auto [ec] = co_await tls->async_handshake(asio::ssl::stream_base::server, asio::as_tuple(asio::use_awaitable));
+        if (ec)
+            co_return;
+        co_await serve_http(std::move(tls));
+    }
+
+    template <typename StreamPtr> asio::awaitable<void> serve_http(StreamPtr stream_ptr) {
+        auto &stream = *stream_ptr;
+        auto head = co_await read_head(stream);
+        if (head.empty())
+            co_return;
+        const auto line_end = head.find("\r\n");
+        const auto line = head.substr(0, line_end);
+        if (!line.starts_with("CONNECT "))
+            co_return;
+        const auto space = line.find(' ', 8);
+        if (space == std::string::npos)
+            co_return;
+        const std::string authority = line.substr(8, space - 8);
+
+        if (m_malformed) {
+            co_await write_str(stream, "this is not an HTTP response\r\n\r\n");
+            close(stream);
+            co_return;
+        }
+        if (!m_user.empty()) {
+            const std::string wanted = "Proxy-Authorization: Basic " + sh::base64_encode(m_user + ":" + m_pass);
+            if (head.find(wanted) == std::string::npos) {
+                ++m_auth_failures;
+                co_await write_str(stream, "HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n");
+                close(stream);
+                co_return;
+            }
+        }
+        if (m_status != 0) {
+            co_await write_str(stream,
+                               "HTTP/1.1 " + std::to_string(m_status) + " Refused\r\nContent-Length: 0\r\n\r\n");
+            close(stream);
+            co_return;
+        }
+
+        auto [host, port] = split_authority(authority);
+        m_last_host = host;
+        auto upstream = co_await dial(host, port);
+        if (!upstream) {
+            co_await write_str(stream, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n");
+            close(stream);
+            co_return;
+        }
+        ++m_tunnels;
+        co_await write_str(stream, "HTTP/1.1 200 Connection established\r\n\r\n");
+        co_await splice(stream, *upstream);
+    }
+
+    asio::awaitable<void> serve_socks(std::shared_ptr<asio::ip::tcp::socket> socket_ptr) {
+        auto &socket = *socket_ptr;
+        std::array<std::byte, 2> greeting{};
+        if (co_await read_exact(socket, greeting))
+            co_return;
+        if (static_cast<unsigned char>(greeting[0]) != 5)
+            co_return;
+        std::vector<std::byte> offered(static_cast<unsigned char>(greeting[1]));
+        if (!offered.empty() && co_await read_exact(socket, offered))
+            co_return;
+
+        if (m_malformed) {
+            co_await write_str(socket, "garbage");
+            close(socket);
+            co_return;
+        }
+
+        const bool want_auth = !m_user.empty();
+        auto offered_method = [&](unsigned char method) {
+            return std::find(offered.begin(), offered.end(), std::byte{method}) != offered.end();
+        };
+        if (want_auth) {
+            if (!offered_method(0x02)) {
+                ++m_auth_failures;
+                const std::array<std::byte, 2> no{std::byte{5}, std::byte{0xFF}};
+                (void)co_await write_exact(socket, no);
+                close(socket);
+                co_return;
+            }
+            const std::array<std::byte, 2> select{std::byte{5}, std::byte{2}};
+            if (co_await write_exact(socket, select))
+                co_return;
+            std::array<std::byte, 2> ver_len{};
+            if (co_await read_exact(socket, ver_len))
+                co_return;
+            std::string user(static_cast<unsigned char>(ver_len[1]), '\0');
+            if (!user.empty()) {
+                std::vector<std::byte> bytes(user.size());
+                if (co_await read_exact(socket, bytes))
+                    co_return;
+                user.assign(reinterpret_cast<const char *>(bytes.data()), bytes.size());
+            }
+            std::array<std::byte, 1> pass_len{};
+            if (co_await read_exact(socket, pass_len))
+                co_return;
+            std::string pass(static_cast<unsigned char>(pass_len[0]), '\0');
+            if (!pass.empty()) {
+                std::vector<std::byte> bytes(pass.size());
+                if (co_await read_exact(socket, bytes))
+                    co_return;
+                pass.assign(reinterpret_cast<const char *>(bytes.data()), bytes.size());
+            }
+            const bool ok = user == m_user && pass == m_pass;
+            const std::array<std::byte, 2> reply{std::byte{1}, std::byte{ok ? 0x00 : 0x01}};
+            if (co_await write_exact(socket, reply))
+                co_return;
+            if (!ok) {
+                ++m_auth_failures;
+                close(socket);
+                co_return;
+            }
+        } else {
+            if (!offered_method(0x00)) {
+                const std::array<std::byte, 2> no{std::byte{5}, std::byte{0xFF}};
+                (void)co_await write_exact(socket, no);
+                close(socket);
+                co_return;
+            }
+            const std::array<std::byte, 2> select{std::byte{5}, std::byte{0}};
+            if (co_await write_exact(socket, select))
+                co_return;
+        }
+
+        std::array<std::byte, 4> request{};
+        if (co_await read_exact(socket, request))
+            co_return;
+        if (static_cast<unsigned char>(request[0]) != 5 || static_cast<unsigned char>(request[1]) != 1)
+            co_return;
+        const auto atyp = static_cast<unsigned char>(request[3]);
+        std::string host;
+        if (atyp == 0x01) {
+            std::array<std::byte, 4> addr{};
+            if (co_await read_exact(socket, addr))
+                co_return;
+            asio::ip::address_v4::bytes_type bytes{};
+            std::memcpy(bytes.data(), addr.data(), addr.size());
+            host = asio::ip::make_address_v4(bytes).to_string();
+        } else if (atyp == 0x04) {
+            std::array<std::byte, 16> addr{};
+            if (co_await read_exact(socket, addr))
+                co_return;
+            asio::ip::address_v6::bytes_type bytes{};
+            std::memcpy(bytes.data(), addr.data(), addr.size());
+            host = asio::ip::make_address_v6(bytes).to_string();
+        } else if (atyp == 0x03) {
+            std::array<std::byte, 1> len{};
+            if (co_await read_exact(socket, len))
+                co_return;
+            std::vector<std::byte> addr(static_cast<unsigned char>(len[0]));
+            if (!addr.empty() && co_await read_exact(socket, addr))
+                co_return;
+            host.assign(reinterpret_cast<const char *>(addr.data()), addr.size());
+        } else {
+            co_return;
+        }
+        std::array<std::byte, 2> port_bytes{};
+        if (co_await read_exact(socket, port_bytes))
+            co_return;
+        const auto port = static_cast<std::uint16_t>((static_cast<unsigned char>(port_bytes[0]) << 8) |
+                                                     static_cast<unsigned char>(port_bytes[1]));
+        m_last_host = host;
+
+        if (m_status != 0) {
+            const std::array<std::byte, 10> reply{
+                std::byte{5}, static_cast<std::byte>(m_status), std::byte{0}, std::byte{1}, {}, {}, {}, {}, {}, {}};
+            (void)co_await write_exact(socket, reply);
+            close(socket);
+            co_return;
+        }
+        auto upstream = co_await dial(host, port);
+        if (!upstream) {
+            const std::array<std::byte, 10> reply{std::byte{5}, std::byte{4}, std::byte{0}, std::byte{1}, {},
+                                                  {},           {},           {},           {},           {}};
+            (void)co_await write_exact(socket, reply);
+            close(socket);
+            co_return;
+        }
+        ++m_tunnels;
+        const std::array<std::byte, 10> reply{std::byte{5}, std::byte{0}, std::byte{0}, std::byte{1}, {},
+                                              {},           {},           {},           {},           {}};
+        if (co_await write_exact(socket, reply))
+            co_return;
+        co_await splice(socket, *upstream);
+    }
+
+    template <typename Stream> asio::awaitable<void> splice(Stream &client, asio::ip::tcp::socket &upstream) {
+        using namespace asio::experimental::awaitable_operators;
+        auto down = [&]() -> asio::awaitable<void> {
+            std::array<std::byte, 16384> buf{};
+            for (;;) {
+                auto [ec, n] = co_await client.async_read_some(asio::buffer(buf), asio::as_tuple(asio::use_awaitable));
+                if (ec)
+                    break;
+                auto [wec, wn] = co_await asio::async_write(upstream, asio::buffer(buf.data(), n),
+                                                            asio::as_tuple(asio::use_awaitable));
+                (void)wn;
+                if (wec)
+                    break;
+            }
+        };
+        auto up = [&]() -> asio::awaitable<void> {
+            std::array<std::byte, 16384> buf{};
+            for (;;) {
+                auto [ec, n] =
+                    co_await upstream.async_read_some(asio::buffer(buf), asio::as_tuple(asio::use_awaitable));
+                if (ec)
+                    break;
+                auto [wec, wn] = co_await asio::async_write(client, asio::buffer(buf.data(), n),
+                                                            asio::as_tuple(asio::use_awaitable));
+                (void)wn;
+                if (wec)
+                    break;
+            }
+        };
+        co_await (down() || up());
+        close(client);
+        sh::error_code ec;
+        upstream.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
+        upstream.close(ec);
+    }
+
+    asio::awaitable<std::optional<asio::ip::tcp::socket>> dial(const std::string &host, std::uint16_t port) {
+        asio::ip::tcp::socket upstream{m_acceptor.get_executor()};
+        asio::ip::tcp::resolver resolver{m_acceptor.get_executor()};
+        auto [ec, results] =
+            co_await resolver.async_resolve(host, std::to_string(port), asio::as_tuple(asio::use_awaitable));
+        if (ec)
+            co_return std::nullopt;
+        auto [cec, endpoint] = co_await asio::async_connect(upstream, results, asio::as_tuple(asio::use_awaitable));
+        (void)endpoint;
+        if (cec)
+            co_return std::nullopt;
+        co_return std::optional<asio::ip::tcp::socket>{std::move(upstream)};
+    }
+
+    static std::pair<std::string, std::uint16_t> split_authority(std::string_view authority) {
+        std::string host;
+        std::string_view port_str;
+        if (!authority.empty() && authority.front() == '[') {
+            const auto close = authority.find(']');
+            if (close == std::string_view::npos)
+                return {};
+            host = std::string{authority.substr(1, close - 1)};
+            if (close + 1 < authority.size() && authority[close + 1] == ':')
+                port_str = authority.substr(close + 2);
+        } else if (const auto colon = authority.rfind(':'); colon != std::string_view::npos) {
+            host = std::string{authority.substr(0, colon)};
+            port_str = authority.substr(colon + 1);
+        } else {
+            return {};
+        }
+        if (port_str.empty())
+            return {};
+        return {host, static_cast<std::uint16_t>(std::stoul(std::string{port_str}))};
+    }
+
+    template <typename Stream> static asio::awaitable<std::string> read_head(Stream &stream) {
+        std::string head;
+        std::array<std::byte, 4096> buf{};
+        while (head.find("\r\n\r\n") == std::string::npos) {
+            auto [ec, n] = co_await stream.async_read_some(asio::buffer(buf), asio::as_tuple(asio::use_awaitable));
+            if (ec)
+                co_return std::string{};
+            head.append(reinterpret_cast<const char *>(buf.data()), n);
+            if (head.size() > 16 * 1024)
+                co_return std::string{};
+        }
+        co_return head;
+    }
+
+    template <typename Stream> static asio::awaitable<void> write_str(Stream &stream, std::string_view data) {
+        (void)co_await asio::async_write(stream, asio::buffer(data.data(), data.size()),
+                                         asio::as_tuple(asio::use_awaitable));
+    }
+
+    template <typename Stream>
+    static asio::awaitable<sh::error_code> read_exact(Stream &stream, std::span<std::byte> buf) {
+        auto [ec, n] = co_await asio::async_read(stream, asio::buffer(buf.data(), buf.size()),
+                                                 asio::as_tuple(asio::use_awaitable));
+        (void)n;
+        co_return ec;
+    }
+
+    template <typename Stream>
+    static asio::awaitable<sh::error_code> write_exact(Stream &stream, std::span<const std::byte> buf) {
+        auto [ec, n] = co_await asio::async_write(stream, asio::buffer(buf.data(), buf.size()),
+                                                  asio::as_tuple(asio::use_awaitable));
+        (void)n;
+        co_return ec;
+    }
+
+    template <typename Stream> static void close(Stream &stream) {
+        sh::error_code ec;
+        stream.lowest_layer().shutdown(asio::ip::tcp::socket::shutdown_both, ec);
+        stream.lowest_layer().close(ec);
+    }
+
+    TestProxyKind m_kind;
+    std::string m_user;
+    std::string m_pass;
+    int m_status{0};
+    bool m_malformed{false};
+    std::shared_ptr<asio::ssl::context> m_tls;
+    asio::ip::tcp::acceptor m_acceptor;
+    std::uint16_t m_port{0};
+    std::size_t m_connections{0};
+    std::size_t m_tunnels{0};
+    std::size_t m_auth_failures{0};
+    std::string m_last_host;
+};
+
+// Proxies must outlive the suite: an acceptor still holding a pending accept
+// cannot be destroyed while the test's io_context runs.
+std::vector<std::shared_ptr<TestProxy>> g_proxies;
+
+TestProxy &make_proxy(asio::io_context &ctx, TestProxyKind kind, std::string user = {}, std::string pass = {},
+                      int http_status = 0, bool malformed = false) {
+    g_proxies.push_back(
+        std::make_shared<TestProxy>(ctx, kind, std::move(user), std::move(pass), http_status, malformed));
+    return *g_proxies.back();
 }
 
 // --- the in-process server ---------------------------------------------------
@@ -2153,6 +2535,297 @@ asio::awaitable<void> suite_shared_client(std::uint16_t port) {
     co_return;
 }
 
+// --- outbound proxies -------------------------------------------------------
+
+asio::awaitable<void> suite_proxy(asio::io_context &ctx, std::uint16_t plain_port, std::uint16_t tls_port) {
+    std::printf("\n== outbound proxies (CONNECT / HTTPS proxy / SOCKS5) ==\n");
+    const auto ex = co_await asio::this_coro::executor;
+    const std::string http_url = "http://127.0.0.1:" + std::to_string(plain_port);
+    const std::string https_url = "https://127.0.0.1:" + std::to_string(tls_port);
+
+    // Plaintext CONNECT proxy: HTTP/1.1 origin.
+    {
+        auto &proxy = make_proxy(ctx, TestProxyKind::Http);
+        sh::ClientConfig cfg = base_config();
+        cfg.default_version = sh::HttpVersionPolicy::Http11;
+        cfg.default_h2c = sh::H2cMode::Off;
+        cfg.proxy = sh::ProxyConfig{.kind = sh::ProxyKind::Http, .host = "127.0.0.1", .port = proxy.port()};
+        h::Client client{ex, cfg};
+        auto r = co_await fetch(client, client.get(http_url + "/world"));
+        check(r && r->status == 200, "CONNECT proxy: plaintext origin over HTTP/1.1");
+        check(proxy.tunnels() == 1 && proxy.connections() == 1, "CONNECT proxy: exactly one tunnel for one request");
+    }
+
+    // Plaintext CONNECT proxy: h2c prior knowledge inside the tunnel.
+    {
+        auto &proxy = make_proxy(ctx, TestProxyKind::Http);
+        sh::ClientConfig cfg = base_config();
+        cfg.default_version = sh::HttpVersionPolicy::Http2;
+        cfg.default_h2c = sh::H2cMode::PriorKnowledge;
+        cfg.proxy = sh::ProxyConfig{.kind = sh::ProxyKind::Http, .host = "127.0.0.1", .port = proxy.port()};
+        h::Client client{ex, cfg};
+        auto r = co_await fetch(client, client.get(http_url + "/world"));
+        check(r && r->status == 200 && r->version == sh::Version::Http2,
+              "CONNECT proxy: a pinned h2c policy sends the preface inside the tunnel");
+    }
+
+    // Plaintext CONNECT proxy: h2c Upgrade still works through the tunnel.
+    {
+        auto &proxy = make_proxy(ctx, TestProxyKind::Http);
+        sh::ClientConfig cfg = base_config();
+        cfg.default_version = sh::HttpVersionPolicy::Auto;
+        cfg.default_h2c = sh::H2cMode::Upgrade;
+        cfg.proxy = sh::ProxyConfig{.kind = sh::ProxyKind::Http, .host = "127.0.0.1", .port = proxy.port()};
+        h::Client client{ex, cfg};
+        auto r = co_await fetch(client, client.get(http_url + "/world"));
+        check(r && r->status == 200 && r->version == sh::Version::Http2,
+              "CONNECT proxy: h2c Upgrade runs over the tunnel");
+    }
+
+    // Plaintext CONNECT proxy: a TLS origin keeps its own ALPN (h2).
+    {
+        auto &proxy = make_proxy(ctx, TestProxyKind::Http);
+        sh::ClientConfig cfg = base_config();
+        cfg.default_version = sh::HttpVersionPolicy::Http2;
+        cfg.proxy = sh::ProxyConfig{.kind = sh::ProxyKind::Http, .host = "127.0.0.1", .port = proxy.port()};
+        h::Client client{ex, cfg};
+        auto r = co_await fetch(client, client.get(https_url + "/world"));
+        check(r && r->status == 200 && r->version == sh::Version::Http2,
+              "CONNECT proxy: TLS origin negotiates h2 inside the tunnel");
+    }
+
+    // Plaintext CONNECT proxy: ws://.
+    {
+        auto &proxy = make_proxy(ctx, TestProxyKind::Http);
+        sh::ClientConfig cfg = base_config();
+        cfg.default_version = sh::HttpVersionPolicy::Http11;
+        cfg.default_h2c = sh::H2cMode::Off;
+        cfg.proxy = sh::ProxyConfig{.kind = sh::ProxyKind::Http, .host = "127.0.0.1", .port = proxy.port()};
+        h::Client client{ex, cfg};
+        auto ws = co_await client.open_websocket("ws://127.0.0.1:" + std::to_string(plain_port) + "/wsecho");
+        if (!ws) {
+            check(false, "CONNECT proxy: ws:// handshake -> " + std::string{ws.error().message()});
+        } else {
+            check(true, "CONNECT proxy: ws:// handshake through the tunnel");
+            if (auto ec = co_await (*ws)->write_text("hello proxy"); ec) {
+                check(false, "CONNECT proxy: ws write -> " + ec.message());
+            } else {
+                auto msg = co_await (*ws)->read();
+                check(msg && msg->text && msg->data == "hello proxy", "CONNECT proxy: ws echo through the tunnel");
+            }
+            (void)co_await (*ws)->close();
+        }
+    }
+
+    // HTTPS proxy (TLS to the proxy): a plaintext origin inside the TLS tunnel.
+    {
+        auto &proxy = make_proxy(ctx, TestProxyKind::Https);
+        sh::ClientConfig cfg = base_config();
+        cfg.default_version = sh::HttpVersionPolicy::Auto;
+        cfg.default_h2c = sh::H2cMode::Upgrade;
+        cfg.proxy = sh::ProxyConfig{.kind = sh::ProxyKind::Https,
+                                    .host = "127.0.0.1",
+                                    .port = proxy.port(),
+                                    .verify_peer = true,
+                                    .verify_host = false, // the test certificate has no SAN
+                                    .ca_file = "./test/tls_certificates/ca_cert.pem"};
+        h::Client client{ex, cfg};
+        auto r = co_await fetch(client, client.get(http_url + "/world"));
+        check(r && r->status == 200 && r->version == sh::Version::Http2,
+              "HTTPS proxy: plaintext origin upgrades to h2c inside the TLS tunnel");
+    }
+
+    // HTTPS proxy: a TLS origin over nested TLS (TLS over TLS), h2.
+    {
+        auto &proxy = make_proxy(ctx, TestProxyKind::Https);
+        sh::ClientConfig cfg = base_config();
+        cfg.default_version = sh::HttpVersionPolicy::Http2;
+        cfg.proxy = sh::ProxyConfig{.kind = sh::ProxyKind::Https,
+                                    .host = "127.0.0.1",
+                                    .port = proxy.port(),
+                                    .verify_peer = true,
+                                    .verify_host = false,
+                                    .ca_file = "./test/tls_certificates/ca_cert.pem"};
+        h::Client client{ex, cfg};
+        auto r = co_await fetch(client, client.get(https_url + "/world"));
+        check(r && r->status == 200 && r->version == sh::Version::Http2,
+              "HTTPS proxy: TLS origin over nested TLS, h2 via ALPN");
+    }
+
+    // HTTPS proxy: wss:// through nested TLS.
+    {
+        auto &proxy = make_proxy(ctx, TestProxyKind::Https);
+        sh::ClientConfig cfg = base_config();
+        cfg.proxy = sh::ProxyConfig{.kind = sh::ProxyKind::Https,
+                                    .host = "127.0.0.1",
+                                    .port = proxy.port(),
+                                    .verify_peer = true,
+                                    .verify_host = false,
+                                    .ca_file = "./test/tls_certificates/ca_cert.pem"};
+        h::Client client{ex, cfg};
+        auto ws = co_await client.open_websocket("wss://127.0.0.1:" + std::to_string(tls_port) + "/wsecho");
+        if (!ws) {
+            check(false, "HTTPS proxy: wss:// handshake -> " + std::string{ws.error().message()});
+        } else {
+            check(true, "HTTPS proxy: wss:// handshake through nested TLS");
+            if (auto ec = co_await (*ws)->write_text("nested"); ec) {
+                check(false, "HTTPS proxy: wss write -> " + ec.message());
+            } else {
+                auto msg = co_await (*ws)->read();
+                check(msg && msg->text && msg->data == "nested", "HTTPS proxy: wss echo through nested TLS");
+            }
+            (void)co_await (*ws)->close();
+        }
+    }
+
+    // SOCKS5, no authentication, remote DNS (a name goes out as ATYP=3).
+    {
+        auto &proxy = make_proxy(ctx, TestProxyKind::Socks5);
+        sh::ClientConfig cfg = base_config();
+        cfg.default_version = sh::HttpVersionPolicy::Http11;
+        cfg.default_h2c = sh::H2cMode::Off;
+        cfg.proxy = sh::ProxyConfig{.kind = sh::ProxyKind::Socks5, .host = "127.0.0.1", .port = proxy.port()};
+        h::Client client{ex, cfg};
+        auto r = co_await fetch(client, client.get("http://localhost:" + std::to_string(plain_port) + "/world"));
+        check(r && r->status == 200, "SOCKS5: plaintext origin through the tunnel");
+        check(proxy.last_host() == "localhost", "SOCKS5: the target name is resolved at the proxy (ATYP=3)");
+    }
+
+    // SOCKS5 with username/password; TLS origin keeps h2 via ALPN.
+    {
+        auto &proxy = make_proxy(ctx, TestProxyKind::Socks5, "user", "pass");
+        sh::ClientConfig cfg = base_config();
+        cfg.default_version = sh::HttpVersionPolicy::Http2;
+        cfg.proxy = sh::ProxyConfig{.kind = sh::ProxyKind::Socks5,
+                                    .host = "127.0.0.1",
+                                    .port = proxy.port(),
+                                    .username = "user",
+                                    .password = "pass"};
+        h::Client client{ex, cfg};
+        auto r = co_await fetch(client, client.get(https_url + "/world"));
+        check(r && r->status == 200 && r->version == sh::Version::Http2,
+              "SOCKS5: authenticated tunnel carries a TLS origin (h2)");
+        check(proxy.auth_failures() == 0, "SOCKS5: credentials accepted");
+    }
+
+    // Authentication failures map to proxy_auth_failed.
+    {
+        auto &proxy = make_proxy(ctx, TestProxyKind::Http, "user", "pass");
+        sh::ClientConfig cfg = base_config();
+        cfg.default_version = sh::HttpVersionPolicy::Http11;
+        cfg.default_h2c = sh::H2cMode::Off;
+        cfg.proxy = sh::ProxyConfig{.kind = sh::ProxyKind::Http, .host = "127.0.0.1", .port = proxy.port()};
+        h::Client client{ex, cfg};
+        auto r = co_await fetch(client, client.get(http_url + "/world"));
+        check(!r && r.error() == sh::make_error_code(sh::client_errc::proxy_auth_failed),
+              "CONNECT proxy: a 407 surfaces as proxy_auth_failed");
+        check(proxy.auth_failures() == 1, "CONNECT proxy: the rejection reached the proxy");
+    }
+    {
+        auto &proxy = make_proxy(ctx, TestProxyKind::Socks5, "user", "pass");
+        sh::ClientConfig cfg = base_config();
+        cfg.default_version = sh::HttpVersionPolicy::Http11;
+        cfg.default_h2c = sh::H2cMode::Off;
+        cfg.proxy = sh::ProxyConfig{.kind = sh::ProxyKind::Socks5, .host = "127.0.0.1", .port = proxy.port()};
+        h::Client client{ex, cfg};
+        auto r = co_await fetch(client, client.get(http_url + "/world"));
+        check(!r && r.error() == sh::make_error_code(sh::client_errc::proxy_auth_failed),
+              "SOCKS5: no acceptable auth method surfaces as proxy_auth_failed");
+    }
+    {
+        auto &proxy = make_proxy(ctx, TestProxyKind::Socks5, "user", "pass");
+        sh::ClientConfig cfg = base_config();
+        cfg.default_version = sh::HttpVersionPolicy::Http11;
+        cfg.default_h2c = sh::H2cMode::Off;
+        cfg.proxy = sh::ProxyConfig{.kind = sh::ProxyKind::Socks5,
+                                    .host = "127.0.0.1",
+                                    .port = proxy.port(),
+                                    .username = "user",
+                                    .password = "wrong"};
+        h::Client client{ex, cfg};
+        auto r = co_await fetch(client, client.get(http_url + "/world"));
+        check(!r && r.error() == sh::make_error_code(sh::client_errc::proxy_auth_failed),
+              "SOCKS5: a rejected password surfaces as proxy_auth_failed");
+    }
+
+    // Malformed and refused replies map to proxy_error.
+    {
+        auto &proxy = make_proxy(ctx, TestProxyKind::Http, {}, {}, 0, /*malformed=*/true);
+        sh::ClientConfig cfg = base_config();
+        cfg.default_version = sh::HttpVersionPolicy::Http11;
+        cfg.default_h2c = sh::H2cMode::Off;
+        cfg.proxy = sh::ProxyConfig{.kind = sh::ProxyKind::Http, .host = "127.0.0.1", .port = proxy.port()};
+        h::Client client{ex, cfg};
+        auto r = co_await fetch(client, client.get(http_url + "/world"));
+        check(!r && r.error() == sh::make_error_code(sh::client_errc::proxy_error),
+              "CONNECT proxy: a malformed reply surfaces as proxy_error");
+    }
+    {
+        auto &proxy = make_proxy(ctx, TestProxyKind::Http, {}, {}, /*http_status=*/403);
+        sh::ClientConfig cfg = base_config();
+        cfg.default_version = sh::HttpVersionPolicy::Http11;
+        cfg.default_h2c = sh::H2cMode::Off;
+        cfg.proxy = sh::ProxyConfig{.kind = sh::ProxyKind::Http, .host = "127.0.0.1", .port = proxy.port()};
+        h::Client client{ex, cfg};
+        auto r = co_await fetch(client, client.get(http_url + "/world"));
+        check(!r && r.error() == sh::make_error_code(sh::client_errc::proxy_error),
+              "CONNECT proxy: a non-2xx, non-407 status surfaces as proxy_error");
+    }
+
+    // NO_PROXY bypasses an explicit proxy: the request works and the proxy is
+    // never even connected to.
+    {
+        auto &proxy = make_proxy(ctx, TestProxyKind::Http);
+        sh::ClientConfig cfg = base_config();
+        cfg.default_version = sh::HttpVersionPolicy::Http11;
+        cfg.default_h2c = sh::H2cMode::Off;
+        cfg.proxy = sh::ProxyConfig{.kind = sh::ProxyKind::Http, .host = "127.0.0.1", .port = proxy.port()};
+        cfg.no_proxy = {"127.0.0.1"};
+        h::Client client{ex, cfg};
+        auto r = co_await fetch(client, client.get(http_url + "/world"));
+        check(r && r->status == 200, "NO_PROXY: a bypassed target is reached directly");
+        check(proxy.connections() == 0, "NO_PROXY: the proxy was never connected to");
+    }
+
+    // Environment selection: http_proxy is honored when no explicit proxy is
+    // configured (proxy_from_env defaults true).
+    {
+        auto &proxy = make_proxy(ctx, TestProxyKind::Http);
+        const std::string value = "http://127.0.0.1:" + std::to_string(proxy.port());
+        ::setenv("http_proxy", value.c_str(), 1);
+        ::unsetenv("no_proxy");
+        sh::ClientConfig cfg = base_config();
+        cfg.default_version = sh::HttpVersionPolicy::Http11;
+        cfg.default_h2c = sh::H2cMode::Off;
+        h::Client client{ex, cfg};
+        auto r = co_await fetch(client, client.get(http_url + "/world"));
+        ::unsetenv("http_proxy");
+        check(r && r->status == 200, "environment proxy: http_proxy is honored");
+        check(proxy.tunnels() == 1, "environment proxy: the request went through the tunnel");
+    }
+
+    // A server-side reverse-proxy upstream must not follow the process's proxy
+    // environment (HttpProxyTarget::use_env_proxy defaults off): the same
+    // frontend server serves /rp/* through an internal Client, and that request
+    // must reach the backend directly with HTTP_PROXY set.
+    {
+        auto &proxy = make_proxy(ctx, TestProxyKind::Http);
+        const std::string value = "http://127.0.0.1:" + std::to_string(proxy.port());
+        ::setenv("http_proxy", value.c_str(), 1);
+        ::unsetenv("no_proxy");
+        // The *front* client stays direct (otherwise it would take the tunnel
+        // itself); only the server-side upstream could follow HTTP_PROXY, and it
+        // must not.
+        sh::ClientConfig front_cfg = base_config();
+        front_cfg.proxy_from_env = false;
+        h::Client client{ex, front_cfg};
+        auto r = co_await fetch(client, client.get(http_url + "/rp/world"));
+        ::unsetenv("http_proxy");
+        check(r && r->status == 200, "reverse-proxy upstream: the front still answers with HTTP_PROXY set");
+        check(proxy.tunnels() == 0, "reverse-proxy upstream: the backend was reached directly, not via the proxy");
+    }
+}
+
 asio::awaitable<void> run_all_suites(asio::io_context &ctx, std::uint16_t plain, std::uint16_t tls_port,
                                      std::uint16_t comp_port) {
     co_await suite_protocol_matrix(plain, tls_port);
@@ -2170,6 +2843,7 @@ asio::awaitable<void> run_all_suites(asio::io_context &ctx, std::uint16_t plain,
     co_await suite_multipart(plain);
     co_await suite_http_api(plain);
     co_await suite_reverse_proxy(plain);
+    co_await suite_proxy(ctx, plain, tls_port);
     co_await suite_raw_peer(ctx);
     co_await suite_compression(comp_port, plain);
     co_return;
@@ -2179,6 +2853,14 @@ asio::awaitable<void> run_all_suites(asio::io_context &ctx, std::uint16_t plain,
 
 int main() {
     sh::set_log_sink(sh::make_stdout_sink(sh::LogLevel::Error));
+
+    // Proxy environment isolation: this harness must not inherit an ambient
+    // HTTP(S)_PROXY (CI machines and developer shells often have one). The proxy
+    // suite sets and restores these explicitly where it needs them.
+    for (const char *name :
+         {"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"}) {
+        ::unsetenv(name);
+    }
 
     // The plaintext and TLS listeners of the library's own server, in-process.
     // Fixed ports, because the reverse-proxy routes below must name the backend's

@@ -116,6 +116,7 @@ struct SharedRun {
 void scenario_supported_thread_use(std::uint16_t port) {
     const std::string base = "http://127.0.0.1:" + std::to_string(port);
     sh::ClientConfig cfg;
+    cfg.proxy_from_env = false; // hermetic: the harness must not follow ambient HTTP_PROXY
     cfg.request_timeout = std::chrono::seconds(15);
     cfg.idle_timeout = std::chrono::seconds(20);
     cfg.default_version = sh::HttpVersionPolicy::Http11;

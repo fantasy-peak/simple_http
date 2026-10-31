@@ -80,6 +80,7 @@
 #include "decompressing_stream.h"
 #include "h1_client.h"
 #include "h2_client.h"
+#include "proxy.h"
 #include "tls_client.h"
 #include "url.h"
 
@@ -310,10 +311,13 @@ class ExchangeGate {
 };
 
 // Wraps an awaitable in a deadline. The awaitable's own I/O is cancelled when
-// the timer wins, which is why callers must also cancel the stream.
+// the timer wins, which is why callers must also cancel the stream. `reason`
+// labels the timeout: dial stages report connect_timeout, whole exchanges
+// report request_timeout.
 template <typename T>
 asio::awaitable<std::expected<T, error_code>> await_with_deadline(asio::awaitable<T> op,
-                                                                  std::chrono::milliseconds limit) {
+                                                                  std::chrono::milliseconds limit,
+                                                                  client_errc reason = client_errc::request_timeout) {
     using namespace asio::experimental::awaitable_operators;
     if (limit.count() <= 0)
         co_return co_await std::move(op);
@@ -326,7 +330,7 @@ asio::awaitable<std::expected<T, error_code>> await_with_deadline(asio::awaitabl
     auto outcome = co_await (std::move(op) || deadline_op());
     if (auto *value = std::get_if<T>(&outcome))
         co_return std::move(*value);
-    co_return std::unexpected{make_error_code(client_errc::request_timeout)};
+    co_return std::unexpected{make_error_code(reason)};
 }
 
 // Drops a reference to a session on the session's own executor. A session's
@@ -662,15 +666,43 @@ class ClientEngine {
     // transport — no HTTP session is started. The caller (the WebSocket
     // client) speaks its own protocol over it.
     // Public: the WebSocket client (client/ws_client.h) dials through here.
-    using DialedTransport = std::variant<std::shared_ptr<TcpStreamTransport>, std::shared_ptr<TlsStreamTransport>>;
-    asio::awaitable<std::expected<DialedTransport, error_code>> dial_transport(ClientTarget target,
-                                                                               asio::any_io_executor ex) {
+    using DialedTransport = std::variant<std::shared_ptr<TcpStreamTransport>, std::shared_ptr<TlsStreamTransport>,
+                                         std::shared_ptr<NestedTlsTransport>>;
+
+    // A dialed transport plus whether it reached the origin through a proxy
+    // tunnel. The flag decides the h2c policy: a tunnel starts at the
+    // connection's first byte, so an h2-pinned plaintext target can send the
+    // preface directly instead of attempting an HTTP/1.1 Upgrade.
+    struct Dialed {
+        DialedTransport transport;
+        bool tunneled{false};
+    };
+
+    // Resolves, connects and (if TLS) handshakes to `target`, directly or
+    // through the proxy select_proxy() picks. No HTTP session is started: the
+    // WebSocket client speaks its own protocol over the returned transport.
+    // Public: the WebSocket client (client/ws_client.h) dials through here.
+    asio::awaitable<std::expected<Dialed, error_code>> dial_transport(ClientTarget target, asio::any_io_executor ex) {
         co_await hop(); // the socket and every timer below bind to the pinned executor
         if (target.version == HttpVersionPolicy::Http3) {
             // QUIC is not a byte stream. Callers that want h3 go through dial().
             co_return std::unexpected{make_error_code(client_errc::version_not_negotiated)};
         }
-        error_code ec;
+        auto proxy = select_proxy(m_config, target);
+        if (!proxy)
+            co_return std::unexpected{proxy.error()};
+        if (*proxy)
+            co_return co_await dial_via_proxy(target, **proxy, ex);
+        auto transport = co_await dial_direct(std::move(target), ex);
+        if (!transport)
+            co_return std::unexpected{transport.error()};
+        co_return Dialed{std::move(*transport), false};
+    }
+
+  private:
+    // The direct path: resolve the origin, connect, and (for TLS) handshake.
+    asio::awaitable<std::expected<DialedTransport, error_code>> dial_direct(ClientTarget target,
+                                                                            asio::any_io_executor ex) {
         auto endpoints = co_await resolve(target, ex);
         if (!endpoints)
             co_return std::unexpected{endpoints.error()};
@@ -691,7 +723,118 @@ class ClientEngine {
 
         auto stream = std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(std::move(*socket), *m_ssl_context);
         auto transport = std::make_shared<TlsStreamTransport>(stream, peer);
+        if (auto ec = co_await target_tls_handshake(*transport, target); ec) {
+            transport->close();
+            co_return std::unexpected{ec};
+        }
+        co_return DialedTransport{std::move(transport)};
+    }
 
+    // The proxy path: connect to the proxy (the origin is never resolved
+    // locally), do the proxy's own TLS leg when it speaks TLS, establish the
+    // tunnel, then start the origin's TLS inside it. Every stage carries the
+    // same connect_timeout the direct path gives its connect and TLS handshake.
+    asio::awaitable<std::expected<Dialed, error_code>>
+    dial_via_proxy(const ClientTarget &target, const ProxyConfig &proxy, asio::any_io_executor ex) {
+        auto endpoints = co_await resolve_host(proxy.host, proxy.effective_port(), ex);
+        if (!endpoints)
+            co_return std::unexpected{endpoints.error()};
+
+        auto socket = std::make_shared<asio::ip::tcp::socket>(ex);
+        apply_socket_options(*socket);
+        if (auto cec = co_await connect_with_deadline(proxy.authority(), *socket, *endpoints)) {
+            socket->close();
+            co_return std::unexpected{cec};
+        }
+        error_code pe;
+        auto peer = socket->remote_endpoint(pe);
+        ++m_opened;
+
+        SIMPLE_HTTP_DEBUG_LOG("client: tunnelling {} through proxy {}", target.authority(), proxy.authority());
+
+        if (proxy.kind == ProxyKind::Https) {
+            std::shared_ptr<asio::ssl::context> context;
+            try {
+                context = proxy_ssl_context(proxy);
+            } catch (const std::exception &e) {
+                SIMPLE_HTTP_ERROR_LOG("client proxy: ssl context for {}: {}", proxy.authority(), e.what());
+                socket->close();
+                co_return std::unexpected{make_error_code(client_errc::proxy_error)};
+            }
+            auto inner = std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(std::move(*socket), *context);
+            ClientTlsHandshake hs;
+            hs.sni = proxy.server_name.empty() ? proxy.host : proxy.server_name;
+            hs.verify_host = proxy.verify_peer && proxy.verify_host;
+            // CONNECT is an HTTP/1.1 request; offer only that on this leg.
+            hs.alpn_wire = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+            TlsStreamTransport proxy_tls{inner, peer}; // thin view for the handshake helper
+            auto outcome = co_await await_with_deadline(tls_client_handshake(proxy_tls, hs), m_config.connect_timeout,
+                                                        client_errc::connect_timeout);
+            if (!outcome || *outcome) {
+                error_code ignored;
+                inner->lowest_layer().close(ignored);
+                if (!outcome)
+                    co_return std::unexpected{outcome.error()};
+                SIMPLE_HTTP_ERROR_LOG("client proxy: TLS handshake with {} failed: {}", proxy.authority(),
+                                      outcome->message());
+                co_return std::unexpected{*outcome};
+            }
+
+            if (auto ec = co_await tunnel_handshake(*inner, proxy, target); ec) {
+                error_code ignored;
+                inner->lowest_layer().close(ignored);
+                co_return std::unexpected{ec};
+            }
+            if (!target.use_tls) {
+                // Plaintext origin inside the proxy's TLS connection: the TLS
+                // transport is just the tunnel's byte stream.
+                co_return Dialed{DialedTransport{std::make_shared<TlsStreamTransport>(inner, peer)}, true};
+            }
+
+            // TLS over TLS. The proxy handshake and CONNECT have completed, so
+            // no operation is outstanding on `inner` when it is moved.
+            auto outer = std::make_shared<asio::ssl::stream<asio::ssl::stream<asio::ip::tcp::socket>>>(
+                std::move(*inner), *m_ssl_context);
+            auto transport = std::make_shared<NestedTlsTransport>(outer, peer);
+            if (auto ec = co_await target_tls_handshake(*transport, target); ec) {
+                transport->close();
+                co_return std::unexpected{ec};
+            }
+            co_return Dialed{DialedTransport{std::move(transport)}, true};
+        }
+
+        if (auto ec = co_await tunnel_handshake(*socket, proxy, target); ec) {
+            socket->close();
+            co_return std::unexpected{ec};
+        }
+        if (!target.use_tls)
+            co_return Dialed{DialedTransport{std::make_shared<TcpStreamTransport>(std::move(socket), peer)}, true};
+
+        auto stream = std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(std::move(*socket), *m_ssl_context);
+        auto transport = std::make_shared<TlsStreamTransport>(stream, peer);
+        if (auto ec = co_await target_tls_handshake(*transport, target); ec) {
+            transport->close();
+            co_return std::unexpected{ec};
+        }
+        co_return Dialed{DialedTransport{std::move(transport)}, true};
+    }
+
+    // CONNECT or SOCKS5, under the dial budget.
+    template <typename Stream>
+    asio::awaitable<error_code> tunnel_handshake(Stream &stream, const ProxyConfig &proxy, const ClientTarget &target) {
+        auto op = proxy.kind == ProxyKind::Socks5 ? socks5_connect(stream, proxy, target.host, target.effective_port())
+                                                  : http_connect(stream, proxy, target.authority());
+        auto outcome =
+            co_await await_with_deadline(std::move(op), m_config.connect_timeout, client_errc::connect_timeout);
+        if (!outcome)
+            co_return outcome.error();
+        co_return *outcome;
+    }
+
+    // The origin's TLS handshake, shared by the direct path and both proxy
+    // paths (the transport may already be nested inside the proxy's TLS).
+    template <typename Transport>
+    asio::awaitable<error_code> target_tls_handshake(Transport &transport, const ClientTarget &target) {
         ClientTlsHandshake hs;
         hs.sni = target.sni.empty() && !m_config.tls.sni_override.empty() ? m_config.tls.sni_override
                                                                           : std::string{target.sni_host()};
@@ -702,20 +845,39 @@ class ClientEngine {
         // would be impossible.
         hs.alpn_wire = alpn_wire_list(target, m_config.tls);
 
-        auto outcome = co_await await_with_deadline(tls_client_handshake(*transport, hs), m_config.connect_timeout);
-        if (!outcome) {
-            transport->close();
-            co_return std::unexpected{outcome.error()};
-        }
+        auto outcome = co_await await_with_deadline(tls_client_handshake(transport, hs), m_config.connect_timeout,
+                                                    client_errc::connect_timeout);
+        if (!outcome)
+            co_return outcome.error();
         if (error_code e = *outcome) {
             SIMPLE_HTTP_ERROR_LOG("client: TLS handshake with {} failed: {}", target.sni_host(), e.message());
-            transport->close();
-            co_return std::unexpected{e};
+            co_return e;
         }
-        co_return DialedTransport{std::move(transport)};
+        co_return error_code{};
     }
 
-  private:
+    // One proxy TLS context per engine. Built from the client's TLS policy but
+    // stripped of everything that belongs to origins: the client certificate
+    // must not be presented to a proxy, the SNI override is an origin name, and
+    // the caller's setup hook is origin policy. Verification follows the
+    // ProxyConfig.
+    std::shared_ptr<asio::ssl::context> proxy_ssl_context(const ProxyConfig &proxy) {
+        if (m_proxy_ssl_context)
+            return m_proxy_ssl_context;
+        TlsClientConfig tls = m_config.tls;
+        tls.cert_chain_file.clear();
+        tls.private_key_file.clear();
+        tls.sni_override.clear();
+        tls.setup = nullptr;
+        tls.alpn.clear();
+        tls.verify_peer = proxy.verify_peer;
+        tls.verify_host = proxy.verify_host && proxy.verify_peer;
+        if (!proxy.ca_file.empty())
+            tls.ca_file = proxy.ca_file;
+        m_proxy_ssl_context = make_client_ssl_context(tls);
+        return m_proxy_ssl_context;
+    }
+
     // The ClientTarget a URL describes, with the client-wide defaults for the
     // knobs a URL cannot express.
     ClientTarget target_from_url(const Url &url) const {
@@ -732,24 +894,44 @@ class ClientEngine {
         const bool want_upgrade = !target.use_tls && target.h2c == H2cMode::Upgrade &&
                                   target.version != HttpVersionPolicy::Http11 && !spec->stream_body();
         if (want_upgrade) {
-            auto h1 = std::dynamic_pointer_cast<Http1ClientSession<TcpStreamTransport>>(session);
-            if (h1 && h1->upgrade_available(spec->stream_body())) {
-                // The upgrading request is consumed by the h2c handshake; the
-                // plain path below would need it whole, so each path gets its
-                // own shared copy (the body rebuilds from the saved source).
-                auto stream = co_await h1->open_stream_upgradeable(
-                    spec->clone_for_replay(co_await asio::this_coro::executor), h2_settings_base64url(m_config.limits));
-                if (!stream)
-                    co_return std::unexpected{stream.error()};
-                // A pinned HTTP/2 policy is not satisfied by an ignored upgrade.
-                if (target.version == HttpVersionPolicy::Http2 && (*stream)->version() != Version::Http2) {
-                    (void)co_await (*stream)->cancel();
-                    co_return std::unexpected{make_error_code(client_errc::version_not_negotiated)};
-                }
-                co_return *stream;
-            }
+            // The h1 session may sit on a direct TCP connection or on a proxy
+            // tunnel: an HTTPS proxy's tunnel is a TlsStreamTransport, while an
+            // HTTP proxy's is the plain TcpStreamTransport. An origin TLS
+            // transport never appears here (want_upgrade requires !use_tls).
+            if (auto attempt = co_await h2c_upgrade<TcpStreamTransport>(session, target, spec))
+                co_return *attempt;
+            if (auto attempt = co_await h2c_upgrade<TlsStreamTransport>(session, target, spec))
+                co_return *attempt;
         }
         co_return co_await session->open_stream(std::move(spec));
+    }
+
+    // The h2c upgrade for one concrete h1-transport instantiation. nullopt means
+    // "this session is not an h1 session of that type (or cannot upgrade)", so
+    // negotiate_and_open tries the next shape and finally falls back to a plain
+    // open_stream.
+    template <typename Transport>
+    asio::awaitable<std::optional<std::expected<std::shared_ptr<ClientStream>, error_code>>>
+    h2c_upgrade(const std::shared_ptr<ClientSession> &session, const ClientTarget &target,
+                const std::shared_ptr<Request> &spec) {
+        auto h1 = std::dynamic_pointer_cast<Http1ClientSession<Transport>>(session);
+        if (!h1 || !h1->upgrade_available(spec->stream_body()))
+            co_return std::nullopt;
+        // The upgrading request is consumed by the h2c handshake; the plain path
+        // would need it whole, so each path gets its own shared copy (the body
+        // rebuilds from the saved source).
+        auto stream = co_await h1->open_stream_upgradeable(spec->clone_for_replay(co_await asio::this_coro::executor),
+                                                           h2_settings_base64url(m_config.limits));
+        if (!stream)
+            co_return std::optional<std::expected<std::shared_ptr<ClientStream>, error_code>>{
+                std::unexpected{stream.error()}};
+        // A pinned HTTP/2 policy is not satisfied by an ignored upgrade.
+        if (target.version == HttpVersionPolicy::Http2 && (*stream)->version() != Version::Http2) {
+            (void)co_await (*stream)->cancel();
+            co_return std::optional<std::expected<std::shared_ptr<ClientStream>, error_code>>{
+                std::unexpected{make_error_code(client_errc::version_not_negotiated)}};
+        }
+        co_return std::optional<std::expected<std::shared_ptr<ClientStream>, error_code>>{*stream};
     }
 
     // Dials an HTTP/3 session: QUIC/UDP plus nghttp3. Its own path because the
@@ -788,55 +970,74 @@ class ClientEngine {
     // keeps it as its single connection or the caller closes it.
     asio::awaitable<std::expected<std::shared_ptr<ClientSession>, error_code>> dial(ClientTarget target,
                                                                                     asio::any_io_executor ex) {
-        if (target.version == HttpVersionPolicy::Http3)
+        if (target.version == HttpVersionPolicy::Http3) {
+            // QUIC cannot travel through a CONNECT tunnel; h3 stays direct even
+            // when a proxy is configured.
+            if (auto selected = select_proxy(m_config, target); selected && *selected)
+                SIMPLE_HTTP_DEBUG_LOG("client: HTTP/3 target {} dials directly (proxies do not carry QUIC)",
+                                      target.authority());
             co_return co_await dial_h3(std::move(target), ex);
-        auto transport = co_await dial_transport(target, ex);
-        if (!transport)
-            co_return std::unexpected{transport.error()};
+        }
+        auto dialed = co_await dial_transport(target, ex);
+        if (!dialed)
+            co_return std::unexpected{dialed.error()};
+        const bool tunneled = dialed->tunneled;
         auto session = co_await std::visit(
             [&](auto &typed) -> asio::awaitable<std::expected<std::shared_ptr<ClientSession>, error_code>> {
                 using Transport = std::decay_t<decltype(*typed)>;
-                // An HTTP/1.1 session, or an HTTP/2 one when the policy says so
-                // (h2c prior-knowledge) / ALPN selected h2, and the wire allows
-                // it. WebSockets never come through here — see dial_transport.
-                if constexpr (std::is_same_v<Transport, TlsStreamTransport>) {
-                    const std::string_view alpn = typed->alpn_selected();
-                    if (target.version == HttpVersionPolicy::Http2 && alpn != "h2") {
+                // The protocol is decided by the target, not by the transport's
+                // concrete type: a plaintext origin behind an HTTPS proxy rides
+                // a TLS transport, and a TLS origin behind one rides a nested
+                // TLS transport.
+                if (target.use_tls) {
+                    if constexpr (requires { typed->alpn_selected(); }) {
+                        const std::string_view alpn = typed->alpn_selected();
+                        if (target.version == HttpVersionPolicy::Http2 && alpn != "h2") {
+                            typed->close();
+                            co_return std::unexpected{make_error_code(client_errc::version_not_negotiated)};
+                        }
+                        if (alpn == "h2") {
+                            auto h2 = std::make_shared<Http2ClientSession<Transport>>(typed, target, m_config.limits,
+                                                                                      m_config.idle_timeout);
+                            if (auto ec = co_await h2->start(); ec) {
+                                h2->close();
+                                co_return std::unexpected{ec};
+                            }
+                            co_return h2;
+                        }
+                        auto h1 = std::make_shared<Http1ClientSession<Transport>>(
+                            typed, target.authority(), m_config.limits, m_config.idle_timeout);
+                        wire_h1_session(h1, target);
+                        co_return h1;
+                    } else {
+                        // A TLS target cannot arrive over a plaintext transport;
+                        // refusing beats speaking the wrong protocol.
                         typed->close();
                         co_return std::unexpected{make_error_code(client_errc::version_not_negotiated)};
                     }
-                    if (alpn == "h2") {
-                        auto session = std::make_shared<Http2ClientSession<TlsStreamTransport>>(
-                            typed, target, m_config.limits, m_config.idle_timeout);
-                        if (auto ec = co_await session->start(); ec) {
-                            session->close();
-                            co_return std::unexpected{ec};
-                        }
-                        co_return session;
-                    }
-                    auto session = std::make_shared<Http1ClientSession<TlsStreamTransport>>(
-                        typed, target.authority(), m_config.limits, m_config.idle_timeout);
-                    wire_h1_session(session, target);
-                    co_return session;
-                } else {
-                    const bool speak_h2_at_once =
-                        target.h2c == H2cMode::PriorKnowledge && target.version != HttpVersionPolicy::Http11;
-                    if (speak_h2_at_once) {
-                        auto session = std::make_shared<Http2ClientSession<TcpStreamTransport>>(
-                            typed, target, m_config.limits, m_config.idle_timeout);
-                        if (auto ec = co_await session->start(); ec) {
-                            session->close();
-                            co_return std::unexpected{ec};
-                        }
-                        co_return session;
-                    }
-                    auto session = std::make_shared<Http1ClientSession<TcpStreamTransport>>(
-                        typed, target.authority(), m_config.limits, m_config.idle_timeout);
-                    wire_h1_session(session, target);
-                    co_return session;
                 }
+                // Plaintext: a tunnel starts at the connection's first byte, so a
+                // pinned HTTP/2 policy can send the preface directly instead of
+                // attempting an Upgrade (which the HTTPS-proxy tunnel cannot
+                // carry, since that session is not an h1-over-TCP one).
+                const bool speak_h2_at_once =
+                    (target.h2c == H2cMode::PriorKnowledge && target.version != HttpVersionPolicy::Http11) ||
+                    (tunneled && target.version == HttpVersionPolicy::Http2 && target.h2c != H2cMode::Off);
+                if (speak_h2_at_once) {
+                    auto h2 = std::make_shared<Http2ClientSession<Transport>>(typed, target, m_config.limits,
+                                                                              m_config.idle_timeout);
+                    if (auto ec = co_await h2->start(); ec) {
+                        h2->close();
+                        co_return std::unexpected{ec};
+                    }
+                    co_return h2;
+                }
+                auto h1 = std::make_shared<Http1ClientSession<Transport>>(typed, target.authority(), m_config.limits,
+                                                                          m_config.idle_timeout);
+                wire_h1_session(h1, target);
+                co_return h1;
             },
-            *transport);
+            dialed->transport);
         co_return session;
     }
 
@@ -867,14 +1068,22 @@ class ClientEngine {
             });
     }
 
+    // Resolves a host through the caller's hook (or the system resolver). Used
+    // for the origin on the direct path and for the proxy host on every proxy
+    // path; the origin is never resolved when a proxy is in effect.
     asio::awaitable<std::expected<std::vector<asio::ip::tcp::endpoint>, error_code>>
-    resolve(const ClientTarget &target, const asio::any_io_executor &ex) {
-        auto [ec, endpoints] = co_await resolve_endpoints(m_config.resolve, target.host, target.effective_port(), ex);
+    resolve_host(const std::string &host, std::uint16_t port, const asio::any_io_executor &ex) {
+        auto [ec, endpoints] = co_await resolve_endpoints(m_config.resolve, host, port, ex);
         if (ec)
             co_return std::unexpected{ec};
         if (endpoints.empty())
             co_return std::unexpected{make_error_code(asio::error::host_not_found)};
         co_return endpoints;
+    }
+
+    asio::awaitable<std::expected<std::vector<asio::ip::tcp::endpoint>, error_code>>
+    resolve(const ClientTarget &target, const asio::any_io_executor &ex) {
+        co_return co_await resolve_host(target.host, target.effective_port(), ex);
     }
 
     asio::awaitable<error_code> connect_with_deadline(const std::string &authority, asio::ip::tcp::socket &socket,
@@ -924,6 +1133,9 @@ class ClientEngine {
     asio::any_io_executor m_executor;
     ClientConfig m_config;
     std::shared_ptr<asio::ssl::context> m_ssl_context; // outlives every stream using it
+    // The proxy leg's own context (HTTPS proxies). Separate from m_ssl_context so
+    // the origin's client certificate and setup hook never reach a proxy.
+    std::shared_ptr<asio::ssl::context> m_proxy_ssl_context;
     std::shared_ptr<ExchangeGate> m_h1_gate{std::make_shared<ExchangeGate>(m_executor)};
     // The single kept connection and its identity, touched only on m_executor
     // (start_exchange runs there; the destructor moves the session out for

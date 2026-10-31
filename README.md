@@ -721,6 +721,52 @@ has `bearer_auth(token)`.
 
 ---
 
+## 🔗 Client: outbound proxies
+
+Every TCP-based client connection — HTTP/1.1, HTTP/2, h2c and WebSocket — can be
+tunnelled through an outbound proxy: HTTP `CONNECT`, an HTTPS proxy (TLS to the
+proxy itself first), or SOCKS5 with optional username/password.
+
+```cpp
+simple_http::ClientConfig cfg;
+cfg.proxy = simple_http::ProxyConfig{
+    .kind = simple_http::ProxyKind::Socks5,   // Http | Https | Socks5
+    .host = "127.0.0.1",
+    .port = 1080,
+    // .username = "user", .password = "pass",
+};
+simple_http::Client client{co_await asio::this_coro::executor, cfg};
+```
+
+Without an explicit `proxy`, `proxy_from_env` (default true) selects
+`HTTPS_PROXY` for https targets and `HTTP_PROXY` for http targets, then
+`ALL_PROXY` (uppercase spelling first, lowercase accepted). `NO_PROXY` is
+evaluated first and bypasses the proxy: entries are `*`, an exact host, a bare or
+leading-dot domain suffix (also matching subdomains), `host:port`, and IPv4/IPv6
+literals — no CIDR or glob forms. `ClientConfig::no_proxy` overrides it for
+environment-selected proxies and always applies to an explicitly configured
+`proxy`. A malformed proxy URL fails closed (`client_errc::proxy_error`); a 407
+or a SOCKS5 rejection is `client_errc::proxy_auth_failed`.
+
+Worth knowing:
+
+- The target is never resolved locally when proxied: CONNECT carries `host:port`,
+  and SOCKS5 sends a name as `ATYP=3` (`socks5://` and `socks5h://` behave the
+  same, matching the xray/v2ray convention).
+- An HTTPS proxy means TLS inside TLS for an https target. The proxy leg gets its
+  own `ssl::context`, so the origin's client certificate is never presented to
+  the proxy; `ProxyConfig` carries its own `verify_peer`/`verify_host`/
+  `server_name`/`ca_file`.
+- HTTP/3 is dialed directly even with a proxy configured: QUIC needs
+  CONNECT-UDP/MASQUE, which this transport does not implement.
+- `ws://` and `wss://` go through the same tunnel (established before the
+  Upgrade).
+- Server-side reverse-proxy upstreams do **not** inherit the process's proxy
+  environment by default (`HttpProxyTarget::use_env_proxy` opts in per route); an
+  explicit `ClientConfig::proxy` on the route still applies.
+
+---
+
 ## 📜 OpenAPI & Swagger UI
 
 `route` is the registration point, so an OpenAPI 3.1 document can be *collected*

@@ -691,7 +691,13 @@ class Router {
             // returns, so nothing is cached across requests — no lock, and no
             // head-of-line blocking between requests on the same worker context.
             auto ex = co_await asio::this_coro::executor;
-            simple_http::Client client{ex, std::move(proxy->client_cfg)};
+            auto client_cfg = std::move(proxy->client_cfg);
+            // Server-side upstreams stay direct by default: the process's proxy
+            // environment must not reroute loopback/private backends. A proxy
+            // configured explicitly on the route is unaffected.
+            if (!client_cfg.proxy)
+                client_cfg.proxy_from_env = client_cfg.proxy_from_env && proxy->target.use_env_proxy;
+            simple_http::Client client{ex, std::move(client_cfg)};
             Next terminal = [&client, client_is_tls, target = std::move(proxy->target)](
                                 RequestPtr r, ResponsePtr w, SslHandle s) mutable -> asio::awaitable<void> {
                 co_await run_http_proxy(std::move(r), std::move(w), client_is_tls, std::move(target), client);

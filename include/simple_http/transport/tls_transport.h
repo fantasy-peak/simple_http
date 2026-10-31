@@ -108,6 +108,13 @@ template <typename Socket> class TlsTransport {
 };
 
 using TlsStreamTransport = TlsTransport<asio::ip::tcp::socket>;
+
+// TLS over a TLS connection: the client's origin TLS runs inside the TLS
+// connection it already established to an HTTPS proxy. asio's ssl::stream
+// accepts another ssl::stream as its next layer (both are byte streams), and
+// lowest_layer() still bottoms out at the TCP socket. The outer SSL object is
+// the origin's, so alpn_selected()/tls_handle() report what dial() needs.
+using NestedTlsTransport = TlsTransport<asio::ssl::stream<asio::ip::tcp::socket>>;
 #ifdef BOOST_ASIO_HAS_LOCAL_SOCKETS
 using TlsUnixTransport = TlsTransport<asio::local::stream_protocol::socket>;
 #endif

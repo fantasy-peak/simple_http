@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -150,6 +151,68 @@ struct TlsClientConfig {
     std::function<void(asio::ssl::context &)> setup;
 };
 
+// An outbound proxy. A configured proxy tunnels every TCP-based connection the
+// client opens - HTTP/1.1, HTTP/2 (including h2c) and WebSocket alike - by
+// connecting to the proxy first and asking it for a byte tunnel to the target.
+//
+// HTTP/3 is deliberately not proxied: QUIC cannot travel through a plain
+// CONNECT tunnel (it needs CONNECT-UDP/MASQUE or SOCKS5 UDP ASSOCIATE), so an
+// h3 request still dials its origin directly.
+enum class ProxyKind : std::uint8_t {
+    Http = 0,  // plaintext CONNECT to the proxy
+    Https = 1, // TLS to the proxy itself, then CONNECT inside it
+    Socks5 = 2 // SOCKS5 CONNECT (RFC 1928), optional user/password (RFC 1929)
+};
+
+struct ProxyConfig {
+    ProxyKind kind{ProxyKind::Http};
+    std::string host;
+    std::uint16_t port{0}; // 0 = the kind's default (80 / 443 / 1080)
+
+    // Credentials. An empty username means no authentication. An HTTP proxy
+    // gets a preemptive `Proxy-Authorization: Basic ...` (RFC 7617); SOCKS5
+    // uses the RFC 1929 sub-negotiation.
+    std::string username;
+    std::string password;
+
+    // Https only: verification and the name to send as SNI (empty = host).
+    // The origin's client certificate is deliberately not presented to the
+    // proxy; the engine builds a separate proxy ssl::context for this leg.
+    bool verify_peer{true};
+    bool verify_host{true};
+    std::string server_name;
+    std::string ca_file; // empty = ClientConfig::tls.ca_file (or system store)
+
+    std::uint16_t effective_port() const {
+        if (port != 0)
+            return port;
+        switch (kind) {
+        case ProxyKind::Https:
+            return 443;
+        case ProxyKind::Socks5:
+            return 1080;
+        case ProxyKind::Http:
+        default:
+            return 80;
+        }
+    }
+
+    // "host:port", bracketing IPv6 literals.
+    std::string authority() const {
+        std::string out;
+        if (host.find(':') != std::string::npos) {
+            out.push_back('[');
+            out.append(host);
+            out.push_back(']');
+        } else {
+            out.append(host);
+        }
+        out.push_back(':');
+        out.append(std::to_string(effective_port()));
+        return out;
+    }
+};
+
 // Where to connect and how to speak there. A `Client` keeps one connection per
 // (origin, version policy, tag) — the target fully decides that key. Internal
 // engine type — hidden in http::detail, since connection policy is not public
@@ -203,6 +266,26 @@ struct ClientTarget {
 // Policy shared by every connection the client opens.
 struct ClientConfig {
     TlsClientConfig tls{};
+
+    // Outbound proxy policy. When set, every TCP-based connection this client
+    // opens is tunnelled through it - including WebSocket. HTTP/3 is dialed
+    // directly regardless (see ProxyKind).
+    //
+    // Selection: `proxy` wins when set. Otherwise, with proxy_from_env (default
+    // true), HTTPS_PROXY / HTTP_PROXY - chosen by the target's scheme - and then
+    // ALL_PROXY are consulted; NO_PROXY is applied first and bypasses the proxy.
+    // The environment is read at dial time, not cached; mutating it from another
+    // thread while requests are in flight is not supported.
+    //
+    // `no_proxy` entries bypass the proxy. When the proxy comes from the
+    // environment and this list is empty, the environment's NO_PROXY is used
+    // instead. Grammar: "*", an exact host, a bare or leading-dot domain suffix,
+    // and host:port; CIDR and glob forms are not supported. Names are matched
+    // case-insensitively against the target host (the name as written, before
+    // any DNS lookup).
+    std::optional<ProxyConfig> proxy{};
+    bool proxy_from_env{true};
+    std::vector<std::string> no_proxy{};
 
     // Defaults for requests that name only a URL (which cannot express a version
     // policy). A ClientTarget passed explicitly overrides them.
@@ -282,9 +365,12 @@ struct ClientConfig {
     // Lets an application plug in its own DNS (cache, DoH, c-ares, a private
     // upstream, …) instead of the built-in asio resolver. Empty =
     // asio::ip::tcp::resolver. The same hook is accepted by WsProxyTarget.
+    // With a proxy selected it resolves the *proxy* host; the origin name is
+    // handed to the proxy and never looked up here.
     ResolveFn resolve;
 
-    // Applied to the freshly-connected socket, before TLS starts.
+    // Applied to the freshly-connected socket, before TLS starts — including the
+    // connection to a proxy.
     std::function<void(asio::ip::tcp::socket &)> socket_setup;
 };
 
@@ -317,6 +403,8 @@ enum class client_errc : int {
     http_status,           // error_for_status(): the response status was not 2xx
     response_head_timeout, // no response head within ClientConfig::response_head_timeout
     body_idle_timeout,     // silence between body reads exceeded body_idle_timeout
+    proxy_error,           // the proxy refused the tunnel, or its reply was malformed
+    proxy_auth_failed,     // the proxy rejected the configured credentials
 };
 
 } // namespace simple_http
@@ -388,6 +476,10 @@ class ClientErrorCategory : public boost::system::error_category {
             return "no response head within the configured TTFB budget";
         case client_errc::body_idle_timeout:
             return "the response body was silent past the idle budget";
+        case client_errc::proxy_error:
+            return "the proxy refused the tunnel or its reply was malformed";
+        case client_errc::proxy_auth_failed:
+            return "the proxy rejected the configured credentials";
         default:
             return "unknown client error";
         }

@@ -106,7 +106,10 @@ include/
       http.h               公共客户端 API（平铺在 `simple_http::` 顶层）：Client / RequestBuilder /
                            Stream / Response / StreamSpec / WebSocketSpec
       ws_client.h          WebSocket 客户端：dial_transport 裸建连 + Upgrade 握手，复用 WsBackendImpl
-      client_config.h      ClientConfig / TlsClientConfig / client_errc / HttpVersionPolicy / H2cMode
+      client_config.h      ClientConfig / TlsClientConfig / ProxyConfig / client_errc /
+                           HttpVersionPolicy / H2cMode
+      proxy.h              出站代理：URL 解析、NO_PROXY、HTTP(S)_PROXY/ALL_PROXY 选择，
+                           CONNECT 与 SOCKS5 隧道握手（模板化在 Asio 流上）
       url.h                绝对 URL 解析（parse_url；ws:// wss:// 归一后复用）
       client_stream.h      ResponseHead / ClientStream / ClientSession（内部引擎接口）
       multiplexed_session.h  h2/h3 共用的多路复用会话骨架与流句柄
@@ -454,6 +457,15 @@ auto ws = co_await client.open_websocket("wss://host/chat", {.origin = "https://
   不依赖调用方何时丢弃 stream。连接是否需要门由 `ClientSession::multiplexes()` 决定，
   不再用 `version()==…` 推断（h1→h2c 升级后报告后继的能力）。版本策略可按请求覆盖
   （`RequestBuilder::version()` / `StreamSpec::version`），策略是连接键的一部分。
+- **出站代理**：`ClientConfig::proxy`（`ProxyConfig`：`Http`/`Https`/`Socks5`，可带
+  Basic / RFC 1929 凭据）显式配置；未设置且 `proxy_from_env`（默认 true）时按目标
+  scheme 读 `HTTPS_PROXY`/`HTTP_PROXY`，再回退 `ALL_PROXY`，`NO_PROXY` 先判（支持 `*`、
+  精确 host、域名后缀、`host:port`、IP 字面量；不支持 CIDR/通配）。目标域名经代理
+  远程解析（SOCKS5 一律 ATYP=3）。HTTPS 代理对 https 目标是 TLS over TLS，代理腿用
+  独立 ssl::context（不向代理出示客户端证书）。h3 恒直连（QUIC 需要 CONNECT-UDP）。
+  反代上游默认不读环境（`HttpProxyTarget::use_env_proxy` 默认 false）。验证：
+  `test/unit/test_proxy_units.cpp` + `test/client.cpp` 的 `suite_proxy`（进程内
+  CONNECT / HTTPS 代理 / SOCKS5，含认证失败、NO_PROXY、环境变量与嵌套 TLS）。
 - **HTTP/3**：设 `ClientConfig::default_version = HttpVersionPolicy::Http3`（URL 必须是
   `https://`；QUIC 自带 TLS 1.3），客户端对同一 origin 保持一条 QUIC 连接、在其上多路
   复用请求流（`Http3ClientSession`，`client/h3_client.h`）。只做显式启用——不做

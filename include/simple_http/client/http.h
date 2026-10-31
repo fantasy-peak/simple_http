@@ -633,9 +633,9 @@ class Client {
         target.version = HttpVersionPolicy::Http11; // WebSocket is HTTP/1-based
         target.h2c = H2cMode::Off;
 
-        auto transport = co_await engine->dial_transport(target, co_await asio::this_coro::executor);
-        if (!transport)
-            co_return std::unexpected{transport.error()};
+        auto dialed = co_await engine->dial_transport(target, co_await asio::this_coro::executor);
+        if (!dialed)
+            co_return std::unexpected{dialed.error()};
 
         const std::string authority = target.authority();
         const std::string path = std::string{parsed->target};
@@ -644,7 +644,7 @@ class Client {
                 co_return co_await detail::ws_upgrade(typed, authority, path, spec, m_cfg.idle_timeout,
                                                       m_cfg.response_head_timeout);
             },
-            *transport);
+            dialed->transport);
     }
 
     // Connection dials (one Client keeps a single connection, re-dialed on a
