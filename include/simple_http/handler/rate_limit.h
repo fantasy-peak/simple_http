@@ -164,6 +164,19 @@ class RateLimiter {
         return m_buckets.size();
     }
 
+    // Seconds until `key` would admit a request; 0 when it already would, or
+    // when the key has no bucket yet. Read-only; a refused request uses it for
+    // Retry-After, so a per-key limiter answers with the same header shape as
+    // the shared-bucket one.
+    std::int64_t seconds_until_token(std::string_view key) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto it = m_buckets.find(std::string{key});
+        if (it == m_buckets.end()) {
+            return 0;
+        }
+        return it->second.bucket->seconds_until_token();
+    }
+
   private:
     struct Entry {
         std::shared_ptr<TokenBucket> bucket;
@@ -254,9 +267,13 @@ inline Middleware rate_limit(std::shared_ptr<RateLimiter> limiter,
                              std::function<std::string(const RequestPtr &)> key_from = detail::request_key) {
     return [limiter = std::move(limiter), key_from = std::move(key_from)](
                RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
-        if (!limiter->try_acquire(key_from(req))) {
+        auto key = key_from(req);
+        if (!limiter->try_acquire(key)) {
+            // The per-key bucket knows when it refills, so the response carries
+            // the same Retry-After as the shared-bucket limiter.
+            res->header(field::retry_after, std::to_string(limiter->seconds_until_token(key)));
             co_await res->status(status::too_many_requests).send("too many requests");
-            co_return; // answered here — a per-key budget has no shared Retry-After
+            co_return; // answered here
         }
         co_await next(std::move(req), std::move(res), ssl);
     };

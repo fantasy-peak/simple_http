@@ -383,7 +383,10 @@ class ResponseWriter {
     // protocol (h1/h2/h3 all go through this ResponseWriter).
     void apply_defaults() {
         ensure_date(m_headers);
-        if (!m_headers.contains("content-type")) {
+        // 204/304 carry no content, so a default Content-Type would describe
+        // something that does not exist (RFC 9110 §15.3.5/§15.4.5). A handler
+        // that set one explicitly still gets it.
+        if (m_status != status::no_content && m_status != status::not_modified && !m_headers.contains("content-type")) {
             m_headers.add_lower("content-type", "text/plain");
         }
         if (!m_headers.contains("server")) {

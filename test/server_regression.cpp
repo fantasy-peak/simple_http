@@ -122,6 +122,15 @@ void register_routes(sh::Server &server) {
     server.route(sh::any_methods, "/empty", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
         co_await res->status(204).send_bodyless();
     });
+    // A handler trying to choose connection framing / disposition: the engine
+    // must strip those fields and emit exactly one framing.
+    server.route(sh::any_methods, "/badhdr", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(200)
+            .header("connection", "keep-alive")
+            .header("transfer-encoding", "chunked")
+            .header("x-ok", "kept")
+            .send("body-with-illegal-headers-stripped");
+    });
     server.route(sh::any_methods, "/stream", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
         (void)co_await res->status(200).content_type("text/plain").begin();
         (void)co_await res->write("one-");
@@ -558,6 +567,27 @@ TEST_CASE("regression/h1: a body larger than the cap is refused with 413", "[reg
     client.send("POST /echo HTTP/1.1\r\nHost: x\r\ncontent-length: " + std::to_string(kMaxBodyBytes + 1) + "\r\n\r\n");
     REQUIRE(client.wait_head());
     CHECK(status_of(client.received()) == 413);
+    client.close();
+}
+
+TEST_CASE("regression/h1: handler hop-by-hop headers are stripped", "[regression][h1]") {
+    plain_server();
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(kPlainPort));
+
+    client.send("GET /badhdr HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    REQUIRE(client.wait_for("body-with-illegal-headers-stripped"));
+    const std::string &wire = client.received();
+    const auto head_end = wire.find("\r\n\r\n");
+    REQUIRE(head_end != std::string::npos);
+    const std::string head = wire.substr(0, head_end);
+    const bool has_te = head.find("transfer-encoding") != std::string::npos;
+    const bool has_cl = head.find("content-length") != std::string::npos;
+    // RFC 9112 §6.1: exactly one framing. A handler-set Transfer-Encoding next
+    // to the engine's Content-Length was the response-splitting shape.
+    CHECK(has_cl != has_te);
+    CHECK(head.find("x-ok: kept") != std::string::npos);
     client.close();
 }
 

@@ -666,6 +666,10 @@ test/conformance/run.sh h2spec   # 只跑指定的（h2spec / h1spec / autobahn 
 “交叉验证”还包含把 simple_http 与成熟开源实现放在同一批输入下对比：
 
 - **对照实现**：Go `net/http`（明文 h1 / TLS+h2）为主；需要时加 nginx、Caddy、Python `http.server`，同一语义尽量由多个实现印证。
+- **开源客户端逐功能差分**：用 httpx（h1/h2）、hyper-h2（trailers / 100-continue）、
+  websockets（text/binary/ping/close）分别驱动 simple_http 与一个实现相同端点语义的
+  Go 参考服务端，比较状态码、framing、关键头、body、trailers 与 WS 消息行为。
+  驱动侧不使用本库客户端，避免与服务端共享规范误读。
 - **驱动**：服务端侧用原始 socket 发送**相同字节**（含畸形与 framing 边界）；客户端侧用同一个第三方客户端分别请求两边。
 - **比较项**：状态码、`Allow`、`Content-Type`、`Content-Length` / `Transfer-Encoding`、body 长度与内容、连接复用/关闭、协商到的协议版本。
 - **判定原则：以 RFC 为准，不以“和 Go 不一样”判定为本库 bug**。已知合理差异：CL+TE 与 obs-fold 上 simple_http 更严格（RFC 9112 §6.1 / §5.2 要求拒绝）；h2 一次性响应省略 `content-length`（`END_STREAM` 界定）；`Allow` 含 `OPTIONS`（自动支持）。真正要修的是双方都违反 RFC，或与独立实现互操作失败的情形。
@@ -719,6 +723,16 @@ add dev <iface> root netem loss 3%` 注入丢包，`h2load --alpn-list=h3 …` �
   连接的 co_spawn 完成回调（不是 handler 返回时）。同时给 accept 加了资源类错误（EMFILE/
   ENOBUFS/ENOMEM）的**指数退避**（5ms→1s），对齐 Go `http.Server`——此前只打日志后
   `continue`，fd 耗尽会空转烧核。可观测：`Server::active_connections()`。
+- **H1 响应 framing**：handler 在 `send()` / `send_headers()` 上设置的
+  `transfer-encoding: chunked`（或 `connection`）曾被原样保留，与引擎自己补的
+  `Content-Length` 同时上线——RFC 9112 §6.1 的双 framing，严格客户端按 chunked 解析会挂起。
+  修法：h1 sink 写头前剥离 handler 提供的 hop-by-hop 字段（connection / keep-alive /
+  transfer-encoding / proxy-connection / upgrade），framing 只由引擎决定。回归：
+  `server_regression.cpp` 的 `/badhdr` 用例。
+- **per-key 限流 Retry-After**：`rate_limit(limiter, key_fn)` 的 429 曾不带 `Retry-After`
+  （只有共享桶版本带）。现在按该 key 的桶计算，两个版本行为一致。
+- **204/304 默认 Content-Type**：`apply_defaults()` 曾给无内容的 204/304 也补
+  `content-type: text/plain`；现在只在有内容的状态上补。
 - **HTTP/2 Rapid Reset（2.3，CVE-2023-44487）**：`h2_max_concurrent_streams` 只限**打开的流**，
   而「开流→立刻 RST」会释放流表槽位但不释放已启动的 handler，故 reset 洪泛能无限派发 handler。
   修法对齐 Go 的 HTTP/2 修复：把**同时在跑的 handler** 上限设为 `h2_max_concurrent_streams`，

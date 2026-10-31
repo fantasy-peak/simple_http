@@ -97,6 +97,11 @@ template <TransportLike Transport> class Http1ResponseSink : public ResponseSink
             // Neither a body nor a Content-Length (RFC 9110 §15.3.5/§15.4.5).
             co_return co_await send_bodyless(status, std::move(headers));
         }
+        // A handler must not choose the connection framing: a Transfer-Encoding
+        // set alongside the Content-Length added below is two framings on one
+        // message (RFC 9112 §6.1), the classic response-splitting shape. The
+        // engine owns framing; connection management likewise stays here.
+        strip_hop_by_hop(headers);
         ensure_date(headers);
 
         // Erase first: add_lower appends, so a handler that set its own
@@ -129,6 +134,7 @@ template <TransportLike Transport> class Http1ResponseSink : public ResponseSink
         co_await hop();
         if (!m_open)
             co_return make_error_code(asio::error::not_connected);
+        strip_hop_by_hop(headers);
         ensure_date(headers);
         std::string out;
         build_head(out, status, headers);
@@ -156,6 +162,7 @@ template <TransportLike Transport> class Http1ResponseSink : public ResponseSink
         co_await hop();
         if (!m_open)
             co_return make_error_code(asio::error::not_connected);
+        strip_hop_by_hop(headers);
         ensure_date(headers);
 
         // A streamed response is chunked (HTTP/1.1) or close-delimited
@@ -410,6 +417,17 @@ template <TransportLike Transport> class Http1ResponseSink : public ResponseSink
         // is needed here.
         const std::array<ConstByteSpan, 1> buffers{as_bytes(out)};
         co_return co_await write_raw_seq(buffers);
+    }
+
+    // Handler-set connection-level fields are never the handler's to choose:
+    // the engine decides both framing (Content-Length vs chunked) and the
+    // connection disposition. Leaving them in can put two framings on one
+    // message (RFC 9112 §6.1) or override keep-alive.
+    static void strip_hop_by_hop(Headers &headers) {
+        for (const std::string_view name :
+             {"connection", "keep-alive", "transfer-encoding", "proxy-connection", "upgrade"}) {
+            headers.erase(name);
+        }
     }
 
     asio::awaitable<void> hop() const { co_await asio::dispatch(asio::bind_executor(m_executor, asio::use_awaitable)); }
