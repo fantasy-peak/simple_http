@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <boost/asio.hpp>
 #include <boost/asio/experimental/awaitable_operators.hpp>
 #include <charconv>
@@ -72,10 +73,15 @@ template <TransportLike Transport> class Http1ResponseSink : public ResponseSink
     // the already-rendered value of the Alt-Svc field, or empty for none: the
     // writer has no business knowing about ports or cache lifetimes, only about
     // where the octets go.
+    // `continue_sent` is shared with the engine so an interim 100 is written at
+    // most once, whether the engine emits it lazily on the first body read or a
+    // handler asks for it explicitly via Response::send_continue().
     Http1ResponseSink(std::shared_ptr<Transport> transport, Version version, SharedDeadline deadline,
-                      std::chrono::steady_clock::duration idle_timeout, std::string alt_svc = {})
+                      std::chrono::steady_clock::duration idle_timeout, std::string alt_svc = {},
+                      std::shared_ptr<std::atomic<bool>> continue_sent = {})
         : m_transport(std::move(transport)), m_executor(m_transport->get_executor()), m_version(version),
-          m_deadline(std::move(deadline)), m_idle_timeout(idle_timeout), m_alt_svc(std::move(alt_svc)) {}
+          m_deadline(std::move(deadline)), m_idle_timeout(idle_timeout), m_alt_svc(std::move(alt_svc)),
+          m_continue_sent(std::move(continue_sent)) {}
 
     // Set by the engine when the request method was HEAD: the response keeps its
     // headers (so the client learns the entity length) but carries no body
@@ -136,6 +142,10 @@ template <TransportLike Transport> class Http1ResponseSink : public ResponseSink
         co_await hop();
         if (!m_open)
             co_return make_error_code(asio::error::not_connected);
+        // The engine may already have sent the interim response when the
+        // handler read the body; a second one is legal but pointless.
+        if (m_continue_sent && m_continue_sent->exchange(true, std::memory_order_relaxed))
+            co_return error_code{};
         auto ec = co_await write_raw("HTTP/1.1 100 Continue\r\n\r\n");
         if (ec)
             m_open = false;
@@ -414,6 +424,8 @@ template <TransportLike Transport> class Http1ResponseSink : public ResponseSink
     SharedDeadline m_deadline;  // shared with the engine (read path + watchdog)
     std::chrono::steady_clock::duration m_idle_timeout{};
     std::string m_alt_svc; // rendered Alt-Svc value; empty for none
+    // Shared with the engine: exactly one interim 100 Continue per request.
+    std::shared_ptr<std::atomic<bool>> m_continue_sent;
 };
 
 template <TransportLike Transport> class Http1Engine : public std::enable_shared_from_this<Http1Engine<Transport>> {
@@ -665,6 +677,8 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
             // Read before the header map is moved into the Request below.
             const bool expect_continue = framing.has_body && header_has_token(head.headers, "expect", "100-continue");
             setup_body_framing(framing.chunked, framing.content_length);
+            m_body_state.expect_continue = expect_continue;
+            m_continue_sent->store(false, std::memory_order_relaxed);
             // Move the parsed header fields into the request: setup_body_framing
             // above was the last thing that read `head.headers`, so from here the
             // per-request copy of every field (name + value string each) is gone.
@@ -679,14 +693,15 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
                 });
 
             // A request that asked for 100-continue is waiting for an interim
-            // response before it sends its body, and this engine deliberately
-            // never sends one (handlers that want it can). If the handler
-            // answers without reading the body, draining would block until the
-            // client gives up — and bytes of the *next* pipelined request would
-            // be consumed as this body. Announce Connection: close up front and
-            // skip the drain below; the exchange ends at the response.
+            // response before it sends its body. The engine writes that 100
+            // lazily on the handler's first body read (RFC 9110 §10.1.1); if
+            // the handler answers without reading the body, no 100 is sent and
+            // draining would block until the client gives up — and bytes of the
+            // *next* pipelined request would be consumed as this body. Announce
+            // Connection: close up front and skip the drain below; the exchange
+            // ends at the response.
             auto writer = std::make_shared<Http1ResponseSink<Transport>>(
-                m_transport, version, m_deadline, m_limits.idle_timeout, m_limits.alt_svc_value());
+                m_transport, version, m_deadline, m_limits.idle_timeout, m_limits.alt_svc_value(), m_continue_sent);
             writer->set_keep_alive(request_keep_alive && !expect_continue);
             const bool head_request = head.method == Method::Head;
             writer->set_head_request(head_request);
@@ -706,9 +721,10 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
             // Drain any request body the handler did not read, so the connection
             // is positioned at the next pipelined request. If draining fails or
             // the body was oversized/malformed, we cannot safely reuse the
-            // connection. An Expect: 100-continue body is the exception: the
-            // peer is waiting for a 100 this engine will not send, so there is
-            // nothing to drain and the connection is closing anyway.
+            // connection. An Expect: 100-continue body the handler never read is
+            // the exception: no interim response was sent, so the peer never
+            // uploaded it and there is nothing to drain; the connection is
+            // closing anyway.
             const bool drained = (expect_continue && !m_body_state.done) ? false : co_await drain_body();
 
             const bool still_open = co_await writer->connected();
@@ -764,6 +780,16 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
     asio::awaitable<std::expected<ReadResult, error_code>> pull_body_chunk_impl() {
         if (m_body_state.done)
             co_return ReadResult::end();
+        // RFC 9110 §10.1.1: a client that sent Expect: 100-continue waits for
+        // the interim response before sending the body, and the server must not
+        // wait for the body first. Emit it on the first read rather than at the
+        // head, so a handler that rejects the upload can still answer with a
+        // final status. The latch makes this exactly once per request, whether
+        // the engine or a handler's send_continue() gets here first.
+        if (m_body_state.expect_continue && !m_continue_sent->exchange(true, std::memory_order_relaxed)) {
+            if (auto ec = co_await write_all(kContinueResponse); ec)
+                co_return std::unexpected{ec};
+        }
         switch (m_body_state.mode) {
         case BodyState::Mode::None:
             m_body_state.done = true;
@@ -1333,6 +1359,8 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
     static constexpr std::string_view kH2cUpgradeResponse = "HTTP/1.1 101 Switching Protocols\r\n"
                                                             "Connection: Upgrade\r\n"
                                                             "Upgrade: h2c\r\n\r\n";
+    // Sent lazily from the body-read path when the request asked for it.
+    static constexpr std::string_view kContinueResponse = "HTTP/1.1 100 Continue\r\n\r\n";
     // How many bytes one transport read grabs (the head-read buffers and the
     // engine's body-framing scratch).
     static constexpr std::size_t kReadChunkBytes = 8192;
@@ -1409,15 +1437,19 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
     struct BodyState {
         enum class Mode { None, Fixed, Chunked };
         Mode mode{Mode::None};
-        std::uint64_t remaining{0}; // Fixed: bytes left to read
-        std::uint64_t total{0};     // Chunked: running total (bounded by max_body_bytes)
-        bool done{false};           // body fully delivered (EOF reached) / no body
-        bool error{false};          // a pull failed: the connection is not at a request boundary
-        bool line_overflow{false};  // the last read_line() stopped at the size bound (not EOF)
+        std::uint64_t remaining{0};  // Fixed: bytes left to read
+        std::uint64_t total{0};      // Chunked: running total (bounded by max_body_bytes)
+        bool done{false};            // body fully delivered (EOF reached) / no body
+        bool error{false};           // a pull failed: the connection is not at a request boundary
+        bool line_overflow{false};   // the last read_line() stopped at the size bound (not EOF)
+        bool expect_continue{false}; // the request asked for an interim 100 before its body
 
         void reset() { *this = BodyState{}; }
     };
     BodyState m_body_state;
+    // Exactly-once latch for the interim 100 Continue, shared with the response
+    // writer and reset at the start of every request.
+    std::shared_ptr<std::atomic<bool>> m_continue_sent{std::make_shared<std::atomic<bool>>(false)};
 
     std::shared_ptr<Transport> m_transport;
     decltype(std::declval<Transport &>().get_executor()) m_executor;

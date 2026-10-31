@@ -112,6 +112,13 @@ void register_routes(sh::Server &server) {
         auto body = co_await req->body().read_all();
         co_await res->status(200).send("len=" + std::to_string(body ? body->size() : 0) + ":" + (body ? *body : ""));
     });
+    // Asks for the interim response explicitly before reading the body, so the
+    // exactly-once latch can be observed from both paths.
+    server.route(sh::any_methods, "/continue", [](sh::RequestPtr req, sh::ResponsePtr res) -> asio::awaitable<void> {
+        (void)co_await res->send_continue();
+        auto body = co_await req->body().read_all();
+        co_await res->status(200).send("len=" + std::to_string(body ? body->size() : 0));
+    });
     server.route(sh::any_methods, "/empty", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
         co_await res->status(204).send_bodyless();
     });
@@ -510,6 +517,44 @@ TEST_CASE("regression/h1: a body larger than the cap is refused with 413", "[reg
     client.close();
 }
 
+TEST_CASE("regression/h1: Expect 100-continue is answered before the body", "[regression][h1]") {
+    plain_server();
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(kPlainPort));
+
+    // Headers only. A client that honors Expect waits for the interim response
+    // before sending the body; the server must answer that wait instead of
+    // sitting in read() waiting for a body that will never arrive.
+    client.send("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n");
+    REQUIRE(client.wait_for("HTTP/1.1 100 Continue\r\n\r\n"));
+    CHECK(client.received().find("HTTP/1.1 100 Continue") != std::string::npos);
+
+    // The body follows, and the exchange completes normally.
+    client.send("hello");
+    REQUIRE(client.wait_for("200"));
+    CHECK(client.received().find("len=5:hello") != std::string::npos);
+    client.close();
+}
+
+TEST_CASE("regression/h1: an explicit send_continue is not duplicated", "[regression][h1]") {
+    plain_server();
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(kPlainPort));
+
+    client.send("POST /continue HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nExpect: 100-continue\r\n\r\n");
+    REQUIRE(client.wait_for("HTTP/1.1 100 Continue\r\n\r\n"));
+    client.send("abc");
+    REQUIRE(client.wait_for("200"));
+
+    const std::string &wire = client.received();
+    const auto first = wire.find("HTTP/1.1 100 Continue");
+    REQUIRE(first != std::string::npos);
+    CHECK(wire.find("HTTP/1.1 100 Continue", first + 1) == std::string::npos);
+    client.close();
+}
+
 TEST_CASE("regression/h1: Content-Length with Transfer-Encoding is refused", "[regression][h1]") {
     plain_server();
     asio::io_context ctx;
@@ -762,22 +807,22 @@ TEST_CASE("regression/h1: idle_timeout=0 disables the watchdog", "[regression][h
     server.stop();
 }
 
-TEST_CASE("regression/h1: Expect: 100-continue is not answered by default", "[regression][h1]") {
+TEST_CASE("regression/h1: Expect: 100-continue is answered when the body is read", "[regression][h1]") {
     plain_server();
     asio::io_context ctx;
     RawClient client{ctx};
     REQUIRE(client.connect(kPlainPort));
 
-    // The engine does not send 100 Continue on its own (a handler may, via
-    // send_continue()). A client that sends the body anyway must be served.
+    // The engine answers the expectation on the handler's first body read
+    // (RFC 9110 §10.1.1). A client that sends the body without waiting for the
+    // interim response must still be served normally.
     client.send("POST /echo HTTP/1.1\r\nHost: x\r\nexpect: "
                 "100-continue\r\ncontent-length: 2\r\n\r\n");
-    client.pump(std::chrono::milliseconds(100));
-    CHECK(client.received().find("100 Continue") == std::string::npos);
+    REQUIRE(client.wait_for("100 Continue"));
 
     client.send("hi");
     REQUIRE(client.wait_for("len="));
-    CHECK(body_of(client.received()) == "len=2:hi");
+    CHECK(client.received().find("len=2:hi") != std::string::npos);
     client.close();
 }
 
