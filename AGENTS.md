@@ -636,6 +636,15 @@ test/conformance/run.sh h2spec   # 只跑指定的（h2spec / h1spec / autobahn 
   - `test/python/run_client_cross.py`：stdlib `http.server` / `websockets` / `aioquic` 驱动 C++ 客户端，43 + 6 checks（h1/WS/h3、超时、取消、复用）。
   - Go `net/http`：明文 h1 与 **TLS + h2**。`loadgen https://host/path -p h2 -B 0` 打 Go `ListenAndServeTLS`（默认 ALPN 协商 h2）。测试 CA 签发带 `IP:127.0.0.1` SAN 的证书，客户端 `SSL_CERT_FILE=test/tls_certificates/ca_cert.pem` 信任；本库 TLS 监听默认 ALPN 为 h2 + http/1.1。
 
+**差分比对（与开源实现对照）**
+
+“交叉验证”还包含把 simple_http 与成熟开源实现放在同一批输入下对比：
+
+- **对照实现**：Go `net/http`（明文 h1 / TLS+h2）为主；需要时加 nginx、Caddy、Python `http.server`，同一语义尽量由多个实现印证。
+- **驱动**：服务端侧用原始 socket 发送**相同字节**（含畸形与 framing 边界）；客户端侧用同一个第三方客户端分别请求两边。
+- **比较项**：状态码、`Allow`、`Content-Type`、`Content-Length` / `Transfer-Encoding`、body 长度与内容、连接复用/关闭、协商到的协议版本。
+- **判定原则：以 RFC 为准，不以“和 Go 不一样”判定为本库 bug**。已知合理差异：CL+TE 与 obs-fold 上 simple_http 更严格（RFC 9112 §6.1 / §5.2 要求拒绝）；h2 一次性响应省略 `content-length`（`END_STREAM` 界定）；`Allow` 含 `OPTIONS`（自动支持）。真正要修的是双方都违反 RFC，或与独立实现互操作失败的情形。
+
 **已知坑**
 
 - `loadgen` 默认带 body（发 POST）：对比只注册 GET 的参考服务端时加 `-B 0`；`pub` 档固定 `Http11`，只有 `h2` 档按 ALPN 协商。
