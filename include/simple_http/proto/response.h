@@ -203,6 +203,17 @@ class ResponseWriter {
         m_started = true;
         co_return co_await m_writer->send_headers(m_status, std::move(m_headers));
     }
+
+    // Sends an interim 1xx response (100 Continue) so a client that sent
+    // `Expect: 100-continue` starts uploading. HTTP/1.x writes it to the wire;
+    // HTTP/2 and HTTP/3 have no equivalent here and report success without
+    // writing. The engine never sends one on its own: a handler that accepts
+    // the upload asks for it here, then reads the body. (HTTP/1.x still closes
+    // the connection after any response that leaves the body unread.)
+    [[nodiscard]] asio::awaitable<error_code> send_continue() {
+        note_activity();
+        co_return co_await m_writer->send_continue();
+    }
     [[nodiscard]] asio::awaitable<error_code> write(std::string data) {
         note_activity();
         return m_writer->send_chunk(std::move(data));
