@@ -61,6 +61,17 @@ class Body {
         if (m_eof) {
             co_return ReadResult::end();
         }
+        // Exactly once, before the first read. HTTP/2 uses this to answer
+        // `Expect: 100-continue` lazily (only if the handler actually reads the
+        // body, so a handler that rejects the upload can still send a final
+        // status). HTTP/1.x emits it from its pull provider instead.
+        if (m_first_read_hook) {
+            auto hook = std::move(m_first_read_hook);
+            m_first_read_hook = nullptr;
+            if (auto ec = co_await hook(); ec) {
+                co_return std::unexpected(ec);
+            }
+        }
         // Pull mode (HTTP/1.x): fetch the next chunk on demand from the provider.
         if (m_pull) {
             auto r = co_await m_pull();
@@ -221,6 +232,12 @@ class Body {
     // thread-safe; it typically just posts onto the connection executor.
     void set_on_consumed(std::function<void(std::size_t)> cb) { m_on_consumed = std::move(cb); }
 
+    // Invoked exactly once, before the first read(), from the consumer's
+    // context. A non-zero error aborts the read. See read() for the HTTP/2
+    // 100-continue use.
+    using FirstReadHook = std::function<asio::awaitable<error_code>()>;
+    void set_first_read_hook(FirstReadHook hook) { m_first_read_hook = std::move(hook); }
+
     // --- pull mode (HTTP/1.x) ---
     //
     // A pull provider turns Body into an on-demand stream: each read() pulls the
@@ -256,6 +273,7 @@ class Body {
     bool m_fed{false};
     std::optional<error_code> m_pending_error;
     std::function<void(std::size_t)> m_on_consumed;
+    FirstReadHook m_first_read_hook;
     PullProvider m_pull; // set in pull mode (HTTP/1.x); unset = pushed channel (HTTP/2)
 };
 

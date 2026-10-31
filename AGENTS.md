@@ -312,10 +312,27 @@ h2 走带 END_STREAM 的尾部 HEADERS、h3 走 nghttp3 trailer；HEAD/HTTP/1.0 
 客户端的 `Stream::trailers()` 暴露响应尾部字段（h1 chunked / h2 尾部 HEADERS），反向代理据此
 用 `finish_trailers()` 把上游 trailer 转发给下游。
 
+文件响应与上传（`handler/file_response.h`、`handler/upload.h`）：`send_file(res, path)` 以 64 KiB
+块流式写文件（自动 content-type + content-length，HEAD 只发头），不把整文件读入内存；
+`read_body_to_file(req->body(), path, max_bytes)` 反向流式落盘。二者都基于
+`asio::stream_file`（`BOOST_ASIO_HAS_FILE`，POSIX/Windows 默认可用）。
+
+统一 JSON 错误（`proto/error_body.h`）：`write_error(res, status, {code, message, details?})`
+输出 `JsonError`；`write_problem(res, status, ProblemDetails{...})` 输出 RFC 9457
+`application/problem+json`（`status` 自动同步）。
+
+请求目标按 RFC 9112 §3.2 规范化：absolute-form（`GET http://host/path`）在 H1 解析时归约为
+origin-form（authority 另存），`CONNECT` 保留 authority-form；普通请求的目标不是 origin-form
+时直接 400。
+
 表单与查询：`read_urlencoded_body(req)`、`read_multipart_body(req)`、`read_json_body<T>` /
 `write_json`。客户端上行 multipart 用 `proto/multipart.h` 的 `MultipartForm`
 （`.field` / `.file`，`release_body()` 免拷贝）。类型化参数：`path_params<T>` /
 `query_params<T>` / `parse_params<T>`。同名头多值：`headers().get_all(name)`。
+
+流式 multipart（`proto/multipart_stream.h`）：`read_multipart_stream(body, boundary, callbacks)` 用
+增量解析器逐 part 回调（`on_part_begin/on_part_data/on_part_end`），文件 part 可直接写盘，
+不把整个 body 放进内存；边界跨读由解析器保留尾部处理。`parse_multipart` 仍是无状态的整块版本。
 
 限流（`handler/rate_limit.h`）：`make_token_bucket(rate, burst)` + `rate_limit(bucket)`；
 按 key 分桶 `RateLimiter(rate, burst, max_keys)` + `rate_limit(limiter, key_fn)`。超限 429 +
@@ -497,6 +514,12 @@ auto ws = co_await client.open_websocket("wss://host/chat", {.origin = "https://
   一个 Client**（pinned 到当前连接 executor），交换结束即释放。WebSocket 反代（`ws_proxy*`）
   是字节级隧道：h1 Upgrade 与 h2 extended CONNECT 共用 `ws_proxy_common.h` 的握手与头策略，
   校验 101 后原样拼接；后端固定为 HTTP/1.1 明文。
+
+- **SSE 客户端**：`client/sse.h` 的 `SseStream::open(client, url)` 返回可 `next()` 的事件流
+  （`SseParser` 是纯逻辑、可单测的实现），`last_event_id()` 供调用方重连时发 `Last-Event-ID`；
+  重连策略由调用方决定，避免把重试语义藏进传输层。
+- **HTTP/2 `Expect: 100-continue`**：h2 引擎在 handler 首次读 body 时懒发 100 HEADERS
+  （与 h1 同一语义）；nghttp3 v1.18 没有 1xx 提交 API，h3 侧仍为 no-op。
 
 完整用法与边界用例参考 `test/client.cpp`（自检，`xmake run client`，218 checks，含
 `suite_websocket`/`suite_multipart`/`suite_retry`/`suite_reverse_proxy`/`suite_proxy`）。**双向 Python

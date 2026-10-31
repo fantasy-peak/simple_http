@@ -39,12 +39,14 @@
 // --- proto layer (version-agnostic HTTP request/response model) ---
 #include "simple_http/proto/body.h"
 #include "simple_http/proto/compressing_writer.h" // opt-in via CompressionConfig::enabled
+#include "simple_http/proto/error_body.h"         // ErrorBody / ProblemDetails + write_error / write_problem
 #include "simple_http/proto/form.h"               // read_urlencoded_body / read_multipart_body
 #include "simple_http/proto/headers.h"
-#include "simple_http/proto/json.h"      // read_json_body / write_json (glaze, unconditional)
-#include "simple_http/proto/multipart.h" // multipart/form-data parsing + MultipartForm (client-side encode)
-#include "simple_http/proto/params.h"    // path_params<T> / query_params<T> (axum Path/Query)
-#include "simple_http/proto/query.h"     // QueryParams: query-string & urlencoded parsing
+#include "simple_http/proto/json.h"             // read_json_body / write_json (glaze, unconditional)
+#include "simple_http/proto/multipart.h"        // multipart/form-data parsing + MultipartForm (client-side encode)
+#include "simple_http/proto/multipart_stream.h" // incremental multipart parsing (streaming uploads)
+#include "simple_http/proto/params.h"           // path_params<T> / query_params<T> (axum Path/Query)
+#include "simple_http/proto/query.h"            // QueryParams: query-string & urlencoded parsing
 #include "simple_http/proto/request.h"
 #include "simple_http/proto/response.h"
 #include "simple_http/proto/response_writer.h"
@@ -67,11 +69,13 @@
 #include "simple_http/handler/builtin_middleware.h" // request_id / access_log / recovery / basic_auth
 #include "simple_http/handler/conditionals.h"       // maybe_not_modified (handler-level ETag → 304)
 #include "simple_http/handler/cors.h"               // CorsConfig (public: exported for server.cors)
+#include "simple_http/handler/file_response.h"      // send_file: bounded-memory file responses
 #include "simple_http/handler/handler.h"
 #include "simple_http/handler/rate_limit.h" // rate limiting (token bucket / per-key)
 #include "simple_http/handler/router.h"
 #include "simple_http/handler/secure_headers.h" // security response headers (HSTS/CSP/frame/nosniff)
 #include "simple_http/handler/static_files.h"
+#include "simple_http/handler/upload.h" // read_body_to_file: bounded-memory uploads
 
 // --- openapi layer (per-route descriptors → OAS document + CDN Swagger UI) ---
 // Always compiled: documentation is per-route metadata (see openapi/openapi.h).
@@ -87,3 +91,4 @@
 // simple_http::detail — it is internal, and only the flat facade is aggregated.
 #include "simple_http/client/cookie_jar.h" // CookieJar (ClientConfig::cookie_jar)
 #include "simple_http/client/http.h"       // Client / RequestBuilder / Stream / Response / WebSocket (client-side)
+#include "simple_http/client/sse.h"        // SseParser / SseStream (text/event-stream client)

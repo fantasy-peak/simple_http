@@ -171,6 +171,23 @@ template <TransportLike Transport> class Http2ResponseSink : public ResponseSink
         co_return error_code{};
     }
 
+    asio::awaitable<error_code> send_continue() override {
+        co_await hop();
+        auto eng = m_engine.lock();
+        if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
+            co_return make_error_code(asio::error::not_connected);
+        }
+        if (m_continue_sent) {
+            co_return error_code{};
+        }
+        m_continue_sent = true;
+        // A 1xx block carries only :status (RFC 9113 §8.1); submit_headers
+        // already skips Date/Alt-Svc for status < 200.
+        eng->submit_headers(m_stream_id, 100, Headers{}, /*end_stream=*/false);
+        eng->flush();
+        co_return error_code{};
+    }
+
     asio::awaitable<error_code> send_headers(int status, Headers headers) override {
         co_await hop();
         auto eng = m_engine.lock();
@@ -276,6 +293,7 @@ template <TransportLike Transport> class Http2ResponseSink : public ResponseSink
     std::uint32_t m_stream_id;
     Executor m_executor;
     bool m_head_request{false};
+    bool m_continue_sent{false}; // an interim 100 was already emitted for this stream
 };
 
 template <TransportLike Transport> class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> {
@@ -413,8 +431,10 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         // entry with an expiry, and a client arriving on a fresh profile has
         // seen none of the earlier ones. HTTP/3 sends it as well, renewing the
         // entry's expiry for a client that already knew how to get here.
-        if (const std::string alt_svc = m_limits.alt_svc_value(); !alt_svc.empty()) {
-            codec::hpack_append_literal(block, "alt-svc", alt_svc);
+        if (status >= 200) {
+            if (const std::string alt_svc = m_limits.alt_svc_value(); !alt_svc.empty()) {
+                codec::hpack_append_literal(block, "alt-svc", alt_svc);
+            }
         }
         append_field_block(stream_id, block, end_stream);
 
@@ -2251,6 +2271,19 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         // response's HEADERS frame ends the stream, the entry is retired and the
         // stream table can no longer answer "was this a HEAD?".
         writer->set_head_request(request->method() == Method::Head);
+        // RFC 9110 §10.1.1: answer an Expect: 100-continue lazily on the
+        // handler's first body read, so a handler that rejects the upload can
+        // still send a final status. The body is pushed on HTTP/2, so Body's
+        // first-read hook is the equivalent of the HTTP/1.x pull point.
+        if (const auto expect = request->header("expect"); expect && header_has_token(*expect, "100-continue")) {
+            std::weak_ptr<Http2ResponseSink<Transport>> weak_writer = writer;
+            request->body().set_first_read_hook([weak_writer]() -> asio::awaitable<error_code> {
+                if (auto w = weak_writer.lock()) {
+                    co_return co_await w->send_continue();
+                }
+                co_return error_code{};
+            });
+        }
         auto self = this->shared_from_this(); // keep engine alive across suspensions
         std::uint32_t sid = stream_id;
         asio::co_spawn(

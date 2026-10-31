@@ -31,6 +31,46 @@ TEST_CASE("h1/parser: a plain request head", "[h1]") {
           std::string_view{"GET /a/b?c=d HTTP/1.1\r\nHost: example.com\r\nX-Trace: abc\r\n\r\n"}.size());
 }
 
+TEST_CASE("h1/parser: absolute-form target is reduced to origin-form", "[h1]") {
+    H1Parser parser;
+    parser.feed("GET http://example.com/a/b?c=d HTTP/1.1\r\nHost: other\r\n\r\n");
+    REQUIRE(parser.parse_head() == H1Parser::State::Done);
+    CHECK(parser.head().target == "/a/b?c=d");
+    CHECK(parser.head().authority == "example.com");
+    CHECK(parser.head().absolute_form);
+}
+
+TEST_CASE("h1/parser: absolute-form without a path becomes /", "[h1]") {
+    H1Parser parser;
+    parser.feed("GET https://example.com?q=1 HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(parser.parse_head() == H1Parser::State::Done);
+    CHECK(parser.head().target == "/?q=1");
+    CHECK(parser.head().authority == "example.com");
+}
+
+TEST_CASE("h1/parser: CONNECT keeps authority-form", "[h1]") {
+    H1Parser parser;
+    parser.feed("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n");
+    REQUIRE(parser.parse_head() == H1Parser::State::Done);
+    CHECK(parser.head().method == Method::Connect);
+    CHECK(parser.head().target == "example.com:443");
+}
+
+TEST_CASE("h1/parser: OPTIONS * is accepted", "[h1]") {
+    H1Parser parser;
+    parser.feed("OPTIONS * HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(parser.parse_head() == H1Parser::State::Done);
+    CHECK(parser.head().target == "*");
+}
+
+TEST_CASE("h1/parser: a target that is not origin-form is rejected", "[h1]") {
+    for (const std::string_view target : {"example.com", "foo/bar", "https://user@host/x"}) {
+        H1Parser parser;
+        parser.feed("GET " + std::string{target} + " HTTP/1.1\r\nHost: x\r\n\r\n");
+        CHECK(parser.parse_head() == H1Parser::State::Error);
+    }
+}
+
 TEST_CASE("h1/parser: incomplete input keeps asking for more", "[h1]") {
     H1Parser parser;
     parser.feed("GET / HTTP/1.1\r\nHost: x");

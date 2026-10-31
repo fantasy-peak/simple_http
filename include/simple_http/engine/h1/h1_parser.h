@@ -164,7 +164,11 @@ inline FieldLine parse_field_line(std::string_view line, Headers &out) {
 struct ParsedHead {
     Method method = Method::Unknown;
     std::string method_token; // raw token, so unknown/extension methods survive
-    std::string target;
+    std::string target;       // always origin-form (or CONNECT's authority-form)
+    // For an absolute-form request-target: the authority from the request line,
+    // which RFC 9112 §3.2.2 says overrides the Host field. Empty for other forms.
+    std::string authority;
+    bool absolute_form{false};
     Version version = Version::Http11;
     Headers headers;
 };
@@ -370,7 +374,9 @@ class H1Parser {
 
         m_head.method_token.assign(method_tok);
         m_head.method = method_from_string(method_tok);
-        m_head.target.assign(target);
+        if (!normalize_target(target)) {
+            return false;
+        }
 
         if (version == "HTTP/1.1") {
             m_head.version = Version::Http11;
@@ -386,6 +392,89 @@ class H1Parser {
             return false;
         }
         return true;
+    }
+
+    // RFC 9112 §3.2 request-target forms:
+    //   origin-form    "/path?query"             (ordinary requests)
+    //   absolute-form  "scheme://authority/path" (proxies; an origin server must accept)
+    //   authority-form "host:port"               (CONNECT only)
+    //   asterisk-form  "*"                       (OPTIONS only)
+    // Absolute-form is reduced to origin-form here, so routing, logging and the
+    // reverse proxy only ever see one shape; the authority is kept separately for
+    // the Host-override rule (§3.2.2).
+    bool normalize_target(std::string_view target) {
+        if (m_head.method == Method::Connect) {
+            if (target.empty() || target.find('/') != std::string_view::npos ||
+                target.find('?') != std::string_view::npos || target.find('#') != std::string_view::npos) {
+                m_error = 40002;
+                return false;
+            }
+            m_head.target.assign(target);
+            return true;
+        }
+        if (target == "*") {
+            if (m_head.method != Method::Options) {
+                m_error = 40002;
+                return false;
+            }
+            m_head.target.assign(target);
+            return true;
+        }
+        const auto scheme_end = target.find("://");
+        if (scheme_end != std::string_view::npos && is_http_scheme(target.substr(0, scheme_end))) {
+            const auto auth_begin = scheme_end + 3;
+            auto auth_end = target.find_first_of("/?#", auth_begin);
+            if (auth_end == std::string_view::npos) {
+                auth_end = target.size();
+            }
+            const std::string_view authority = target.substr(auth_begin, auth_end - auth_begin);
+            // Userinfo is not meaningful to an origin server and is a host
+            // confusion vector; refuse it.
+            if (authority.empty() || authority.find('@') != std::string_view::npos) {
+                m_error = 40002;
+                return false;
+            }
+            if (auth_end == target.size() || target[auth_end] != '/') {
+                // No path: origin-form is "/" plus any query.
+                std::string normalized{"/"};
+                normalized.append(target.substr(auth_end));
+                m_head.authority.assign(authority);
+                m_head.absolute_form = true;
+                m_head.target.assign(std::move(normalized));
+                return true;
+            }
+            const std::string_view path = target.substr(auth_end);
+            if (path.find('#') != std::string_view::npos) {
+                m_error = 40002;
+                return false;
+            }
+            m_head.authority.assign(authority);
+            m_head.absolute_form = true;
+            m_head.target.assign(path);
+            return true;
+        }
+        if (target.empty() || target.front() != '/' || target.find('#') != std::string_view::npos) {
+            m_error = 40002;
+            return false;
+        }
+        m_head.target.assign(target);
+        return true;
+    }
+
+    static bool is_http_scheme(std::string_view scheme) {
+        auto eq = [](std::string_view a, std::string_view b) {
+            if (a.size() != b.size()) {
+                return false;
+            }
+            for (std::size_t i = 0; i < a.size(); ++i) {
+                const char c = static_cast<char>(a[i] >= 'A' && a[i] <= 'Z' ? a[i] - 'A' + 'a' : a[i]);
+                if (c != b[i]) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        return eq(scheme, "http") || eq(scheme, "https");
     }
 
     // Header field parsing: split on the first ':', skip leading spaces in the

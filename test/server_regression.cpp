@@ -171,6 +171,50 @@ void register_routes(sh::Server &server) {
         }
         co_return;
     });
+    // send_file: the body is streamed in bounded chunks, never buffered whole.
+    server.route(sh::any_methods, "/send-file", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+        if (auto ec = co_await sh::send_file(*res, (static_root() / "index.html").string()); ec) {
+            co_await res->status(500).send("file error");
+        }
+    });
+    // read_body_to_file: the upload is streamed to a temporary file.
+    server.route(sh::any_methods, "/upload", [](sh::RequestPtr req, sh::ResponsePtr res) -> asio::awaitable<void> {
+        const auto path = (std::filesystem::temp_directory_path() / "simple_http_regression_upload.bin").string();
+        auto written = co_await sh::read_body_to_file(req->body(), path, kMaxBodyBytes);
+        if (!written) {
+            co_await res->status(400).send("upload failed");
+            co_return;
+        }
+        co_await res->status(200).send(std::to_string(*written));
+    });
+    // read_multipart_stream: incremental multipart parsing with part callbacks.
+    server.route(
+        sh::any_methods, "/multipart-stream", [](sh::RequestPtr req, sh::ResponsePtr res) -> asio::awaitable<void> {
+            const auto ct = req->header("content-type").value_or(std::string_view{});
+            auto boundary = sh::multipart_boundary(ct);
+            if (!boundary) {
+                co_await res->status(400).send("no boundary");
+                co_return;
+            }
+            std::string out;
+            sh::MultipartStreamCallbacks cb;
+            cb.on_part_begin = [&](const sh::MultipartPart &part) {
+                out += part.name + "=";
+                return true;
+            };
+            cb.on_part_data = [&](std::string_view data) {
+                out.append(data);
+                return true;
+            };
+            cb.on_part_end = [&] { out += ";"; };
+            auto parsed =
+                co_await sh::read_multipart_stream(req->body(), std::move(*boundary), std::move(cb), kMaxBodyBytes);
+            if (!parsed) {
+                co_await res->status(400).send("bad multipart");
+                co_return;
+            }
+            co_await res->status(200).send(out);
+        });
     server.fallback([](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
         co_await res->status(404).send("not found");
     });
@@ -514,6 +558,65 @@ TEST_CASE("regression/h1: a body larger than the cap is refused with 413", "[reg
     client.send("POST /echo HTTP/1.1\r\nHost: x\r\ncontent-length: " + std::to_string(kMaxBodyBytes + 1) + "\r\n\r\n");
     REQUIRE(client.wait_head());
     CHECK(status_of(client.received()) == 413);
+    client.close();
+}
+
+TEST_CASE("regression/h1: send_file streams the file with a known length", "[regression][h1]") {
+    plain_server();
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(kPlainPort));
+
+    // GET is streamed: HTTP/1.x frames it as chunked (the engine drops a
+    // Content-Length that a streamed response cannot promise).
+    client.send("GET /send-file HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(client.wait_for("<html>index</html>"));
+    CHECK(status_of(client.received()) == 200);
+    CHECK(client.received().find("content-type: text/html") != std::string::npos);
+    CHECK(client.received().find("transfer-encoding: chunked") != std::string::npos);
+    client.close();
+
+    // HEAD carries the length a GET would have produced.
+    asio::io_context head_ctx;
+    RawClient head{head_ctx};
+    REQUIRE(head.connect(kPlainPort));
+    head.send("HEAD /send-file HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(head.wait_head());
+    CHECK(status_of(head.received()) == 200);
+    CHECK(head.received().find("content-length: 18") != std::string::npos);
+    head.close();
+}
+
+TEST_CASE("regression/h1: read_body_to_file streams the upload", "[regression][h1]") {
+    plain_server();
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(kPlainPort));
+
+    client.send("POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello");
+    REQUIRE(client.wait_for("\r\n\r\n5"));
+    CHECK(status_of(client.received()) == 200);
+    CHECK(body_of(client.received()) == "5");
+    client.close();
+}
+
+TEST_CASE("regression/h1: read_multipart_stream delivers parts", "[regression][h1]") {
+    plain_server();
+    asio::io_context ctx;
+    RawClient client{ctx};
+    REQUIRE(client.connect(kPlainPort));
+
+    const std::string body = "--X\r\n"
+                             "Content-Disposition: form-data; name=\"title\"\r\n"
+                             "\r\n"
+                             "hello\r\n"
+                             "--X--\r\n";
+    client.send("POST /multipart-stream HTTP/1.1\r\nHost: x\r\n"
+                "Content-Type: multipart/form-data; boundary=X\r\nContent-Length: " +
+                std::to_string(body.size()) + "\r\n\r\n" + body);
+    REQUIRE(client.wait_for("title=hello;"));
+    CHECK(status_of(client.received()) == 200);
+    CHECK(body_of(client.received()) == "title=hello;");
     client.close();
 }
 
