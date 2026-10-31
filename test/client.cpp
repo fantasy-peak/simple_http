@@ -3048,6 +3048,16 @@ int main() {
     plain.stop();
     secure.stop();
 
+    // The in-process fake servers and proxies are process-wide so their accept
+    // loops outlive an individual suite, but their acceptors are bound to
+    // `ctx`. Destroy them while the io_context is still alive: `ctx` is a local
+    // of main, so static destructors at exit would otherwise touch a destroyed
+    // execution_context (ASan: heap-use-after-free in
+    // reactive_socket_service_base::destroy).
+    g_proxies.clear();
+    g_fakes.clear();
+    g_flaky.clear();
+
     std::printf("\n%d checks, %d failed\n", g_checks, g_failed);
     return g_failed == 0 ? 0 : 1;
 }
