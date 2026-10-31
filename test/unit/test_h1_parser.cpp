@@ -196,6 +196,33 @@ TEST_CASE("h1/parser: reset_after_head serves the next pipelined request", "[h1]
     CHECK(parser.remainder().empty());
 }
 
+TEST_CASE("h1/parser: parse_head(string_view) reads caller-owned bytes", "[h1]") {
+    // The server keeps every unread byte in its own buffer and parses straight
+    // out of it; the parser must not need a copy, and its rescan cursor must
+    // survive that buffer growing between calls.
+    std::string bytes = "GET /one HTTP/1.1\r\nHo";
+    H1Parser parser;
+    CHECK(parser.parse_head(std::string_view{bytes}) == H1Parser::State::NeedMore);
+
+    bytes += "st: h\r\n\r\nGARBAGE";
+    REQUIRE(parser.parse_head(std::string_view{bytes}) == H1Parser::State::Done);
+    CHECK(parser.head().target == "/one");
+    CHECK(parser.head().headers.get("host") == "h");
+    const std::size_t consumed = parser.consumed();
+    CHECK(consumed == bytes.size() - std::string_view{"GARBAGE"}.size());
+    // The caller owns the bytes, so the parser has no remainder of its own.
+    CHECK(parser.remainder().empty());
+
+    // Consume, reset, and parse the next head out of the caller's buffer.
+    bytes.erase(0, consumed);
+    parser.reset_for_next_head();
+    CHECK(parser.head().target.empty());
+    bytes = "GET /two HTTP/1.1\r\nHost: h\r\n\r\n";
+    REQUIRE(parser.parse_head(std::string_view{bytes}) == H1Parser::State::Done);
+    CHECK(parser.head().target == "/two");
+    CHECK(parser.consumed() == bytes.size());
+}
+
 // --- response head -----------------------------------------------------------
 
 TEST_CASE("h1/response parser: a plain response head", "[h1]") {

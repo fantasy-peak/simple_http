@@ -382,7 +382,8 @@ DATA 流当作 WebSocket 隧道（`engine/h2/h2_ws_transport.h` 把单条 h2 流
   保留 query 与后端协商的 `Sec-WebSocket-Extensions`/`Sec-WebSocket-Protocol`，随后
   字节级拼接；后端拒绝升级时回传其真实状态（非 502）。`:protocol` 非 websocket 走普通
   dispatch。
-- 升级成功后 transport 交由对应协议层接管，H1 引擎不再关闭它（`m_upgraded`）。
+- 升级成功后 transport 交由对应协议层接管，H1 引擎不再关闭它（`m_owner` /
+  `TransportOwner`，同时让 watchdog 停止收割）。
 
 完整用法参考 `test/server.cpp`。
 
@@ -497,8 +498,8 @@ auto ws = co_await client.open_websocket("wss://host/chat", {.origin = "https://
   是字节级隧道：h1 Upgrade 与 h2 extended CONNECT 共用 `ws_proxy_common.h` 的握手与头策略，
   校验 101 后原样拼接；后端固定为 HTTP/1.1 明文。
 
-完整用法与边界用例参考 `test/client.cpp`（自检，`xmake run client`，175 checks，含
-`suite_websocket`/`suite_multipart`/`suite_retry`/`suite_reverse_proxy`）。**双向 Python
+完整用法与边界用例参考 `test/client.cpp`（自检，`xmake run client`，218 checks，含
+`suite_websocket`/`suite_multipart`/`suite_retry`/`suite_reverse_proxy`/`suite_proxy`）。**双向 Python
 交叉验证**：`test/python/run.py` 用第三方客户端驱动 C++ 服务端（httpx/h2/websockets/aioquic，
 113 checks，含 h1/h2/h3 三传输的响应 trailer）；`test/python/rfc8441_client.py` 单独验证
 h2 extended CONNECT 与 h2 ws 反代（84 checks）；`test/python/run_client_cross.py`
@@ -567,9 +568,9 @@ xmake run server         # 运行示例服务器（明文 :7788，TLS :7789，h2
 四套自检（前三套默认不参与 all，`set_default(false)`）：
 
 ```sh
-xmake build unittest && xmake run unittest      # 纯逻辑单元测试（Catch2，秒级；294 用例）
+xmake build unittest && xmake run unittest      # 纯逻辑单元测试（Catch2，秒级；352 用例）
 xmake build regression && xmake run regression  # 服务端对抗性回归（裸 socket）
-xmake build client && xmake run client          # 客户端整合自检（PASS/FAIL + 退出码；175 checks）
+xmake build client && xmake run client          # 客户端整合自检（PASS/FAIL + 退出码；218 checks）
 xmake build server && xmake run python-tests    # 第三方客户端驱动服务端（113 checks）
 ```
 

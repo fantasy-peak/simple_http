@@ -178,14 +178,65 @@ class H1Parser {
     void feed(const std::byte *data, std::size_t n) { m_buf.append(reinterpret_cast<const char *>(data), n); }
 
     // Attempts to parse a complete request head (up to and including the blank
-    // line CRLFCRLF). Idempotent while NeedMore.
-    State parse_head() {
+    // line CRLFCRLF) out of the internal buffer filled by feed(). Idempotent
+    // while NeedMore.
+    State parse_head() { return parse_head_from(m_buf); }
+
+    // Same, parsing a caller-owned buffer instead of the internal one: the
+    // server keeps every unread byte in its own buffer and consumes consumed()
+    // itself, so neither the head nor the bytes after it are copied. The buffer
+    // may only grow between calls (bytes appended at the end); the rescan
+    // cursor is an offset into it. Do not mix this overload with feed() on one
+    // parser.
+    State parse_head(std::string_view bytes) { return parse_head_from(bytes); }
+
+    const ParsedHead &head() const { return m_head; }
+    // Mutable access so the engine can move the parsed head (target, header
+    // fields) straight into the Request it builds, instead of copying each
+    // string. Safe because all the search/semantics reads happen before this
+    // point and the parser is reset before the next head is parsed.
+    ParsedHead &head() { return m_head; }
+    std::size_t consumed() const { return m_consumed; }
+    unsigned int error() const { return m_error; }
+
+    // Bytes currently buffered while still parsing the head — used by the engine
+    // to bound the request head size (Slowloris / oversized-header defense).
+    std::size_t buffered() const { return m_buf.size(); }
+
+    // The bytes remaining after the parsed head (the beginning of the body).
+    // Only meaningful for the feed() style: with parse_head(string_view) the
+    // caller owns the bytes and consumes consumed() itself, so this is empty.
+    std::string_view remainder() const {
+        const std::size_t pos = std::min(m_consumed, m_buf.size());
+        return std::string_view{m_buf}.substr(pos);
+    }
+
+    // Resets so the same parser can serve the next pipelined request from the
+    // internal buffer. Drops the consumed head and keeps any leftover bytes.
+    void reset_after_head() {
+        m_buf.erase(0, m_consumed);
+        reset_for_next_head();
+    }
+
+    // The same reset for the parse_head(string_view) style, where the caller
+    // owns the bytes and has already consumed them: only parser state is
+    // cleared.
+    void reset_for_next_head() {
+        m_consumed = 0;
+        m_scan_from = 0;
+        m_head = ParsedHead{};
+        m_error = 0;
+    }
+
+  private:
+    State parse_head_from(std::string_view bytes) {
         // Locate the end of the header block, resuming where the previous call
-        // stopped. feed() only appends, so a terminator that was absent before
-        // cannot begin earlier than (old_size - 3): a 4-byte CRLFCRLF may
-        // straddle the old end. Without this cursor a peer dribbling a head
-        // byte-by-byte made every parse_head re-scan the whole buffer (O(n^2),
-        // up to max_header_bytes — a Slowloris amplifier).
+        // stopped. The buffer only grows (feed appends; the engine appends to
+        // its read buffer), so a terminator that was absent before cannot begin
+        // earlier than (old_size - 3): a 4-byte CRLFCRLF may straddle the old
+        // end. Without this cursor a peer dribbling a head byte-by-byte made
+        // every parse call re-scan the whole buffer (O(n^2), up to
+        // max_header_bytes — a Slowloris amplifier).
         // The head ends at the first blank line, and a blank line is two
         // consecutive line endings: CRLF or LF in either position. Tolerating
         // bare LF is deliberate (minimal clients and tests use it), but the two
@@ -208,14 +259,14 @@ class H1Parser {
             {"\n\n", {std::string::npos, 2, false, true}},
         }};
         for (auto [pattern, candidate] : terminators) {
-            candidate.pos = m_buf.find(pattern, m_scan_from);
+            candidate.pos = bytes.find(pattern, m_scan_from);
             if (candidate.pos == std::string::npos)
                 continue;
             if (term.pos == std::string::npos || candidate.pos < term.pos)
                 term = candidate;
         }
         if (term.pos == std::string::npos) {
-            m_scan_from = m_buf.size() >= 3 ? m_buf.size() - 3 : 0;
+            m_scan_from = bytes.size() >= 3 ? bytes.size() - 3 : 0;
             return State::NeedMore;
         }
 
@@ -227,9 +278,9 @@ class H1Parser {
         bool saw_crlf = term.crlf;
         bool saw_lf = term.lf;
         for (std::size_t i = 0; i < term.pos; ++i) {
-            if (m_buf[i] != '\n')
+            if (bytes[i] != '\n')
                 continue;
-            if (i > 0 && m_buf[i - 1] == '\r')
+            if (i > 0 && bytes[i - 1] == '\r')
                 saw_crlf = true;
             else
                 saw_lf = true;
@@ -242,11 +293,11 @@ class H1Parser {
         // all; it would be smuggled into the next field. The request line is
         // excluded: a bare CR in the target is a control byte there and is
         // reported by parse_request_line (40006), not as a line-ending error.
-        const std::size_t first_lf = m_buf.find('\n');
+        const std::size_t first_lf = bytes.find('\n');
         const std::size_t fields_from =
             (first_lf == std::string::npos || first_lf >= term.pos) ? term.pos : first_lf + 1;
         for (std::size_t i = fields_from; i < term.pos; ++i) {
-            if (m_buf[i] == '\r' && (i + 1 == term.pos || m_buf[i + 1] != '\n')) {
+            if (bytes[i] == '\r' && (i + 1 == term.pos || bytes[i + 1] != '\n')) {
                 m_error = 40007;
                 return State::Error;
             }
@@ -254,7 +305,7 @@ class H1Parser {
 
         const std::size_t end = term.pos;
         const std::size_t sep = term.sep;
-        std::string_view block{m_buf.data(), end};
+        std::string_view block{bytes.data(), end};
         if (!parse_block(block)) {
             return State::Error;
         }
@@ -263,33 +314,6 @@ class H1Parser {
         return State::Done;
     }
 
-    const ParsedHead &head() const { return m_head; }
-    // Mutable access so the engine can move the parsed head (target, header
-    // fields) straight into the Request it builds, instead of copying each
-    // string. Safe because all the search/semantics reads happen before this
-    // point and the parser itself is a per-request local (re-parsed next loop).
-    ParsedHead &head() { return m_head; }
-    std::size_t consumed() const { return m_consumed; }
-    unsigned int error() const { return m_error; }
-
-    // Bytes currently buffered while still parsing the head — used by the engine
-    // to bound the request head size (Slowloris / oversized-header defense).
-    std::size_t buffered() const { return m_buf.size(); }
-
-    // The bytes remaining after the parsed head (the beginning of the body).
-    std::string_view remainder() const { return std::string_view{m_buf}.substr(m_consumed); }
-
-    // Resets so the same parser can serve the next pipelined request. Drops the
-    // consumed head and keeps any leftover bytes.
-    void reset_after_head() {
-        m_buf.erase(0, m_consumed);
-        m_consumed = 0;
-        m_scan_from = 0;
-        m_head = ParsedHead{};
-        m_error = 0;
-    }
-
-  private:
     bool parse_block(std::string_view block) {
         std::size_t pos = 0;
         // --- request line ---
