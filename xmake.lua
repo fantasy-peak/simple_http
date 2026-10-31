@@ -70,6 +70,24 @@ target("server")
     set_rundir(".")
 target_end()
 
+-- Middleware + compression test server: mounts every built-in middleware and
+-- routes that exercise the compression policy (min_bytes, content type,
+-- streamed responses). Listens on 127.0.0.1:7796:
+--   xmake build middleware_server && xmake run middleware_server
+target("middleware_server")
+    set_kind("binary")
+    set_default(false)
+    on_load(function (target)
+        if target:toolchain("gcc") then
+            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete", "-Wno-type-limits")
+        end
+    end)
+    add_deps("simple_http")
+    add_files("test/middleware_server.cpp")
+    add_packages("zlib", "brotli")
+    set_rundir(".")
+target_end()
+
 -- The client layer's exercise program: starts a server in the same process and
 -- drives the client at it (and at a raw responder) across the protocol matrix.
 -- Run it from the repository root: `xmake run client`.
