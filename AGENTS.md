@@ -93,8 +93,10 @@ include/
       conditionals.h       handler 级条件请求 304
       router.h             Router（方法感知精确路由 + 段 trie + 反代 + 静态阶段；group/per-route）
       http_proxy.h         请求级反代（Go ReverseProxy 形态）：每请求一条上游连接（client 层），
-                           响应流式回传；hop-by-hop/X-Forwarded-*/TE:trailers、CONNECT 405、
-                           幂等重试、请求取消、Rewrite/ModifyResponse/ErrorHandler 钩子
+                           响应流式回传；hop-by-hop/X-Forwarded-*/TE:trailers、CONNECT 拒绝
+                           （origin-form 在 H1 解析器按 RFC 9112 先行 400；到达 handler 的
+                           CONNECT 由反代回 405）、幂等重试、请求取消、Rewrite/ModifyResponse/
+                           ErrorHandler 钩子
       static_files.h       静态文件服务（static_table.h 的 serving 半边 + SPA fallback）
     quic/                  QUIC 传输（#ifdef SIMPLE_HTTP_ENABLE_HTTP3）——ngtcp2 的包装
       protocol.h / connection.h / endpoint.h / ngtcp2_config.h / ngtcp2_crypto.h / tls.h

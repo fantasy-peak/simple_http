@@ -985,8 +985,11 @@ asio::awaitable<void> suite_reverse_proxy(std::uint16_t plain_port) {
         cfg.default_h2c = sh::H2cMode::Off;
         h::Client h1_http{co_await asio::this_coro::executor, cfg};
         auto connect = co_await fetch(h1_http, h1_http.request(sh::Method::Connect, front + "/rp/world"));
-        check(connect && connect->status == 405,
-              "CONNECT is refused by the reverse proxy -> " +
+        // RFC 9112 §3.2.3: CONNECT uses authority-form, so an origin-form target
+        // is malformed and the H1 parser answers 400 before the proxy sees it.
+        // (The proxy's own CONNECT-405 branch still protects direct callers.)
+        check(connect && connect->status == 400,
+              "CONNECT with an origin-form target is refused -> " +
                   (connect ? std::to_string(connect->status) : describe(connect.error())));
     }
 
