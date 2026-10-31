@@ -623,6 +623,26 @@ test/conformance/run.sh h2spec   # 只跑指定的（h2spec / h1spec / autobahn 
   Docker。
 - **UNIMPLEMENTED / INFORMATIONAL 不算失败**，但 **NON-STRICT 算**。
 
+### 交叉验证（独立实现双向驱动）
+
+本库自己的客户端与服务端互相驱动时，双方共享的规范误读会互相抵消。**“交叉验证”指把两端分别交给独立实现**，而不是再跑一遍本库自测：
+
+- **服务端 ← 独立客户端**
+  - `test/python/run.py`：httpx / hyper-h2 / websockets / aioquic 驱动 `test/server`，113 checks（h1/h2/h3/WS/trailer/CORS/回归）。
+  - Autobahn（Docker，Python/Twisted）打 `:7788`，WebSocket 517 用例。
+  - h2spec（Go）打 `:7790`，HTTP/2 严格一致性。
+  - 边界/framing：原始 socket 或手工 HTTP/2 帧对 **Go `net/http`** 做差分——同一请求分别打 simple_http 与 Go，比较状态码、`Allow`、连接行为。
+- **客户端 → 独立服务端**
+  - `test/python/run_client_cross.py`：stdlib `http.server` / `websockets` / `aioquic` 驱动 C++ 客户端，43 + 6 checks（h1/WS/h3、超时、取消、复用）。
+  - Go `net/http`：明文 h1 与 **TLS + h2**。`loadgen https://host/path -p h2 -B 0` 打 Go `ListenAndServeTLS`（默认 ALPN 协商 h2）。测试 CA 签发带 `IP:127.0.0.1` SAN 的证书，客户端 `SSL_CERT_FILE=test/tls_certificates/ca_cert.pem` 信任；本库 TLS 监听默认 ALPN 为 h2 + http/1.1。
+
+**已知坑**
+
+- `loadgen` 默认带 body（发 POST）：对比只注册 GET 的参考服务端时加 `-B 0`；`pub` 档固定 `Http11`，只有 `h2` 档按 ALPN 协商。
+- `test/server.cpp` 的 TLS 监听是 **mTLS**，客户端需 `client_cert.pem` / `client_key.pem`。
+- h2 一次性响应**刻意不发 `content-length`**（`END_STREAM` 界定，`HEAD` 例外）；`Allow` 含 `OPTIONS` 是因为确实自动支持 OPTIONS——与 Go 的差异属功能集不同，不是缺陷。
+- h2spec 2.6.0 在服务端宣告 `max_concurrent_streams=200` 时 5.1.2 会假阳性；用手工帧复现可确认服务端对第 201 个流正确回 `RST_STREAM(REFUSED_STREAM)`。
+
 ### 负载与连接生命周期套件（改传输层或流的生老病死之后必跑）
 
 一致性套件每例从干净连接开始，看不见「同一条连接上第 N 个请求」。`test/stress/run.sh` 专问
