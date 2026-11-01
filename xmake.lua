@@ -70,6 +70,23 @@ target("server")
     set_rundir(".")
 target_end()
 
+-- Client-behavior probe against an external server (used with a Go reference
+-- server so the client is not tested against its own server):
+--   xmake build client_go_probe && ./build/linux/x86_64/release/client_go_probe http://127.0.0.1:7801
+target("client_go_probe")
+    set_kind("binary")
+    set_default(false)
+    on_load(function (target)
+        if target:toolchain("gcc") then
+            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete", "-Wno-type-limits")
+        end
+    end)
+    add_deps("simple_http")
+    add_files("test/client_go_probe.cpp")
+    add_packages("zlib", "brotli")
+    set_rundir(".")
+target_end()
+
 -- Middleware + compression test server: mounts every built-in middleware and
 -- routes that exercise the compression policy (min_bytes, content type,
 -- streamed responses). Listens on 127.0.0.1:7796:

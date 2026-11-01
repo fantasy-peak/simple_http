@@ -99,6 +99,10 @@ class DecompressingClientStream final : public ClientStream {
     }
 
     bool finished() const override { return m_inner->finished(); }
+    // The trailer section is parsed by the inner stream after the body; the
+    // decoder sits between the caller and it, so it must forward them (and the
+    // reverse proxy reads them through this layer).
+    [[nodiscard]] const Headers &response_trailers() const noexcept override { return m_inner->response_trailers(); }
     Version version() const override { return m_inner->version(); }
     std::uint32_t id() const override { return m_inner->id(); }
     asio::awaitable<void> cancel() override { co_return co_await m_inner->cancel(); }

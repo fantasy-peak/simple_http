@@ -212,7 +212,7 @@ class ClientStream {
     // (a caller that only ever reads the head sees an empty set). Like head(),
     // this is written on the session's executor and safe to read once the
     // exchange has delivered the values.
-    [[nodiscard]] const Headers &response_trailers() const noexcept { return m_trailers; }
+    [[nodiscard]] virtual const Headers &response_trailers() const noexcept { return m_trailers; }
 
     // The next body event: a chunk, or end-of-body. The head is parsed on the
     // way if the caller never asked for it.
