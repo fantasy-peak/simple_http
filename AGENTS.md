@@ -83,7 +83,7 @@ include/
       form.h                       read_urlencoded_body / read_multipart_body
       params.h                     path_params<T> / query_params<T> / parse_params<T>
       json.h                       read_json_body<T> / write_json（glaze）
-      request.h                    Request（两端共用）
+      request.h                    Request（两端共用；含 AppStateView / app_state<T>()）
       response.h                   ResponseWriter（fluent 门面）
       response_writer.h            ResponseSink 抽象（引擎实现）
       compressing_writer.h         响应压缩装饰
@@ -114,6 +114,11 @@ include/
         h3_engine.h                HTTP/3 引擎（ngtcp2 + nghttp3）
     handler/
       handler.h                    Handler / Next / Middleware / make_handler / invoke_handler
+      validation.h                 Validator<T> / FieldError / 约束辅助函数
+      extract.h                    Path/Query/Json/Form/State/Header/Cookie 提取器 + extract<...>()
+      session.h                    SessionStore / MemorySessionStore / Session + session() 中间件
+      csrf.h                       double-submit CSRF 中间件
+      jwt.h                        JWT 验证（HS256/RS256/ES256）+ require_scope/require_role
       builtin_middleware.h         request_id / access_log / recovery / basic_auth / real_ip /
                                    clean_path / strip_prefix / redirect_slashes / ws_origin /
                                    timeout / compress
@@ -121,7 +126,7 @@ include/
       rate_limit.h                 TokenBucket / RateLimiter / rate_limit
       cors.h                       CorsConfig / make_cors_middleware
       conditionals.h               maybe_not_modified（handler 级 304）
-      router.h                     Router（精确路由 + 段 trie + 正则 + 反代 + 静态）
+      router.h                     Router（精确路由 + 段 trie + {*rest} + Host + 正则 + 反代 + 静态）
       http_proxy.h                 请求级 HTTP 反代
       static_files.h               静态文件服务
       file_response.h              send_file
@@ -327,7 +332,42 @@ using Middleware =
 - WebSocket 查找：本地精确 ws → ws 反代 → 本地正则 ws。
 - CORS 不覆盖 WebSocket 升级，使用 `ws_origin()`。
 
-### 4.3 Request / ResponseWriter / Body
+### 4.3 框架层（State / Extractor / Validation / Auth）
+
+```cpp
+// 共享应用状态：按类型键，shared_ptr 共享，不按请求复制；start() 前注册。
+server.state(std::make_shared<AppState>(...));
+const AppState *st = req->app_state<AppState>();
+
+// 类型化提取器：失败自动 400/422/500，不进入 handler。
+server.route({Method::Post}, "/users/{id}",
+    extract<Path<UserParams>, Valid<Json<CreateUser>>>(
+        [](const UserParams &p, CreateUser in, RequestPtr req, ResponsePtr res)
+            -> asio::awaitable<void> { ... }));
+
+// 校验：为类型特化 Validator<T>；失败 422，details 是字段错误数组。
+template <> struct simple_http::Validator<CreateUser> { ... };
+
+// Session / CSRF / JWT（均在 simple_http::middleware）。
+server.use(middleware::session(store, SessionConfig{...}));
+server.use(middleware::csrf(CsrfConfig{...}));
+server.use(middleware::jwt(JwtConfig{.algorithms = {"RS256"}, .public_key_pem = pem, ...}));
+server.use(middleware::require_scope("users:write"));
+
+auto *s = session(*req);       // Session*（middleware 未挂载时为 nullptr）
+const Principal *p = principal(*req);
+```
+
+- `extract<...>` 返回普通 `Handler`，不影响 route/group/middleware/OpenAPI。
+- 同一次提取最多一个 body 提取器（`Json`/`Form`）。
+- `SessionStore` 是 awaitable 接口；`MemorySessionStore` 带锁，Redis/DB 适配器放消费侧。
+- JWT 强制算法 allowlist，拒绝 `none`；`exp` 默认必填；不做签发/JWKS/OAuth2。
+- Host 路由：`server.host(pattern, registrar)`；`*.example.com` 不匹配裸域或
+  `evil-example.com`。Host 子 Router 共享 state，但 WebSocket 查找仍 host-agnostic，
+  OpenAPI 文档也各自独立。
+- 通配路径：`/files/{*rest}` 只能作为最后一段，捕获剩余路径（含 `/`）。
+
+### 4.4 Request / ResponseWriter / Body
 
 ```cpp
 req->method(); method_token(); version(); target(); path(); query();
@@ -367,7 +407,7 @@ co_await res->finish();
 引擎会剥离 handler 设置的 hop-by-hop 字段（connection / keep-alive /
 transfer-encoding / proxy-connection / upgrade）。
 
-### 4.4 WebSocket
+### 4.5 WebSocket
 
 ```cpp
 server.ws_route("/chat",
@@ -390,7 +430,7 @@ server.ws_route("/chat",
 - 协议错误 / Close / 非法 UTF-8 由 reader 记下关闭码，但 Close 帧要等应用下次
   `read()` 排空缓存后才发出（`flush_deferred_close`）。
 
-### 4.5 Client
+### 4.6 Client
 
 ```cpp
 Client http{executor, ClientConfig{}};
@@ -416,7 +456,7 @@ auto ws = co_await http.open_websocket("wss://host/chat");
   origin 使用一次性连接。
 - 免费透明重拨：打开阶段与读响应阶段各一次；策略重试由 `ClientConfig::retry` 控制。
 
-### 4.6 数据与 OpenAPI
+### 4.7 数据与 OpenAPI
 
 ```cpp
 read_urlencoded_body(req)         // expected<QueryParams, error_code>
@@ -595,7 +635,7 @@ xmake build server && xmake run python-tests
 
 | 套件 | 规模 |
 |---|---|
-| `unittest`（Catch2） | 372 个用例，65094 条断言 |
+| `unittest`（Catch2） | 387 个用例，65218 条断言 |
 | `regression` | 79 个 TEST_CASE，裸 socket 畸形/边界请求 |
 | `client` | 218 checks |
 | `python-tests` | 113 checks（httpx / hyper-h2 / websockets / aioquic） |
@@ -778,6 +818,13 @@ xmake build server && xmake run python-tests
 - 客户端单连接模型：每个 origin 一条连接，其他 origin 一次性连接；没有传统连接池。
 - 客户端 WebSocket 不协商 permessage-deflate。
 - CORS 不处理 WebSocket 升级。
+- Host 路由只作用于 HTTP dispatch；WebSocket 查找仍 host-agnostic，Host 子 Router 有独立
+  OpenAPI 文档。
+- JWT 只是验证器：不做令牌签发、JWKS 拉取、OAuth2/OIDC 发现或 refresh-token 流程；
+  RS256/ES256 需要 PEM 公钥；`aud`/`scope` 按字符串 claim 解析，不支持 audience 数组。
+- Session 只内置进程内存储；Redis/DB 适配器由消费侧实现 `SessionStore`。CSRF 是
+  header 型 double-submit，无法设置 header 的表单需 handler 自行校验字段。
+- 校验通过 `Validator<T>` 按类型 opt-in，没有 tag/DSL 校验器。
 - CMake 接口未接入 ngtcp2/nghttp3；HTTP/3 目前只由 xmake 构建提供。
 - `simple_httpConfig.cmake.in` 缺 `find_dependency(glaze)`。
 - 根目录 `compile_commands.json` 可能过期；以 `build/` 下的为准。

@@ -302,6 +302,76 @@ void readme_static_files(simple_http::Server &server) {
 
 void readme_logging() { simple_http::set_log_sink(simple_http::make_stdout_sink(simple_http::LogLevel::Info)); }
 
+// --- Framework layer (README → State / Extractors / Validation / Auth) -------
+
+namespace framework_readme {
+
+struct AppState {
+    std::string name;
+};
+struct UserParams {
+    int id{};
+};
+struct CreateUser {
+    std::string name;
+    int age{};
+};
+struct RestParams {
+    std::string rest;
+};
+
+} // namespace framework_readme
+
+namespace simple_http {
+
+template <> struct Validator<framework_readme::CreateUser> {
+    static std::expected<void, std::vector<FieldError>> validate(const framework_readme::CreateUser &value) {
+        std::vector<FieldError> errors;
+        push_if(errors, required_field("name", !value.name.empty()));
+        push_if(errors, range("age", value.age, 1, 150));
+        return errors.empty() ? std::expected<void, std::vector<FieldError>>{} : std::unexpected(std::move(errors));
+    }
+};
+
+} // namespace simple_http
+
+void readme_framework(simple_http::Server &server) {
+    using namespace framework_readme;
+
+    server.state(std::make_shared<AppState>(AppState{"app"}));
+
+    server.host("api.example.com", [](simple_http::Router &api) {
+        api.route(
+            {simple_http::Method::Get}, "/users/{id}",
+            simple_http::extract<simple_http::Path<UserParams>, simple_http::State<AppState>>(
+                [](const UserParams &params, AppState *state, RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+                    co_await res->status(200).send(std::to_string(params.id) + ":" + state->name);
+                }));
+    });
+
+    server.route({simple_http::Method::Post}, "/users",
+                 simple_http::extract<simple_http::Valid<simple_http::Json<CreateUser>>>(
+                     [](CreateUser user, RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+                         co_await res->status(201).send(user.name);
+                     }));
+
+    server.route(
+        {simple_http::Method::Get}, "/files/{*rest}",
+        [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
+            co_await res->status(200).send(std::string{req->param("rest").value_or("")});
+        },
+        simple_http::openapi::doc().path_params<RestParams>());
+
+    auto sessions = std::make_shared<simple_http::MemorySessionStore>();
+    server.use(simple_http::middleware::session(sessions, simple_http::SessionConfig{.secure = false}));
+    server.use(simple_http::middleware::csrf(simple_http::CsrfConfig{.secure = false}));
+    server.use(simple_http::middleware::jwt(simple_http::JwtConfig{
+        .algorithms = {"HS256"},
+        .secret = "secret",
+    }));
+    server.use(simple_http::middleware::require_scope("read"));
+}
+
 // --- Routing details (README → Quick Start / Router) -------------------------
 
 void readme_routing_details(simple_http::Server &server) {

@@ -411,6 +411,28 @@ class Server {
         m_router->fallback(std::forward<F>(handler));
         return *this;
     }
+
+    // Shared application state, read in a handler with req->app_state<T>() (or
+    // the State<T> extractor). Held by shared_ptr; not copied per request.
+    // Register it before start(), like routes and middleware.
+    template <typename T> Server &state(std::shared_ptr<T> value) {
+        m_router->state(std::move(value));
+        return *this;
+    }
+    template <typename T> std::shared_ptr<T> state() const { return m_router->template state<T>(); }
+
+    // Host-scoped routes: the child Router only matches requests whose Host /
+    // :authority matches `pattern`. Exact hosts beat wildcard suffixes; a
+    // `*.example.com` pattern matches subdomains but not the bare domain.
+    // WebSocket routing remains host-agnostic in the current engines.
+    template <typename F> Server &host(std::string pattern, F &&register_routes) {
+        m_router->host(std::move(pattern), std::forward<F>(register_routes));
+        return *this;
+    }
+    template <typename F> Server &host(std::string pattern, std::vector<Middleware> middlewares, F &&register_routes) {
+        m_router->host(std::move(pattern), std::move(middlewares), std::forward<F>(register_routes));
+        return *this;
+    }
     // --- middleware (Go net/http / tower style) ---
     // Appends a middleware to the dispatch chain: it runs before route matching
     // (and before any earlier-registered middleware), may short-circuit by never

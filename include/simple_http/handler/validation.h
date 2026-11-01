@@ -1,0 +1,109 @@
+#pragma once
+
+// Request-body / parameter validation.
+//
+// The library does not impose a validation DSL. A type opts in by specializing
+// Validator<T>; the Valid<E> extractor (see extract.h) runs it after the value
+// has been parsed, and turns a failure into a 422 with a structured field-error
+// list. The default Validator<T> accepts everything, so validation is opt-in
+// per type and costs nothing for types that do not use it.
+//
+//     template <> struct simple_http::Validator<CreateUser> {
+//         static std::expected<void, std::vector<FieldError>>
+//         validate(const CreateUser &v) {
+//             std::vector<FieldError> errors;
+//             push_if(errors, required_field("name", !v.name.empty()));
+//             push_if(errors, range("age", v.age, 1, 150));
+//             return errors.empty() ? std::expected<void, std::vector<FieldError>>{}
+//                                   : std::unexpected(std::move(errors));
+//         }
+//     };
+//
+// The helpers below are convenience predicates, not a schema language. A
+// project that already uses a validator library can adapt it in one function.
+
+#include <cstddef>
+#include <expected>
+#include <initializer_list>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <glaze/glaze.hpp>
+
+namespace simple_http {
+
+// One field-level validation failure. `field` is the JSON/path parameter name,
+// `code` is a stable machine-readable token, and `message` is for humans.
+struct FieldError {
+    std::string field;
+    std::string code;
+    std::string message;
+};
+
+// The opt-in validation hook. The primary template accepts everything; a
+// caller specializes it for a type it wants validated.
+template <typename T> struct Validator {
+    static std::expected<void, std::vector<FieldError>> validate(const T &) { return {}; }
+};
+
+// --- convenience predicates -------------------------------------------------
+//
+// Each returns an optional<FieldError>: push it only when it has a value.
+
+inline std::optional<FieldError> required_field(std::string field, bool present, std::string message = "required") {
+    if (present) {
+        return std::nullopt;
+    }
+    return FieldError{std::move(field), "required", std::move(message)};
+}
+
+inline std::optional<FieldError> min_length(std::string field, std::string_view value, std::size_t min) {
+    if (value.size() >= min) {
+        return std::nullopt;
+    }
+    return FieldError{std::move(field), "min_length", "must contain at least " + std::to_string(min) + " characters"};
+}
+
+inline std::optional<FieldError> max_length(std::string field, std::string_view value, std::size_t max) {
+    if (value.size() <= max) {
+        return std::nullopt;
+    }
+    return FieldError{std::move(field), "max_length", "must contain at most " + std::to_string(max) + " characters"};
+}
+
+template <typename T> std::optional<FieldError> range(std::string field, const T &value, const T &low, const T &high) {
+    if (value >= low && value <= high) {
+        return std::nullopt;
+    }
+    return FieldError{std::move(field), "range", "must be between the allowed bounds"};
+}
+
+inline std::optional<FieldError> one_of(std::string field, std::string_view value,
+                                        std::initializer_list<std::string_view> allowed) {
+    for (std::string_view candidate : allowed) {
+        if (value == candidate) {
+            return std::nullopt;
+        }
+    }
+    return FieldError{std::move(field), "one_of", "must be one of the allowed values"};
+}
+
+// Appends `error` to `errors` when it is present. Lets a validator read as a
+// list of checks without repeating the optional dance.
+inline void push_if(std::vector<FieldError> &errors, std::optional<FieldError> error) {
+    if (error) {
+        errors.push_back(std::move(*error));
+    }
+}
+
+// Renders field errors as the `details` string of the JSON error body. Kept out
+// of the error type so callers can replace the whole body shape.
+inline std::string field_errors_json(const std::vector<FieldError> &errors) {
+    auto json = glz::write_json(errors);
+    return json ? std::move(*json) : std::string{"[]"};
+}
+
+} // namespace simple_http

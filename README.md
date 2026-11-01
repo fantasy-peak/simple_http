@@ -21,6 +21,7 @@ and no locks in the protocol engines.
 - [What is this](#what-is-this)
 - [Features](#features)
 - [Quick start](#quick-start)
+- [Framework layer](#framework-layer)
 - [Build, dependencies and macros](#build)
 - [Server guide](#server-guide)
 - [Client guide](#client-guide)
@@ -41,7 +42,7 @@ under `include/`; there are no `.cpp` files:
 | `proto` | `include/simple_http/proto/` | Version-agnostic `Request` / `ResponseWriter` / `Body` model; forms, JSON, multipart, WebSocket message layer |
 | `transport` | `include/simple_http/transport/` | Byte-stream abstraction: plain TCP and TLS (with ALPN / mTLS) |
 | `engine` | `include/simple_http/engine/` | Per-version engines: `h1/`, `h2/`, `h3/`; each implements the same `ResponseSink` behind the `ResponseWriter` facade |
-| `handler` | `include/simple_http/handler/` | Handler type system, router, middleware, static files, reverse proxy, rate limiting, CORS, security headers |
+| `handler` | `include/simple_http/handler/` | Handler type system, router/middleware, app state, extractors/validation, sessions/CSRF/JWT, static files, reverse proxy, rate limiting, CORS, security headers |
 | `net` | `include/simple_http/net/` | Listeners, protocol sniffing, the `Server` facade |
 | `client` | `include/simple_http/client/` | Outbound client: HTTP/1.1, HTTP/2, optional HTTP/3, WebSocket, SSE, proxies, cookies |
 | `quic` | `include/simple_http/quic/` | QUIC transport wrapper (ngtcp2), compiled only with `SIMPLE_HTTP_ENABLE_HTTP3` |
@@ -81,8 +82,10 @@ concrete `ResponseSink` implementations; `ResponseWriter` only forwards.
 - HTTP/3 over QUIC (requires `SIMPLE_HTTP_ENABLE_HTTP3`; ngtcp2 + nghttp3), with Alt-Svc
   advertisement, connection migration and configurable 0-RTT.
 - WebSocket over HTTP/1.1 `Upgrade` and HTTP/2 extended CONNECT (RFC 8441).
-- Method-aware routing: exact paths, `{param}` segment trie, regex routes,
-  `any_methods`, fallback.
+- Method-aware routing: exact paths, `{param}` segment trie, `{*rest}` catch-all,
+  regex routes, host scoping, `any_methods`, fallback.
+- Framework layer: typed application state, compile-time extractors, validation,
+  sessions, CSRF and JWT (HS256/RS256/ES256).
 - Middleware chain at global, group and per-route scope: CORS, timeouts, recovery, auth,
   access logging, request-id, real-ip, rate limiting, security headers, response
   compression.
@@ -295,6 +298,160 @@ xmake run server
 TLS/mTLS (with QUIC on the same port over UDP), `:7790` h2c-only, `:7791` h1-only,
 `:7792` TCP+UDP dual transport, `:7793` h2 with a large window, and `:7794` h1-only
 configured through the listener builder. Full route examples live there as well.
+
+<a id="framework-layer"></a>
+## Framework layer
+
+The `handler/` layer includes the pieces a small application would otherwise build
+around the router: shared state, typed extraction, validation, sessions/CSRF/JWT, host
+scoping and catch-all routes. Everything is opt-in and layer-local — no protocol engine
+knows about it.
+
+### Application state
+
+Register shared, type-keyed state on the server, then read it without copying per
+request:
+
+```cpp
+struct AppState {
+    std::shared_ptr<Db> db;
+};
+
+server.state(std::make_shared<AppState>(AppState{db}));
+
+server.route({Method::Get}, "/users", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
+    const AppState *state = req->app_state<AppState>();
+    if (!state) {
+        co_await res->status(500).send("state missing");
+        co_return;
+    }
+    auto rows = co_await state->db->query(...);
+    co_await res->status(200).send(rows);
+});
+```
+
+State is shared by every connection (the handler layer may use locks; the engines do
+not). Register it before `start()`, like middleware. Host child routers share the same
+state registry.
+
+### Typed extractors and validation
+
+`extract<...>(handler)` runs extractors before the handler and answers 400/422/500 on
+failure; the handler is not entered. The wrapper is still an ordinary `Handler`, so
+routes, groups, middleware and OpenAPI descriptors are unchanged.
+
+```cpp
+struct UserParams { int id{}; };
+struct CreateUser { std::string name; int age{}; };
+
+server.route({Method::Get}, "/users/{id}",
+    extract<Path<UserParams>, State<AppState>>(
+        [](const UserParams &p, AppState *state, RequestPtr, ResponsePtr res)
+            -> asio::awaitable<void> {
+            co_await res->status(200).send(std::to_string(p.id));
+        }));
+
+server.route({Method::Post}, "/users",
+    extract<Valid<Json<CreateUser>>>(
+        [](CreateUser in, RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+            co_await res->status(201).send(in.name);
+        }));
+```
+
+Extractors: `Path<T>`, `Query<T>`, `Json<T>`, `Form<T>`, `State<T>`, `Header<T, "name">`, `Cookie<T, "name">`. At most one body
+extractor (`Json`/`Form`) may appear per `extract<...>`.
+
+Validation is an opt-in specialization; a failure becomes 422 with a field-error array
+in the JSON `details`:
+
+```cpp
+template <> struct simple_http::Validator<CreateUser> {
+    static std::expected<void, std::vector<FieldError>> validate(const CreateUser &v) {
+        std::vector<FieldError> errors;
+        push_if(errors, required_field("name", !v.name.empty()));
+        push_if(errors, range("age", v.age, 1, 150));
+        return errors.empty() ? std::expected<void, std::vector<FieldError>>{}
+                              : std::unexpected(std::move(errors));
+    }
+};
+```
+
+### Sessions and CSRF
+
+```cpp
+auto sessions = std::make_shared<MemorySessionStore>();
+server.use(middleware::session(sessions, SessionConfig{
+    .cookie_name = "__Host-sid",
+    .secure = true,
+    .http_only = true,
+    .same_site = "Lax",
+}));
+server.use(middleware::csrf(CsrfConfig{
+    .cookie_name = "__Host-csrf",
+    .header_name = "x-csrf-token",
+}));
+
+server.route({Method::Post}, "/login",
+    [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
+        if (auto *s = session(*req)) {
+            s->regenerate_id();     // session-fixation defense
+            s->set("uid", "42");
+        }
+        co_await res->status(204).send("");
+    });
+```
+
+The cookie carries only an opaque id; values live in the `SessionStore`. The interface
+is awaitable, so a Redis/database adapter is a consumer-side implementation. The default
+`MemorySessionStore` is in-process and lock-protected. CSRF is double-submit: a safe
+request establishes the cookie, and an unsafe request must echo it in the header. Form
+posts that cannot set a header should validate the hidden field themselves or use a
+small adapter.
+
+### JWT
+
+```cpp
+server.use(middleware::jwt(JwtConfig{
+    .algorithms = {"RS256"},
+    .public_key_pem = read_file("public.pem"),
+    .issuer = "https://issuer.example",
+    .audience = "my-api",
+}));
+server.use(middleware::require_scope("users:write"));
+
+server.route({Method::Get}, "/me", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
+    const Principal *principal = simple_http::principal(*req);
+    co_await res->status(200).send(principal ? principal->subject : "");
+});
+```
+
+The verifier enforces the configured algorithm allowlist (rejecting `none`), checks the
+signature with OpenSSL (HS256, RS256, ES256), and validates `exp` (required by default),
+`nbf`, `iss` and `aud`. It publishes a `Principal` with subject, scopes and roles.
+Token issuance, JWKS fetching and OAuth2/OIDC discovery are intentionally not part of
+this layer yet.
+
+### Host routing and catch-all paths
+
+```cpp
+server.host("api.example.com", [](Router &api) {
+    api.route({Method::Get}, "/users", users_handler);
+});
+server.host("*.example.com", [](Router &sub) {
+    sub.route({Method::Get}, "/", subdomain_handler);
+});
+
+server.route({Method::Get}, "/files/{*rest}",
+    [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(200).send(std::string{req->param("rest").value_or("")});
+    });
+```
+
+Exact hosts beat wildcard suffixes, and the longest wildcard suffix wins. A
+`*.example.com` pattern does not match `example.com` or `evil-example.com`. A host
+pattern without a port ignores the request's port; one with `:port` compares it too.
+`{*rest}` must be the final segment and captures the remaining path including `/`.
+Host routing currently applies to HTTP dispatch, not WebSocket lookup.
 
 <a id="build"></a>
 ## Build, dependencies and macros
@@ -1119,15 +1276,16 @@ testing them against each other cancels the mistake out.
 ### Local test targets
 
 ```sh
-xmake build unittest && xmake run unittest      # Catch2: 372 cases, 65094 assertions
+xmake build unittest && xmake run unittest      # Catch2: 387 cases, 65218 assertions
 xmake build regression && xmake run regression  # raw-socket malformed/boundary requests
 xmake build client && xmake run client          # client integration: 218 checks
 xmake build server && xmake run python-tests    # third-party Python clients: 113 checks
 ```
 
 The unit tests cover core, proto, the H1 parser, H2 frames / HPACK / Huffman, WebSocket
-frames and message handling, routing, CORS, rate limiting, static files, OpenAPI, and
-client URL / config / TLS parameters / proxies. Filter by tag:
+frames and message handling, routing, host/catch-all routing, application state,
+extractors, validation, sessions, CSRF, JWT, CORS, rate limiting, static files, OpenAPI,
+and client URL / config / TLS parameters / proxies. Filter by tag:
 `xmake run unittest "[h2]"`.
 
 `test/server.cpp` listens on: `:7788` plaintext sniffing, `:7789` TLS/mTLS (and QUIC on
@@ -1227,6 +1385,15 @@ xmake run loadgen ws://127.0.0.1:7788/echo1k -p ws -n 200000 -c 64
 - The client HTTP/2 session does not expose 1xx interim responses to the caller;
   `100-continue` is visible on HTTP/1.1 and HTTP/3.
 - CORS middleware does not apply to WebSocket upgrades; use `ws_origin()`.
+- Host routing applies to HTTP dispatch only; the current WebSocket engine lookup is
+  host-agnostic. A host child Router has its own OpenAPI document.
+- JWT is a verifier only: no token issuance, JWKS fetching, OAuth2/OIDC discovery or
+  refresh-token flow. RS256/ES256 require a PEM public key. `aud` and `scope` are parsed
+  as string claims; audience arrays are not supported.
+- Sessions ship with an in-process store; Redis/database adapters implement the
+  `SessionStore` interface on the consumer side. CSRF is header-based (double submit);
+  forms that cannot set a header need a handler-side field check.
+- Validation is opt-in per type through `Validator<T>`; there is no tag/DSL validator.
 - HTTP/2 one-shot responses deliberately omit `Content-Length` (END_STREAM delimits the
   body; HEAD is the exception).
 - The CMake INTERFACE target does not wire ngtcp2/nghttp3, so HTTP/3 is currently

@@ -572,8 +572,12 @@ inline std::vector<Param> template_path_params(std::string_view path) {
         const std::string_view seg =
             path.substr(pos, end == std::string_view::npos ? std::string_view::npos : end - pos);
         if (seg.size() >= 2 && seg.front() == '{' && seg.back() == '}') {
-            out.push_back(
-                Param{std::string{seg.substr(1, seg.size() - 2)}, ParamIn::Path, true, {}, R"({"type":"string"})"});
+            std::string name{seg.substr(1, seg.size() - 2)};
+            // A catch-all is written {*rest}; its parameter name is "rest".
+            if (!name.empty() && name.front() == '*') {
+                name.erase(0, 1);
+            }
+            out.push_back(Param{std::move(name), ParamIn::Path, true, {}, R"({"type":"string"})"});
         }
         if (end == std::string_view::npos) {
             break;

@@ -69,13 +69,18 @@
 #include "simple_http/handler/builtin_middleware.h" // request_id / access_log / recovery / basic_auth
 #include "simple_http/handler/conditionals.h"       // maybe_not_modified (handler-level ETag → 304)
 #include "simple_http/handler/cors.h"               // CorsConfig (public: exported for server.cors)
+#include "simple_http/handler/csrf.h"               // double-submit-cookie CSRF middleware
+#include "simple_http/handler/extract.h"            // Path/Query/Json/Form/State extractors + extract<...>()
 #include "simple_http/handler/file_response.h"      // send_file: bounded-memory file responses
 #include "simple_http/handler/handler.h"
+#include "simple_http/handler/jwt.h"        // JWT verifier + require_scope / require_role
 #include "simple_http/handler/rate_limit.h" // rate limiting (token bucket / per-key)
 #include "simple_http/handler/router.h"
 #include "simple_http/handler/secure_headers.h" // security response headers (HSTS/CSP/frame/nosniff)
+#include "simple_http/handler/session.h"        // SessionStore / Session + session() middleware
 #include "simple_http/handler/static_files.h"
-#include "simple_http/handler/upload.h" // read_body_to_file: bounded-memory uploads
+#include "simple_http/handler/upload.h"     // read_body_to_file: bounded-memory uploads
+#include "simple_http/handler/validation.h" // Validator<T> + FieldError
 
 // --- openapi layer (per-route descriptors → OAS document + CDN Swagger UI) ---
 // Always compiled: documentation is per-route metadata (see openapi/openapi.h).

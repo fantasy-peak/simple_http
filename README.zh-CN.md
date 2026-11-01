@@ -22,6 +22,7 @@
 - [这是什么](#what-is-this)
 - [特性概览](#features)
 - [快速开始](#quick-start)
+- [框架层](#framework-layer)
 - [构建、依赖与编译宏](#build)
 - [服务端指南](#server-guide)
 - [客户端指南](#client-guide)
@@ -42,7 +43,7 @@
 | `proto` | `include/simple_http/proto/` | 版本无关的 `Request` / `ResponseWriter` / `Body` 模型，表单、JSON、multipart、WebSocket 消息层 |
 | `transport` | `include/simple_http/transport/` | 字节流抽象：明文 TCP、TLS（含 ALPN / mTLS） |
 | `engine` | `include/simple_http/engine/` | 各协议版本引擎：`h1/`、`h2/`、`h3/`；它们实现同一套 `ResponseSink`，由 `ResponseWriter` 门面转发 |
-| `handler` | `include/simple_http/handler/` | Handler 类型系统、路由、中间件、静态文件、反代、限流、CORS、安全头 |
+| `handler` | `include/simple_http/handler/` | Handler 类型系统、路由、中间件、App State、提取器/校验、Session/CSRF/JWT、静态文件、反代、限流、CORS、安全头 |
 | `net` | `include/simple_http/net/` | 监听、协议嗅探、`Server` 门面 |
 | `client` | `include/simple_http/client/` | 出站客户端：HTTP/1.1、HTTP/2、可选的 HTTP/3、WebSocket、SSE、代理、Cookie |
 | `quic` | `include/simple_http/quic/` | QUIC 传输封装（ngtcp2），仅在 `SIMPLE_HTTP_ENABLE_HTTP3` 下编入 |
@@ -75,7 +76,10 @@
 - HTTP/3 over QUIC（需要 `SIMPLE_HTTP_ENABLE_HTTP3`，依赖 ngtcp2 + nghttp3）；
   支持 Alt-Svc 通告、连接迁移与可配置 0-RTT。
 - WebSocket：HTTP/1.1 `Upgrade`，以及 HTTP/2 extended CONNECT（RFC 8441）。
-- 方法感知路由：精确路径、`{param}` 段 trie、正则路由、`any_methods`、fallback。
+- 方法感知路由：精确路径、`{param}` 段 trie、`{*rest}` 通配、正则路由、Host 作用域、
+  `any_methods`、fallback。
+- 框架层：类型化 App State、编译期提取器、校验、Session、CSRF、JWT
+  （HS256/RS256/ES256）。
 - 中间件链：全局、组、单路由三级作用域；CORS、超时、恢复、认证、访问日志、
   request-id、real-ip、限流、安全头、响应压缩。
 - 流式响应、SSE、响应尾部字段（trailers）。
@@ -278,6 +282,145 @@ xmake run server
 `test/server.cpp` 会启动多个监听器：`:7788` 明文嗅探、`:7789` TLS/mTLS（同时
 UDP QUIC）、`:7790` 纯 h2c、`:7791` 纯 h1、`:7792` TCP+UDP 双传输、`:7793`
 大窗口 h2、`:7794` builder 配置的纯 h1。完整路由示例也在其中。
+
+<a id="framework-layer"></a>
+## 框架层 · Framework layer
+
+`handler/` 层现在包含一组小型应用框架能力：共享状态、类型化提取、校验、Session/
+CSRF/JWT、Host 作用域和通配路由。全部 opt-in，且只存在于 handler 层，协议引擎无感知。
+
+### App State
+
+```cpp
+struct AppState {
+    std::shared_ptr<Db> db;
+};
+
+server.state(std::make_shared<AppState>(AppState{db}));
+
+server.route({Method::Get}, "/users", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
+    const AppState *state = req->app_state<AppState>();
+    if (!state) {
+        co_await res->status(500).send("state missing");
+        co_return;
+    }
+    co_await res->status(200).send(co_await state->db->query(...));
+});
+```
+
+状态按静态类型键存放在 Router 中，按 `shared_ptr` 共享，不按请求复制。必须在
+`start()` 前注册；Host 子 Router 共享同一份状态。
+
+### 类型化提取器与校验
+
+```cpp
+struct UserParams { int id{}; };
+struct CreateUser { std::string name; int age{}; };
+
+server.route({Method::Get}, "/users/{id}",
+    extract<Path<UserParams>, State<AppState>>(
+        [](const UserParams &p, AppState *state, RequestPtr, ResponsePtr res)
+            -> asio::awaitable<void> {
+            co_await res->status(200).send(std::to_string(p.id));
+        }));
+
+server.route({Method::Post}, "/users",
+    extract<Valid<Json<CreateUser>>>(
+        [](CreateUser in, RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+            co_await res->status(201).send(in.name);
+        }));
+```
+
+提取器：`Path<T>`、`Query<T>`、`Json<T>`、`Form<T>`、`State<T>`、`Header<T, "name">`、`Cookie<T, "name">`；同一次 `extract<...>`
+最多一个 body 提取器（`Json`/`Form`）。失败自动 400/422/500，不会进入 handler。
+
+校验通过 `Validator<T>` 特化 opt-in：
+
+```cpp
+template <> struct simple_http::Validator<CreateUser> {
+    static std::expected<void, std::vector<FieldError>> validate(const CreateUser &v) {
+        std::vector<FieldError> errors;
+        push_if(errors, required_field("name", !v.name.empty()));
+        push_if(errors, range("age", v.age, 1, 150));
+        return errors.empty() ? std::expected<void, std::vector<FieldError>>{}
+                              : std::unexpected(std::move(errors));
+    }
+};
+```
+
+失败返回 422，字段错误数组放在 JSON `details` 中。
+
+### Session 与 CSRF
+
+```cpp
+auto sessions = std::make_shared<MemorySessionStore>();
+server.use(middleware::session(sessions, SessionConfig{
+    .cookie_name = "__Host-sid",
+    .secure = true,
+    .http_only = true,
+    .same_site = "Lax",
+}));
+server.use(middleware::csrf(CsrfConfig{
+    .cookie_name = "__Host-csrf",
+    .header_name = "x-csrf-token",
+}));
+
+server.route({Method::Post}, "/login",
+    [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
+        if (auto *s = session(*req)) {
+            s->regenerate_id();     // 防会话固定
+            s->set("uid", "42");
+        }
+        co_await res->status(204).send("");
+    });
+```
+
+Cookie 只存不透明 id，数据在 `SessionStore` 里；接口是 awaitable 的，Redis/数据库
+适配器由使用者在消费侧实现。默认 `MemorySessionStore` 是进程内、带锁实现。CSRF 使用
+double-submit：安全请求建立 cookie，非安全请求必须在 header 中回显。无法设置 header 的
+HTML 表单需要在 handler 里自行校验隐藏字段或写适配器。
+
+### JWT
+
+```cpp
+server.use(middleware::jwt(JwtConfig{
+    .algorithms = {"RS256"},
+    .public_key_pem = read_file("public.pem"),
+    .issuer = "https://issuer.example",
+    .audience = "my-api",
+}));
+server.use(middleware::require_scope("users:write"));
+
+server.route({Method::Get}, "/me", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
+    const Principal *p = simple_http::principal(*req);
+    co_await res->status(200).send(p ? p->subject : "");
+});
+```
+
+验证器强制算法 allowlist（拒绝 `none`），用 OpenSSL 校验 HS256/RS256/ES256 签名，
+并校验 `exp`（默认必填）、`nbf`、`iss`、`aud`，成功后发布 `Principal`（subject /
+scopes / roles）。令牌签发、JWKS 拉取、OAuth2/OIDC 发现暂不在这一层。
+
+### Host 路由与通配路径
+
+```cpp
+server.host("api.example.com", [](Router &api) {
+    api.route({Method::Get}, "/users", users_handler);
+});
+server.host("*.example.com", [](Router &sub) {
+    sub.route({Method::Get}, "/", subdomain_handler);
+});
+
+server.route({Method::Get}, "/files/{*rest}",
+    [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(200).send(std::string{req->param("rest").value_or("")});
+    });
+```
+
+精确 Host 优先于通配后缀，最长后缀优先；`*.example.com` 不匹配 `example.com` 或
+`evil-example.com`。不带端口的 pattern 忽略请求端口，带 `:port` 时也比较端口。
+`{*rest}` 只能出现在最后一段，捕获剩余路径（含 `/`）。Host 路由目前只作用于 HTTP
+dispatch，WebSocket 查找仍是 host-agnostic。
 
 <a id="build"></a>
 ## 构建、依赖与编译宏 · Build
@@ -1061,14 +1204,15 @@ socket 字节
 ### 本地测试目标
 
 ```sh
-xmake build unittest && xmake run unittest      # Catch2：372 个用例，65094 条断言
+xmake build unittest && xmake run unittest      # Catch2：387 个用例，65218 条断言
 xmake build regression && xmake run regression  # 裸 socket 畸形/边界请求
 xmake build client && xmake run client          # 客户端整合自检：218 checks
 xmake build server && xmake run python-tests    # Python 第三方客户端：113 checks
 ```
 
 单元测试涵盖 core、proto、h1 解析器、h2 帧 / HPACK / Huffman、WebSocket 帧与消息层、
-路由、CORS、限流、静态文件、OpenAPI、客户端 URL / 配置 / TLS 参数 / 代理等。
+路由、Host/通配路由、App State、提取器、校验、Session、CSRF、JWT、CORS、限流、
+静态文件、OpenAPI、客户端 URL / 配置 / TLS 参数 / 代理等。
 按标签过滤：`xmake run unittest "[h2]"`。
 
 ### 交叉验证
@@ -1159,6 +1303,13 @@ xmake run loadgen ws://127.0.0.1:7788/echo1k -p ws -n 200000 -c 64
 - 客户端 HTTP/2 会话不向调用方暴露 1xx 中间响应；`100-continue` 在 HTTP/1.1 与
   HTTP/3 路径可见。
 - CORS 中间件不处理 WebSocket 升级；请使用 `ws_origin()` 做 Origin 校验。
+- Host 路由只作用于 HTTP dispatch；当前 WebSocket 引擎查找是 host-agnostic 的。
+  Host 子 Router 有独立的 OpenAPI 文档。
+- JWT 只是验证器：不做令牌签发、JWKS 拉取、OAuth2/OIDC 发现或 refresh-token 流程；
+  RS256/ES256 需要 PEM 公钥。`aud`/`scope` 按字符串 claim 解析，不支持 audience 数组。
+- Session 只内置进程内存储；Redis/数据库适配器由消费侧实现 `SessionStore`。CSRF 是
+  header 型 double-submit；无法设置 header 的表单需要在 handler 里校验字段。
+- 校验通过 `Validator<T>` 按类型 opt-in，没有 tag/DSL 校验器。
 - HTTP/2 一次性响应刻意不发 `Content-Length`（由 END_STREAM 界定，HEAD 除外）。
 - CMake 的 INTERFACE 目标未接入 ngtcp2/nghttp3，因此 HTTP/3 目前只由 xmake 构建提供。
 - 服务端默认 TLS 1.3-only；需要 TLS 1.2 时显式设置 `TlsConfig::min_version`。

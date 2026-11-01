@@ -24,6 +24,7 @@
 // matches the engine's Dispatcher type, so the same router serves every
 // protocol version.
 
+#include <algorithm>
 #include <atomic>
 #include <boost/asio/awaitable.hpp>
 #include <cstdint>
@@ -32,11 +33,13 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <typeindex>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -126,6 +129,10 @@ struct RouteEntry {
 struct TemplateRoute {
     std::vector<std::optional<std::string>> segments;
     std::vector<std::string> param_names; // one per nullopt segment
+    // The final segment was written `{*name}`: it captures the rest of the path
+    // (including '/' characters), not one segment. Only legal as the last
+    // segment.
+    bool wildcard{false};
 };
 
 // A registration scope: one open group() call. The prefix accumulates across
@@ -140,10 +147,12 @@ struct RegistrationScope {
 
 class Router {
   public:
+    using StateRegistry = AppStateView::Registry;
+
     // Reverse-proxy routes build no client up front: dispatch constructs one
     // per proxied request from the route's own ClientConfig (see http_proxy),
     // so there is no cross-request cache to tear down at shutdown.
-    Router() = default;
+    Router() : m_states(std::make_shared<StateRegistry>()) {}
 
     // --- registration (fluent) ---
     // Methods come first: a route is a (method, path) pair. The list may be a
@@ -281,6 +290,51 @@ class Router {
 
     template <typename F> Router &fallback(F &&handler) {
         m_fallback = make_handler(std::forward<F>(handler));
+        return *this;
+    }
+
+    // --- application state (typed, shared across connections) ---
+    // Registers shared state under its static type, to be read from a handler
+    // with `req->app_state<T>()` (or the State<T> extractor). The value is held
+    // by shared_ptr and is not copied per request. Register state before the
+    // server starts: dispatch reads the registry without a lock, and the same
+    // freeze-before-start rule as use()/cors() applies. A Router shared by
+    // several Servers shares its state with all of them.
+    template <typename T> Router &state(std::shared_ptr<T> value) {
+        (*m_states)[std::type_index(typeid(T))] = std::move(value);
+        return *this;
+    }
+    template <typename T> std::shared_ptr<T> state() const {
+        const auto it = m_states->find(std::type_index(typeid(T)));
+        if (it == m_states->end() || !it->second) {
+            return nullptr;
+        }
+        return std::static_pointer_cast<T>(it->second);
+    }
+
+    // --- host routing ---
+    // Routes registered inside host() only match requests whose Host /
+    // :authority matches the pattern. Exact hosts win over wildcard suffixes,
+    // and the longest wildcard suffix wins among wildcards. A `*.example.com`
+    // pattern matches one or more leading labels (`api.example.com`,
+    // `a.b.example.com`) but not `example.com` or `evil-example.com`. A host
+    // pattern without a port ignores the request's port; one with `:port`
+    // compares it too. Host groups compose like any other Router: the lambda
+    // receives a child Router with its own routes, middleware, static files and
+    // OpenAPI document. Root global middleware still wraps the host's chain.
+    //
+    // WebSocket routing is host-agnostic in the current engines; host() applies
+    // to HTTP dispatch only.
+    template <typename F> Router &host(std::string pattern, F &&register_routes) {
+        return host(std::move(pattern), {}, std::forward<F>(register_routes));
+    }
+    template <typename F> Router &host(std::string pattern, std::vector<Middleware> middlewares, F &&register_routes) {
+        auto child = std::shared_ptr<Router>(new Router(m_states));
+        for (auto &middleware : middlewares) {
+            child->use(std::move(middleware));
+        }
+        std::forward<F>(register_routes)(*child);
+        register_host(std::move(pattern), std::move(child));
         return *this;
     }
 
@@ -579,10 +633,104 @@ class Router {
     // (dispatch_impl). The chain is built once, on first use, and frozen
     // thereafter: registration (use/cors) must finish before start().
     asio::awaitable<void> dispatch(RequestPtr req, ResponsePtr res, SslHandle ssl) const {
+        req->set_state(AppStateView{m_states.get()});
         co_await chain()(std::move(req), std::move(res), ssl);
     }
 
   private:
+    explicit Router(std::shared_ptr<StateRegistry> states) : m_states(std::move(states)) {}
+
+    // A host pattern and the child Router that serves it. Patterns are stored
+    // lower-case and without a trailing dot; wildcards keep the leading "*." and
+    // are matched by suffix, longest first.
+    struct HostWildcard {
+        std::string pattern;
+        std::string suffix; // pattern without the leading '*'
+        std::shared_ptr<Router> router;
+    };
+
+    static std::string normalize_host_pattern(std::string pattern) {
+        pattern = ascii_lower_copy(pattern);
+        while (!pattern.empty() && pattern.back() == '.') {
+            pattern.pop_back();
+        }
+        return pattern;
+    }
+
+    static std::string normalize_host_value(std::string_view host) {
+        std::string out = ascii_lower_copy(host);
+        while (!out.empty() && out.back() == '.') {
+            out.pop_back();
+        }
+        return out;
+    }
+
+    // The host without its port, IPv6 brackets preserved: "[::1]:8080" ->
+    // "[::1]", "example.com:8080" -> "example.com". A bare IPv6 literal without
+    // brackets is left alone (Host requires brackets there).
+    static std::string strip_port(std::string_view host) {
+        if (!host.empty() && host.front() == '[') {
+            const auto close = host.find(']');
+            return close == std::string_view::npos ? std::string{host} : std::string{host.substr(0, close + 1)};
+        }
+        const auto first = host.find(':');
+        if (first != std::string_view::npos && host.find(':', first + 1) == std::string_view::npos) {
+            return std::string{host.substr(0, first)};
+        }
+        return std::string{host};
+    }
+
+    void register_host(std::string pattern, std::shared_ptr<Router> router) {
+        pattern = normalize_host_pattern(std::move(pattern));
+        if (pattern.empty() || pattern == "*") {
+            SIMPLE_HTTP_ERROR_LOG("host route [{}]: invalid pattern; registration skipped", pattern);
+            return;
+        }
+        if (pattern.starts_with("*.")) {
+            for (const auto &entry : m_host_wildcards) {
+                if (entry.pattern == pattern) {
+                    SIMPLE_HTTP_INFO_LOG("host wildcard [{}] already registered; the first router stays", pattern);
+                    return;
+                }
+            }
+            m_host_wildcards.push_back(HostWildcard{pattern, pattern.substr(1), std::move(router)});
+            std::sort(m_host_wildcards.begin(), m_host_wildcards.end(),
+                      [](const HostWildcard &a, const HostWildcard &b) { return a.suffix.size() > b.suffix.size(); });
+            return;
+        }
+        if (!m_host_exact.emplace(std::move(pattern), std::move(router)).second) {
+            SIMPLE_HTTP_INFO_LOG("host [{}] already registered; the first router stays", pattern);
+        }
+    }
+
+    std::shared_ptr<Router> find_host_router(const Request &req) const {
+        if (m_host_exact.empty() && m_host_wildcards.empty()) {
+            return nullptr;
+        }
+        const auto raw = req.header("host");
+        if (!raw) {
+            return nullptr;
+        }
+        const std::string host = normalize_host_value(*raw);
+        const std::string host_without_port = strip_port(host);
+        if (auto it = m_host_exact.find(host); it != m_host_exact.end()) {
+            return it->second;
+        }
+        if (auto it = m_host_exact.find(host_without_port); it != m_host_exact.end()) {
+            return it->second;
+        }
+        for (const auto &entry : m_host_wildcards) {
+            const bool pattern_has_port = entry.pattern.find(':') != std::string::npos;
+            const std::string &candidate = pattern_has_port ? host : host_without_port;
+            // suffix includes the leading dot for a hostname pattern, so
+            // "*.example.com" cannot match "example.com" or "evil-example.com".
+            if (candidate.size() > entry.suffix.size() && candidate.ends_with(entry.suffix)) {
+                return entry.router;
+            }
+        }
+        return nullptr;
+    }
+
     // The composed chain, built lazily on first dispatch so a Router that is
     // configured but never dispatched pays nothing. Built under a mutex because
     // dispatch may be entered concurrently (one worker thread per connection);
@@ -626,6 +774,15 @@ class Router {
     // a middleware's next() ultimately reaches: exact routes, path templates,
     // the reverse-proxy stage, regex, the static stage, fallback, built-in 404.
     asio::awaitable<void> dispatch_impl(RequestPtr req, ResponsePtr res, SslHandle ssl) const {
+        // Host-specific routes take over the request before path matching. The
+        // child Router runs its own global middleware and path table; if it does
+        // not match, its own 404/fallback answers, rather than falling back into
+        // the host-agnostic table below.
+        if (auto host_router = find_host_router(*req)) {
+            co_await host_router->dispatch(std::move(req), std::move(res), ssl);
+            co_return;
+        }
+
         // A view, not a copy: the exact maps have transparent hashers, so they can
         // be probed with the request's own path, and the proxy lookups take a
         // string_view too. The copy is only needed for the regex walk — and only
@@ -775,6 +932,16 @@ class Router {
                 path.substr(pos, end == std::string_view::npos ? std::string_view::npos : end - pos);
             if (seg.size() >= 2 && seg.front() == '{' && seg.back() == '}') {
                 std::string name{seg.substr(1, seg.size() - 2)};
+                bool wildcard = false;
+                if (!name.empty() && name.front() == '*') {
+                    wildcard = true;
+                    name.erase(0, 1);
+                    // A catch-all consumes the rest of the path, so it can only
+                    // be the final segment.
+                    if (end != std::string_view::npos) {
+                        return std::nullopt;
+                    }
+                }
                 if (name.empty()) {
                     return std::nullopt;
                 }
@@ -786,6 +953,9 @@ class Router {
                 seen.push_back(name);
                 out.segments.push_back(std::nullopt);
                 out.param_names.push_back(std::move(name));
+                if (wildcard) {
+                    out.wildcard = true;
+                }
             } else {
                 if (seg.find('{') != std::string_view::npos || seg.find('}') != std::string_view::npos) {
                     return std::nullopt;
@@ -839,6 +1009,7 @@ class Router {
         // route.
         std::map<std::string, std::size_t, std::less<>> literals;
         std::size_t param_child{npos};
+        std::size_t wildcard_child{npos}; // {*name}: captures the rest of the path
         TrieTerminal terminal;
     };
 
@@ -1011,8 +1182,16 @@ class Router {
             m_trie.push_back(TrieNode{});
         }
         std::size_t node = 0;
-        for (const auto &seg : tmpl.segments) {
-            if (seg.has_value()) {
+        for (std::size_t i = 0; i < tmpl.segments.size(); ++i) {
+            const auto &seg = tmpl.segments[i];
+            const bool is_wildcard = tmpl.wildcard && i + 1 == tmpl.segments.size();
+            if (is_wildcard) {
+                if (m_trie[node].wildcard_child == TrieNode::npos) {
+                    m_trie[node].wildcard_child = m_trie.size();
+                    m_trie.push_back(TrieNode{});
+                }
+                node = m_trie[node].wildcard_child;
+            } else if (seg.has_value()) {
                 auto [it, fresh] = m_trie[node].literals.emplace(*seg, TrieNode::npos);
                 if (fresh) {
                     it->second = m_trie.size();
@@ -1094,6 +1273,16 @@ class Router {
             if (hit)
                 return true;
             found.pop_back(); // this branch failed: leave the captures as they were
+        }
+
+        // The catch-all edge is the least specific: it is tried only after the
+        // literal and {param} branches have failed. It captures everything left,
+        // including '/', and may be empty after a trailing slash.
+        if (n.wildcard_child != TrieNode::npos) {
+            if (terminal_ready(trie, n.wildcard_child, term)) {
+                found.push_back(path.substr(pos));
+                return true;
+            }
         }
         return false;
     }
@@ -1306,6 +1495,14 @@ class Router {
     mutable Next m_chain;
     mutable std::atomic<bool> m_chain_built{false};
     mutable std::mutex m_chain_mutex;
+
+    // Shared application state (Router::state); the same registry is shared by
+    // host child Routers. Read-only after configuration, like the middleware
+    // chain.
+    std::shared_ptr<StateRegistry> m_states;
+
+    std::unordered_map<std::string, std::shared_ptr<Router>, StringHash, std::equal_to<>> m_host_exact;
+    std::vector<HostWildcard> m_host_wildcards;
 
     std::unordered_map<std::string, WsRouteEntry, StringHash, std::equal_to<>> m_ws_exact;
     std::vector<std::pair<RegexRoute, WsRouteEntry>> m_ws_regex;

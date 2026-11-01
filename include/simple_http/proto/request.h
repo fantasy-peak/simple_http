@@ -16,6 +16,8 @@
 #include <stop_token>
 #include <string>
 #include <string_view>
+#include <typeindex>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -32,6 +34,15 @@
 namespace simple_http {
 
 namespace asio = boost::asio;
+
+// A non-owning view of the Router's application-state registry, placed on the
+// Request by Router::dispatch. The registry itself is owned by the Router and
+// outlives every request; values are type-keyed shared_ptrs, so a handler reads
+// one with `req->app_state<T>()` without copying anything per request.
+struct AppStateView {
+    using Registry = std::unordered_map<std::type_index, std::shared_ptr<void>>;
+    const Registry *states{nullptr};
+};
 
 class Request {
   public:
@@ -275,6 +286,36 @@ class Request {
             }
         }
         return nullptr;
+    }
+
+    // --- application state (Router::state) ---
+    // Unlike get_state<T>() (per-request, copied into the request), this reads
+    // the Router's shared application state: the object registered with
+    // `server.state(std::shared_ptr<T>)`. It is a pointer into that shared
+    // object, not a copy, and is null when no state of that exact type was
+    // registered. The Router must outlive the request (it does: the Server owns
+    // it), and state must be registered before the server starts.
+    template <typename T> T *app_state() {
+        const auto *view = get_state<AppStateView>();
+        if (!view || !view->states) {
+            return nullptr;
+        }
+        const auto it = view->states->find(std::type_index(typeid(T)));
+        if (it == view->states->end() || !it->second) {
+            return nullptr;
+        }
+        return static_cast<T *>(it->second.get());
+    }
+    template <typename T> const T *app_state() const {
+        const auto *view = get_state<AppStateView>();
+        if (!view || !view->states) {
+            return nullptr;
+        }
+        const auto it = view->states->find(std::type_index(typeid(T)));
+        if (it == view->states->end() || !it->second) {
+            return nullptr;
+        }
+        return static_cast<const T *>(it->second.get());
     }
 
     // The request's access-log context (see logging.h LogFields): a middleware or
