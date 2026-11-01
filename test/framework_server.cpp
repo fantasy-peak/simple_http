@@ -1,0 +1,218 @@
+// Reference server for the framework-layer differential test against Go.
+//
+// It exposes every new handler-layer feature under deterministic routes so
+// test/python/framework_diff.py can send the same request to this server and
+// to test/go/framework_server.go and compare the observable behavior.
+//
+//   xmake build framework_server
+//   ./build/linux/x86_64/release/framework_server 7798
+
+#include <csignal>
+#include <cstdint>
+#include <memory>
+#include <print>
+#include <string>
+#include <thread>
+
+#include "simple_http.h"
+
+namespace asio = boost::asio;
+using namespace simple_http;
+
+struct AppState {
+    std::string name{"from-state"};
+};
+
+struct UserParams {
+    int id{};
+};
+
+struct CreateUser {
+    std::string name;
+    int age{};
+};
+
+struct ListQuery {
+    std::string q;
+    int page{};
+};
+
+namespace simple_http {
+template <> struct Validator<CreateUser> {
+    static std::expected<void, std::vector<FieldError>> validate(const CreateUser &value) {
+        std::vector<FieldError> errors;
+        push_if(errors, required_field("name", !value.name.empty()));
+        push_if(errors, range("age", value.age, 1, 150));
+        return errors.empty() ? std::expected<void, std::vector<FieldError>>{} : std::unexpected(std::move(errors));
+    }
+};
+} // namespace simple_http
+
+namespace {
+
+volatile std::sig_atomic_t g_stop = 0;
+void on_signal(int) { g_stop = 1; }
+
+} // namespace
+
+int main(int argc, char **argv) {
+    const auto port = static_cast<std::uint16_t>(argc > 1 ? std::stoi(argv[1]) : 7798);
+
+    set_log_sink(make_stderr_sink(LogLevel::Warn));
+
+    ServerConfig cfg;
+    cfg.listen = InetAddress{"127.0.0.1", port, false};
+    cfg.worker_threads = 2;
+    Server server{cfg};
+    server.state(std::make_shared<AppState>());
+
+    // --- application state / extractors / validation -------------------------
+    server.route({Method::Get}, "/state", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
+        const AppState *state = req->app_state<AppState>();
+        co_await res->status(200).send(state ? state->name : "missing");
+    });
+
+    server.route({Method::Get}, "/users/{id}",
+                 extract<Path<UserParams>, State<AppState>>([](const UserParams &params, AppState *state, RequestPtr,
+                                                               ResponsePtr res) -> asio::awaitable<void> {
+                     co_await res->status(200).send(std::to_string(params.id) + ":" + state->name);
+                 }));
+
+    server.route(
+        {Method::Get}, "/list",
+        extract<Query<ListQuery>>([](const ListQuery &query, RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+            co_await res->status(200).send(query.q + ":" + std::to_string(query.page));
+        }));
+
+    server.route({Method::Post}, "/json",
+                 extract<Json<CreateUser>>([](CreateUser value, RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+                     co_await res->status(201).send(value.name + ":" + std::to_string(value.age));
+                 }));
+
+    server.route(
+        {Method::Post}, "/valid",
+        extract<Valid<Json<CreateUser>>>([](CreateUser value, RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+            co_await res->status(201).send(value.name);
+        }));
+
+    server.route({Method::Post}, "/form",
+                 extract<Form<CreateUser>>([](CreateUser value, RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+                     co_await res->status(201).send(value.name + ":" + std::to_string(value.age));
+                 }));
+
+    server.route({Method::Get}, "/header",
+                 extract<Header<int, "x-page">, Cookie<std::string, "sid">>(
+                     [](int page, std::string sid, RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+                         co_await res->status(200).send(std::to_string(page) + ":" + sid);
+                     }));
+
+    // --- catch-all / exact / template precedence -----------------------------
+    server.route({Method::Get}, "/files/static", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(200).send("static");
+    });
+    server.route({Method::Get}, "/files/{id}", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(200).send("id=" + std::string{req->param("id").value_or("")});
+    });
+    server.route({Method::Get}, "/files/{*rest}", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(200).send("rest=" + std::string{req->param("rest").value_or("")});
+    });
+
+    // --- host routing --------------------------------------------------------
+    server.route({Method::Get}, "/who",
+                 [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(200).send("root"); });
+    server.host("api.example.com", [](Router &api) {
+        api.route({Method::Get}, "/who",
+                  [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(200).send("api"); });
+    });
+    server.host("*.example.com", [](Router &sub) {
+        sub.route({Method::Get}, "/who",
+                  [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(200).send("sub"); });
+    });
+    server.host("api.example.com:8080", [](Router &port_router) {
+        port_router.route({Method::Get}, "/who", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+            co_await res->status(200).send("port");
+        });
+    });
+
+    // --- sessions ------------------------------------------------------------
+    auto sessions = std::make_shared<MemorySessionStore>();
+    auto session_mw = middleware::session(
+        sessions, SessionConfig{.cookie_name = "sid", .same_site = "Lax", .secure = false, .http_only = true});
+    server.route({Method::Post}, "/session/set", {session_mw},
+                 [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
+                     if (auto *s = session(*req)) {
+                         s->set("uid", "42");
+                     }
+                     co_await res->status(204).send("");
+                 });
+    server.route({Method::Get}, "/session/get", {session_mw},
+                 [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
+                     auto *s = session(*req);
+                     const auto uid = s ? s->get("uid") : std::nullopt;
+                     co_await res->status(200).send(uid ? std::string{*uid} : "none");
+                 });
+    server.route({Method::Get}, "/session/rotate", {session_mw},
+                 [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
+                     if (auto *s = session(*req)) {
+                         s->regenerate_id();
+                         s->set("uid", "99");
+                     }
+                     co_await res->status(204).send("");
+                 });
+
+    // --- CSRF ---------------------------------------------------------------
+    auto csrf_mw = middleware::csrf(CsrfConfig{
+        .cookie_name = "csrf",
+        .header_name = "x-csrf-token",
+        .secure = false,
+        .exempt_paths = {"/csrf/exempt"},
+    });
+    server.route({Method::Get}, "/csrf/token", {csrf_mw}, [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(200).send(std::string{csrf_token(*req)});
+    });
+    server.route({Method::Post}, "/csrf/submit", {csrf_mw},
+                 [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(204).send(""); });
+    server.route({Method::Post}, "/csrf/exempt", {csrf_mw},
+                 [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(204).send(""); });
+
+    // --- JWT ----------------------------------------------------------------
+    auto jwt_mw = middleware::jwt(JwtConfig{
+        .algorithms = {"HS256"},
+        .secret = "secret",
+        .issuer = "iss",
+        .audience = "aud",
+    });
+    server.route({Method::Get}, "/jwt/me", {jwt_mw}, [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
+        const Principal *identity = principal(*req);
+        if (!identity) {
+            co_await res->status(500).send("no principal");
+            co_return;
+        }
+        std::string scopes;
+        for (const auto &scope : identity->scopes) {
+            scopes += (scopes.empty() ? "" : ",") + scope;
+        }
+        co_await res->status(200).send(identity->subject + ":" + scopes);
+    });
+    server.route({Method::Get}, "/jwt/write", {jwt_mw, middleware::require_scope("write")},
+                 [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(204).send(""); });
+
+    auto started = server.start();
+    if (!started) {
+        for (const auto &failure : started.error().failures) {
+            std::println(stderr, "{}: {}", failure.name, failure.error.message());
+        }
+        return 1;
+    }
+    std::println("framework reference server on 127.0.0.1:{}", port);
+    std::fflush(stdout);
+
+    std::signal(SIGINT, on_signal);
+    std::signal(SIGTERM, on_signal);
+    while (g_stop == 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    server.stop();
+    return 0;
+}

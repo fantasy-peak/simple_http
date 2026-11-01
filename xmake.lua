@@ -177,6 +177,37 @@ target("unittest")
     set_rundir(".")
 target_end()
 
+-- Framework-layer reference server: exposes application state, extractors,
+-- validation, sessions/CSRF/JWT, host routing and catch-all paths for the
+-- differential test against Go (test/python/framework_diff.py).
+--   xmake build framework_server
+--   test/framework_diff.sh
+target("framework_server")
+    set_kind("binary")
+    set_default(false)
+    on_load(function (target)
+        if target:toolchain("gcc") then
+            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete", "-Wno-type-limits")
+        end
+    end)
+    add_deps("simple_http")
+    add_files("test/framework_server.cpp")
+    add_packages("zlib", "brotli")
+    set_rundir(".")
+target_end()
+
+-- Differential test against the Go standard library: builds both reference
+-- servers and runs test/python/framework_diff.py.
+--   xmake run framework-diff
+target("framework-diff")
+    set_kind("phony")
+    set_default(false)
+    add_deps("framework_server")
+    on_run(function ()
+        os.execv("bash", {"test/framework_diff.sh"})
+    end)
+target_end()
+
 -- OpenAPI demo: per-route operation descriptors (openapi::doc()...) collected
 -- into an OAS 3.1 document served at /openapi.json, browsed at /swagger
 -- (CDN-hosted Swagger UI).
