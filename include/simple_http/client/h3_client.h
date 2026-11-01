@@ -170,7 +170,7 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
     // expected holds why it could not.
     static asio::awaitable<std::expected<std::shared_ptr<Http3ClientSession>, error_code>>
     connect(Executor ex, SSL_CTX *ssl_ctx, const ClientTarget &target, const ClientTlsHandshake &hs,
-            const EngineLimits &limits, std::chrono::milliseconds connect_timeout,
+            const EngineLimits &limits, std::uint32_t max_udp_payload_size, std::chrono::milliseconds connect_timeout,
             std::chrono::milliseconds idle_timeout, const ResolveFn &resolve_fn) {
         if (!target.use_tls) {
             // QUIC carries its own TLS 1.3: there is no plaintext form.
@@ -219,7 +219,8 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
                 if (i + 1 < ordered.size() && slice > kAttemptCap)
                     slice = std::chrono::duration_cast<std::chrono::milliseconds>(kAttemptCap);
             }
-            auto attempt = co_await connect_one(ex, ssl_ctx, target, hs, limits, idle_timeout, ordered[i], slice);
+            auto attempt = co_await connect_one(ex, ssl_ctx, target, hs, limits, max_udp_payload_size, idle_timeout,
+                                                ordered[i], slice);
             if (attempt)
                 co_return attempt;
             last_error = attempt.error();
@@ -232,7 +233,7 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
     // One address, one QUIC connection attempt.
     static asio::awaitable<std::expected<std::shared_ptr<Http3ClientSession>, error_code>>
     connect_one(Executor ex, SSL_CTX *ssl_ctx, const ClientTarget &target, const ClientTlsHandshake &hs,
-                const EngineLimits &limits, std::chrono::milliseconds idle_timeout,
+                const EngineLimits &limits, std::uint32_t max_udp_payload_size, std::chrono::milliseconds idle_timeout,
                 const asio::ip::udp::endpoint &remote, std::chrono::milliseconds attempt_timeout) {
         auto socket = std::make_shared<asio::ip::udp::socket>(ex);
         error_code ec;
@@ -252,6 +253,7 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         auto udp = std::make_shared<Udp>(socket);
 
         quic::QuicConnectionConfig qcfg;
+        qcfg.max_udp_payload_size = max_udp_payload_size;
         if (idle_timeout.count() > 0) {
             qcfg.max_idle_timeout_ms = static_cast<std::uint64_t>(idle_timeout.count());
         }

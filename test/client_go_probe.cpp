@@ -71,6 +71,7 @@ struct JsonEcho {
 } // namespace
 
 int main(int argc, char **argv) {
+    set_log_sink(make_stderr_sink(LogLevel::Trace));
     const std::string base = argc > 1 ? argv[1] : "http://127.0.0.1:7801";
     asio::io_context io;
     auto work = asio::make_work_guard(io);
@@ -294,6 +295,82 @@ int main(int argc, char **argv) {
             body && body->find("\"name\"") != std::string::npos && body->find("\"age\"") != std::string::npos;
         check(ok, "json body", body ? *body : err(body));
     }
+
+    {
+        ClientConfig h2 = cfg;
+        h2.default_version = HttpVersionPolicy::Http2;
+        h2.tls.ca_file = "test/tls_certificates/ca_cert.pem";
+        h2.tls.cert_chain_file = "test/tls_certificates/client_cert.pem";
+        h2.tls.private_key_file = "test/tls_certificates/client_key.pem";
+        Client secure{io.get_executor(), h2};
+        auto r = run([&]() -> asio::awaitable<std::expected<Response, error_code>> {
+            co_return co_await secure.get("https://127.0.0.1:8443/world").send();
+        });
+        check(r && r->status() == 200 && r->version() == Version::Http2, "h2 TLS GET /world",
+              r ? std::to_string(r->status()) + "/v" + std::to_string(static_cast<int>(r->version())) : err(r));
+    }
+
+    {
+        ClientConfig h2c = cfg;
+        h2c.default_version = HttpVersionPolicy::Http2;
+        h2c.default_h2c = H2cMode::PriorKnowledge;
+        Client cleartext{io.get_executor(), h2c};
+        auto r = run([&]() -> asio::awaitable<std::expected<Response, error_code>> {
+            co_return co_await cleartext.get("http://127.0.0.1:7802/world").send();
+        });
+        check(r && r->status() == 200 && r->version() == Version::Http2, "h2c prior-knowledge GET /world",
+              r ? std::to_string(r->status()) + "/v" + std::to_string(static_cast<int>(r->version())) : err(r));
+    }
+
+    {
+        auto ws = run([&]() -> asio::awaitable<std::expected<std::shared_ptr<WebSocket>, error_code>> {
+            co_return co_await client.open_websocket("ws://127.0.0.1:7801/ws", {});
+        });
+        if (!ws) {
+            check(false, "websocket echo", err(ws));
+        } else {
+            auto wrote = run([&]() -> asio::awaitable<error_code> { co_return co_await (*ws)->write_text("hello"); });
+            auto msg = run(
+                [&]() -> asio::awaitable<std::expected<WsMessage, error_code>> { co_return co_await (*ws)->read(); });
+            auto wrote_bin = run([&]() -> asio::awaitable<error_code> {
+                co_return co_await (*ws)->write_binary(std::string("\x00\x01", 2));
+            });
+            auto bin = run(
+                [&]() -> asio::awaitable<std::expected<WsMessage, error_code>> { co_return co_await (*ws)->read(); });
+            (void)run([&]() -> asio::awaitable<error_code> { co_return co_await (*ws)->close(); });
+            const bool ok = !wrote && msg && msg->data == "hello" && msg->text && !wrote_bin && bin &&
+                            bin->data == std::string("\x00\x01", 2) && !bin->text;
+            check(ok, "websocket echo", msg ? msg->data : err(msg));
+        }
+    }
+
+    {
+        ClientConfig via_proxy = cfg;
+        via_proxy.proxy = ProxyConfig{.kind = ProxyKind::Http, .host = "127.0.0.1", .port = 7890};
+        Client proxied{io.get_executor(), via_proxy};
+        auto r = run([&]() -> asio::awaitable<std::expected<Response, error_code>> {
+            co_return co_await proxied.get("http://127.0.0.1:7801/world").send();
+        });
+        auto body =
+            r ? run([&]() -> asio::awaitable<std::expected<std::string, error_code>> { co_return co_await r->text(); })
+              : std::expected<std::string, error_code>{};
+        check(r && r->status() == 200 && body && body->size() == 1024, "HTTP CONNECT proxy",
+              r ? (body ? std::to_string(body->size()) : err(body)) : err(r));
+    }
+
+#if defined(SIMPLE_HTTP_ENABLE_HTTP3)
+    {
+        ClientConfig h3 = cfg;
+        h3.default_version = HttpVersionPolicy::Http3;
+        h3.tls.ca_file = "test/tls_certificates/ca_cert.pem";
+        Client quic{io.get_executor(), h3};
+        auto r = run([&]() -> asio::awaitable<std::expected<Response, error_code>> {
+            co_return co_await quic.get("https://127.0.0.1:8444/world").send();
+        });
+        check(r && r->status() == 200 && r->version() == Version::Http3, "h3 GET /world",
+              r ? std::to_string(r->status()) + "/v" + std::to_string(static_cast<int>(r->version())) : err(r));
+    }
+#endif
 
     std::cout << "\n" << g_checks << " checks, " << g_failed << " failed\n";
     work.reset();

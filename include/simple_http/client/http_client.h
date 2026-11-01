@@ -952,8 +952,8 @@ class ClientEngine {
         hs.alpn_wire.assign(quic::kHttp3AlpnWire.begin(), quic::kHttp3AlpnWire.end());
 
         auto session = co_await Http3ClientSession<asio::any_io_executor>::connect(
-            ex, m_ssl_context->native_handle(), target, hs, m_config.limits, m_config.connect_timeout,
-            m_config.idle_timeout, m_config.resolve);
+            ex, m_ssl_context->native_handle(), target, hs, m_config.limits, m_config.quic_max_udp_payload_size,
+            m_config.connect_timeout, m_config.idle_timeout, m_config.resolve);
         if (!session)
             co_return std::unexpected{session.error()};
         ++m_opened;

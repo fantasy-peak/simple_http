@@ -288,6 +288,11 @@ struct ClientConfig {
     // policy). A ClientTarget passed explicitly overrides them.
     HttpVersionPolicy default_version{HttpVersionPolicy::Auto};
     H2cMode default_h2c{H2cMode::Upgrade};
+    // Largest UDP datagram the HTTP/3 client asks ngtcp2 to build. QUIC's
+    // minimum MTU is 1200, which is the safe choice for paths that clamp below
+    // Ethernet (VPNs, tunnels, WSL2 — a 1472-byte datagram was observed to be
+    // truncated to 1416 there); raise it toward 1472 on a clean Ethernet path.
+    std::uint32_t quic_max_udp_payload_size{1200};
 
     // Whole-connection connect budget (DNS + TCP + TLS handshake).
     std::chrono::milliseconds connect_timeout{10000};
