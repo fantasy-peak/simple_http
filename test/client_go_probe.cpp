@@ -358,6 +358,39 @@ int main(int argc, char **argv) {
               r ? (body ? std::to_string(body->size()) : err(body)) : err(r));
     }
 
+    {
+        ClientConfig via_socks = cfg;
+        via_socks.proxy = ProxyConfig{.kind = ProxyKind::Socks5, .host = "127.0.0.1", .port = 1081};
+        Client proxied{io.get_executor(), via_socks};
+        auto r = run([&]() -> asio::awaitable<std::expected<Response, error_code>> {
+            co_return co_await proxied.get("http://127.0.0.1:7801/world").send();
+        });
+        auto body =
+            r ? run([&]() -> asio::awaitable<std::expected<std::string, error_code>> { co_return co_await r->text(); })
+              : std::expected<std::string, error_code>{};
+        check(r && r->status() == 200 && body && body->size() == 1024, "SOCKS5 proxy",
+              r ? (body ? std::to_string(body->size()) : err(body)) : err(r));
+    }
+
+    {
+        ClientConfig via_https = cfg;
+        via_https.proxy = ProxyConfig{.kind = ProxyKind::Https,
+                                      .host = "127.0.0.1",
+                                      .port = 7891,
+                                      .verify_peer = true,
+                                      .verify_host = true,
+                                      .ca_file = "test/tls_certificates/ca_cert.pem"};
+        Client proxied{io.get_executor(), via_https};
+        auto r = run([&]() -> asio::awaitable<std::expected<Response, error_code>> {
+            co_return co_await proxied.get("http://127.0.0.1:7801/world").send();
+        });
+        auto body =
+            r ? run([&]() -> asio::awaitable<std::expected<std::string, error_code>> { co_return co_await r->text(); })
+              : std::expected<std::string, error_code>{};
+        check(r && r->status() == 200 && body && body->size() == 1024, "HTTPS proxy",
+              r ? (body ? std::to_string(body->size()) : err(body)) : err(r));
+    }
+
 #if defined(SIMPLE_HTTP_ENABLE_HTTP3)
     {
         ClientConfig h3 = cfg;

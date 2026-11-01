@@ -668,7 +668,7 @@ test/conformance/run.sh h2spec   # 只跑指定的（h2spec / h1spec / autobahn 
   - Go `net/http`：明文 h1 与 **TLS + h2**。`loadgen https://host/path -p h2 -B 0` 打 Go `ListenAndServeTLS`（默认 ALPN 协商 h2）。测试 CA 签发带 `IP:127.0.0.1` SAN 的证书，客户端 `SSL_CERT_FILE=test/tls_certificates/ca_cert.pem` 信任；本库 TLS 监听默认 ALPN 为 h2 + http/1.1。
   - **TLS 矩阵**（openssl s_client + httpx，对 Go TLS 监听）：TLS 1.3/1.2、ALPN（h2 / http/1.1 / 无）、mTLS（缺证书、不可信证书、正确证书）、未知 SNI、h1-over-TLS、h2-over-TLS。本库默认 1.3-only，Go 允许 1.2，属策略差异；`TlsConfig::min_version=Tls12` 后可对齐。
   - **HTTP/3**（aioquic 独立客户端对 quic-go 参考服务端）：GET/POST、204、404、响应 trailer；另跑 h3spec（基线 49 例 ≥47，2 个已知 TLS 8.2 假阳性）与 3% 丢包下的恢复（tc netem，单连接 200 请求全成）。
-  - **客户端 → Go 服务端**（`test/client_go_probe.cpp`）：h1（重定向/Cookie/gzip/trailers/超时/表单/JSON）、h2 TLS（mTLS）、h2c prior-knowledge、h3（quic-go）、WebSocket、HTTP CONNECT 代理；与 Go `net/http` 客户端逐场景比对（各 18 项）。
+  - **客户端 → Go 服务端**（`test/client_go_probe.cpp`）：h1（重定向/Cookie/gzip/trailers/超时/表单/JSON）、h2 TLS（mTLS）、h2c prior-knowledge、h3（quic-go）、WebSocket、HTTP CONNECT / HTTPS / SOCKS5 代理；与 Go `net/http` 客户端逐场景比对（各 20 项）。
   - **静态文件 / 表单 / JSON / 重定向 / Cookie / SSE / 压缩细节 / 反代 / h2c / 连接级**：`test/middleware_server.cpp`（:7796，另 :7797 显式启用 TLS 1.2）与等价 Go 参考逐项比对——Range/条件请求/SPA/immutable、urlencoded/multipart、JSON、Set-Cookie、SSE 帧、qvalue/min_bytes/no-transform/ETag 弱化/Vary 合并、HTTP 与 WebSocket 反代、h2c prior-knowledge、keep-alive/close/413/431。差异按 RFC 判定；br（Go 无 brotli）、panic 策略、XFF 自证 vs 追加属已知实现策略差异。
 
 **差分比对（与开源实现对照）**
