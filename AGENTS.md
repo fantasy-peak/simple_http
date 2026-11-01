@@ -1,8 +1,9 @@
 # AGENTS.md — simple_http
 
 面向参与本工程的 AI / 协作者的工程说明。内容以当前源码、构建脚本和测试为准；
-与 `README.md` 的分工是：README 面向使用者，本文件面向**修改代码的人**，重点记录
-分层边界、并发契约、测试门线和已固化的回归点。
+与 `README.md`（英文默认）和 `README.zh-CN.md`（完整中文版）的分工是：README 面向
+使用者，本文件面向**修改代码的人**，重点记录分层边界、并发契约、测试门线和已固化的
+回归点。
 
 如果文档与代码冲突，以代码为准，并顺手修正文档。
 
@@ -162,7 +163,8 @@ include/
 - `test/python/`：第三方实现（httpx / hyper-h2 / websockets / aioquic）驱动本库。
 - `test/tls_certificates/`：测试证书。
 - `cmake/`：`simple_httpConfig.cmake.in`。
-- **没有 `docs/`，也没有 `ROADMAP.md`**（已删除）；文档只有 `README.md` 与本文件。
+- **没有 `docs/`，也没有 `ROADMAP.md`**（已删除）；文档为 `README.md`（英文默认）、
+  `README.zh-CN.md`（完整中文）与本文件。
 
 ---
 
@@ -714,7 +716,7 @@ xmake build server && xmake run python-tests
 
 ### 8.4 加新 API / 行为
 
-- 同步更新 `README.md` 与本文件。
+- 同步更新 `README.md`、`README.zh-CN.md` 与本文件。
 - 在 `test/readme_examples.cpp` 加上可编译的样例（若面向用户）。
 - 在 `test/unit/` 或 `test/python/` 加覆盖；跨实现的行为优先放 Python 套件。
 - 不要引入协议版本分支到 `handler/` / `proto/` / `net/` / 客户端门面。

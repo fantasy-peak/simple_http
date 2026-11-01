@@ -11,7 +11,7 @@ and no locks in the protocol engines.
 - **License**: MIT
 - **Umbrella header**: `#include <simple_http.h>`
 
-[English](#toc) · [中文概览](#chinese-overview)
+[English](#toc) · [中文](README.zh-CN.md)
 
 ---
 
@@ -28,7 +28,6 @@ and no locks in the protocol engines.
 - [Testing and verification](#testing)
 - [Known limitations](#known-limitations)
 - [Style and contributing](#contributing)
-- [中文概览](#chinese-overview)
 
 <a id="what-is-this"></a>
 ## What is this
@@ -1247,36 +1246,12 @@ xmake run loadgen ws://127.0.0.1:7788/echo1k -p ws -n 200000 -c 64
 - RAII, no raw `new` / `delete`, explicit ownership.
 - Run `test/conformance/run.sh` after protocol/transport changes, and additionally
   `test/stress/run.sh` after stream-lifecycle changes.
-- When adding a public API or changing behavior, update `README.md` and `AGENTS.md`.
+- When adding a public API or changing behavior, update `README.md`,
+  `README.zh-CN.md` and `AGENTS.md`.
 
 <a id="license"></a>
 ## License
 
 MIT License, see [LICENSE](LICENSE).
 
----
-
-<a id="chinese-overview"></a>
-## 中文概览
-
-`simple_http` 是一个 **header-only 的 C++ HTTP 服务器 + 客户端库**，基于 Boost.Asio
-C++23 协程实现，入口头为 `#include <simple_http.h>`，当前版本 `0.9.0`，MIT 许可。
-
-- **服务端**：HTTP/1.0、HTTP/1.1、HTTP/2（ALPN / h2c Upgrade / prior-knowledge）、
-  可选 HTTP/3 over QUIC、WebSocket（h1 Upgrade + h2 extended CONNECT）；方法感知路由、
-  中间件、CORS、限流、安全头、压缩、静态文件、文件流式发送、上传落盘、表单/JSON/
-  multipart、SSE、trailers、HTTP 反代与 WebSocket 反代、OpenAPI 3.1 + Swagger UI。
-- **客户端**：HTTP/1.1、HTTP/2（ALPN / h2c）、显式 HTTP/3、WebSocket、SSE；
-  重定向、CookieJar、Basic/Bearer 认证、自动解压、HTTP/HTTPS/SOCKS5 出站代理、
-  分层超时、免费透明重拨与可配置重试。
-- **架构**：版本无关的 `Request` / `ResponseWriter` / `Router`；版本差异只在
-  `engine/` 与 `ResponseSink`。并发模型 A：每条连接绑定一个单线程 `io_context`，
-  引擎内零锁；`ResponseWriter` / `WebSocket` 跨线程使用时先 hop 回连接 executor。
-- **构建**：主构建用 xmake（包来自私有仓库 `fantasy-peak/xmake-repo`），xmake 设
-  `c++26`；CMake 只安装 INTERFACE 目标，声明 `cxx_std_23`，且未接入 ngtcp2/nghttp3。
-- **测试**：Catch2 372 个用例 / 65094 条断言；服务端对抗性回归 79 个 TEST_CASE；
-  客户端自检 218 checks；第三方 Python 客户端 113 checks；RFC 8441 交叉验证
-  85 checks；客户端交叉验证 43 + 6 checks；h2spec 146/146、h1spec 33/33、
-  Autobahn FAILED 0 / NON-STRICT 0、h3spec ≥47/49。压测门线为失败数 0。
-
-完整的构建、API、协议实现与修改指南见上方英文正文，以及 [`AGENTS.md`](AGENTS.md)。
+完整中文文档见 [`README.zh-CN.md`](README.zh-CN.md)。
