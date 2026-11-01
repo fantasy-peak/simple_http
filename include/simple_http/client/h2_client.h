@@ -215,6 +215,9 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
         stream_opened();
         Stream &st = it->second;
         init_stream(st, id);
+        if (const auto expect = request->header("expect")) {
+            st.expect_continue = icontains_ci(*expect, "100-continue");
+        }
 
         std::string block;
         if (auto ec = encode_request_head(*request, block); ec) {
@@ -276,6 +279,43 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
     bool draining() const { return m_goaway_received || m_goaway_sent; }
 
     // --- stream operations (called by Http2ClientStream) ---
+
+    // Ends a streamed request with an HPACK trailer block. The block is sent as
+    // trailing HEADERS with END_STREAM after every queued DATA frame, so it
+    // cannot overtake the body.
+    asio::awaitable<error_code> stream_finish_trailers(std::uint32_t id, Headers trailers) {
+        co_await hop();
+        {
+            auto it = m_streams.find(id);
+            if (it == m_streams.end())
+                co_return make_error_code(client_errc::session_closed);
+            Stream &st = it->second;
+            if (st.write_error)
+                co_return st.write_error;
+            if (st.reset || st.failed)
+                co_return st.error ? st.error : make_error_code(client_errc::stream_reset);
+            if (st.local_end || st.out_finished)
+                co_return make_error_code(client_errc::body_not_streaming);
+
+            std::string block;
+            for (const auto &[name, value] : trailers) {
+                if (name.empty() || name.front() == ':' || is_connection_specific(name) || contains_ctl(name) ||
+                    contains_ctl(value)) {
+                    continue;
+                }
+                codec::hpack_append_literal(block, name, value);
+            }
+            if (block.empty()) {
+                // Nothing valid to send: fall back to a normal END_STREAM.
+                co_return co_await stream_write(id, {}, true);
+            }
+            st.out_trailers = std::move(block);
+            st.out_trailers_set = true;
+            st.out_finished = true;
+        }
+        flush();
+        co_return error_code{};
+    }
 
     asio::awaitable<error_code> stream_write(std::uint32_t id, std::string data, bool last) {
         co_await hop();
@@ -477,6 +517,8 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
         bool head_seen{false};        // a final header block was decoded (and published
                                       // to the handle)
         bool block_end_stream{false}; // the HEADERS frame that started the block carried END_STREAM
+        bool expect_continue{false};  // request carried Expect: 100-continue
+        bool interim_100_sent{false}; // the interim 100 was published to the handle
         std::deque<std::string> in_queue;
         std::size_t in_bytes{0};
         std::shared_ptr<asio::experimental::concurrent_channel<void(error_code)>> in_notify;
@@ -488,6 +530,8 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
 
         // --- outbound (request body) ---
         std::deque<std::string> out_queue;
+        std::string out_trailers; // encoded trailing HEADERS block
+        bool out_trailers_set{false};
         std::size_t out_offset{0};
         std::size_t out_queued{0};
         bool out_finished{false}; // the caller finished the body
@@ -1043,8 +1087,20 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
             return true;
         }
         if (status < 200) {
-            // Informational (1xx): not the response, so drop it and keep waiting
-            // for the final head (RFC 9113 §8.1).
+            // Informational (1xx): not the final response. An asked-for
+            // 100-continue is published to the caller so the automatic stream
+            // can send its body; every other 1xx is dropped (RFC 9113 §8.1).
+            if (status == 100 && st.expect_continue && !st.interim_100_sent) {
+                st.interim_100_sent = true;
+                ResponseHead interim{};
+                interim.status = 100;
+                interim.version = Version::Http2;
+                interim.headers = std::move(headers);
+                interim.bodyless = true;
+                if (auto handle = st.handle.lock())
+                    handle->set_head(std::move(interim));
+                wake(st);
+            }
             return true;
         }
 
@@ -1407,8 +1463,16 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
             for (;;) {
                 if (st.out_queue.empty()) {
                     if (st.out_finished) {
-                        // The body is done: an empty DATA frame carries END_STREAM.
-                        append_frame(m_out, codec::H2FrameType::Data, codec::H2_FLAG_END_STREAM, id, {});
+                        if (st.out_trailers_set) {
+                            // A trailing HEADERS block carries END_STREAM; the
+                            // preceding final DATA frame must not.
+                            append_frame(m_out, codec::H2FrameType::Headers,
+                                         codec::H2_FLAG_END_STREAM | codec::H2_FLAG_END_HEADERS, id, st.out_trailers);
+                            st.out_trailers_set = false;
+                        } else {
+                            // The body is done: an empty DATA frame carries END_STREAM.
+                            append_frame(m_out, codec::H2FrameType::Data, codec::H2_FLAG_END_STREAM, id, {});
+                        }
                         st.local_end = true;
                         finished.push_back(id);
                         wake(st);
@@ -1429,7 +1493,7 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
                     break; // nothing can advance: stop rather than spin
 
                 const bool front_done = (st.out_offset + take >= front.size());
-                const bool last = front_done && st.out_queue.size() == 1 && st.out_finished;
+                const bool last = front_done && st.out_queue.size() == 1 && st.out_finished && !st.out_trailers_set;
                 append_frame(m_out, codec::H2FrameType::Data, last ? codec::H2_FLAG_END_STREAM : 0, id,
                              std::string_view{front.data() + st.out_offset, take});
                 st.out_offset += take;

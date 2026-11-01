@@ -187,6 +187,13 @@ class ClientStream {
     // with Request::stream_body; otherwise body_not_streaming.
     [[nodiscard]] virtual asio::awaitable<error_code> write(std::string data) = 0;
     [[nodiscard]] virtual asio::awaitable<error_code> finish(std::string data) = 0;
+    // Ends a streamed body with a trailer section. Implementations that cannot
+    // carry request trailers return client_errc::trailers_not_supported rather
+    // than silently dropping the fields.
+    [[nodiscard]] virtual asio::awaitable<error_code> finish_trailers(Headers trailers) {
+        (void)trailers;
+        co_return make_error_code(client_errc::trailers_not_supported);
+    }
 
     // --- response side ---
     // The response head: waits for it (and parses it) if that has not happened
@@ -248,6 +255,10 @@ class ClientStream {
     // unknown position). Hops like the operations above, because it changes
     // session state the driving coroutine also touches.
     [[nodiscard]] virtual asio::awaitable<void> cancel() = 0;
+
+    // Drops the cached head so the next read_head() parses the final response.
+    // Used after an interim 100-continue was delivered to an automatic caller.
+    void clear_head_cache() { reset_head(); }
 
   protected:
     // Called by the session once the response head is parsed; `await_head()` must

@@ -118,6 +118,16 @@ struct RetryPolicy {
     // idle, so nothing of this request was in flight), or dialing failed
     // before anything reached the wire.
     std::function<bool(error_code, Method, bool)> condition;
+
+    // Successful responses with these statuses are retried when the request is
+    // replayable and (unless retry_status_on_non_idempotent is set) idempotent.
+    // Empty by default: Go net/http and reqwest do not retry 429/503 unless the
+    // caller opts in, and a policy retry should not silently duplicate a
+    // request. Set {429, 503} to enable the common policy. A Retry-After header
+    // (seconds or IMF-fixdate) replaces the backoff for that attempt; the
+    // response body is consumed before retrying.
+    std::vector<int> retry_statuses{};
+    bool retry_status_on_non_idempotent{false};
 };
 
 // TLS knobs for a client connection.
@@ -398,15 +408,17 @@ enum class client_errc : int {
     goaway,                 // the peer is draining the connection (GOAWAY)
     connect_timeout,
     request_timeout,
-    invalid_spec,          // the caller's Request contradicts itself (body +
-                           // stream_body)
-    redirect_to_insecure,  // a redirect would downgrade https -> http
-    too_many_redirects,    // the redirect chain exceeded ClientConfig::max_redirects
-    http_status,           // error_for_status(): the response status was not 2xx
-    response_head_timeout, // no response head within ClientConfig::response_head_timeout
-    body_idle_timeout,     // silence between body reads exceeded body_idle_timeout
-    proxy_error,           // the proxy refused the tunnel, or its reply was malformed
-    proxy_auth_failed,     // the proxy rejected the configured credentials
+    invalid_spec,           // the caller's Request contradicts itself (body +
+                            // stream_body)
+    redirect_to_insecure,   // a redirect would downgrade https -> http
+    too_many_redirects,     // the redirect chain exceeded ClientConfig::max_redirects
+    http_status,            // error_for_status(): the response status was not 2xx
+    response_head_timeout,  // no response head within ClientConfig::response_head_timeout
+    body_idle_timeout,      // silence between body reads exceeded body_idle_timeout
+    expectation_failed,     // the peer answered Expect: 100-continue with a final response
+    trailers_not_supported, // request trailers are not implemented for this protocol
+    proxy_error,            // the proxy refused the tunnel, or its reply was malformed
+    proxy_auth_failed,      // the proxy rejected the configured credentials
 };
 
 } // namespace simple_http
@@ -478,6 +490,10 @@ class ClientErrorCategory : public boost::system::error_category {
             return "no response head within the configured TTFB budget";
         case client_errc::body_idle_timeout:
             return "the response body was silent past the idle budget";
+        case client_errc::expectation_failed:
+            return "the peer answered Expect: 100-continue with a final response";
+        case client_errc::trailers_not_supported:
+            return "request trailers are not supported by this protocol implementation";
         case client_errc::proxy_error:
             return "the proxy refused the tunnel or its reply was malformed";
         case client_errc::proxy_auth_failed:

@@ -302,6 +302,49 @@ void readme_static_files(simple_http::Server &server) {
 
 void readme_logging() { simple_http::set_log_sink(simple_http::make_stdout_sink(simple_http::LogLevel::Info)); }
 
+// --- Client streaming extras (README → multipart / 100-continue / trailers) ---
+
+asio::awaitable<void> readme_client_streaming_extras(simple_http::Client &client) {
+    auto upload = co_await simple_http::MultipartStreamWriter::open(client, "https://host/upload", {.boundary = "B"});
+    if (upload) {
+        (void)co_await upload->field("title", "hello");
+        (void)co_await upload->file("upload", "notes.txt", "./notes.txt");
+        (void)co_await upload->finish();
+        (void)co_await upload->stream().read_head();
+        (void)co_await upload->stream().read_all();
+    }
+
+    auto raw = co_await client.open_stream("https://host/upload", {.method = simple_http::Method::Put});
+    if (raw) {
+        (void)co_await simple_http::stream_file_body(*raw, "./blob.bin");
+        (void)co_await raw->finish();
+    }
+
+    auto expect = co_await client.open_stream("https://host/upload",
+                                              {.method = simple_http::Method::Post, .auto_expect_continue = true});
+    if (expect) {
+        if (co_await expect->write("body") == simple_http::client_errc::expectation_failed) {
+            (void)co_await expect->read_head();
+        }
+    }
+
+    simple_http::StreamSpec spec;
+    spec.method = simple_http::Method::Post;
+    spec.headers.add("trailer", "x-checksum");
+    auto trailers = co_await client.open_stream("https://host/upload", std::move(spec));
+    if (trailers) {
+        (void)co_await trailers->write("body");
+        simple_http::Headers fields;
+        fields.add("x-checksum", "abc123");
+        (void)co_await trailers->finish_trailers(std::move(fields));
+    }
+
+    simple_http::ClientConfig cfg;
+    cfg.retry.max_retries = 2;
+    cfg.retry.retry_statuses = {429, 503};
+    (void)cfg;
+}
+
 // --- Framework layer (README → State / Extractors / Validation / Auth) -------
 
 namespace framework_readme {
@@ -368,6 +411,12 @@ void readme_framework(simple_http::Server &server) {
     server.use(simple_http::middleware::jwt(simple_http::JwtConfig{
         .algorithms = {"HS256"},
         .secret = "secret",
+    }));
+    server.use(simple_http::middleware::jwt(simple_http::JwtConfig{
+        .algorithms = {"RS256", "ES256"},
+        .jwks_json = R"({"keys":[]})",
+        .issuer = "iss",
+        .audience = "aud",
     }));
     server.use(simple_http::middleware::require_scope("read"));
 }

@@ -118,7 +118,8 @@ include/
       extract.h                    Path/Query/Json/Form/State/Header/Cookie 提取器 + extract<...>()
       session.h                    SessionStore / MemorySessionStore / Session + session() 中间件
       csrf.h                       double-submit CSRF 中间件
-      jwt.h                        JWT 验证（HS256/RS256/ES256）+ require_scope/require_role
+      jwt.h                        JWT 验证（HS256/RS256/ES256/JWKS）+ require_scope/require_role
+      jwks.h                       JWKS 解析（RSA/EC/oct）+ fetch_jwks_json
       builtin_middleware.h         request_id / access_log / recovery / basic_auth / real_ip /
                                    clean_path / strip_prefix / redirect_slashes / ws_origin /
                                    timeout / compress
@@ -136,6 +137,7 @@ include/
       server.h                     Server / ServerConfig / Listener 配置 / 生命周期
     client/
       http.h                       公共客户端 API（平铺在 simple_http::）
+      multipart_stream.h           MultipartStreamWriter / stream_file_body（流式上传）
       client_config.h              ClientConfig / TlsClientConfig / ProxyConfig / RetryPolicy /
                                    HttpVersionPolicy / H2cMode / client_errc
       client_stream.h              ResponseHead / ClientStream / ClientSession
@@ -363,7 +365,8 @@ const Principal *p = principal(*req);
 - `extract<...>` 返回普通 `Handler`，不影响 route/group/middleware/OpenAPI。
 - 同一次提取最多一个 body 提取器（`Json`/`Form`）。
 - `SessionStore` 是 awaitable 接口；`MemorySessionStore` 带锁，Redis/DB 适配器放消费侧。
-- JWT 强制算法 allowlist，拒绝 `none`；`exp` 默认必填；不做签发/JWKS/OAuth2。
+- JWT 强制算法 allowlist，拒绝 `none`；`exp` 默认必填；JWKS 支持静态/手动拉取文档
+  （RSA/EC/oct，按 `kid` 选），不做签发/OAuth2/OIDC。
 - Host 路由：`server.host(pattern, registrar)`；`*.example.com` 不匹配裸域或
   `evil-example.com`。Host 子 Router 共享 state，但 WebSocket 查找仍 host-agnostic，
   OpenAPI 文档也各自独立。
@@ -457,6 +460,12 @@ auto ws = co_await http.open_websocket("wss://host/chat");
 - 单连接模型：对第一个 origin 保持一条连接（h1 FIFO 门 / h2 多路复用），其他
   origin 使用一次性连接。
 - 免费透明重拨：打开阶段与读响应阶段各一次；策略重试由 `ClientConfig::retry` 控制。
+  状态码重试默认关闭（`retry_statuses` 为空，与 Go/reqwest 一致）；显式设 `{429, 503}` 后支持 `Retry-After`。
+- 流式上传：`MultipartStreamWriter`（field/file/file_data）与 `stream_file_body`。
+- 自动 100-continue：`StreamSpec::auto_expect_continue`；h1/h2 等待 interim，h3 直接
+  发 body。最终拒绝返回 `client_errc::expectation_failed`。
+- 请求 trailers：`Stream::finish_trailers()`，h1 chunked 终止符 / h2 trailing HEADERS；
+  h3 返回 `trailers_not_supported`。服务端 `req->trailers()` 在 h1/h2 暴露。
 
 ### 4.7 数据与 OpenAPI
 
@@ -637,9 +646,9 @@ xmake build server && xmake run python-tests
 
 | 套件 | 规模 |
 |---|---|
-| `unittest`（Catch2） | 387 个用例，65218 条断言 |
+| `unittest`（Catch2） | 389 个用例，65298 条断言 |
 | `regression` | 79 个 TEST_CASE，裸 socket 畸形/边界请求 |
-| `client` | 218 checks |
+| `client` | 245 checks |
 | `python-tests` | 113 checks（httpx / hyper-h2 / websockets / aioquic） |
 
 单元测试按标签过滤：`xmake run unittest "[h2]"`。
@@ -806,6 +815,15 @@ xmake build server && xmake run python-tests
 16. **WebSocket Close 顺序**：协议错误/Close/非法 UTF-8 先记关闭码，Close 帧要等
     应用下次 `read()` 排空缓存后才发出，保证「先回显、后失败」。
 17. **h2 `100-continue`**：handler 首次读 body 时懒发；h3 侧 no-op。
+18. **客户端自动 100-continue**：h1/h2 先把 interim 100 交给 `write()`；h2 必须
+    `clear_head_cache()`，否则后续 `read_head()` 会一直返回 100。h1 的
+    `exchange_read` 半双工检查必须放行「Expect 已收到最终响应」的情况。
+19. **h2 请求 trailers**：带 trailer 的最后一个 DATA **不能**带 END_STREAM；trailing
+    HEADERS 同时带 END_STREAM + END_HEADERS，并在 body 队列排空后发送。
+20. **h1 请求 trailers**：chunked 终止符是 `0\r\n<fields>\r\n`；服务端在 body EOF 前
+    把字段写进 `Request::trailers()`。
+21. **状态码重试**：`retry_statuses` 默认空（与 Go/reqwest 一致），显式开启后才按
+    429/503 + `Retry-After` 重试；重试前响应体已消费。
 
 ---
 
@@ -814,7 +832,7 @@ xmake build server && xmake run python-tests
 - 客户端 `open_websocket` 只走 HTTP/1.1 Upgrade；不支持 h2/h3 WebSocket。
 - 服务端 HTTP/3 不支持 WebSocket（RFC 9220 未实现）。
 - 服务端 HTTP/3 的 `Expect: 100-continue` 是 no-op。
-- 客户端 HTTP/2 不向调用方暴露 1xx 中间响应。
+- 客户端不暴露 103 等其他 1xx；100-continue 在 h1/h2 暴露给自动流。
 - HTTP/3 客户端只显式启用；不做 Alt-Svc / HTTPS RR 发现；不支持 0-RTT。
 - 出站代理不覆盖 HTTP/3。
 - `NO_PROXY` 不支持 CIDR / 通配。
@@ -823,8 +841,11 @@ xmake build server && xmake run python-tests
 - CORS 不处理 WebSocket 升级。
 - Host 路由只作用于 HTTP dispatch；WebSocket 查找仍 host-agnostic，Host 子 Router 有独立
   OpenAPI 文档。
-- JWT 只是验证器：不做令牌签发、JWKS 拉取、OAuth2/OIDC 发现或 refresh-token 流程；
-  RS256/ES256 需要 PEM 公钥；`aud`/`scope` 按字符串 claim 解析，不支持 audience 数组。
+- JWT 只是验证器：不做令牌签发、OAuth2/OIDC 发现或 refresh-token 流程。JWKS 支持
+  静态/手动拉取文档（`fetch_jwks_json`），不内置后台自动刷新；`aud`/`scope` 按字符串
+  claim 解析，不支持 audience 数组。
+- 请求 trailers 只支持 h1/h2；h3 返回 `trailers_not_supported`。
+- 自动 100-continue 在 h1/h2 等待 interim；h3 直接发送 body（服务端无 1xx API）。
 - Session 只内置进程内存储；Redis/DB 适配器由消费侧实现 `SessionStore`。CSRF 是
   header 型 double-submit，无法设置 header 的表单需 handler 自行校验字段。
 - 校验通过 `Validator<T>` 按类型 opt-in，没有 tag/DSL 校验器。

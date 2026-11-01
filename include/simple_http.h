@@ -73,6 +73,7 @@
 #include "simple_http/handler/extract.h"            // Path/Query/Json/Form/State extractors + extract<...>()
 #include "simple_http/handler/file_response.h"      // send_file: bounded-memory file responses
 #include "simple_http/handler/handler.h"
+#include "simple_http/handler/jwks.h"       // JWKS parsing + fetch_jwks_json
 #include "simple_http/handler/jwt.h"        // JWT verifier + require_scope / require_role
 #include "simple_http/handler/rate_limit.h" // rate limiting (token bucket / per-key)
 #include "simple_http/handler/router.h"
@@ -96,4 +97,5 @@
 // simple_http::detail — it is internal, and only the flat facade is aggregated.
 #include "simple_http/client/cookie_jar.h" // CookieJar (ClientConfig::cookie_jar)
 #include "simple_http/client/http.h"       // Client / RequestBuilder / Stream / Response / WebSocket (client-side)
-#include "simple_http/client/sse.h"        // SseParser / SseStream (text/event-stream client)
+#include "simple_http/client/multipart_stream.h" // MultipartStreamWriter / stream_file_body
+#include "simple_http/client/sse.h"              // SseParser / SseStream (text/event-stream client)

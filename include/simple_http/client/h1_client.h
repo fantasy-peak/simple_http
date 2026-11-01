@@ -81,6 +81,10 @@ template <TransportLike Transport> class Http1ClientStream final : public Client
                                                      /*last=*/true);
     }
 
+    asio::awaitable<error_code> finish_trailers(Headers trailers) override {
+        co_return co_await m_session->exchange_write_trailers(std::move(trailers));
+    }
+
     asio::awaitable<std::expected<ReadResult, error_code>> read() override {
         // The exchange this stream belongs to has finished (the session marked
         // it at finish_exchange): a caller that reads once more for the end-of-
@@ -558,6 +562,38 @@ class Http1ClientSession final : public ClientSession,
         co_return error_code{};
     }
 
+    // Ends a chunked request body with a trailer section. The fields are written
+    // after the terminating chunk ("0\r\n<fields>\r\n"); framing fields are
+    // ignored. The peer must have been told to expect them via the request's
+    // `Trailer` header; that is the caller's contract.
+    asio::awaitable<error_code> exchange_write_trailers(Headers trailers) {
+        co_await hop();
+        if (!m_alive || m_switched)
+            co_return closed_error();
+        if (!m_req_streaming || m_req_finished)
+            co_return make_error_code(client_errc::body_not_streaming);
+
+        std::string out = "0\r\n";
+        for (const auto &[name, value] : trailers) {
+            if (name.empty() || name.front() == ':' || is_connection_specific_field(name) || contains_ctl(name) ||
+                contains_ctl(value)) {
+                continue;
+            }
+            out += name;
+            out += ": ";
+            out += value;
+            out += "\r\n";
+        }
+        out += "\r\n";
+        m_req_finished = true;
+
+        if (auto ec = co_await write_raw(out); ec) {
+            fail_session();
+            co_return ec;
+        }
+        co_return error_code{};
+    }
+
     // Appends a size in lowercase hex (chunked framing) without the locale and
     // formatted-output overhead of snprintf.
     static void append_hex(std::string &out, std::size_t value) {
@@ -594,7 +630,12 @@ class Http1ClientSession final : public ClientSession,
         // waiting for the rest of the request — fail fast instead of hanging.
         // Body-less requests (GET/HEAD/…s) are unaffected: their "stream" never
         // writes, and servers respond immediately without waiting.
-        if (m_req_streaming && !m_req_finished && method_expects_body(m_spec->method()))
+        // A final response to Expect: 100-continue is a legitimate exception:
+        // the peer refused the body, so the response is readable without
+        // finishing it. (A 100 alone leaves m_head_parsed false and keeps the
+        // fail-fast rule: the caller must send the body first.)
+        if (m_req_streaming && !m_req_finished && method_expects_body(m_spec->method()) &&
+            !(m_expect_continue && m_head_parsed))
             co_return std::unexpected{make_error_code(client_errc::half_duplex)};
         if (m_cancelled)
             co_return std::unexpected{closed_error()};

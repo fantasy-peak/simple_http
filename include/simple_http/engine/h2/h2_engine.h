@@ -1569,7 +1569,10 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                 malformed("TE with a value other than trailers");
                 return true;
             }
-            st.request->mutable_headers().add_lower(std::move(f.name), std::move(f.value));
+            if (trailers)
+                st.request->mutable_trailers().add_lower(std::move(f.name), std::move(f.value));
+            else
+                st.request->mutable_headers().add_lower(std::move(f.name), std::move(f.value));
         }
 
         // §8.3.1: a request carries :method, :scheme and :path — CONNECT is the

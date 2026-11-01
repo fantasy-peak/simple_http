@@ -701,6 +701,7 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
             // above was the last thing that read `head.headers`, so from here the
             // per-request copy of every field (name + value string each) is gone.
             request->mutable_headers() = std::move(head.headers);
+            m_body_request = request;
             std::weak_ptr<Http1Engine> weak = this->weak_from_this();
             request->body().set_pull_provider(
                 [weak = std::move(weak)]() mutable -> asio::awaitable<std::expected<ReadResult, error_code>> {
@@ -898,6 +899,19 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
                 if (m_body_state.total > m_limits.max_body_bytes) {
                     m_body_state.done = true;
                     co_return std::unexpected(make_error_code(asio::error::message_size));
+                }
+                // Expose the field once the body ends. Framing fields are not
+                // valid trailers (RFC 9110 §6.5.1) and are ignored.
+                if (auto request = m_body_request.lock()) {
+                    const auto colon = trailer.find(':');
+                    if (colon != std::string::npos) {
+                        const std::string_view name = trim_ows(std::string_view{trailer}.substr(0, colon));
+                        const std::string_view value = trim_ows(std::string_view{trailer}.substr(colon + 1));
+                        if (!name.empty() && !contains_ctl(name) && !contains_ctl(value) &&
+                            !is_connection_specific_field(name)) {
+                            request->mutable_trailers().add_lower(ascii_lower_copy(name), std::string{value});
+                        }
+                    }
                 }
             }
             m_body_state.done = true;
@@ -1465,6 +1479,9 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
         void reset() { *this = BodyState{}; }
     };
     BodyState m_body_state;
+    // Set while a request body is being pulled, so chunked trailers can be
+    // published onto the Request. Weak: the Request may outlive the engine.
+    std::weak_ptr<Request> m_body_request;
     // Exactly-once latch for the interim 100 Continue, shared with the response
     // writer and reset at the start of every request.
     std::shared_ptr<std::atomic<bool>> m_continue_sent{std::make_shared<std::atomic<bool>>(false)};

@@ -46,6 +46,7 @@
 #include "../core/types.h"
 #include "../proto/error_body.h"
 #include "handler.h"
+#include "jwks.h"
 #include "session.h" // constant_time_equal
 
 namespace simple_http {
@@ -70,6 +71,11 @@ struct JwtConfig {
     std::string secret;
     // PEM public key for RS256 / ES256.
     std::string public_key_pem;
+    // A static JWKS document (RFC 7517). When non-empty it takes precedence over
+    // public_key_pem and keys are selected by the token's `kid` (or the single
+    // key when there is exactly one). Fetch it with fetch_jwks_json() and pass
+    // the body here; refresh is the caller's policy.
+    std::string jwks_json;
     // Claim checks. Empty issuer/audience disables that check.
     std::string issuer;
     std::string audience;
@@ -212,10 +218,10 @@ inline std::string ecdsa_raw_to_der(std::string_view raw) {
     return out;
 }
 
-inline bool verify_signature(const JwtConfig &config, EVP_PKEY *public_key, std::string_view alg,
+inline bool verify_signature(std::string_view secret, EVP_PKEY *public_key, std::string_view alg,
                              std::string_view input, std::string_view signature) {
     if (alg == "HS256") {
-        return !config.secret.empty() && verify_hmac(config.secret, input, signature);
+        return !secret.empty() && verify_hmac(secret, input, signature);
     }
     if (alg == "RS256") {
         return public_key != nullptr && verify_openssl(public_key, input, signature);
@@ -260,15 +266,26 @@ inline asio::awaitable<void> jwt_reject(ResponsePtr res, int status_code, std::s
 }
 
 inline Middleware jwt(JwtConfig config = {}) {
-    // Parse the PEM once, at middleware construction, not per request.
+    // Parse the PEM / JWKS once, at middleware construction, not per request.
     jwt_detail::SharedKey public_key;
     if (!config.public_key_pem.empty()) {
         auto loaded = jwt_detail::load_public_key(config.public_key_pem);
         public_key = jwt_detail::SharedKey(loaded.release(), EVP_PKEY_free);
     }
+    const bool jwks_configured = !config.jwks_json.empty();
+    std::shared_ptr<Jwks> jwks;
+    if (jwks_configured) {
+        auto parsed = Jwks::parse(config.jwks_json);
+        if (!parsed) {
+            SIMPLE_HTTP_ERROR_LOG("jwt: {}", parsed.error());
+            jwks = std::make_shared<Jwks>();
+        } else {
+            jwks = std::make_shared<Jwks>(std::move(*parsed));
+        }
+    }
 
-    return [config = std::move(config), public_key = std::move(public_key)](
-               RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
+    return [config = std::move(config), public_key = std::move(public_key), jwks = std::move(jwks),
+            jwks_configured](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
         const auto header = req->header(config.header_name);
         if (!header) {
             if (config.optional) {
@@ -325,8 +342,29 @@ inline Middleware jwt(JwtConfig config = {}) {
             co_await jwt_reject(res, status::unauthorized, "disallowed JWT algorithm");
             co_return;
         }
-        if (!jwt_detail::verify_signature(config, public_key.get(), jwt_header.alg,
-                                          jwt_detail::signing_input(token, second), signature)) {
+
+        std::string_view secret = config.secret;
+        EVP_PKEY *signing_key = public_key.get();
+        if (jwks_configured) {
+            if (!jwks || jwks->empty()) {
+                co_await jwt_reject(res, status::unauthorized, "JWT key set unavailable");
+                co_return;
+            }
+            const JwkKey *key = jwks->find(jwt_header.kid, jwt_header.alg);
+            if (!key) {
+                co_await jwt_reject(res, status::unauthorized, "unknown JWT key");
+                co_return;
+            }
+            if (!key->secret.empty()) {
+                secret = key->secret;
+                signing_key = nullptr;
+            } else {
+                secret = {};
+                signing_key = key->public_key.get();
+            }
+        }
+        if (!jwt_detail::verify_signature(secret, signing_key, jwt_header.alg, jwt_detail::signing_input(token, second),
+                                          signature)) {
             co_await jwt_reject(res, status::unauthorized, "invalid JWT signature");
             co_return;
         }

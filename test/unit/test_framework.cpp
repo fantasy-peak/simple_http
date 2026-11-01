@@ -6,6 +6,7 @@
 
 #include <openssl/bn.h>
 #include <openssl/buffer.h>
+#include <openssl/core_names.h>
 #include <openssl/ec.h>
 #include <openssl/ecdsa.h>
 #include <openssl/evp.h>
@@ -486,6 +487,35 @@ std::string jws(std::string_view header, std::string_view payload, std::string_v
     return base64_url_encode(header) + "." + base64_url_encode(payload) + "." + base64_url_encode(signature);
 }
 
+std::string b64_bn(const BIGNUM *value) {
+    std::string bytes(BN_num_bytes(value), '\0');
+    BN_bn2bin(value, reinterpret_cast<unsigned char *>(bytes.data()));
+    return base64_url_encode(bytes);
+}
+
+std::string rsa_jwk(EVP_PKEY *key, std::string_view kid) {
+    BIGNUM *n = nullptr;
+    BIGNUM *e = nullptr;
+    REQUIRE(EVP_PKEY_get_bn_param(key, OSSL_PKEY_PARAM_RSA_N, &n) == 1);
+    REQUIRE(EVP_PKEY_get_bn_param(key, OSSL_PKEY_PARAM_RSA_E, &e) == 1);
+    std::string json = "{\"kty\":\"RSA\",\"kid\":\"" + std::string{kid} + "\",\"alg\":\"RS256\",\"n\":\"" + b64_bn(n) +
+                       "\",\"e\":\"" + b64_bn(e) + "\"}";
+    BN_free(n);
+    BN_free(e);
+    return json;
+}
+
+std::string ec_jwk(EVP_PKEY *key, std::string_view kid) {
+    unsigned char point[65]{};
+    std::size_t length = 0;
+    REQUIRE(EVP_PKEY_get_octet_string_param(key, OSSL_PKEY_PARAM_PUB_KEY, point, sizeof(point), &length) == 1);
+    REQUIRE((length == 65 && point[0] == 0x04));
+    const std::string_view x{reinterpret_cast<const char *>(point + 1), 32};
+    const std::string_view y{reinterpret_cast<const char *>(point + 33), 32};
+    return "{\"kty\":\"EC\",\"kid\":\"" + std::string{kid} + "\",\"alg\":\"ES256\",\"crv\":\"P-256\",\"x\":\"" +
+           base64_url_encode(x) + "\",\"y\":\"" + base64_url_encode(y) + "\"}";
+}
+
 } // namespace
 
 TEST_CASE("framework: JWT verifies HS256, claims and scopes", "[framework][jwt]") {
@@ -581,4 +611,79 @@ TEST_CASE("framework: JWT verifies RS256 and ES256 signatures", "[framework][jwt
     auto es_request = make_request(ctx, "/me");
     es_request->mutable_headers().add("authorization", "Bearer " + es_token);
     CHECK(dispatch(ctx, es_router, es_request)->last_body == "es");
+}
+
+TEST_CASE("framework: JWKS selects RSA/EC keys by kid", "[framework][jwt][jwks]") {
+    asio::io_context ctx;
+    TestKey rsa = make_rsa_key();
+    TestKey ec = make_ec_key();
+    const std::string payload = jwt_payload("alice", "read", now_unix() + 3600);
+    const std::string jwks = R"({"keys":[)" + rsa_jwk(rsa.key.get(), "rsa1") + "," + ec_jwk(ec.key.get(), "ec1") + "]}";
+
+    auto sign = [](EVP_PKEY *key, std::string_view alg, std::string_view input) {
+        std::string signature = sign_evp(key, input);
+        return alg == "ES256" ? ecdsa_der_to_raw(signature) : signature;
+    };
+    auto make_token = [&](EVP_PKEY *key, std::string alg, std::string kid) {
+        std::string header = R"({"alg":")" + alg + R"(","typ":"JWT","kid":")" + kid + R"("})";
+        const std::string input = base64_url_encode(header) + "." + base64_url_encode(payload);
+        return jws(header, payload, sign(key, alg, input));
+    };
+    auto make_no_kid_token = [&](EVP_PKEY *key, std::string alg) {
+        std::string header = R"({"alg":")" + alg + R"(","typ":"JWT"})";
+        const std::string input = base64_url_encode(header) + "." + base64_url_encode(payload);
+        return jws(header, payload, sign(key, alg, input));
+    };
+
+    Router router;
+    router.use(middleware::jwt(JwtConfig{
+        .algorithms = {"RS256", "ES256"},
+        .jwks_json = jwks,
+        .issuer = "iss",
+        .audience = "aud",
+    }));
+    router.route({Method::Get}, "/me", text_handler("ok"));
+
+    auto with_token = [&](const std::string &token) {
+        auto req = make_request(ctx, "/me");
+        req->mutable_headers().add("authorization", "Bearer " + token);
+        return dispatch(ctx, router, req);
+    };
+
+    CHECK(with_token(make_token(rsa.key.get(), "RS256", "rsa1"))->last_body == "ok");
+    CHECK(with_token(make_token(ec.key.get(), "ES256", "ec1"))->last_body == "ok");
+    CHECK(with_token(make_token(rsa.key.get(), "RS256", "nope"))->last_status == 401);
+    // No kid is fine when the algorithm leaves exactly one candidate...
+    CHECK(with_token(make_no_kid_token(rsa.key.get(), "RS256"))->last_body == "ok");
+    {
+        const std::string header = R"({"alg":"ES256","typ":"JWT","kid":"rsa1"})";
+        const std::string input = base64_url_encode(header) + "." + base64_url_encode(payload);
+        CHECK(with_token(jws(header, payload, sign_evp(rsa.key.get(), input)))->last_status == 401);
+    }
+
+    // ...but is rejected when several keys share the algorithm.
+    Router ambiguous;
+    ambiguous.use(middleware::jwt(JwtConfig{
+        .algorithms = {"RS256"},
+        .jwks_json = R"({"keys":[)" + rsa_jwk(rsa.key.get(), "rsa1") + "," + rsa_jwk(rsa.key.get(), "rsa2") + "]}",
+        .issuer = "iss",
+        .audience = "aud",
+    }));
+    ambiguous.route({Method::Get}, "/me", text_handler("ambiguous"));
+    auto ambiguous_request = make_request(ctx, "/me");
+    ambiguous_request->mutable_headers().add("authorization", "Bearer " + make_no_kid_token(rsa.key.get(), "RS256"));
+    CHECK(dispatch(ctx, ambiguous, ambiguous_request)->last_status == 401);
+
+    // A single key is usable without a kid.
+    Router single;
+    single.use(middleware::jwt(JwtConfig{
+        .algorithms = {"RS256"},
+        .jwks_json = R"({"keys":[)" + rsa_jwk(rsa.key.get(), "rsa1") + "]}",
+        .issuer = "iss",
+        .audience = "aud",
+    }));
+    single.route({Method::Get}, "/me", text_handler("single"));
+    auto single_request = make_request(ctx, "/me");
+    single_request->mutable_headers().add("authorization", "Bearer " + make_no_kid_token(rsa.key.get(), "RS256"));
+    CHECK(dispatch(ctx, single, single_request)->last_body == "single");
 }

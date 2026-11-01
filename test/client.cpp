@@ -25,6 +25,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <expected>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <span>
 #include <string>
@@ -680,6 +682,24 @@ void register_routes(sh::Server &server) {
         auto body = co_await req->body().read_all();
         co_await res->status(200).send("received " + std::to_string(body ? body->size() : 0) + " bytes");
     });
+    // Automatic Expect: 100-continue: agree, then read the body.
+    server.route(sh::any_methods, "/expect-ok", [](sh::RequestPtr req, sh::ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->send_continue();
+        auto body = co_await req->body().read_all();
+        co_await res->status(200).send("got " + std::to_string(body ? body->size() : 0));
+    });
+    // The peer refuses the body with a final status instead of a 100.
+    server.route(sh::any_methods, "/expect-reject", [](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(417).send("no");
+    });
+    // Request trailers: read the body to EOF, then echo the trailer field.
+    server.route(sh::any_methods, "/trailer-echo",
+                 [](sh::RequestPtr req, sh::ResponsePtr res) -> asio::awaitable<void> {
+                     auto body = co_await req->body().read_all();
+                     (void)body;
+                     const auto check = req->trailers().get("x-check");
+                     co_await res->status(200).send(check ? std::string{*check} : std::string{"missing"});
+                 });
     server.route(sh::any_methods, "/big", [](sh::RequestPtr req, sh::ResponsePtr res) -> asio::awaitable<void> {
         const std::size_t n = static_cast<std::size_t>(query_number(req, "n", 65536));
         std::string body(n, 'x');
@@ -730,6 +750,18 @@ void register_routes(sh::Server &server) {
     server.route(sh::any_methods, "/query-echo", [](sh::RequestPtr req, sh::ResponsePtr res) -> asio::awaitable<void> {
         co_await res->status(200).send(std::string{req->query()});
     });
+    // 429/Retry-After round trip: the first two hits answer 429, the third 200.
+    auto retry_status_hits = std::make_shared<std::atomic<int>>(0);
+    server.route(sh::any_methods, "/retry-status",
+                 [retry_status_hits](sh::RequestPtr, sh::ResponsePtr res) -> asio::awaitable<void> {
+                     const int hit = retry_status_hits->fetch_add(1);
+                     if (hit < 2) {
+                         res->header("retry-after", "0");
+                         co_await res->status(429).send("retry");
+                     } else {
+                         co_await res->status(200).send("ok");
+                     }
+                 });
     server.route(sh::any_methods, "/whoami",
                  [](sh::RequestPtr, sh::ResponsePtr res, sh::SslHandle ssl) -> asio::awaitable<void> {
                      std::string who = "no client certificate";
@@ -1211,6 +1243,106 @@ asio::awaitable<void> suite_framing(std::uint16_t plain, asio::io_context &ctx) 
 
 asio::awaitable<void> suite_streaming(std::uint16_t plain) {
     std::printf("\n== streaming ==\n");
+    // Request trailers on HTTP/1.1: the terminating chunk carries the fields and
+    // the server exposes them through Request::trailers().
+    {
+        auto cfg = base_config();
+        cfg.default_version = sh::HttpVersionPolicy::Http11;
+        cfg.default_h2c = sh::H2cMode::Off;
+        h::Client h1{co_await asio::this_coro::executor, cfg};
+        sh::StreamSpec spec;
+        spec.method = sh::Method::Post;
+        spec.headers.add("trailer", "x-check");
+        auto up = co_await h1.open_stream(url(plain, "/trailer-echo"), std::move(spec));
+        check(up.has_value(), "request-trailer stream opens");
+        if (up) {
+            (void)co_await up->write("body");
+            sh::Headers trailers;
+            trailers.add("x-check", "yes");
+            const auto ec = co_await up->finish_trailers(std::move(trailers));
+            check(ec == sh::error_code{}, "finish_trailers writes an HTTP/1.1 trailer section");
+            auto body = co_await up->read_all();
+            check(body && *body == "yes", "the server exposes the request trailer");
+        }
+    }
+
+    // Request trailers over HTTP/2: trailing HEADERS with END_STREAM.
+    {
+        auto cfg = base_config();
+        cfg.default_version = sh::HttpVersionPolicy::Http2;
+        cfg.default_h2c = sh::H2cMode::PriorKnowledge;
+        h::Client h2{co_await asio::this_coro::executor, cfg};
+        sh::StreamSpec spec;
+        spec.method = sh::Method::Post;
+        spec.headers.add("trailer", "x-check");
+        auto up = co_await h2.open_stream(url(plain, "/trailer-echo"), std::move(spec));
+        check(up.has_value(), "HTTP/2 request-trailer stream opens");
+        if (up) {
+            (void)co_await up->write("body");
+            sh::Headers trailers;
+            trailers.add("x-check", "yes");
+            const auto ec = co_await up->finish_trailers(std::move(trailers));
+            check(ec == sh::error_code{}, "finish_trailers writes HTTP/2 trailing HEADERS");
+            auto body = co_await up->read_all();
+            check(body && *body == "yes", "the server exposes the HTTP/2 request trailer");
+        }
+    }
+
+    // Automatic Expect: 100-continue over HTTP/2: the interim HEADERS block is
+    // surfaced to write(), then the body proceeds.
+    {
+        auto cfg = base_config();
+        cfg.default_version = sh::HttpVersionPolicy::Http2;
+        cfg.default_h2c = sh::H2cMode::PriorKnowledge;
+        h::Client h2{co_await asio::this_coro::executor, cfg};
+        auto up = co_await h2.open_stream(url(plain, "/expect-ok"),
+                                          {.method = sh::Method::Post, .auto_expect_continue = true});
+        check(up.has_value(), "HTTP/2 auto Expect: 100-continue opens a stream");
+        if (up) {
+            check((co_await up->write("hello")) == sh::error_code{}, "HTTP/2 write() waits for the interim 100");
+            (void)co_await up->finish("!");
+            auto body = co_await up->read_all();
+            check(body && *body == "got 6", "HTTP/2 auto 100-continue uploads the body");
+        }
+    }
+
+    // Automatic Expect: 100-continue on HTTP/1.1: write() waits for the
+    // interim 100; a final response is surfaced as expectation_failed.
+    {
+        auto cfg = base_config();
+        cfg.default_version = sh::HttpVersionPolicy::Http11;
+        cfg.default_h2c = sh::H2cMode::Off;
+        h::Client h1{co_await asio::this_coro::executor, cfg};
+
+        auto accepted = co_await h1.open_stream(url(plain, "/expect-ok"),
+                                                {.method = sh::Method::Post, .auto_expect_continue = true});
+        check(accepted.has_value(), "auto Expect: 100-continue opens a stream");
+        if (accepted) {
+            check((co_await accepted->write("hello")) == sh::error_code{},
+                  "write() waits for the interim 100 and proceeds");
+            (void)co_await accepted->finish("!");
+            auto head = co_await accepted->read_head();
+            auto body = co_await accepted->read_all();
+            check(head && head->status == 200 && body && *body == "got 6",
+                  "auto 100-continue uploads the body and reads the response");
+        }
+
+        auto rejected = co_await h1.open_stream(url(plain, "/expect-reject"),
+                                                {.method = sh::Method::Post, .auto_expect_continue = true});
+        check(rejected.has_value(), "auto Expect: 100-continue opens the rejecting stream");
+        if (rejected) {
+            const auto ec = co_await rejected->write("body");
+            check(ec == sh::client_errc::expectation_failed,
+                  "a final response to Expect is surfaced as expectation_failed");
+            auto head = co_await rejected->read_head();
+            auto body = co_await rejected->read_all();
+            std::string detail;
+            detail += head ? "status=" + std::to_string(head->status) : "head_err=" + head.error().message();
+            detail += body ? " body=" + *body : " body_err=" + body.error().message();
+            check(head && head->status == 417 && body && *body == "no",
+                  "the final response remains readable after expectation_failed (" + detail + ")");
+        }
+    }
     for (const auto mode : {sh::H2cMode::PriorKnowledge, sh::H2cMode::Upgrade}) {
         auto cfg = base_config();
         cfg.default_version = sh::HttpVersionPolicy::Http2;
@@ -2179,9 +2311,22 @@ asio::awaitable<void> suite_redirect(std::uint16_t port) {
     }
 }
 
-asio::awaitable<void> suite_retry(asio::io_context &ctx) {
+asio::awaitable<void> suite_retry(asio::io_context &ctx, std::uint16_t port) {
     std::printf("\n== configurable retry (RetryPolicy) ==\n");
     const std::string ok = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    const std::string base = "http://127.0.0.1:" + std::to_string(port);
+
+    // 429/503 with Retry-After: a replayable, idempotent request is retried
+    // until the peer answers with something outside retry_statuses.
+    {
+        sh::ClientConfig cfg = base_config();
+        cfg.retry.max_retries = 3;
+        cfg.retry.initial_backoff = std::chrono::milliseconds(1);
+        cfg.retry.retry_statuses = {429, 503};
+        h::Client client{co_await asio::this_coro::executor, cfg};
+        auto r = co_await fetch(client, client.get(base + "/retry-status"));
+        check(r && r->status == 200 && r->body == "ok", "a 429 response is retried and succeeds");
+    }
 
     // A connection that dies before answering is retried up to max_retries.
     {
@@ -2415,6 +2560,65 @@ asio::awaitable<void> suite_multipart(std::uint16_t port) {
         check(a.boundary().size() > 10 && a.boundary() != b.boundary(), "boundaries are generated per form");
         a.field("x", "y");
         check(a.content_length() == a.body().size(), "content_length() matches the serialized body");
+    }
+
+    // Streaming multipart: each part is written as it is added, with no
+    // whole-body buffer. The server still parses the same wire format.
+    {
+        auto opened = co_await sh::MultipartStreamWriter::open(client, base + "/mp", {.boundary = "STREAMB"});
+        check(opened.has_value(), "streaming multipart opens a stream");
+        if (opened) {
+            check((co_await opened->field("title", "hello")) == sh::error_code{}, "streaming multipart writes a field");
+            check((co_await opened->file_data("upload", "notes.txt", "text/plain", "file data")) == sh::error_code{},
+                  "streaming multipart writes an in-memory file part");
+            check((co_await opened->finish()) == sh::error_code{}, "streaming multipart finishes the body");
+            auto head = co_await opened->stream().read_head();
+            auto body = co_await opened->stream().read_all();
+            check(head && head->status == 200 && body &&
+                      *body == "field:title=hello|file:upload:notes.txt:text/plain:9",
+                  "streaming multipart round-trips through the server parser");
+        }
+    }
+
+    // A file part read from disk in chunks, plus a raw file body upload.
+    {
+        std::filesystem::path path = std::filesystem::temp_directory_path() / "simple_http_stream_upload.bin";
+        std::string payload(200000, 'x');
+        for (std::size_t i = 0; i < payload.size(); ++i) {
+            payload[i] = static_cast<char>('a' + (i % 26));
+        }
+        {
+            std::ofstream out{path, std::ios::binary};
+            out.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+        }
+
+        auto opened = co_await sh::MultipartStreamWriter::open(client, base + "/mp",
+                                                               {.boundary = "FILEB", .file_chunk_bytes = 4096});
+        check(opened.has_value(), "streaming multipart opens for a disk file");
+        if (opened) {
+            check((co_await opened->file("up", "blob.bin", path.string())) == sh::error_code{},
+                  "streaming multipart streams a file part from disk");
+            check((co_await opened->finish()) == sh::error_code{}, "streaming multipart finishes the file body");
+            auto head = co_await opened->stream().read_head();
+            auto body = co_await opened->stream().read_all();
+            check(head && head->status == 200 && body && *body == "file:up:blob.bin:application/octet-stream:200000",
+                  "disk file part round-trips through the server parser");
+        }
+
+        auto raw = co_await client.open_stream(base + "/echo", {.method = sh::Method::Put});
+        check(raw.has_value(), "raw file upload opens a stream");
+        if (raw) {
+            auto write_ec = co_await sh::stream_file_body(*raw, path.string(), 4096);
+            auto finish_ec = co_await raw->finish();
+            auto head = co_await raw->read_head();
+            auto body = co_await raw->read_all();
+            check(write_ec == sh::error_code{} && finish_ec == sh::error_code{} && head && head->status == 200 &&
+                      body && *body == payload,
+                  "stream_file_body uploads a file without buffering it");
+        }
+
+        std::error_code remove_ec;
+        std::filesystem::remove(path, remove_ec);
     }
 }
 
@@ -2840,7 +3044,7 @@ asio::awaitable<void> run_all_suites(asio::io_context &ctx, std::uint16_t plain,
     co_await suite_spec_validation(plain);
     co_await suite_tls(tls_port);
     co_await suite_redirect(plain);
-    co_await suite_retry(ctx);
+    co_await suite_retry(ctx, plain);
     co_await suite_shared_client(plain);
     co_await suite_websocket(plain);
     co_await suite_multipart(plain);

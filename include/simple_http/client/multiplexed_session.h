@@ -124,6 +124,12 @@ template <typename Session, typename Id> class MultiplexedClientStream final : p
         co_return co_await m_session->stream_write(m_id, std::move(data), /*last=*/true);
     }
 
+    asio::awaitable<error_code> finish_trailers(Headers trailers) override {
+        if (m_outcome->get() != StreamState::Open)
+            co_return m_outcome->to_error();
+        co_return co_await m_session->stream_finish_trailers(m_id, std::move(trailers));
+    }
+
     asio::awaitable<std::expected<ReadResult, error_code>> read() override {
         if (m_outcome->get() != StreamState::Open)
             co_return outcome_result(*m_outcome);

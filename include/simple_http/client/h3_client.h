@@ -472,6 +472,14 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         }
     }
 
+    // nghttp3 supports request trailers, but wiring them into this stream
+    // adapter is a separate change; report it rather than dropping fields.
+    asio::awaitable<error_code> stream_finish_trailers(std::int64_t id, Headers trailers) {
+        (void)id;
+        (void)trailers;
+        co_return make_error_code(client_errc::trailers_not_supported);
+    }
+
     asio::awaitable<std::expected<ReadResult, error_code>> stream_read(std::int64_t id) {
         co_await hop();
         if (!m_streams.contains(id))

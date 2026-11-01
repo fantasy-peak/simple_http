@@ -22,6 +22,7 @@
 // open_stream() 是全流式新管道（Stream 上写与读自行驱动）。两条路径共享同一
 // 底层会话内核（detail::ClientEngine；h1 半双工时序、h2 独立收发队列 + 双窗口/水位）。
 
+#include <charconv>
 #include <chrono>
 #include <expected>
 #include <initializer_list>
@@ -36,6 +37,7 @@
 #include <glaze/glaze.hpp>
 
 #include "../core/base64.h" // basic_auth
+#include "../core/http_date.h"
 #include "../core/http_field.h"
 #include "../core/http_method.h"
 #include "../core/http_status.h"
@@ -105,6 +107,16 @@ struct StreamSpec {
     // its single kept connection per origin (the policy is part of the
     // connection key).
     std::optional<HttpVersionPolicy> version{};
+
+    // Automatic Expect: 100-continue. When true, the request carries the Expect
+    // header and the first write()/finish() waits up to continue_timeout for
+    // the interim 100. A 100 lets the body proceed; a final response makes
+    // write() return client_errc::expectation_failed (read the response with
+    // read_head()/read()); a timeout sends the body anyway, like Go. HTTP/1.1
+    // and HTTP/3 surface the interim response; HTTP/2 currently sends the body
+    // immediately.
+    bool auto_expect_continue{false};
+    std::chrono::milliseconds continue_timeout{1000};
 };
 
 // --- the explicit, full-duplex stream (hyper/tokio model) ---------------------
@@ -119,15 +131,35 @@ class Stream {
     // Constructed by the public client (open_stream / open_target); public so
     // the stream can be owned via shared_ptr/make_shared.
     explicit Stream(std::shared_ptr<detail::ClientStream> stream, std::chrono::milliseconds head_timeout = {},
-                    std::chrono::milliseconds idle_timeout = {})
-        : m_stream(std::move(stream)), m_head_timeout(head_timeout), m_idle_timeout(idle_timeout) {}
+                    std::chrono::milliseconds idle_timeout = {}, bool auto_expect_continue = false,
+                    std::chrono::milliseconds continue_timeout = std::chrono::milliseconds{1000})
+        : m_stream(std::move(stream)), m_head_timeout(head_timeout), m_idle_timeout(idle_timeout),
+          m_auto_expect_continue(auto_expect_continue), m_continue_timeout(continue_timeout) {}
 
     // --- write end: the request body ---
-    [[nodiscard]] asio::awaitable<error_code> write(std::string chunk) { return m_stream->write(std::move(chunk)); }
+    [[nodiscard]] asio::awaitable<error_code> write(std::string chunk) {
+        if (auto ec = co_await ensure_continue(); ec) {
+            co_return ec;
+        }
+        co_return co_await m_stream->write(std::move(chunk));
+    }
     // Ends the body; after this the write end is closed (h1: the read end
     // opens; h2: END_STREAM is sent).
     [[nodiscard]] asio::awaitable<error_code> finish(std::string last = {}) {
-        return m_stream->finish(std::move(last));
+        if (auto ec = co_await ensure_continue(); ec) {
+            co_return ec;
+        }
+        co_return co_await m_stream->finish(std::move(last));
+    }
+    // Ends a streamed body with request trailers (RFC 9110 §6.5). Set the
+    // request's `Trailer` header before opening the stream so a peer knows which
+    // fields to expect. HTTP/1.1 is implemented; HTTP/2/3 currently return
+    // client_errc::trailers_not_supported.
+    [[nodiscard]] asio::awaitable<error_code> finish_trailers(Headers trailers) {
+        if (auto ec = co_await ensure_continue(); ec) {
+            co_return ec;
+        }
+        co_return co_await m_stream->finish_trailers(std::move(trailers));
     }
 
     // --- read end: the response ---
@@ -168,9 +200,46 @@ class Stream {
 
   private:
     friend class Client;
+
+    // Automatic Expect: 100-continue, performed once before the first body
+    // byte. A 100 means "go"; a final response is surfaced as
+    // expectation_failed and remains readable; a timed-out wait sends the body
+    // anyway (a peer that ignores Expect must not stall the upload).
+    [[nodiscard]] asio::awaitable<error_code> ensure_continue() {
+        if (!m_auto_expect_continue || m_continue_checked) {
+            co_return error_code{};
+        }
+        m_continue_checked = true;
+        // h1 and h2 surface the interim 100; h3 servers have no 1xx API, so the
+        // client sends the body without waiting.
+        if (m_stream->version() != Version::Http11 && m_stream->version() != Version::Http2) {
+            co_return error_code{};
+        }
+        auto head =
+            co_await detail::deadline(m_stream->read_head(), m_continue_timeout, client_errc::response_head_timeout);
+        if (!head) {
+            // No interim answer in time: proceed with the body, as Go's
+            // ExpectContinueTimeout does with a peer that ignores the header.
+            if (head.error() == make_error_code(client_errc::response_head_timeout)) {
+                co_return error_code{};
+            }
+            co_return head.error();
+        }
+        if (head->status == 100) {
+            // The interim head was handed to us; the final response still
+            // follows, so the next read_head() must parse it.
+            m_stream->clear_head_cache();
+            co_return error_code{};
+        }
+        co_return make_error_code(client_errc::expectation_failed);
+    }
+
     std::shared_ptr<detail::ClientStream> m_stream;
     std::chrono::milliseconds m_head_timeout{};
     std::chrono::milliseconds m_idle_timeout{};
+    bool m_auto_expect_continue{false};
+    std::chrono::milliseconds m_continue_timeout{1000};
+    bool m_continue_checked{false};
 };
 
 // --- the response lens --------------------------------------------------------
@@ -586,7 +655,7 @@ class Client {
         inner->set_method(spec.method);
         inner->set_target(std::move(spec.target));
         inner->mutable_headers() = std::move(spec.headers);
-        if (spec.expect_100_continue) {
+        if (spec.expect_100_continue || spec.auto_expect_continue) {
             inner->mutable_headers().add(std::string{field::expect}, "100-continue");
         }
         inner->set_close(spec.close);
@@ -599,7 +668,7 @@ class Client {
             spec.response_head_timeout.count() > 0 ? spec.response_head_timeout : m_cfg.response_head_timeout;
         const std::chrono::milliseconds idle =
             spec.body_idle_timeout.count() > 0 ? spec.body_idle_timeout : m_cfg.body_idle_timeout;
-        co_return Stream{std::move(opened->stream), head, idle};
+        co_return Stream{std::move(opened->stream), head, idle, spec.auto_expect_continue, spec.continue_timeout};
     }
 
     // --- WebSocket client (RFC 6455) ---
@@ -723,8 +792,25 @@ class Client {
             if (limit.count() > 0 && remaining.count() <= 0)
                 co_return std::unexpected{make_error_code(client_errc::request_timeout)};
             auto response = co_await read_exchange(stream, cap, remaining);
-            if (response)
+            if (response) {
+                if (detail::retry_status_allowed(budget, *request, response->status())) {
+                    const auto retry_after = response->header("retry-after");
+                    const auto delay =
+                        retry_after ? detail::retry_after_delay(*retry_after) : std::chrono::milliseconds{0};
+                    SIMPLE_HTTP_WARN_LOG("client: {} returned {} (Retry-After {}), retry {} of {}", target.authority(),
+                                         response->status(),
+                                         retry_after ? std::string{*retry_after} : std::string{"none"}, budget.used,
+                                         retry.max_retries);
+                    // The response body has been consumed; the kept h1 gate is
+                    // free for the next attempt even though this stream handle
+                    // is still in scope.
+                    if (opened->gate_token)
+                        impl->release_h1_gate(opened->gate_token);
+                    co_await detail::retry_sleep_for(retry, budget.used, delay, budget.deadline);
+                    continue;
+                }
                 co_return std::move(*response);
+            }
 
             const error_code ec = response.error();
             // The exchange on the kept h1 connection is over: hand the gate back

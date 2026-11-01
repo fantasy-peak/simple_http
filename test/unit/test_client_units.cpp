@@ -383,3 +383,16 @@ TEST_CASE("client/resolve: the hook wins, an empty hook falls back to asio", "[c
     CHECK(fallback->second[0].address() == asio::ip::make_address("127.0.0.1"));
     CHECK(fallback->second[0].port() == 80);
 }
+
+TEST_CASE("client/retry: Retry-After parses seconds and HTTP dates", "[client][retry]") {
+    CHECK(retry_after_delay("2") == std::chrono::seconds{2});
+    CHECK(retry_after_delay("0") == std::chrono::milliseconds{0});
+    // A hostile value is capped at one hour.
+    CHECK(retry_after_delay("999999") == std::chrono::hours{1});
+    CHECK(retry_after_delay("garbage") == std::chrono::milliseconds{0});
+
+    const auto in_five = now_unix() + 5;
+    const auto parsed = retry_after_delay(http_date(in_five));
+    CHECK(parsed >= std::chrono::seconds{4});
+    CHECK(parsed <= std::chrono::seconds{5});
+}

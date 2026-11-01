@@ -53,9 +53,9 @@ class Request {
         : m_version(other.m_version), m_peer(std::move(other.m_peer)), m_body(std::move(other.m_body)),
           m_method(other.m_method), m_method_token(std::move(other.m_method_token)),
           m_target(std::move(other.m_target)), m_headers(std::move(other.m_headers)),
-          m_params(std::move(other.m_params)), m_query_params(std::move(other.m_query_params)),
-          m_query_parsed(other.m_query_parsed), m_close(other.m_close), m_stream_body(other.m_stream_body),
-          m_content_length(other.m_content_length), m_url(std::move(other.m_url)),
+          m_trailers(std::move(other.m_trailers)), m_params(std::move(other.m_params)),
+          m_query_params(std::move(other.m_query_params)), m_query_parsed(other.m_query_parsed), m_close(other.m_close),
+          m_stream_body(other.m_stream_body), m_content_length(other.m_content_length), m_url(std::move(other.m_url)),
           m_body_source(std::move(other.m_body_source)), m_state(std::move(other.m_state)),
           m_stop(std::move(other.m_stop)) {
         rebind_views();
@@ -70,6 +70,7 @@ class Request {
         m_method_token = std::move(other.m_method_token);
         m_target = std::move(other.m_target);
         m_headers = std::move(other.m_headers);
+        m_trailers = std::move(other.m_trailers);
         m_params = std::move(other.m_params);
         m_query_params = std::move(other.m_query_params);
         m_query_parsed = other.m_query_parsed;
@@ -142,6 +143,13 @@ class Request {
     const Headers &headers() const { return m_headers; }
     std::optional<std::string_view> header(std::string_view name) const { return m_headers.get(name); }
 
+    // Request trailers (RFC 9110 §6.5), populated by the server after the body
+    // has ended. Empty until then; a client sending trailers sets them through
+    // Stream::finish_trailers().
+    const Headers &trailers() const { return m_trailers; }
+    Headers &mutable_trailers() { return m_trailers; }
+    void set_trailer(std::string name, std::string value) { m_trailers.add(std::move(name), std::move(value)); }
+
     // The value of a cookie in the Cookie request header (first match), or
     // nullopt. Values are returned as sent — no percent-decoding — like Go's
     // r.Cookie. The header is "name=value; name2=value2"; a quoted value is
@@ -202,6 +210,7 @@ class Request {
         copy->set_target(m_target);
         copy->m_url = m_url;
         copy->mutable_headers() = m_headers;
+        copy->m_trailers = m_trailers;
         copy->m_close = m_close;
         copy->m_stream_body = m_stream_body;
         if (!m_body_source.empty()) {
@@ -445,6 +454,7 @@ class Request {
     std::string m_method_token{"GET"};
     std::string m_target;
     Headers m_headers;
+    Headers m_trailers;
 
     // Path parameters from a template route, published by the Router during
     // dispatch. Values are views into m_target (stable after set_target).

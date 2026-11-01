@@ -97,7 +97,9 @@
 - HTTP/1.1 与 HTTP/2（HTTPS 走 ALPN；明文走 h2c Upgrade 或 prior-knowledge）。
 - HTTP/3（`HttpVersionPolicy::Http3`，显式启用；QUIC 自带 TLS 1.3）。
 - 便捷 API（`get` / `post` / … / `send`）与显式全双工 `Stream`。
-- 重定向、CookieJar、Basic/Bearer 认证、自动解压、multipart 上行。
+- 流式 multipart / 文件体上传，不把整个 body 放进内存。
+- 自动 `Expect: 100-continue`、请求 trailers、429/503 `Retry-After` 重试。
+- 重定向、CookieJar、Basic/Bearer 认证、自动解压、缓冲式 multipart 上行。
 - 出站代理：HTTP CONNECT、HTTPS 代理、SOCKS5，支持环境变量与 `NO_PROXY`。
 - 分层超时（连接、响应头 TTFB、响应体空闲）、免费透明重拨 + 可配置重试。
 - 服务端/客户端 WebSocket 共用同一套消息层；客户端 WebSocket 走 HTTP/1.1 Upgrade。
@@ -399,7 +401,20 @@ server.route({Method::Get}, "/me", [](RequestPtr req, ResponsePtr res) -> asio::
 
 验证器强制算法 allowlist（拒绝 `none`），用 OpenSSL 校验 HS256/RS256/ES256 签名，
 并校验 `exp`（默认必填）、`nbf`、`iss`、`aud`，成功后发布 `Principal`（subject /
-scopes / roles）。令牌签发、JWKS 拉取、OAuth2/OIDC 发现暂不在这一层。
+scopes / roles）。JWKS 支持静态文档与手动拉取（RSA / EC P-256 / oct key，按 `kid` 选）：
+
+```cpp
+auto jwks_body = co_await fetch_jwks_json(client, jwks_url);
+server.use(middleware::jwt(JwtConfig{
+    .algorithms = {"RS256", "ES256"},
+    .jwks_json = jwks_body ? *jwks_body : std::string{},
+    .issuer = "https://issuer.example",
+    .audience = "my-api",
+}));
+```
+
+文档在 middleware 构造时解析一次；自动后台刷新不在这一层。令牌签发与 OAuth2/OIDC
+发现也未包含。
 
 ### Host 路由与通配路径
 
@@ -994,6 +1009,55 @@ auto item = co_await r->json<Item>();
 
 也可以直接构造两端共用的 `Request` 再 `client.send(req)`（Go `http.Client.Do` 形态）。
 
+### 流式 multipart 与文件上传
+
+`MultipartForm` 是整块缓冲路径。大文件用 `MultipartStreamWriter` 逐 part 写出：
+
+```cpp
+auto up = co_await MultipartStreamWriter::open(
+    client, "https://host/upload", {.boundary = "B"});
+co_await up->field("title", "hello");
+co_await up->file("upload", "notes.txt", "./notes.txt"); // 从磁盘分块读取
+co_await up->finish();
+```
+
+裸文件体上传用 `stream_file_body`：
+
+```cpp
+auto up = co_await client.open_stream("https://host/upload",
+                                      {.method = Method::Put});
+co_await stream_file_body(*up, "./blob.bin");
+co_await up->finish();
+```
+
+两者都按 64 KiB 分块，走普通流式请求体（HTTP/1.1 chunked，HTTP/2/3 DATA）。
+
+### Expect: 100-continue 与请求 trailers
+
+```cpp
+auto up = co_await client.open_stream("https://host/upload",
+    {.method = Method::Post, .auto_expect_continue = true,
+     .continue_timeout = std::chrono::seconds{1}});
+if (co_await up->write(body) == client_errc::expectation_failed) {
+    auto head = co_await up->read_head(); // 对端拒绝了 body，最终响应可读
+}
+```
+
+请求 trailers 用 `finish_trailers`；需要先在请求头写 `Trailer`：
+
+```cpp
+StreamSpec spec;
+spec.method = Method::Post;
+spec.headers.add("trailer", "x-checksum");
+auto up = co_await client.open_stream(url, std::move(spec));
+co_await up->write(body);
+Headers trailers;
+trailers.add("x-checksum", "abc123");
+co_await up->finish_trailers(std::move(trailers));
+```
+
+服务端在 body 结束后通过 `req->trailers()` 读取（HTTP/1.1 与 HTTP/2）。
+
 ### 显式 Stream
 
 ```cpp
@@ -1067,6 +1131,9 @@ cfg.tls = TlsClientConfig{
   与读响应两个阶段各有一次免费重放，不计入 `max_retries`。
 - **策略重试**：`ClientConfig::retry` 配置最大次数、指数退避与条件回调；默认重试
   `stream_refused`、幂等方法的传输失败、以及请求尚未发出时的拨号失败。
+- **状态码重试**：`retry.retry_statuses` 默认空（与 Go/reqwest 一致，需显式开启）；
+  设为 `{429, 503}` 后，在 `max_retries > 0` 时对可重放、幂等的请求生效。`Retry-After`（秒或 IMF-fixdate）会替代该次退避；重试前
+  会先读完响应体。`retry_status_on_non_idempotent` 可让 POST 类方法也参与。
 - 重试总是重新拨号；同一次交换的 open 与读响应共享一个 retry budget，并受
   `request_timeout` 约束（重定向的每一跳各自获得完整的 `request_timeout`）。
 - 流式 body 已被消费、无法重放的请求默认不重试（`require_replayable`）。
@@ -1204,9 +1271,9 @@ socket 字节
 ### 本地测试目标
 
 ```sh
-xmake build unittest && xmake run unittest      # Catch2：387 个用例，65218 条断言
+xmake build unittest && xmake run unittest      # Catch2：389 个用例，65298 条断言
 xmake build regression && xmake run regression  # 裸 socket 畸形/边界请求
-xmake build client && xmake run client          # 客户端整合自检：218 checks
+xmake build client && xmake run client          # 客户端整合自检：245 checks
 xmake build server && xmake run python-tests    # Python 第三方客户端：113 checks
 ```
 
@@ -1303,13 +1370,18 @@ xmake run loadgen ws://127.0.0.1:7788/echo1k -p ws -n 200000 -c 64
 - 客户端采用“每个 origin 一条连接”的模型：对第一目标保持一条连接，其他 origin 使用
   一次性连接；没有传统连接池。
 - 客户端 WebSocket 不协商 permessage-deflate（服务端已实现 RFC 7692）。
-- 客户端 HTTP/2 会话不向调用方暴露 1xx 中间响应；`100-continue` 在 HTTP/1.1 与
-  HTTP/3 路径可见。
+- 客户端在 HTTP/1.1 与 HTTP/2 暴露 interim `100-continue`；其他 1xx（如 103 Early
+  Hints）仍会丢弃。
 - CORS 中间件不处理 WebSocket 升级；请使用 `ws_origin()` 做 Origin 校验。
 - Host 路由只作用于 HTTP dispatch；当前 WebSocket 引擎查找是 host-agnostic 的。
   Host 子 Router 有独立的 OpenAPI 文档。
-- JWT 只是验证器：不做令牌签发、JWKS 拉取、OAuth2/OIDC 发现或 refresh-token 流程；
-  RS256/ES256 需要 PEM 公钥。`aud`/`scope` 按字符串 claim 解析，不支持 audience 数组。
+- JWT 只是验证器：不做令牌签发、OAuth2/OIDC 发现或 refresh-token 流程。JWKS 支持
+  静态/手动拉取文档，不内置后台自动刷新。`aud`/`scope` 按字符串 claim 解析，不支持
+  audience 数组。
+- 请求 trailers 支持 HTTP/1.1 与 HTTP/2；HTTP/3 返回
+  `client_errc::trailers_not_supported`。
+- 自动 `Expect: 100-continue` 在 HTTP/1.1 与 HTTP/2 等待 interim 响应；HTTP/3 直接
+  发送 body（nghttp3 无 1xx 提交 API）。
 - Session 只内置进程内存储；Redis/数据库适配器由消费侧实现 `SessionStore`。CSRF 是
   header 型 double-submit；无法设置 header 的表单需要在 handler 里校验字段。
 - 校验通过 `Validator<T>` 按类型 opt-in，没有 tag/DSL 校验器。

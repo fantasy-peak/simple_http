@@ -85,7 +85,7 @@ concrete `ResponseSink` implementations; `ResponseWriter` only forwards.
 - Method-aware routing: exact paths, `{param}` segment trie, `{*rest}` catch-all,
   regex routes, host scoping, `any_methods`, fallback.
 - Framework layer: typed application state, compile-time extractors, validation,
-  sessions, CSRF and JWT (HS256/RS256/ES256).
+  sessions, CSRF and JWT (HS256/RS256/ES256 + JWKS).
 - Middleware chain at global, group and per-route scope: CORS, timeouts, recovery, auth,
   access logging, request-id, real-ip, rate limiting, security headers, response
   compression.
@@ -106,7 +106,9 @@ concrete `ResponseSink` implementations; `ResponseWriter` only forwards.
 - HTTP/1.1 and HTTP/2 (ALPN over HTTPS; h2c Upgrade or prior knowledge over plaintext).
 - HTTP/3 (`HttpVersionPolicy::Http3`, explicit opt-in; QUIC carries its own TLS 1.3).
 - Convenience API (`get` / `post` / … / `send`) and an explicit full-duplex `Stream`.
-- Redirects, CookieJar, Basic/Bearer auth, automatic decompression, multipart uploads.
+- Streaming multipart uploads and file-body uploads without buffering the whole body.
+- Automatic `Expect: 100-continue`, request trailers, and 429/503 `Retry-After` retries.
+- Redirects, CookieJar, Basic/Bearer auth, automatic decompression, buffered multipart.
 - Outbound proxies: HTTP CONNECT, HTTPS proxy, SOCKS5, environment variables and
   `NO_PROXY`.
 - Layered timeouts (connect, response-head TTFB, body idle), free transparent redials,
@@ -428,8 +430,23 @@ server.route({Method::Get}, "/me", [](RequestPtr req, ResponsePtr res) -> asio::
 The verifier enforces the configured algorithm allowlist (rejecting `none`), checks the
 signature with OpenSSL (HS256, RS256, ES256), and validates `exp` (required by default),
 `nbf`, `iss` and `aud`. It publishes a `Principal` with subject, scopes and roles.
-Token issuance, JWKS fetching and OAuth2/OIDC discovery are intentionally not part of
-this layer yet.
+
+A static JWKS document selects keys by `kid` (RSA, EC P-256 and `oct` keys are
+supported); fetch it with the provided helper and pass the JSON to the middleware:
+
+```cpp
+auto jwks_body = co_await fetch_jwks_json(client, jwks_url);
+server.use(middleware::jwt(JwtConfig{
+    .algorithms = {"RS256", "ES256"},
+    .jwks_json = jwks_body ? *jwks_body : std::string{},
+    .issuer = "https://issuer.example",
+    .audience = "my-api",
+}));
+```
+
+The document is parsed once, at middleware construction. Key refresh is the caller's
+policy (fetch again and rebuild the middleware). Token issuance and OAuth2/OIDC
+discovery are not part of this layer.
 
 ### Host routing and catch-all paths
 
@@ -1048,6 +1065,67 @@ and `version`. `send()` returns a buffered response; `send_stream()` returns an 
 You can also build a shared `Request` and call `client.send(req)` (the Go
 `http.Client.Do` shape).
 
+### Streaming multipart and file uploads
+
+`MultipartForm` is the buffered convenience path. For large files, open a stream and
+write parts incrementally:
+
+```cpp
+auto up = co_await MultipartStreamWriter::open(
+    client, "https://host/upload", {.boundary = "B"});
+co_await up->field("title", "hello");
+co_await up->file("upload", "notes.txt", "./notes.txt"); // streamed from disk
+co_await up->finish();
+
+auto head = co_await up->stream().read_head();
+auto response_body = co_await up->stream().read_all();
+```
+
+A raw file body (no multipart framing) uses `stream_file_body`:
+
+```cpp
+auto up = co_await client.open_stream("https://host/upload",
+                                      {.method = Method::Put});
+co_await stream_file_body(*up, "./blob.bin");
+co_await up->finish();
+```
+
+Both helpers read the file in 64 KiB chunks and send each chunk through the normal
+streaming-body path (chunked on HTTP/1.1, DATA frames on HTTP/2/3).
+
+### Expect: 100-continue and request trailers
+
+Set `auto_expect_continue` and the first `write()`/`finish()` waits for the interim
+100 (HTTP/1.1 and HTTP/2; HTTP/3 sends the body immediately because the server has no
+1xx API):
+
+```cpp
+auto up = co_await client.open_stream("https://host/upload",
+    {.method = Method::Post, .auto_expect_continue = true,
+     .continue_timeout = std::chrono::seconds{1}});
+if (co_await up->write(body) == client_errc::expectation_failed) {
+    // The peer refused the body; the final response is readable.
+    auto head = co_await up->read_head();
+}
+```
+
+Request trailers use `finish_trailers` (HTTP/1.1 and HTTP/2; HTTP/3 returns
+`trailers_not_supported`). Set the `Trailer` header before opening the stream:
+
+```cpp
+StreamSpec spec;
+spec.method = Method::Post;
+spec.headers.add("trailer", "x-checksum");
+auto up = co_await client.open_stream(url, std::move(spec));
+co_await up->write(body);
+Headers trailers;
+trailers.add("x-checksum", "abc123");
+co_await up->finish_trailers(std::move(trailers));
+```
+
+The server exposes request trailers through `req->trailers()` after the body ends
+(HTTP/1.1 and HTTP/2).
+
 ### Explicit Stream
 
 ```cpp
@@ -1126,6 +1204,11 @@ cfg.tls = TlsClientConfig{
   exponential backoff and a condition callback. By default it retries `stream_refused`,
   transport failures for idempotent methods, and dial failures before anything reached
   the wire.
+- **Status retries**: `retry.retry_statuses` is empty by default, matching Go/reqwest;
+  set `{429, 503}` to opt in. It applies to replayable, idempotent requests with
+  `max_retries > 0`. A `Retry-After` header
+  (seconds or IMF-fixdate) replaces the backoff for that attempt; a response body is
+  consumed before retrying. `retry_status_on_non_idempotent` opts POST-like methods in.
 - Retries always dial a fresh connection. The open and response-read phases of one
   exchange share a retry budget, bounded by `request_timeout` (each redirect hop gets its
   own full `request_timeout`).
@@ -1276,9 +1359,9 @@ testing them against each other cancels the mistake out.
 ### Local test targets
 
 ```sh
-xmake build unittest && xmake run unittest      # Catch2: 387 cases, 65218 assertions
+xmake build unittest && xmake run unittest      # Catch2: 389 cases, 65298 assertions
 xmake build regression && xmake run regression  # raw-socket malformed/boundary requests
-xmake build client && xmake run client          # client integration: 218 checks
+xmake build client && xmake run client          # client integration: 245 checks
 xmake build server && xmake run python-tests    # third-party Python clients: 113 checks
 ```
 
@@ -1386,14 +1469,19 @@ xmake run loadgen ws://127.0.0.1:7788/echo1k -p ws -n 200000 -c 64
 - The client uses a one-connection-per-origin model: it keeps one connection to its first
   origin and uses throwaway connections for others; there is no traditional connection pool.
 - The client WebSocket does not negotiate permessage-deflate (the server implements RFC 7692).
-- The client HTTP/2 session does not expose 1xx interim responses to the caller;
-  `100-continue` is visible on HTTP/1.1 and HTTP/3.
+- The client exposes the interim `100-continue` on HTTP/1.1 and HTTP/2; other 1xx
+  responses (such as 103 Early Hints) are still dropped.
 - CORS middleware does not apply to WebSocket upgrades; use `ws_origin()`.
 - Host routing applies to HTTP dispatch only; the current WebSocket engine lookup is
   host-agnostic. A host child Router has its own OpenAPI document.
-- JWT is a verifier only: no token issuance, JWKS fetching, OAuth2/OIDC discovery or
-  refresh-token flow. RS256/ES256 require a PEM public key. `aud` and `scope` are parsed
-  as string claims; audience arrays are not supported.
+- JWT is a verifier only: no token issuance, OAuth2/OIDC discovery or refresh-token
+  flow. JWKS is supported from a static/fetched JSON document; automatic background
+  refresh is not built in. `aud` and `scope` are parsed as string claims; audience
+  arrays are not supported.
+- Request trailers are implemented for HTTP/1.1 and HTTP/2; HTTP/3 returns
+  `client_errc::trailers_not_supported`.
+- Automatic `Expect: 100-continue` waits for the interim response on HTTP/1.1 and
+  HTTP/2; HTTP/3 sends the body immediately (nghttp3 has no 1xx submission API).
 - Sessions ship with an in-process store; Redis/database adapters implement the
   `SessionStore` interface on the consumer side. CSRF is header-based (double submit);
   forms that cannot set a header need a handler-side field check.

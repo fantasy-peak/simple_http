@@ -45,6 +45,7 @@
 // session or gate state (and hold a throwaway session strongly so it dies on
 // that executor, never on the caller's thread).
 
+#include <algorithm>
 #include <atomic>
 #include <boost/asio.hpp>
 #include <boost/asio/any_completion_handler.hpp>
@@ -52,6 +53,7 @@
 #include <boost/asio/experimental/awaitable_operators.hpp>
 #include <boost/asio/experimental/concurrent_channel.hpp>
 #include <boost/asio/ssl.hpp>
+#include <charconv>
 #include <chrono>
 #include <cmath> // std::isfinite (retry_delay overflow guard)
 #include <cstddef>
@@ -67,6 +69,7 @@
 #include <variant>
 #include <vector>
 
+#include "../core/http_date.h"
 #include "../core/http_field.h"
 #include "../core/http_status.h"
 #include "../core/limits.h"
@@ -181,6 +184,79 @@ struct RetryBudget {
     std::size_t used{0};
     std::chrono::steady_clock::time_point deadline{};
 };
+
+// Whether a successful response with `status` should be retried. Kept separate
+// from retry_allowed() because there is no error_code to pass to a condition;
+// the replayability and idempotence rules are the same, and a request with a
+// streamed body is never retried after it was sent.
+inline bool retry_status_allowed(RetryBudget &budget, const Request &spec, int status) {
+    if (!budget.policy || budget.policy->max_retries == 0 || budget.used >= budget.policy->max_retries)
+        return false;
+    if (budget.deadline != std::chrono::steady_clock::time_point{} &&
+        std::chrono::steady_clock::now() >= budget.deadline)
+        return false;
+    const RetryPolicy &policy = *budget.policy;
+    if (policy.retry_statuses.empty())
+        return false;
+    if (policy.require_replayable && spec.stream_body())
+        return false;
+    if (!is_idempotent(spec.method()) && !policy.retry_status_on_non_idempotent)
+        return false;
+    if (std::find(policy.retry_statuses.begin(), policy.retry_statuses.end(), status) == policy.retry_statuses.end())
+        return false;
+    ++budget.used;
+    return true;
+}
+
+// Parses Retry-After (RFC 9110 §10.2.3): a non-negative delta-seconds or an
+// IMF-fixdate. Returns 0 when absent/malformed/past. Capped at one hour so a
+// hostile value cannot park a request indefinitely; the request deadline caps
+// it further at the sleep site.
+inline std::chrono::milliseconds retry_after_delay(std::string_view value) {
+    while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
+        value.remove_prefix(1);
+    }
+    while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) {
+        value.remove_suffix(1);
+    }
+    if (value.empty()) {
+        return {};
+    }
+    std::int64_t seconds = 0;
+    const auto [ptr, ec] = std::from_chars(value.data(), value.data() + value.size(), seconds);
+    if (ec == std::errc{} && ptr == value.data() + value.size() && seconds >= 0) {
+        constexpr std::int64_t kMaxSeconds = 3600;
+        seconds = std::min(seconds, kMaxSeconds);
+        return std::chrono::milliseconds{seconds * 1000};
+    }
+    if (auto date = parse_http_date(value); date && *date > now_unix()) {
+        constexpr std::int64_t kMaxSeconds = 3600;
+        const std::int64_t delta = std::min(*date - now_unix(), kMaxSeconds);
+        return std::chrono::milliseconds{delta * 1000};
+    }
+    return {};
+}
+
+// Sleeps for `explicit_delay` when it is positive, otherwise for the policy's
+// exponential backoff for retry `ordinal`; capped by the request deadline.
+inline asio::awaitable<void> retry_sleep_for(const RetryPolicy &policy, std::size_t ordinal,
+                                             std::chrono::milliseconds explicit_delay,
+                                             std::chrono::steady_clock::time_point deadline = {}) {
+    auto delay = explicit_delay.count() > 0 ? explicit_delay : retry_delay(policy, ordinal);
+    if (deadline != std::chrono::steady_clock::time_point{}) {
+        const auto remaining = deadline - std::chrono::steady_clock::now();
+        if (remaining <= std::chrono::steady_clock::duration::zero())
+            co_return;
+        const auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(remaining).count();
+        if (delay.count() > remaining_ms)
+            delay = std::chrono::milliseconds{remaining_ms};
+    }
+    if (delay.count() <= 0)
+        co_return;
+    asio::steady_timer timer{co_await asio::this_coro::executor};
+    timer.expires_after(delay);
+    co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+}
 
 // Whether a failed attempt may be retried against `budget`. `request_sent`
 // tells the default rule whether anything of this request reached the wire: a
