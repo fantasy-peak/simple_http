@@ -9,13 +9,19 @@
 package main
 
 import (
+	"crypto"
+	"crypto/ecdsa"
 	"crypto/hmac"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
+	"math/big"
 	"net/http"
 	"os"
 	"strconv"
@@ -196,7 +202,48 @@ func csrfToken(w http.ResponseWriter, r *http.Request) string {
 	return token
 }
 
-func jwtAuthenticate(w http.ResponseWriter, r *http.Request) (string, []string, bool) {
+type jwtVerifier struct {
+	alg       string
+	secret    []byte
+	publicKey any
+}
+
+func loadPublicKey(path string) (any, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return nil, fmt.Errorf("no PEM block in %s", path)
+	}
+	return x509.ParsePKIXPublicKey(block.Bytes)
+}
+
+func (v jwtVerifier) verify(input string, signature []byte) bool {
+	digest := sha256.Sum256([]byte(input))
+	switch v.alg {
+	case "HS256":
+		mac := hmac.New(sha256.New, v.secret)
+		_, _ = mac.Write([]byte(input))
+		return subtle.ConstantTimeCompare(mac.Sum(nil), signature) == 1
+	case "RS256":
+		key, ok := v.publicKey.(*rsa.PublicKey)
+		return ok && rsa.VerifyPKCS1v15(key, crypto.SHA256, digest[:], signature) == nil
+	case "ES256":
+		key, ok := v.publicKey.(*ecdsa.PublicKey)
+		if !ok || len(signature) != 64 {
+			return false
+		}
+		r := new(big.Int).SetBytes(signature[:32])
+		s := new(big.Int).SetBytes(signature[32:])
+		return ecdsa.Verify(key, digest[:], r, s)
+	default:
+		return false
+	}
+}
+
+func jwtAuthenticate(w http.ResponseWriter, r *http.Request, verifier jwtVerifier) (string, []string, bool) {
 	header := r.Header.Get("Authorization")
 	if header == "" {
 		writeUnauthorized(w)
@@ -220,17 +267,13 @@ func jwtAuthenticate(w http.ResponseWriter, r *http.Request) (string, []string, 
 		return "", nil, false
 	}
 	var headerJSON jwtHeader
-	if json.Unmarshal(headerBytes, &headerJSON) != nil || headerJSON.Alg != "HS256" {
+	if json.Unmarshal(headerBytes, &headerJSON) != nil || headerJSON.Alg != verifier.alg {
 		writeUnauthorized(w)
 		return "", nil, false
 	}
 
-	signingInput := parts[0] + "." + parts[1]
-	mac := hmac.New(sha256.New, []byte(jwtSecret))
-	_, _ = mac.Write([]byte(signingInput))
-	expected := mac.Sum(nil)
 	signature, err := base64.RawURLEncoding.DecodeString(parts[2])
-	if err != nil || subtle.ConstantTimeCompare(expected, signature) != 1 {
+	if err != nil || !verifier.verify(parts[0]+"."+parts[1], signature) {
 		writeUnauthorized(w)
 		return "", nil, false
 	}
@@ -285,8 +328,8 @@ func main() {
 
 	mux.HandleFunc("GET /list", func(w http.ResponseWriter, r *http.Request) {
 		page, err := strconv.Atoi(r.URL.Query().Get("page"))
-		if err != nil && r.URL.Query().Get("page") != "" {
-			writeText(w, http.StatusBadRequest, "invalid query")
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_query", "invalid or missing query parameters", nil)
 			return
 		}
 		writeText(w, http.StatusOK, r.URL.Query().Get("q")+":"+strconv.Itoa(page))
@@ -335,14 +378,19 @@ func main() {
 	})
 
 	mux.HandleFunc("GET /header", func(w http.ResponseWriter, r *http.Request) {
-		page, err := strconv.Atoi(r.Header.Get("X-Page"))
+		rawPage := r.Header.Get("X-Page")
+		if rawPage == "" {
+			writeError(w, http.StatusBadRequest, "missing_header", "missing required header", "x-page")
+			return
+		}
+		page, err := strconv.Atoi(rawPage)
 		if err != nil {
-			writeText(w, http.StatusBadRequest, "missing header")
+			writeError(w, http.StatusBadRequest, "invalid_header", "invalid header value", "x-page")
 			return
 		}
 		cookie, err := r.Cookie("sid")
 		if err != nil {
-			writeText(w, http.StatusBadRequest, "missing cookie")
+			writeError(w, http.StatusBadRequest, "missing_cookie", "missing required cookie", "sid")
 			return
 		}
 		writeText(w, http.StatusOK, strconv.Itoa(page)+":"+cookie.Value)
@@ -392,26 +440,46 @@ func main() {
 		w.WriteHeader(http.StatusNoContent)
 	})
 
-	mux.HandleFunc("GET /jwt/me", func(w http.ResponseWriter, r *http.Request) {
-		sub, scopes, ok := jwtAuthenticate(w, r)
-		if !ok {
-			return
-		}
-		writeText(w, http.StatusOK, sub+":"+strings.Join(scopes, ","))
-	})
-	mux.HandleFunc("GET /jwt/write", func(w http.ResponseWriter, r *http.Request) {
-		_, scopes, ok := jwtAuthenticate(w, r)
-		if !ok {
-			return
-		}
-		for _, scope := range scopes {
-			if scope == "write" {
-				w.WriteHeader(http.StatusNoContent)
+	registerJWT := func(prefix string, verifier jwtVerifier) {
+		mux.HandleFunc("GET "+prefix+"/me", func(w http.ResponseWriter, r *http.Request) {
+			sub, scopes, ok := jwtAuthenticate(w, r, verifier)
+			if !ok {
 				return
 			}
+			writeText(w, http.StatusOK, sub+":"+strings.Join(scopes, ","))
+		})
+		mux.HandleFunc("GET "+prefix+"/write", func(w http.ResponseWriter, r *http.Request) {
+			_, scopes, ok := jwtAuthenticate(w, r, verifier)
+			if !ok {
+				return
+			}
+			for _, scope := range scopes {
+				if scope == "write" {
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+			}
+			writeForbidden(w, "forbidden")
+		})
+	}
+
+	registerJWT("/jwt", jwtVerifier{alg: "HS256", secret: []byte(jwtSecret)})
+	if len(os.Args) > 2 {
+		key, err := loadPublicKey(os.Args[2])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
 		}
-		writeForbidden(w, "forbidden")
-	})
+		registerJWT("/jwt/rs256", jwtVerifier{alg: "RS256", publicKey: key})
+	}
+	if len(os.Args) > 3 {
+		key, err := loadPublicKey(os.Args[3])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		registerJWT("/jwt/es256", jwtVerifier{alg: "ES256", publicKey: key})
+	}
 
 	addr := "127.0.0.1:" + port
 	fmt.Printf("go reference server on %s\n", addr)

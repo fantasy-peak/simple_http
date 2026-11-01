@@ -1286,8 +1286,8 @@ xmake run loadgen ws://127.0.0.1:7788/echo1k -p ws -n 200000 -c 64
 - `xmake run h3_public_check -- https://cloudflare-quic.com/`：手工公网 HTTP/3 冒烟。
 - `xmake run thread_check`：客户端线程模型与销毁路径压测（配合 sanitizer 使用）。
 - `test/framework_diff.sh` / `xmake run framework-diff`：同时启动 C++ 框架参考服务器与
-  等价的 Go `net/http` 服务器，对比 39 项可观测行为——App State、提取器、校验、
-  Session、CSRF、JWT、Host 路由和通配路径。
+  等价的 Go `net/http` 服务器，对比 64 项可观测行为——App State、提取器、校验、
+  Session、CSRF、JWT（HS256/RS256/ES256）、Host 路由和通配路径。
 
 <a id="known-limitations"></a>
 ## 已知限制 · Known limitations

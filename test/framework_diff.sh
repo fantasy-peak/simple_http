@@ -17,6 +17,7 @@ cd "$ROOT"
 CPP_PORT="${CPP_PORT:-7798}"
 GO_PORT="${GO_PORT:-7799}"
 CACHE="${ROOT}/.cache/framework_diff"
+KEYS="${CACHE}/keys"
 CPP_BIN="${ROOT}/build/linux/x86_64/release/framework_server"
 GO_BIN="${CACHE}/framework_server_go"
 PY="${ROOT}/test/python/.venv/bin/python"
@@ -28,7 +29,13 @@ if [[ ! -x "$PY" ]]; then
     exit 1
 fi
 
-mkdir -p "$CACHE"
+mkdir -p "$CACHE" "$KEYS"
+
+echo "==> generating RSA / EC keys"
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$KEYS/rsa_priv.pem" 2>/dev/null
+openssl pkey -in "$KEYS/rsa_priv.pem" -pubout -out "$KEYS/rsa_pub.pem" 2>/dev/null
+openssl ecparam -name prime256v1 -genkey -noout -out "$KEYS/ec_priv.pem" 2>/dev/null
+openssl pkey -in "$KEYS/ec_priv.pem" -pubout -out "$KEYS/ec_pub.pem" 2>/dev/null
 
 echo "==> building C++ framework server"
 xmake build framework_server >/dev/null
@@ -41,9 +48,9 @@ GO_LOG="$CACHE/go.log"
 : >"$CPP_LOG"
 : >"$GO_LOG"
 
-"$CPP_BIN" "$CPP_PORT" >"$CPP_LOG" 2>&1 &
+"$CPP_BIN" "$CPP_PORT" "$KEYS/rsa_pub.pem" "$KEYS/ec_pub.pem" >"$CPP_LOG" 2>&1 &
 CPP_PID=$!
-"$GO_BIN" "$GO_PORT" >"$GO_LOG" 2>&1 &
+"$GO_BIN" "$GO_PORT" "$KEYS/rsa_pub.pem" "$KEYS/ec_pub.pem" >"$GO_LOG" 2>&1 &
 GO_PID=$!
 
 cleanup() {
@@ -53,4 +60,4 @@ cleanup() {
 trap cleanup EXIT
 
 echo "==> simple_http on :$CPP_PORT, Go on :$GO_PORT"
-"$PY" "$ROOT/test/python/framework_diff.py" "$CPP_PORT" "$GO_PORT"
+"$PY" "$ROOT/test/python/framework_diff.py" "$CPP_PORT" "$GO_PORT" "$KEYS/rsa_priv.pem" "$KEYS/ec_priv.pem"

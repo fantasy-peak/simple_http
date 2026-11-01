@@ -167,7 +167,7 @@ include/
 - `test/stress/`：连接复用与负载统一入口。
 - `test/python/`：第三方实现（httpx / hyper-h2 / websockets / aioquic）驱动本库；
   `test/framework_diff.sh` + `test/go/framework_server.go` 是与 Go `net/http` 的框架层
-  差分测试（39 checks）。
+  差分测试（64 checks）。
 - `test/tls_certificates/`：测试证书。
 - `cmake/`：`simple_httpConfig.cmake.in`。
 - **没有 `docs/`，也没有 `ROADMAP.md`**（已删除）；文档为 `README.md`（英文默认）、
@@ -666,7 +666,7 @@ test/python/.venv/bin/pip install -r test/python/requirements.txt
 | `test/python/rfc8441_client.py` | hyper-h2 → h2 extended CONNECT / ws 反代 | 85 checks |
 | `test/python/run_client_cross.py` | C++ 客户端 → Python 服务端 | 43 + 6 checks |
 | `test/openapi_verify.py` | OpenAPI 文档 | 端到端断言 |
-| `test/framework_diff.sh` | C++ 框架参考服务器 ↔ Go `net/http` 参考服务器 | 39 checks：State/Extractor/Validation/Session/CSRF/JWT/Host/Wildcard |
+| `test/framework_diff.sh` | C++ 框架参考服务器 ↔ Go `net/http` 参考服务器 | 64 checks：State/Extractor/Validation/Session/CSRF/JWT(HS/RS/ES)/Host/Wildcard |
 | Autobahn | Python/Twisted → WebSocket | FAILED 0、NON-STRICT 0 |
 | h2spec | Go → 纯 h2c `:7790` | 146/146 |
 | h1spec | Deno → 纯 h1 `:7791` | 33/33 |
@@ -850,7 +850,7 @@ xmake run regression
 xmake run client
 xmake run python-tests
 xmake run readme_examples
-xmake run framework-diff              # C++ vs Go net/http 框架层差分（39 checks）
+xmake run framework-diff              # C++ vs Go net/http 框架层差分（64 checks）
 
 # 交叉验证（ws_cross / h3_client_cross 需先启动对应的 Python 服务端）
 test/python/.venv/bin/python test/python/ws_echo_server.py 27920 &

@@ -9,7 +9,10 @@
 
 #include <csignal>
 #include <cstdint>
+#include <fstream>
+#include <iterator>
 #include <memory>
+#include <optional>
 #include <print>
 #include <string>
 #include <thread>
@@ -53,10 +56,20 @@ namespace {
 volatile std::sig_atomic_t g_stop = 0;
 void on_signal(int) { g_stop = 1; }
 
+std::string read_file(const char *path) {
+    if (!path) {
+        return {};
+    }
+    std::ifstream in{path, std::ios::binary};
+    return {std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
     const auto port = static_cast<std::uint16_t>(argc > 1 ? std::stoi(argv[1]) : 7798);
+    const std::string rsa_public_pem = read_file(argc > 2 ? argv[2] : nullptr);
+    const std::string ec_public_pem = read_file(argc > 3 ? argv[3] : nullptr);
 
     set_log_sink(make_stderr_sink(LogLevel::Warn));
 
@@ -176,26 +189,42 @@ int main(int argc, char **argv) {
                  [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(204).send(""); });
 
     // --- JWT ----------------------------------------------------------------
-    auto jwt_mw = middleware::jwt(JwtConfig{
-        .algorithms = {"HS256"},
-        .secret = "secret",
-        .issuer = "iss",
-        .audience = "aud",
-    });
-    server.route({Method::Get}, "/jwt/me", {jwt_mw}, [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
-        const Principal *identity = principal(*req);
-        if (!identity) {
-            co_await res->status(500).send("no principal");
-            co_return;
-        }
-        std::string scopes;
-        for (const auto &scope : identity->scopes) {
-            scopes += (scopes.empty() ? "" : ",") + scope;
-        }
-        co_await res->status(200).send(identity->subject + ":" + scopes);
-    });
-    server.route({Method::Get}, "/jwt/write", {jwt_mw, middleware::require_scope("write")},
-                 [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(204).send(""); });
+    auto register_jwt_routes = [&server](const std::string &prefix, Middleware jwt_mw) {
+        server.route({Method::Get}, prefix + "/me", {jwt_mw},
+                     [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
+                         const Principal *identity = principal(*req);
+                         if (!identity) {
+                             co_await res->status(500).send("no principal");
+                             co_return;
+                         }
+                         std::string scopes;
+                         for (const auto &scope : identity->scopes) {
+                             scopes += (scopes.empty() ? "" : ",") + scope;
+                         }
+                         co_await res->status(200).send(identity->subject + ":" + scopes);
+                     });
+        server.route({Method::Get}, prefix + "/write", {std::move(jwt_mw), middleware::require_scope("write")},
+                     [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(204).send(""); });
+    };
+
+    register_jwt_routes("/jwt", middleware::jwt(JwtConfig{
+                                    .algorithms = {"HS256"},
+                                    .secret = "secret",
+                                    .issuer = "iss",
+                                    .audience = "aud",
+                                }));
+    register_jwt_routes("/jwt/rs256", middleware::jwt(JwtConfig{
+                                          .algorithms = {"RS256"},
+                                          .public_key_pem = rsa_public_pem,
+                                          .issuer = "iss",
+                                          .audience = "aud",
+                                      }));
+    register_jwt_routes("/jwt/es256", middleware::jwt(JwtConfig{
+                                          .algorithms = {"ES256"},
+                                          .public_key_pem = ec_public_pem,
+                                          .issuer = "iss",
+                                          .audience = "aud",
+                                      }));
 
     auto started = server.start();
     if (!started) {

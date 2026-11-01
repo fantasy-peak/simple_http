@@ -1368,9 +1368,9 @@ xmake run loadgen ws://127.0.0.1:7788/echo1k -p ws -n 200000 -c 64
   smoke test.
 - `xmake run thread_check`: client threading and teardown stress (for sanitizers).
 - `test/framework_diff.sh` / `xmake run framework-diff`: starts the C++ framework
-  reference server and an equivalent Go `net/http` server, then compares 39 observable
-  behaviors for application state, extractors, validation, sessions, CSRF, JWT, host
-  routing and catch-all paths.
+  reference server and an equivalent Go `net/http` server, then compares 64 observable
+  behaviors for application state, extractors, validation, sessions, CSRF, JWT
+  (HS256/RS256/ES256), host routing and catch-all paths.
 
 <a id="known-limitations"></a>
 ## Known limitations
