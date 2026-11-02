@@ -123,12 +123,32 @@ class CookieJar {
         m_cookies.erase(std::remove_if(m_cookies.begin(), m_cookies.end(), expired), m_cookies.end());
     }
 
+    // localhost / *.localhost and loopback IP literals are potentially
+    // trustworthy origins (Go's cookiejar secureMatch).
+    static bool loopback_domain(std::string_view domain) {
+        if (domain == "::1" || domain == "[::1]") {
+            return true;
+        }
+        if (domain.starts_with("127.")) {
+            return true;
+        }
+        const auto dot = domain.rfind('.');
+        const auto last = dot == std::string_view::npos ? domain : domain.substr(dot + 1);
+        return iequals_ci(last, "localhost");
+    }
+
     // Whether a request to `url` may carry this cookie. Domain: exact host when
     // host-only, or a '.'-bounded suffix otherwise (a Domain of "example.com"
     // matches "example.com" and "app.example.com" but not "notexample.com").
-    // Path: the request path must begin with the cookie's. Secure: https only.
+    // Path: the request path must begin with the cookie's. Secure: https, or a
+    // loopback origin (localhost / 127.0.0.0/8 / ::1).
     static bool matches(const Cookie &cookie, const detail::Url &url) {
-        if (url.scheme != "https" && cookie.secure) {
+        // Secure cookies travel over https, and over http to a trustworthy
+        // loopback origin (RFC 6265bis §5.4 / browser behavior). Go's
+        // net/http/cookiejar has the same localhost and 127.0.0.0/8 exception;
+        // without it the same client code sends a different Cookie header to a
+        // local test server than Go does.
+        if (url.scheme != "https" && cookie.secure && !loopback_domain(cookie.domain)) {
             return false;
         }
         if (cookie.host_only) {

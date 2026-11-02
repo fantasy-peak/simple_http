@@ -880,8 +880,13 @@ class Client {
         auto request = std::make_shared<Request>(Version::Http11, co_await asio::this_coro::executor);
         // The raw token carries extension methods through the convenience path;
         // set_method_token() also refreshes the enum.
-        request->set_method_token(method_token.empty() ? std::string{to_string(method)} : std::move(method_token));
-        request->mutable_headers() = std::move(headers);
+        // Both are needed again on the next hop: the method token for an
+        // extension method, and every caller header (User-Agent, Authorization,
+        // custom fields). Moving them here left the recursive call with empty
+        // values, so a redirect silently dropped them and the engine supplied
+        // its default User-Agent instead. Go's http.Client preserves them.
+        request->set_method_token(method_token.empty() ? std::string{to_string(method)} : method_token);
+        request->mutable_headers() = headers;
         request->set_target(url_target.empty() ? "/" : url_target);
         request->set_close(close); // Go's Request.Close survives the redirect loop
         if (!body.empty())

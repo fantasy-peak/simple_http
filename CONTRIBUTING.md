@@ -7,7 +7,7 @@
 Start the server in one shell:
 
 ```sh
-xmake run fixture_server
+xmake run fixture_conformance_server
 ```
 
 Make a mTLS request using curl in another shell. Run this in `./test/tls_certificates/` or adjust the paths accordingly.

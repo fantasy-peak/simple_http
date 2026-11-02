@@ -23,7 +23,7 @@
 #   例：test/external/stress/run.sh both h3        # 两实现都只跑 h3 档
 #       test/external/stress/run.sh cpp --no-conformance   # 只压 C++，不跑符合性
 #
-# 脚本开头会**无条件清理所有遗留测试服务**（C++ release/debug fixture_server、rust_http_server、
+# 脚本开头会**无条件清理所有遗留测试服务**（C++ release/debug fixture_conformance_server、rust_http_server、
 # server_dbg），并验证 TCP+UDP 端口释放后才启动被测服务器——否则 SO_REUSEPORT 会把
 # 新服务器与残留进程哈希分流，QUIC 连接表被劈开（症状：20 万请求 ~800 failed）。
 #
@@ -79,9 +79,9 @@ select_target() {
         cpp)
             TARGET=cpp
             CACHE="${ROOT}/.cache/stress"
-            SERVER_BIN="${SERVER_BIN_ENV:-${ROOT}/build/linux/x86_64/release/fixture_server}"
+            SERVER_BIN="${SERVER_BIN_ENV:-${ROOT}/build/linux/x86_64/release/fixture_conformance_server}"
             PORT_WS=7788; PORT_H2C=7790; PORT_H1=7791; PORT_H3=7792
-            BUILD_SERVER="xmake build fixture_server"
+            BUILD_SERVER="xmake build fixture_conformance_server"
             REQ_BODY="${CACHE}/req1024.bin"
             ;;
         rust)
@@ -389,7 +389,7 @@ want() {
 # 哈希劈给两个进程（实测 20 万请求 ~800 failed）；7789 无 reuse_port 则直接 EADDRINUSE。
 kill_all_test_servers() {
     head_ "清理遗留测试服务（强制，改动后必跑）"
-    local pat='[r]elease/fixture_server|[d]ebug/fixture_server|[r]ust_http_server|[s]erver_dbg'
+    local pat='[r]elease/fixture_conformance_server|[d]ebug/fixture_conformance_server|[r]ust_http_server|[s]erver_dbg'
     local pids
     pids="$(ps ax -o pid,cmd | grep -E "$pat" | grep -v grep | awk '{print $1}')"
     if [[ -z "$pids" ]]; then

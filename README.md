@@ -292,15 +292,14 @@ server.serve_swagger_ui("/swagger", "/openapi.json");
 ### Build and run
 
 ```sh
-xmake build -j12
-xmake run fixture_server
+xmake build -j 12
+xmake run diff_openapi_server   # petshop + OpenAPI document on :7795
 ```
 
-`test/server/fixtures/server.cpp` starts several listeners: `:7788` plaintext sniffing, `:7789`
-TLS/mTLS (with QUIC on the same port over UDP), `:7790` h2c-only, `:7791` h1-only,
-`:7792` TCP+UDP dual transport, `:7793` h2 with a large window, `:7794` h1-only
-configured through the listener builder, and `:7797` a non-mTLS TLS h1 listener used
-by the TLS benchmark. Full route examples live there as well.
+`test/fixtures/conformance_server.cpp` is the minimal fixture the external suites
+drive (`:7788` sniffing + WebSocket, `:7790` h2c, `:7791` h1, `:7792` TCP+UDP h3).
+`test/diff/server/cpp/server.cpp` is the full differential server; it and its Go
+counterpart register the same route table and are compared request by request.
 
 <a id="framework-layer"></a>
 ## Framework layer
@@ -506,18 +505,16 @@ crypto helper that HTTP/3 needs. The build enables dependency locking
 (`package.requires_lock`).
 
 ```sh
-xmake build -j12                       # build; also refreshes build/compile_commands.json
-xmake run fixture_server               # example / fixture servers
+xmake build -j 12                      # build; also refreshes build/compile_commands.json
 xmake run test_unit                    # Catch2 unit tests
-xmake run test_client                  # client integration self-check
-xmake run test_server_regression       # adversarial server regression
-xmake run tool_loadgen -- ...          # load generator
+xmake run diff_openapi_server          # petshop OpenAPI demo on :7795
+xmake run fixture_conformance_server   # minimal conformance/stress fixture
 ```
 
 The test suites have one entry point, `test/run.sh` (see `test/README.md`):
 
 ```sh
-test/run.sh fast      # unit + in-process C++ suites
+test/run.sh fast      # unit
 test/run.sh standard  # + independent Python implementations
 test/run.sh full      # + Go differentials + external conformance/stress
 ```
@@ -1389,121 +1386,93 @@ socket bytes
 <a id="testing"></a>
 ## Testing and verification
 
-The project is tested both by its own suites and by independent implementations. The
-latter matters: if the client and server share the same misreading of a specification,
-testing them against each other cancels the mistake out.
-
-### Local test targets
+The suite is organized around one idea: **behavior is compared with Go's standard
+library, not asserted in isolation**. Two differential harnesses run the same
+requests through this library and through Go, and a registered difference is the
+only way a divergence can pass.
 
 ```sh
-test/run.sh unit                # Catch2: 401 cases, 65377 assertions
-test/run.sh server-regression   # raw-socket malformed/boundary requests
-test/run.sh client              # client integration: 250 checks
-test/run.sh server-conformance  # third-party Python clients: 129 checks
-test/run.sh fast                # all of the above that do not need a venv
+test/run.sh fast        # unit
+test/run.sh standard    # unit + OpenAPI
+test/run.sh full        # + client-diff + server-diff + conformance + stress
+test/run.sh list
+test/run.sh doctor
+test/run.sh <suite>     # unit / openapi / client-diff / server-diff / ...
 ```
 
-The unit tests cover core, proto, the H1 parser, H2 frames / HPACK / Huffman, WebSocket
-frames and message handling, routing, host/catch-all routing, application state,
-extractors, validation, sessions, CSRF, JWT, CORS, rate limiting, static files, OpenAPI,
-and client URL / config / TLS parameters / proxies. Filter by tag:
-`test/run.sh unit '[h2]'`.
-
-`test/server/fixtures/server.cpp` listens on: `:7788` plaintext sniffing, `:7789` TLS/mTLS
-(and QUIC on the same port over UDP), `:7790` h2c-only, `:7791` h1-only, `:7792`
-TCP+UDP dual transport, `:7793` h2 with a large window, `:7794` h1-only from the
-builder, and `:7797` a non-mTLS TLS h1 listener for the benchmark.
-
-### Cross-validation
-
-| Direction | Driver | Coverage |
+| Suite | Tier | What it compares |
 |---|---|---|
-| Server ← independent clients | `test/server/run.py` (httpx / hyper-h2 / websockets / aioquic) | 129 checks: h1 / h2 / h3 / WS / trailers / CORS / regressions / request decompression |
-| Server ← independent client | `test/server/h2_websocket.py` | 85 checks: HTTP/2 extended CONNECT and h2 WebSocket proxying |
-| Client → independent servers | `test/client/run.py` | 43 checks (stdlib http.server / websockets) + 6 checks (aioquic h3) |
-| Server ← Autobahn | Docker `crossbario/autobahn-testsuite` | Full WebSocket suite; FAILED 0, NON-STRICT 0 |
-| Server ← h2spec | Go h2spec | `:7790`, 146/146 |
-| Server ← h1spec | Deno h1spec | `:7791`, 33/33 |
-| Server ← h3spec | h3spec | `udp :7792`, at least 47 of 49 (2 known TLS 8.2 false positives) |
+| `unit` | fast | Catch2 pure-logic tests (kept from the previous suite) |
+| `openapi` | standard | OAS 3.1 metaschema, document/live-route contract, Swagger UI |
+| `client-diff` | full | C++ client ↔ Go `net/http` client to the same Go server |
+| `server-diff` | full | Go client → C++ server ↔ the same request → Go server |
+| `conformance` | full | h2spec / h1spec / Autobahn / h3spec |
+| `stress` | full | h2load / k6; the only gate is zero failures |
 
-Python dependency versions are pinned in `test/requirements.txt`. First-time setup:
+### Client differential
+
+`test/diff/client/` builds one C++ probe and one Go probe per feature group
+(`basic`, `body`, `policy`, `ws`, `h3`). Both load the same JSON cases and send
+them to one Go reference server:
+
+- `7810` plaintext HTTP/1.1 and WebSocket
+- `7811` TLS with ALPN h2 + http/1.1
+- `7812` h2c
+- `7813` HTTP/3 over QUIC
+
+The server echoes the method, headers, body and trailers it received, so a
+difference in the two observations can only come from the clients. Groups cover
+redirects, cookies, compression, retries, streaming multipart, streaming uploads,
+100-continue, request/response trailers, SSE, WebSocket and HTTP/3.
+
+### Server differential
+
+`test/diff/server/` runs `diff_server_cpp` (`7820`–`7823`) and an equivalent Go
+`net/http` server (`7830`–`7833`). A Go probe sends the same request to both and
+prints two observations per case. Groups: `routing`, `body`, `semantics`,
+`middleware`, `framework`, `static`, `ws`.
+
+### Observations and known differences
+
+Every probe emits one JSON object per case
+(`case/target/status/version/headers/body/body_encoding/framing/error/notes`).
+`test/diff/support/harness.py` lowercases header names, compares set-valued
+headers as sets, ignores transport details such as `Date`, `Server`,
+`Content-Length`, `Transfer-Encoding` and `Set-Cookie`, and supports `exact`,
+`json` and `none` body modes plus per-case `scrub` patterns.
+
+An unexpected difference fails the suite. A genuinely acceptable difference is
+registered in `test/diff/known_diffs.json` with a reason (and RFC where relevant).
+Each run writes `diff-report.md`, listing every difference with the C++ value, the
+Go value, the verdict and the reason.
+
+### OpenAPI
+
+`test/diff/openapi/` validates the petshop document against the vendored official
+OAS 3.1 metaschema, checks structural invariants (unique operationIds, path
+parameters matching the template, resolvable `$ref`s), exercises every declared
+response status with a real request, validates response bodies against their
+declared JSON Schemas, and checks Swagger UI and document determinism.
+
+### External conformance and stress
+
+`test/external/conformance/run.sh` drives the minimal
+`fixture_conformance_server` with h2spec (`:7790`), h1spec (`:7791`), Autobahn
+(`:7788`) and h3spec (`udp :7792`). `test/external/stress/run.sh` drives the same
+fixture with h2load and k6. Ports and baselines are unchanged; the fixture only
+contains the four routes those tools need (`/`, `/world`, `ws /echo`,
+`ws /echo1k`).
+
+### Environment
 
 ```sh
 python3 -m venv test/.venv
 test/.venv/bin/pip install -r test/requirements.txt
+cd test/diff && go mod download
 ```
 
-### External conformance suites
-
-```sh
-test/external/conformance/run.sh          # h2spec / h1spec / autobahn / h3spec
-test/external/conformance/run.sh h2spec   # run one suite
-```
-
-Ports must not be mixed: `7790` is pure h2c, `7791` is pure h1, `7788` is sniffing +
-WebSocket, and `7792` is TCP + UDP dual transport. Single-protocol ports are required
-because on the sniffing port a malformed HTTP/2 preface and a malformed HTTP/1.x request
-line are the same bytes, while h2spec wants GOAWAY and h1spec wants 400.
-
-The tools are not vendored (license/size); the script checks the environment and prints
-setup commands for h2spec, Deno-based h1spec, the Autobahn Docker image and h3spec.
-
-### Stress and connection lifecycle
-
-```sh
-test/external/stress/run.sh [cpp|rust|both] [h1|h2|h3|ws]...
-test/external/stress/run.sh both          # default: both implementations, all four suites
-test/external/stress/run.sh cpp h3        # only the C++ h3 suite
-```
-
-The script force-kills leftover test servers and verifies that TCP/UDP ports are released
-before starting (otherwise SO_REUSEPORT splits the QUIC connection table), optionally
-runs the conformance suite, then runs the load tests. The only gate is: **failures must
-be zero**. Throughput is reported but never asserted, because it depends on the machine.
-
-Requires `h2load` and `k6`; the h3 suite additionally requires an h2load built with
-ngtcp2/nghttp3. The `cpp` target uses ports `7788`–`7792`; the `rust` target uses
-`7888`–`7892`.
-
-### Load generator
-
-```sh
-xmake build tool_loadgen
-xmake run tool_loadgen http://127.0.0.1:7791/world -p h1 -n 300000 -c 100
-xmake run tool_loadgen http://127.0.0.1:7790/world -p h2 -n 600000 -c 20 -m 40
-xmake run tool_loadgen ws://127.0.0.1:7788/echo1k -p ws -n 200000 -c 64
-```
-
-`-p` accepts `h1` / `pub` / `h2` / `ws`; the output follows the h2load shape
-(`finished in Xs, N req/s, M MB/s`) plus latency percentiles.
-
-### Other check targets
-
-- `xmake run example_readme`: compile-check the main README samples.
-- `xmake run example_openapi` + `test/examples/openapi_verify.py`: OpenAPI end-to-end
-  (the demo listens on `:7795`; browse `/swagger`).
-- `xmake run fixture_middleware_server`: mounts every built-in middleware on `:7796`
-  (and a TLS 1.2 variant on `:7797`) for differential testing against Go.
-- `test/run.sh client-cross`: client cross-validation against independent Python
-  servers.
-- `xmake run tool_h3_public -- https://cloudflare-quic.com/`: manual public HTTP/3
-  smoke test.
-- `xmake run test_threading`: client threading and teardown stress (for sanitizers).
-- `test/run.sh framework-diff` / `test/.venv/bin/python test/differential/run.py framework`: starts
-  the C++ framework reference server and an equivalent Go `net/http` server, then
-  compares 64 observable behaviors for application state, extractors, validation,
-  sessions, CSRF, JWT (HS256/RS256/ES256), host routing and catch-all paths.
-- `test/run.sh client-diff` / `test/.venv/bin/python test/differential/run.py client`: runs a C++
-  client probe against a Go reference server, a Go client probe against the same
-  server, and the Go probe against the C++ framework server. The three PASS/FAIL
-  outputs are diffed across streaming multipart/file upload, automatic 100-continue,
-  request trailers, 429/Retry-After and JWKS fetch.
-- `test/run.sh compression-diff` / `test/.venv/bin/python test/differential/run.py compression`:
-  runs the Go `net/http` client and the simple_http client against the same Go
-  reference server and diffs their PASS/FAIL lines (gzip negotiation, explicit
-  `Accept-Encoding`, HEAD/Range, `Uncompressed`, header removal), then compares
-  server-side request decompression between a Go reference handler and
-  `middleware::decompress_request` on the same compressed requests.
+Python packages are pinned in `test/requirements.txt`; Go modules are pinned in
+`test/diff/go.mod`. `test/run.sh doctor` lists missing tools per suite.
 
 <a id="known-limitations"></a>
 ## Known limitations

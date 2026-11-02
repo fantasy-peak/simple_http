@@ -1,0 +1,192 @@
+[
+  {
+    "id": "policy.redirect_chain",
+    "client": {
+      "version": "h1",
+      "max_redirects": 5
+    },
+    "request": {
+      "method": "GET",
+      "path": "/redirect-chain/2"
+    },
+    "expect": {
+      "status": 200,
+      "body_mode": "exact"
+    }
+  },
+  {
+    "id": "policy.redirect_limit",
+    "client": {
+      "version": "h1",
+      "max_redirects": 1
+    },
+    "request": {
+      "method": "GET",
+      "path": "/redirect-chain/5"
+    },
+    "expect": {
+      "status": 0,
+      "body_mode": "none"
+    }
+  },
+  {
+    "id": "policy.compression_auto",
+    "client": {
+      "version": "h1",
+      "auto_decompress": true
+    },
+    "request": {
+      "method": "GET",
+      "path": "/compress/gzip?body=hello-compressed"
+    },
+    "expect": {
+      "status": 200,
+      "body_mode": "exact"
+    }
+  },
+  {
+    "id": "policy.compression_off",
+    "client": {
+      "version": "h1",
+      "auto_decompress": false
+    },
+    "request": {
+      "method": "GET",
+      "path": "/compress/gzip?body=hello-compressed"
+    },
+    "expect": {
+      "status": 200,
+      "body_mode": "exact",
+      "compare_headers": [
+        "content-encoding"
+      ]
+    }
+  },
+  {
+    "id": "policy.compression_explicit_accept",
+    "client": {
+      "version": "h1",
+      "auto_decompress": true
+    },
+    "request": {
+      "method": "GET",
+      "path": "/compress/gzip?body=hello-compressed",
+      "headers": [
+        {
+          "name": "accept-encoding",
+          "value": "identity"
+        }
+      ]
+    },
+    "expect": {
+      "status": 200,
+      "body_mode": "exact"
+    }
+  },
+  {
+    "id": "policy.head_no_encoding",
+    "client": {
+      "version": "h1",
+      "auto_decompress": true
+    },
+    "request": {
+      "method": "HEAD",
+      "path": "/compress/gzip?body=hello-compressed"
+    },
+    "expect": {
+      "status": 200,
+      "body_mode": "none"
+    }
+  },
+  {
+    "id": "policy.jwks",
+    "client": {
+      "version": "h1"
+    },
+    "request": {
+      "method": "GET",
+      "path": "/jwks"
+    },
+    "expect": {
+      "status": 200,
+      "body_mode": "json",
+      "compare_headers": [
+        "content-type"
+      ]
+    }
+  },
+  {
+    "id": "policy.multipart_buffered",
+    "client": {
+      "version": "h1"
+    },
+    "request": {
+      "method": "POST",
+      "path": "/multipart",
+      "body": {
+        "kind": "multipart",
+        "parts": [
+          {
+            "name": "title",
+            "data": "hello"
+          },
+          {
+            "name": "upload",
+            "filename": "notes.txt",
+            "content_type": "text/plain",
+            "data": "file data"
+          }
+        ]
+      }
+    },
+    "expect": {
+      "status": 200,
+      "body_mode": "json"
+    }
+  },
+  {
+    "id": "policy.trailers_response",
+    "client": {
+      "version": "h1"
+    },
+    "request": {
+      "method": "GET",
+      "path": "/trailers"
+    },
+    "expect": {
+      "status": 200,
+      "body_mode": "exact",
+      "capture_trailers": true
+    }
+  },
+  {
+    "id": "policy.h2_compression",
+    "client": {
+      "version": "h2",
+      "auto_decompress": true
+    },
+    "request": {
+      "method": "GET",
+      "path": "/compress/gzip?body=h2-compressed"
+    },
+    "expect": {
+      "status": 200,
+      "body_mode": "exact"
+    }
+  },
+  {
+    "id": "policy.redirect_referer",
+    "client": {
+      "version": "h1",
+      "max_redirects": 5
+    },
+    "request": {
+      "method": "GET",
+      "path": "/redirect-to-referer"
+    },
+    "expect": {
+      "status": 200,
+      "body_mode": "exact"
+    }
+  }
+]

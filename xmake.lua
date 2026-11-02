@@ -55,16 +55,14 @@ target("simple_http")
 target_end()
 
 -- TEST TARGETS --
--- Everything under test/ follows four role prefixes:
---   test_*    programs that assert behaviour (unit, regression, integration)
---   fixture_* servers a suite drives from the outside
---   probe_*   clients that talk to an independent peer, printing PASS/FAIL
---   tool_*    manual utilities (load profiling, public smoke tests, harnesses)
---   example_* documentation samples that must keep compiling
+-- Three roles:
+--   test_*      assertion programs (Catch2 unit suite)
+--   fixture_*   servers an external suite drives from the outside
+--   diff_*      differential drivers / servers (C++, plus Go built by run.py)
 --
--- test/run.py is the one orchestration entry point; xmake only builds these
--- binaries and runs them directly when a developer asks for a single target.
--- Common GCC warning suppressions live in one helper instead of 23 copies.
+-- test/run.py is the only orchestration entry point; xmake only builds these
+-- binaries. Every diff group is a separate executable: a failure keeps the
+-- blast radius small and running one group never builds the others.
 local test_cxxflags = {
     "-Wno-maybe-uninitialized",
     "-Wno-mismatched-new-delete",
@@ -84,6 +82,11 @@ local function add_test_binary(name, files, opts)
                 add_packages(package)
             end
         end
+        if opts.defines then
+            for _, define in ipairs(opts.defines) do
+                add_defines(define)
+            end
+        end
         if opts.http3 then
             add_defines("SIMPLE_HTTP_ENABLE_HTTP3")
         end
@@ -98,30 +101,9 @@ local function add_test_binary(name, files, opts)
     target_end()
 end
 
--- Fixture servers -----------------------------------------------------------
--- The general-purpose fixture: plaintext 7788 (h1/h2c sniffing), TLS/mTLS 7789,
--- h2c-only 7790, h1-only 7791, TCP+UDP 7792, large-window h2 7793, h1 7794.
-add_test_binary("fixture_server", "test/server/fixtures/server.cpp", {
-    group = "test/fixtures",
-    http3 = true,
-    packages = {"zlib", "brotli"},
-})
-
--- Built-in middleware + compression policy fixture (127.0.0.1:7796, TLS :7797).
-add_test_binary("fixture_middleware_server", "test/server/fixtures/middleware_server.cpp", {
-    group = "test/fixtures",
-    packages = {"zlib", "brotli"},
-})
-
--- Framework-layer reference server for the Go differential (default :7798).
-add_test_binary("fixture_framework_server", "test/server/fixtures/framework_server.cpp", {
-    group = "test/fixtures",
-    packages = {"zlib", "brotli"},
-})
-
--- Unit and in-process integration ------------------------------------------
--- The Catch2 entry point lives in test/support so both suites share it, and so
--- a glob over test/unit can never pick up a second main().
+-- Unit ----------------------------------------------------------------------
+-- The Catch2 entry point lives in test/support so a glob over test/unit can
+-- never pick up a second main().
 add_test_binary("test_unit", {
     "test/unit/test_*.cpp",
     "test/support/catch_main.cpp",
@@ -131,110 +113,39 @@ add_test_binary("test_unit", {
     packages = {"catch2", "glaze", "zlib", "brotli"},
 })
 
--- Raw-socket regression suite: malformed and boundary requests against an
--- in-process server (Catch2).
-add_test_binary("test_server_regression", {
-    "test/integration/server_regression.cpp",
-    "test/support/catch_main.cpp",
-}, {
-    group = "test/integration",
-    http3 = true,
-    packages = {"catch2", "zlib", "brotli"},
-})
-
--- Client-layer self-check: in-process servers plus raw responders, 245 checks.
-add_test_binary("test_client", "test/integration/client.cpp", {
-    group = "test/integration",
-    packages = {"zlib", "brotli"},
-})
-
--- Multi-thread concurrency harness for the client (sanitizer-oriented).
-add_test_binary("test_threading", "test/integration/thread_check.cpp", {
-    group = "test/integration",
-    packages = {"zlib", "brotli"},
-})
-
--- Deferred body read after the h1 engine is gone must be a clean error (ASan).
-add_test_binary("test_h1_lifetime", "test/integration/h1_pull_lifetime.cpp", {
-    group = "test/integration",
-})
-
--- Client probes against independent servers ---------------------------------
-add_test_binary("probe_client_cross", "test/client/probes/client_cross.cpp", {
-    group = "test/probes",
-})
-
-add_test_binary("probe_ws_cross", "test/client/probes/ws_client_cross.cpp", {
-    group = "test/probes",
-    packages = {"zlib"},
-})
-
-add_test_binary("probe_h3_cross", "test/client/probes/h3_client_cross.cpp", {
-    group = "test/probes",
-    http3 = true,
-})
-
-add_test_binary("probe_client_diff", "test/client/probes/client_diff_probe.cpp", {
-    group = "test/probes",
-    packages = {"zlib", "brotli"},
-})
-
--- Client compression semantics against a Go net/http reference server. Mirrors
--- test/differential/go/compression_probe.go; the two PASS/FAIL outputs are
--- diffed line by line.
-add_test_binary("probe_compression_diff", "test/client/probes/compression_diff_probe.cpp", {
-    group = "test/probes",
-    packages = {"zlib", "brotli"},
-})
-
--- Manual proxy probe against Go reference servers (SOCKS5 / HTTPS / CONNECT).
-add_test_binary("probe_client_go", "test/client/probes/client_go_probe.cpp", {
-    group = "test/probes",
+-- Conformance / stress fixture ---------------------------------------------
+-- Deliberately tiny: exactly the four routes the external suites need
+-- (/, /world, ws /echo, ws /echo1k) on the fixed ports 7788/7790/7791/7792.
+-- Everything else lives in the differential servers.
+add_test_binary("fixture_conformance_server", "test/fixtures/conformance_server.cpp", {
+    group = "test/fixtures",
     http3 = true,
     packages = {"zlib", "brotli"},
 })
 
-add_test_binary("probe_body_cap", "test/client/probes/body_cap.cpp", {
-    group = "test/probes",
+-- Client differential -------------------------------------------------------
+-- One binary per feature group. They share a source file and differ only in
+-- the group define; the case data is read from test/diff/client/cases/*.json.
+for _, group in ipairs({"basic", "body", "policy", "ws", "h3"}) do
+    add_test_binary("diff_client_" .. group, "test/diff/client/cpp/driver.cpp", {
+        group = "test/diff/client",
+        http3 = group == "h3",
+        packages = {"zlib", "brotli"},
+        defines = {"DIFF_GROUP_" .. group:upper()},
+    })
+end
+
+-- Server differential -------------------------------------------------------
+-- One C++ server implements the whole shared route table; the Go reference
+-- server and the Go probes are built by test/diff/server/run.py.
+add_test_binary("diff_server_cpp", "test/diff/server/cpp/server.cpp", {
+    group = "test/diff/server",
+    http3 = true,
+    packages = {"zlib", "brotli"},
 })
 
-add_test_binary("probe_h1_duplex", "test/client/probes/h1_duplex.cpp", {
-    group = "test/probes",
-})
-
-add_test_binary("probe_h2_limit", "test/client/probes/h2_limit.cpp", {
-    group = "test/probes",
-})
-
-add_test_binary("probe_read_all_timeout", "test/client/probes/read_all_timeout.cpp", {
-    group = "test/probes",
-})
-
-add_test_binary("probe_retry", "test/client/probes/retry.cpp", {
-    group = "test/probes",
-})
-
--- Examples ------------------------------------------------------------------
-add_test_binary("example_openapi", "test/examples/openapi_demo.cpp", {
-    group = "test/examples",
+-- OpenAPI -------------------------------------------------------------------
+add_test_binary("diff_openapi_server", "test/diff/openapi/demo_server.cpp", {
+    group = "test/diff/openapi",
     packages = {"glaze"},
-})
-
-add_test_binary("example_readme", "test/examples/readme_examples.cpp", {
-    group = "test/examples",
-    packages = {"glaze"},
-})
-
--- Manual tools --------------------------------------------------------------
-add_test_binary("tool_loadgen", "test/tools/loadgen.cpp", {
-    group = "test/tools",
-})
-
-add_test_binary("tool_h3_public", "test/tools/h3_public_check.cpp", {
-    group = "test/tools",
-    http3 = true,
-})
-
-add_test_binary("tool_codeserver_proxy", "test/tools/codeserver_proxy.cpp", {
-    group = "test/tools",
 })

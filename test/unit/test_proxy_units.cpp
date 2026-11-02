@@ -1,6 +1,6 @@
 // client/proxy.h: proxy URL parsing, NO_PROXY matching, environment selection
 // and the CONNECT request/status wire format. The tunnel handshakes themselves
-// are exercised end-to-end in test/integration/client.cpp against in-process proxies.
+// are exercised end-to-end by the differential client suite (test/diff/client) against its proxy cases.
 
 #include <catch2/catch_test_macros.hpp>
 #include <cstdlib>

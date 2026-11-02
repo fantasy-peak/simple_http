@@ -592,18 +592,17 @@ server.serve_swagger_ui("/swagger", "/openapi.json");
 ### 6.1 xmake（主构建）
 
 ```sh
-xmake build -j12
-xmake run fixture_server
+xmake build -j 12
 xmake run test_unit
-xmake run test_client
-xmake run test_server_regression
+xmake run diff_openapi_server
+xmake run fixture_conformance_server
 ```
 
 - `xmake.lua`：`set_languages("c++26")`。
 - 全局 `-O2 -Wextra`，关闭少量 GCC 误报；目前没有把 warning 当 error。
 - 全局定义 `SIMPLE_HTTP_USE_BOOST_REGEX`。
-- `SIMPLE_HTTP_ENABLE_HTTP3` 只加在需要它的目标（fixture_server、probe_client_go、
-  test_unit、test_server_regression、probe_h3_cross、tool_h3_public）。
+- `SIMPLE_HTTP_ENABLE_HTTP3` 只加在需要它的目标（`fixture_conformance_server`、
+  `diff_client_h3`、`diff_server_cpp`、`test_unit`）。
 - 包来自私有仓库 `fantasy-peak/xmake-repo`：上游 ngtcp2 包不产 OpenSSL crypto
   helper，HTTP/3 需要私有仓库里的 `ENABLE_OPENSSL=ON` 构建。
 - 依赖锁：`package.requires_lock`、`package.librarydeps.strict_compatibility`。
@@ -642,98 +641,94 @@ target_link_libraries(app PRIVATE simple_http::simple_http)
 
 ## 7. 测试与验证
 
-### 7.1 自测目标
-
-唯一入口（详细矩阵见 `test/README.md`）：
+### 7.1 唯一入口与分层
 
 ```sh
-test/run.sh fast        # unit / server-regression / client / h1-lifetime / readme
-test/run.sh standard    # + threading / Python 交叉验证 / checks / openapi
-test/run.sh full        # + Go 差分 / 外部一致性 / 压力
+test/run.sh fast        # unit
+test/run.sh standard    # + openapi
+test/run.sh full        # + client-diff / server-diff / conformance / stress
 test/run.sh list
 test/run.sh doctor
-test/run.sh <suite>     # 单套件，例如 unit / server-conformance / client-cross
+test/run.sh <suite>     # 单套件，例如 unit / client-diff / server-diff
+test/run.sh unit '[h2]' # Catch2 过滤
 ```
 
-当前规模（实跑）：
-
-| 套件 | suite | 规模 |
+| suite | tier | 内容 |
 |---|---|---|
-| Catch2 单元 | `unit` | 401 个用例，65377 条断言 |
-| 裸 socket 回归 | `server-regression` | 79 个 TEST_CASE |
-| 客户端整合自检 | `client` | 250 checks |
-| Python 服务端交叉 | `server-conformance` | 129 checks（httpx / hyper-h2 / websockets / aioquic） |
+| `unit` | fast | 原 Catch2 纯逻辑测试（约 401 用例） |
+| `openapi` | standard | OAS 3.1 元模式 + 文档/路由契约 + Swagger UI |
+| `client-diff` | full | C++ 客户端 ↔ Go 客户端，同一个 Go 服务端 |
+| `server-diff` | full | Go 客户端 → C++ 服务端 ↔ Go 服务端 |
+| `conformance` | full | h2spec / h1spec / Autobahn / h3spec |
+| `stress` | full | h2load / k6，失败数必须为 0 |
 
-单元测试按标签过滤：`test/run.sh unit '[h2]'`。
+C++ 二进制由 xmake 构建；Go 参考服务端与探针由各 runner 用 `go build` 构建
+（`test/diff/go.mod` 固定 `x/net`、`gorilla/websocket`、`quic-go`）。
+Python 侧只需要 `httpx`、`jsonschema`、`brotli`（`test/requirements.txt`）。
 
-`test/server/fixtures/server.cpp` 的监听端口：`:7788` 明文嗅探、`:7789` TLS/mTLS
-（同端口 UDP QUIC）、`:7790` 纯 h2c、`:7791` 纯 h1、`:7792` TCP+UDP 双传输、
-`:7793` 大窗口 h2、`:7794` builder 配置的纯 h1、`:7797` 非 mTLS 的 TLS h1
-（TLS 基准用）。
+### 7.2 差分测试
 
-Python 首次运行（统一 venv 在 `test/.venv`）：
+`test/diff/` 分两个方向，二者都把 Go 标准库当作参考实现：
 
-```sh
-python3 -m venv test/.venv
-test/.venv/bin/pip install -r test/requirements.txt
-```
+- **client**（`test/diff/client/`）：C++ 客户端与 Go `net/http` 客户端读同一份
+  `cases/*.json`，请求同一个 Go 参考服务端（h1 `7810` / TLS h2 `7811` /
+  h2c `7812` / h3 `7813` / WS `7810`）。服务端回显收到的 method/header/body，
+  因此差异只能来自客户端。组：`basic`、`body`、`policy`、`ws`、`h3`。
+- **server**（`test/diff/server/`）：同一个 Go 探针把请求分别发给 C++ 参考服务端
+  （`7820`–`7823`）与 Go 参考服务端（`7830`–`7833`），每个案例输出
+  `target=cpp` / `target=go` 两行。组：`routing`、`body`、`semantics`、
+  `middleware`、`framework`、`static`、`ws`。
 
-依赖版本已在 `test/requirements.txt` 固定
-（`aioquic==1.5.0`、`cryptography==50.0.2`、`h2==4.4.1`、
-`httpx[http2]==0.28.1`、`websockets==17.1`）。
+每个组是独立可执行程序（C++ 用 `DIFF_GROUP_*`，Go 用 `-ldflags -X main.defaultGroup`）。
+观测是 JSONL，字段为 `case/target/status/version/headers/body/body_encoding/framing/error/notes`。
 
-### 7.2 独立实现交叉验证
+归一化与门禁都在 `test/diff/support/harness.py`：
 
-| 脚本 | 方向 | 结果 |
-|---|---|---|
-| `test/server/run.py` | 第三方客户端 → C++ 服务端 | 113 checks |
-| `test/server/h2_websocket.py` | hyper-h2 → h2 extended CONNECT / ws 反代 | 85 checks |
-| `test/client/run.py` | C++ 客户端 → Python 服务端 | 43 + 6 checks |
-| `test/examples/openapi_verify.py` | OpenAPI 文档 | 端到端断言 |
-| `test/differential/run.py framework` | C++ 框架参考服务器 ↔ Go `net/http` 参考服务器 | 64 checks：State/Extractor/Validation/Session/CSRF/JWT(HS/RS/ES)/Host/Wildcard |
-| `test/differential/run.py client` | C++ client → Go server；Go client → Go/C++ server | 8 checks × 3 条腿：流式上传/100-continue/trailers/429/JWKS |
-| `test/differential/run.py compression` | C++ client ↔ Go client；C++ server ↔ Go server | 客户端 10 项解压语义 diff + 服务端解压 5 项 |
-| Autobahn | Python/Twisted → WebSocket | FAILED 0、NON-STRICT 0 |
-| h2spec | Go → 纯 h2c `:7790` | 146/146 |
-| h1spec | Deno → 纯 h1 `:7791` | 33/33 |
-| h3spec | h3spec → UDP `:7792` | 49 例，通过 ≥47 |
+- header 名小写，`allow`/`vary`/`cache-control` 按集合比较；
+- 默认忽略 Date/Server/Content-Length/Transfer-Encoding/Connection/ETag/
+  Last-Modified/Set-Cookie 等传输细节；
+- body 支持 `exact` / `json` / `none`，可配置 `scrub` 正则；
+- 未登记差异失败；`test/diff/known_diffs.json` 登记双方都合法的差异并写明理由；
+- 每次运行写 `diff-report.md`（逐字段 cpp/go/verdict/reason）。
 
-`test/server/h2_websocket.py` 与 `test/server/h2_window_leak.py` 会自行启动和停止
-`fixture_server`；也可由 `test/run.sh h2-websocket` / `h2-window-leak` 驱动。
+新增功能时：在 C++/Go 参考实现同步加行为 → 在对应组加用例 → 跑 diff → 只把
+确属合法差异的项登记到 `known_diffs.json`。Go 无对应能力的功能标 `cpp-only`
+并写单侧期望，不要伪造 Go 行为。
 
-### 7.3 外部一致性
+### 7.3 外部一致性与压力
+
+被测 server 是 `test/fixtures/conformance_server.cpp`（目标
+`fixture_conformance_server`），只保留外部套件需要的四个路由：
+
+- `any /`：回显请求体（h1spec）
+- `any /world`：回显 `?n=` 字节（h2spec、压力）
+- `ws /echo`：逐字节回显（Autobahn）
+- `ws /echo1k`：固定 1024 字节（压力）
+
+监听 `7788`（嗅探+ws）、`7790`（纯 h2c）、`7791`（纯 h1）、`7792`（TCP+UDP h3）。
+单协议端口是必需的：嗅探端口上「畸形 HTTP/2 前导」与「畸形 HTTP/1.x 请求行」
+是同一批字节，h2spec 要 GOAWAY、h1spec 要 400。
 
 ```sh
 test/external/conformance/run.sh
 test/external/conformance/run.sh h2spec
+test/external/stress/run.sh cpp h3 --no-conformance
 ```
 
-端口固定，别改：
+压力门线与参数不变：POST 1 KiB、响应 2k/10k/20k、每档 300000 请求、4 线程、
+200 客户端、20 流；WS 100 VUs × 600 iterations × 2000 消息。**唯一门线是失败数 0**。
+脚本会先清理遗留服务并确认端口释放，否则 SO_REUSEPORT 会把 QUIC 连接表劈开。
 
-- `7790` 纯 h2c
-- `7791` 纯 h1
-- `7788` 嗅探 + WebSocket
-- `7792` TCP + UDP 双传输
+### 7.4 OpenAPI
 
-单协议端口是必需的：在嗅探端口上，「畸形 HTTP/2 前导」和「畸形 HTTP/1.x 请求行」
-是同一批字节，而 h2spec 要 GOAWAY、h1spec 要 400。
+`test/diff/openapi/` 的 petshop 夹具（`:7795`）同时验证：
 
-工具不在仓库里（许可证/体积），脚本会自检并打印准备命令。
-
-### 7.4 压力与连接生命周期
-
-```sh
-test/external/stress/run.sh [cpp|rust|both] [h1|h2|h3|ws]... [--no-conformance]
-```
-
-- 默认 `both`，四档全跑。
-- `cpp` 端口 `7788`–`7792`；`rust` 端口 `7888`–`7892`。
-- 依赖 `h2load` 与 `k6`；h3 档要求 h2load 带 ngtcp2/nghttp3。
-- 请求 POST 1 KiB body；响应三档 2 KiB / 10 KiB / 20 KiB；每档 300000 请求，
-  4 线程、200 客户端、20 流。
-- WS：100 VUs、600 iterations、每连接 2000 条消息，512 B → 1 KiB。
-- **门线只有一条：失败数必须为 0**；吞吐只报告。
-- 脚本会先清理遗留测试服务并确认端口释放，否则 SO_REUSEPORT 会把 QUIC 连接表劈开。
+1. `/openapi.json` 通过官方 OAS 3.1 元模式（`schema/openapi-3.1.json`）；
+2. 结构不变量：operationId 唯一、path 参数与模板一致且 required、每个声明响应
+   有 description、`$ref` 全部可解析且无 `$defs` 泄漏；
+3. 文档 ↔ 实际路由：每个 operation 的每个声明状态都有真实请求覆盖，校验状态码、
+   Content-Type、响应 JSON Schema、声明响应头与 401 challenge；
+4. `/swagger` 可访问、引用正确 spec、文档两次获取字节一致。
 
 ### 7.5 差分比对原则
 
@@ -741,6 +736,8 @@ test/external/stress/run.sh [cpp|rust|both] [h1|h2|h3|ws]... [--no-conformance]
 - 已知合理差异：CL+TE 与 obs-fold 上更严格；h2 一次性响应省略 content-length；
   `Allow` 包含自动支持的 OPTIONS；br 压缩 Go 无对应。
 - 真正要修的是双方都违反 RFC，或与独立实现互操作失败。
+- 测试发现真实 bug 时优先修库（例如重定向丢 header、SSE 请求体未 finish、
+  CookieJar 未把 loopback 视为安全源），而不是把它登记成已知差异。
 
 ---
 
@@ -759,8 +756,7 @@ test/external/stress/run.sh
 
 ```sh
 test/run.sh unit
-test/run.sh server-regression
-test/run.sh server-conformance
+test/run.sh server-diff
 ```
 
 ### 8.2 改客户端
@@ -768,28 +764,24 @@ test/run.sh server-conformance
 必跑：
 
 ```sh
-test/run.sh client
-test/run.sh client-cross
+test/run.sh client-diff
 ```
 
-涉及超时/取消/重试时，补对应的专项 check（suite `client-checks`，或直接构建
-`probe_h2_limit`、`probe_h1_duplex`、`probe_retry`、`probe_read_all_timeout`、
-`probe_body_cap`；交叉验证用 `probe_ws_cross`、`probe_h3_cross`）。
+涉及 h3 时确认 `diff_client_h3` 构建成功；无法构建时该组 SKIP，其他组仍跑。
 
 ### 8.3 改服务端 handler / 路由
 
 ```sh
 test/run.sh unit
-test/run.sh server-regression
-test/run.sh server-conformance
+test/run.sh server-diff
 ```
 
 ### 8.4 加新 API / 行为
 
 - 同步更新 `README.md`、`README.zh-CN.md` 与本文件。
-- 在 `test/examples/readme_examples.cpp` 加上可编译的样例（若面向用户）。
-- 在 `test/unit/` 或 `test/server/`（Python 交叉套件）加覆盖；跨实现的行为优先放
-  Python 套件。
+- 在 `test/unit/` 加纯逻辑覆盖；跨实现行为加到 `test/diff/` 对应功能组
+  （客户端加 `client/cases/*.json` 与驱动，服务端加两侧路由与 Go 探针）。
+- 新增差异必须登记到 `test/diff/known_diffs.json` 并写清 RFC 依据，否则 suite 失败。
 - 不要引入协议版本分支到 `handler/` / `proto/` / `net/` / 客户端门面。
 
 ### 8.5 代码风格
@@ -852,6 +844,15 @@ test/run.sh server-conformance
     调用方显式设置 `Accept-Encoding`、HEAD、Range 时不注入也不解码。解压装饰器必须
     转发 `clear_head_cache()`（否则 100-continue 的 interim head 会循环）和
     `finish_trailers()`。
+24. **重定向保留请求头**：`follow_redirects` 曾把 method token 与 headers `std::move`
+    进当前 hop，递归的下一跳拿到空值；结果是 User-Agent/自定义头/Authorization
+    在 3xx 后静默丢失。两处都必须是拷贝（跨 origin 的 auth/cookie 清除仍按规则做）。
+25. **SSE 请求体必须 finish**：`SseStream::open` 走显式 Stream，请求体在
+    `finish()` 前一直开着；不 finish 时等待响应头的服务端永远不返回。GET 的 SSE
+    请求要在 `read_head()` 前 `finish()`。
+26. **CookieJar 的 Secure 与 loopback**：RFC 6265bis / Go 把 localhost 与
+    `127.0.0.0/8`/`::1` 视为可信源，Secure cookie 在 http 下也会发送；不要把它
+    简化成「仅 https」。
 
 ---
 
@@ -889,12 +890,11 @@ test/run.sh server-conformance
 ## 11. 常用命令速查
 
 ```sh
-# 构建 / 示例
-xmake build -j12
-xmake run fixture_server              # :7788-:7797
-xmake run fixture_middleware_server   # :7796（TLS1.2 :7797）
-xmake run example_openapi             # :7795
-xmake run tool_loadgen -- <url> -p h1 -n 100000 -c 100
+# 构建
+xmake build -j 12
+xmake build -j 12 fixture_conformance_server
+xmake build -j 12 diff_server_cpp
+xmake build -j 12 diff_openapi_server
 
 # 自测（唯一入口）
 test/run.sh fast
@@ -906,35 +906,22 @@ test/run.sh doctor
 # 单套件
 test/run.sh unit
 test/run.sh unit '[h2]'
-test/run.sh server-regression
-test/run.sh client
-test/run.sh server-conformance
-test/run.sh client-cross
-test/run.sh client-checks
 test/run.sh openapi
-test/run.sh example_readme
-test/run.sh framework-diff            # C++ vs Go net/http 框架层差分（64 checks）
-test/run.sh client-diff               # 客户端/服务端差分：C++/Go client × Go/C++ server
-test/run.sh compression-diff          # 压缩/解压：C++ client vs Go client；C++ server vs Go server
+test/run.sh client-diff
+test/run.sh server-diff
+test/run.sh conformance
+test/run.sh stress
 
-# 单独运行 Python 交叉套件（runner 会注入 SIMPLE_HTTP_TEST_BIN_DIR）
-test/.venv/bin/python test/server/run.py
-test/.venv/bin/python test/client/run.py
-test/.venv/bin/python test/client/checks.py
-test/.venv/bin/python test/differential/run.py framework
-test/.venv/bin/python test/differential/run.py client
-test/.venv/bin/python test/differential/run.py compression
-
-# 手工工具
-xmake run tool_h3_public -- https://cloudflare-quic.com/
-xmake run test_threading
+# 直接运行差分 runner（Go 二进制由 runner 自行构建）
+test/.venv/bin/python test/diff/client/run.py --groups basic,body,policy,ws,h3
+test/.venv/bin/python test/diff/server/run.py --groups routing,body,semantics,middleware,framework,static,ws
+test/.venv/bin/python test/diff/openapi/run.py
 
 # 外部一致性 / 压力
 test/external/conformance/run.sh
 test/external/conformance/run.sh h2spec
+test/external/stress/run.sh cpp h3 --no-conformance
 test/external/stress/run.sh both
-test/external/stress/run.sh cpp h3
-test/external/bench/tls_bench.sh
 
 # 格式
 ./format.sh

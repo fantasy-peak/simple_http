@@ -1,0 +1,10 @@
+{
+  "client": {
+    "policy.redirect_referer": {
+      "fields": ["body"],
+      "verdict": "acceptable",
+      "reason": "Go's net/http sets Referer on a followed redirect; simple_http does not. RFC 9110 §10.1.4 makes the field optional, and omitting it is the privacy-preserving choice."
+    }
+  },
+  "server": {}
+}

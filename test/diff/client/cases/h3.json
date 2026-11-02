@@ -1,0 +1,38 @@
+[
+  {
+    "id": "h3.get_echo",
+    "client": {"version": "h3"},
+    "request": {"method": "GET", "path": "/echo"},
+    "expect": {"status": 200, "body_mode": "json", "compare_headers": ["content-type"]}
+  },
+  {
+    "id": "h3.post_text",
+    "client": {"version": "h3"},
+    "request": {"method": "POST", "path": "/echo", "body": {"kind": "text", "value": "over h3"}},
+    "expect": {"status": 200, "body_mode": "json"}
+  },
+  {
+    "id": "h3.large_64k",
+    "client": {"version": "h3"},
+    "request": {"method": "GET", "path": "/large?n=65536"},
+    "expect": {"status": 200, "body_mode": "exact"}
+  },
+  {
+    "id": "h3.status_204",
+    "client": {"version": "h3"},
+    "request": {"method": "GET", "path": "/status/204"},
+    "expect": {"status": 204, "body_mode": "none"}
+  },
+  {
+    "id": "h3.redirect_follow",
+    "client": {"version": "h3", "max_redirects": 5},
+    "request": {"method": "GET", "path": "/redirect/302"},
+    "expect": {"status": 200, "body_mode": "json"}
+  },
+  {
+    "id": "h3.compression_auto",
+    "client": {"version": "h3", "auto_decompress": true},
+    "request": {"method": "GET", "path": "/compress/gzip?body=h3-compressed"},
+    "expect": {"status": 200, "body_mode": "exact"}
+  }
+]

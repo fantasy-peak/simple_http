@@ -176,6 +176,13 @@ class SseStream {
             co_return std::unexpected{opened.error()};
         }
         Stream stream = std::move(*opened);
+        // The explicit-stream path keeps the request body open until it is
+        // finished. An SSE request has no body, so finish it before waiting for
+        // the response; otherwise the write end never closes and a server that
+        // waits for the request to end never sends its head.
+        if (auto ec = co_await stream.finish()) {
+            co_return std::unexpected{ec};
+        }
         auto head = co_await stream.read_head();
         if (!head) {
             co_return std::unexpected{head.error()};

@@ -1,0 +1,174 @@
+[
+  {
+    "id": "basic.get_echo",
+    "client": {"version": "h1"},
+    "request": {"method": "GET", "path": "/echo"},
+    "expect": {"status": 200, "body_mode": "json", "compare_headers": ["content-type"]}
+  },
+  {
+    "id": "basic.post_text",
+    "client": {"version": "h1"},
+    "request": {
+      "method": "POST",
+      "path": "/echo",
+      "body": {"kind": "text", "value": "hello body"}
+    },
+    "expect": {"status": 200, "body_mode": "json", "compare_headers": ["content-type"]}
+  },
+  {
+    "id": "basic.put_text",
+    "client": {"version": "h1"},
+    "request": {
+      "method": "PUT",
+      "path": "/echo",
+      "body": {"kind": "text", "value": "put body"}
+    },
+    "expect": {"status": 200, "body_mode": "json"}
+  },
+  {
+    "id": "basic.delete",
+    "client": {"version": "h1"},
+    "request": {"method": "DELETE", "path": "/echo"},
+    "expect": {"status": 200, "body_mode": "json"}
+  },
+  {
+    "id": "basic.patch_json",
+    "client": {"version": "h1"},
+    "request": {
+      "method": "PATCH",
+      "path": "/echo",
+      "headers": [{"name": "content-type", "value": "application/json"}],
+      "body": {"kind": "json", "value": "{\"name\":\"book\",\"age\":3}"}
+    },
+    "expect": {"status": 200, "body_mode": "json", "compare_headers": ["content-type"]}
+  },
+  {
+    "id": "basic.query_encoding",
+    "client": {"version": "h1"},
+    "request": {
+      "method": "GET",
+      "path": "/echo",
+      "query": [
+        {"name": "q", "value": "a b&c=d"},
+        {"name": "empty", "value": ""},
+        {"name": "utf8", "value": "中文"}
+      ]
+    },
+    "expect": {"status": 200, "body_mode": "json"}
+  },
+  {
+    "id": "basic.custom_headers",
+    "client": {"version": "h1"},
+    "request": {
+      "method": "GET",
+      "path": "/echo",
+      "headers": [
+        {"name": "x-probe", "value": "one"},
+        {"name": "x-probe", "value": "two"},
+        {"name": "user-agent", "value": "diff-probe"}
+      ]
+    },
+    "expect": {"status": 200, "body_mode": "json"}
+  },
+  {
+    "id": "basic.basic_auth",
+    "client": {"version": "h1"},
+    "request": {
+      "method": "GET",
+      "path": "/echo",
+      "headers": [{"name": "authorization", "value": "Basic dXNlcjpwYXNz"}]
+    },
+    "expect": {"status": 200, "body_mode": "json"}
+  },
+  {
+    "id": "basic.bearer_auth",
+    "client": {"version": "h1"},
+    "request": {
+      "method": "GET",
+      "path": "/echo",
+      "headers": [{"name": "authorization", "value": "Bearer token-123"}]
+    },
+    "expect": {"status": 200, "body_mode": "json"}
+  },
+  {
+    "id": "basic.head",
+    "client": {"version": "h1"},
+    "request": {"method": "HEAD", "path": "/large?n=100"},
+    "expect": {"status": 200, "body_mode": "none", "compare_headers": ["content-type"]}
+  },
+  {
+    "id": "basic.status_204",
+    "client": {"version": "h1"},
+    "request": {"method": "GET", "path": "/status/204"},
+    "expect": {"status": 204, "body_mode": "none"}
+  },
+  {
+    "id": "basic.redirect_off",
+    "client": {"version": "h1", "max_redirects": 0},
+    "request": {"method": "GET", "path": "/redirect/302"},
+    "expect": {"status": 302, "body_mode": "none", "compare_headers": ["location"]}
+  },
+  {
+    "id": "basic.redirect_follow_get",
+    "client": {"version": "h1", "max_redirects": 5},
+    "request": {"method": "GET", "path": "/redirect/302"},
+    "expect": {"status": 200, "body_mode": "json"}
+  },
+  {
+    "id": "basic.redirect_post_303",
+    "client": {"version": "h1", "max_redirects": 5},
+    "request": {
+      "method": "POST",
+      "path": "/redirect/303",
+      "body": {"kind": "text", "value": "payload"}
+    },
+    "expect": {"status": 200, "body_mode": "json"}
+  },
+  {
+    "id": "basic.redirect_post_307",
+    "client": {"version": "h1", "max_redirects": 5},
+    "request": {
+      "method": "POST",
+      "path": "/redirect/307",
+      "body": {"kind": "text", "value": "payload"}
+    },
+    "expect": {"status": 200, "body_mode": "json"}
+  },
+  {
+    "id": "basic.large_64k",
+    "client": {"version": "h1"},
+    "request": {"method": "GET", "path": "/large?n=65536"},
+    "expect": {"status": 200, "body_mode": "exact"}
+  },
+  {
+    "id": "basic.h1_version",
+    "client": {"version": "h1"},
+    "request": {"method": "GET", "path": "/version"},
+    "expect": {"status": 200, "body_mode": "exact"}
+  },
+  {
+    "id": "basic.h2_version",
+    "client": {"version": "h2"},
+    "request": {"method": "GET", "path": "/version"},
+    "expect": {"status": 200, "body_mode": "exact"}
+  },
+  {
+    "id": "basic.h2_echo",
+    "client": {"version": "h2"},
+    "request": {"method": "POST", "path": "/echo", "body": {"kind": "text", "value": "over h2"}},
+    "expect": {"status": 200, "body_mode": "json"}
+  },
+  {
+    "id": "basic.h2c_echo",
+    "client": {"version": "h2c"},
+    "request": {"method": "GET", "path": "/echo"},
+    "expect": {"status": 200, "body_mode": "json"}
+  },
+  {
+    "id": "basic.h2c_upgrade",
+    "mode": "cpp-only",
+    "client": {"version": "h2c-upgrade"},
+    "request": {"method": "GET", "path": "/echo"},
+    "expect": {"status": 200, "body_mode": "none"}
+  }
+]

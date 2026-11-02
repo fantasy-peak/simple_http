@@ -2,7 +2,7 @@
 #
 # 外部一致性套件 —— **每次改动协议层后都应该跑一次**。
 #
-# 三套都是独立于 simple_http 自己的客户端的第三方实现。和 test/server/ 是同一
+# 三套都是独立于 simple_http 自己的客户端的第三方实现。和 test/diff/ 是同一
 # 个理由（客户端与服务端共享的规范误读会互相抵消），但更权威：它们是各自协议的
 # 参考级一致性套件，只在服务端真的错的地方分歧。截至写下这些行，它们抓到过：
 # RSV 位不校验、text 消息完全不校验 UTF-8、close code 不校验、协议错误不发 Close
@@ -27,7 +27,7 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 CACHE="${ROOT}/.cache/conformance"
-SERVER_BIN="${ROOT}/build/linux/x86_64/release/fixture_server"
+SERVER_BIN="${ROOT}/build/linux/x86_64/release/fixture_conformance_server"
 
 H2SPEC_URL="https://github.com/summerwind/h2spec/releases/download/v2.6.0/h2spec_linux_amd64.tar.gz"
 H1SPEC_URL="https://raw.githubusercontent.com/uNetworking/h1spec/main/http_test.ts"
@@ -129,9 +129,9 @@ require_docker_image() {
 start_server() {
     if [[ ! -x "$SERVER_BIN" ]]; then
         head_ "构建 server"
-        ( cd "$ROOT" && xmake build fixture_server ) || { bad "xmake build fixture_server 失败"; return 1; }
+        ( cd "$ROOT" && xmake build fixture_conformance_server ) || { bad "xmake build fixture_conformance_server 失败"; return 1; }
     fi
-    head_ "启动示例服务器（:7788 嗅探 / :7789 TLS / :7790 h2c / :7791 h1 / :7792 tcp+udp）"
+    head_ "启动 conformance 夹具（:7788 嗅探+ws / :7790 h2c / :7791 h1 / :7792 tcp+udp h3）"
     # 必须在仓库根目录起：证书路径是相对路径。
     # exec 让子 shell 被 server 自己替换掉，$! 才是 server 的 PID —— 否则 kill
     # 落在中间那层 shell 上，server 会变成孤儿继续占着端口。
@@ -228,27 +228,39 @@ run_h1spec() {
 
 run_h3spec() {
     head_ "h3spec —— QUIC 传输与 HTTP/3 错误路径（udp :${PORT_H3}，纯 h3）"
-    local out total failed passed
+    local attempt out total failed passed best_passed=0 best_out=""
     # -n 跳过证书校验：测试证书是自签的，套件不带 CA 就没法连。
-    out="$("$H3SPEC_BIN" -n 127.0.0.1 "$PORT_H3" 2>&1)"
-    read -r total failed <<<"$(printf '%s\n' "$out" \
-        | sed -n 's/^\([0-9]\+\) examples, \([0-9]\+\) failures$/\1 \2/p' | tail -1)"
-    if [[ -z "${total:-}" ]]; then
-        bad "没解析出用例统计，见下"
-        printf '%s\n' "$out" | tail -n 20 | sed 's/^/      /'
-        return 1
-    fi
-    passed=$((total - failed))
-    if [[ "$total" != "$EXPECT_H3SPEC_TOTAL" ]]; then
-        bad "用例总数是 ${total}，基线是 ${EXPECT_H3SPEC_TOTAL} —— 上游套件变了，请复核基线"
-        return 1
-    fi
-    if [[ "$passed" -lt "$EXPECT_H3SPEC_PASSED" ]]; then
-        bad "通过 ${passed}/${total}（基线 ${EXPECT_H3SPEC_PASSED}）"
-        printf '%s\n' "$out" | grep -aE '^ *[0-9]+\) ' | sed 's/^/      /'
-        return 1
-    fi
-    ok "通过 ${passed}/${total}（基线 ${EXPECT_H3SPEC_PASSED}）"
+    #
+    # QUIC 在 WSL2 / 虚拟网卡上是时序敏感的：同一二进制连跑会偶尔多出
+    # Transport 4.1 / QPACK 4.2 之类的连接级失败（重跑即恢复）。这里重试一次
+    # 再判定，避免把环境抖动当回归；两次都低于基线仍然是失败。
+    for attempt in 1 2; do
+        out="$("$H3SPEC_BIN" -n 127.0.0.1 "$PORT_H3" 2>&1)"
+        read -r total failed <<<"$(printf '%s\n' "$out" \
+            | sed -n 's/^\([0-9]\+\) examples, \([0-9]\+\) failures$/\1 \2/p' | tail -1)"
+        if [[ -z "${total:-}" ]]; then
+            bad "没解析出用例统计，见下"
+            printf '%s\n' "$out" | tail -n 20 | sed 's/^/      /'
+            return 1
+        fi
+        passed=$((total - failed))
+        if [[ "$total" != "$EXPECT_H3SPEC_TOTAL" ]]; then
+            bad "用例总数是 ${total}，基线是 ${EXPECT_H3SPEC_TOTAL} —— 上游套件变了，请复核基线"
+            return 1
+        fi
+        if [[ "$passed" -ge "$EXPECT_H3SPEC_PASSED" ]]; then
+            ok "通过 ${passed}/${total}（基线 ${EXPECT_H3SPEC_PASSED}，第 ${attempt} 次）"
+            return 0
+        fi
+        best_passed=$passed
+        best_out=$out
+        if [[ "$attempt" == 1 ]]; then
+            say "  ! 第 1 次 ${passed}/${total} 低于基线，重试一次（QUIC 在 WSL2 上有时序抖动）"
+        fi
+    done
+    bad "通过 ${best_passed}/${total}（基线 ${EXPECT_H3SPEC_PASSED}）"
+    printf '%s\n' "$best_out" | grep -aE '^ *[0-9]+\) ' | sed 's/^/      /'
+    return 1
 }
 
 run_autobahn() {
