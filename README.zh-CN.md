@@ -278,12 +278,13 @@ server.serve_swagger_ui("/swagger", "/openapi.json");
 
 ```sh
 xmake build -j12
-xmake run server
+xmake run fixture_server
 ```
 
-`test/server.cpp` 会启动多个监听器：`:7788` 明文嗅探、`:7789` TLS/mTLS（同时
+`test/server/fixtures/server.cpp` 会启动多个监听器：`:7788` 明文嗅探、`:7789` TLS/mTLS（同时
 UDP QUIC）、`:7790` 纯 h2c、`:7791` 纯 h1、`:7792` TCP+UDP 双传输、`:7793`
-大窗口 h2、`:7794` builder 配置的纯 h1。完整路由示例也在其中。
+大窗口 h2、`:7794` builder 配置的纯 h1、`:7797` 非 mTLS 的 TLS h1 监听（TLS 基准用）。
+完整路由示例也在其中。
 
 <a id="framework-layer"></a>
 ## 框架层 · Framework layer
@@ -461,12 +462,20 @@ ngtcp2 包的 OpenSSL crypto helper 不可用，HTTP/3 需要该仓库里的构�
 依赖锁（`package.requires_lock`）。
 
 ```sh
-xmake build -j12              # 构建；同时刷新 build/compile_commands.json
-xmake run server              # 示例服务器
-xmake run unittest            # 单元测试
-xmake run client              # 客户端整合自检
-xmake run regression          # 服务端对抗性回归
-xmake run loadgen -- ...      # 压测工具
+xmake build -j12                    # 构建；同时刷新 build/compile_commands.json
+xmake run fixture_server            # 示例 / 夹具服务器
+xmake run test_unit                 # Catch2 单元测试
+xmake run test_client               # 客户端整合自检
+xmake run test_server_regression    # 服务端对抗性回归
+xmake run tool_loadgen -- ...       # 压测工具
+```
+
+测试套件只有一个入口 `test/run.sh`（详见 `test/README.md`）：
+
+```sh
+test/run.sh fast      # 单元 + 进程内 C++ 套件
+test/run.sh standard  # + 独立 Python 实现
+test/run.sh full      # + Go 差分 + 外部一致性/压力
 ```
 
 `simple_http` 目标本身是 `set_kind("static")` 的空壳，只把 `include/` 与依赖以 `public`
@@ -1271,41 +1280,42 @@ socket 字节
 ### 本地测试目标
 
 ```sh
-xmake build unittest && xmake run unittest      # Catch2：389 个用例，65298 条断言
-xmake build regression && xmake run regression  # 裸 socket 畸形/边界请求
-xmake build client && xmake run client          # 客户端整合自检：245 checks
-xmake build server && xmake run python-tests    # Python 第三方客户端：113 checks
+test/run.sh unit                # Catch2：389 个用例，65298 条断言
+test/run.sh server-regression   # 裸 socket 畸形/边界请求
+test/run.sh client              # 客户端整合自检：245 checks
+test/run.sh server-conformance  # Python 第三方客户端：113 checks
+test/run.sh fast                # 以上不需要 venv 的套件
 ```
 
 单元测试涵盖 core、proto、h1 解析器、h2 帧 / HPACK / Huffman、WebSocket 帧与消息层、
 路由、Host/通配路由、App State、提取器、校验、Session、CSRF、JWT、CORS、限流、
 静态文件、OpenAPI、客户端 URL / 配置 / TLS 参数 / 代理等。
-按标签过滤：`xmake run unittest "[h2]"`。
+按标签过滤：`test/run.sh unit '[h2]'`。
 
 ### 交叉验证
 
 | 方向 | 驱动 | 内容 |
 |---|---|---|
-| 服务端 ← 独立客户端 | `test/python/run.py`（httpx / hyper-h2 / websockets / aioquic） | 113 checks：h1 / h2 / h3 / WS / trailer / CORS / 回归 |
-| 服务端 ← 独立客户端 | `test/python/rfc8441_client.py` | 85 checks：HTTP/2 extended CONNECT 与 h2 WebSocket 反代 |
-| 客户端 → 独立服务端 | `test/python/run_client_cross.py` | 43 checks（stdlib http.server / websockets）+ 6 checks（aioquic h3） |
+| 服务端 ← 独立客户端 | `test/server/run.py`（httpx / hyper-h2 / websockets / aioquic） | 113 checks：h1 / h2 / h3 / WS / trailer / CORS / 回归 |
+| 服务端 ← 独立客户端 | `test/server/h2_websocket.py` | 85 checks：HTTP/2 extended CONNECT 与 h2 WebSocket 反代 |
+| 客户端 → 独立服务端 | `test/client/run.py` | 43 checks（stdlib http.server / websockets）+ 6 checks（aioquic h3） |
 | 服务端 ← Autobahn | Docker `crossbario/autobahn-testsuite` | WebSocket 全量用例；要求 FAILED 0、NON-STRICT 0 |
 | 服务端 ← h2spec | Go 版 h2spec | `:7790`，146/146 |
 | 服务端 ← h1spec | Deno 版 h1spec | `:7791`，33/33 |
 | 服务端 ← h3spec | h3spec | `udp :7792`，49 例中通过 ≥47（2 个已知 TLS 8.2 假阳性） |
 
-Python 依赖在 `test/python/requirements.txt` 中固定版本；首次使用先建虚拟环境：
+Python 依赖在 `test/requirements.txt` 中固定版本；首次使用先建虚拟环境：
 
 ```sh
-python3 -m venv test/python/.venv
-test/python/.venv/bin/pip install -r test/python/requirements.txt
+python3 -m venv test/.venv
+test/.venv/bin/pip install -r test/requirements.txt
 ```
 
 ### 外部一致性套件
 
 ```sh
-test/conformance/run.sh          # h2spec / h1spec / autobahn / h3spec 全部
-test/conformance/run.sh h2spec   # 只跑一个
+test/external/conformance/run.sh          # h2spec / h1spec / autobahn / h3spec 全部
+test/external/conformance/run.sh h2spec   # 只跑一个
 ```
 
 端口不能混用：`7790` 是纯 h2c，`7791` 是纯 h1，`7788` 是嗅探 + WebSocket，
@@ -1318,9 +1328,9 @@ h2spec / h1spec / h3spec / Autobahn 的工具不在仓库里；脚本会自检�
 ### 压力与连接生命周期
 
 ```sh
-test/stress/run.sh [cpp|rust|both] [h1|h2|h3|ws]...
-test/stress/run.sh both          # 默认：两个实现、四档全跑
-test/stress/run.sh cpp h3        # 只压 C++ 的 h3
+test/external/stress/run.sh [cpp|rust|both] [h1|h2|h3|ws]...
+test/external/stress/run.sh both          # 默认：两个实现、四档全跑
+test/external/stress/run.sh cpp h3        # 只压 C++ 的 h3
 ```
 
 脚本会先强制清理遗留测试服务并确认 TCP/UDP 端口释放（否则 SO_REUSEPORT 会把 QUIC
@@ -1333,10 +1343,10 @@ test/stress/run.sh cpp h3        # 只压 C++ 的 h3
 ### 压测工具
 
 ```sh
-xmake build loadgen
-xmake run loadgen http://127.0.0.1:7791/world -p h1 -n 300000 -c 100
-xmake run loadgen http://127.0.0.1:7790/world -p h2 -n 600000 -c 20 -m 40
-xmake run loadgen ws://127.0.0.1:7788/echo1k -p ws -n 200000 -c 64
+xmake build tool_loadgen
+xmake run tool_loadgen http://127.0.0.1:7791/world -p h1 -n 300000 -c 100
+xmake run tool_loadgen http://127.0.0.1:7790/world -p h2 -n 600000 -c 20 -m 40
+xmake run tool_loadgen ws://127.0.0.1:7788/echo1k -p ws -n 200000 -c 64
 ```
 
 `-p` 可选 `h1` / `pub` / `h2` / `ws`；输出对齐 h2load 的
@@ -1344,21 +1354,21 @@ xmake run loadgen ws://127.0.0.1:7788/echo1k -p ws -n 200000 -c 64
 
 ### 其他检查目标
 
-- `xmake run readme_examples`：编译检查 README 中的代码样例。
-- `xmake run openapi_demo` + `test/openapi_verify.py`：OpenAPI 端到端（demo 监听
-  `:7795`，`/swagger` 浏览）。
-- `xmake run middleware_server`：在 `:7796`（以及 TLS 1.2 的 `:7797`）挂载全部内置
-  中间件，供与 Go 参考实现做差分。
-- `xmake run client-cross-python`：客户端对独立 Python 服务端的交叉验证。
-- `xmake run h3_public_check -- https://cloudflare-quic.com/`：手工公网 HTTP/3 冒烟。
-- `xmake run thread_check`：客户端线程模型与销毁路径压测（配合 sanitizer 使用）。
-- `test/framework_diff.sh` / `xmake run framework-diff`：同时启动 C++ 框架参考服务器与
-  等价的 Go `net/http` 服务器，对比 64 项可观测行为——App State、提取器、校验、
-  Session、CSRF、JWT（HS256/RS256/ES256）、Host 路由和通配路径。
-- `test/client_diff.sh` / `xmake run client-diff`：C++ 客户端打 Go 参考服务端、Go 客户端
-  打同一个 Go 服务端、Go 客户端再打 C++ 框架服务端；三份 PASS/FAIL 输出逐项 diff，
-  覆盖流式 multipart/文件上传、自动 100-continue、请求 trailers、429/Retry-After、
-  JWKS 拉取。
+- `xmake run example_readme`：编译检查 README 中的代码样例。
+- `xmake run example_openapi` + `test/examples/openapi_verify.py`：OpenAPI 端到端
+  （demo 监听 `:7795`，`/swagger` 浏览）。
+- `xmake run fixture_middleware_server`：在 `:7796`（以及 TLS 1.2 的 `:7797`）挂载全部
+  内置中间件，供与 Go 参考实现做差分。
+- `test/run.sh client-cross`：客户端对独立 Python 服务端的交叉验证。
+- `xmake run tool_h3_public -- https://cloudflare-quic.com/`：手工公网 HTTP/3 冒烟。
+- `xmake run test_threading`：客户端线程模型与销毁路径压测（配合 sanitizer 使用）。
+- `test/run.sh framework-diff` / `test/.venv/bin/python test/differential/run.py framework`：同时启动
+  C++ 框架参考服务器与等价的 Go `net/http` 服务器，对比 64 项可观测行为——App State、
+  提取器、校验、Session、CSRF、JWT（HS256/RS256/ES256）、Host 路由和通配路径。
+- `test/run.sh client-diff` / `test/.venv/bin/python test/differential/run.py client`：C++ 客户端打
+  Go 参考服务端、Go 客户端打同一个 Go 服务端、Go 客户端再打 C++ 框架服务端；三份
+  PASS/FAIL 输出逐项 diff，覆盖流式 multipart/文件上传、自动 100-continue、请求
+  trailers、429/Retry-After、JWKS 拉取。
 
 <a id="known-limitations"></a>
 ## 已知限制 · Known limitations
@@ -1402,8 +1412,8 @@ xmake run loadgen ws://127.0.0.1:7788/echo1k -p ws -n 200000 -c 64
 - 分层约束：上层（`proto` / `handler` / `net` / `client` 门面）不得出现协议版本分支，
   版本差异只放进 `engine/` 与对应的 `ResponseSink` 实现。
 - RAII、无裸 `new` / `delete`，所有权显式。
-- 改协议/传输层后跑 `test/conformance/run.sh`；改流的生命周期后额外跑
-  `test/stress/run.sh`。
+- 改协议/传输层后跑 `test/external/conformance/run.sh`；改流的生命周期后额外跑
+  `test/external/stress/run.sh`。
 - 新的公开 API 或行为变化，请同步更新 `README.md`、`README.zh-CN.md` 与 `AGENTS.md`。
 
 <a id="license"></a>

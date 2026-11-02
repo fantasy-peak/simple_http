@@ -1,0 +1,758 @@
+// Example server demonstrating the simple_http v2 API (coroutine-only
+// handlers).
+//
+// It starts a plaintext server (HTTP/1.1, h2c upgrade, HTTP/2 prior-knowledge)
+// and a TLS server (HTTP/1.1 and HTTP/2 via ALPN, mutual TLS), sharing the same
+// routes. All handlers are coroutines; responses can be one-shot or streamed
+// (chunked over HTTP/1.1, DATA frames over HTTP/2).
+
+#include <openssl/ssl.h>
+#include <openssl/x509.h>
+
+#include <atomic>
+#include <boost/asio/experimental/awaitable_operators.hpp>
+#include <charconv>
+#include <csignal>
+#include <format>
+#include <print>
+#include <string>
+#include <thread>
+
+#include "simple_http.h"
+
+namespace asio = boost::asio;
+using namespace simple_http;
+
+// Returns the subject name of an X509 certificate, or "-" if none.
+static std::string subject_name(X509 *cert) {
+    if (!cert)
+        return "-";
+    char buf[512] = {0};
+    X509_NAME_oneline(X509_get_subject_name(cert), buf, sizeof(buf) - 1);
+    return std::string{buf};
+}
+
+// Parses an unsigned integer query parameter "key=..." from a raw query string,
+// returning `fallback` if absent or unparseable.
+static std::size_t query_uint(std::string_view query, std::string_view key, std::size_t fallback) {
+    std::string needle{key};
+    needle += '=';
+    for (std::size_t pos = 0; pos < query.size();) {
+        auto amp = query.find('&', pos);
+        auto pair = query.substr(pos, amp == std::string_view::npos ? std::string_view::npos : amp - pos);
+        if (pair.starts_with(needle)) {
+            auto val = pair.substr(needle.size());
+            std::size_t out = 0;
+            auto [ptr, ec] = std::from_chars(val.data(), val.data() + val.size(), out);
+            if (ec == std::errc{})
+                return out;
+            return fallback;
+        }
+        if (amp == std::string_view::npos)
+            break;
+        pos = amp + 1;
+    }
+    return fallback;
+}
+
+// Registers the shared route table on a server.
+//
+// Every handler below is method-agnostic (it reads the body and query, never
+// `req->method()`), so each registers as `any_methods` — that is also what the
+// protocol-conformance suites require, since they hit "/" under any method. A
+// real endpoint would restrict the list instead: `route({Method::Post}, ...)`.
+template <typename ServerT> void register_routes(ServerT &server) {
+    // One-shot response. Body size configurable via ?n= (default 1 KiB) so the
+    // stress suite can compare 1k / 10k / 50k response packages.
+    server.route(any_methods, "/world",
+                 [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+                     // Drain the request body. The body-size comparison POSTs a 512
+                     // B payload (h2load -d); left unread it would corrupt
+                     // keep-alive HTTP/1.1 framing. GET sends an empty body, so
+                     // read_all() returns immediately.
+                     auto body = co_await req->body().read_all();
+                     if (!body) {
+                         co_await res->status(400).send("read error");
+                         co_return;
+                     }
+                     std::size_t n = query_uint(req->query(), "n", 1024);
+                     co_await res->status(200).send(std::string(n, 'a'));
+                 });
+
+    // Bidirectional streaming: read each request-body frame, log it, and echo a
+    // response frame back per received frame. Chunked over HTTP/1.1, DATA frames
+    // over HTTP/2 — every frame is flushed as it is produced.
+    server.route(any_methods, "/hello",
+                 [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+                     co_await res->status(200).content_type("text/plain").begin();
+                     int i = 0;
+                     for (;;) {
+                         auto frame = co_await req->body().read();
+                         if (!frame) {
+                             std::println("[SERVER] body read error: {}", frame.error().message());
+                             break;
+                         }
+                         if (frame->eof) {
+                             std::println("[SERVER] <-- request body EOF");
+                             break;
+                         }
+                         std::println("[SERVER] <-- recv frame #{} ({} bytes): {}", i, frame->data.size(), frame->data);
+                         std::string out = std::format("echo #{}: {}", i, frame->data);
+                         co_await res->write(out);
+                         std::println("[SERVER] --> sent frame #{} ({} bytes)", i, out.size());
+                         ++i;
+                     }
+                     co_await res->finish(std::format("done, {} frames\n", i));
+                     std::println("[SERVER] --> sent final frame (total {} frames)", i);
+                 });
+
+    // Reads the whole request body and echoes it back (one-shot).
+    server.route(any_methods, "/echo",
+                 [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+                     auto body = co_await req->body().read_all();
+                     if (!body) {
+                         co_await res->status(400).send("read error");
+                         co_return;
+                     }
+                     co_await res->status(200).send(*body);
+                 });
+
+    // Root: the same echo. Protocol-conformance suites target "/" and cannot be
+    // pointed elsewhere, so this is not a duplicate of /echo but the path they
+    // actually need — h1spec sends every case to it and checks the body comes
+    // back verbatim under any method.
+    server.route(any_methods, "/",
+                 [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+                     auto body = co_await req->body().read_all();
+                     if (!body) {
+                         co_await res->status(400).send("read error");
+                         co_return;
+                     }
+                     co_await res->status(200).send(*body);
+                 });
+
+    // A simple one-shot handler.
+    server.route(any_methods, "/sync",
+                 [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+                     co_await res->status(200).content_type("text/plain").send("simple one-shot reply");
+                 });
+
+    // Echoes all received request headers. Handy to inspect what a reverse-proxy
+    // forwards (X-Forwarded-For / X-Forwarded-Proto / X-Forwarded-Host / Host).
+    server.route(any_methods, "/headers",
+                 [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+                     std::string out;
+                     for (const auto &[name, value] : req->headers()) {
+                         out += name + ": " + value + "\n";
+                     }
+                     co_await res->status(200).content_type("text/plain").send(out);
+                 });
+
+    // TLS-aware handler: inspects the peer (client) certificate.
+    server.route(
+        any_methods, "/whoami",
+        [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res, SslHandle ssl) -> asio::awaitable<void> {
+            std::string who = "no TLS";
+            if (ssl && *ssl) {
+                X509 *peer = SSL_get_peer_certificate(*ssl);
+                who = std::string{"client="} + subject_name(peer);
+                if (peer)
+                    X509_free(peer);
+            }
+            co_await res->status(200).send(who);
+        });
+
+    // Large one-shot response body (default 1 MiB) — exercises flow control /
+    // multiple DATA frames (h2) or a large chunked body (h1). Size via ?n=BYTES.
+    server.route(any_methods, "/big",
+                 [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+                     std::size_t n = query_uint(req->query(), "n", 1024 * 1024);
+                     co_await res->status(200).send(std::string(n, 'x'));
+                 });
+
+    // A response written in pieces, spaced out in time so each piece is
+    // acknowledged before the next one is produced. That ordering is the whole
+    // point: a plain GET ends its request with the FIN, so on a stream whose
+    // response is produced slowly, "the peer is done and nothing is
+    // unacknowledged right now" is true between every pair of pieces — and a
+    // server that retires the stream on that condition truncates the response
+    // without an error anywhere. Each piece is flushed as it is written, so a
+    // client sees the gap rather than one coalesced body.
+    server.route(any_methods, "/stream",
+                 [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+                     co_await res->status(200).content_type("text/plain").begin();
+                     for (int i = 0; i < 3; ++i) {
+                         asio::steady_timer timer{co_await asio::this_coro::executor};
+                         timer.expires_after(std::chrono::milliseconds(120));
+                         co_await timer.async_wait(asio::use_awaitable);
+                         co_await res->write(std::format("part{} ", i));
+                     }
+                     co_await res->finish("end\n");
+                 });
+
+    // A streamed response that ends with an EMPTY final chunk, after the last
+    // data has already been flushed. This is the shape a streaming reverse proxy
+    // and every `finish()` with no argument produce, and it is the one state in
+    // which nghttp3 reports "0 length data + FIN" from
+    // `nghttp3_conn_writev_stream` (count 0, stream id set, fin set) — which an
+    // HTTP/3 engine has to forward to QUIC as-is. Dropping it leaves the client
+    // reading a body that never ends. The wait between the last write and the
+    // finish is what puts the EOF in a call of its own; without it the FIN rides
+    // along with the final DATA and the bug stays hidden.
+    server.route(any_methods, "/stream-fin",
+                 [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+                     co_await res->status(200).content_type("text/plain").begin();
+                     co_await res->write("hello");
+                     asio::steady_timer timer{co_await asio::this_coro::executor};
+                     timer.expires_after(std::chrono::milliseconds(200));
+                     co_await timer.async_wait(asio::use_awaitable);
+                     co_await res->finish();
+                 });
+
+    // A streamed response that ends with a trailer section (RFC 9110 §6.5): the
+    // body arrives first, and the fields after it are the ones only known once
+    // the body is done (gRPC's grpc-status is the canonical user). `?oneshot=1`
+    // exercises the same fields through the one-shot send() path, which has to
+    // switch to streamed framing to have somewhere to put them.
+    server.route(any_methods, "/trailers",
+                 [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+                     if (req->query().find("oneshot=1") != std::string::npos) {
+                         res->trailer("x-checksum", "abc123");
+                         co_await res->status(200).content_type("text/plain").send("oneshot body");
+                         co_return;
+                     }
+                     co_await res->status(200).content_type("text/plain").begin();
+                     co_await res->write("first ");
+                     co_await res->write("second");
+                     res->trailer("x-checksum", "abc123").trailer("x-trailer-count", "2");
+                     co_await res->finish();
+                 });
+
+    // Reads the entire request body and replies with its length — exercises
+    // large body upload + flow control.
+    server.route(any_methods, "/drain",
+                 [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+                     auto body = co_await req->body().read_all();
+                     if (!body) {
+                         co_await res->status(400).send("read error");
+                         co_return;
+                     }
+                     co_await res->status(200).send(std::format("received {} bytes", body->size()));
+                 });
+
+    // Delays before responding (default 500 ms) — verifies the idle watchdog
+    // does not kill an active-but-slow handler. Delay via ?ms=MILLIS.
+    server.route(any_methods, "/delay",
+                 [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+                     int ms = static_cast<int>(query_uint(req->query(), "ms", 500));
+                     asio::steady_timer timer{co_await asio::this_coro::executor};
+                     timer.expires_after(std::chrono::milliseconds(ms));
+                     co_await timer.async_wait(asio::use_awaitable);
+                     co_await res->status(200).send(std::format("waited {} ms", ms));
+                 });
+
+    // Request cancellation, for the sanitizer/stress runs. The handler races a
+    // short timer against req->wait_cancelled(); the timer normally wins and
+    // operator|| cancels the token branch — so every request tears down a parked
+    // wait_cancelled() (frame destruction + std::stop_callback deregistration),
+    // which is exactly where a lifetime bug would surface under ASan.
+    server.route(any_methods, "/cancel-race",
+                 [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+                     using namespace asio::experimental::awaitable_operators;
+                     asio::steady_timer timer{co_await asio::this_coro::executor};
+                     timer.expires_after(std::chrono::milliseconds(5));
+                     co_await (timer.async_wait(asio::as_tuple(asio::use_awaitable)) || req->wait_cancelled());
+                     if (req->cancelled())
+                         co_return;
+                     co_await res->status(200).send("raced");
+                 });
+
+    // Per-route deadline under load: the handler always overruns, so every
+    // request runs the timeout path — cancel the chain, fire the request token,
+    // answer 504 — and a detached coroutine parked on wait_cancelled() must
+    // observe the token.
+    server.route(any_methods, "/timeout", {simple_http::middleware::timeout(std::chrono::milliseconds(150))},
+                 [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+                     auto exec = co_await asio::this_coro::executor;
+                     asio::co_spawn(
+                         exec,
+                         [req]() -> asio::awaitable<void> {
+                             co_await req->wait_cancelled(); // woken when the deadline fires
+                         },
+                         asio::detached);
+                     asio::steady_timer timer{exec};
+                     timer.expires_after(std::chrono::seconds(3));
+                     co_await timer.async_wait(asio::use_awaitable); // cancelled by the deadline
+                     co_await res->status(200).send("too late");
+                 });
+
+    // Streaming under a deadline: ~200 ms of output at 10 ms intervals with a
+    // 50 ms timeout. The stream is four times the deadline end to end but never
+    // idle for more than 10 ms, so the idle half of middleware::timeout must keep
+    // it alive (where an absolute deadline would truncate it).
+    server.route(any_methods, "/stream-timed", {simple_http::middleware::timeout(std::chrono::milliseconds(50))},
+                 [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+                     co_await res->status(200).content_type("text/plain").begin();
+                     for (int i = 0; i < 20; ++i) {
+                         asio::steady_timer t{co_await asio::this_coro::executor};
+                         t.expires_after(std::chrono::milliseconds(10));
+                         co_await t.async_wait(asio::use_awaitable);
+                         co_await res->write("x");
+                     }
+                     co_await res->finish();
+                 });
+
+    // The same shape, but the stream goes silent after the first chunk: the idle
+    // half of the deadline must abort it (close, not a 504 — the head is out).
+    server.route(any_methods, "/stream-stall", {simple_http::middleware::timeout(std::chrono::milliseconds(100))},
+                 [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+                     co_await res->status(200).content_type("text/plain").begin();
+                     co_await res->write("first");
+                     asio::steady_timer t{co_await asio::this_coro::executor};
+                     t.expires_after(std::chrono::seconds(3));
+                     co_await t.async_wait(asio::use_awaitable);
+                     co_await res->finish();
+                 });
+
+    // Handler that throws — the engine must not crash; the connection stays sane.
+    server.route(any_methods, "/throw",
+                 [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+                     throw std::runtime_error("handler failure (intentional)");
+                     co_return;
+                 });
+
+    // Empty response (204 No Content, no body).
+    server.route(any_methods, "/empty",
+                 [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+                     co_await res->status(204).send("");
+                 });
+
+    // Response carrying connection-specific headers that are illegal in HTTP/2;
+    // the engine must strip them so the response stays valid.
+    server.route(any_methods, "/badhdr",
+                 [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+                     co_await res->status(200)
+                         .header("connection", "keep-alive")
+                         .header("transfer-encoding", "chunked")
+                         .header("x-ok", "kept")
+                         .send("body-with-illegal-headers-stripped");
+                 });
+
+    // Full-duplex, HTTP/2 only. Demonstrates a reader coroutine and a writer
+    // coroutine running INDEPENDENTLY and CONCURRENTLY on the same stream, both
+    // spawned AFTER the handler returns (they capture
+    // shared_ptr<Request>/<Response> so both outlive the handler body):
+    //   * reader: drains the request body frame by frame (upstream), on its own
+    //   * writer: pushes a server frame every 200ms on its own schedule, then
+    //   ends
+    // Neither waits on the other — true bidirectional flow, which only HTTP/2
+    // supports. HTTP/1.1 is half-duplex, so it falls back to read-then-reply.
+    server.route(any_methods, "/duplex",
+                 [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+                     auto exec = co_await asio::this_coro::executor;
+
+                     if (req->version() != Version::Http2) {
+                         // HTTP/1.x: half-duplex. Read the whole body, then reply once.
+                         auto body = co_await req->body().read_all();
+                         std::size_t n = body ? body->size() : 0;
+                         co_await res->status(200).send(std::format("half-duplex (HTTP/1.x): drained {} bytes\n", n));
+                         co_return;
+                     }
+
+                     // Reader coroutine: independently consume the uplink body to
+                     // completion.
+                     asio::co_spawn(
+                         exec,
+                         [req]() -> asio::awaitable<void> {
+                             int i = 0;
+                             for (;;) {
+                                 auto frame = co_await req->body().read();
+                                 if (!frame || frame->eof)
+                                     break;
+                                 std::println("[SERVER] duplex <-- recv frame #{} ({} bytes): {}", i,
+                                              frame->data.size(), frame->data);
+                                 ++i;
+                             }
+                             std::println("[SERVER] duplex reader done ({} frames)", i);
+                         },
+                         asio::detached);
+
+                     // Writer coroutine: independently push frames on a timer, not tied to
+                     // reads.
+                     asio::co_spawn(
+                         exec,
+                         [res, exec]() -> asio::awaitable<void> {
+                             if (auto ec = co_await res->status(200).content_type("text/plain").begin(); ec)
+                                 co_return;
+                             asio::steady_timer timer{exec};
+                             for (int i = 0; i < 5; ++i) {
+                                 timer.expires_after(std::chrono::milliseconds(200));
+                                 co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+                                 if (auto ec = co_await res->write(std::format("push #{}\n", i)); ec)
+                                     co_return;
+                                 std::println("[SERVER] duplex --> push #{}", i);
+                             }
+                             co_await res->finish("done\n");
+                             std::println("[SERVER] duplex writer done");
+                         },
+                         asio::detached);
+
+                     co_return; // handler returns immediately; the two coroutines keep
+                                // going
+                 });
+
+    // Regex catch-all.
+    server.route_regex(any_methods, "/api/.*",
+                       [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+                           co_await res->status(200).send(std::string{"api path: "} + std::string{req->path()});
+                       });
+
+    // Full-duplex WebSocket endpoint (ws over plaintext, wss over TLS):
+    //   * a spawned writer coroutine pushes a server message every second
+    //   * the read loop echoes each client message, preserving its text/binary
+    //   type
+    // Both write concurrently; the WebSocket serializes writes internally.
+    server.ws_route("/chat", [](std::shared_ptr<Request> req, std::shared_ptr<WebSocket> ws) -> asio::awaitable<void> {
+        std::println("[SERVER] websocket connected: {}", req->path());
+        auto exec = co_await asio::this_coro::executor;
+
+        // Concurrent writer: periodic server-initiated pushes.
+        asio::co_spawn(
+            exec,
+            [ws]() -> asio::awaitable<void> {
+                asio::steady_timer timer{co_await asio::this_coro::executor};
+                for (int i = 0; ws->is_open(); ++i) {
+                    timer.expires_after(std::chrono::seconds(1));
+                    co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+                    if (!ws->is_open())
+                        break;
+                    if (co_await ws->write_text(std::format("server-push #{}", i)))
+                        break;
+                }
+                co_return;
+            },
+            asio::detached);
+
+        // Read loop: echo each message back with the same type (text/binary).
+        for (;;) {
+            auto msg = co_await ws->read();
+            if (!msg) {
+                std::println("[SERVER] websocket closed: {}", msg.error().message());
+                break;
+            }
+            std::println("[SERVER] ws recv ({} bytes, {}): {}", msg->data.size(), msg->text ? "text" : "binary",
+                         msg->text ? msg->data : std::string{"<binary>"});
+            if (auto ec = co_await ws->write("echo: " + msg->data, msg->text); ec) {
+                break;
+            }
+        }
+        co_return;
+    });
+
+    // Plain echo, for protocol-conformance suites (Autobahn's fuzzingclient).
+    // It must return exactly what it was sent — same text/binary type, no prefix,
+    // no server-initiated frames — or every case reads the extra traffic as a
+    // protocol error. /chat above is the demo, this is the test surface.
+    server.ws_route("/echo", [](std::shared_ptr<Request>, std::shared_ptr<WebSocket> ws) -> asio::awaitable<void> {
+        for (;;) {
+            auto msg = co_await ws->read();
+            if (!msg)
+                break;
+            if (auto ec = co_await ws->write(msg->data, msg->text))
+                break;
+        }
+        co_return;
+    });
+
+    // WebSocket endpoint behind the middleware chain — which upgrades only
+    // reach since ws routes now flow through use()/per-route middleware. Two
+    // per-route middleware wrap it: request_id (whose X-Request-Id the terminal
+    // folds into the 101, verifiable on the wire) and an Origin gate — the
+    // CSWSH defense (RFC 6455 §1.3). The Python suite drives it with and
+    // without an allowed Origin to pin down both halves.
+    server.ws_route(
+        "/private",
+        {simple_http::middleware::request_id(), simple_http::middleware::ws_origin({"http://allowed.example"})},
+        [](std::shared_ptr<Request>, std::shared_ptr<WebSocket> ws) -> asio::awaitable<void> {
+            for (;;) {
+                auto msg = co_await ws->read();
+                if (!msg)
+                    break;
+                if (auto ec = co_await ws->write(msg->data, msg->text))
+                    break;
+            }
+            co_return;
+        });
+
+    // Benchmark echo: answer every message with a fixed WS_RESP_SIZE (1 KiB)
+    // payload regardless of what was sent. This is the stress-suite workload
+    // shape (request 512 B → response 1 KiB); /echo above stays verbatim for
+    // Autobahn, which requires exact echo.
+    server.ws_route("/echo1k", [](std::shared_ptr<Request>, std::shared_ptr<WebSocket> ws) -> asio::awaitable<void> {
+        std::string resp(1024, 'a');
+        for (;;) {
+            auto msg = co_await ws->read();
+            if (!msg)
+                break;
+            // `resp` outlives each co_await, so borrow it: no per-message copy.
+            if (auto ec = co_await ws->write_view(resp, msg->text))
+                break;
+        }
+        co_return;
+    });
+
+    // Byte-level WebSocket reverse proxy: an Upgrade: websocket on /wsproxy is
+    // spliced verbatim to the backend below. Frames, fragmentation, masking and
+    // control frames all pass through untouched (no re-framing, no size cap).
+    // Here the backend is this same plaintext server's /chat endpoint (the
+    // request target is rewritten to /chat so the backend routes to a real ws
+    // handler instead of looping back through the proxy), so /wsproxy behaves
+    // exactly like connecting to /chat directly.
+    server.ws_proxy("/wsproxy", "127.0.0.1", 7788, "/chat");
+
+    // Regex proxy with capture-group rewrite: /proxy/<name> is spliced to the
+    // backend with its target rewritten to /<name>. $1 is the first capture
+    // group. e.g. /proxy/chat -> backend /chat. Every /proxy/* path routes to a
+    // single rule, and the backend still sees the meaningful sub-path.
+    server.ws_proxy_regex("/proxy/(.*)", "127.0.0.1", 7788, "/$1");
+
+    // HTTP reverse proxy (request-level). /rproxy/<rest> is forwarded to this
+    // same plaintext server with the target rewritten to /<rest>, so e.g.
+    // /rproxy/world -> backend /world, /rproxy/echo -> backend /echo. Standard
+    // X-Forwarded-* headers are added and the response is streamed back. Works
+    // for HTTP/1.1, h2c and HTTP/2 clients (backend hop is HTTP/1.1).
+    server.http_proxy_regex("/rproxy/(.*)", "127.0.0.1", 7788, "/$1");
+
+    // Per-route CORS surface for the third-party-client edge tests. A subdomain
+    // wildcard must accept real subdomains of example.com and nothing else; the
+    // Python suite checks that a look-alike such as evil-example.com gets no
+    // Access-Control-Allow-Origin. Credentials are on, so an accepted origin is
+    // mirrored (not "*") and a bypass is directly observable on the wire.
+    server.route(
+        any_methods, "/cors-wildcard",
+        {make_cors_middleware(CorsConfig{.allow_origins = {"https://*.example.com"}, .allow_credentials = true})},
+        [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+            co_await res->status(200).send("cors");
+        });
+
+    // Per-key rate-limit surface with a tiny key cap and a key taken from a
+    // header, plus a read-only view of the bucket count, so the Python suite can
+    // prove a hostile key space cannot grow the map past max_keys.
+    auto limiter = std::make_shared<middleware::RateLimiter>(/*rate=*/0.01, /*burst=*/1, /*max_keys=*/4);
+    auto rate_key = [](const RequestPtr &req) {
+        auto h = req->header("x-rate-key");
+        return h ? std::string{*h} : std::string{};
+    };
+    server.route(any_methods, "/ratelimited", {middleware::rate_limit(limiter, rate_key)},
+                 [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+                     co_await res->status(200).send("ok");
+                 });
+    server.route({Method::Get}, "/ratelimit-keys",
+                 [limiter](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+                     co_await res->status(200).send(std::to_string(limiter->bucket_count()));
+                 });
+
+    // Handlers actively reading a request body, so the suite can observe that a
+    // reset or aborted upload releases the handler (and its engine) instead of
+    // parking it on a body channel that is never failed.
+    auto active_uploads = std::make_shared<std::atomic<int>>(0);
+    server.route(
+        any_methods, "/upload",
+        [active_uploads](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+            active_uploads->fetch_add(1, std::memory_order_relaxed);
+            auto body = co_await req->body().read_all();
+            active_uploads->fetch_sub(1, std::memory_order_relaxed);
+            if (!body) {
+                co_await res->status(400).send("read error");
+                co_return;
+            }
+            co_await res->status(200).send("uploaded " + std::to_string(body->size()));
+        });
+    server.route(
+        {Method::Get}, "/upload-active",
+        [active_uploads](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+            co_await res->status(200).send(std::to_string(active_uploads->load(std::memory_order_relaxed)));
+        });
+
+    // A streaming response that also carries a handler-set Content-Length. The
+    // engine must never emit both Content-Length and Transfer-Encoding: chunked
+    // (RFC 9112 §6.1), so the Python suite reads the raw head and checks exactly
+    // one framing header is present.
+    server.route({Method::Get}, "/stream-cl",
+                 [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+                     co_await res->status(200).header("content-length", "5").begin();
+                     co_await res->write("hello");
+                     co_await res->finish("");
+                 });
+
+    server.fallback([](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+        co_await res->status(404).send("not found");
+    });
+}
+
+namespace {
+
+// Set by the signal handler, read by the main loop. `sig_atomic_t` is the only
+// type the C standard guarantees a handler may touch, and a handler may do
+// nothing else that is not async-signal-safe — which rules out Server::stop()
+// itself (it posts to other contexts and waits on a future).
+volatile std::sig_atomic_t g_stop_requested = 0;
+
+void request_stop(int) { g_stop_requested = 1; }
+
+} // namespace
+
+int main() {
+    set_log_sink(make_stdout_sink(LogLevel::Info));
+
+    // Ctrl-C, or the `kill` every test script ends with, stops the servers
+    // rather than the process: a clean teardown drains connections and closes
+    // the listeners, so the port is free immediately and the run is a normal
+    // exit. That last part is what lets a sanitizer see the end of the program
+    // at all — LeakSanitizer reports on exit, and a process killed outright
+    // never gets there.
+    std::signal(SIGINT, request_stop);
+    std::signal(SIGTERM, request_stop);
+
+    // Plaintext server: HTTP/1.1, h2c upgrade, HTTP/2 prior-knowledge. This one
+    // uses the explicit listener list (the multi-listener form) rather than the
+    // single-listener sugar, so the whole third-party suite exercises it.
+    ServerConfig plain_cfg;
+    TcpListenerConfig plain_listener;
+    plain_listener.address = InetAddress{"0.0.0.0", 7788, false};
+    plain_cfg.listeners.push_back(std::move(plain_listener));
+    plain_cfg.worker_threads = 4;
+    // permessage-deflate (RFC 7692) on: the Autobahn and third-party Python
+    // suites drive this listener, so the extension's whole wire surface
+    // (negotiation, context takeover, compressed echo) is exercised by
+    // independent implementations rather than by our own client.
+    plain_cfg.limits.ws_compression = true;
+    Server plain{plain_cfg};
+    register_routes(plain);
+    // A second TCP listener on the same Server, configured through the fluent
+    // builder: different port, h1-only (no h2c upgrade), its own name.
+    plain.listen(InetAddress{"0.0.0.0", 7794, false}).name("h1-only").plaintext(PlaintextHttp::Http1Only);
+    // Non-mutual TLS listener for the TLS buffer benchmark (test/external/bench):
+    // h1-only with the server certificate alone, so a load generator that has no
+    // client certificate can drive it. :7789 remains the mTLS deployment shape.
+    plain.listen(InetAddress{"0.0.0.0", 7797, false})
+        .name("tls-bench")
+        .tls(TlsConfig{
+            .cert_chain_file = "./test/tls_certificates/server_cert.pem",
+            .private_key_file = "./test/tls_certificates/server_key.pem",
+        })
+        .alpn(TlsHttp::Http1Only);
+
+    // TLS server: HTTP/1.1 and HTTP/2 selected by ALPN, with mutual TLS.
+    ServerConfig tls_cfg;
+    tls_cfg.listen = InetAddress{"0.0.0.0", 7789, false};
+    tls_cfg.worker_threads = 4;
+    tls_cfg.limits.ws_compression = true; // same surface as the plaintext listener
+    tls_cfg.tls = TlsConfig{
+        .cert_chain_file = "./test/tls_certificates/server_cert.pem",
+        .private_key_file = "./test/tls_certificates/server_key.pem",
+        .mutual = true,
+        .ca_file = "./test/tls_certificates/ca_cert.pem",
+    };
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+    // HTTP/3 alongside HTTP/1.1 and HTTP/2 on the *same port number*, which is
+    // the usual deployment and the reason the two listeners are configured
+    // separately: TCP and UDP do not collide, and the client picks a transport
+    // with ALPN. This is nginx's `listen 443 ssl` plus `listen 443 quic`.
+    // Inherits the mTLS policy above, so it also exercises client certificates
+    // over QUIC.
+    tls_cfg.quic = QuicAddress{"0.0.0.0", 7789, false};
+    // It advertises itself over the TCP side, on the same port number — which is
+    // where a browser that has never seen this origin arrives (RFC 7838), and is
+    // the whole shape of the deployment: one number, two transports.
+#endif
+    Server tls{tls_cfg};
+    register_routes(tls);
+
+    // Single-protocol plaintext listeners, for the conformance suites. Each one
+    // declares what it speaks instead of sniffing, because on the sniffing port
+    // above a malformed HTTP/2 opening and an HTTP/1.x request line are the same
+    // bytes: h2spec's "invalid connection preface" wants a GOAWAY, h1spec's
+    // "invalid prefix of request" wants a 400, and sniffing can only pick one.
+    ServerConfig h2c_cfg;
+    h2c_cfg.listen = InetAddress{"0.0.0.0", 7790, false};
+    h2c_cfg.worker_threads = 4;
+    h2c_cfg.plaintext_protocols = PlaintextProtocols::Http2;
+    Server h2c{h2c_cfg};
+    register_routes(h2c);
+
+    ServerConfig h1_cfg;
+    h1_cfg.listen = InetAddress{"0.0.0.0", 7791, false};
+    h1_cfg.worker_threads = 4;
+    h1_cfg.plaintext_protocols = PlaintextProtocols::Http1;
+    h1_cfg.limits.ws_compression = true;
+    Server h1{h1_cfg};
+    register_routes(h1);
+
+    // A large configured HTTP/2 receive window (stream and connection). The
+    // connection-level window is 65535 by protocol default regardless of
+    // SETTINGS_INITIAL_WINDOW_SIZE, so the engine has to raise it explicitly;
+    // this listener is where the Python suite checks a request body larger than
+    // 64 KiB completes instead of stalling on the unreplenished connection
+    // window.
+    ServerConfig h2win_cfg;
+    h2win_cfg.listen = InetAddress{"0.0.0.0", 7793, false};
+    h2win_cfg.worker_threads = 2;
+    h2win_cfg.plaintext_protocols = PlaintextProtocols::Http2;
+    h2win_cfg.limits.h2_initial_window = 1 << 20;
+    Server h2win{h2win_cfg};
+    register_routes(h2win);
+
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+    // A dual-transport listener with no client-certificate requirement, for the
+    // conformance suite and for curl, neither of which has a client cert: the
+    // same routes on TCP :7792 (HTTP/1.x and h2c) and UDP :7792 (HTTP/3), from
+    // one Server — one thread pool, one router, one configuration. The two
+    // transports do not collide because one is TCP and the other UDP, which is
+    // why they are two fields rather than two servers.
+    ServerConfig dual_cfg;
+    dual_cfg.listen = InetAddress{"0.0.0.0", 7792, false};
+    dual_cfg.quic = QuicAddress{"0.0.0.0", 7792, false};
+    dual_cfg.worker_threads = 4;
+    // Measured, not assumed. Without this the QUIC side gets *one* UDP socket
+    // on one worker context, while the TCP side's connections are spread across
+    // the whole pool — so h3 was effectively running on a quarter of the
+    // machine and lost ~3x against its own h2c endpoint on the same box
+    // (`-t 4 -n 200000 -c 200 -m 20`: 7.2k req/s vs 21k req/s). With it, h3 is
+    // also faster than the ngtcp2 reference server (21k vs 13.5k), which is
+    // single-socket, so the driver itself was never the problem.
+    dual_cfg.reuse_port = true;
+    dual_cfg.tls = TlsConfig{
+        .cert_chain_file = "./test/tls_certificates/server_cert.pem",
+        .private_key_file = "./test/tls_certificates/server_key.pem",
+    };
+    Server dual{dual_cfg};
+    register_routes(dual);
+#endif
+
+    bool ok = plain.start() && tls.start() && h2c.start() && h1.start() && h2win.start();
+    std::println("servers started: plaintext :7788 (sniffing), tls :7789, h2c-only :7790, "
+                 "h1-only :7791, h2-large-window :7793 (ok={})",
+                 ok);
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+    // Started last and reported separately: a QUIC bind failure is its own
+    // answer, not a reason for the TCP listeners to report failure.
+    const bool dual_ok = static_cast<bool>(dual.start());
+    std::println("dual-transport :7792 tcp+udp started (ok={}), http/3 also on udp :7789", dual_ok);
+    ok = ok && dual_ok;
+#endif
+
+    while (g_stop_requested == 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    plain.stop();
+    tls.stop();
+    h2c.stop();
+    h1.stop();
+    h2win.stop();
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+    dual.stop();
+#endif
+    return 0;
+}

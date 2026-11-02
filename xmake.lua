@@ -22,17 +22,16 @@ add_repositories("my_private_repo https://github.com/fantasy-peak/xmake-repo.git
 add_requires("boost", {configs = {cmake = true, asio=true, regex=true}})
 add_requires("openssl4", {system = false})
 add_requires("ngtcp2", "nghttp3")
-add_requires("catch2")  -- unit tests only (target `unittest`)
-add_requires("glaze")  -- OpenAPI schemas + JSON helpers; header-only, always compiled
+add_requires("catch2")  -- Catch2 unit/regression suites
+-- glaze is an unconditional dependency: OpenAPI schemas and the JSON helpers
+-- (proto/json.h, read_json_body / write_json). Header-only, no transitive deps.
+add_requires("glaze")
 -- Response-body compression (core/content_encoding.h) and WebSocket
 -- permessage-deflate (proto/ws_deflate.h) are both compiled in unconditionally:
 -- zlib and brotli are normal dependencies of the library now. Whether either
 -- takes effect is a runtime setting (EngineLimits::compression / ws_compression,
 -- ClientConfig::auto_decompress).
 add_requires("zlib", "brotli")
--- glaze is an unconditional dependency: it backs the JSON helpers
--- (proto/json.h, read_json_body / write_json). Header-only, no transitive deps.
-add_requires("glaze")
 
 add_cxflags("-O2 -Wextra -Wno-missing-field-initializers -Wno-ignored-qualifiers")
 add_defines("SIMPLE_HTTP_USE_BOOST_REGEX")
@@ -55,465 +54,179 @@ target("simple_http")
     )
 target_end()
 
-target("server")
-    set_kind("binary")
-    on_load(function (target)
-        if target:toolchain("gcc") then
-            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete", "-Wno-type-limits")
+-- TEST TARGETS --
+-- Everything under test/ follows four role prefixes:
+--   test_*    programs that assert behaviour (unit, regression, integration)
+--   fixture_* servers a suite drives from the outside
+--   probe_*   clients that talk to an independent peer, printing PASS/FAIL
+--   tool_*    manual utilities (load profiling, public smoke tests, harnesses)
+--   example_* documentation samples that must keep compiling
+--
+-- test/run.py is the one orchestration entry point; xmake only builds these
+-- binaries and runs them directly when a developer asks for a single target.
+-- Common GCC warning suppressions live in one helper instead of 23 copies.
+local test_cxxflags = {
+    "-Wno-maybe-uninitialized",
+    "-Wno-mismatched-new-delete",
+    "-Wno-type-limits",
+}
+
+local function add_test_binary(name, files, opts)
+    opts = opts or {}
+    target(name)
+        set_kind("binary")
+        set_default(false)
+        set_group(opts.group or "test/other")
+        add_deps("simple_http")
+        add_files(files)
+        if opts.packages then
+            for _, package in ipairs(opts.packages) do
+                add_packages(package)
+            end
         end
-        -- xmake f --toolchain=llvm --runtimes=c++_static -c -v
-    end)
-    add_deps("simple_http")
-    add_files("test/server.cpp")
-    add_defines("SIMPLE_HTTP_ENABLE_HTTP3")
-    add_packages("zlib")
-    set_rundir(".")
-target_end()
-
--- Client-behavior probe against an external server (used with a Go reference
--- server so the client is not tested against its own server):
---   xmake build client_go_probe && ./build/linux/x86_64/release/client_go_probe http://127.0.0.1:7801
-target("client_go_probe")
-    set_kind("binary")
-    set_default(false)
-    on_load(function (target)
-        if target:toolchain("gcc") then
-            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete", "-Wno-type-limits")
+        if opts.http3 then
+            add_defines("SIMPLE_HTTP_ENABLE_HTTP3")
         end
-    end)
-    add_deps("simple_http")
-    add_files("test/client_go_probe.cpp")
-    add_defines("SIMPLE_HTTP_ENABLE_HTTP3")
-    add_packages("zlib", "brotli")
-    set_rundir(".")
-target_end()
+        on_load(function (target)
+            if target:toolchain("gcc") then
+                target:add("cxxflags", test_cxxflags)
+            end
+        end)
+        -- The TLS certificates are referenced relative to the repository root
+        -- (./test/tls_certificates/...), so every test binary runs there.
+        set_rundir(".")
+    target_end()
+end
 
--- Middleware + compression test server: mounts every built-in middleware and
--- routes that exercise the compression policy (min_bytes, content type,
--- streamed responses). Listens on 127.0.0.1:7796:
---   xmake build middleware_server && xmake run middleware_server
-target("middleware_server")
-    set_kind("binary")
-    set_default(false)
-    on_load(function (target)
-        if target:toolchain("gcc") then
-            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete", "-Wno-type-limits")
-        end
-    end)
-    add_deps("simple_http")
-    add_files("test/middleware_server.cpp")
-    add_packages("zlib", "brotli")
-    set_rundir(".")
-target_end()
+-- Fixture servers -----------------------------------------------------------
+-- The general-purpose fixture: plaintext 7788 (h1/h2c sniffing), TLS/mTLS 7789,
+-- h2c-only 7790, h1-only 7791, TCP+UDP 7792, large-window h2 7793, h1 7794.
+add_test_binary("fixture_server", "test/server/fixtures/server.cpp", {
+    group = "test/fixtures",
+    http3 = true,
+    packages = {"zlib", "brotli"},
+})
 
--- The client layer's exercise program: starts a server in the same process and
--- drives the client at it (and at a raw responder) across the protocol matrix.
--- Run it from the repository root: `xmake run client`.
-target("client")
-    set_kind("binary")
-    on_load(function (target)
-        if target:toolchain("gcc") then
-            -- GCC false positives around asio's coroutine frames; the server
-            -- target needs the first one too.
-            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete", "-Wno-type-limits")
-        end
-    end)
-    add_deps("simple_http")
-    add_files("test/client.cpp")
-    add_packages("zlib", "brotli")
-    set_rundir(".")
-target_end()
+-- Built-in middleware + compression policy fixture (127.0.0.1:7796, TLS :7797).
+add_test_binary("fixture_middleware_server", "test/server/fixtures/middleware_server.cpp", {
+    group = "test/fixtures",
+    packages = {"zlib", "brotli"},
+})
 
--- Multi-thread stress for the client's threading model (concurrency model A).
--- A thread-concurrency harness, not a protocol suite: per-thread Clients, a
--- teardown loop (Client dropped + io_context drained — the ASan-class hazard)
--- and a high-concurrency shape, for the sanitizers to vet. In-process servers,
--- like test/client.cpp.
---   xmake build thread_check && xmake run thread_check [-- --quick]
-target("thread_check")
-    set_kind("binary")
-    on_load(function (target)
-        if target:toolchain("gcc") then
-            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete", "-Wno-type-limits")
-        end
-    end)
-    add_deps("simple_http")
-    add_files("test/thread_check.cpp")
-    add_packages("zlib", "brotli")
-    set_rundir(".")
-target_end()
+-- Framework-layer reference server for the Go differential (default :7798).
+add_test_binary("fixture_framework_server", "test/server/fixtures/framework_server.cpp", {
+    group = "test/fixtures",
+    packages = {"zlib", "brotli"},
+})
 
--- A load generator built on the library's own client (h1 / h2 multiplexed /
--- WebSocket), printing an h2load-shaped summary so results can be compared with
--- k6 / h2load / wrk on the same endpoint. See test/loadgen.cpp.
-target("loadgen")
-    set_kind("binary")
-    set_default(false)
-    on_load(function (target)
-        if target:toolchain("gcc") then
-            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete", "-Wno-type-limits")
-        end
-    end)
-    add_deps("simple_http")
-    add_files("test/loadgen.cpp")
-    set_rundir(".")
-target_end()
+-- Unit and in-process integration ------------------------------------------
+-- The Catch2 entry point lives in test/support so both suites share it, and so
+-- a glob over test/unit can never pick up a second main().
+add_test_binary("test_unit", {
+    "test/unit/test_*.cpp",
+    "test/support/catch_main.cpp",
+}, {
+    group = "test/unit",
+    http3 = true,
+    packages = {"catch2", "glaze", "zlib", "brotli"},
+})
 
--- Unit tests (Catch2): pure logic, no sockets — parsers, HPACK, frames, the
--- URL/config helpers, routing. Fast enough to run on every change:
---   xmake build unittest && xmake run unittest
-target("unittest")
-    set_kind("binary")
-    set_default(false)
-    add_defines("SIMPLE_HTTP_ENABLE_HTTP3")
-    on_load(function (target)
-        if target:toolchain("gcc") then
-            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete", "-Wno-type-limits")
-        end
-    end)
-    add_deps("simple_http")
-    add_files("test/unit/*.cpp")
-    add_packages("catch2", "zlib", "brotli", "glaze")
-    set_rundir(".")
-target_end()
+-- Raw-socket regression suite: malformed and boundary requests against an
+-- in-process server (Catch2).
+add_test_binary("test_server_regression", {
+    "test/integration/server_regression.cpp",
+    "test/support/catch_main.cpp",
+}, {
+    group = "test/integration",
+    http3 = true,
+    packages = {"catch2", "zlib", "brotli"},
+})
 
--- Framework-layer reference server: exposes application state, extractors,
--- validation, sessions/CSRF/JWT, host routing and catch-all paths for the
--- differential test against Go (test/python/framework_diff.py).
---   xmake build framework_server
---   test/framework_diff.sh
-target("framework_server")
-    set_kind("binary")
-    set_default(false)
-    on_load(function (target)
-        if target:toolchain("gcc") then
-            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete", "-Wno-type-limits")
-        end
-    end)
-    add_deps("simple_http")
-    add_files("test/framework_server.cpp")
-    add_packages("zlib", "brotli")
-    set_rundir(".")
-target_end()
+-- Client-layer self-check: in-process servers plus raw responders, 245 checks.
+add_test_binary("test_client", "test/integration/client.cpp", {
+    group = "test/integration",
+    packages = {"zlib", "brotli"},
+})
 
--- Differential test against the Go standard library: builds both reference
--- servers and runs test/python/framework_diff.py.
---   xmake run framework-diff
-target("framework-diff")
-    set_kind("phony")
-    set_default(false)
-    add_deps("framework_server")
-    on_run(function ()
-        os.execv("bash", {"test/framework_diff.sh"})
-    end)
-target_end()
+-- Multi-thread concurrency harness for the client (sanitizer-oriented).
+add_test_binary("test_threading", "test/integration/thread_check.cpp", {
+    group = "test/integration",
+    packages = {"zlib", "brotli"},
+})
 
--- C++ client probe for the client differential suite (streaming multipart,
--- 100-continue, request trailers, 429 and JWKS), mirrored by
--- test/go/client_diff_probe.go.
-target("client_diff_probe")
-    set_kind("binary")
-    set_default(false)
-    on_load(function (target)
-        if target:toolchain("gcc") then
-            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete", "-Wno-type-limits")
-        end
-    end)
-    add_deps("simple_http")
-    add_files("test/client_diff_probe.cpp")
-    add_packages("zlib", "brotli")
-    set_rundir(".")
-target_end()
+-- Deferred body read after the h1 engine is gone must be a clean error (ASan).
+add_test_binary("test_h1_lifetime", "test/integration/h1_pull_lifetime.cpp", {
+    group = "test/integration",
+})
 
--- Differential client/server suite for streaming uploads, 100-continue,
--- request trailers, 429 Retry-After and JWKS:
--- C++ client -> Go server, Go client -> Go server, Go client -> C++ server.
---   xmake run client-diff
-target("client-diff")
-    set_kind("phony")
-    set_default(false)
-    add_deps("client_diff_probe", "framework_server")
-    on_run(function ()
-        os.execv("bash", {"test/client_diff.sh"})
-    end)
-target_end()
+-- Client probes against independent servers ---------------------------------
+add_test_binary("probe_client_cross", "test/client/probes/client_cross.cpp", {
+    group = "test/probes",
+})
 
--- OpenAPI demo: per-route operation descriptors (openapi::doc()...) collected
--- into an OAS 3.1 document served at /openapi.json, browsed at /swagger
--- (CDN-hosted Swagger UI).
--- A standalone binary so test/server.cpp — the conformance/stress surface —
--- stays untouched. Run from the repository root:
---   xmake build openapi_demo && xmake run openapi_demo
--- then open http://127.0.0.1:7795/swagger
-target("openapi_demo")
-    set_kind("binary")
-    set_default(false)
-    on_load(function (target)
-        if target:toolchain("gcc") then
-            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete", "-Wno-type-limits")
-        end
-    end)
-    add_deps("simple_http")
-    add_files("test/openapi_demo.cpp")
-    add_packages("glaze")
-    set_rundir(".")
-target_end()
+add_test_binary("probe_ws_cross", "test/client/probes/ws_client_cross.cpp", {
+    group = "test/probes",
+    packages = {"zlib"},
+})
 
--- Server regression suite: raw sockets against an in-process server, sending the
--- malformed and boundary cases a well-behaved client will not send.
---   xmake build regression && xmake run regression
-target("regression")
-    set_kind("binary")
-    set_default(false)
-    add_defines("SIMPLE_HTTP_ENABLE_HTTP3")
-    on_load(function (target)
-        if target:toolchain("gcc") then
-            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete", "-Wno-type-limits")
-        end
-    end)
-    add_deps("simple_http")
-    add_files("test/server_regression.cpp", "test/unit/main.cpp")
-    add_packages("catch2")
-    set_rundir(".")
-target_end()
+add_test_binary("probe_h3_cross", "test/client/probes/h3_client_cross.cpp", {
+    group = "test/probes",
+    http3 = true,
+})
 
--- Python-side protocol tests. The C++ suites drive simple_http with its own
--- client, so a spec misreading shared by both halves cancels out; these use
--- httpx / hyper-h2 / websockets instead, which are independent implementations.
--- First run:
---   python3 -m venv test/python/.venv
---   test/python/.venv/bin/pip install -r test/python/requirements.txt
--- Then:
---   xmake python-tests
-target("python-tests")
-    set_kind("phony")
-    add_deps("server")
-    on_run(function ()
-        local python = "test/python/.venv/bin/python"
-        if not os.isfile(python) then
-            raise("no virtualenv at test/python/.venv — see test/python/requirements.txt")
-        end
-        os.execv(python, {"test/python/run.py"})
-    end)
-target_end()
+add_test_binary("probe_client_diff", "test/client/probes/client_diff_probe.cpp", {
+    group = "test/probes",
+    packages = {"zlib", "brotli"},
+})
 
--- Compile check for the code samples in README.md. Documented code is not
--- exercised by anything else, and the README had quietly drifted to APIs that no
--- longer existed — a string of examples that looked plausible and would not
--- build. Reproducing them here turns that drift into a build failure:
---   xmake build readme_examples
-target("readme_examples")
-    set_kind("binary")
-    set_default(false)
-    on_load(function (target)
-        if target:toolchain("gcc") then
-            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-type-limits")
-        end
-    end)
-    add_deps("simple_http")
-    add_files("test/readme_examples.cpp")
-    add_packages("glaze")
-    set_rundir(".")
-target_end()
+-- Manual proxy probe against Go reference servers (SOCKS5 / HTTPS / CONNECT).
+add_test_binary("probe_client_go", "test/client/probes/client_go_probe.cpp", {
+    group = "test/probes",
+    http3 = true,
+    packages = {"zlib", "brotli"},
+})
 
--- Client-side SETTINGS_MAX_CONCURRENT_STREAMS check: drive the h2 client at an
--- independent Python h2 server (test/python/h2_max_concurrent_server.py) that
--- announces a limit and logs every arriving frame. The server-side log, not the
--- client's error code, is the ground truth for "the client refused locally".
--- See the test file's header comment for the usage recipe.
-target("h2_limit_check")
-    set_kind("binary")
-    set_default(false)
-    on_load(function (target)
-        if target:toolchain("gcc") then
-            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-type-limits")
-        end
-    end)
-    add_deps("simple_http")
-    add_files("test/h2_limit_check.cpp")
-    set_rundir(".")
-target_end()
+add_test_binary("probe_body_cap", "test/client/probes/body_cap.cpp", {
+    group = "test/probes",
+})
 
--- Client-side HTTP/1.1 half-duplex guard: reading the response before the
--- request body ends must be refused fast (client_errc::half_duplex), not hang.
--- Driven against an independent Python stall server (test/python/h1_stall_server.py),
--- exactly like h2_limit_check. See the test file's header comment.
-target("h1_duplex_check")
-    set_kind("binary")
-    set_default(false)
-    on_load(function (target)
-        if target:toolchain("gcc") then
-            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-type-limits")
-        end
-    end)
-    add_deps("simple_http")
-    add_files("test/h1_duplex_check.cpp")
-    set_rundir(".")
-target_end()
+add_test_binary("probe_h1_duplex", "test/client/probes/h1_duplex.cpp", {
+    group = "test/probes",
+})
 
---- Reverse-proxy harness (code-server shape) for the h2/RFC 8441 WebSocket
---- path; see test/codeserver_proxy.cpp. Needs code-server on 127.0.0.1:8080.
-target("codeserver_proxy")
-    set_kind("binary")
-    set_default(false)
-    on_load(function (target)
-        if target:toolchain("gcc") then
-            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-type-limits")
-        end
-    end)
-    add_deps("simple_http")
-    add_files("test/codeserver_proxy.cpp")
-    set_rundir(".")
-target_end()
+add_test_binary("probe_h2_limit", "test/client/probes/h2_limit.cpp", {
+    group = "test/probes",
+})
 
--- Client-side body-cap check: the streaming Response's buffered readers
--- (bytes()/text()/json()) must honour the constructor's body_cap. This target
--- also holds the compile-time evidence: before the cap parameter existed, this
--- file did not build. See the test file's header comment.
-target("body_cap_check")
-    set_kind("binary")
-    set_default(false)
-    on_load(function (target)
-        if target:toolchain("gcc") then
-            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-type-limits")
-        end
-    end)
-    add_deps("simple_http")
-    add_files("test/body_cap_check.cpp")
-    set_rundir(".")
-target_end()
+add_test_binary("probe_read_all_timeout", "test/client/probes/read_all_timeout.cpp", {
+    group = "test/probes",
+})
 
--- HTTP/1.x pull-provider lifetime: reading a request body after the connection
--- (and its engine) is gone must be a clean error, not a use-after-free. Run
--- under the repo's ASan build: pre-fix aborts with heap-use-after-free, post-fix
--- prints DEFERRED_READ <ec> and exits 0. See the test file's header comment.
-target("h1_pull_lifetime_check")
-    set_kind("binary")
-    set_default(false)
-    on_load(function (target)
-        if target:toolchain("gcc") then
-            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete", "-Wno-type-limits")
-        end
-    end)
-    add_deps("simple_http")
-    add_files("test/h1_pull_lifetime_check.cpp")
-    set_rundir(".")
-target_end()
+add_test_binary("probe_retry", "test/client/probes/retry.cpp", {
+    group = "test/probes",
+})
 
--- Client-side default retry condition: a client-side decision error (body cap,
--- protocol error) must not be retried just because the method is idempotent.
--- Driven against an independent Python counting server (test/python/retry_echo_server.py),
--- exactly like h2_limit_check. See the test file's header comment.
-target("retry_check")
-    set_kind("binary")
-    set_default(false)
-    on_load(function (target)
-        if target:toolchain("gcc") then
-            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-type-limits")
-        end
-    end)
-    add_deps("simple_http")
-    add_files("test/retry_check.cpp")
-    set_rundir(".")
-target_end()
+-- Examples ------------------------------------------------------------------
+add_test_binary("example_openapi", "test/examples/openapi_demo.cpp", {
+    group = "test/examples",
+    packages = {"glaze"},
+})
 
--- Client-side body-idle deadline on read_all(): the buffered reader must be
--- bounded per read like read() is, not skip the budget. Driven against an
--- independent Python slow-body server (test/python/slow_body_server.py). See
--- the test file's header comment.
-target("read_all_timeout_check")
-    set_kind("binary")
-    set_default(false)
-    on_load(function (target)
-        if target:toolchain("gcc") then
-            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-type-limits")
-        end
-    end)
-    add_deps("simple_http")
-    add_files("test/read_all_timeout_check.cpp")
-    set_rundir(".")
-target_end()
+add_test_binary("example_readme", "test/examples/readme_examples.cpp", {
+    group = "test/examples",
+    packages = {"glaze"},
+})
 
--- Cross-validation of the client-side WebSocket against an independent server
--- (test/python/ws_echo_server.py, the `websockets` library). See the file's
--- header comment:   test/python/.venv/bin/python test/python/ws_echo_server.py
---                    xmake run ws_cross -- 27920
-target("ws_cross")
-    set_kind("binary")
-    set_default(false)
-    on_load(function (target)
-        if target:toolchain("gcc") then
-            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-type-limits")
-        end
-    end)
-    add_deps("simple_http")
-    add_files("test/ws_client_cross.cpp")
-    add_packages("zlib")
-    set_rundir(".")
-target_end()
+-- Manual tools --------------------------------------------------------------
+add_test_binary("tool_loadgen", "test/tools/loadgen.cpp", {
+    group = "test/tools",
+})
 
--- Cross-validation of the client against an independent HTTP/1.1 server
--- (test/python/http_server.py, stdlib http.server). See the file header.
-target("client_cross")
-    set_kind("binary")
-    set_default(false)
-    on_load(function (target)
-        if target:toolchain("gcc") then
-            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-type-limits")
-        end
-    end)
-    add_deps("simple_http")
-    add_files("test/client_cross.cpp")
-    set_rundir(".")
-target_end()
+add_test_binary("tool_h3_public", "test/tools/h3_public_check.cpp", {
+    group = "test/tools",
+    http3 = true,
+})
 
--- Cross-validation of the HTTP/3 client against an independent h3 server
--- (test/python/h3_server.py, aioquic). Needs SIMPLE_HTTP_ENABLE_HTTP3.
-target("h3_client_cross")
-    set_kind("binary")
-    set_default(false)
-    add_defines("SIMPLE_HTTP_ENABLE_HTTP3")
-    on_load(function (target)
-        if target:toolchain("gcc") then
-            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-type-limits")
-        end
-    end)
-    add_deps("simple_http")
-    add_files("test/h3_client_cross.cpp")
-    set_rundir(".")
-target_end()
-
--- Manual smoke test: fetch a real public origin (h1/h2/h3) with the system CA
--- store. The network is the machine's, so this is not part of the suites.
---   xmake run h3_public_check -- https://cloudflare-quic.com/
---   xmake run h3_public_check -- https://www.google.com/ 127.0.0.1 h2
-target("h3_public_check")
-    set_kind("binary")
-    set_default(false)
-    add_defines("SIMPLE_HTTP_ENABLE_HTTP3")
-    on_load(function (target)
-        if target:toolchain("gcc") then
-            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-type-limits")
-        end
-    end)
-    add_deps("simple_http")
-    add_files("test/h3_public_check.cpp")
-    set_rundir(".")
-target_end()
-
--- One-shot: build the client cross-validation binaries and drive them
--- against the independent Python servers (test/python/run_client_cross.py).
-target("client-cross-python")
-    set_kind("phony")
-    set_default(false)
-    add_deps("client_cross", "ws_cross", "h3_client_cross")
-    on_run(function ()
-        local python = "test/python/.venv/bin/python"
-        if not os.isfile(python) then
-            raise("no virtualenv at test/python/.venv — see test/python/requirements.txt")
-        end
-        os.execv(python, {"test/python/run_client_cross.py"})
-    end)
-target_end()
-
-
+add_test_binary("tool_codeserver_proxy", "test/tools/codeserver_proxy.cpp", {
+    group = "test/tools",
+})

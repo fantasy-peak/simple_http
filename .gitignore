@@ -4,7 +4,7 @@ build-dbg/
 .cache/
 
 # The Python test environment is created by the test runner, not committed.
-test/python/.venv/
+test/.venv/
 __pycache__/
 
 .vscode/*

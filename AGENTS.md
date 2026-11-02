@@ -163,15 +163,17 @@ include/
 
 其它目录：
 
-- `test/`：示例服务器、客户端整合自检、服务端对抗性回归、Catch2 单测、
-  独立实现交叉验证、loadgen、OpenAPI demo、中间件差分服务器、各类专项 check。
-- `test/conformance/`：h2spec / h1spec / Autobahn / h3spec 外部一致性脚本。
-- `test/stress/`：连接复用与负载统一入口。
-- `test/python/`：第三方实现（httpx / hyper-h2 / websockets / aioquic）驱动本库；
-  `test/framework_diff.sh` + `test/go/framework_server.go` 是与 Go `net/http` 的框架层
-  差分测试（64 checks）；`test/client_diff.sh` + `test/go/client_diff_*.go` 覆盖新客户端
-  功能（流式上传/100-continue/trailers/429/JWKS）的 C++/Go 双向差分。
-- `test/tls_certificates/`：测试证书。
+- `test/`：统一入口 `test/run.sh`（`test/run.py`，分层 fast / standard / full）；
+  按被测对象分层：
+  - `unit/` Catch2 纯逻辑；`integration/` 进程内 C++ 集成；
+  - `server/` 被测服务端 ← 独立客户端，`server/fixtures/` 是 C++ 夹具；
+  - `client/` 被测客户端 → 独立服务端，`client/probes/` 是 C++ probe，
+    `client/peers/` 是 Python 独立服务端；
+  - `differential/` C++ ↔ Go 双向差分（`run.py` + `framework_diff.py` + `go/`）；
+  - `external/conformance/`、`external/stress/`、`external/bench/` 外部工具套件；
+  - `examples/`、`tools/`、`support/`、`tls_certificates/`。
+  报告写到 `.cache/test-run/<timestamp>-<pid>/`（`report.json` + `junit.xml`）。
+- `test/tls_certificates/`：测试证书（`./test/tls_certificates/...` 是相对路径契约）。
 - `cmake/`：`simple_httpConfig.cmake.in`。
 - **没有 `docs/`，也没有 `ROADMAP.md`**（已删除）；文档为 `README.md`（英文默认）、
   `README.zh-CN.md`（完整中文）与本文件。
@@ -585,17 +587,17 @@ server.serve_swagger_ui("/swagger", "/openapi.json");
 
 ```sh
 xmake build -j12
-xmake run server
-xmake run unittest
-xmake run client
-xmake run regression
+xmake run fixture_server
+xmake run test_unit
+xmake run test_client
+xmake run test_server_regression
 ```
 
 - `xmake.lua`：`set_languages("c++26")`。
 - 全局 `-O2 -Wextra`，关闭少量 GCC 误报；目前没有把 warning 当 error。
 - 全局定义 `SIMPLE_HTTP_USE_BOOST_REGEX`。
-- `SIMPLE_HTTP_ENABLE_HTTP3` 只加在需要它的目标（server、client_go_probe、
-  unittest、regression、h3_client_cross、h3_public_check）。
+- `SIMPLE_HTTP_ENABLE_HTTP3` 只加在需要它的目标（fixture_server、probe_client_go、
+  test_unit、test_server_regression、probe_h3_cross、tool_h3_public）。
 - 包来自私有仓库 `fantasy-peak/xmake-repo`：上游 ngtcp2 包不产 OpenSSL crypto
   helper，HTTP/3 需要私有仓库里的 `ENABLE_OPENSSL=ON` 构建。
 - 依赖锁：`package.requires_lock`、`package.librarydeps.strict_compatibility`。
@@ -636,60 +638,67 @@ target_link_libraries(app PRIVATE simple_http::simple_http)
 
 ### 7.1 自测目标
 
+唯一入口（详细矩阵见 `test/README.md`）：
+
 ```sh
-xmake build unittest && xmake run unittest
-xmake build regression && xmake run regression
-xmake build client && xmake run client
-xmake build server && xmake run python-tests
+test/run.sh fast        # unit / server-regression / client / h1-lifetime / readme
+test/run.sh standard    # + threading / Python 交叉验证 / checks / openapi
+test/run.sh full        # + Go 差分 / 外部一致性 / 压力
+test/run.sh list
+test/run.sh doctor
+test/run.sh <suite>     # 单套件，例如 unit / server-conformance / client-cross
 ```
 
 当前规模（实跑）：
 
-| 套件 | 规模 |
-|---|---|
-| `unittest`（Catch2） | 389 个用例，65298 条断言 |
-| `regression` | 79 个 TEST_CASE，裸 socket 畸形/边界请求 |
-| `client` | 245 checks |
-| `python-tests` | 113 checks（httpx / hyper-h2 / websockets / aioquic） |
+| 套件 | suite | 规模 |
+|---|---|---|
+| Catch2 单元 | `unit` | 389 个用例，65298 条断言 |
+| 裸 socket 回归 | `server-regression` | 79 个 TEST_CASE |
+| 客户端整合自检 | `client` | 245 checks |
+| Python 服务端交叉 | `server-conformance` | 113 checks（httpx / hyper-h2 / websockets / aioquic） |
 
-单元测试按标签过滤：`xmake run unittest "[h2]"`。
+单元测试按标签过滤：`test/run.sh unit '[h2]'`。
 
-`test/server.cpp` 的监听端口：`:7788` 明文嗅探、`:7789` TLS/mTLS（同端口 UDP QUIC）、
-`:7790` 纯 h2c、`:7791` 纯 h1、`:7792` TCP+UDP 双传输、`:7793` 大窗口 h2、
-`:7794` builder 配置的纯 h1。
+`test/server/fixtures/server.cpp` 的监听端口：`:7788` 明文嗅探、`:7789` TLS/mTLS
+（同端口 UDP QUIC）、`:7790` 纯 h2c、`:7791` 纯 h1、`:7792` TCP+UDP 双传输、
+`:7793` 大窗口 h2、`:7794` builder 配置的纯 h1、`:7797` 非 mTLS 的 TLS h1
+（TLS 基准用）。
 
-Python 首次运行：
+Python 首次运行（统一 venv 在 `test/.venv`）：
 
 ```sh
-python3 -m venv test/python/.venv
-test/python/.venv/bin/pip install -r test/python/requirements.txt
+python3 -m venv test/.venv
+test/.venv/bin/pip install -r test/requirements.txt
 ```
 
-依赖版本已在 `test/python/requirements.txt` 固定
-（`aioquic==1.5.0`、`h2==4.4.1`、`httpx[http2]==0.28.1`、`websockets==17.1`）。
+依赖版本已在 `test/requirements.txt` 固定
+（`aioquic==1.5.0`、`cryptography==50.0.2`、`h2==4.4.1`、
+`httpx[http2]==0.28.1`、`websockets==17.1`）。
 
 ### 7.2 独立实现交叉验证
 
 | 脚本 | 方向 | 结果 |
 |---|---|---|
-| `test/python/run.py` | 第三方客户端 → C++ 服务端 | 113 checks |
-| `test/python/rfc8441_client.py` | hyper-h2 → h2 extended CONNECT / ws 反代 | 85 checks |
-| `test/python/run_client_cross.py` | C++ 客户端 → Python 服务端 | 43 + 6 checks |
-| `test/openapi_verify.py` | OpenAPI 文档 | 端到端断言 |
-| `test/framework_diff.sh` | C++ 框架参考服务器 ↔ Go `net/http` 参考服务器 | 64 checks：State/Extractor/Validation/Session/CSRF/JWT(HS/RS/ES)/Host/Wildcard |
-| `test/client_diff.sh` | C++ client → Go server；Go client → Go/C++ server | 8 checks × 3 条腿：流式上传/100-continue/trailers/429/JWKS |
+| `test/server/run.py` | 第三方客户端 → C++ 服务端 | 113 checks |
+| `test/server/h2_websocket.py` | hyper-h2 → h2 extended CONNECT / ws 反代 | 85 checks |
+| `test/client/run.py` | C++ 客户端 → Python 服务端 | 43 + 6 checks |
+| `test/examples/openapi_verify.py` | OpenAPI 文档 | 端到端断言 |
+| `test/differential/run.py framework` | C++ 框架参考服务器 ↔ Go `net/http` 参考服务器 | 64 checks：State/Extractor/Validation/Session/CSRF/JWT(HS/RS/ES)/Host/Wildcard |
+| `test/differential/run.py client` | C++ client → Go server；Go client → Go/C++ server | 8 checks × 3 条腿：流式上传/100-continue/trailers/429/JWKS |
 | Autobahn | Python/Twisted → WebSocket | FAILED 0、NON-STRICT 0 |
 | h2spec | Go → 纯 h2c `:7790` | 146/146 |
 | h1spec | Deno → 纯 h1 `:7791` | 33/33 |
 | h3spec | h3spec → UDP `:7792` | 49 例，通过 ≥47 |
 
-`rfc8441_client.py` 需要先启动 `test/server`。
+`test/server/h2_websocket.py` 与 `test/server/h2_window_leak.py` 会自行启动和停止
+`fixture_server`；也可由 `test/run.sh h2-websocket` / `h2-window-leak` 驱动。
 
 ### 7.3 外部一致性
 
 ```sh
-test/conformance/run.sh
-test/conformance/run.sh h2spec
+test/external/conformance/run.sh
+test/external/conformance/run.sh h2spec
 ```
 
 端口固定，别改：
@@ -707,7 +716,7 @@ test/conformance/run.sh h2spec
 ### 7.4 压力与连接生命周期
 
 ```sh
-test/stress/run.sh [cpp|rust|both] [h1|h2|h3|ws]... [--no-conformance]
+test/external/stress/run.sh [cpp|rust|both] [h1|h2|h3|ws]... [--no-conformance]
 ```
 
 - 默认 `both`，四档全跑。
@@ -735,16 +744,16 @@ test/stress/run.sh [cpp|rust|both] [h1|h2|h3|ws]... [--no-conformance]
 必跑：
 
 ```sh
-test/conformance/run.sh
-test/stress/run.sh
+test/external/conformance/run.sh
+test/external/stress/run.sh
 ```
 
 若涉及 h2/h3/WS，再补：
 
 ```sh
-xmake run unittest
-xmake run regression
-xmake build server && xmake run python-tests
+test/run.sh unit
+test/run.sh server-regression
+test/run.sh server-conformance
 ```
 
 ### 8.2 改客户端
@@ -752,27 +761,28 @@ xmake build server && xmake run python-tests
 必跑：
 
 ```sh
-xmake run client
-xmake run client-cross-python
+test/run.sh client
+test/run.sh client-cross
 ```
 
-涉及超时/取消/重试时，补对应的专项 check：
-`h2_limit_check`、`h1_duplex_check`、`retry_check`、`read_all_timeout_check`、
-`body_cap_check`、`ws_cross`、`h3_client_cross`。
+涉及超时/取消/重试时，补对应的专项 check（suite `client-checks`，或直接构建
+`probe_h2_limit`、`probe_h1_duplex`、`probe_retry`、`probe_read_all_timeout`、
+`probe_body_cap`；交叉验证用 `probe_ws_cross`、`probe_h3_cross`）。
 
 ### 8.3 改服务端 handler / 路由
 
 ```sh
-xmake run unittest
-xmake run regression
-xmake build server && xmake run python-tests
+test/run.sh unit
+test/run.sh server-regression
+test/run.sh server-conformance
 ```
 
 ### 8.4 加新 API / 行为
 
 - 同步更新 `README.md`、`README.zh-CN.md` 与本文件。
-- 在 `test/readme_examples.cpp` 加上可编译的样例（若面向用户）。
-- 在 `test/unit/` 或 `test/python/` 加覆盖；跨实现的行为优先放 Python 套件。
+- 在 `test/examples/readme_examples.cpp` 加上可编译的样例（若面向用户）。
+- 在 `test/unit/` 或 `test/server/`（Python 交叉套件）加覆盖；跨实现的行为优先放
+  Python 套件。
 - 不要引入协议版本分支到 `handler/` / `proto/` / `net/` / 客户端门面。
 
 ### 8.5 代码风格
@@ -862,33 +872,48 @@ xmake build server && xmake run python-tests
 ```sh
 # 构建 / 示例
 xmake build -j12
-xmake run server
-xmake run middleware_server          # :7796（TLS1.2 :7797）
-xmake run openapi_demo               # :7795
-xmake run loadgen -- <url> -p h1 -n 100000 -c 100
+xmake run fixture_server              # :7788-:7797
+xmake run fixture_middleware_server   # :7796（TLS1.2 :7797）
+xmake run example_openapi             # :7795
+xmake run tool_loadgen -- <url> -p h1 -n 100000 -c 100
 
-# 自测
-xmake run unittest
-xmake run regression
-xmake run client
-xmake run python-tests
-xmake run readme_examples
-xmake run framework-diff              # C++ vs Go net/http 框架层差分（64 checks）
-xmake run client-diff                 # 客户端/服务端差分：C++/Go client × Go/C++ server
+# 自测（唯一入口）
+test/run.sh fast
+test/run.sh standard
+test/run.sh full
+test/run.sh list
+test/run.sh doctor
 
-# 交叉验证（ws_cross / h3_client_cross 需先启动对应的 Python 服务端）
-test/python/.venv/bin/python test/python/ws_echo_server.py 27920 &
-xmake run ws_cross -- 27920
-test/python/.venv/bin/python test/python/h3_server.py 27922 &
-xmake run h3_client_cross -- 27922
-xmake run client-cross-python          # 一次性构建并驱动全部客户端交叉
-xmake run h3_public_check -- https://cloudflare-quic.com/
+# 单套件
+test/run.sh unit
+test/run.sh unit '[h2]'
+test/run.sh server-regression
+test/run.sh client
+test/run.sh server-conformance
+test/run.sh client-cross
+test/run.sh client-checks
+test/run.sh openapi
+test/run.sh example_readme
+test/run.sh framework-diff            # C++ vs Go net/http 框架层差分（64 checks）
+test/run.sh client-diff               # 客户端/服务端差分：C++/Go client × Go/C++ server
+
+# 单独运行 Python 交叉套件（runner 会注入 SIMPLE_HTTP_TEST_BIN_DIR）
+test/.venv/bin/python test/server/run.py
+test/.venv/bin/python test/client/run.py
+test/.venv/bin/python test/client/checks.py
+test/.venv/bin/python test/differential/run.py framework
+test/.venv/bin/python test/differential/run.py client
+
+# 手工工具
+xmake run tool_h3_public -- https://cloudflare-quic.com/
+xmake run test_threading
 
 # 外部一致性 / 压力
-test/conformance/run.sh
-test/conformance/run.sh h2spec
-test/stress/run.sh both
-test/stress/run.sh cpp h3
+test/external/conformance/run.sh
+test/external/conformance/run.sh h2spec
+test/external/stress/run.sh both
+test/external/stress/run.sh cpp h3
+test/external/bench/tls_bench.sh
 
 # 格式
 ./format.sh

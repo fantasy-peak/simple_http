@@ -5,7 +5,7 @@
 #include <memory>
 #include <string>
 
-#include "../static_fixture.h"
+#include "../support/static_fixture.h"
 #include "simple_http.h"
 #include "test_support.h"
 

@@ -41,7 +41,7 @@ esac
 # include/ 与 test/ 下的 C/C++ 源文件。
 mapfile -t files < <(find "$ROOT/include" "$ROOT/test" -type f \
     \( -name '*.h' -o -name '*.hpp' -o -name '*.hh' -o -name '*.cpp' -o -name '*.cc' -o -name '*.cxx' \) \
-    -not -path '*/build/*' | sort)
+    -not -path '*/build/*' -not -path '*/.venv/*' | sort)
 
 if [[ ${#files[@]} -eq 0 ]]; then
     echo "no C++ source files found under include/ and test/"
