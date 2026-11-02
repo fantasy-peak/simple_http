@@ -57,18 +57,18 @@ BUILD_SERVER=""
 # ===== 测试参数配置（可随时改，改完直接跑）=====================================
 # 请求/响应体规格（需求方指定）：请求 POST 1 KiB body，响应三档 2k/10k/20k。
 # 复用门线用最小的那一档代表负载形态。
-RESP_TIERS="2048 10240 20480"      # 响应体三档（字节）
+RESP_TIERS="${RESP_TIERS:-2048 10240 20480}"      # 响应体三档（字节）
 # 负载档（h2load + k6）：
-LOAD_THREADS=4                     # h2load -t：发压进程数
-LOAD_REQUESTS=300000               # 每个负载档的总请求数
-LOAD_CLIENTS=200                   # 客户端数/连接数（h2load -c；k6 的 VUS）
-LOAD_STREAMS=20                    # 每连接并发流数（h2load -m；k6 h1 档不适用）
+LOAD_THREADS="${LOAD_THREADS:-4}"          # h2load -t：发压进程数
+LOAD_REQUESTS="${LOAD_REQUESTS:-300000}"   # 每个负载档的总请求数
+LOAD_CLIENTS="${LOAD_CLIENTS:-200}"        # 客户端数/连接数（h2load -c；k6 的 VUS）
+LOAD_STREAMS="${LOAD_STREAMS:-20}"         # 每连接并发流数（h2load -m；k6 h1 档不适用）
 # WebSocket 档（打 /echo1k：请求 WS_MSG_SIZE 字节，服务端固定回 WS_RESP_SIZE 字节）：
-WS_MSG_VUS=100                     # ws 客户端数（k6 VUS）
-WS_MSG_ITERS=600                   # ws 连接数（k6 iterations，总消息数 = ITERS × WANT）
-WS_MSG_WANT=2000                   # 每连接发送帧数
-WS_MSG_SIZE=512                    # ws 请求包字节
-WS_RESP_SIZE=1024                  # ws 响应包字节（两端 /echo1k 固定回这么多）
+WS_MSG_VUS="${WS_MSG_VUS:-100}"            # ws 客户端数（k6 VUS）
+WS_MSG_ITERS="${WS_MSG_ITERS:-600}"        # ws 连接数（k6 iterations，总消息数 = ITERS × WANT）
+WS_MSG_WANT="${WS_MSG_WANT:-2000}"         # 每连接发送帧数
+WS_MSG_SIZE="${WS_MSG_SIZE:-512}"          # ws 请求包字节
+WS_RESP_SIZE="${WS_RESP_SIZE:-1024}"       # ws 响应包字节（两端 /echo1k 固定回这么多）
 # 改动后必跑顺序（内建）：先符合性（simple_http 的 test/external/conformance/run.sh，仅 cpp
 # 目标那一轮跑），全绿才继续压力测试。设 RUN_CONFORMANCE=0 可跳过符合性。
 RUN_CONFORMANCE="${RUN_CONFORMANCE:-1}"

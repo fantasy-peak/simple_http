@@ -12,4 +12,12 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Sanitizer builds need their own isolated worktree/build configuration, so
+# they live in a separate orchestrator while this stays the single entry point.
+if [[ "${1:-}" == "sanitize" ]]; then
+    shift
+    exec python3 "${HERE}/sanitize.py" "$@"
+fi
+
 exec python3 "${HERE}/run.py" "$@"

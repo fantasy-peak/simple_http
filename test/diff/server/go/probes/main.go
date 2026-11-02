@@ -325,7 +325,12 @@ func bodyCases() []caseSpec {
 			Headers: map[string]string{"Content-Type": "application/x-www-form-urlencoded"},
 			Body:    []byte("name=book&age=3")},
 		{ID: "body.drain_1m", Method: "POST", Path: "/drain", Body: bytes.Repeat([]byte("x"), 1<<20)},
-		{ID: "body.too_large", Method: "POST", Path: "/drain", Body: bytes.Repeat([]byte("x"), 2<<20)},
+		// Ask both servers to decide before the body is written. Without Expect,
+		// an instrumented server may reset the socket while the 2 MiB body is
+		// still in flight, which looks like a client-side error instead of 413.
+		{ID: "body.too_large", Method: "POST", Path: "/drain",
+			Headers: map[string]string{"Expect": "100-continue"},
+			Body:    bytes.Repeat([]byte("x"), 2<<20)},
 		{ID: "body.chunked_echo", Method: "POST", Path: "/echo", Body: []byte("chunked body"), Chunked: true},
 		{ID: "body.expect_ok", Method: "POST", Path: "/expect-ok",
 			Headers: map[string]string{"Expect": "100-continue"}, Body: []byte("hello!")},

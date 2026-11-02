@@ -144,6 +144,15 @@ add_test_binary("diff_server_cpp", "test/diff/server/cpp/server.cpp", {
     packages = {"zlib", "brotli"},
 })
 
+-- Sanitizer concurrency -----------------------------------------------------
+-- Multi-client / multi-thread / cross-executor teardown harness. It is a
+-- normal test binary (runs without sanitizers), but is primarily driven by
+-- test/run.sh sanitize asan|tsan.
+add_test_binary("test_sanitizer_concurrency", "test/sanitizer/concurrency.cpp", {
+    group = "test/sanitizer",
+    packages = {"zlib", "brotli"},
+})
+
 -- OpenAPI -------------------------------------------------------------------
 add_test_binary("diff_openapi_server", "test/diff/openapi/demo_server.cpp", {
     group = "test/diff/openapi",

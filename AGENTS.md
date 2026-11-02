@@ -662,6 +662,10 @@ test/run.sh unit '[h2]' # Catch2 过滤
 | `conformance` | full | h2spec / h1spec / Autobahn / h3spec |
 | `stress` | full | h2load / k6，失败数必须为 0 |
 
+`test/run.sh` 默认 `--parallel 3`：`conformance`/`stress` 共用 7788–7792，固定为
+同一条串行 lane；其余套件端口互不重叠（`concurrency` 用临时端口），可并行。
+`--parallel 1` 完全串行。编译并行度用 `--jobs`（sanitizer 默认 7）。
+
 C++ 二进制由 xmake 构建；Go 参考服务端与探针由各 runner 用 `go build` 构建
 （`test/diff/go.mod` 固定 `x/net`、`gorilla/websocket`、`quic-go`）。
 Python 侧只需要 `httpx`、`jsonschema`、`brotli`（`test/requirements.txt`）。
@@ -730,7 +734,26 @@ test/external/stress/run.sh cpp h3 --no-conformance
    Content-Type、响应 JSON Schema、声明响应头与 401 challenge；
 4. `/swagger` 可访问、引用正确 spec、文档两次获取字节一致。
 
-### 7.5 差分比对原则
+### 7.5 Sanitizer
+
+```sh
+test/run.sh sanitize asan   [suite...]   # ASan + LSan + UBSan
+test/run.sh sanitize tsan   [suite...]   # TSan
+test/run.sh sanitize ubsan  [suite...]   # 仅 UBSan
+```
+
+- 默认 suite：asan = unit/openapi/client-diff/server-diff/concurrency；
+  tsan = unit/concurrency/server-diff；ubsan = unit/client-diff/server-diff。
+- 默认 `--jobs 7`。unit 用 ASan 时 `-j14` 会 OOM；不要把它调回 12/14。
+- 默认在 `.cache/sanitize/worktree-<san>` 建独立 worktree，日常 `build/` 不受影响；
+  `--build-dir build-asan` 可复用已有目录，结束时恢复 `xmake f -c -o build`。
+- `concurrency`（`test/sanitizer/concurrency.cpp`）覆盖多客户端、多线程、
+  跨 executor `ResponseWriter` 写和日志 sink 替换；Go 参考实现不插桩。
+- 报告扫描 ASan/LSan/TSan/UBSan 关键字；强制 `SIGKILL` 记为
+  `STOP_TIMEOUT`（泄漏检查被跳过），不当作通过。
+- 抑制规则保持最小：`test/sanitizer/{lsan,tsan,ubsan}.supp`。
+
+### 7.6 差分比对原则
 
 - 以 RFC 为准，不以「和 Go/nginx 不一样」判定为本库 bug。
 - 已知合理差异：CL+TE 与 obs-fold 上更严格；h2 一次性响应省略 content-length；
@@ -916,6 +939,12 @@ test/run.sh stress
 test/.venv/bin/python test/diff/client/run.py --groups basic,body,policy,ws,h3
 test/.venv/bin/python test/diff/server/run.py --groups routing,body,semantics,middleware,framework,static,ws
 test/.venv/bin/python test/diff/openapi/run.py
+
+# Sanitizer（默认 -j7；独立 worktree）
+test/run.sh sanitize asan
+test/run.sh sanitize asan unit --build-dir build-asan --jobs 7
+test/run.sh sanitize tsan
+test/run.sh sanitize ubsan unit
 
 # 外部一致性 / 压力
 test/external/conformance/run.sh

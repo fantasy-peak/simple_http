@@ -1,6 +1,7 @@
 .xmake/
 build/
 build-dbg/
+build-*/
 .cache/
 
 # The Python test environment is created by the test runner, not committed.

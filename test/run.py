@@ -16,10 +16,12 @@ Exit codes: 0 pass (skips allowed), 1 failure, 2 usage, 3 environment.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -54,6 +56,8 @@ SUITES = (
           tools=("go",)),
     Suite("server-diff", "full", ("diff_server_cpp",), "python",
           "diff/server/run.py", tools=("go",)),
+    Suite("concurrency", "full", ("test_sanitizer_concurrency",), "binary",
+          "test_sanitizer_concurrency", timeout=300),
     Suite("conformance", "full", ("fixture_conformance_server",), "bash",
           "external/conformance/run.sh",
           tools=("h2spec", "h3spec-linux-x86_64", "docker", "curl"), timeout=1800),
@@ -169,15 +173,24 @@ def main() -> int:
     parser.add_argument("catch_filter", nargs="?", default=None)
     parser.add_argument("--filter", default=None)
     parser.add_argument("--report-dir", default=None)
+    parser.add_argument("--bin-dir", default=None,
+                        help="directory holding the test binaries (default: build/linux/x86_64/release)")
     parser.add_argument("--no-build", action="store_true")
     parser.add_argument("--fail-fast", action="store_true")
     parser.add_argument("--allow-skip", action="store_true")
     parser.add_argument("--strict-deps", action="store_true")
     parser.add_argument("--jobs", type=int, default=12)
+    parser.add_argument("--parallel", type=int, default=3,
+                        help="run independent suites concurrently (default 3; 1 = serial). "
+                             "conformance and stress always share one serial lane.")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--doctor", action="store_true")
     args = parser.parse_args()
+
+    global BIN_DIR
+    if args.bin_dir:
+        BIN_DIR = Path(args.bin_dir)
 
     if args.suite == "list":
         args.list = True
@@ -219,6 +232,13 @@ def main() -> int:
 
     results: list[tuple[str, str, float]] = []
     exit_code = 0
+
+    def suite_args_for(suite: Suite) -> list[str]:
+        if args.catch_filter and suite.name == "unit":
+            return [args.catch_filter]
+        return []
+
+    runnable: list[Suite] = []
     for suite in suites:
         missing = missing_deps(suite)
         if missing:
@@ -229,19 +249,66 @@ def main() -> int:
             results.append((suite.name, "SKIP", 0.0))
             if args.strict_deps:
                 exit_code = 3
+        else:
+            runnable.append(suite)
+
+    # conformance and stress both bind 7788-7792 and kill leftover fixtures, so
+    # they share one serial lane. Every other suite uses a disjoint port block
+    # (or an ephemeral port) and can run in parallel.
+    serial_names = {"conformance", "stress"}
+    lanes: list[list[Suite]] = []
+    serial_lane = [suite for suite in runnable if suite.name in serial_names]
+    if serial_lane:
+        lanes.append(serial_lane)
+    lanes.extend([suite] for suite in runnable if suite.name not in serial_names)
+
+    cancelled = threading.Event()
+
+    def run_lane(lane: list[Suite]) -> list[tuple[Suite, str, int, float]]:
+        outcome: list[tuple[Suite, str, int, float]] = []
+        for suite in lane:
+            if cancelled.is_set():
+                outcome.append((suite, "SKIP", 0, 0.0))
+                continue
+            status, code, elapsed = run_suite(suite, suite_args_for(suite), report_dir, args.verbose)
+            outcome.append((suite, status, code, elapsed))
+            if code != 0 and args.fail_fast:
+                cancelled.set()
+        return outcome
+
+    if args.parallel <= 1 or len(lanes) <= 1:
+        outcomes = []
+        for lane in lanes:
+            outcomes.extend(run_lane(lane))
+    else:
+        outcomes = []
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(args.parallel, len(lanes))) as pool:
+            futures = [pool.submit(run_lane, lane) for lane in lanes]
+            for future in concurrent.futures.as_completed(futures):
+                lane_outcome = future.result()
+                for suite, status, code, elapsed in lane_outcome:
+                    print(f"{status}  {suite.name} ({elapsed:.1f}s)")
+                    results.append((suite.name, status, elapsed))
+                    if code != 0:
+                        print(tail(report_dir / f"{suite.name}.log"), file=sys.stderr)
+                outcomes.extend(lane_outcome)
+
+    if args.parallel <= 1 or len(lanes) <= 1:
+        for suite, status, code, elapsed in outcomes:
+            print(f"{status}  {suite.name} ({elapsed:.1f}s)")
+            results.append((suite.name, status, elapsed))
+            if code != 0:
+                print(tail(report_dir / f"{suite.name}.log"), file=sys.stderr)
+
+    for _, status, code, _ in outcomes:
+        if status == "SKIP":
             continue
-        suite_args = []
-        if args.catch_filter and suite.name == "unit":
-            suite_args.append(args.catch_filter)
-        status, code, elapsed = run_suite(suite, suite_args, report_dir, args.verbose)
-        print(f"{status}  {suite.name} ({elapsed:.1f}s)")
-        results.append((suite.name, status, elapsed))
         if code != 0:
             exit_code = 1
-            print(tail(report_dir / f"{suite.name}.log"), file=sys.stderr)
-            if args.fail_fast:
-                break
 
+    order = {suite.name: index for index, suite in enumerate(suites)}
+    results.sort(key=lambda item: order.get(item[0], 1 << 30))
     print("\nsummary:")
     for name, status, elapsed in results:
         print(f"  {status:5} {name:14} {elapsed:.1f}s")

@@ -1,0 +1,6 @@
+# UndefinedBehaviorSanitizer suppressions.
+#
+# Keep this list minimal and reviewed. Syntax: <check>:<substring>
+#
+# Example:
+# signed-integer-overflow:libcrypto

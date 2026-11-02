@@ -41,6 +41,17 @@ test/run.sh unit '[h2]'            # Catch2 过滤参数跟在套件名后
 `fast` = `unit`；`standard` = `fast` + `openapi`；`full` = 全部。缺失依赖默认
 打印 `SKIP`，`--strict-deps` 会把 SKIP 当作失败。
 
+并行执行：`--parallel N`（默认 3）。`conformance` 与 `stress` 共用 7788–7792，
+因此固定放在同一条串行 lane；`unit` / `openapi` / `client-diff` / `server-diff` /
+`concurrency` 使用互不重叠的端口（concurrency 用临时端口），可以并行：
+
+```sh
+test/run.sh full --parallel 4
+test/run.sh full --parallel 1   # 完全串行，便于定位
+```
+
+编译并行度由 `--jobs` 控制；sanitizer 默认 7。
+
 ## 差分协议
 
 每个探针输出 JSONL，一行一个观测：
@@ -97,6 +108,33 @@ cd test/diff && go mod download
 ```
 
 `test/run.sh doctor` 会列出每个套件缺失的工具/Python 包。
+
+## Sanitizer
+
+```sh
+test/run.sh sanitize asan [suite...]     # ASan + LSan + UBSan
+test/run.sh sanitize tsan [suite...]     # TSan
+test/run.sh sanitize ubsan [suite...]    # 仅 UBSan
+```
+
+默认矩阵：
+
+| sanitizer | suites |
+|---|---|
+| `asan` | `unit openapi client-diff server-diff concurrency` |
+| `tsan` | `unit concurrency server-diff` |
+| `ubsan` | `unit client-diff server-diff` |
+
+- 默认 **`--jobs 7`**：ASan 编译 unit 时 `-j14` 会 OOM；内存足够才上调。
+- 默认在 `.cache/sanitize/worktree-<san>` 建独立 worktree，不污染日常 `build/`；
+  也可 `--build-dir build-asan` 复用已有目录（结束时恢复默认 xmake 配置）。
+- `conformance` / `stress` 需显式指定；stress 自动缩减到 20000 请求/50 连接。
+- 新增 `concurrency` 用例：多客户端、多线程、跨 executor 写、日志 sink 替换，
+  专门给 TSan/ASan 抓共享状态与拆卸问题。
+- 报告：`.cache/sanitize/<san>/<timestamp>/sanitize-report.{md,json}`。
+- Go 参考服务端/探针不插桩；只检查 C++ 侧。
+
+详见 `test/sanitizer/README.md`。
 
 ## 外部套件
 

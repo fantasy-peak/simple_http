@@ -1,0 +1,7 @@
+# ThreadSanitizer suppressions.
+#
+# Keep this list minimal and reviewed. Syntax: race:<substring>
+#
+# Example:
+# race:libssl
+# race:libcrypto

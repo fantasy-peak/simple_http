@@ -120,6 +120,8 @@ def run_group(group: str, cpp_binary: Path, go_binary: Path, report_dir: Path,
     definitions = load_case_definitions(definition)
     cpp_out = report_dir / f"{group}.cpp.jsonl"
     go_out = report_dir / f"{group}.go.jsonl"
+    cpp_err = report_dir / f"{group}.cpp.stderr"
+    go_err = report_dir / f"{group}.go.stderr"
 
     cpp_cmd = [str(cpp_binary)]
     go_cmd = [str(go_binary), "--group", group]
@@ -128,7 +130,9 @@ def run_group(group: str, cpp_binary: Path, go_binary: Path, report_dir: Path,
         go_cmd += ["--cases", str(definition)]
 
     cpp_result = run_probe(cpp_cmd, cpp_out)
+    cpp_err.write_text(cpp_result.stderr or "", encoding="utf-8")
     go_result = run_probe(go_cmd, go_out)
+    go_err.write_text(go_result.stderr or "", encoding="utf-8")
 
     report = harness.DiffReport(f"client-{group}", registry)
     if cpp_result.returncode != 0:

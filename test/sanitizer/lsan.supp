@@ -1,0 +1,9 @@
+# LeakSanitizer suppressions.
+#
+# Keep this list minimal and reviewed. A real leak in simple_http must not be
+# hidden here; entries are only for third-party libraries that allocate global
+# state and never free it (OpenSSL/Boost). Syntax: leak:<substring>
+#
+# Example:
+# leak:libssl
+# leak:libcrypto

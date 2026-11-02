@@ -93,6 +93,9 @@ def start(cmd: list[str], log_path: Path, cwd: Path = REPO,
 
 
 def stop(*processes: subprocess.Popen | None) -> None:
+    # Sanitizer builds (especially ASan/LSan) may take longer to run their
+    # atexit checks; a SIGKILL would silently lose the leak report.
+    grace = float(os.environ.get("SIMPLE_HTTP_TEST_STOP_GRACE_MS", "5000")) / 1000.0
     for process in processes:
         if process is None:
             continue
@@ -101,8 +104,14 @@ def stop(*processes: subprocess.Popen | None) -> None:
         if process is None:
             continue
         try:
-            process.wait(timeout=5)
+            process.wait(timeout=grace)
         except subprocess.TimeoutExpired:
+            # The sanitizer orchestrator treats a forced kill as "leak check
+            # skipped" rather than as a clean pass.
+            handle = getattr(process, "_test_log", None)
+            if handle is not None:
+                handle.write("\nSTOP_TIMEOUT: forced SIGKILL (sanitizer checks skipped)\n")
+                handle.flush()
             process.kill()
             process.wait(timeout=5)
         handle = getattr(process, "_test_log", None)

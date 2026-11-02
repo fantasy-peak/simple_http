@@ -145,7 +145,9 @@ def run_probe(command: list[str], output: Path, timeout: int = 180) -> subproces
 def compare_group(group: str, probe: Path, report_dir: Path, registry: dict,
                   h3_ok: bool) -> int:
     output = report_dir / f"{group}.jsonl"
+    stderr_path = report_dir / f"{group}.stderr"
     result = run_probe([str(probe), "--group", group], output)
+    stderr_path.write_text(result.stderr or "", encoding="utf-8")
     report = harness.DiffReport(f"server-{group}", registry)
     if result.returncode != 0:
         report.fail(f"probe-{group}", result.stderr.strip()[-500:])
