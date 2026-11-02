@@ -56,7 +56,7 @@ test/.venv/bin/pip install -r test/requirements.txt
 | `h1-lifetime` | fast | 引擎销毁后的 deferred body read | xmake |
 | `readme` | fast | README 示例编译/运行 | xmake |
 | `threading` | standard | 客户端多线程/拆卸 | xmake |
-| `server-conformance` | standard | 独立客户端 → fixture server | httpx、h2、websockets |
+| `server-conformance` | standard | 独立客户端 → fixture server（含请求解压） | httpx、h2、websockets、brotli |
 | `h2-websocket` | standard | hyper-h2 RFC 8441 → fixture server | h2、hpack、hyperframe |
 | `h2-window-leak` | standard | 原始 h2 帧 → fixture server | hpack、hyperframe |
 | `client-cross` | standard | C++ client → 独立 Python server | websockets、aioquic |
@@ -64,6 +64,7 @@ test/.venv/bin/pip install -r test/requirements.txt
 | `openapi` | standard | OpenAPI demo 端到端 | httpx |
 | `framework-diff` | full | C++ framework server ↔ Go net/http | go、openssl、httpx、cryptography |
 | `client-diff` | full | C++/Go client ↔ Go/C++ server | go |
+| `compression-diff` | full | C++ client ↔ Go client；C++ server ↔ Go server 的解压行为 | go |
 | `external-conformance` | full | h2spec / h1spec / Autobahn / h3spec | h2spec、h3spec、docker、curl |
 | `stress` | full | h2load / k6（C++，默认不进 conformance） | h2load、k6 |
 | `bench` | manual | TLS 缓冲基准 | h2load |
@@ -84,6 +85,7 @@ test/.venv/bin/pip install -r test/requirements.txt
 | 7795 | OpenAPI demo |
 | 7798 / 7799 | framework 差分：C++ / Go |
 | 7802–7804 | client 差分：Go server / Go baseline / C++ server |
+| 7810 | compression 差分的 Go 参考服务器 |
 | 7813、7822–7826 | 专项 check 的 Python peers |
 | 27910–27912 | `test_client` 进程内监听 |
 | 27920–27922 | client 交叉验证：WS / HTTP / HTTP3 |
@@ -127,6 +129,7 @@ test/external/bench/tls_bench.sh
 # 差分
 test/.venv/bin/python test/differential/run.py framework
 test/.venv/bin/python test/differential/run.py client
+test/.venv/bin/python test/differential/run.py compression
 ```
 
 自动化测试统一用 `cwd = 仓库根` 启动（证书是相对路径）；二进制路径由 runner 通过

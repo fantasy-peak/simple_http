@@ -17,12 +17,14 @@
 #include <cstddef>
 #include <expected>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
 #include <utility>
 #include <variant>
 
+#include "../core/content_encoding.h"
 #include "../core/types.h"
 
 namespace simple_http {
@@ -72,65 +74,110 @@ class Body {
                 co_return std::unexpected(ec);
             }
         }
+        m_read_started = true;
         // Pull mode (HTTP/1.x): fetch the next chunk on demand from the provider.
         if (m_pull) {
-            auto r = co_await m_pull();
-            if (!r || r->eof)
-                m_eof = true;
-            co_return r;
-        }
-        // A channel that was never created means no byte was ever fed, so a
-        // terminator recorded before the first read can be answered without
-        // building one (the common GET/response path). Only a stream that is
-        // still waiting for data needs the channel as its wait point.
-        if (!m_channel) {
-            if (m_pending_error) {
-                m_eof = true;
-                co_return std::unexpected(*m_pending_error);
+            for (;;) {
+                auto r = co_await m_pull();
+                if (!r) {
+                    m_eof = true;
+                    co_return r;
+                }
+                if (r->eof) {
+                    if (!m_decoder) {
+                        m_eof = true;
+                        co_return ReadResult::end();
+                    }
+                    auto tail = finish_decoder();
+                    m_eof = true;
+                    if (!tail) {
+                        co_return std::unexpected(tail.error());
+                    }
+                    if (!tail->empty()) {
+                        co_return ReadResult::chunk(std::move(*tail));
+                    }
+                    co_return ReadResult::end();
+                }
+                if (!m_decoder) {
+                    co_return r;
+                }
+                auto out = decode_chunk(r->data);
+                if (!out) {
+                    m_eof = true;
+                    co_return std::unexpected(out.error());
+                }
+                if (out->empty()) {
+                    continue; // the codec is buffering; pull more wire bytes
+                }
+                co_return ReadResult::chunk(std::move(*out));
             }
-            if (m_pending_eof) {
-                m_eof = true;
-                co_return ReadResult::end();
+        }
+        // Push mode (HTTP/2, HTTP/3): consume raw frames from the channel. When
+        // decoding is enabled, the decoder runs here, on the consumer side;
+        // flow-control credit is still reported for the raw (wire) frame size.
+        for (;;) {
+            // A channel that was never created means no byte was ever fed, so a
+            // terminator recorded before the first read can be answered without
+            // building one (the common GET/response path). Only a stream that is
+            // still waiting for data needs the channel as its wait point.
+            if (!m_channel) {
+                if (m_pending_error) {
+                    m_eof = true;
+                    co_return std::unexpected(*m_pending_error);
+                }
+                if (m_pending_eof) {
+                    co_return co_await finish_push_decoder();
+                }
             }
-        }
-        error_code ec;
-        Frame frame;
-        // Fast path: a frame is already queued.
-        Channel &ch = channel();
-        bool got = ch.try_receive([&](error_code e, Frame f) {
-            ec = e;
-            frame = std::move(f);
-        });
-        if (!got) {
-            // A finish()/fail() that could not fit when it arrived. Reaching here
-            // means the queue is drained (try_receive failed), so delivering the
-            // recorded terminator now is exactly what a queued one would have done.
-            if (m_pending_error) {
-                m_eof = true;
-                co_return std::unexpected(*m_pending_error);
+            error_code ec;
+            Frame frame;
+            // Fast path: a frame is already queued.
+            Channel &ch = channel();
+            bool got = ch.try_receive([&](error_code e, Frame f) {
+                ec = e;
+                frame = std::move(f);
+            });
+            if (!got) {
+                // A finish()/fail() that could not fit when it arrived. Reaching
+                // here means the queue is drained (try_receive failed), so
+                // delivering the recorded terminator now is exactly what a queued
+                // one would have done.
+                if (m_pending_error) {
+                    m_eof = true;
+                    co_return std::unexpected(*m_pending_error);
+                }
+                if (m_pending_eof) {
+                    co_return co_await finish_push_decoder();
+                }
+                std::tie(ec, frame) = co_await ch.async_receive(asio::as_tuple(asio::use_awaitable));
             }
-            if (m_pending_eof) {
+            if (ec) {
                 m_eof = true;
-                co_return ReadResult::end();
+                co_return std::unexpected(ec);
             }
-            std::tie(ec, frame) = co_await ch.async_receive(asio::as_tuple(asio::use_awaitable));
+            if (std::holds_alternative<Eof>(frame)) {
+                co_return co_await finish_push_decoder();
+            }
+            std::string data = std::move(std::get<std::string>(frame));
+            // Notify the producer (HTTP/2/3 engine) that these wire bytes were
+            // consumed, so it can replenish flow-control credit. Decoding does
+            // not change this: the engine's windows count compressed bytes.
+            if (m_on_consumed && !data.empty()) {
+                m_on_consumed(data.size());
+            }
+            if (!m_decoder) {
+                co_return ReadResult::chunk(std::move(data));
+            }
+            auto out = decode_chunk(data);
+            if (!out) {
+                m_eof = true;
+                co_return std::unexpected(out.error());
+            }
+            if (out->empty()) {
+                continue; // the codec is buffering; wait for the next frame
+            }
+            co_return ReadResult::chunk(std::move(*out));
         }
-        if (ec) {
-            m_eof = true;
-            co_return std::unexpected(ec);
-        }
-        if (std::holds_alternative<Eof>(frame)) {
-            m_eof = true;
-            co_return ReadResult::end();
-        }
-        std::string data = std::move(std::get<std::string>(frame));
-        // Notify the producer (HTTP/2 engine) that these bytes were consumed, so
-        // it can replenish flow-control credit only for data the handler has
-        // actually read — this bounds in-flight memory (no un-consumed backlog).
-        if (m_on_consumed && !data.empty()) {
-            m_on_consumed(data.size());
-        }
-        co_return ReadResult::chunk(std::move(data));
     }
 
     // Reads and concatenates the entire remaining body.
@@ -250,6 +297,22 @@ class Body {
     void set_pull_provider(PullProvider provider) { m_pull = std::move(provider); }
     bool is_pull() const { return static_cast<bool>(m_pull); }
 
+    // --- transparent decoding (server request decompression) ---
+    //
+    // Installed by middleware::decompress_request before the handler runs. The
+    // engine may already have queued raw (compressed) frames - the decoder runs
+    // in read(), on the consumer side - so this only refuses once a read has
+    // started. `max_decoded` caps the decoded bytes; 0 means no extra cap.
+    [[nodiscard]] bool enable_decoding(std::unique_ptr<ContentDecoder> decoder, std::size_t max_decoded = 0) {
+        if (!decoder || m_decoder || m_read_started) {
+            return false;
+        }
+        m_decoder = std::move(decoder);
+        m_max_decoded = max_decoded;
+        return true;
+    }
+    bool decoding() const { return static_cast<bool>(m_decoder); }
+
   private:
     // The frame channel is created on first use. HTTP/1.x runs the body in pull
     // mode and never feeds or reads the channel, so building it in the
@@ -259,6 +322,67 @@ class Body {
         if (!m_channel)
             m_channel = std::make_shared<Channel>(m_exec, m_capacity);
         return *m_channel;
+    }
+
+    std::size_t decode_room() const {
+        return m_max_decoded == 0 ? std::numeric_limits<std::size_t>::max() : m_max_decoded - m_decoded_total;
+    }
+
+    bool over_decoded_limit(std::size_t produced) {
+        if (produced == 0 || m_max_decoded == 0) {
+            return false;
+        }
+        if (produced > m_max_decoded - m_decoded_total) {
+            return true;
+        }
+        m_decoded_total += produced;
+        return false;
+    }
+
+    std::expected<std::string, error_code> decode_chunk(std::string_view data) {
+        bool exceeded = false;
+        auto out = m_decoder->write_bounded(data, decode_room(), exceeded);
+        if (m_decoder->failed()) {
+            return std::unexpected{make_error_code(asio::error::invalid_argument)};
+        }
+        if (exceeded || over_decoded_limit(out.size())) {
+            return std::unexpected{make_error_code(asio::error::message_size)};
+        }
+        return out;
+    }
+
+    std::expected<std::string, error_code> finish_decoder() {
+        if (!m_decoder || m_decoder_finished) {
+            return std::string{};
+        }
+        m_decoder_finished = true;
+        bool exceeded = false;
+        auto tail = m_decoder->finish_bounded(decode_room(), exceeded);
+        if (m_decoder->failed()) {
+            return std::unexpected{make_error_code(asio::error::invalid_argument)};
+        }
+        if (exceeded || over_decoded_limit(tail.size())) {
+            return std::unexpected{make_error_code(asio::error::message_size)};
+        }
+        return tail;
+    }
+
+    // Shared EOF path for the pushed (h2/h3) side. Returns a final decoded tail
+    // if the codec buffered one, otherwise end-of-body.
+    asio::awaitable<std::expected<ReadResult, error_code>> finish_push_decoder() {
+        if (!m_decoder) {
+            m_eof = true;
+            co_return ReadResult::end();
+        }
+        auto tail = finish_decoder();
+        m_eof = true;
+        if (!tail) {
+            co_return std::unexpected(tail.error());
+        }
+        if (!tail->empty()) {
+            co_return ReadResult::chunk(std::move(*tail));
+        }
+        co_return ReadResult::end();
     }
 
     asio::any_io_executor m_exec;
@@ -275,6 +399,13 @@ class Body {
     std::function<void(std::size_t)> m_on_consumed;
     FirstReadHook m_first_read_hook;
     PullProvider m_pull; // set in pull mode (HTTP/1.x); unset = pushed channel (HTTP/2)
+    // Server request decompression (see enable_decoding). Unique-ptr keeps Body
+    // movable; the decoder is only touched from the consumer (read()).
+    std::unique_ptr<ContentDecoder> m_decoder;
+    std::size_t m_max_decoded{0};
+    std::size_t m_decoded_total{0};
+    bool m_read_started{false};
+    bool m_decoder_finished{false};
 };
 
 } // namespace simple_http

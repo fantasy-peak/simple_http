@@ -11,12 +11,16 @@
 //     size / type rules;
 //   * client: ClientConfig::auto_decompress and accept_encodings.
 //
-// Only the encoders live here. Decoding is provided for tests and for callers
-// that explicitly want it; the server never decodes (it does not accept
-// compressed request bodies) and the HTTP client does not decode responses.
+// Encoders and decoders share the wire-format code here; the policies are
+// separate:
+//   * server responses: middleware::compress (opt-in, per scope);
+//   * server requests: middleware::decompress_request (opt-in, per scope);
+//   * client responses: ClientConfig::auto_decompress (Go-like default).
+// The server does not touch Content-Encoding unless that middleware is mounted.
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -34,6 +38,28 @@ namespace simple_http {
 inline constexpr std::string_view kEncodingGzip = "gzip";
 inline constexpr std::string_view kEncodingBrotli = "br";
 inline constexpr std::string_view kEncodingIdentity = "identity";
+
+// One Content-Encoding value, as far as this library understands it. A list of
+// codings (gzip, br) is Unsupported: chaining decoders is deliberately out of
+// scope, and treating a list as one coding would decode the wrong bytes.
+enum class ContentCoding : std::uint8_t { Identity, Gzip, Brotli, Unsupported };
+
+inline ContentCoding parse_content_coding(std::string_view value) {
+    value = trim_ows(value);
+    if (value.empty() || value.find(',') != std::string_view::npos) {
+        return ContentCoding::Unsupported;
+    }
+    if (iequals_ci(value, kEncodingIdentity)) {
+        return ContentCoding::Identity;
+    }
+    if (iequals_ci(value, kEncodingGzip) || iequals_ci(value, "x-gzip")) {
+        return ContentCoding::Gzip;
+    }
+    if (iequals_ci(value, kEncodingBrotli)) {
+        return ContentCoding::Brotli;
+    }
+    return ContentCoding::Unsupported;
+}
 
 // --- small text helpers ---------------------------------------------------
 
@@ -106,6 +132,31 @@ class ContentDecoder {
     virtual std::string write(std::string_view data) = 0;
     virtual std::string finish() = 0;
     virtual bool failed() const = 0;
+
+    // Bounded variants for untrusted input (the server's request
+    // decompression). `max_output` is an absolute cap for this call; when the
+    // codec would exceed it, it returns at most that many bytes and sets
+    // `limit_exceeded`. The stream is not usable afterwards - the caller is
+    // expected to fail the body. The default cannot bound a third-party
+    // codec's allocation; the bundled gzip/brotli decoders override it.
+    virtual std::string write_bounded(std::string_view data, std::size_t max_output, bool &limit_exceeded) {
+        limit_exceeded = false;
+        auto out = write(data);
+        if (out.size() > max_output) {
+            out.resize(max_output);
+            limit_exceeded = true;
+        }
+        return out;
+    }
+    virtual std::string finish_bounded(std::size_t max_output, bool &limit_exceeded) {
+        limit_exceeded = false;
+        auto out = finish();
+        if (out.size() > max_output) {
+            out.resize(max_output);
+            limit_exceeded = true;
+        }
+        return out;
+    }
 };
 
 namespace detail {
@@ -247,7 +298,13 @@ class GzipDecoder final : public ContentDecoder {
         }
     }
 
-    std::string write(std::string_view data) override { return run(data); }
+    std::string write(std::string_view data) override {
+        bool unused = false;
+        return run(data, std::numeric_limits<std::size_t>::max(), unused);
+    }
+    std::string write_bounded(std::string_view data, std::size_t max_output, bool &limit_exceeded) override {
+        return run(data, max_output, limit_exceeded);
+    }
 
     // inflate has no flush step: the stream ends where the data says it does,
     // so reaching here without Z_STREAM_END means the body was truncated.
@@ -261,7 +318,8 @@ class GzipDecoder final : public ContentDecoder {
     bool failed() const override { return m_failed; }
 
   private:
-    std::string run(std::string_view data) {
+    std::string run(std::string_view data, std::size_t max_output, bool &limit_exceeded) {
+        limit_exceeded = false;
         if (m_failed) {
             return {};
         }
@@ -273,7 +331,14 @@ class GzipDecoder final : public ContentDecoder {
             m_zs.next_out = reinterpret_cast<Bytef *>(buf);
             m_zs.avail_out = sizeof(buf);
             const int rc = ::inflate(&m_zs, Z_NO_FLUSH);
-            out.append(buf, sizeof(buf) - m_zs.avail_out);
+            const std::size_t produced = sizeof(buf) - m_zs.avail_out;
+            const std::size_t room = max_output > out.size() ? max_output - out.size() : 0;
+            if (produced > room) {
+                out.append(buf, room);
+                limit_exceeded = true;
+                break;
+            }
+            out.append(buf, produced);
             if (rc == Z_STREAM_END) {
                 m_stream_end = true;
                 if (m_zs.avail_in == 0)
@@ -337,6 +402,15 @@ class BrotliDecoderImpl final : public ContentDecoder {
     }
 
     std::string write(std::string_view data) override {
+        bool unused = false;
+        return run(data, std::numeric_limits<std::size_t>::max(), unused);
+    }
+    std::string write_bounded(std::string_view data, std::size_t max_output, bool &limit_exceeded) override {
+        return run(data, max_output, limit_exceeded);
+    }
+
+    std::string run(std::string_view data, std::size_t max_output, bool &limit_exceeded) {
+        limit_exceeded = false;
         if (!m_st || m_failed) {
             return {};
         }
@@ -349,7 +423,14 @@ class BrotliDecoderImpl final : public ContentDecoder {
             std::uint8_t *next_out = buf;
             const BrotliDecoderResult rc =
                 ::BrotliDecoderDecompressStream(m_st, &avail_in, &next_in, &avail_out, &next_out, nullptr);
-            out.append(reinterpret_cast<const char *>(buf), sizeof(buf) - avail_out);
+            const std::size_t produced = sizeof(buf) - avail_out;
+            const std::size_t room = max_output > out.size() ? max_output - out.size() : 0;
+            if (produced > room) {
+                out.append(reinterpret_cast<const char *>(buf), room);
+                limit_exceeded = true;
+                break;
+            }
+            out.append(reinterpret_cast<const char *>(buf), produced);
             if (rc == BROTLI_DECODER_RESULT_SUCCESS) {
                 m_stream_end = true;
                 break;

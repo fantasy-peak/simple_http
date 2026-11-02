@@ -7,6 +7,7 @@
 //
 // Compiled in unconditionally; `enabled` is the runtime decision to use it.
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -58,6 +59,27 @@ struct CompressionConfig {
     // compressed - which can make it a few bytes larger. Turn this off to have
     // only responses whose full length is known (send()) compressed.
     bool compress_streamed{true};
+};
+
+// RequestDecompressionConfig: the server-side counterpart, used by
+// middleware::decompress_request(). The server does nothing automatically -
+// this policy only exists while that middleware is mounted for a scope, just
+// like CompressionConfig only applies while middleware::compress is mounted.
+struct RequestDecompressionConfig {
+    // Cap on the decoded (not wire) body size. 0 means no extra cap; the
+    // engine's max_body_bytes still bounds the compressed input.
+    std::size_t max_decoded_bytes{64ull * 1024 * 1024};
+
+    // Codings this policy accepts. Any other Content-Encoding is answered with
+    // 415 by the middleware.
+    bool gzip{true};
+    bool brotli{true};
+
+    // Exact request targets, or prefixes when the entry ends in '/', that the
+    // middleware leaves alone. This is how a globally mounted policy can keep
+    // reverse-proxy routes on the raw compressed body (Go's ReverseProxy
+    // behaviour).
+    std::vector<std::string> excluded_paths{};
 };
 
 } // namespace simple_http

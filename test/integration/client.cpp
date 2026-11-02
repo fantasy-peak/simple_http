@@ -80,6 +80,9 @@ class FakeServer {
     std::uint16_t port() const { return m_port; }
 
     std::atomic<int> connections{0};
+    // The head of the last request received, for tests that assert what the
+    // client did (or did not) put on the wire.
+    std::string last_request;
 
   private:
     void accept() {
@@ -109,6 +112,7 @@ class FakeServer {
                 if (seen.find("\r\n\r\n") != std::string::npos)
                     break;
             }
+            last_request = seen;
         }
         if (m_split_write) {
             // Deliver it in small pieces: a head that arrives complete is parsed in
@@ -814,6 +818,7 @@ struct ApiResult {
     sh::Version version{sh::Version::Http11};
     sh::Headers headers;
     bool bodyless{false};
+    bool uncompressed{false};
     std::string body;
 
     std::optional<std::string_view> header(std::string_view name) const { return headers.get(name); }
@@ -829,6 +834,7 @@ asio::awaitable<std::expected<ApiResult, sh::error_code>> fetch(h::Client &clien
     out.version = r->version();
     out.headers = r->headers();
     out.bodyless = r->bodyless();
+    out.uncompressed = r->uncompressed();
     auto body = co_await r->read_all();
     if (!body)
         co_return std::unexpected{body.error()};
@@ -1662,6 +1668,13 @@ asio::awaitable<void> suite_tls(std::uint16_t tls_port) {
 asio::awaitable<void> suite_raw_peer(asio::io_context &ctx) {
     std::printf("\n== raw peer edge cases ==\n");
 
+    { // HEAD does not trigger the automatic Accept-Encoding (Go semantics)
+        FakeServer &fake = make_fake(ctx, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        h::Client http{co_await asio::this_coro::executor, base_config()};
+        auto r = co_await fetch(http, http.head(url(fake.port(), "/x")));
+        check(r && r->status == 200 && fake.last_request.find("accept-encoding") == std::string::npos,
+              "HEAD suppresses the automatic Accept-Encoding");
+    }
     { // an informational response before the real one
         FakeServer &fake = make_fake(ctx,
                                      "HTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\n"
@@ -1778,9 +1791,9 @@ std::string big_expected(std::size_t n) {
 
 // Response compression, against a listener that has it enabled. The other
 // suites compare response bodies byte-for-byte, so they must keep running
-// against servers that do not compress. The client never asks for compression
-// or decodes it on its own, so this suite supplies Accept-Encoding and decodes
-// whatever comes back.
+// against servers that do not compress. The client's default now matches Go:
+// it advertises gzip (and only decodes what it advertised) unless the caller
+// set Accept-Encoding itself, the request is HEAD, or it carries Range.
 asio::awaitable<void> suite_compression(std::uint16_t comp_port, std::uint16_t plain_port) {
     std::printf("\n== response compression ==\n");
 
@@ -1823,11 +1836,12 @@ asio::awaitable<void> suite_compression(std::uint16_t comp_port, std::uint16_t p
                   tag + ": /big with 'gzip' -> " + (r ? enc : describe(r.error())));
         }
 
-        // A client that did not ask must get the bytes unchanged.
+        // A default client (auto_decompress on) asks for gzip and sees the
+        // decoded body; the encoding headers are gone and Uncompressed is set.
         {
             auto r = co_await fetch(http, http.get(url(comp_port, "/big?n=8192")));
-            check(r && !r->header("content-encoding").has_value() && r->body == want,
-                  tag + ": /big without accept-encoding is untouched");
+            check(r && !r->header("content-encoding").has_value() && r->body == want && r->uncompressed,
+                  tag + ": /big without accept-encoding is decoded by the default client");
         }
 
         // identity explicitly requested.
@@ -1904,6 +1918,7 @@ asio::awaitable<void> suite_compression(std::uint16_t comp_port, std::uint16_t p
         {
             auto r = co_await fetch(http, http.get(url(comp_port, "/big?n=8192")));
             check(r && r->status == 200 && r->body == want, tag + ": the body arrives decoded");
+            check(r && r->uncompressed, tag + ": Response::uncompressed is set");
             check(r && !r->header("content-encoding").has_value(), tag + ": the encoding header is gone");
             check(r && !r->header("content-length").has_value(), tag + ": the stale Content-Length is gone");
         }
@@ -1931,12 +1946,29 @@ asio::awaitable<void> suite_compression(std::uint16_t comp_port, std::uint16_t p
             }
         }
 
-        // A caller that sets the header keeps control of the negotiation, and
-        // the result is still decoded.
+        // Go semantics: a caller that sets the header keeps the response opaque.
+        // The client must not decode a body it did not negotiate itself.
         {
             auto r = co_await fetch(http, http.get(url(comp_port, "/big?n=8192")).header("accept-encoding", "gzip"));
-            check(r && r->body == want, tag + ": an explicit Accept-Encoding is respected");
+            const std::string enc = r ? std::string{r->header("content-encoding").value_or("")} : std::string{};
+            check(r && enc == "gzip" && sh::decompress_all(enc, r->body) == want && !r->uncompressed,
+                  tag + ": an explicit Accept-Encoding keeps the body encoded");
         }
+    }
+
+    // Default configuration advertises gzip only (Go), and HEAD/Range suppress
+    // the automatic header entirely.
+    {
+        h::Client http{co_await asio::this_coro::executor, base_config()};
+        auto r = co_await fetch(http, http.get(url(comp_port, "/headers")));
+        check(r && r->body.find("accept-encoding: gzip") != std::string::npos &&
+                  r->body.find("accept-encoding: br") == std::string::npos &&
+                  r->body.find("accept-encoding: gzip, br") == std::string::npos,
+              "the default client advertises gzip only");
+
+        auto ranged = co_await fetch(http, http.get(url(comp_port, "/headers")).header("range", "bytes=0-0"));
+        check(ranged && ranged->body.find("accept-encoding:") == std::string::npos,
+              "Range suppresses the automatic Accept-Encoding");
     }
 
     co_return;

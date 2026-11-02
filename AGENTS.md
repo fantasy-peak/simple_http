@@ -316,7 +316,8 @@ using Middleware =
 `request_id()`、`access_log()`、`recovery()`、`basic_auth(user, pass)`、
 `real_ip(trusted)`、`clean_path()`、`strip_prefix(prefix)`、`redirect_slashes()`、
 `ws_origin(allowed, allow_missing=false)`、`timeout(d)`、`compress(cfg)`、
-`secure_headers(cfg)`、`rate_limit(bucket)`、`rate_limit(limiter, key_fn)`；
+`decompress_request(cfg)`（opt-in 请求体解压）、`secure_headers(cfg)`、
+`rate_limit(bucket)`、`rate_limit(limiter, key_fn)`；
 `simple_http::make_cors_middleware(cfg)` 在顶层命名空间。
 
 路由匹配顺序：
@@ -454,9 +455,14 @@ auto ws = co_await http.open_websocket("wss://host/chat");
   `multipart`、`basic_auth`、`bearer_auth`、`max_body_bytes`、`timeout`、`version`。
 - `send()` 返回缓冲 `Response`，应用重定向 / Cookie / 重试 / 自动解压。
 - `open_stream()` / `send_stream()` 是显式流，**不**自动跟随重定向、不应用 Cookie、
-  不跑便捷层重试。
+  不跑便捷层重试；自动解压仍生效（与 Go 的 `Response.Body` 一致）。
+- 自动解压对齐 Go `Transport`：`auto_decompress` 默认 true，默认只广告/解码 gzip；
+  调用方显式设置 `Accept-Encoding`、HEAD、带 Range 时不注入也不解码。br 需显式
+  `accept_encodings = {"br","gzip"}`。解压后删除 `Content-Encoding`/`Content-Length`
+  并置 `Response::uncompressed()`；解压装饰器会把请求 `finish_trailers()` 转发给内层。
 - `Response`：`status`、`version`、`headers`、`header` / `header_owned`、`ok`、
-  `bodyless`、`error_for_status`、`text` / `bytes` / `json<T>`、`read` / `read_all`。
+  `bodyless`、`uncompressed`、`error_for_status`、`text` / `bytes` / `json<T>`、
+  `read` / `read_all`。
 - `Stream`：`write` / `finish`、`read_head`、`read` / `read_all`、`trailers`、
   `abort`；`read()` 受 body-idle 预算约束，`read_all()` 不套该 deadline。
 - 客户端绑定单线程 executor（模型 A）；`io_context` 必须活过会话。
@@ -653,10 +659,10 @@ test/run.sh <suite>     # 单套件，例如 unit / server-conformance / client-
 
 | 套件 | suite | 规模 |
 |---|---|---|
-| Catch2 单元 | `unit` | 389 个用例，65298 条断言 |
+| Catch2 单元 | `unit` | 401 个用例，65377 条断言 |
 | 裸 socket 回归 | `server-regression` | 79 个 TEST_CASE |
-| 客户端整合自检 | `client` | 245 checks |
-| Python 服务端交叉 | `server-conformance` | 113 checks（httpx / hyper-h2 / websockets / aioquic） |
+| 客户端整合自检 | `client` | 250 checks |
+| Python 服务端交叉 | `server-conformance` | 129 checks（httpx / hyper-h2 / websockets / aioquic） |
 
 单元测试按标签过滤：`test/run.sh unit '[h2]'`。
 
@@ -686,6 +692,7 @@ test/.venv/bin/pip install -r test/requirements.txt
 | `test/examples/openapi_verify.py` | OpenAPI 文档 | 端到端断言 |
 | `test/differential/run.py framework` | C++ 框架参考服务器 ↔ Go `net/http` 参考服务器 | 64 checks：State/Extractor/Validation/Session/CSRF/JWT(HS/RS/ES)/Host/Wildcard |
 | `test/differential/run.py client` | C++ client → Go server；Go client → Go/C++ server | 8 checks × 3 条腿：流式上传/100-continue/trailers/429/JWKS |
+| `test/differential/run.py compression` | C++ client ↔ Go client；C++ server ↔ Go server | 客户端 10 项解压语义 diff + 服务端解压 5 项 |
 | Autobahn | Python/Twisted → WebSocket | FAILED 0、NON-STRICT 0 |
 | h2spec | Go → 纯 h2c `:7790` | 146/146 |
 | h1spec | Deno → 纯 h1 `:7791` | 33/33 |
@@ -836,6 +843,15 @@ test/run.sh server-conformance
     把字段写进 `Request::trailers()`。
 21. **状态码重试**：`retry_statuses` 默认空（与 Go/reqwest 一致），显式开启后才按
     429/503 + `Retry-After` 重试；重试前响应体已消费。
+22. **请求解压是 opt-in 且默认 Go 语义**：服务端只有挂载
+    `middleware::decompress_request` 才解码；反代路由不挂载时原样转发压缩体与头。
+    解码在 `Body::read()` 消费侧进行（h2/h3 可在 middleware 运行前已排队原始帧），
+    `on_consumed` 必须按线上压缩字节归还流控；解码后超限 413、畸形/截断 400、
+    不支持的 coding 415。`Body::enable_decoding` 只拒绝“已开始 read”的 body。
+23. **客户端解压只在“自己请求的编码”上生效**：默认 `auto_decompress=true` + 仅 gzip；
+    调用方显式设置 `Accept-Encoding`、HEAD、Range 时不注入也不解码。解压装饰器必须
+    转发 `clear_head_cache()`（否则 100-continue 的 interim head 会循环）和
+    `finish_trailers()`。
 
 ---
 
@@ -857,6 +873,9 @@ test/run.sh server-conformance
   静态/手动拉取文档（`fetch_jwks_json`），不内置后台自动刷新；`aud`/`scope` 按字符串
   claim 解析，不支持 audience 数组。
 - 请求 trailers 只支持 h1/h2；h3 返回 `trailers_not_supported`。
+- 服务端请求解压只支持单个 `gzip`/`br` coding；`deflate`、多 coding 列表返回 415。
+  默认不启用，需挂载 `middleware::decompress_request`。
+- 客户端自动解压默认仅 gzip（对齐 Go）；br 需显式 `accept_encodings={"br","gzip"}`。
 - 自动 100-continue 在 h1/h2 等待 interim；h3 直接发送 body（服务端无 1xx API）。
 - Session 只内置进程内存储；Redis/DB 适配器由消费侧实现 `SessionStore`。CSRF 是
   header 型 double-submit，无法设置 header 的表单需 handler 自行校验字段。
@@ -896,6 +915,7 @@ test/run.sh openapi
 test/run.sh example_readme
 test/run.sh framework-diff            # C++ vs Go net/http 框架层差分（64 checks）
 test/run.sh client-diff               # 客户端/服务端差分：C++/Go client × Go/C++ server
+test/run.sh compression-diff          # 压缩/解压：C++ client vs Go client；C++ server vs Go server
 
 # 单独运行 Python 交叉套件（runner 会注入 SIMPLE_HTTP_TEST_BIN_DIR）
 test/.venv/bin/python test/server/run.py
@@ -903,6 +923,7 @@ test/.venv/bin/python test/client/run.py
 test/.venv/bin/python test/client/checks.py
 test/.venv/bin/python test/differential/run.py framework
 test/.venv/bin/python test/differential/run.py client
+test/.venv/bin/python test/differential/run.py compression
 
 # 手工工具
 xmake run tool_h3_public -- https://cloudflare-quic.com/

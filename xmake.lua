@@ -179,6 +179,14 @@ add_test_binary("probe_client_diff", "test/client/probes/client_diff_probe.cpp",
     packages = {"zlib", "brotli"},
 })
 
+-- Client compression semantics against a Go net/http reference server. Mirrors
+-- test/differential/go/compression_probe.go; the two PASS/FAIL outputs are
+-- diffed line by line.
+add_test_binary("probe_compression_diff", "test/client/probes/compression_diff_probe.cpp", {
+    group = "test/probes",
+    packages = {"zlib", "brotli"},
+})
+
 -- Manual proxy probe against Go reference servers (SOCKS5 / HTTPS / CONNECT).
 add_test_binary("probe_client_go", "test/client/probes/client_go_probe.cpp", {
     group = "test/probes",

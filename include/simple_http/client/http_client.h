@@ -549,12 +549,27 @@ class ClientEngine {
             spec->set_target(url_target.empty() ? "/" : url_target);
 
         // Every public entry point funnels through here, so this is the one
-        // place that has to advertise what we can decode. A caller that set
-        // accept-encoding itself keeps full control of the negotiation.
-        if (m_config.auto_decompress && !spec->headers().contains("accept-encoding")) {
-            std::string wanted = accept_encoding_value(m_config.accept_encodings);
-            if (!wanted.empty()) {
-                spec->mutable_headers().add("accept-encoding", std::move(wanted));
+        // place that has to advertise what we can decode. Go's Transport adds
+        // Accept-Encoding only when it is the one asking (no caller header, no
+        // Range, not HEAD), and only decodes a response when it added the
+        // header itself. Track that decision for the response decorator.
+        detail::ResponseDecoding decoding;
+        if (auto injected = spec->get_state<detail::InjectedAcceptEncoding>()) {
+            const auto current = spec->header("accept-encoding");
+            if (current && *current == injected->header_value) {
+                decoding.enabled = true;
+                decoding.encodings = injected->encodings;
+            }
+        }
+        if (!decoding.enabled && m_config.auto_decompress && !spec->headers().contains("accept-encoding") &&
+            !spec->headers().contains("range") && spec->method() != Method::Head) {
+            auto advertised = detail::normalize_accept_encodings(m_config.accept_encodings);
+            if (!advertised.empty()) {
+                std::string value = detail::join_encodings(advertised);
+                spec->mutable_headers().add("accept-encoding", value);
+                spec->set_state(detail::InjectedAcceptEncoding{value, advertised});
+                decoding.enabled = true;
+                decoding.encodings = std::move(advertised);
             }
         }
 
@@ -652,7 +667,7 @@ class ClientEngine {
             }
             auto usable = co_await negotiate_and_open(session, target, spec->clone_for_replay(m_executor));
             if (usable) {
-                auto stream = maybe_decompressing_stream(*usable, m_config.auto_decompress);
+                auto stream = maybe_decompressing_stream(*usable, std::move(decoding));
                 stream->set_gate_token(gate_token);
                 if (keep_exchange) {
                     if (gated) {

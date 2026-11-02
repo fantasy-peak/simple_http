@@ -173,6 +173,90 @@ def _probe_lines(path: Path) -> list[str]:
             if line.startswith(("PASS", "FAIL"))]
 
 
+def _output_lines(text: str) -> list[str]:
+    return [line for line in text.splitlines() if line.startswith(("PASS", "FAIL"))]
+
+
+def compression() -> int:
+    """C++ client vs Go net/http client, against the same Go reference server."""
+    reporter = Reporter(os.environ.get("SIMPLE_HTTP_TEST_SUITE", "compression-diff"))
+    cache = workdir()
+    cpp_probe = find_binary("probe_compression_diff")
+    if not cpp_probe.exists():
+        reporter.check(False, "C++ probe not built — run `xmake build probe_compression_diff`")
+        return reporter.summary()
+
+    go_server = cache / "compression_server"
+    go_probe = cache / "compression_probe"
+    go_server_probe = cache / "compression_server_probe"
+    if not go_build(go_server, GO_DIR / "compression_server.go"):
+        reporter.check(False, "build Go reference server")
+        return reporter.summary()
+    if not go_build(go_probe, GO_DIR / "compression_probe.go"):
+        reporter.check(False, "build Go probe")
+        return reporter.summary()
+    if not go_build(go_server_probe, GO_DIR / "compression_server_probe.go"):
+        reporter.check(False, "build Go server probe")
+        return reporter.summary()
+
+    fixture = find_binary("fixture_server")
+    if not fixture.exists():
+        reporter.check(False, "C++ fixture not built — run `xmake build fixture_server`")
+        return reporter.summary()
+
+    port = 7810
+    log = open(cache / "compression_server.log", "w")
+    fixture_log = open(cache / "compression_fixture.log", "w")
+    server = subprocess.Popen([str(go_server), str(port)], stdout=log, stderr=subprocess.STDOUT,
+                              cwd=str(REPO))
+    cpp_server = subprocess.Popen([str(fixture)], stdout=fixture_log, stderr=subprocess.STDOUT,
+                                  cwd=str(REPO))
+    try:
+        go_up = wait_http(f"http://127.0.0.1:{port}/plain")
+        cpp_up = wait_http("http://127.0.0.1:7788/world")
+        reporter.check(go_up, f"Go reference server up on :{port}")
+        reporter.check(cpp_up, "C++ fixture server up on :7788")
+        if not (go_up and cpp_up):
+            return reporter.summary()
+
+        base = f"http://127.0.0.1:{port}"
+        go_run = subprocess.run([str(go_probe), base], text=True, capture_output=True, cwd=str(REPO))
+        cpp_run = subprocess.run([str(cpp_probe), base], text=True, capture_output=True, cwd=str(REPO))
+        go_text = go_run.stdout + go_run.stderr
+        cpp_text = cpp_run.stdout + cpp_run.stderr
+        print("== Go net/http client\n" + go_text.rstrip())
+        print("== simple_http client\n" + cpp_text.rstrip())
+
+        go_lines = _output_lines(go_run.stdout)
+        cpp_lines = _output_lines(cpp_run.stdout)
+        for line in cpp_lines:
+            reporter.record(line.startswith("PASS"), line[6:].strip())
+        if go_run.returncode != 0:
+            reporter.record(False, f"Go probe exited with {go_run.returncode}")
+        if cpp_run.returncode != 0:
+            reporter.record(False, f"C++ probe exited with {cpp_run.returncode}")
+        diff = list(difflib.unified_diff(go_lines, cpp_lines, "go-client", "simple_http-client",
+                                         lineterm=""))
+        if diff:
+            print("\n".join(diff), file=sys.stderr)
+        reporter.check(not diff, "Go and simple_http client outputs agree")
+
+        # Server-side request decompression: Go reference handler vs the C++
+        # fixture's middleware, on the same requests.
+        server_run = subprocess.run([str(go_server_probe), base, "http://127.0.0.1:7788"],
+                                    text=True, capture_output=True, cwd=str(REPO))
+        print("== server request decompression (Go vs C++)\n" + server_run.stdout.rstrip())
+        for line in _output_lines(server_run.stdout):
+            reporter.record(line.startswith("PASS"), line[6:].strip())
+        if server_run.returncode != 0:
+            reporter.record(False, f"server probe exited with {server_run.returncode}")
+    finally:
+        stop(server, cpp_server)
+        log.close()
+        fixture_log.close()
+    return reporter.summary()
+
+
 def client() -> int:
     reporter = Reporter(os.environ.get("SIMPLE_HTTP_TEST_SUITE", "client-diff"))
     cache = workdir()
@@ -260,7 +344,9 @@ def main() -> int:
         return framework()
     if suite == "client":
         return client()
-    print("usage: run.py framework|client", file=sys.stderr)
+    if suite == "compression":
+        return compression()
+    print("usage: run.py framework|client|compression", file=sys.stderr)
     return 2
 
 

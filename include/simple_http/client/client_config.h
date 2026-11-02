@@ -346,16 +346,18 @@ struct ClientConfig {
     bool tcp_nodelay{true};
     bool tcp_keepalive{false};
 
-    // Automatic response decompression. When on, the client advertises the
-    // encodings below and decodes whatever comes back, so a caller always sees
-    // the original bytes. Off by default: it changes what goes out on the wire,
-    // so it is opt-in. Set it per Client, or flip it at runtime by recreating
-    // the Client (or by setting Accept-Encoding yourself — see below).
-    bool auto_decompress{false};
+    // Automatic response decompression, matching Go's http.Transport: on by
+    // default, but only when the client itself added Accept-Encoding (the
+    // caller did not set it), the method is not HEAD, and the request has no
+    // Range header. Set false for Go's DisableCompression behaviour, or set
+    // Accept-Encoding yourself to keep the response opaque.
+    bool auto_decompress{true};
     // Encodings advertised when auto_decompress is on, most preferred first.
-    // Only the ones this build can actually decode are sent; a caller that sets
-    // accept-encoding itself keeps full control (nothing is injected).
-    std::vector<std::string> accept_encodings{"br", "gzip"};
+    // Go's Transport only negotiates gzip, so gzip is the default. Add "br" to
+    // opt into brotli (a simple_http extension). Only encodings this build can
+    // decode are sent; a caller that sets accept-encoding itself keeps full
+    // control (nothing is injected and nothing is decoded).
+    std::vector<std::string> accept_encodings{"gzip"};
 
     // Redirect handling for the convenience level (get/post/put/…):
     //   * max_redirects — how many 3xx (301/302/303/307/308) with a Location to

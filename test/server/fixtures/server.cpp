@@ -107,6 +107,35 @@ template <typename ServerT> void register_routes(ServerT &server) {
                  });
 
     // Reads the whole request body and echoes it back (one-shot).
+    // Request decompression is opt-in: only this route mounts the middleware.
+    // A decoded body is echoed with the post-middleware Content-Encoding /
+    // Content-Length values, so the suite can verify the headers were removed.
+    // The reverse-proxy routes below deliberately do not mount it: they must
+    // forward the compressed bytes and headers untouched (Go's ReverseProxy
+    // semantics).
+    server.route(any_methods, "/decode",
+                 {middleware::decompress_request(RequestDecompressionConfig{.max_decoded_bytes = 1024 * 1024})},
+                 [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+                     auto body = co_await req->body().read_all();
+                     if (!body) {
+                         const int status = body.error() == asio::error::message_size ? 413 : 400;
+                         co_await res->status(status).send(body.error().message());
+                         co_return;
+                     }
+                     const std::string ce{req->header(field::content_encoding).value_or("none")};
+                     const std::string cl{req->header(field::content_length).value_or("none")};
+                     co_await res->status(200).send(std::format("ce={};cl={};", ce, cl) + *body);
+                 });
+
+    // No decompression middleware: the raw body and Content-Encoding reach the
+    // handler, matching Go's server and the reverse-proxy passthrough path.
+    server.route(any_methods, "/raw",
+                 [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+                     auto body = co_await req->body().read_all();
+                     std::string ce{req->header(field::content_encoding).value_or("none")};
+                     co_await res->status(200).send(std::format("ce={};", ce) + (body ? *body : std::string{}));
+                 });
+
     server.route(any_methods, "/echo",
                  [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
                      auto body = co_await req->body().read_all();

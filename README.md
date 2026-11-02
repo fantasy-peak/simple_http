@@ -481,13 +481,22 @@ Host routing currently applies to HTTP dispatch, not WebSocket lookup.
 | Boost (asio, regex) | Async I/O and regex |
 | OpenSSL | TLS / mTLS / QUIC TLS |
 | glaze | JSON reflection and OpenAPI schemas (a normal library dependency) |
-| zlib, brotli | Response compression and WebSocket permessage-deflate (always compiled in) |
+| zlib, brotli | Response compression, request decompression and WebSocket permessage-deflate (always compiled in) |
 | ngtcp2, nghttp3 | HTTP/3 only (QUIC/QPACK/framing) |
 | Catch2 | Unit tests only |
 
 Compression and WebSocket extensions have **no feature macro**: zlib/brotli are normal
 dependencies, and whether they take effect is a runtime decision
-(`middleware::compress`, `EngineLimits::ws_compression`, `ClientConfig::auto_decompress`).
+(`middleware::compress`, `middleware::decompress_request`,
+`EngineLimits::ws_compression`, `ClientConfig::auto_decompress`).
+
+By default the server does not compress responses, decompress requests or rewrite
+`Content-Encoding` on a reverse proxy — the same defaults as Go's `net/http`. Mount
+`middleware::compress(cfg)` to compress responses and
+`middleware::decompress_request(cfg)` to accept compressed request bodies; both can be
+scoped globally, per group or per route. Reverse-proxy routes that do not mount the
+decompression middleware forward the compressed body and headers untouched, matching
+`httputil.ReverseProxy`.
 
 ### xmake
 
@@ -683,6 +692,7 @@ Built-in middleware (in `simple_http::middleware` unless noted):
 | `ws_origin(allowed, allow_missing=false)` | Validate WebSocket `Origin` (CSWSH defense) |
 | `timeout(d)` | Streaming-friendly timeout: absolute before the head, idle after it; 504 or abort |
 | `compress(cfg)` | Mounting enables response compression; decides per request by Accept-Encoding / type / size |
+| `decompress_request(cfg)` | Mounting enables request-body decompression (gzip/br); unsupported coding → 415, decoded-size cap → 413 |
 | `secure_headers(cfg)` | CSP / X-Frame-Options / nosniff / Referrer-Policy / HSTS, etc. |
 | `rate_limit(bucket)` | Shared token bucket; 429 + `Retry-After` |
 | `rate_limit(limiter, key_fn)` | Per-key buckets with a key cap and LRU eviction |
@@ -942,7 +952,24 @@ server.use(middleware::compress(CompressionConfig{
     .brotli_quality = 5,
     .compress_streamed = true,
 }));
+
+// request decompression: also opt-in, and also scopeable to a group or one route
+server.route({Method::Post}, "/upload",
+    {middleware::decompress_request(RequestDecompressionConfig{.max_decoded_bytes = 1 << 20})},
+    upload_handler);
+
+// a globally mounted policy can leave reverse-proxy routes on the raw bytes
+server.use(middleware::decompress_request(RequestDecompressionConfig{
+    .excluded_paths = {"/proxy/"},
+}));
 ```
+
+`decompress_request` decodes `gzip`/`br` request bodies before the handler runs and
+removes `Content-Encoding`/`Content-Length` (the handler sees the identity representation).
+Unsupported codings (`deflate`, multi-coding lists) are 415, malformed/truncated streams
+are 400, and decoded bytes beyond `max_decoded_bytes` are 413. Do not mount it on a
+reverse-proxy route unless you intend to terminate the encoding: without it, the upstream
+receives the compressed bytes and headers unchanged, like Go's `ReverseProxy`.
 
 `allow_origins` accepts exact origins and subdomain wildcards such as
 `https://*.example.com`. With `allow_credentials=true` the server mirrors the actual
@@ -1175,7 +1202,8 @@ cfg.response_head_timeout = std::chrono::seconds{30};  // TTFB
 cfg.body_idle_timeout = std::chrono::seconds{0};       // 0 = a body may idle forever
 cfg.max_redirects = 5;                                 // 0 = do not follow redirects
 cfg.cookie_jar = std::make_shared<CookieJar>();
-cfg.auto_decompress = true;                            // decompress and send Accept-Encoding
+cfg.auto_decompress = true;                            // Go-like: send Accept-Encoding: gzip and decode
+cfg.accept_encodings = {"gzip"};                       // add "br" to opt into brotli
 cfg.default_version = HttpVersionPolicy::Auto;         // Auto / Http11 / Http2 / Http3
 cfg.default_h2c = H2cMode::Upgrade;                    // Upgrade / PriorKnowledge / Off
 cfg.retry.max_retries = 2;
@@ -1368,10 +1396,10 @@ testing them against each other cancels the mistake out.
 ### Local test targets
 
 ```sh
-test/run.sh unit                # Catch2: 389 cases, 65298 assertions
+test/run.sh unit                # Catch2: 401 cases, 65377 assertions
 test/run.sh server-regression   # raw-socket malformed/boundary requests
-test/run.sh client              # client integration: 245 checks
-test/run.sh server-conformance  # third-party Python clients: 113 checks
+test/run.sh client              # client integration: 250 checks
+test/run.sh server-conformance  # third-party Python clients: 129 checks
 test/run.sh fast                # all of the above that do not need a venv
 ```
 
@@ -1390,7 +1418,7 @@ builder, and `:7797` a non-mTLS TLS h1 listener for the benchmark.
 
 | Direction | Driver | Coverage |
 |---|---|---|
-| Server ← independent clients | `test/server/run.py` (httpx / hyper-h2 / websockets / aioquic) | 113 checks: h1 / h2 / h3 / WS / trailers / CORS / regressions |
+| Server ← independent clients | `test/server/run.py` (httpx / hyper-h2 / websockets / aioquic) | 129 checks: h1 / h2 / h3 / WS / trailers / CORS / regressions / request decompression |
 | Server ← independent client | `test/server/h2_websocket.py` | 85 checks: HTTP/2 extended CONNECT and h2 WebSocket proxying |
 | Client → independent servers | `test/client/run.py` | 43 checks (stdlib http.server / websockets) + 6 checks (aioquic h3) |
 | Server ← Autobahn | Docker `crossbario/autobahn-testsuite` | Full WebSocket suite; FAILED 0, NON-STRICT 0 |
@@ -1470,6 +1498,12 @@ xmake run tool_loadgen ws://127.0.0.1:7788/echo1k -p ws -n 200000 -c 64
   server, and the Go probe against the C++ framework server. The three PASS/FAIL
   outputs are diffed across streaming multipart/file upload, automatic 100-continue,
   request trailers, 429/Retry-After and JWKS fetch.
+- `test/run.sh compression-diff` / `test/.venv/bin/python test/differential/run.py compression`:
+  runs the Go `net/http` client and the simple_http client against the same Go
+  reference server and diffs their PASS/FAIL lines (gzip negotiation, explicit
+  `Accept-Encoding`, HEAD/Range, `Uncompressed`, header removal), then compares
+  server-side request decompression between a Go reference handler and
+  `middleware::decompress_request` on the same compressed requests.
 
 <a id="known-limitations"></a>
 ## Known limitations

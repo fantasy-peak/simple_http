@@ -448,12 +448,18 @@ dispatch，WebSocket 查找仍是 host-agnostic。
 | Boost（asio、regex） | 异步 I/O 与正则 |
 | OpenSSL | TLS / mTLS / QUIC TLS |
 | glaze | JSON 反射与 OpenAPI schema（主库常规依赖） |
-| zlib、brotli | 响应压缩与 WebSocket permessage-deflate（始终编入） |
+| zlib、brotli | 响应压缩、请求解压与 WebSocket permessage-deflate（始终编入） |
 | ngtcp2、nghttp3 | 仅 HTTP/3（QUIC/QPACK/帧层） |
 | Catch2 | 仅单元测试 |
 
 压缩与 WebSocket 扩展**没有开关宏**：zlib/brotli 是常规依赖，是否生效由运行时配置决定
-（`middleware::compress`、`EngineLimits::ws_compression`、`ClientConfig::auto_decompress`）。
+（`middleware::compress`、`middleware::decompress_request`、
+`EngineLimits::ws_compression`、`ClientConfig::auto_decompress`）。
+
+服务端默认不压缩响应、不解压请求，也不在反向代理链路上改写 `Content-Encoding`——
+与 Go `net/http` 的默认行为一致。需要时显式挂载 `middleware::compress(cfg)` 压缩响应，
+或 `middleware::decompress_request(cfg)` 接受压缩请求体；两者都可作用于全局、group 或单路由。
+未挂载解压中间件的反代路由会原样转发压缩体与相关请求头，等价于 `httputil.ReverseProxy`。
 
 ### xmake
 
@@ -641,6 +647,7 @@ server.use([](RequestPtr req, ResponsePtr res, SslHandle ssl,
 | `ws_origin(allowed, allow_missing=false)` | 校验 WebSocket 的 `Origin`（CSWSH 防护） |
 | `timeout(d)` | 流式友好超时：响应头前绝对时限，响应头后空闲时限；到期 504 或中止 |
 | `compress(cfg)` | 挂载即启用响应压缩；按 Accept-Encoding / 类型 / 大小判定 |
+| `decompress_request(cfg)` | 挂载即启用请求体解压（gzip/br）；不支持的编码 → 415，解码后超限 → 413 |
 | `secure_headers(cfg)` | CSP / X-Frame-Options / nosniff / Referrer-Policy / HSTS 等 |
 | `rate_limit(bucket)` | 共享令牌桶；超限 429 + `Retry-After` |
 | `rate_limit(limiter, key_fn)` | 按 key 分桶；带 key 上限与 LRU 淘汰 |
@@ -894,7 +901,23 @@ server.use(middleware::compress(CompressionConfig{
     .brotli_quality = 5,
     .compress_streamed = true,
 }));
+
+// 请求解压：同样 opt-in，也可只作用于 group 或单个路由
+server.route({Method::Post}, "/upload",
+    {middleware::decompress_request(RequestDecompressionConfig{.max_decoded_bytes = 1 << 20})},
+    upload_handler);
+
+// 全局挂载时，可用 excluded_paths 让反代路由保持原始压缩字节
+server.use(middleware::decompress_request(RequestDecompressionConfig{
+    .excluded_paths = {"/proxy/"},
+}));
 ```
+
+`decompress_request` 在 handler 运行前解码 `gzip`/`br` 请求体，并删除
+`Content-Encoding`/`Content-Length`（handler 看到的是 identity 表示）。不支持的编码
+（`deflate`、多 coding 列表）返回 415，畸形/截断流返回 400，解码后超过
+`max_decoded_bytes` 返回 413。反代路由不要挂载它，除非确实要终止内容编码；不挂载时上游
+收到的仍是压缩体与原始头，与 Go `ReverseProxy` 一致。
 
 CORS 的 `allow_origins` 支持精确 origin 与子域通配 `https://*.example.com`；
 `allow_credentials=true` 时不会回 `*`，而是回显实际 Origin。
@@ -1105,7 +1128,8 @@ cfg.response_head_timeout = std::chrono::seconds{30};  // TTFB
 cfg.body_idle_timeout = std::chrono::seconds{0};       // 0 = 体可无限空闲
 cfg.max_redirects = 5;                                 // 0 = 不跟随
 cfg.cookie_jar = std::make_shared<CookieJar>();
-cfg.auto_decompress = true;                            // 自动解压并发送 Accept-Encoding
+cfg.auto_decompress = true;                            // Go 语义：发 Accept-Encoding: gzip 并解压
+cfg.accept_encodings = {"gzip"};                       // 加入 "br" 可显式启用 brotli
 cfg.default_version = HttpVersionPolicy::Auto;         // Auto / Http11 / Http2 / Http3
 cfg.default_h2c = H2cMode::Upgrade;                    // Upgrade / PriorKnowledge / Off
 cfg.retry.max_retries = 2;
@@ -1280,10 +1304,10 @@ socket 字节
 ### 本地测试目标
 
 ```sh
-test/run.sh unit                # Catch2：389 个用例，65298 条断言
+test/run.sh unit                # Catch2：401 个用例，65377 条断言
 test/run.sh server-regression   # 裸 socket 畸形/边界请求
-test/run.sh client              # 客户端整合自检：245 checks
-test/run.sh server-conformance  # Python 第三方客户端：113 checks
+test/run.sh client              # 客户端整合自检：250 checks
+test/run.sh server-conformance  # Python 第三方客户端：129 checks
 test/run.sh fast                # 以上不需要 venv 的套件
 ```
 
@@ -1296,7 +1320,7 @@ test/run.sh fast                # 以上不需要 venv 的套件
 
 | 方向 | 驱动 | 内容 |
 |---|---|---|
-| 服务端 ← 独立客户端 | `test/server/run.py`（httpx / hyper-h2 / websockets / aioquic） | 113 checks：h1 / h2 / h3 / WS / trailer / CORS / 回归 |
+| 服务端 ← 独立客户端 | `test/server/run.py`（httpx / hyper-h2 / websockets / aioquic） | 129 checks：h1 / h2 / h3 / WS / trailer / CORS / 回归 / 请求解压 |
 | 服务端 ← 独立客户端 | `test/server/h2_websocket.py` | 85 checks：HTTP/2 extended CONNECT 与 h2 WebSocket 反代 |
 | 客户端 → 独立服务端 | `test/client/run.py` | 43 checks（stdlib http.server / websockets）+ 6 checks（aioquic h3） |
 | 服务端 ← Autobahn | Docker `crossbario/autobahn-testsuite` | WebSocket 全量用例；要求 FAILED 0、NON-STRICT 0 |
@@ -1369,6 +1393,11 @@ xmake run tool_loadgen ws://127.0.0.1:7788/echo1k -p ws -n 200000 -c 64
   Go 参考服务端、Go 客户端打同一个 Go 服务端、Go 客户端再打 C++ 框架服务端；三份
   PASS/FAIL 输出逐项 diff，覆盖流式 multipart/文件上传、自动 100-continue、请求
   trailers、429/Retry-After、JWKS 拉取。
+- `test/run.sh compression-diff` / `test/.venv/bin/python test/differential/run.py compression`：
+  让 Go `net/http` 客户端与 simple_http 客户端请求同一个 Go 参考服务器，逐行 diff
+  PASS/FAIL（gzip 协商、显式 `Accept-Encoding`、HEAD/Range、`Uncompressed`、头删除），
+  再用相同压缩请求对比 Go 参考解压 handler 与 `middleware::decompress_request` 的
+  服务端行为。
 
 <a id="known-limitations"></a>
 ## 已知限制 · Known limitations

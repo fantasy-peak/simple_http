@@ -266,6 +266,9 @@ class Response {
     }
     bool ok() const { return m_head.status >= 200 && m_head.status < 300; }
     bool bodyless() const { return m_head.bodyless; }
+    // True when the client transparently decoded this body (Go's
+    // Response.Uncompressed); Content-Encoding/Content-Length are then absent.
+    bool uncompressed() const { return m_head.uncompressed; }
 
     // 2xx → this; anything else → unexpected{client_errc::http_status} (the
     // real status stays readable via status()): the reqwest error_for_status().

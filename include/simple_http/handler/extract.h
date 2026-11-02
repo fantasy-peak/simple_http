@@ -53,6 +53,12 @@ struct HttpError {
     std::string details;
 };
 
+// A body read can fail because it was malformed/truncated (400) or because the
+// decoded representation exceeded the configured limit (413). Everything else
+// stays a bad request; the handler can inspect the original error if it needs
+// to distinguish further.
+inline int body_error_status(const error_code &ec) { return ec == asio::error::message_size ? 413 : 400; }
+
 // Renders an HttpError as the library's standard JSON error body.
 inline asio::awaitable<void> render_http_error(ResponsePtr res, const HttpError &error) {
     JsonError body{.code = error.code.empty() ? std::string{"error"} : error.code,
@@ -144,8 +150,8 @@ template <typename T> struct Extractor<Json<T>> {
     static asio::awaitable<std::expected<T, HttpError>> run(Request &req) {
         auto value = co_await read_json_body<T>(req);
         if (!value) {
-            co_return std::unexpected(
-                HttpError{400, "invalid_json", "malformed JSON request body", value.error().message()});
+            co_return std::unexpected(HttpError{body_error_status(value.error()), "invalid_json",
+                                                "malformed JSON request body", value.error().message()});
         }
         co_return std::move(*value);
     }
@@ -157,8 +163,8 @@ template <typename T> struct Extractor<Form<T>> {
     static asio::awaitable<std::expected<T, HttpError>> run(Request &req) {
         auto form = co_await read_urlencoded_body(req);
         if (!form) {
-            co_return std::unexpected(
-                HttpError{400, "invalid_form", "malformed URL-encoded request body", form.error().message()});
+            co_return std::unexpected(HttpError{body_error_status(form.error()), "invalid_form",
+                                                "malformed URL-encoded request body", form.error().message()});
         }
         auto value = parse_params<T>(*form);
         if (!value) {

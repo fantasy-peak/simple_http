@@ -32,7 +32,8 @@
 #include <array>
 
 #include "../core/base64.h"
-#include "../core/compression.h" // CompressionConfig (middleware::compress)
+#include "../core/compression.h"      // CompressionConfig / RequestDecompressionConfig
+#include "../core/content_encoding.h" // ContentDecoder / parse_content_coding
 #include "../core/http_field.h"
 #include "../core/http_method.h"
 #include "../core/http_status.h"
@@ -608,6 +609,100 @@ inline Middleware timeout(std::chrono::milliseconds deadline) {
         } else {
             co_await res->close(); // mid-stream: abort, never truncate silently
         }
+    };
+}
+
+// Request-body decompression, the server-side counterpart of Go's decision to
+// leave Content-Encoding alone by default: nothing is decoded unless this
+// middleware is mounted. Mounting it is the opt-in, and it works with use()
+// (global), group() and route()'s middleware list exactly like compress().
+//
+//   server.use(middleware::decompress_request());                 // local routes
+//   server.group("/api", {middleware::decompress_request()}, reg); // a group
+//   server.route({Method::Post}, "/upload", {middleware::decompress_request()}, h);
+//
+// Reverse-proxy routes should not mount it: that keeps the request body and
+// Content-Encoding byte-for-byte, which is what Go's httputil.ReverseProxy does.
+// A globally mounted policy can exclude proxy paths with excluded_paths.
+//
+// The decoder runs in Body::read(), before the handler consumes bytes. HTTP/2
+// and HTTP/3 may already have queued raw DATA frames, which is fine: those
+// frames stay compressed until read() decodes them.
+inline Middleware decompress_request(RequestDecompressionConfig config = {},
+                                     std::function<bool(const Request &)> skip = {}) {
+    return [config = std::move(config), skip = std::move(skip)](RequestPtr req, ResponsePtr res, SslHandle ssl,
+                                                                Next next) -> asio::awaitable<void> {
+        bool covered = true;
+        const std::string_view path = req->path();
+        for (const std::string &entry : config.excluded_paths) {
+            if (entry.empty()) {
+                continue;
+            }
+            if (entry.back() == '/') {
+                if (path.starts_with(std::string_view{entry}.substr(0, entry.size() - 1))) {
+                    covered = false;
+                    break;
+                }
+            } else if (path == entry) {
+                covered = false;
+                break;
+            }
+        }
+        if (covered && skip && skip(*req)) {
+            covered = false;
+        }
+        if (!covered) {
+            co_await next(std::move(req), std::move(res), ssl);
+            co_return;
+        }
+
+        const auto values = req->headers().get_all(field::content_encoding);
+        if (values.empty()) {
+            co_await next(std::move(req), std::move(res), ssl);
+            co_return;
+        }
+        // Only one coding is understood; a list is deliberately unsupported
+        // rather than guessed at (decoding the wrong layer would corrupt bytes).
+        const ContentCoding coding =
+            values.size() == 1 ? parse_content_coding(values.front()) : ContentCoding::Unsupported;
+        if (coding == ContentCoding::Identity) {
+            co_await next(std::move(req), std::move(res), ssl);
+            co_return;
+        }
+        const bool allowed =
+            (coding == ContentCoding::Gzip && config.gzip) || (coding == ContentCoding::Brotli && config.brotli);
+        if (!allowed) {
+            std::string accept;
+            if (config.gzip) {
+                accept = "gzip";
+            }
+            if (config.brotli) {
+                if (!accept.empty()) {
+                    accept += ", ";
+                }
+                accept += "br";
+            }
+            auto &response = res->status(status::unsupported_media_type);
+            if (!accept.empty()) {
+                response.header(field::accept_encoding, std::move(accept));
+            }
+            (void)co_await response.send("unsupported content-encoding");
+            co_return;
+        }
+
+        auto decoder = make_decoder(coding == ContentCoding::Gzip ? kEncodingGzip : kEncodingBrotli);
+        if (!decoder || !req->body().enable_decoding(std::move(decoder), config.max_decoded_bytes)) {
+            SIMPLE_HTTP_ERROR_LOG("request decompression: body was already read before the middleware");
+            (void)co_await res->status(status::internal_server_error).send("request body already consumed");
+            co_return;
+        }
+        // The body now yields the decoded representation; the wire framing and
+        // digest headers no longer describe it.
+        req->mutable_headers().erase(field::content_encoding);
+        req->mutable_headers().erase(field::content_length);
+        req->mutable_headers().erase("content-md5");
+        req->mutable_headers().erase("content-digest");
+        co_await next(std::move(req), std::move(res), ssl);
     };
 }
 

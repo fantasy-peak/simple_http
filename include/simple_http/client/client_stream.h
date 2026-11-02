@@ -65,6 +65,9 @@ struct ResponseHead {
     Headers headers;
     // True when nothing follows the head: a response to HEAD, or 204/304.
     bool bodyless{false};
+    // True when the client transparently decoded this body (Go's
+    // Response.Uncompressed). Content-Encoding/Content-Length are then absent.
+    bool uncompressed{false};
 
     std::optional<std::string_view> header(std::string_view name) const { return headers.get(name); }
 };
@@ -258,7 +261,9 @@ class ClientStream {
 
     // Drops the cached head so the next read_head() parses the final response.
     // Used after an interim 100-continue was delivered to an automatic caller.
-    void clear_head_cache() { reset_head(); }
+    // Virtual so a decorator can also clear the wrapped stream's cache; the
+    // inner session caches the interim head independently.
+    virtual void clear_head_cache() { reset_head(); }
 
   protected:
     // Called by the session once the response head is parsed; `await_head()` must
