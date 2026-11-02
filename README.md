@@ -1454,6 +1454,11 @@ xmake run loadgen ws://127.0.0.1:7788/echo1k -p ws -n 200000 -c 64
   reference server and an equivalent Go `net/http` server, then compares 64 observable
   behaviors for application state, extractors, validation, sessions, CSRF, JWT
   (HS256/RS256/ES256), host routing and catch-all paths.
+- `test/client_diff.sh` / `xmake run client-diff`: runs a C++ client probe against a
+  Go reference server, a Go client probe against the same server, and the Go probe
+  against the C++ framework server. The three PASS/FAIL outputs are diffed across
+  streaming multipart/file upload, automatic 100-continue, request trailers,
+  429/Retry-After and JWKS fetch.
 
 <a id="known-limitations"></a>
 ## Known limitations

@@ -7,6 +7,7 @@
 //   xmake build framework_server
 //   ./build/linux/x86_64/release/framework_server 7798
 
+#include <atomic>
 #include <csignal>
 #include <cstdint>
 #include <fstream>
@@ -128,6 +129,58 @@ int main(int argc, char **argv) {
     });
     server.route({Method::Get}, "/files/{*rest}", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
         co_await res->status(200).send("rest=" + std::string{req->param("rest").value_or("")});
+    });
+
+    // --- endpoints used by the C++/Go client differential probe --------------
+    server.route({Method::Get, Method::Post}, "/world",
+                 [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(200).send("world"); });
+    server.route(any_methods, "/echo", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
+        auto body = co_await req->body().read_all();
+        co_await res->status(200).send(body ? *body : std::string{});
+    });
+    server.route({Method::Post}, "/mp", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
+        auto parts = co_await read_multipart_body(*req);
+        if (!parts) {
+            co_await res->status(400).send("not multipart");
+            co_return;
+        }
+        std::string out;
+        for (const auto &part : *parts) {
+            if (!out.empty())
+                out.push_back('|');
+            if (part.filename.empty()) {
+                out += "field:" + part.name + "=" + part.data;
+            } else {
+                out += "file:" + part.name + ":" + part.filename + ":" + part.content_type + ":" +
+                       std::to_string(part.data.size());
+            }
+        }
+        co_await res->status(200).send(std::move(out));
+    });
+    server.route({Method::Post}, "/expect-ok", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->send_continue();
+        auto body = co_await req->body().read_all();
+        co_await res->status(200).send("got " + std::to_string(body ? body->size() : 0));
+    });
+    server.route({Method::Post}, "/expect-reject",
+                 [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(417).send("no"); });
+    server.route({Method::Post}, "/trailer-echo", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
+        (void)co_await req->body().read_all();
+        const auto check = req->trailers().get("x-check");
+        co_await res->status(200).send(check ? std::string{*check} : std::string{"missing"});
+    });
+    auto retry_status_hits = std::make_shared<std::atomic<int>>(0);
+    server.route({Method::Get}, "/retry-status",
+                 [retry_status_hits](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+                     if (retry_status_hits->fetch_add(1) < 2) {
+                         res->header("retry-after", "0");
+                         co_await res->status(429).send("retry");
+                     } else {
+                         co_await res->status(200).send("ok");
+                     }
+                 });
+    server.route({Method::Get}, "/jwks", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(200).content_type("application/json").send(R"({"keys":[]})");
     });
 
     // --- host routing --------------------------------------------------------

@@ -208,6 +208,36 @@ target("framework-diff")
     end)
 target_end()
 
+-- C++ client probe for the client differential suite (streaming multipart,
+-- 100-continue, request trailers, 429 and JWKS), mirrored by
+-- test/go/client_diff_probe.go.
+target("client_diff_probe")
+    set_kind("binary")
+    set_default(false)
+    on_load(function (target)
+        if target:toolchain("gcc") then
+            target:add("cxxflags", "-Wno-maybe-uninitialized", "-Wno-mismatched-new-delete", "-Wno-type-limits")
+        end
+    end)
+    add_deps("simple_http")
+    add_files("test/client_diff_probe.cpp")
+    add_packages("zlib", "brotli")
+    set_rundir(".")
+target_end()
+
+-- Differential client/server suite for streaming uploads, 100-continue,
+-- request trailers, 429 Retry-After and JWKS:
+-- C++ client -> Go server, Go client -> Go server, Go client -> C++ server.
+--   xmake run client-diff
+target("client-diff")
+    set_kind("phony")
+    set_default(false)
+    add_deps("client_diff_probe", "framework_server")
+    on_run(function ()
+        os.execv("bash", {"test/client_diff.sh"})
+    end)
+target_end()
+
 -- OpenAPI demo: per-route operation descriptors (openapi::doc()...) collected
 -- into an OAS 3.1 document served at /openapi.json, browsed at /swagger
 -- (CDN-hosted Swagger UI).

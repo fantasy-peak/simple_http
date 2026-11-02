@@ -1355,6 +1355,10 @@ xmake run loadgen ws://127.0.0.1:7788/echo1k -p ws -n 200000 -c 64
 - `test/framework_diff.sh` / `xmake run framework-diff`：同时启动 C++ 框架参考服务器与
   等价的 Go `net/http` 服务器，对比 64 项可观测行为——App State、提取器、校验、
   Session、CSRF、JWT（HS256/RS256/ES256）、Host 路由和通配路径。
+- `test/client_diff.sh` / `xmake run client-diff`：C++ 客户端打 Go 参考服务端、Go 客户端
+  打同一个 Go 服务端、Go 客户端再打 C++ 框架服务端；三份 PASS/FAIL 输出逐项 diff，
+  覆盖流式 multipart/文件上传、自动 100-continue、请求 trailers、429/Retry-After、
+  JWKS 拉取。
 
 <a id="known-limitations"></a>
 ## 已知限制 · Known limitations
