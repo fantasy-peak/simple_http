@@ -21,8 +21,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
-TARGETS=(fuzz_h1 fuzz_h2 fuzz_ws fuzz_multipart)
-NAMES=(h1 h2 ws multipart)
+TARGETS=(fuzz_h1 fuzz_h1_body fuzz_h2 fuzz_ws fuzz_ws_deflate fuzz_multipart)
+NAMES=(h1 h1_body h2 ws ws_deflate multipart)
 ITERATIONS="${FUZZ_ITERATIONS:-20000}"
 TIME="${FUZZ_TIME:-30}"
 JOBS="${FUZZ_JOBS:-7}"

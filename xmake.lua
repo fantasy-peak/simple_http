@@ -190,7 +190,7 @@ local fuzz_flags = fuzz_libfuzzer and {
     "-g",
     "-O1",
 }
-for _, name in ipairs({"h1", "h2", "ws", "multipart"}) do
+for _, name in ipairs({"h1", "h1_body", "h2", "ws", "ws_deflate", "multipart"}) do
     local files = {"test/fuzz/fuzz_" .. name .. ".cpp"}
     local defines = {}
     if not fuzz_libfuzzer then

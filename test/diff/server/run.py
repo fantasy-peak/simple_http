@@ -48,6 +48,7 @@ CASE_OPTIONS: dict[str, dict] = {
     "routing.options": {"body_mode": "none"},
     "routing.method_not_allowed": {"body_mode": "none"},
     "routing.fallback": {"body_mode": "exact"},
+    "body.multipart_form": {"body_mode": "json"},
     "body.json_invalid": {"body_mode": "json"},
     "body.json_type_mismatch": {"body_mode": "json"},
     "body.too_large": {"body_mode": "none", "ignore_headers": ["content-type"]},

@@ -341,6 +341,14 @@ func bodyCases() []caseSpec {
 		{ID: "body.form", Method: "POST", Path: "/form",
 			Headers: map[string]string{"Content-Type": "application/x-www-form-urlencoded"},
 			Body:    []byte("name=book&age=3")},
+		{ID: "body.multipart_form", Method: "POST", Path: "/multipart",
+			Headers: map[string]string{"Content-Type": "multipart/form-data; boundary=diff-boundary"},
+			Body: []byte("--diff-boundary\r\n" +
+				"Content-Disposition: form-data; name=\"name\"\r\n\r\nbook\r\n" +
+				"--diff-boundary\r\n" +
+				"Content-Disposition: form-data; name=\"upload\"; filename=\"a.txt\"\r\n" +
+				"Content-Type: text/plain\r\n\r\nhello\r\n" +
+				"--diff-boundary--\r\n")},
 		{ID: "body.drain_1m", Method: "POST", Path: "/drain", Body: bytes.Repeat([]byte("x"), 1<<20)},
 		// Ask both servers to decide before the body is written. Without Expect,
 		// an instrumented server may reset the socket while the 2 MiB body is
@@ -377,6 +385,7 @@ func semanticsCases() []caseSpec {
 		{ID: "semantics.status_404", Method: "GET", Path: "/status/404"},
 		{ID: "semantics.redirect", Method: "GET", Path: "/redirect/302"},
 		{ID: "semantics.stream", Method: "GET", Path: "/stream"},
+		{ID: "semantics.sse", Method: "GET", Path: "/sse"},
 		{ID: "semantics.gzip", Method: "GET", Path: "/gzip",
 			Headers: map[string]string{"Accept-Encoding": "gzip"}, Decompress: true},
 		{ID: "semantics.h1_echo", Method: "POST", Path: "/echo", Body: []byte("over h1")},
@@ -432,6 +441,8 @@ func frameworkCases() []caseSpec {
 			Headers: map[string]string{"X-Page": "3", "Cookie": "sid=abc"}},
 		{ID: "framework.header_missing", Method: "GET", Path: "/header"},
 		{ID: "framework.host_api", Method: "GET", Path: "/who", Host: "api.example.com"},
+		// The CSRF middleware's exempt_paths route: no token is required.
+		{ID: "framework.csrf_exempt", Method: "POST", Path: "/csrf/exempt"},
 	}
 }
 

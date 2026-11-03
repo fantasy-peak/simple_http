@@ -136,8 +136,9 @@ FUZZ_ITERATIONS=100000 test/fuzz/run.sh
 test/fuzz/run.sh --libfuzzer --time 60   # clang-24 + libFuzzer
 ```
 
-目标：`fuzz_h1`（请求头）、`fuzz_h2`（帧头/HPACK）、`fuzz_ws`（帧解析）、
-`fuzz_multipart`（增量 multipart）。默认模式不需要 clang；`--libfuzzer` 使用
+目标：`fuzz_h1`（请求头）、`fuzz_h1_body`（chunked 请求体）、`fuzz_h2`
+（帧头/HPACK）、`fuzz_ws`（帧解析）、`fuzz_ws_deflate`（permessage-deflate
+解压）、`fuzz_multipart`（增量 multipart）。默认模式不需要 clang；`--libfuzzer` 使用
 `/usr/lib/llvm-24`（回退 `clang++`），以 `-fsanitize=fuzzer,address,undefined`
 构建。种子语料在 `test/fuzz/corpus/`，libFuzzer 的变异语料写到 `.cache/fuzz/`。
 

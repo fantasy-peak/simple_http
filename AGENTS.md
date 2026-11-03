@@ -775,8 +775,10 @@ test/fuzz/run.sh                         # GCC + ASan/UBSan，确定性变异
 test/fuzz/run.sh --libfuzzer --time 60   # clang-24 + libFuzzer
 ```
 
-- 四个目标：`fuzz_h1` / `fuzz_h2` / `fuzz_ws` / `fuzz_multipart`，统一
-  `LLVMFuzzerTestOneInput` 入口；语料在 `test/fuzz/corpus/`。
+- 六个目标：`fuzz_h1`（请求头）/ `fuzz_h1_body`（chunked 请求体）/ `fuzz_h2`
+  （帧头/HPACK）/ `fuzz_ws`（帧解析）/ `fuzz_ws_deflate`（permessage-deflate
+  解压）/ `fuzz_multipart`（增量 multipart），统一 `LLVMFuzzerTestOneInput`
+  入口；语料在 `test/fuzz/corpus/`。
 - 默认工具链是 GCC（无 libFuzzer），由 `standalone_main.cpp` 做有界变异驱动；
   装 clang 后 `--libfuzzer` 使用 `/usr/lib/llvm-24`（或 PATH 上的 `clang++`），
   以 `-fsanitize=fuzzer,address,undefined` 构建。
