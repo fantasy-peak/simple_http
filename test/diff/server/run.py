@@ -17,6 +17,7 @@ import argparse
 import gzip
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -30,7 +31,7 @@ sys.path.insert(0, str(DIFF / "support"))
 
 import harness  # noqa: E402
 
-ALL_GROUPS = ("routing", "body", "semantics", "middleware", "framework", "static", "ws", "raw")
+ALL_GROUPS = ("routing", "body", "semantics", "middleware", "framework", "static", "ws", "raw", "h2raw")
 
 # The two reference servers bind different ports, and /echo reports the Host
 # header verbatim. Scrub the port so the same request is byte-comparable.
@@ -99,10 +100,13 @@ def build_go(cache: Path, groups: tuple[str, ...]) -> dict[str, Path]:
     outputs["server"] = server
     for group in groups:
         binary = binary_dir / f"server_probe_{group}"
-        result = subprocess.run(
-            [go, "build", "-ldflags", f"-X main.defaultGroup={group}",
-             "-o", str(binary), "./server/go/probes"],
-            cwd=str(DIFF), text=True, capture_output=True, env=env)
+        if group == "h2raw":
+            command = [go, "build", "-o", str(binary), "./server/go/h2raw"]
+        else:
+            command = [go, "build", "-ldflags", f"-X main.defaultGroup={group}",
+                       "-o", str(binary), "./server/go/probes"]
+        result = subprocess.run(command, cwd=str(DIFF), text=True,
+                                capture_output=True, env=env)
         if result.returncode != 0:
             raise RuntimeError(f"go build probe {group} failed:\n{result.stderr}")
         outputs[group] = binary
@@ -146,8 +150,39 @@ def run_probe(command: list[str], output: Path, timeout: int = 180) -> subproces
                               stderr=subprocess.PIPE, text=True, timeout=timeout)
 
 
+def run_h2raw(probe: Path, report_dir: Path, registry: dict) -> int:
+    """Raw h2 assertions are C++-only: parse PASS/FAIL rather than diff targets."""
+    output = report_dir / "h2raw.log"
+    stderr_path = report_dir / "h2raw.stderr"
+    result = run_probe([str(probe), "--h2c", "http://127.0.0.1:7821"], output)
+    stderr_path.write_text(result.stderr or "", encoding="utf-8")
+    report = harness.DiffReport("server-h2raw", registry)
+    found = False
+    for line in output.read_text(encoding="utf-8", errors="replace").splitlines():
+        match = re.match(r"^(PASS|FAIL)\s+(.*)$", line.strip())
+        if not match:
+            continue
+        found = True
+        case_id = match.group(2).strip()
+        if match.group(1) == "PASS":
+            report.record(case_id, [])
+        else:
+            report.fail(case_id, "assertion failed")
+    if not found:
+        report.fail("h2raw", "no PASS/FAIL output; see h2raw.log")
+    if result.returncode != 0 and found:
+        # The individual FAIL lines already recorded the assertion; keep the
+        # process exit as a separate diagnostic only when nothing else failed.
+        if report.outcome.failed == 0:
+            report.fail("h2raw", f"probe exited {result.returncode}")
+    return report.summary(report_dir / "h2raw")
+
+
 def compare_group(group: str, probe: Path, report_dir: Path, registry: dict,
                   h3_ok: bool) -> int:
+    if group == "h2raw":
+        return run_h2raw(probe, report_dir, registry)
+
     output = report_dir / f"{group}.jsonl"
     stderr_path = report_dir / f"{group}.stderr"
     result = run_probe([str(probe), "--group", group], output)

@@ -664,6 +664,13 @@ func makeHandler(state *serverState, staticRoot string) http.Handler {
 		}
 		writeText(w, 200, "ce=none;cl=none;"+string(decoded))
 	})
+	mux.HandleFunc("/delay", func(w http.ResponseWriter, r *http.Request) {
+		ms, _ := strconv.Atoi(r.URL.Query().Get("ms"))
+		if ms > 0 {
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+		}
+		writeText(w, 200, "delayed")
+	})
 	mux.HandleFunc("/drain", func(w http.ResponseWriter, r *http.Request) {
 		body := readAll(r)
 		writeText(w, 200, "received "+strconv.Itoa(len(body))+" bytes")

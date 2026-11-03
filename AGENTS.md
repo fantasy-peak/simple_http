@@ -682,7 +682,12 @@ Python 侧只需要 `httpx`、`jsonschema`、`brotli`（`test/requirements.txt`�
 - **server**（`test/diff/server/`）：同一个 Go 探针把请求分别发给 C++ 参考服务端
   （`7820`–`7824`，`7824` 是纯 h1）与 Go 参考服务端（`7830`–`7833`），每个案例输出
   `target=cpp` / `target=go` 两行。组：`routing`、`body`、`semantics`、
-  `middleware`、`framework`、`static`、`ws`、`raw`。
+  `middleware`、`framework`、`static`、`ws`、`raw`、`h2raw`。
+  `h2raw` 是 C++ 单侧原始 HTTP/2 断言（`test/diff/server/go/h2raw/`）：RFC 8441
+  extended CONNECT，以及「重置已开流后再开新流」的 Rapid Reset 队列溢出
+  `GOAWAY(ENHANCE_YOUR_CALM)`。Go `net/http` 无对应能力，因此输出 PASS/FAIL
+  而不是双 target。h2c 夹具（`:7821`）把 `h2_max_queued_streams` 调小，否则
+  RFC 9113 §5.1.2 的 `REFUSED_STREAM` 会先于队列溢出触发。
 
 每个组是独立可执行程序（C++ 用 `DIFF_GROUP_*`，Go 用 `-ldflags -X main.defaultGroup`）。
 观测是 JSONL，字段为 `case/target/status/version/headers/body/body_encoding/framing/error/notes`。
@@ -966,7 +971,7 @@ test/run.sh stress
 
 # 直接运行差分 runner（Go 二进制由 runner 自行构建）
 test/.venv/bin/python test/diff/client/run.py --groups basic,body,policy,ws,h3
-test/.venv/bin/python test/diff/server/run.py --groups routing,body,semantics,middleware,framework,static,ws
+test/.venv/bin/python test/diff/server/run.py --groups routing,body,semantics,middleware,framework,static,ws,raw,h2raw
 test/.venv/bin/python test/diff/openapi/run.py
 
 # 覆盖率（--coverage + gcovr）

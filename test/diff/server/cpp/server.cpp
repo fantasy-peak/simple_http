@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <charconv>
+#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <format>
@@ -302,6 +303,17 @@ template <typename ServerT> void register_routes(ServerT &server, const std::sha
                      co_await res->status(200).send(std::format("ce={};cl={};", ce, cl) + *body);
                  });
 
+    // Slow handler for the raw Rapid Reset probe: enough concurrent streams
+    // must fill h2_max_concurrent_streams + h2_max_queued_streams.
+    server.route(any_methods, "/delay",
+                 [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+                     const auto ms = static_cast<int>(query_uint(req->query(), "ms", 100));
+                     asio::steady_timer timer{co_await asio::this_coro::executor};
+                     timer.expires_after(std::chrono::milliseconds(ms));
+                     co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+                     co_await res->status(200).send("delayed");
+                 });
+
     server.route(any_methods, "/drain",
                  [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
                      auto body = co_await req->body().read_all();
@@ -469,6 +481,12 @@ int main(int argc, char **argv) {
     h2c_cfg.worker_threads = 2;
     h2c_cfg.plaintext_protocols = PlaintextProtocols::Http2;
     h2c_cfg.limits.max_body_bytes = 1024 * 1024;
+    // The raw Rapid Reset probe needs the dispatch-queue bound reachable. At the
+    // default (queued == concurrent) a new stream hits the RFC 9113 §5.1.2
+    // REFUSED_STREAM cap before the queue can overflow, so keep the queue small
+    // on this fixture-only listener. No stock request opens enough streams to
+    // notice; only the h2raw probe resets open streams to free table slots.
+    h2c_cfg.limits.h2_max_queued_streams = 1;
     Server h2c{h2c_cfg};
     register_routes(h2c, site);
 
