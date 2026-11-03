@@ -163,16 +163,20 @@ include/
 
 其它目录：
 
-- `test/`：统一入口 `test/run.sh`（`test/run.py`，分层 fast / standard / full）；
-  按被测对象分层：
-  - `unit/` Catch2 纯逻辑；`integration/` 进程内 C++ 集成；
-  - `server/` 被测服务端 ← 独立客户端，`server/fixtures/` 是 C++ 夹具；
-  - `client/` 被测客户端 → 独立服务端，`client/probes/` 是 C++ probe，
-    `client/peers/` 是 Python 独立服务端；
-  - `differential/` C++ ↔ Go 双向差分（`run.py` + `framework_diff.py` + `go/`）；
-  - `external/conformance/`、`external/stress/`、`external/bench/` 外部工具套件；
-  - `examples/`、`tools/`、`support/`、`tls_certificates/`。
+- `test/`：统一入口 `test/run.sh`（`test/run.py`，分层 fast / standard / full）。
+  实际分层：
+  - `unit/`：Catch2 纯逻辑测试，单个 `test_unit` 可执行程序；
+  - `diff/client/`：C++ 客户端 ↔ Go `net/http` 客户端（`cases/*.json` +
+    `cpp/driver.cpp` + `go/driver` + `go/refserver`）；
+  - `diff/server/`：Go 探针 → C++ 服务端 ↔ Go 参考服务端（`go/probes`、
+    `go/h2raw`、`go/server`）；
+  - `diff/openapi/`：OAS 3.1 元模式、文档 ↔ 路由一致性、Swagger UI；
+  - `diff/support/harness.py`：归一化、比较与 `known_diffs.json`；
+  - `fixtures/`：压力/合规专用简化服务端（`conformance_server.cpp`）；
+  - `external/conformance/`、`external/stress/`：外部工具套件（**没有** bench）；
+  - `fuzz/`、`sanitizer/`、`support/`、`tls_certificates/`。
   报告写到 `.cache/test-run/<timestamp>-<pid>/`（`report.json` + `junit.xml`）。
+  `full` 档默认要求外部工具齐全（缺工具即失败），本地可用 `--allow-skip` 放行。
 - `test/tls_certificates/`：测试证书（`./test/tls_certificates/...` 是相对路径契约）。
 - `cmake/`：`simple_httpConfig.cmake.in`。
 - **没有 `docs/`，也没有 `ROADMAP.md`**（已删除）；文档为 `README.md`（英文默认）、
@@ -698,6 +702,11 @@ Python 侧只需要 `httpx`、`jsonschema`、`brotli`（`test/requirements.txt`�
 - 默认忽略 Date/Server/Content-Length/Transfer-Encoding/Connection/ETag/
   Last-Modified/Set-Cookie 等传输细节；
 - body 支持 `exact` / `json` / `none`，可配置 `scrub` 正则；
+- 客户端差分默认比较 `version` 与 `framing`（双方观察同一个参考服务端；合法差异在
+  case 的 `expect` 里显式关闭）；版本串 `HTTP/2.0`/`HTTP/3.0` 归一为
+  `HTTP/2`/`HTTP/3`；
+- 客户端错误按稳定 slug 比较（`bad_url`、`body_decode_failed`、`goaway` 等），
+  只有未映射的传输错误落到 `other`；四种超时合并为 `timeout` 以对齐 Go；
 - 未登记差异失败；`test/diff/known_diffs.json` 登记双方都合法的差异并写明理由；
 - 每次运行写 `diff-report.md`（逐字段 cpp/go/verdict/reason）。
 

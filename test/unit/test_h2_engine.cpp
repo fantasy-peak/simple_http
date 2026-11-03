@@ -52,6 +52,19 @@ std::string headers_frame(std::uint32_t id, bool end_stream) {
     return out;
 }
 
+// RFC 8441 extended CONNECT: CONNECT plus :protocol/:scheme/:path.
+std::string extended_connect_headers_frame(std::uint32_t id) {
+    std::string block;
+    hpack_append_literal(block, ":method", "CONNECT");
+    hpack_append_literal(block, ":protocol", "websocket");
+    hpack_append_literal(block, ":scheme", "http");
+    hpack_append_literal(block, ":path", "/ws/echo");
+    hpack_append_literal(block, ":authority", "example.com");
+    std::string out;
+    append_frame(out, H2FrameType::Headers, H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM, id, block);
+    return out;
+}
+
 std::string rst_frame(std::uint32_t id) {
     std::string out;
     append_frame(out, H2FrameType::RstStream, 0, id, u32be(H2_CANCEL));
@@ -370,4 +383,31 @@ TEST_CASE("h2/engine: SETTINGS that push a stream window past 2^31-1 is FLOW_CON
     REQUIRE(run_on(ctx, engine->run(dispatcher)));
 
     CHECK(has_goaway(transport->written(), codec::H2_FLOW_CONTROL_ERROR));
+}
+
+TEST_CASE("h2/engine: extended CONNECT is refused when the setting is off", "[h2]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+
+    EngineLimits limits;
+    limits.h2_enable_connect_protocol = false;
+
+    std::string in{codec::kH2ClientPreface};
+    append_frame(in, H2FrameType::Settings, 0, 0, ""); // client SETTINGS
+    in += extended_connect_headers_frame(1);
+    transport->push(std::move(in));
+
+    std::atomic<int> dispatched{0};
+    auto dispatcher = [&](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter>,
+                          SslHandle) -> asio::awaitable<void> {
+        dispatched.fetch_add(1);
+        co_return;
+    };
+    auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, limits);
+    REQUIRE(run_on(ctx, engine->run(dispatcher)));
+
+    // RFC 8441 §3: the server advertised ENABLE_CONNECT_PROTOCOL=0, so using
+    // the extended CONNECT is a connection error, and no handler runs.
+    CHECK(has_goaway(transport->written(), codec::H2_PROTOCOL_ERROR));
+    CHECK(dispatched.load() == 0);
 }

@@ -1037,7 +1037,9 @@ auto item = co_await r->json<Item>();
 方法：`get` / `post` / `put` / `del` / `head` / `patch` / `request`。
 `RequestBuilder` 支持 `query`、`header(s)`、`content_type`、`body`、`json<T>`、
 `multipart(MultipartForm)`、`basic_auth`、`bearer_auth`、`max_body_bytes`、`timeout`、
-`version`。`send()` 返回缓冲响应；`send_stream()` 返回显式 `Stream`。
+`version`。`timeout(head, idle)` 只覆盖单次请求的 response-head 与 body-idle 预算；
+总预算仍由 `ClientConfig::request_timeout` 控制。`send()` 返回缓冲响应；
+`send_stream()` 返回显式 `Stream`。
 
 也可以直接构造两端共用的 `Request` 再 `client.send(req)`（Go `http.Client.Do` 形态）。
 

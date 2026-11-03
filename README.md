@@ -1092,8 +1092,9 @@ auto item = co_await r->json<Item>();
 Methods: `get` / `post` / `put` / `del` / `head` / `patch` / `request`.
 `RequestBuilder` supports `query`, `header(s)`, `content_type`, `body`, `json<T>`,
 `multipart(MultipartForm)`, `basic_auth`, `bearer_auth`, `max_body_bytes`, `timeout`
-and `version`. `send()` returns a buffered response; `send_stream()` returns an explicit
-`Stream`.
+and `version`. `timeout(head, idle)` overrides the per-request response-head and
+body-idle budgets only; `ClientConfig::request_timeout` remains the overall bound.
+`send()` returns a buffered response; `send_stream()` returns an explicit `Stream`.
 
 You can also build a shared `Request` and call `client.send(req)` (the Go
 `http.Client.Do` shape).

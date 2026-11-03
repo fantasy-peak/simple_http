@@ -243,6 +243,12 @@ def main() -> int:
             return [args.catch_filter]
         return []
 
+    # A green `full` run must actually include the external conformance and
+    # stress lanes; otherwise the only independent protocol checks silently
+    # disappear on a machine without their tools. --allow-skip restores the
+    # lenient behaviour for local work.
+    strict_deps = args.strict_deps or (args.suite == "full" and not args.allow_skip)
+
     runnable: list[Suite] = []
     for suite in suites:
         missing = missing_deps(suite)
@@ -252,7 +258,7 @@ def main() -> int:
             (report_dir / f"{suite.name}.log").write_text(f"SKIP: missing {message}\n",
                                                           encoding="utf-8")
             results.append((suite.name, "SKIP", 0.0))
-            if args.strict_deps:
+            if strict_deps:
                 exit_code = 3
         else:
             runnable.append(suite)

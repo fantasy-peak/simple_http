@@ -443,6 +443,22 @@ func main() {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = io.WriteString(w, "slow")
 	})
+	// Sends a head and one flushed chunk, then stalls: exercises the client's
+	// body-idle budget rather than the response-head budget.
+	mux.HandleFunc("/stall", func(w http.ResponseWriter, r *http.Request) {
+		ms, _ := strconv.Atoi(r.URL.Query().Get("ms"))
+		flusher, _ := w.(http.Flusher)
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "start ")
+		if flusher != nil {
+			flusher.Flush()
+		}
+		if ms > 0 {
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+		}
+		_, _ = io.WriteString(w, "end")
+	})
 	mux.HandleFunc("/multipart", multipartEcho)
 	mux.HandleFunc("/expect-ok", func(w http.ResponseWriter, r *http.Request) {
 		body := readAll(r)

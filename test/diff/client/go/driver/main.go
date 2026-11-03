@@ -342,12 +342,33 @@ func classifyError(err error, bodyTooLarge bool) string {
 	if errors.As(err, &netError) && netError.Timeout() {
 		return "timeout"
 	}
-	text := err.Error()
-	if strings.Contains(text, "connection refused") || strings.Contains(text, "connect:") {
+	// Mirror the C++ classifier as far as net/http exposes the cause. Keeping
+	// the slugs aligned is what makes an error-path differential meaningful;
+	// anything unmapped stays "other" on both sides.
+	text := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(text, "connection refused") || strings.Contains(text, "connect:"):
 		return "connect"
-	}
-	if strings.Contains(text, "too many redirects") {
+	case strings.Contains(text, "unsupported protocol scheme"):
+		return "unsupported_scheme"
+	case strings.Contains(text, "invalid uri") || strings.Contains(text, "invalid url") ||
+		strings.Contains(text, "missing protocol scheme"):
+		return "bad_url"
+	case strings.Contains(text, "too many redirects") ||
+		(strings.Contains(text, "stopped after") && strings.Contains(text, "redirect")):
 		return "too_many_redirects"
+	case strings.Contains(text, "server response headers exceeded"):
+		return "header_too_large"
+	case strings.Contains(text, "gzip") || strings.Contains(text, "flate") || strings.Contains(text, "brotli"):
+		return "body_decode_failed"
+	case strings.Contains(text, "goaway"):
+		return "goaway"
+	case strings.Contains(text, "refused_stream"):
+		return "stream_refused"
+	case strings.Contains(text, "rst_stream") || strings.Contains(text, "stream error"):
+		return "stream_reset"
+	case strings.Contains(text, "proxyconnect") || strings.Contains(text, "proxy authentication"):
+		return "proxy_error"
 	}
 	return "other"
 }
@@ -358,7 +379,10 @@ func framingOf(resp *http.Response) string {
 			return "chunked"
 		}
 	}
-	if resp.ContentLength >= 0 {
+	// Go synthesizes ContentLength = 0 for bodyless statuses (204/304/HEAD)
+	// even when the wire carried no Content-Length, so key off the observed
+	// header first and treat a positive length as the fallback.
+	if resp.Header.Get("Content-Length") != "" || resp.ContentLength > 0 {
 		return "content-length"
 	}
 	return "none"
@@ -374,7 +398,9 @@ func observeResponse(resp *http.Response, err error, maxBody int64) observation 
 	defer resp.Body.Close()
 	status := resp.StatusCode
 	obs.Status = &status
-	obs.Version = resp.Proto
+	// C++ reports the protocol version as HTTP/2 / HTTP/3; Go spells the same
+	// version HTTP/2.0 / HTTP/3.0. Normalize so compare_version is meaningful.
+	obs.Version = strings.TrimSuffix(resp.Proto, ".0")
 	obs.Framing = framingOf(resp)
 	obs.Headers = map[string][]string{}
 	for name, values := range resp.Header {

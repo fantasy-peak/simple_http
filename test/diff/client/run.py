@@ -34,6 +34,17 @@ import harness  # noqa: E402
 
 ALL_GROUPS = ("basic", "body", "policy", "ws", "h3")
 
+# Version and framing are on by default: both probes observe the same reference
+# server, so a difference is a client bug (or a documented divergence, which
+# belongs in known_diffs.json). A case that legitimately differs opts out with
+# "compare_version": false / "compare_framing": false.
+DEFAULT_EXPECT = {"body_mode": "exact", "compare_version": True, "compare_framing": True}
+
+# Overrides for cases driven by hand in the probes (body/ws need streaming
+# writes, so they have no JSON file). Keyed by case id, merged over both the
+# defaults and any JSON-defined expect block.
+CASE_OPTIONS: dict[str, dict] = {}
+
 
 def cache_dir(explicit: str | None) -> Path:
     if explicit:
@@ -145,7 +156,9 @@ def run_group(group: str, cpp_binary: Path, go_binary: Path, report_dir: Path,
     go_rows = harness.by_case(harness.load_jsonl(go_out))
 
     for case_id in sorted(set(definitions) | set(cpp_rows) | set(go_rows)):
-        definition = definitions.get(case_id, {"id": case_id, "expect": {"body_mode": "exact"}})
+        definition = definitions.get(case_id, {"id": case_id})
+        expect = {**DEFAULT_EXPECT, **(definition.get("expect") or {}), **CASE_OPTIONS.get(case_id, {})}
+        definition = {**definition, "expect": expect}
         cpp_obs = cpp_rows.get(case_id)
         go_obs = go_rows.get(case_id)
         if cpp_obs is not None and go_obs is not None:

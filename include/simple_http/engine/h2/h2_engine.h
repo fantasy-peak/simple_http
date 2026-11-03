@@ -1601,6 +1601,16 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
             // carries `:scheme` and `:path`. Only "websocket" is acted on; any
             // other value is left to normal dispatch (which answers 404).
             if (seen_protocol) {
+                // RFC 8441 §3: extended CONNECT is only legal once the server
+                // advertised SETTINGS_ENABLE_CONNECT_PROTOCOL=1. With the knob
+                // off we advertise 0, so a client that uses it anyway is a
+                // connection error — not a request we quietly upgrade.
+                if (!m_limits.h2_enable_connect_protocol) {
+                    SIMPLE_HTTP_ERROR_LOG("h2: extended CONNECT while ENABLE_CONNECT_PROTOCOL=0 (stream={})",
+                                          stream_id);
+                    go_away(codec::H2_PROTOCOL_ERROR);
+                    return false;
+                }
                 if (st.request->method() != Method::Connect) {
                     malformed(":protocol on a non-CONNECT request");
                     return true;

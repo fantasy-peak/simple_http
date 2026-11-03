@@ -72,6 +72,8 @@ test/run.sh full --parallel 1   # 完全串行，便于定位
   按集合比较；默认忽略 `date`/`server`/`content-length`/`transfer-encoding`/
   `connection`/`etag`/`last-modified`/`set-cookie` 等传输细节；body 支持
   `exact` / `json` / `none`；可配置 `scrub` 正则（例如把服务端端口替换成占位符）。
+- **客户端差分**：`version` / `framing` 默认参与比较；错误按稳定 slug 比较
+  （四种超时合并为 `timeout`），避免错误路径出现 `other == other` 的假通过。
 - **已知差异**：`diff/known_diffs.json`。未登记的差异直接失败；登记的差异打印
   `KNOWN` 并附带理由。每次运行写 `diff-report.md`，逐字段列出 cpp/go 值与判定。
 - **用例模式**：`compare`（默认）、`cpp-only` / `go-only`（仅一侧有能力，

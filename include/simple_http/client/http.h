@@ -22,6 +22,7 @@
 // open_stream() 是全流式新管道（Stream 上写与读自行驱动）。两条路径共享同一
 // 底层会话内核（detail::ClientEngine；h1 半双工时序、h2 独立收发队列 + 双窗口/水位）。
 
+#include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <expected>
@@ -561,10 +562,13 @@ class Client {
     // redirects can resend it. `url` overrides the Request's own target when
     // the request only carries an origin-form target.
     // `version` overrides ClientConfig::default_version for this request (and
-    // every redirect hop it follows).
+    // every redirect hop it follows). `response_head_timeout` / `body_idle_timeout`
+    // are the layered per-phase budgets (0 = the Client's defaults); `timeout`
+    // stays the overall request budget.
     [[nodiscard]] asio::awaitable<std::expected<Response, error_code>>
     send(std::shared_ptr<Request> request, std::string url = {}, std::size_t max_body_bytes = 0,
-         std::chrono::milliseconds timeout = {}, std::optional<HttpVersionPolicy> version = std::nullopt) const {
+         std::chrono::milliseconds timeout = {}, std::optional<HttpVersionPolicy> version = std::nullopt,
+         std::chrono::milliseconds response_head_timeout = {}, std::chrono::milliseconds body_idle_timeout = {}) const {
         co_await hop(); // everything below (incl. the request's Body channel) runs on the pinned executor
         // A directly fed body lives in the Request's Body channel, not in
         // body_source(). The redirect/retry loop rebuilds each hop from the
@@ -634,10 +638,10 @@ class Client {
                 }
             }
         }
-        co_return co_await follow_redirects(m_impl, m_cfg, std::move(target), request->method(),
-                                            std::string{request->method_token()}, std::move(headers),
-                                            std::move(direct_body), request->close(), std::move(url_target), cap, limit,
-                                            m_cfg.max_redirects, std::move(current_url), effective_version);
+        co_return co_await follow_redirects(
+            m_impl, m_cfg, std::move(target), request->method(), std::string{request->method_token()},
+            std::move(headers), std::move(direct_body), request->close(), std::move(url_target), cap, limit,
+            m_cfg.max_redirects, std::move(current_url), effective_version, response_head_timeout, body_idle_timeout);
     }
 
     // --- explicit streaming (full-duplex) ---
@@ -770,7 +774,8 @@ class Client {
     static asio::awaitable<std::expected<Response, error_code>>
     exchange_once(std::shared_ptr<detail::ClientEngine> impl, detail::ClientTarget target,
                   std::shared_ptr<Request> request, const std::string &url_target, std::size_t cap,
-                  std::chrono::milliseconds limit, const RetryPolicy &retry) {
+                  std::chrono::milliseconds limit, const RetryPolicy &retry,
+                  std::chrono::milliseconds response_head_timeout, std::chrono::milliseconds body_idle_timeout) {
         if (request->target().empty())
             request->set_target(url_target.empty() ? "/" : url_target);
 
@@ -802,7 +807,7 @@ class Client {
             // the RequestBuilder override); only an actual budget can expire.
             if (limit.count() > 0 && remaining.count() <= 0)
                 co_return std::unexpected{make_error_code(client_errc::request_timeout)};
-            auto response = co_await read_exchange(stream, cap, remaining);
+            auto response = co_await read_exchange(stream, cap, remaining, response_head_timeout, body_idle_timeout);
             if (response) {
                 if (detail::retry_status_allowed(budget, *request, response->status())) {
                     const auto retry_after = response->header("retry-after");
@@ -881,7 +886,8 @@ class Client {
     follow_redirects(std::shared_ptr<detail::ClientEngine> impl, const ClientConfig &cfg, detail::ClientTarget target,
                      Method method, std::string method_token, Headers headers, std::string body, bool close,
                      std::string url_target, std::size_t cap, std::chrono::milliseconds limit, std::size_t remaining,
-                     std::string current_url, HttpVersionPolicy version) {
+                     std::string current_url, HttpVersionPolicy version,
+                     std::chrono::milliseconds response_head_timeout, std::chrono::milliseconds body_idle_timeout) {
         // Saved before target is moved into the exchange: the next hop's origin
         // comparison needs the current authority. Origin is scheme + host +
         // port (RFC 9110 §4.3.1); comparing only the host would carry
@@ -903,8 +909,8 @@ class Client {
         request->set_close(close); // Go's Request.Close survives the redirect loop
         if (!body.empty())
             request->set_body(body);
-        auto response =
-            co_await exchange_once(impl, std::move(target), std::move(request), url_target, cap, limit, cfg.retry);
+        auto response = co_await exchange_once(impl, std::move(target), std::move(request), url_target, cap, limit,
+                                               cfg.retry, response_head_timeout, body_idle_timeout);
         if (!response)
             co_return std::unexpected{response.error()};
 
@@ -970,18 +976,42 @@ class Client {
         // The next hop's origin-form target supersedes the old one; exchange_once
         // only fills an empty one.
         url_target = hop->url_target;
-        co_return co_await follow_redirects(
-            std::move(impl), cfg, std::move(hop->target), method, std::move(method_token), std::move(headers),
-            std::move(body), close, std::move(url_target), cap, limit, remaining - 1, std::move(hop->url), version);
+        co_return co_await follow_redirects(std::move(impl), cfg, std::move(hop->target), method,
+                                            std::move(method_token), std::move(headers), std::move(body), close,
+                                            std::move(url_target), cap, limit, remaining - 1, std::move(hop->url),
+                                            version, response_head_timeout, body_idle_timeout);
     }
 
-    // Reads the response of one exchange: head, then whole body, both under the
-    // request budget.
+    // The tighter of a layered per-phase budget and the request's remaining
+    // overall budget; 0 means "no limit" on either axis. The reason tracks
+    // which side won, so a timeout is reported as the phase that actually
+    // expired (a per-phase budget) rather than always request_timeout.
+    struct Deadline {
+        std::chrono::milliseconds limit;
+        client_errc reason;
+    };
+    static Deadline effective_deadline(std::chrono::milliseconds phase, std::chrono::milliseconds overall,
+                                       client_errc phase_reason) {
+        if (phase.count() <= 0)
+            return {overall, client_errc::request_timeout};
+        if (overall.count() <= 0 || phase <= overall)
+            return {phase, phase_reason};
+        return {overall, client_errc::request_timeout};
+    }
+
+    // Reads the response of one exchange: head, then whole body. The head is
+    // bounded by the caller's response-head budget and each body read by the
+    // body-idle budget (a download that keeps flowing is not cut off); the
+    // request's overall budget still caps both.
     static asio::awaitable<std::expected<Response, error_code>>
-    read_exchange(std::shared_ptr<detail::ClientStream> stream, std::size_t cap, std::chrono::milliseconds limit) {
+    read_exchange(std::shared_ptr<detail::ClientStream> stream, std::size_t cap, std::chrono::milliseconds limit,
+                  std::chrono::milliseconds response_head_timeout, std::chrono::milliseconds body_idle_timeout) {
+        const auto head_deadline = effective_deadline(response_head_timeout, limit, client_errc::response_head_timeout);
+        const auto body_deadline = effective_deadline(body_idle_timeout, limit, client_errc::body_idle_timeout);
         // Both expected layers matter: the outer one is the deadline, the inner
         // is the exchange itself.
-        auto head = co_await detail::await_with_deadline(stream->read_head(), limit);
+        auto head =
+            co_await detail::await_with_deadline(stream->read_head(), head_deadline.limit, head_deadline.reason);
         if (!head || !*head)
             co_return std::unexpected{head ? (*head).error() : head.error()};
         // An asked-for 100-continue is an *interim* head. read_head() hands it to
@@ -990,14 +1020,15 @@ class Client {
         // is what read() returns). read_head() caches nothing for the interim, so
         // the next call parses the final head.
         while ((*head)->status == 100) {
-            head = co_await detail::await_with_deadline(stream->read_head(), limit);
+            head = co_await detail::await_with_deadline(stream->read_head(), head_deadline.limit, head_deadline.reason);
             if (!head || !*head)
                 co_return std::unexpected{head ? (*head).error() : head.error()};
         }
 
         std::string body;
         for (;;) {
-            auto chunk = co_await detail::await_with_deadline(stream->read(), limit);
+            auto chunk =
+                co_await detail::await_with_deadline(stream->read(), body_deadline.limit, body_deadline.reason);
             if (!chunk || !*chunk)
                 co_return std::unexpected{chunk ? (*chunk).error() : chunk.error()};
             if ((*chunk)->eof)
@@ -1105,7 +1136,11 @@ inline asio::awaitable<std::expected<Response, error_code>> RequestBuilder::send
         request->set_body(m_body);
     }
 
-    co_return co_await m_client->send(std::move(request), url, m_max_body_bytes, m_head_timeout, m_version);
+    // The builder's timeouts are layered (head / body-idle), not an overall
+    // request budget: hand them through as such. ClientConfig::request_timeout
+    // remains the overall bound.
+    co_return co_await m_client->send(std::move(request), url, m_max_body_bytes, {}, m_version, m_head_timeout,
+                                      m_idle_timeout);
 }
 
 } // namespace simple_http

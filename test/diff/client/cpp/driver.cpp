@@ -273,29 +273,68 @@ void set_body(Observation &obs, std::string body) {
     }
 }
 
+// Every library error gets its own slug so an error-path differential cannot
+// pass as `other == other`. The four timeout kinds stay collapsed: Go net/http
+// reports them all as a context deadline, so a finer split would create noise,
+// not information.
 std::string classify(error_code ec) {
     if (!ec) {
         return {};
     }
-    if (ec == make_error_code(client_errc::connect_timeout) || ec == make_error_code(client_errc::request_timeout) ||
-        ec == make_error_code(client_errc::response_head_timeout) ||
-        ec == make_error_code(client_errc::body_idle_timeout)) {
-        return "timeout";
-    }
-    if (ec == make_error_code(client_errc::body_too_large)) {
-        return "body_too_large";
-    }
-    if (ec == make_error_code(client_errc::too_many_redirects)) {
-        return "too_many_redirects";
-    }
-    if (ec == make_error_code(client_errc::redirect_to_insecure)) {
-        return "redirect_to_insecure";
-    }
-    if (ec == make_error_code(client_errc::expectation_failed)) {
-        return "expectation_failed";
-    }
-    if (ec == make_error_code(client_errc::trailers_not_supported)) {
-        return "trailers_not_supported";
+    if (ec.category() == client_category()) {
+        switch (static_cast<client_errc>(ec.value())) {
+        case client_errc::bad_url:
+            return "bad_url";
+        case client_errc::unsupported_scheme:
+            return "unsupported_scheme";
+        case client_errc::protocol_error:
+            return "protocol_error";
+        case client_errc::version_not_negotiated:
+            return "version_not_negotiated";
+        case client_errc::header_too_large:
+            return "header_too_large";
+        case client_errc::body_too_large:
+            return "body_too_large";
+        case client_errc::body_decode_failed:
+            return "body_decode_failed";
+        case client_errc::session_busy:
+            return "session_busy";
+        case client_errc::session_closed:
+            return "session_closed";
+        case client_errc::body_not_streaming:
+            return "body_not_streaming";
+        case client_errc::half_duplex:
+            return "half_duplex";
+        case client_errc::too_many_streams:
+            return "too_many_streams";
+        case client_errc::stream_reset:
+            return "stream_reset";
+        case client_errc::stream_refused:
+            return "stream_refused";
+        case client_errc::goaway:
+            return "goaway";
+        case client_errc::connect_timeout:
+        case client_errc::request_timeout:
+        case client_errc::response_head_timeout:
+        case client_errc::body_idle_timeout:
+            return "timeout";
+        case client_errc::invalid_spec:
+            return "invalid_spec";
+        case client_errc::redirect_to_insecure:
+            return "redirect_to_insecure";
+        case client_errc::too_many_redirects:
+            return "too_many_redirects";
+        case client_errc::http_status:
+            return "http_status";
+        case client_errc::expectation_failed:
+            return "expectation_failed";
+        case client_errc::trailers_not_supported:
+            return "trailers_not_supported";
+        case client_errc::proxy_error:
+            return "proxy_error";
+        case client_errc::proxy_auth_failed:
+            return "proxy_auth_failed";
+        }
     }
     if (ec == asio::error::connection_refused) {
         return "connect";
@@ -901,6 +940,31 @@ asio::awaitable<void> run_policy_group() {
         Client client{co_await asio::this_coro::executor, cfg};
         emit(co_await get_observation(client, base + "/slow?ms=2000", "policy.timeout"));
     }
+
+    // RequestBuilder::timeout(head, idle) is layered: head bounds the wait for
+    // the response head, idle bounds silence between body chunks. Go has no
+    // body-idle knob, so these are C++-only assertions on the exact error.
+    auto builder_timeout_case = [&](std::string case_id, std::string path, std::chrono::milliseconds head,
+                                    std::chrono::milliseconds idle, client_errc want) -> asio::awaitable<void> {
+        ClientConfig cfg;
+        cfg.default_version = HttpVersionPolicy::Http11;
+        cfg.default_h2c = H2cMode::Off;
+        Client client{co_await asio::this_coro::executor, cfg};
+        auto response = co_await client.get(base + path).header("user-agent", "diff-probe").timeout(head, idle).send();
+        Observation obs;
+        obs.case_id = case_id;
+        obs.mode = "cpp-only";
+        if (response) {
+            obs.error = "expected_timeout_response_succeeded";
+        } else if (response.error() != make_error_code(want)) {
+            obs.error = std::string{"wrong_error: "} + response.error().message();
+        }
+        emit(std::move(obs));
+    };
+    co_await builder_timeout_case("policy.builder_head_timeout", "/slow?ms=2000", 100ms, {},
+                                  client_errc::response_head_timeout);
+    co_await builder_timeout_case("policy.builder_body_idle_timeout", "/stall?ms=2000", {}, 100ms,
+                                  client_errc::body_idle_timeout);
 
     // Outbound proxies: a CONNECT proxy, a SOCKS5 proxy, and a proxy that is
     // bypassed by NO_PROXY. The origin is the TLS reference listener.
