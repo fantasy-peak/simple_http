@@ -1219,6 +1219,15 @@ cfg.tls = TlsClientConfig{
     .private_key_file = "client_key.pem",
     .min_version = TlsMinVersion::Tls12,  // client default 1.2; server default 1.3
 };
+
+// One configured SSL_CTX can be shared by many Clients. It is
+// reference-counted and thread-safe after configuration; the per-Client
+// TlsClientConfig fields (including the setup hook) are ignored when
+// shared_context is set.
+auto shared = make_client_tls_context(cfg.tls);
+ClientConfig a, b;
+a.tls.shared_context = shared;
+b.tls.shared_context = shared;
 ```
 
 ### Redirects, cookies and auth

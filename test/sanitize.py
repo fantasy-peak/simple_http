@@ -360,7 +360,7 @@ def main() -> int:
             # Restore the normal build configuration. This intentionally does
             # not try to preserve a custom user config; the default is what the
             # repository's normal test runs use.
-            subprocess.run(["xmake", "f", "-c", "-o", "build"],
+            subprocess.run(["xmake", "f", "-c", "-o", "build", "-m", "release"],
                            cwd=str(ROOT), capture_output=True)
 
 

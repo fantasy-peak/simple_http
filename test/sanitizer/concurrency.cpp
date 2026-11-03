@@ -25,8 +25,6 @@
 #include <thread>
 #include <vector>
 
-#include <openssl/ssl.h>
-
 #include <boost/asio.hpp>
 
 #include "simple_http.h"
@@ -131,16 +129,6 @@ void client_thread(unsigned short port, int id, int iterations) {
 } // namespace
 
 int main(int argc, char **argv) {
-    // OpenSSL 3 initializes lazily. Doing it here, on the main thread, before
-    // any Client constructs an ssl::context, keeps TSan from reporting the
-    // library's one-time hash-table setup as a race between client threads.
-    OPENSSL_init_ssl(0, nullptr);
-    {
-        // Warm OpenSSL's per-process algorithm/property tables before the
-        // client threads create their own ssl::context objects concurrently.
-        asio::ssl::context warmup{asio::ssl::context::tls_client};
-    }
-
     set_log_sink(make_stderr_sink(LogLevel::Error));
     const auto requested_port = static_cast<unsigned short>(argc > 1 ? std::atoi(argv[1]) : 0);
     constexpr int threads = 6;

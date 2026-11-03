@@ -156,6 +156,15 @@ struct TlsClientConfig {
     // sets for the same knob. (`verify_host` is ignored unless `verify_peer` is
     // set: without chain verification a name check proves nothing.)
     std::function<void(asio::ssl::context &)> setup;
+    // Optional pre-built client context. When set, the Client uses it as-is
+    // instead of building one, and the fields above (including `setup`) are
+    // ignored for origin connections. The caller owns its configuration and
+    // lifetime. An SSL_CTX is reference-counted and thread-safe once fully
+    // configured, so the same context may be shared by many Clients, including
+    // Clients constructed on different threads. Proxy connections always build
+    // their own context (the client certificate must not be presented to a
+    // proxy).
+    std::shared_ptr<asio::ssl::context> shared_context;
 };
 
 // An outbound proxy. A configured proxy tunnels every TCP-based connection the

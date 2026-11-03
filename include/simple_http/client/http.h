@@ -58,6 +58,14 @@ namespace asio = boost::asio;
 // The layered deadline used by Stream: bounds one expected-returning awaitable
 // with a timer, reporting the given client_errc on timeout. limit <= 0 means no
 // bound, so a zero budget (the default) never triggers.
+// Builds and configures one client-side TLS context. Assign it to
+// TlsClientConfig::shared_context to share it across several Clients (an
+// SSL_CTX is reference-counted and thread-safe once fully configured). A
+// Client otherwise builds its own context from its TlsClientConfig.
+inline std::shared_ptr<asio::ssl::context> make_client_tls_context(const TlsClientConfig &cfg) {
+    return detail::make_client_ssl_context(cfg);
+}
+
 namespace detail {
 template <typename T>
 asio::awaitable<std::expected<T, error_code>> deadline(asio::awaitable<std::expected<T, error_code>> op,

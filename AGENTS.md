@@ -876,6 +876,13 @@ test/run.sh server-diff
 26. **CookieJar 的 Secure 与 loopback**：RFC 6265bis / Go 把 localhost 与
     `127.0.0.0/8`/`::1` 视为可信源，Secure cookie 在 http 下也会发送；不要把它
     简化成「仅 https」。
+27. **OpenSSL 惰性初始化**：所有 `ssl::context` 构造入口（`TlsContext`、
+    `QuicTlsContext`、`make_client_ssl_context`）都必须先经过
+    `transport/openssl_init.h` 的 `detail::ensure_openssl_initialized()`。
+    多个线程首次并发 `SSL_CTX_new` 会在 OpenSSL 4 的 `ossl_ht_get` 里产生
+    TSan race；这个 `std::call_once` 预热是进程级的，不是 SSL_CTX 单例。
+    需要跨 Client 共享 context 时用 `make_client_tls_context()` +
+    `TlsClientConfig::shared_context`，不要做全局单例。
 
 ---
 

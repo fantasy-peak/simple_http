@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "../core/logging.h"
+#include "../transport/openssl_init.h"
 #include "../transport/tls_transport.h"
 #include "client_config.h"
 
@@ -82,6 +83,13 @@ inline std::vector<unsigned char> alpn_wire_list(const ClientTarget &target, con
 // Builds and configures the client-side ssl::context: verification, CA bundle,
 // optional client certificate (mTLS) and the TLS floor.
 inline std::shared_ptr<asio::ssl::context> make_client_ssl_context(const TlsClientConfig &cfg) {
+    // One-time OpenSSL warm-up: several Clients may be constructed on different
+    // threads, and the first SSL_CTX_new would otherwise race in OpenSSL's
+    // lazy tables (see transport/openssl_init.h).
+    ensure_openssl_initialized();
+    if (cfg.shared_context) {
+        return cfg.shared_context;
+    }
     auto ctx = std::make_shared<asio::ssl::context>(asio::ssl::context::tls_client);
 
     if (cfg.setup) {

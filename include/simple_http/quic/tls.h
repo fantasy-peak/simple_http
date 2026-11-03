@@ -49,12 +49,17 @@ inline constexpr std::array<unsigned char, 3> kHttp3AlpnWire{0x02, 'h', '3'};
 // OpenSSL API would be a second copy of the same policy, free to drift.
 class QuicTlsContext {
   public:
-    explicit QuicTlsContext(const TlsConfig &cfg) : m_ctx(asio::ssl::context::tlsv13_server) { configure(cfg); }
+    explicit QuicTlsContext(const TlsConfig &cfg) : m_ctx(context_method()) { configure(cfg); }
 
     [[nodiscard]] asio::ssl::context &context() { return m_ctx; }
     [[nodiscard]] SSL_CTX *native_handle() { return m_ctx.native_handle(); }
 
   private:
+    static asio::ssl::context::method context_method() {
+        simple_http::detail::ensure_openssl_initialized();
+        return asio::ssl::context::tlsv13_server;
+    }
+
     static bool is_regular_file(const std::filesystem::path &path) {
         std::error_code ec;
         return std::filesystem::is_regular_file(path, ec) && !ec;

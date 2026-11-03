@@ -1148,6 +1148,14 @@ cfg.tls = TlsClientConfig{
     .private_key_file = "client_key.pem",
     .min_version = TlsMinVersion::Tls12,  // 客户端默认 1.2；服务端默认 1.3
 };
+
+// 一个配置好的 SSL_CTX 可以被多个 Client 共享：它在配置完成后是
+// 引用计数且线程安全的；设置 shared_context 后，per-Client 的
+// TlsClientConfig 字段（包括 setup hook）会被忽略。
+auto shared = make_client_tls_context(cfg.tls);
+ClientConfig a, b;
+a.tls.shared_context = shared;
+b.tls.shared_context = shared;
 ```
 
 ### 重定向、Cookie 与认证

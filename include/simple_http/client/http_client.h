@@ -960,6 +960,7 @@ class ClientEngine {
         tls.private_key_file.clear();
         tls.sni_override.clear();
         tls.setup = nullptr;
+        tls.shared_context = nullptr; // the proxy has its own TLS policy
         tls.alpn.clear();
         tls.verify_peer = proxy.verify_peer;
         tls.verify_host = proxy.verify_host && proxy.verify_peer;

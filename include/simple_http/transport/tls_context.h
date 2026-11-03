@@ -24,6 +24,7 @@
 #include "../core/logging.h"
 #include "../core/tls_version.h" // TlsMinVersion
 #include "../core/types.h"       // error_code: used below, and this header must stand alone
+#include "openssl_init.h"
 
 namespace simple_http {
 
@@ -75,8 +76,7 @@ class TlsContext {
     // (`TlsHttp`) is translated here, so a listener configured as
     // HTTP/1.1-only really offers http/1.1 and no h2.
     explicit TlsContext(const TlsConfig &cfg, std::span<const std::string_view> alpn = {})
-        : m_ctx(cfg.min_version == TlsMinVersion::Tls13 ? asio::ssl::context::tlsv13_server
-                                                        : asio::ssl::context::tls_server) {
+        : m_ctx(context_method(cfg)) {
         if (cfg.min_version == TlsMinVersion::Tls12) {
             // tls_server spans 1.2/1.3; pin the floor so 1.0/1.1 remain off.
             if (SSL_CTX_set_min_proto_version(m_ctx.native_handle(), TLS1_2_VERSION) != 1) {
@@ -89,6 +89,15 @@ class TlsContext {
     asio::ssl::context &context() { return m_ctx; }
 
   private:
+    // OpenSSL's lazy tables must be initialized before the first SSL_CTX is
+    // built; see transport/openssl_init.h. Keeping it in the initializer keeps
+    // this correct even when several listeners are constructed concurrently.
+    static asio::ssl::context::method context_method(const TlsConfig &cfg) {
+        detail::ensure_openssl_initialized();
+        return cfg.min_version == TlsMinVersion::Tls13 ? asio::ssl::context::tlsv13_server
+                                                       : asio::ssl::context::tls_server;
+    }
+
     static bool is_regular_file(const std::filesystem::path &path) {
         std::error_code ec;
         return std::filesystem::is_regular_file(path, ec) && !ec;

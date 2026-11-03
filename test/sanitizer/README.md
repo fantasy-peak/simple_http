@@ -80,13 +80,15 @@ concurrently with a normal build.
 ASan catches use-after-free during teardown; TSan catches races in handler-layer
 shared state, log-sink replacement and the cross-executor write hop.
 
-The harness calls `OPENSSL_init_ssl()` and creates/destroys one throwaway
-`ssl::context` on the main thread before starting client threads. OpenSSL 4
-initializes its algorithm/property hash table lazily; without the warm-up, TSan
-reports `ossl_ht_get` as a race when several `Client` objects construct their
-SSL contexts concurrently. The library intentionally builds the context in the
-constructor (configuration faults surface early), so the application initializes
-OpenSSL once before starting threads.
+OpenSSL 4 initializes its algorithm/property hash table lazily; without a
+warm-up, TSan reports `ossl_ht_get` as a race when several `Client` objects
+construct their SSL contexts concurrently. The library now performs that
+warm-up once under `std::call_once` in
+`include/simple_http/transport/openssl_init.h`, called by both the client and
+server context builders. The harness no longer needs any OpenSSL-specific
+setup. A context still carries per-Client TLS policy; callers that want to
+share one across Clients can build it with `make_client_tls_context()` and set
+`TlsClientConfig::shared_context`.
 
 ## Logs and findings
 
