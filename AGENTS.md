@@ -684,7 +684,8 @@ Python 侧只需要 `httpx`、`jsonschema`、`brotli`（`test/requirements.txt`�
   HTTP CONNECT `7816`、SOCKS5 `7817`）。服务端回显收到的 method/header/body，
   因此差异只能来自客户端。组：`basic`、`body`、`policy`、`ws`、`h3`。
 - **server**（`test/diff/server/`）：同一个 Go 探针把请求分别发给 C++ 参考服务端
-  （`7820`–`7824`，`7824` 是纯 h1）与 Go 参考服务端（`7830`–`7833`），每个案例输出
+  （`7820`–`7824`，`7824` 是纯 h1；`7825` 是要求客户端证书的 mTLS）与 Go 参考
+  服务端（`7830`–`7834`），每个案例输出
   `target=cpp` / `target=go` 两行。组：`routing`、`body`、`semantics`、
   `middleware`、`framework`、`static`、`ws`、`raw`、`h2raw`。
   `h2raw` 是 C++ 单侧原始 HTTP/2 断言（`test/diff/server/go/h2raw/`）：RFC 8441

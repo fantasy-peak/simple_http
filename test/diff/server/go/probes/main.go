@@ -72,7 +72,8 @@ func emit(obs observation) {
 	fmt.Println(string(data))
 }
 
-func baseFor(target, protocol, cppH1, cppH2C, cppTLS, cppH3, goH1, goH2C, goTLS, goH3 string) string {
+func baseFor(target, protocol, cppH1, cppH2C, cppTLS, cppH3, cppMTLS, goH1, goH2C, goTLS, goH3,
+	goMTLS string) string {
 	if target == "cpp" {
 		switch protocol {
 		case "h2c":
@@ -81,6 +82,8 @@ func baseFor(target, protocol, cppH1, cppH2C, cppTLS, cppH3, goH1, goH2C, goTLS,
 			return cppTLS
 		case "h3":
 			return cppH3
+		case "mtls", "mtls-nocert":
+			return cppMTLS
 		default:
 			return cppH1
 		}
@@ -92,6 +95,8 @@ func baseFor(target, protocol, cppH1, cppH2C, cppTLS, cppH3, goH1, goH2C, goTLS,
 		return goTLS
 	case "h3":
 		return goH3
+	case "mtls", "mtls-nocert":
+		return goMTLS
 	default:
 		return goH1
 	}
@@ -118,6 +123,18 @@ func clientFor(protocol string, jar http.CookieJar) *http.Client {
 		transport = &http3.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13},
 		}
+	case "mtls", "mtls-nocert":
+		cfg := &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12}
+		if protocol == "mtls" {
+			// The test cert has no SAN, so verification is off; what is under
+			// test is the server's client-certificate requirement.
+			cert, err := tls.LoadX509KeyPair("./test/tls_certificates/client_cert.pem",
+				"./test/tls_certificates/client_key.pem")
+			if err == nil {
+				cfg.Certificates = []tls.Certificate{cert}
+			}
+		}
+		transport = &http.Transport{TLSClientConfig: cfg}
 	default:
 		plain := http.DefaultTransport.(*http.Transport).Clone()
 		plain.DisableCompression = true
@@ -147,6 +164,11 @@ func classify(err error) string {
 	text := err.Error()
 	if strings.Contains(text, "connection refused") || strings.Contains(text, "connect:") {
 		return "connect"
+	}
+	// Both reference servers reject a missing client certificate with the TLS
+	// "certificate required" alert, so the handshake-failure slug is shared.
+	if strings.Contains(text, "certificate required") || strings.Contains(text, "bad certificate") {
+		return "client_cert_required"
 	}
 	return "other"
 }
@@ -264,9 +286,9 @@ func observe(resp *http.Response, err error, decompress bool) observation {
 }
 
 type harness struct {
-	cppH1, cppH2C, cppTLS, cppH3 string
-	goH1, goH2C, goTLS, goH3     string
-	cppRaw, goRaw                string
+	cppH1, cppH2C, cppTLS, cppH3, cppMTLS string
+	goH1, goH2C, goTLS, goH3, goMTLS      string
+	cppRaw, goRaw                         string
 }
 
 func (h harness) rawBase(target string) string {
@@ -277,8 +299,8 @@ func (h harness) rawBase(target string) string {
 }
 
 func (h harness) base(target string, spec caseSpec) string {
-	return baseFor(target, spec.Protocol, h.cppH1, h.cppH2C, h.cppTLS, h.cppH3,
-		h.goH1, h.goH2C, h.goTLS, h.goH3)
+	return baseFor(target, spec.Protocol, h.cppH1, h.cppH2C, h.cppTLS, h.cppH3, h.cppMTLS,
+		h.goH1, h.goH2C, h.goTLS, h.goH3, h.goMTLS)
 }
 
 func (h harness) run(spec caseSpec) {
@@ -443,6 +465,10 @@ func frameworkCases() []caseSpec {
 		{ID: "framework.host_api", Method: "GET", Path: "/who", Host: "api.example.com"},
 		// The CSRF middleware's exempt_paths route: no token is required.
 		{ID: "framework.csrf_exempt", Method: "POST", Path: "/csrf/exempt"},
+		// Mutual TLS: the verified client CN on the mTLS listener, and the
+		// handshake failure when no certificate is presented.
+		{ID: "framework.client_cert", Method: "GET", Path: "/client-cert", Protocol: "mtls"},
+		{ID: "framework.client_cert_missing", Method: "GET", Path: "/client-cert", Protocol: "mtls-nocert"},
 	}
 }
 
@@ -479,6 +505,43 @@ func wsObservation(caseName, target, text string, data []byte, err error) {
 		obs.BodyEncoding = "base64"
 	}
 	emit(obs)
+}
+
+// Origin-gated WebSocket route: allowed / denied / missing Origin. The
+// handshake status is the observable; 403 bodies are framework-specific.
+func runWSOrigin(target, base string) {
+	url := strings.Replace(base, "http://", "ws://", 1) + "/ws/guarded"
+	record := func(caseName string, resp *http.Response, err error) {
+		obs := observation{Case: caseName, Target: target, Headers: map[string][]string{}, BodyEncoding: "utf8"}
+		if resp != nil {
+			status := resp.StatusCode
+			obs.Status = &status
+		}
+		if err != nil {
+			reason := "other"
+			obs.Error = &reason
+		}
+		emit(obs)
+	}
+	dialer := websocket.Dialer{HandshakeTimeout: 3 * time.Second}
+	for _, probe := range []struct {
+		caseName string
+		origin   string
+	}{
+		{"ws.origin_allowed", "https://app.example.com"},
+		{"ws.origin_denied", "https://evil.example.com"},
+		{"ws.origin_missing", ""},
+	} {
+		var header http.Header
+		if probe.origin != "" {
+			header = http.Header{"Origin": {probe.origin}}
+		}
+		conn, resp, err := dialer.Dial(url, header)
+		if conn != nil {
+			_ = conn.Close()
+		}
+		record(probe.caseName, resp, err)
+	}
 }
 
 func runWS(target, base string) {
@@ -743,12 +806,14 @@ func main() {
 	goH2C := flag.String("go-h2c", "http://127.0.0.1:7831", "Go h2c base")
 	goTLS := flag.String("go-tls", "https://127.0.0.1:7832", "Go TLS base")
 	goH3 := flag.String("go-h3", "https://127.0.0.1:7833", "Go h3 base")
+	cppMTLS := flag.String("cpp-mtls", "https://127.0.0.1:7825", "C++ mutual-TLS base")
+	goMTLS := flag.String("go-mtls", "https://127.0.0.1:7834", "Go mutual-TLS base")
 	cppRaw := flag.String("cpp-raw", "http://127.0.0.1:7824", "C++ raw h1 base")
 	goRaw := flag.String("go-raw", "http://127.0.0.1:7830", "Go raw h1 base")
 	flag.Parse()
 
-	h := harness{cppH1: *cppH1, cppH2C: *cppH2C, cppTLS: *cppTLS, cppH3: *cppH3,
-		goH1: *goH1, goH2C: *goH2C, goTLS: *goTLS, goH3: *goH3,
+	h := harness{cppH1: *cppH1, cppH2C: *cppH2C, cppTLS: *cppTLS, cppH3: *cppH3, cppMTLS: *cppMTLS,
+		goH1: *goH1, goH2C: *goH2C, goTLS: *goTLS, goH3: *goH3, goMTLS: *goMTLS,
 		cppRaw: *cppRaw, goRaw: *goRaw}
 
 	var cases []caseSpec
@@ -767,7 +832,9 @@ func main() {
 		cases = staticCases()
 	case "ws":
 		for _, target := range []string{"cpp", "go"} {
-			runWS(target, h.base(target, caseSpec{}))
+			base := h.base(target, caseSpec{})
+			runWS(target, base)
+			runWSOrigin(target, base)
 		}
 		return
 	case "raw":

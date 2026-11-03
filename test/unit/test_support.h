@@ -165,6 +165,17 @@ class MockTransport {
     // Queues bytes for the next reads.
     void push(std::string bytes) { m_in.push_back(std::move(bytes)); }
 
+    // Bytes still queued for reading (not yet handed out by async_read_some).
+    // Lets a test observe that a bounded consumer stopped pulling from the
+    // transport instead of buffering everything.
+    std::size_t pending() const {
+        std::size_t bytes = 0;
+        for (const auto &chunk : m_in) {
+            bytes += chunk.size();
+        }
+        return bytes;
+    }
+
     // Everything written so far, concatenated, and chunk by chunk.
     const std::string &written() const { return m_written; }
 

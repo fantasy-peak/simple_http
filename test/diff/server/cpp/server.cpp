@@ -32,6 +32,8 @@
 #include <vector>
 
 #include <glaze/glaze.hpp>
+#include <openssl/ssl.h>
+#include <openssl/x509.h>
 
 #include "simple_http.h"
 
@@ -179,6 +181,23 @@ asio::awaitable<void> multipart_handler(std::shared_ptr<Request> req, std::share
     co_await res->status(200).content_type("application/json").send(encoded ? *encoded : "[]");
 }
 
+// The client certificate's Common Name, or "none" when the connection is not
+// mutually authenticated. The Go reference exposes the same string from
+// r.TLS.PeerCertificates so the probe can compare them.
+std::string peer_common_name(SslHandle ssl) {
+    if (!ssl || !*ssl) {
+        return "none";
+    }
+    X509 *cert = SSL_get1_peer_certificate(*ssl);
+    if (!cert) {
+        return "none";
+    }
+    char name[256]{};
+    const int length = X509_NAME_get_text_by_NID(X509_get_subject_name(cert), NID_commonName, name, sizeof(name));
+    X509_free(cert);
+    return length > 0 ? std::string{name, static_cast<std::size_t>(length)} : std::string{"none"};
+}
+
 struct StaticFilesConfigArgs {
     std::string root;
 };
@@ -203,6 +222,12 @@ template <typename ServerT> void register_routes(ServerT &server, const std::sha
                  [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(200).send("hello"); });
     server.route(any_methods, "/echo", echo_handler);
     server.route(any_methods, "/multipart", multipart_handler);
+    // Mutually authenticated listeners expose the verified client certificate;
+    // the rest report "none".
+    server.route({Method::Get}, "/client-cert",
+                 [](RequestPtr, ResponsePtr res, SslHandle ssl) -> asio::awaitable<void> {
+                     co_await res->status(200).send(peer_common_name(ssl));
+                 });
 
     // The status template needs a numeric path capture.
     server.route({Method::Get}, "/status/{code}",
@@ -434,6 +459,20 @@ template <typename ServerT> void register_routes(ServerT &server, const std::sha
         });
 
     // WebSocket.
+    // Origin-gated WebSocket route: proves per-route middleware runs on the
+    // upgrade path (CSWSH defense). The Go reference uses gorilla's CheckOrigin.
+    server.ws_route("/ws/guarded", {middleware::ws_origin({"https://app.example.com"})},
+                    [](std::shared_ptr<Request>, std::shared_ptr<WebSocket> ws) -> asio::awaitable<void> {
+                        for (;;) {
+                            auto msg = co_await ws->read();
+                            if (!msg) {
+                                break;
+                            }
+                            if (co_await ws->write(msg->data, msg->text)) {
+                                break;
+                            }
+                        }
+                    });
     server.ws_route("/ws/echo", [](std::shared_ptr<Request>, std::shared_ptr<WebSocket> ws) -> asio::awaitable<void> {
         for (;;) {
             auto msg = co_await ws->read();
@@ -513,8 +552,23 @@ int main(int argc, char **argv) {
     Server tls{tls_cfg};
     register_routes(tls, site);
 
-    bool ok = sniff.start() && h2c.start() && h1.start() && tls.start();
-    std::println("diff server cpp: :7820 sniff :7821 h2c :7822 tls :7824 h1 (ok={})", ok);
+    // Mutual TLS: the handshake fails unless the client presents a certificate
+    // signed by the test CA. /client-cert reports the verified CN.
+    ServerConfig mtls_cfg;
+    mtls_cfg.listen = InetAddress{"0.0.0.0", 7825, false};
+    mtls_cfg.worker_threads = 2;
+    mtls_cfg.limits.max_body_bytes = 1024 * 1024;
+    mtls_cfg.tls = TlsConfig{
+        .cert_chain_file = "./test/tls_certificates/server_cert.pem",
+        .private_key_file = "./test/tls_certificates/server_key.pem",
+        .mutual = true,
+        .ca_file = "./test/tls_certificates/ca_cert.pem",
+    };
+    Server mtls{mtls_cfg};
+    register_routes(mtls, site);
+
+    bool ok = sniff.start() && h2c.start() && h1.start() && tls.start() && mtls.start();
+    std::println("diff server cpp: :7820 sniff :7821 h2c :7822 tls :7824 h1 :7825 mtls (ok={})", ok);
 
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
     ServerConfig h3_cfg;
@@ -545,6 +599,7 @@ int main(int argc, char **argv) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     sniff.stop();
+    mtls.stop();
     h2c.stop();
     h1.stop();
     tls.stop();

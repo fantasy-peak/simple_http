@@ -99,7 +99,8 @@ test/run.sh full --parallel 1   # 完全串行，便于定位
 | 7815 | client-diff 的第二 origin（跨 origin 重定向） |
 | 7816 / 7817 | client-diff 的 HTTP CONNECT / SOCKS5 代理 |
 | 7820–7824 | server-diff 的 C++ 服务端（嗅探 / h2c / TLS / tcp+udp h3 / 纯 h1） |
-| 7830–7833 | server-diff 的 Go 服务端 |
+| 7825 | server-diff 的 C++ mTLS 服务端（要求客户端证书） |
+| 7830–7834 | server-diff 的 Go 服务端（含 mTLS） |
 | 7795 | OpenAPI petshop |
 
 端口是脚本契约，不要改。

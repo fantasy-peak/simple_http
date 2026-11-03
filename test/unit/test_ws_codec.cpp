@@ -911,6 +911,46 @@ TEST_CASE("ws/deflate: per-connection compression controls", "[ws][ws-deflate]")
     }
 }
 
+TEST_CASE("ws/inbox: a flooding peer is bounded by inbox_limit", "[ws]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    constexpr std::size_t kPayload = 4096;
+    // One message (payload + per-message overhead) fits; two do not.
+    constexpr std::size_t kLimit = 5000;
+    auto backend = std::make_shared<WsBackendImpl<MockTransport>>(transport, /*max_payload=*/65536,
+                                                                  std::chrono::seconds(5), /*expect_masked=*/true,
+                                                                  /*inbox_limit=*/kLimit);
+    auto ws = std::make_shared<WebSocket>(backend);
+    asio::co_spawn(ctx, ws->run_writer(), asio::detached);
+
+    const unsigned char mask[4] = {0x37, 0xfa, 0x21, 0x3d};
+    std::string expected;
+    for (int i = 0; i < 10; ++i) {
+        std::string payload(kPayload, static_cast<char>('a' + i));
+        expected += payload;
+        transport->push(ws_client_frame(WsOpcode::Text, payload, /*fin=*/true, mask));
+    }
+
+    // Touch read() once so the reader pump starts, then let it run ahead. If
+    // the inbox were unbounded it would swallow the whole flood here.
+    auto first = run_until(ctx, ws->read());
+    REQUIRE(first.has_value());
+    REQUIRE(first->has_value());
+    drain(ctx);
+    CHECK(transport->pending() > 0);
+
+    // Draining makes room; the reader resumes and delivers everything in order.
+    std::string got = (*first)->data;
+    for (int i = 1; i < 10; ++i) {
+        auto message = run_until(ctx, ws->read());
+        REQUIRE(message.has_value());
+        REQUIRE(message->has_value());
+        got += (*message)->data;
+    }
+    CHECK(got == expected);
+    CHECK(transport->pending() == 0);
+}
+
 TEST_CASE("ws: client mask keys come from the CSPRNG", "[ws]") {
     unsigned char a[4]{};
     unsigned char b[4]{};

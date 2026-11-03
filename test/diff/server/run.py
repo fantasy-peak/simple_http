@@ -60,6 +60,11 @@ CASE_OPTIONS: dict[str, dict] = {
     "framework.valid_fail": {"body_mode": "json", "parse_json_strings": ["details"]},
     "framework.header_missing": {"body_mode": "json"},
     "framework.jwt_missing": {"body_mode": "json"},
+    # WebSocket origin gate: the 403 bodies are framework-specific; the
+    # handshake status is the contract under test.
+    "ws.origin_allowed": {"body_mode": "none"},
+    "ws.origin_denied": {"body_mode": "none", "ignore_headers": ["content-type"]},
+    "ws.origin_missing": {"body_mode": "none", "ignore_headers": ["content-type"]},
     "static.index": {"body_mode": "exact"},
     "static.file": {"body_mode": "exact"},
     "static.spa": {"body_mode": "exact"},

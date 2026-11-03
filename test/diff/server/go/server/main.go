@@ -19,6 +19,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
@@ -484,6 +485,13 @@ func makeHandler(state *serverState, staticRoot string) http.Handler {
 	mux.HandleFunc("/plain", func(w http.ResponseWriter, r *http.Request) { writeText(w, 200, "hello") })
 	mux.HandleFunc("/echo", echoHandler)
 	mux.HandleFunc("/multipart", multipartHandler)
+	mux.HandleFunc("/client-cert", func(w http.ResponseWriter, r *http.Request) {
+		cn := "none"
+		if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+			cn = r.TLS.PeerCertificates[0].Subject.CommonName
+		}
+		writeText(w, 200, cn)
+	})
 	mux.HandleFunc("/status/", func(w http.ResponseWriter, r *http.Request) {
 		code, err := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/status/"))
 		if err != nil || code == 0 {
@@ -783,6 +791,25 @@ func makeHandler(state *serverState, staticRoot string) http.Handler {
 		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("/jwt/me", jwtHandler)
+	guarded := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool {
+		return r.Header.Get("Origin") == "https://app.example.com"
+	}}
+	mux.HandleFunc("/ws/guarded", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := guarded.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			kind, data, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			if err := conn.WriteMessage(kind, data); err != nil {
+				return
+			}
+		}
+	})
 	mux.HandleFunc("/ws/echo", func(w http.ResponseWriter, r *http.Request) {
 		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -816,6 +843,8 @@ func main() {
 	h2cAddr := flag.String("h2c", "127.0.0.1:7831", "h2c address")
 	tlsAddr := flag.String("tls", "127.0.0.1:7832", "TLS address")
 	h3Addr := flag.String("h3", "127.0.0.1:7833", "HTTP/3 address")
+	mtlsAddr := flag.String("mtls", "127.0.0.1:7834", "mutual-TLS address")
+	caFile := flag.String("ca", "./test/tls_certificates/ca_cert.pem", "CA bundle for client certificates")
 	certFile := flag.String("cert", "./test/tls_certificates/server_cert.pem", "certificate")
 	keyFile := flag.String("key", "./test/tls_certificates/server_key.pem", "private key")
 	staticRoot := flag.String("static-root", "./test/diff/server/fixtures/static", "static root")
@@ -863,6 +892,33 @@ func main() {
 	}
 	go func() { _ = tlsServer.Serve(tls.NewListener(tlsListener, tlsConfig)) }()
 
+	// Mutual TLS: RequireAndVerifyClientCert makes an absent or untrusted
+	// client certificate a handshake failure. /client-cert exposes the CN.
+	caPEM, err := os.ReadFile(*caFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "load ca: %v\n", err)
+		os.Exit(1)
+	}
+	clientCAs := x509.NewCertPool()
+	if !clientCAs.AppendCertsFromPEM(caPEM) {
+		fmt.Fprintln(os.Stderr, "ca bundle is empty")
+		os.Exit(1)
+	}
+	mtlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{certificate},
+		MinVersion:   tls.VersionTLS12,
+		NextProtos:   []string{"http/1.1"},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    clientCAs,
+	}
+	mtlsServer := &http.Server{Handler: handler, MaxHeaderBytes: 64 << 10}
+	mtlsListener, err := net.Listen("tcp", *mtlsAddr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mtls listen: %v\n", err)
+		os.Exit(1)
+	}
+	go func() { _ = mtlsServer.Serve(tls.NewListener(mtlsListener, mtlsConfig)) }()
+
 	var h3Server *http3.Server
 	var h3Conn net.PacketConn
 	if *enableH3 {
@@ -887,7 +943,8 @@ func main() {
 		go func() { _ = h3Server.Serve(h3Conn) }()
 	}
 
-	fmt.Printf("READY diff-server-go h1=%s h2c=%s tls=%s h3=%s\n", *h1Addr, *h2cAddr, *tlsAddr, *h3Addr)
+	fmt.Printf("READY diff-server-go h1=%s h2c=%s tls=%s h3=%s mtls=%s\n", *h1Addr, *h2cAddr, *tlsAddr, *h3Addr,
+		*mtlsAddr)
 	os.Stdout.Sync()
 
 	signals := make(chan os.Signal, 1)
@@ -896,6 +953,7 @@ func main() {
 	_ = h1.Close()
 	_ = h2cServer.Close()
 	_ = tlsServer.Close()
+	_ = mtlsServer.Close()
 	if h3Server != nil {
 		_ = h3Server.Close()
 	}
