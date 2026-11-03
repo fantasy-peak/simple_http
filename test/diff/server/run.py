@@ -60,6 +60,17 @@ CASE_OPTIONS: dict[str, dict] = {
     "framework.valid_fail": {"body_mode": "json", "parse_json_strings": ["details"]},
     "framework.header_missing": {"body_mode": "json"},
     "framework.jwt_missing": {"body_mode": "json"},
+    # The two verifiers agree on the status and WWW-Authenticate header but
+    # word the rejection differently, so only those are compared.
+    "framework.jwt_expired": {"body_mode": "none"},
+    "framework.jwt_not_yet_valid": {"body_mode": "none"},
+    "framework.jwt_wrong_issuer": {"body_mode": "none"},
+    "framework.jwt_wrong_audience": {"body_mode": "none"},
+    "framework.jwt_tampered": {"body_mode": "none"},
+    "framework.jwt_alg_none": {"body_mode": "none"},
+    "framework.jwt_malformed": {"body_mode": "none"},
+    # Both report "invalid authorization scheme"; the JSON body is identical.
+    "framework.jwt_bad_scheme": {"body_mode": "json"},
     # WebSocket origin gate: the 403 bodies are framework-specific; the
     # handshake status is the contract under test.
     "ws.origin_allowed": {"body_mode": "none"},

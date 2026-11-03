@@ -698,29 +698,54 @@ func runCSRF(h harness, target string) {
 	emit(obs)
 }
 
+func mintHS256(header, payload, secret string) string {
+	encodedHeader := base64.RawURLEncoding.EncodeToString([]byte(header))
+	encodedPayload := base64.RawURLEncoding.EncodeToString([]byte(payload))
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte(encodedHeader + "." + encodedPayload))
+	return encodedHeader + "." + encodedPayload + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func jwtClaims(iss, aud string, exp, nbf int64) string {
+	return fmt.Sprintf(`{"sub":"alice","iss":%q,"aud":%q,"exp":%d,"nbf":%d}`, iss, aud, exp, nbf)
+}
+
 func runJWT(h harness, target string) {
 	base := h.base(target, caseSpec{})
-	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
-	payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(
-		`{"sub":"alice","iss":"iss","aud":"aud","exp":%d}`, time.Now().Add(time.Hour).Unix())))
-	mac := hmac.New(sha256.New, []byte("secret"))
-	_, _ = mac.Write([]byte(header + "." + payload))
-	token := header + "." + payload + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	now := time.Now()
+	const header = `{"alg":"HS256","typ":"JWT"}`
+	validClaims := jwtClaims("iss", "aud", now.Add(time.Hour).Unix(), 0)
+	valid := mintHS256(header, validClaims, "secret")
 
-	withToken, _ := http.NewRequest("GET", base+"/jwt/me", nil)
-	withToken.Header.Set("Authorization", "Bearer "+token)
-	resp, err := clientFor("h1", nil).Do(withToken)
-	obs := observe(resp, err, false)
-	obs.Case = "framework.jwt_ok"
-	obs.Target = target
-	emit(obs)
+	emitAuth := func(caseName, authorization string) {
+		request, _ := http.NewRequest("GET", base+"/jwt/me", nil)
+		if authorization != "" {
+			request.Header.Set("Authorization", authorization)
+		}
+		resp, err := clientFor("h1", nil).Do(request)
+		obs := observe(resp, err, false)
+		obs.Case = caseName
+		obs.Target = target
+		emit(obs)
+	}
 
-	without, _ := http.NewRequest("GET", base+"/jwt/me", nil)
-	resp, err = clientFor("h1", nil).Do(without)
-	obs = observe(resp, err, false)
-	obs.Case = "framework.jwt_missing"
-	obs.Target = target
-	emit(obs)
+	emitAuth("framework.jwt_ok", "Bearer "+valid)
+	emitAuth("framework.jwt_missing", "")
+	emitAuth("framework.jwt_expired",
+		"Bearer "+mintHS256(header, jwtClaims("iss", "aud", now.Add(-time.Hour).Unix(), 0), "secret"))
+	emitAuth("framework.jwt_not_yet_valid",
+		"Bearer "+mintHS256(header, jwtClaims("iss", "aud", now.Add(time.Hour).Unix(), now.Add(time.Hour).Unix()), "secret"))
+	emitAuth("framework.jwt_wrong_issuer",
+		"Bearer "+mintHS256(header, jwtClaims("other", "aud", now.Add(time.Hour).Unix(), 0), "secret"))
+	emitAuth("framework.jwt_wrong_audience",
+		"Bearer "+mintHS256(header, jwtClaims("iss", "other", now.Add(time.Hour).Unix(), 0), "secret"))
+	emitAuth("framework.jwt_tampered", "Bearer "+mintHS256(header, validClaims, "wrong-secret"))
+	// alg:none with an empty signature must be rejected by the allowlist.
+	noneToken := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`)) + "." +
+		base64.RawURLEncoding.EncodeToString([]byte(validClaims)) + "."
+	emitAuth("framework.jwt_alg_none", "Bearer "+noneToken)
+	emitAuth("framework.jwt_malformed", "Bearer not-a-jwt")
+	emitAuth("framework.jwt_bad_scheme", "Basic abc")
 }
 
 func runETag(h harness, target string) {

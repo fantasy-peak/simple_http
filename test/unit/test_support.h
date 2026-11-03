@@ -293,6 +293,8 @@ class FakeResponseSink : public ResponseSink {
         co_return error_code{};
     }
 
+    bool head_request() const noexcept override { return head; }
+
     asio::awaitable<bool> connected() const override { co_return open; }
 
     asio::awaitable<void> close() override {
@@ -314,6 +316,7 @@ class FakeResponseSink : public ResponseSink {
     bool finished{false};
     bool sent_bodyless{false};
     bool sent_trailers{false};
+    bool head{false}; // report head_request() == true
     bool open{true};
     Version ver{Version::Http11};
 

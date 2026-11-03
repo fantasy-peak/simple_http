@@ -574,6 +574,111 @@ TEST_CASE("framework: JWT verifies HS256, claims and scopes", "[framework][jwt]"
     CHECK(dispatch(ctx, router, scoped)->last_status == 204);
 }
 
+TEST_CASE("framework: JWT rejects malformed, unsigned and mismatched tokens", "[framework][jwt]") {
+    asio::io_context ctx;
+    const std::string header = R"({"alg":"HS256","typ":"JWT"})";
+    const auto now = now_unix();
+
+    auto claims = [](std::string_view iss, std::string_view aud, std::int64_t exp, std::int64_t nbf,
+                     std::string_view roles) {
+        return "{\"sub\":\"alice\",\"scope\":\"read\",\"roles\":[" + std::string{roles} + "],\"iss\":\"" +
+               std::string{iss} + "\",\"aud\":\"" + std::string{aud} + "\",\"exp\":" + std::to_string(exp) +
+               ",\"nbf\":" + std::to_string(nbf) + "}";
+    };
+    auto bearer = [&](const std::string &token, std::string path = "/me") {
+        auto req = make_request(ctx, std::move(path));
+        req->mutable_headers().add("authorization", "Bearer " + token);
+        return req;
+    };
+
+    Router router;
+    router.use(middleware::jwt(JwtConfig{
+        .algorithms = {"HS256"},
+        .secret = "secret",
+        .issuer = "iss",
+        .audience = "aud",
+    }));
+    router.route({Method::Get}, "/me", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
+        const Principal *identity = principal(*req);
+        co_await res->status(200).send(identity ? identity->subject : std::string{"none"});
+    });
+    router.route({Method::Get}, "/admin", {middleware::require_role("admin")}, text_handler("admin"));
+
+    const std::string admin_roles = R"("admin")";
+    const std::string user_roles = R"("user")";
+    const std::string valid = hs256_token(header, claims("iss", "aud", now + 3600, 0, admin_roles), "secret");
+    CHECK(dispatch(ctx, router, bearer(valid))->last_body == "alice");
+
+    // exp / nbf / iss / aud claims.
+    CHECK(dispatch(ctx, router, bearer(hs256_token(header, claims("iss", "aud", now - 3600, 0, admin_roles), "secret")))
+              ->last_status == 401);
+    CHECK(dispatch(ctx, router,
+                   bearer(hs256_token(header, claims("iss", "aud", now + 3600, now + 3600, admin_roles), "secret")))
+              ->last_status == 401);
+    CHECK(
+        dispatch(ctx, router, bearer(hs256_token(header, claims("other", "aud", now + 3600, 0, admin_roles), "secret")))
+            ->last_status == 401);
+    CHECK(
+        dispatch(ctx, router, bearer(hs256_token(header, claims("iss", "other", now + 3600, 0, admin_roles), "secret")))
+            ->last_status == 401);
+    // require_exp is on by default.
+    CHECK(dispatch(ctx, router, bearer(hs256_token(header, R"({"sub":"alice","iss":"iss","aud":"aud"})", "secret")))
+              ->last_status == 401);
+
+    // Signature and algorithm allowlist.
+    CHECK(dispatch(ctx, router, bearer(hs256_token(header, claims("iss", "aud", now + 3600, 0, admin_roles), "wrong")))
+              ->last_status == 401);
+    const std::string unsigned_token = base64_url_encode(R"({"alg":"none"})") + "." +
+                                       base64_url_encode(claims("iss", "aud", now + 3600, 0, admin_roles)) + ".";
+    CHECK(dispatch(ctx, router, bearer(unsigned_token))->last_status == 401);
+
+    TestKey rsa = make_rsa_key();
+    Router rs_only;
+    rs_only.use(middleware::jwt(JwtConfig{
+        .algorithms = {"RS256"},
+        .public_key_pem = rsa.public_pem,
+        .issuer = "iss",
+        .audience = "aud",
+    }));
+    rs_only.route({Method::Get}, "/me", text_handler("rs"));
+    // Algorithm confusion: an HS256 token must not be accepted by an RS256-only
+    // verifier even though its MAC would verify.
+    CHECK(dispatch(ctx, rs_only, bearer(valid))->last_status == 401);
+
+    // Malformed compact JWS and a non-Bearer scheme.
+    CHECK(dispatch(ctx, router, bearer("not-a-jwt"))->last_status == 401);
+    CHECK(dispatch(ctx, router, bearer("a.b"))->last_status == 401);
+    {
+        auto req = make_request(ctx, "/me");
+        req->mutable_headers().add("authorization", "Basic abc");
+        CHECK(dispatch(ctx, router, req)->last_status == 401);
+    }
+
+    // require_role: a valid but under-privileged token is 403, not 401.
+    const std::string user_token = hs256_token(header, claims("iss", "aud", now + 3600, 0, user_roles), "secret");
+    CHECK(dispatch(ctx, router, bearer(user_token, "/admin"))->last_status == 403);
+    CHECK(dispatch(ctx, router, bearer(valid, "/admin"))->last_body == "admin");
+
+    // optional=true: no header passes through anonymously; an invalid token is
+    // still rejected.
+    Router optional;
+    optional.use(middleware::jwt(JwtConfig{
+        .algorithms = {"HS256"},
+        .secret = "secret",
+        .issuer = "iss",
+        .audience = "aud",
+        .optional = true,
+    }));
+    optional.route({Method::Get}, "/me", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
+        const Principal *identity = principal(*req);
+        co_await res->status(200).send(identity ? identity->subject : std::string{"none"});
+    });
+    CHECK(dispatch(ctx, optional, make_request(ctx, "/me"))->last_body == "none");
+    CHECK(
+        dispatch(ctx, optional, bearer(hs256_token(header, claims("iss", "aud", now + 3600, 0, admin_roles), "wrong")))
+            ->last_status == 401);
+}
+
 TEST_CASE("framework: JWT verifies RS256 and ES256 signatures", "[framework][jwt]") {
     asio::io_context ctx;
     const std::string payload = jwt_payload("alice", "read", now_unix() + 3600);
