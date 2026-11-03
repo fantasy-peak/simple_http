@@ -12,6 +12,7 @@
 package main
 
 import (
+	"bytes"
 	"compress/gzip"
 	"crypto/hmac"
 	"crypto/rand"
@@ -26,6 +27,8 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/signal"
 	"path"
@@ -623,6 +626,44 @@ func makeHandler(state *serverState, staticRoot string) http.Handler {
 		}
 		writeText(w, 200, strconv.Itoa(page)+":"+cookie.Value)
 	})
+	mux.HandleFunc("/backend", func(w http.ResponseWriter, r *http.Request) {
+		writeText(w, 200, "backend")
+	})
+	proxyTarget, _ := url.Parse("http://127.0.0.1:7830")
+	proxy := httputil.NewSingleHostReverseProxy(proxyTarget)
+	mux.HandleFunc("/proxy", func(w http.ResponseWriter, r *http.Request) {
+		r.URL.Path = "/backend"
+		proxy.ServeHTTP(w, r)
+	})
+	mux.HandleFunc("/decode", func(w http.ResponseWriter, r *http.Request) {
+		data := readAll(r)
+		encoding := strings.ToLower(r.Header.Get("Content-Encoding"))
+		switch encoding {
+		case "":
+			writeText(w, 200, "ce=none;cl=none;"+string(data))
+			return
+		case "gzip":
+		default:
+			writeText(w, 415, "unsupported content coding")
+			return
+		}
+		reader, err := gzip.NewReader(bytes.NewReader(data))
+		if err != nil {
+			writeText(w, 400, "decode error")
+			return
+		}
+		decoded, err := io.ReadAll(io.LimitReader(reader, (1<<20)+1))
+		_ = reader.Close()
+		if err != nil {
+			writeText(w, 400, "decode error")
+			return
+		}
+		if len(decoded) > 1<<20 {
+			writeText(w, 413, "decode error")
+			return
+		}
+		writeText(w, 200, "ce=none;cl=none;"+string(decoded))
+	})
 	mux.HandleFunc("/drain", func(w http.ResponseWriter, r *http.Request) {
 		body := readAll(r)
 		writeText(w, 200, "received "+strconv.Itoa(len(body))+" bytes")
@@ -787,7 +828,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "h1 listen: %v\n", err)
 		os.Exit(1)
 	}
-	h1 := &http.Server{Handler: handler}
+	h1 := &http.Server{Handler: handler, MaxHeaderBytes: 64 << 10}
 	go func() { _ = h1.Serve(h1Listener) }()
 
 	h2cListener, err := net.Listen("tcp", *h2cAddr)
@@ -795,7 +836,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "h2c listen: %v\n", err)
 		os.Exit(1)
 	}
-	h2cServer := &http.Server{Handler: h2c.NewHandler(handler, &http2.Server{})}
+	h2cServer := &http.Server{Handler: h2c.NewHandler(handler, &http2.Server{}), MaxHeaderBytes: 64 << 10}
 	go func() { _ = h2cServer.Serve(h2cListener) }()
 
 	tlsConfig := &tls.Config{
@@ -803,7 +844,7 @@ func main() {
 		MinVersion:   tls.VersionTLS12,
 		NextProtos:   []string{"h2", "http/1.1"},
 	}
-	tlsServer := &http.Server{Handler: handler, TLSConfig: tlsConfig}
+	tlsServer := &http.Server{Handler: handler, TLSConfig: tlsConfig, MaxHeaderBytes: 64 << 10}
 	if err := http2.ConfigureServer(tlsServer, &http2.Server{}); err != nil {
 		fmt.Fprintf(os.Stderr, "tls h2: %v\n", err)
 		os.Exit(1)

@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -173,6 +174,14 @@ func protoName(proto string) string {
 	}
 }
 
+func gzipBytes(data []byte) []byte {
+	var buffer bytes.Buffer
+	writer := gzip.NewWriter(&buffer)
+	_, _ = writer.Write(data)
+	_ = writer.Close()
+	return buffer.Bytes()
+}
+
 func buildRequest(base string, spec caseSpec) (*http.Request, error) {
 	target := spec.Path
 	if target == "" {
@@ -257,6 +266,14 @@ func observe(resp *http.Response, err error, decompress bool) observation {
 type harness struct {
 	cppH1, cppH2C, cppTLS, cppH3 string
 	goH1, goH2C, goTLS, goH3     string
+	cppRaw, goRaw                string
+}
+
+func (h harness) rawBase(target string) string {
+	if target == "cpp" {
+		return h.cppRaw
+	}
+	return h.goRaw
 }
 
 func (h harness) base(target string, spec caseSpec) string {
@@ -340,6 +357,16 @@ func bodyCases() []caseSpec {
 			Body: []byte("body"), Chunked: true,
 			Trailers: map[string]string{"X-Check": "yes"}},
 		{ID: "body.response_trailers", Method: "GET", Path: "/trailers"},
+		{ID: "body.gzip_request", Method: "POST", Path: "/decode",
+			Headers: map[string]string{"Content-Encoding": "gzip"},
+			Body:    gzipBytes([]byte("hello decompressed"))},
+		{ID: "body.deflate_request", Method: "POST", Path: "/decode",
+			Headers: map[string]string{"Content-Encoding": "deflate"}, Body: []byte("x")},
+		{ID: "body.bad_gzip", Method: "POST", Path: "/decode",
+			Headers: map[string]string{"Content-Encoding": "gzip"}, Body: []byte("not gzip")},
+		{ID: "body.gzip_over_limit", Method: "POST", Path: "/decode",
+			Headers: map[string]string{"Content-Encoding": "gzip"},
+			Body:    gzipBytes(bytes.Repeat([]byte("x"), 2<<20))},
 	}
 }
 
@@ -356,6 +383,7 @@ func semanticsCases() []caseSpec {
 		{ID: "semantics.h2_echo", Method: "POST", Path: "/echo", Body: []byte("over h2"), Protocol: "h2c"},
 		{ID: "semantics.tls_echo", Method: "POST", Path: "/echo", Body: []byte("over tls"), Protocol: "tls"},
 		{ID: "semantics.h3_echo", Method: "POST", Path: "/echo", Body: []byte("over h3"), Protocol: "h3"},
+		{ID: "semantics.proxy", Method: "GET", Path: "/proxy"},
 	}
 }
 
@@ -417,6 +445,8 @@ func staticCases() []caseSpec {
 			Headers: map[string]string{"Range": "bytes=0-4"}},
 		{ID: "static.precompressed", Method: "GET", Path: "/data.txt",
 			Headers: map[string]string{"Accept-Encoding": "gzip"}, Decompress: true},
+		{ID: "static.precompressed_br", Method: "GET", Path: "/data.txt",
+			Headers: map[string]string{"Accept-Encoding": "br"}},
 	}
 }
 
@@ -469,6 +499,79 @@ func runWS(target, base string) {
 	} else {
 		_, data, err := conn.ReadMessage()
 		wsObservation("ws.large", target, string(data), nil, err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// raw HTTP/1.x cases
+// ---------------------------------------------------------------------------
+
+type rawCase struct {
+	ID      string
+	Request string
+}
+
+func rawCases() []rawCase {
+	big := strings.Repeat("a", 70*1024)
+	return []rawCase{
+		{ID: "raw.get_plain", Request: "GET /plain HTTP/1.1\r\nHost: x\r\n\r\n"},
+		{ID: "raw.h1_0", Request: "GET /plain HTTP/1.0\r\n\r\n"},
+		{ID: "raw.cl_te", Request: "POST /plain HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"},
+		{ID: "raw.duplicate_cl", Request: "POST /plain HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\nContent-Length: 4\r\n\r\nbody"},
+		{ID: "raw.bad_line", Request: "GARBAGE\r\n\r\n"},
+		{ID: "raw.obs_fold", Request: "GET /plain HTTP/1.1\r\nHost: x\r\nX-Test: a\r\n b\r\n\r\n"},
+		{ID: "raw.large_head", Request: "GET /plain HTTP/1.1\r\nHost: x\r\nX-Big: " + big + "\r\n\r\n"},
+	}
+}
+
+func rawObservation(target, caseID, base, request string) observation {
+	obs := observation{Case: caseID, Target: target, Headers: map[string][]string{}, BodyEncoding: "utf8"}
+	host := strings.TrimPrefix(strings.TrimPrefix(base, "http://"), "https://")
+	conn, err := net.DialTimeout("tcp", host, 2*time.Second)
+	if err != nil {
+		reason := "connect"
+		obs.Error = &reason
+		return obs
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	// An oversized head may be rejected before the whole write completes; the
+	// response is still on the socket, so ignore write errors and read.
+	_, _ = conn.Write([]byte(request))
+	buffer := make([]byte, 8192)
+	n, _ := conn.Read(buffer)
+	if n == 0 {
+		reason := "other"
+		obs.Error = &reason
+		return obs
+	}
+	text := string(buffer[:n])
+	line := text
+	if index := strings.Index(text, "\r\n"); index >= 0 {
+		line = text[:index]
+	}
+	fields := strings.Fields(line)
+	if len(fields) < 2 {
+		reason := "other"
+		obs.Error = &reason
+		return obs
+	}
+	code, err := strconv.Atoi(fields[1])
+	if err != nil {
+		reason := "other"
+		obs.Error = &reason
+		return obs
+	}
+	obs.Status = &code
+	obs.Version = fields[0]
+	return obs
+}
+
+func runRawGroup(h harness) {
+	for _, raw := range rawCases() {
+		for _, target := range []string{"cpp", "go"} {
+			emit(rawObservation(target, raw.ID, h.rawBase(target), raw.Request))
+		}
 	}
 }
 
@@ -629,10 +732,13 @@ func main() {
 	goH2C := flag.String("go-h2c", "http://127.0.0.1:7831", "Go h2c base")
 	goTLS := flag.String("go-tls", "https://127.0.0.1:7832", "Go TLS base")
 	goH3 := flag.String("go-h3", "https://127.0.0.1:7833", "Go h3 base")
+	cppRaw := flag.String("cpp-raw", "http://127.0.0.1:7824", "C++ raw h1 base")
+	goRaw := flag.String("go-raw", "http://127.0.0.1:7830", "Go raw h1 base")
 	flag.Parse()
 
 	h := harness{cppH1: *cppH1, cppH2C: *cppH2C, cppTLS: *cppTLS, cppH3: *cppH3,
-		goH1: *goH1, goH2C: *goH2C, goTLS: *goTLS, goH3: *goH3}
+		goH1: *goH1, goH2C: *goH2C, goTLS: *goTLS, goH3: *goH3,
+		cppRaw: *cppRaw, goRaw: *goRaw}
 
 	var cases []caseSpec
 	switch *group {
@@ -652,6 +758,9 @@ func main() {
 		for _, target := range []string{"cpp", "go"} {
 			runWS(target, h.base(target, caseSpec{}))
 		}
+		return
+	case "raw":
+		runRawGroup(h)
 		return
 	default:
 		fmt.Fprintf(os.Stderr, "unknown group %q\n", *group)

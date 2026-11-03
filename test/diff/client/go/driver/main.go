@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -31,6 +32,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/net/http2"
+	xproxy "golang.org/x/net/proxy"
 )
 
 // Replaced at build time with -ldflags "-X main.defaultGroup=body".
@@ -69,6 +71,9 @@ type clientSpec struct {
 	CookieJar        bool       `json:"cookie_jar"`
 	Retry            *retrySpec `json:"retry"`
 	TLSVerify        *bool      `json:"tls_verify"`
+	CAFile           string     `json:"ca_file"`
+	CertChainFile    string     `json:"cert_chain_file"`
+	PrivateKeyFile   string     `json:"private_key_file"`
 }
 
 type requestSpec struct {
@@ -126,15 +131,47 @@ func boolValue(value *bool, fallback bool) bool {
 	return *value
 }
 
-func baseFor(version string) (string, http.RoundTripper, func()) {
+func tlsConfigFor(spec clientSpec, minVersion uint16) (*tls.Config, error) {
+	verify := boolValue(spec.TLSVerify, false)
+	config := &tls.Config{InsecureSkipVerify: !verify, MinVersion: minVersion}
+	if spec.CAFile != "" {
+		pem, err := os.ReadFile(spec.CAFile)
+		if err != nil {
+			return nil, err
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("parse CA %s", spec.CAFile)
+		}
+		config.RootCAs = pool
+	}
+	if spec.CertChainFile != "" || spec.PrivateKeyFile != "" {
+		pair, err := tls.LoadX509KeyPair(spec.CertChainFile, spec.PrivateKeyFile)
+		if err != nil {
+			return nil, err
+		}
+		config.Certificates = []tls.Certificate{pair}
+	}
+	return config, nil
+}
+
+func baseFor(version string, spec clientSpec) (string, http.RoundTripper, func(), error) {
 	noop := func() {}
 	switch version {
-	case "h2":
-		transport := &http.Transport{
-			TLSClientConfig:   &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12},
-			ForceAttemptHTTP2: true,
+	case "h2", "tls", "mtls":
+		tlsConfig, err := tlsConfigFor(spec, tls.VersionTLS12)
+		if err != nil {
+			return "", nil, noop, err
 		}
-		return "https://127.0.0.1:7811", transport, transport.CloseIdleConnections
+		transport := &http.Transport{
+			TLSClientConfig:   tlsConfig,
+			ForceAttemptHTTP2: version == "h2",
+		}
+		port := "7811"
+		if version == "mtls" {
+			port = "7814"
+		}
+		return "https://127.0.0.1:" + port, transport, transport.CloseIdleConnections, nil
 	case "h2c":
 		transport := &http2.Transport{
 			AllowHTTP: true,
@@ -144,22 +181,27 @@ func baseFor(version string) (string, http.RoundTripper, func()) {
 				return dialer.DialContext(ctx, network, addr)
 			},
 		}
-		return "http://127.0.0.1:7812", transport, noop
+		return "http://127.0.0.1:7812", transport, noop, nil
 	case "h3":
-		transport := &http3.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13},
+		tlsConfig, err := tlsConfigFor(spec, tls.VersionTLS13)
+		if err != nil {
+			return "", nil, noop, err
 		}
-		return "https://127.0.0.1:7813", transport, func() { _ = transport.Close() }
+		transport := &http3.Transport{TLSClientConfig: tlsConfig}
+		return "https://127.0.0.1:7813", transport, func() { _ = transport.Close() }, nil
 	default:
 		transport := http.DefaultTransport.(*http.Transport).Clone()
 		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12}
 		transport.ForceAttemptHTTP2 = false
-		return "http://127.0.0.1:7810", transport, transport.CloseIdleConnections
+		return "http://127.0.0.1:7810", transport, transport.CloseIdleConnections, nil
 	}
 }
 
-func newClient(spec clientSpec) (*http.Client, string, func()) {
-	base, transport, cleanup := baseFor(spec.Version)
+func newClient(spec clientSpec) (*http.Client, string, func(), error) {
+	base, transport, cleanup, err := baseFor(spec.Version, spec)
+	if err != nil {
+		return nil, "", cleanup, err
+	}
 	if baseConfig, ok := transport.(*http.Transport); ok {
 		baseConfig.DisableCompression = !boolValue(spec.AutoDecompress, true)
 	}
@@ -185,7 +227,7 @@ func newClient(spec clientSpec) (*http.Client, string, func()) {
 		jar, _ := cookiejar.New(nil)
 		client.Jar = jar
 	}
-	return client, base, cleanup
+	return client, base, cleanup, nil
 }
 
 func addQuery(path string, pairs []headerKV) string {
@@ -390,8 +432,12 @@ func runDeclarative(path string) error {
 }
 
 func runOne(c testCase) observation {
-	client, base, cleanup := newClient(c.Client)
+	client, base, cleanup, err := newClient(c.Client)
 	defer cleanup()
+	if err != nil {
+		reason := "other"
+		return observation{Error: &reason}
+	}
 	request, err := buildRequest(c, base)
 	if err != nil {
 		reason := "other"
@@ -404,7 +450,7 @@ func runOne(c testCase) observation {
 // --- streaming body group ---------------------------------------------------
 
 func runBodyGroup() error {
-	base, _, cleanup := baseFor("h1")
+	base, _, cleanup, _ := baseFor("h1", clientSpec{})
 	defer cleanup()
 
 	// 1. Streaming multipart: field + in-memory file part.
@@ -524,7 +570,36 @@ func runBodyGroup() error {
 		emit(obs)
 	}
 
-	// 8. max_body_bytes.
+	// 8. SSE reconnect: Last-Event-ID resumes after the previous id.
+	{
+		request, _ := http.NewRequest(http.MethodGet, base+"/sse-resume", nil)
+		request.Header.Set("Last-Event-ID", "2")
+		request.Header.Set("User-Agent", "diff-probe")
+		resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(request)
+		obs := observation{Case: "body.sse_resume", Target: "go"}
+		if err != nil {
+			reason := classifyError(err, false)
+			obs.Error = &reason
+			emit(obs)
+			return nil
+		}
+		var events []string
+		scanner := bufio.NewScanner(resp.Body)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.HasPrefix(line, "data: ") {
+				events = append(events, strings.TrimPrefix(line, "data: "))
+			}
+		}
+		_ = resp.Body.Close()
+		obs.Body = strings.Join(events, "|")
+		obs.BodyEncoding = "utf8"
+		status := resp.StatusCode
+		obs.Status = &status
+		emit(obs)
+	}
+
+	// 9. max_body_bytes.
 	{
 		request, _ := http.NewRequest(http.MethodGet, base+"/large?n=100000", nil)
 		request.Header.Set("User-Agent", "diff-probe")
@@ -538,8 +613,18 @@ func runBodyGroup() error {
 
 // --- policy group -----------------------------------------------------------
 
+func runProxyCase(caseID string, transport http.RoundTripper) observation {
+	client := &http.Client{Transport: transport, Timeout: 10 * time.Second}
+	request, _ := http.NewRequest(http.MethodGet, "https://127.0.0.1:7811/echo", nil)
+	request.Header.Set("User-Agent", "diff-probe")
+	resp, err := client.Do(request)
+	obs := observeResponse(resp, err, 0)
+	obs.Case = caseID
+	return obs
+}
+
 func runPolicyGroup() error {
-	base, _, cleanup := baseFor("h1")
+	base, _, cleanup, _ := baseFor("h1", clientSpec{})
 	defer cleanup()
 
 	// CookieJar across requests.
@@ -566,6 +651,45 @@ func runPolicyGroup() error {
 		obs := observeResponse(resp, err, 0)
 		obs.Case = "policy.timeout"
 		emit(obs)
+	}
+
+	// Outbound proxies against the TLS reference listener.
+	{
+		proxyURL, _ := url.Parse("http://127.0.0.1:7816")
+		transport := &http.Transport{
+			Proxy:           http.ProxyURL(proxyURL),
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12},
+		}
+		emit(runProxyCase("policy.proxy_connect", transport))
+	}
+	{
+		dialer, err := xproxy.SOCKS5("tcp", "127.0.0.1:7817", nil, &net.Dialer{})
+		if err != nil {
+			reason := "other"
+			emit(observation{Case: "policy.proxy_socks5", Target: "go", Error: &reason})
+		} else {
+			transport := &http.Transport{
+				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					return dialer.Dial(network, addr)
+				},
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12},
+			}
+			emit(runProxyCase("policy.proxy_socks5", transport))
+		}
+	}
+	{
+		proxyURL, _ := url.Parse("http://127.0.0.1:7816")
+		bypass := func(request *http.Request) (*url.URL, error) {
+			if request.URL.Hostname() == "127.0.0.1" {
+				return nil, nil
+			}
+			return proxyURL, nil
+		}
+		transport := &http.Transport{
+			Proxy:           bypass,
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12},
+		}
+		emit(runProxyCase("policy.no_proxy", transport))
 	}
 
 	// Default status handling: no retry, the 429 is returned to the caller.

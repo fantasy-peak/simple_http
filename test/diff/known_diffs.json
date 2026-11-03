@@ -1,10 +1,41 @@
 {
   "client": {
     "policy.redirect_referer": {
-      "fields": ["body"],
+      "fields": [
+        "body"
+      ],
       "verdict": "acceptable",
       "reason": "Go's net/http sets Referer on a followed redirect; simple_http does not. RFC 9110 §10.1.4 makes the field optional, and omitting it is the privacy-preserving choice."
+    },
+    "policy.redirect_cross_origin": {
+      "fields": [
+        "body"
+      ],
+      "verdict": "acceptable",
+      "reason": "Go's http.Client decides whether to forward Authorization/Cookie on a redirect by hostname only, ignoring the port; simple_http compares the full origin (scheme+host+port) per RFC 9110 §4.3.1 and strips them across a port change. The library is stricter and matches the origin boundary."
     }
   },
-  "server": {}
+  "server": {
+    "raw.cl_te": {
+      "fields": [
+        "status"
+      ],
+      "verdict": "acceptable",
+      "reason": "Go net/http accepts a request carrying both Content-Length and Transfer-Encoding (TE wins); simple_http rejects the double framing with 400 per RFC 9112 §6.3 and as a request-smuggling defense."
+    },
+    "raw.duplicate_cl": {
+      "fields": [
+        "status"
+      ],
+      "verdict": "acceptable",
+      "reason": "Go net/http collapses/accepts duplicate identical Content-Length values; simple_http rejects duplicate Content-Length with 400 per RFC 9112 §6.3 (ambiguous framing / smuggling vector)."
+    },
+    "raw.obs_fold": {
+      "fields": [
+        "status"
+      ],
+      "verdict": "acceptable",
+      "reason": "Go net/http accepts obsolete line folding in a header value; simple_http rejects it with 400. RFC 9112 §5.2 obsoletes obs-fold and permits rejecting it; rejecting avoids front-end/back-end smuggling splits."
+    }
+  }
 }

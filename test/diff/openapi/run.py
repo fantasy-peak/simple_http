@@ -26,6 +26,7 @@ def main() -> int:
         return 1
 
     cache = Path(os.environ.get("SIMPLE_HTTP_TEST_WORKDIR", REPO / ".cache" / "openapi"))
+    cache = cache.resolve()
     cache.mkdir(parents=True, exist_ok=True)
     log = cache / "openapi-server.log"
     server = harness.start([str(binary)], log)

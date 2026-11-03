@@ -305,8 +305,8 @@ def main() -> int:
         return 2
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    report_dir = Path(args.report_dir) if args.report_dir else (
-        CACHE / name / stamp)
+    report_dir = (Path(args.report_dir) if args.report_dir else (
+        CACHE / name / stamp)).resolve()
     report_dir.mkdir(parents=True, exist_ok=True)
 
     worktree: Path | None = None

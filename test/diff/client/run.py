@@ -40,6 +40,7 @@ def cache_dir(explicit: str | None) -> Path:
         path = Path(explicit)
     else:
         path = Path(os.environ.get("SIMPLE_HTTP_TEST_WORKDIR", REPO / ".cache" / "client-diff"))
+    path = path.resolve()
     path.mkdir(parents=True, exist_ok=True)
     return path
 

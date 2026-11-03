@@ -546,6 +546,14 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
                 co_await send_error_response(400);
                 co_return;
             }
+            // The loop above checks the limit only while the head is
+            // incomplete. A head larger than max_header_bytes that arrives
+            // complete in the final read would otherwise be parsed and served:
+            // the size test must also run once the parser says Done.
+            if (parser.consumed() > m_limits.max_header_bytes) {
+                co_await send_error_response(431);
+                co_return;
+            }
 
             // The parsed head is a set of owned strings, so everything left in
             // m_in is the body (or the peer's first frames after an upgrade).

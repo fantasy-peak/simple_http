@@ -12,9 +12,11 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
@@ -171,13 +173,136 @@ func sse(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// bufferedConn lets the HTTP CONNECT handler hand any bytes already buffered
+// by bufio (the TLS ClientHello often rides in the same packet as the CONNECT
+// head) to the spliced upstream.
+type bufferedConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c *bufferedConn) Read(p []byte) (int, error) { return c.reader.Read(p) }
+
+func splice(a, b net.Conn) {
+	done := make(chan struct{}, 2)
+	copyOne := func(dst, src net.Conn) {
+		_, _ = io.Copy(dst, src)
+		if tcp, ok := dst.(*net.TCPConn); ok {
+			_ = tcp.CloseWrite()
+		}
+		done <- struct{}{}
+	}
+	go copyOne(a, b)
+	go copyOne(b, a)
+	<-done
+	<-done
+	_ = a.Close()
+	_ = b.Close()
+}
+
+func serveHTTPConnect(conn net.Conn) {
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+	request, err := http.ReadRequest(reader)
+	if err != nil || request.Method != http.MethodConnect {
+		_, _ = io.WriteString(conn, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+		return
+	}
+	upstream, err := net.DialTimeout("tcp", request.Host, 5*time.Second)
+	if err != nil {
+		_, _ = io.WriteString(conn, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+		return
+	}
+	if _, err := io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+		_ = upstream.Close()
+		return
+	}
+	splice(&bufferedConn{Conn: conn, reader: reader}, upstream)
+}
+
+func acceptLoop(listener net.Listener, handler func(net.Conn)) {
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		go handler(conn)
+	}
+}
+
+func serveSOCKS5(conn net.Conn) {
+	defer conn.Close()
+	header := make([]byte, 2)
+	if _, err := io.ReadFull(conn, header); err != nil || header[0] != 0x05 {
+		return
+	}
+	methods := make([]byte, int(header[1]))
+	if _, err := io.ReadFull(conn, methods); err != nil {
+		return
+	}
+	if _, err := conn.Write([]byte{0x05, 0x00}); err != nil { // no authentication
+		return
+	}
+	request := make([]byte, 4)
+	if _, err := io.ReadFull(conn, request); err != nil || request[0] != 0x05 || request[1] != 0x01 {
+		return
+	}
+	var host string
+	switch request[3] {
+	case 0x01: // IPv4
+		address := make([]byte, 4)
+		if _, err := io.ReadFull(conn, address); err != nil {
+			return
+		}
+		host = net.IP(address).String()
+	case 0x03: // domain
+		length := make([]byte, 1)
+		if _, err := io.ReadFull(conn, length); err != nil {
+			return
+		}
+		name := make([]byte, int(length[0]))
+		if _, err := io.ReadFull(conn, name); err != nil {
+			return
+		}
+		host = string(name)
+	case 0x04: // IPv6
+		address := make([]byte, 16)
+		if _, err := io.ReadFull(conn, address); err != nil {
+			return
+		}
+		host = net.IP(address).String()
+	default:
+		return
+	}
+	portBytes := make([]byte, 2)
+	if _, err := io.ReadFull(conn, portBytes); err != nil {
+		return
+	}
+	target := net.JoinHostPort(host, strconv.Itoa(int(portBytes[0])<<8|int(portBytes[1])))
+	upstream, err := net.DialTimeout("tcp", target, 5*time.Second)
+	if err != nil {
+		_, _ = conn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+	if _, err := conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
+		_ = upstream.Close()
+		return
+	}
+	splice(conn, upstream)
+}
+
 func main() {
 	h1Addr := flag.String("h1", "127.0.0.1:7810", "plaintext HTTP/1.1 address")
 	tlsAddr := flag.String("tls", "127.0.0.1:7811", "TLS h2/h1 address")
 	h2cAddr := flag.String("h2c", "127.0.0.1:7812", "h2c address")
 	h3Addr := flag.String("h3", "127.0.0.1:7813", "HTTP/3 address")
+	mtlsAddr := flag.String("mtls", "127.0.0.1:7814", "mutual-TLS HTTP/1.1 address")
 	certFile := flag.String("cert", "./test/tls_certificates/server_cert.pem", "TLS certificate")
 	keyFile := flag.String("key", "./test/tls_certificates/server_key.pem", "TLS private key")
+	caFile := flag.String("ca", "./test/tls_certificates/ca_cert.pem", "CA used to verify client certificates")
+	httpProxyAddr := flag.String("http-proxy", "127.0.0.1:7816", "HTTP CONNECT proxy address")
+	socksProxyAddr := flag.String("socks-proxy", "127.0.0.1:7817", "SOCKS5 proxy address")
+	altAddr := flag.String("alt", "127.0.0.1:7815", "second plaintext origin for cross-origin redirects")
 	enableH3 := flag.Bool("h3-enable", true, "start the HTTP/3 listener")
 	flag.Parse()
 
@@ -204,6 +329,10 @@ func main() {
 		}
 		w.Header().Set("Location", "/echo")
 		w.WriteHeader(code)
+	})
+	mux.HandleFunc("/redirect-cross", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "http://127.0.0.1:7815/echo")
+		w.WriteHeader(http.StatusFound)
 	})
 	mux.HandleFunc("/redirect-chain/", func(w http.ResponseWriter, r *http.Request) {
 		left, _ := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/redirect-chain/"))
@@ -295,6 +424,17 @@ func main() {
 		w.Header().Set("X-Checksum", "abc123")
 	})
 	mux.HandleFunc("/sse", sse)
+	mux.HandleFunc("/sse-resume", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		start := 1
+		if r.Header.Get("Last-Event-ID") == "2" {
+			start = 3
+		}
+		for i := start; i <= 4; i++ {
+			_, _ = fmt.Fprintf(w, "id: %d\ndata: value-%d\n\n", i, i)
+		}
+	})
 	mux.HandleFunc("/slow", func(w http.ResponseWriter, r *http.Request) {
 		ms, _ := strconv.Atoi(r.URL.Query().Get("ms"))
 		if ms > 0 {
@@ -377,6 +517,18 @@ func main() {
 		}
 	}()
 
+	altListener, err := net.Listen("tcp", *altAddr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "alt listen: %v\n", err)
+		os.Exit(1)
+	}
+	altServer := &http.Server{Handler: handler}
+	go func() {
+		if err := altServer.Serve(altListener); err != nil && err != http.ErrServerClosed {
+			fmt.Fprintf(os.Stderr, "alt: %v\n", err)
+		}
+	}()
+
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{certificate},
 		MinVersion:   tls.VersionTLS12,
@@ -410,6 +562,49 @@ func main() {
 		}
 	}()
 
+	// Mutual TLS: the client must present a certificate signed by the test CA.
+	caPEM, err := os.ReadFile(*caFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "load ca: %v\n", err)
+		os.Exit(1)
+	}
+	clientCAs := x509.NewCertPool()
+	if !clientCAs.AppendCertsFromPEM(caPEM) {
+		fmt.Fprintf(os.Stderr, "parse ca: %v\n", *caFile)
+		os.Exit(1)
+	}
+	mtlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{certificate},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    clientCAs,
+		MinVersion:   tls.VersionTLS12,
+		NextProtos:   []string{"http/1.1"},
+	}
+	mtlsListener, err := net.Listen("tcp", *mtlsAddr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mtls listen: %v\n", err)
+		os.Exit(1)
+	}
+	mtlsServer := &http.Server{Handler: handler}
+	go func() {
+		if err := mtlsServer.Serve(tls.NewListener(mtlsListener, mtlsConfig)); err != nil && err != http.ErrServerClosed {
+			fmt.Fprintf(os.Stderr, "mtls: %v\n", err)
+		}
+	}()
+
+	httpProxyListener, err := net.Listen("tcp", *httpProxyAddr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "http proxy listen: %v\n", err)
+		os.Exit(1)
+	}
+	go acceptLoop(httpProxyListener, serveHTTPConnect)
+	socksProxyListener, err := net.Listen("tcp", *socksProxyAddr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "socks proxy listen: %v\n", err)
+		os.Exit(1)
+	}
+	go acceptLoop(socksProxyListener, serveSOCKS5)
+
 	var h3Server *http3.Server
 	var h3Conn net.PacketConn
 	if *enableH3 {
@@ -436,8 +631,8 @@ func main() {
 		}()
 	}
 
-	fmt.Printf("READY client-reference h1=%s tls=%s h2c=%s h3=%s\n",
-		*h1Addr, *tlsAddr, *h2cAddr, *h3Addr)
+	fmt.Printf("READY client-reference h1=%s tls=%s h2c=%s h3=%s mtls=%s alt=%s http-proxy=%s socks-proxy=%s\n",
+		*h1Addr, *tlsAddr, *h2cAddr, *h3Addr, *mtlsAddr, *altAddr, *httpProxyAddr, *socksProxyAddr)
 	os.Stdout.Sync()
 
 	signalChannel := make(chan os.Signal, 1)
@@ -446,6 +641,10 @@ func main() {
 	_ = h1.Close()
 	_ = tlsServer.Close()
 	_ = h2cServer.Close()
+	_ = mtlsServer.Close()
+	_ = altServer.Close()
+	_ = httpProxyListener.Close()
+	_ = socksProxyListener.Close()
 	if h3Server != nil {
 		_ = h3Server.Close()
 	}

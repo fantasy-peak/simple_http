@@ -18,6 +18,7 @@
 #include <charconv>
 #include <csignal>
 #include <cstdint>
+#include <format>
 #include <fstream>
 #include <iterator>
 #include <map>
@@ -278,6 +279,29 @@ template <typename ServerT> void register_routes(ServerT &server, const std::sha
                          co_await res->status(200).send(std::to_string(page) + ":" + sid);
                      }));
 
+    // Reverse proxy to this same server's /backend. Go's reference server uses
+    // httputil.ReverseProxy, so the observable part is the backend body.
+    server.route(any_methods, "/backend", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(200).send("backend");
+    });
+    server.http_proxy("/proxy", HttpProxyTarget{.host = "127.0.0.1", .port = 7820, .rewrite_path = "/backend"});
+
+    // Request decompression is opt-in middleware; the handler sees the decoded
+    // bytes and the headers are removed, matching the Go reference handler.
+    server.route({Method::Post}, "/decode",
+                 {middleware::decompress_request(RequestDecompressionConfig{.max_decoded_bytes = 1 << 20})},
+                 [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+                     auto body = co_await req->body().read_all();
+                     if (!body) {
+                         const int status = body.error() == asio::error::message_size ? 413 : 400;
+                         co_await res->status(status).send("decode error");
+                         co_return;
+                     }
+                     const std::string ce{req->header(field::content_encoding).value_or("none")};
+                     const std::string cl{req->header(field::content_length).value_or("none")};
+                     co_await res->status(200).send(std::format("ce={};cl={};", ce, cl) + *body);
+                 });
+
     server.route(any_methods, "/drain",
                  [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
                      auto body = co_await req->body().read_all();
@@ -448,6 +472,18 @@ int main(int argc, char **argv) {
     Server h2c{h2c_cfg};
     register_routes(h2c, site);
 
+    // Pure HTTP/1.x listener for raw request-parsing cases: the sniffing
+    // listener cannot decide whether "GARBAGE" is a bad h1 line or an h2
+    // preface until it sees more bytes, while a declared h1 listener answers
+    // 400 immediately (the same reason conformance uses single-protocol ports).
+    ServerConfig h1_cfg;
+    h1_cfg.listen = InetAddress{"0.0.0.0", 7824, false};
+    h1_cfg.worker_threads = 2;
+    h1_cfg.plaintext_protocols = PlaintextProtocols::Http1;
+    h1_cfg.limits.max_body_bytes = 1024 * 1024;
+    Server h1{h1_cfg};
+    register_routes(h1, site);
+
     ServerConfig tls_cfg;
     tls_cfg.listen = InetAddress{"0.0.0.0", 7822, false};
     tls_cfg.worker_threads = 2;
@@ -459,8 +495,8 @@ int main(int argc, char **argv) {
     Server tls{tls_cfg};
     register_routes(tls, site);
 
-    bool ok = sniff.start() && h2c.start() && tls.start();
-    std::println("diff server cpp: :7820 sniff :7821 h2c :7822 tls (ok={})", ok);
+    bool ok = sniff.start() && h2c.start() && h1.start() && tls.start();
+    std::println("diff server cpp: :7820 sniff :7821 h2c :7822 tls :7824 h1 (ok={})", ok);
 
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
     ServerConfig h3_cfg;
@@ -492,6 +528,7 @@ int main(int argc, char **argv) {
     }
     sniff.stop();
     h2c.stop();
+    h1.stop();
     tls.stop();
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
     h3.stop();

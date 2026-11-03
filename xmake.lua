@@ -90,6 +90,18 @@ local function add_test_binary(name, files, opts)
         if opts.http3 then
             add_defines("SIMPLE_HTTP_ENABLE_HTTP3")
         end
+        if opts.cxxflags then
+            for _, flag in ipairs(opts.cxxflags) do
+                add_cxflags(flag)
+            end
+        end
+        if opts.ldflags then
+            for _, flag in ipairs(opts.ldflags) do
+                -- Sanitizer runtime flags look like unused linker flags to
+                -- xmake's heuristic; force them onto the link line.
+                add_ldflags(flag, {force = true})
+            end
+        end
         on_load(function (target)
             if target:toolchain("gcc") then
                 target:add("cxxflags", test_cxxflags)
@@ -152,6 +164,47 @@ add_test_binary("test_sanitizer_concurrency", "test/sanitizer/concurrency.cpp", 
     group = "test/sanitizer",
     packages = {"zlib", "brotli"},
 })
+
+option("fuzz_libfuzzer")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Link fuzz_* targets with libFuzzer (clang) instead of the standalone GCC driver")
+option_end()
+
+-- Fuzz targets --------------------------------------------------------------
+-- Same LLVMFuzzerTestOneInput entry points as libFuzzer. This repository's
+-- default toolchain is GCC (no libFuzzer), so each target is linked with
+-- test/fuzz/standalone_main.cpp, a deterministic mutation driver. If clang is
+-- available, the same sources can be built with -fsanitize=fuzzer instead.
+local fuzz_libfuzzer = has_config("fuzz_libfuzzer")
+local fuzz_flags = fuzz_libfuzzer and {
+    "-fsanitize=fuzzer,address,undefined",
+    "-fno-sanitize-recover=undefined",
+    "-fno-omit-frame-pointer",
+    "-g",
+    "-O1",
+} or {
+    "-fsanitize=address,undefined",
+    "-fno-sanitize-recover=undefined",
+    "-fno-omit-frame-pointer",
+    "-g",
+    "-O1",
+}
+for _, name in ipairs({"h1", "h2", "ws", "multipart"}) do
+    local files = {"test/fuzz/fuzz_" .. name .. ".cpp"}
+    local defines = {}
+    if not fuzz_libfuzzer then
+        table.insert(files, "test/fuzz/standalone_main.cpp")
+        table.insert(defines, "FUZZ_STANDALONE")
+    end
+    add_test_binary("fuzz_" .. name, files, {
+        group = "test/fuzz",
+        packages = {"zlib", "brotli"},
+        defines = defines,
+        cxxflags = fuzz_flags,
+        ldflags = fuzz_flags,
+    })
+end
 
 -- OpenAPI -------------------------------------------------------------------
 add_test_binary("diff_openapi_server", "test/diff/openapi/demo_server.cpp", {

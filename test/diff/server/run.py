@@ -30,7 +30,7 @@ sys.path.insert(0, str(DIFF / "support"))
 
 import harness  # noqa: E402
 
-ALL_GROUPS = ("routing", "body", "semantics", "middleware", "framework", "static", "ws")
+ALL_GROUPS = ("routing", "body", "semantics", "middleware", "framework", "static", "ws", "raw")
 
 # The two reference servers bind different ports, and /echo reports the Host
 # header verbatim. Scrub the port so the same request is byte-comparable.
@@ -50,6 +50,9 @@ CASE_OPTIONS: dict[str, dict] = {
     "body.json_invalid": {"body_mode": "json"},
     "body.json_type_mismatch": {"body_mode": "json"},
     "body.too_large": {"body_mode": "none", "ignore_headers": ["content-type"]},
+    "body.deflate_request": {"body_mode": "none", "ignore_headers": ["accept-encoding"]},
+    "body.bad_gzip": {"body_mode": "none"},
+    "body.gzip_over_limit": {"body_mode": "none"},
     "semantics.status_204": {"body_mode": "none"},
     "middleware.cors_preflight": {"body_mode": "none"},
     "framework.valid_fail": {"body_mode": "json", "parse_json_strings": ["details"]},
@@ -73,6 +76,7 @@ CASE_OPTIONS: dict[str, dict] = {
 def cache_dir(explicit: str | None) -> Path:
     path = Path(explicit) if explicit else Path(
         os.environ.get("SIMPLE_HTTP_TEST_WORKDIR", REPO / ".cache" / "server-diff"))
+    path = path.resolve()
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -165,6 +169,8 @@ def compare_group(group: str, probe: Path, report_dir: Path, registry: dict,
             report.fail(case_id, f"missing observation from {'cpp' if cpp_obs is None else 'go'}")
             continue
         option = CASE_OPTIONS.get(case_id, {})
+        if case_id.startswith("raw."):
+            option = {"body_mode": "none"}
         definition = {"id": case_id, "expect": {**DEFAULT_EXPECT, **option}}
         report.record(case_id, harness.compare_case(definition, cpp_obs, go_obs))
 

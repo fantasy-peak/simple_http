@@ -188,5 +188,77 @@
       "status": 200,
       "body_mode": "exact"
     }
+  },
+  {
+    "id": "policy.mtls_ok",
+    "client": {
+      "version": "mtls",
+      "tls_verify": false,
+      "cert_chain_file": "./test/tls_certificates/client_cert.pem",
+      "private_key_file": "./test/tls_certificates/client_key.pem"
+    },
+    "request": {
+      "method": "GET",
+      "path": "/echo"
+    },
+    "expect": {
+      "status": 200,
+      "body_mode": "json"
+    }
+  },
+  {
+    "id": "policy.mtls_missing",
+    "client": {
+      "version": "mtls",
+      "tls_verify": false
+    },
+    "request": {
+      "method": "GET",
+      "path": "/echo"
+    },
+    "expect": {
+      "status": 0,
+      "body_mode": "none"
+    }
+  },
+  {
+    "id": "policy.tls_verify_fail",
+    "client": {
+      "version": "tls",
+      "tls_verify": true
+    },
+    "request": {
+      "method": "GET",
+      "path": "/echo"
+    },
+    "expect": {
+      "status": 0,
+      "body_mode": "none"
+    }
+  },
+  {
+    "id": "policy.redirect_cross_origin",
+    "client": {
+      "version": "h1",
+      "max_redirects": 5
+    },
+    "request": {
+      "method": "GET",
+      "path": "/redirect-cross",
+      "headers": [
+        {
+          "name": "authorization",
+          "value": "Bearer should-not-cross"
+        },
+        {
+          "name": "cookie",
+          "value": "sid=should-not-cross"
+        }
+      ]
+    },
+    "expect": {
+      "status": 200,
+      "body_mode": "json"
+    }
   }
 ]

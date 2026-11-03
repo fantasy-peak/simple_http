@@ -676,12 +676,13 @@ Python 侧只需要 `httpx`、`jsonschema`、`brotli`（`test/requirements.txt`�
 
 - **client**（`test/diff/client/`）：C++ 客户端与 Go `net/http` 客户端读同一份
   `cases/*.json`，请求同一个 Go 参考服务端（h1 `7810` / TLS h2 `7811` /
-  h2c `7812` / h3 `7813` / WS `7810`）。服务端回显收到的 method/header/body，
+  h2c `7812` / h3 `7813` / WS `7810`；mTLS `7814`、第二 origin `7815`、
+  HTTP CONNECT `7816`、SOCKS5 `7817`）。服务端回显收到的 method/header/body，
   因此差异只能来自客户端。组：`basic`、`body`、`policy`、`ws`、`h3`。
 - **server**（`test/diff/server/`）：同一个 Go 探针把请求分别发给 C++ 参考服务端
-  （`7820`–`7823`）与 Go 参考服务端（`7830`–`7833`），每个案例输出
+  （`7820`–`7824`，`7824` 是纯 h1）与 Go 参考服务端（`7830`–`7833`），每个案例输出
   `target=cpp` / `target=go` 两行。组：`routing`、`body`、`semantics`、
-  `middleware`、`framework`、`static`、`ws`。
+  `middleware`、`framework`、`static`、`ws`、`raw`。
 
 每个组是独立可执行程序（C++ 用 `DIFF_GROUP_*`，Go 用 `-ldflags -X main.defaultGroup`）。
 观测是 JSONL，字段为 `case/target/status/version/headers/body/body_encoding/framing/error/notes`。
@@ -753,7 +754,22 @@ test/run.sh sanitize ubsan  [suite...]   # 仅 UBSan
   `STOP_TIMEOUT`（泄漏检查被跳过），不当作通过。
 - 抑制规则保持最小：`test/sanitizer/{lsan,tsan,ubsan}.supp`。
 
-### 7.6 差分比对原则
+### 7.6 Fuzzing
+
+```sh
+test/fuzz/run.sh                         # GCC + ASan/UBSan，确定性变异
+test/fuzz/run.sh --libfuzzer --time 60   # clang-24 + libFuzzer
+```
+
+- 四个目标：`fuzz_h1` / `fuzz_h2` / `fuzz_ws` / `fuzz_multipart`，统一
+  `LLVMFuzzerTestOneInput` 入口；语料在 `test/fuzz/corpus/`。
+- 默认工具链是 GCC（无 libFuzzer），由 `standalone_main.cpp` 做有界变异驱动；
+  装 clang 后 `--libfuzzer` 使用 `/usr/lib/llvm-24`（或 PATH 上的 `clang++`），
+  以 `-fsanitize=fuzzer,address,undefined` 构建。
+- 目标必须确定性、无 I/O/网络，所有循环和分配都要受输入大小约束。
+- 发现 crash 先最小化、加入 corpus，再修解析器；不要把 crash 放到抑制列表。
+
+### 7.7 差分比对原则
 
 - 以 RFC 为准，不以「和 Go/nginx 不一样」判定为本库 bug。
 - 已知合理差异：CL+TE 与 obs-fold 上更严格；h2 一次性响应省略 content-length；
@@ -883,6 +899,12 @@ test/run.sh server-diff
     TSan race；这个 `std::call_once` 预热是进程级的，不是 SSL_CTX 单例。
     需要跨 Client 共享 context 时用 `make_client_tls_context()` +
     `TlsClientConfig::shared_context`，不要做全局单例。
+28. **h1 431 与完整 head**：`max_header_bytes` 不能只在 `NeedMore` 循环里检查；
+    超大头如果在最后一次读取中完整到达，`parse_head` 会直接 Done 并绕过 431。
+    解析 Done 后必须再比较 `parser.consumed() > max_header_bytes`。
+29. **重定向的 origin 边界**：清除 Authorization/Cookie 时必须比较
+    scheme + host + port，而不是只比较 host。只比 host 会在端口变化时把凭据
+    带到另一个 origin；Go 只比较 hostname，是已知差异，本库更严格。
 
 ---
 
@@ -946,6 +968,14 @@ test/run.sh stress
 test/.venv/bin/python test/diff/client/run.py --groups basic,body,policy,ws,h3
 test/.venv/bin/python test/diff/server/run.py --groups routing,body,semantics,middleware,framework,static,ws
 test/.venv/bin/python test/diff/openapi/run.py
+
+# 覆盖率（--coverage + gcovr）
+test/coverage.sh
+COVERAGE_SUITES="unit server-diff" test/coverage.sh
+
+# Fuzzing
+test/fuzz/run.sh
+test/fuzz/run.sh --libfuzzer --time 60
 
 # Sanitizer（默认 -j7；独立 worktree）
 test/run.sh sanitize asan

@@ -883,8 +883,12 @@ class Client {
                      std::string url_target, std::size_t cap, std::chrono::milliseconds limit, std::size_t remaining,
                      std::string current_url, HttpVersionPolicy version) {
         // Saved before target is moved into the exchange: the next hop's origin
-        // comparison needs the current authority.
+        // comparison needs the current authority. Origin is scheme + host +
+        // port (RFC 9110 §4.3.1); comparing only the host would carry
+        // Authorization/Cookie across a port change, which Go does not.
         const std::string current_host = target.host;
+        const std::uint16_t current_port = target.effective_port();
+        const bool current_tls = target.use_tls;
         auto request = std::make_shared<Request>(Version::Http11, co_await asio::this_coro::executor);
         // The raw token carries extension methods through the convenience path;
         // set_method_token() also refreshes the enum.
@@ -947,7 +951,9 @@ class Client {
         // credentials — Go's http.Client rule. Cookies are replayed through the
         // jar (domain-filtered) when one is configured; an ad-hoc Cookie header
         // is dropped across origins either way.
-        if (!iequals_ci(hop->target.host, current_host)) {
+        const bool same_origin = iequals_ci(hop->target.host, current_host) &&
+                                 hop->target.effective_port() == current_port && hop->target.use_tls == current_tls;
+        if (!same_origin) {
             headers.erase("authorization");
             headers.erase("proxy-authorization");
             headers.erase("cookie");

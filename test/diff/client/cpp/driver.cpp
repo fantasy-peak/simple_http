@@ -76,6 +76,9 @@ struct ClientSpec {
     bool cookie_jar{};
     std::optional<RetrySpec> retry;
     std::optional<bool> tls_verify;
+    std::string ca_file;
+    std::string cert_chain_file;
+    std::string private_key_file;
 };
 
 struct RequestSpec {
@@ -330,6 +333,9 @@ Endpoint endpoint_for(std::string_view version) {
     if (version == "h2") {
         return {"https://127.0.0.1:7811", HttpVersionPolicy::Http2, H2cMode::Off, true};
     }
+    if (version == "tls") {
+        return {"https://127.0.0.1:7811", HttpVersionPolicy::Http11, H2cMode::Off, true};
+    }
     if (version == "h2c") {
         return {"http://127.0.0.1:7812", HttpVersionPolicy::Http2, H2cMode::PriorKnowledge, false};
     }
@@ -338,6 +344,9 @@ Endpoint endpoint_for(std::string_view version) {
     }
     if (version == "h3") {
         return {"https://127.0.0.1:7813", HttpVersionPolicy::Http3, H2cMode::Off, true};
+    }
+    if (version == "mtls") {
+        return {"https://127.0.0.1:7814", HttpVersionPolicy::Http11, H2cMode::Off, true};
     }
     return {"http://127.0.0.1:7810", HttpVersionPolicy::Http11, H2cMode::Off, false};
 }
@@ -381,9 +390,15 @@ ClientConfig make_config(const ClientSpec &spec) {
         cfg.retry.retry_statuses = spec.retry->retry_statuses;
         cfg.retry.initial_backoff = 1ms;
     }
-    if (endpoint.tls || (spec.tls_verify.has_value() && !*spec.tls_verify)) {
-        cfg.tls.verify_peer = false;
-        cfg.tls.verify_host = false;
+    if (endpoint.tls) {
+        const bool verify = spec.tls_verify.value_or(false);
+        cfg.tls.verify_peer = verify;
+        cfg.tls.verify_host = verify;
+        if (!spec.ca_file.empty()) {
+            cfg.tls.ca_file = spec.ca_file;
+        }
+        cfg.tls.cert_chain_file = spec.cert_chain_file;
+        cfg.tls.private_key_file = spec.private_key_file;
     }
     return cfg;
 }
@@ -805,7 +820,38 @@ asio::awaitable<void> run_body_group() {
         emit(std::move(obs));
     }
 
-    // 8. max_body_bytes.
+    // 8. SSE reconnect: Last-Event-ID resumes after the previous id.
+    {
+        Observation obs;
+        obs.case_id = "body.sse_resume";
+        SseOptions options;
+        options.last_event_id = "2";
+        auto sse = co_await SseStream::open(client, base + "/sse-resume", options);
+        if (!sse) {
+            obs.error = classify(sse.error());
+        } else {
+            std::string data;
+            for (;;) {
+                auto event = co_await (*sse).next();
+                if (!event) {
+                    break;
+                }
+                if (!data.empty()) {
+                    data.push_back('|');
+                }
+                std::string value = event->data;
+                while (!value.empty() && value.back() == '\n') {
+                    value.pop_back();
+                }
+                data += value;
+            }
+            obs.status = 200;
+            set_body(obs, std::move(data));
+        }
+        emit(std::move(obs));
+    }
+
+    // 9. max_body_bytes.
     {
         TestCase c;
         c.id = "body.max_body_bytes";
@@ -820,7 +866,7 @@ asio::awaitable<void> run_body_group() {
 // ---------------------------------------------------------------------------
 
 asio::awaitable<Observation> get_observation(Client &client, const std::string &url, const std::string &case_id) {
-    auto response = co_await client.get(url).send();
+    auto response = co_await client.get(url).header("user-agent", "diff-probe").send();
     Observation obs;
     obs.case_id = case_id;
     if (!response) {
@@ -855,6 +901,25 @@ asio::awaitable<void> run_policy_group() {
         Client client{co_await asio::this_coro::executor, cfg};
         emit(co_await get_observation(client, base + "/slow?ms=2000", "policy.timeout"));
     }
+
+    // Outbound proxies: a CONNECT proxy, a SOCKS5 proxy, and a proxy that is
+    // bypassed by NO_PROXY. The origin is the TLS reference listener.
+    auto proxy_case = [&](std::string case_id, ProxyKind kind, std::uint16_t proxy_port,
+                          std::vector<std::string> no_proxy) -> asio::awaitable<void> {
+        ClientConfig cfg;
+        cfg.default_version = HttpVersionPolicy::Http11;
+        cfg.default_h2c = H2cMode::Off;
+        cfg.proxy_from_env = false;
+        cfg.proxy = ProxyConfig{.kind = kind, .host = "127.0.0.1", .port = proxy_port};
+        cfg.no_proxy = std::move(no_proxy);
+        cfg.tls.verify_peer = false;
+        cfg.tls.verify_host = false;
+        Client client{co_await asio::this_coro::executor, cfg};
+        emit(co_await get_observation(client, "https://127.0.0.1:7811/echo", case_id));
+    };
+    co_await proxy_case("policy.proxy_connect", ProxyKind::Http, 7816, {});
+    co_await proxy_case("policy.proxy_socks5", ProxyKind::Socks5, 7817, {});
+    co_await proxy_case("policy.no_proxy", ProxyKind::Http, 7816, {"127.0.0.1"});
 
     // Default: no retry; the 429 reaches the caller.
     {

@@ -91,7 +91,10 @@ test/run.sh full --parallel 1   # 完全串行，便于定位
 |---|---|
 | 7788 / 7790 / 7791 / 7792 | conformance/stress fixture（嗅探+ws / 纯 h2c / 纯 h1 / tcp+udp h3） |
 | 7810–7813 | client-diff 的 Go 参考服务端（h1 / TLS h2 / h2c / h3） |
-| 7820–7823 | server-diff 的 C++ 服务端（嗅探 / h2c / TLS / tcp+udp h3） |
+| 7814 | client-diff 的 mTLS 服务端（需要客户端证书） |
+| 7815 | client-diff 的第二 origin（跨 origin 重定向） |
+| 7816 / 7817 | client-diff 的 HTTP CONNECT / SOCKS5 代理 |
+| 7820–7824 | server-diff 的 C++ 服务端（嗅探 / h2c / TLS / tcp+udp h3 / 纯 h1） |
 | 7830–7833 | server-diff 的 Go 服务端 |
 | 7795 | OpenAPI petshop |
 
@@ -108,6 +111,31 @@ cd test/diff && go mod download
 ```
 
 `test/run.sh doctor` 会列出每个套件缺失的工具/Python 包。
+
+## Coverage
+
+```sh
+test/coverage.sh
+COVERAGE_SUITES="unit server-diff" test/coverage.sh
+COVERAGE_FAIL_UNDER=70 test/coverage.sh
+```
+
+用 `--coverage` 构建独立的 `build-cov`，跑选定的测试套件后由 `gcovr` 聚合
+`include/simple_http` 的行/分支覆盖率；报告写到 `.cache/coverage/coverage.txt`
+和 `coverage.html`。需要 `test/.venv` 中的 `gcovr`。脚本结束会恢复默认 xmake 配置。
+
+## Fuzzing
+
+```sh
+test/fuzz/run.sh                         # GCC + ASan/UBSan，确定性变异
+FUZZ_ITERATIONS=100000 test/fuzz/run.sh
+test/fuzz/run.sh --libfuzzer --time 60   # clang-24 + libFuzzer
+```
+
+目标：`fuzz_h1`（请求头）、`fuzz_h2`（帧头/HPACK）、`fuzz_ws`（帧解析）、
+`fuzz_multipart`（增量 multipart）。默认模式不需要 clang；`--libfuzzer` 使用
+`/usr/lib/llvm-24`（回退 `clang++`），以 `-fsanitize=fuzzer,address,undefined`
+构建。种子语料在 `test/fuzz/corpus/`，libFuzzer 的变异语料写到 `.cache/fuzz/`。
 
 ## Sanitizer
 

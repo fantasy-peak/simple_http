@@ -155,7 +155,10 @@ def tail(path: Path, lines: int = 40) -> str:
 
 def selected_suites(args: argparse.Namespace) -> list[Suite]:
     wanted = args.suite
-    if wanted and wanted in TIERS:
+    if args.suites:
+        names = {name.strip() for name in args.suites.split(",") if name.strip()}
+        suites = [suite for suite in SUITES if suite.name in names]
+    elif wanted and wanted in TIERS:
         tiers = TIERS[wanted]
         suites = [suite for suite in SUITES if suite.tier in tiers]
     elif wanted:
@@ -172,6 +175,8 @@ def main() -> int:
     parser.add_argument("suite", nargs="?", default=None)
     parser.add_argument("catch_filter", nargs="?", default=None)
     parser.add_argument("--filter", default=None)
+    parser.add_argument("--suites", default=None,
+                        help="comma-separated suite names (alternative to the positional suite)")
     parser.add_argument("--report-dir", default=None)
     parser.add_argument("--bin-dir", default=None,
                         help="directory holding the test binaries (default: build/linux/x86_64/release)")
@@ -214,8 +219,8 @@ def main() -> int:
         return 2
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    report_dir = Path(args.report_dir) if args.report_dir else (
-        ROOT / ".cache" / "test-run" / f"{stamp}-{os.getpid()}")
+    report_dir = (Path(args.report_dir) if args.report_dir else (
+        ROOT / ".cache" / "test-run" / f"{stamp}-{os.getpid()}")).resolve()
     report_dir.mkdir(parents=True, exist_ok=True)
     build_log = report_dir / "build.log"
 

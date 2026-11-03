@@ -8,3 +8,4 @@
 httpx==0.28.1
 jsonschema>=4.23
 brotli==1.2.1
+gcovr>=8.0

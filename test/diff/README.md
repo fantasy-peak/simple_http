@@ -54,6 +54,9 @@ diff/
 - `7811` TLS h2/h1（ALPN）
 - `7812` h2c
 - `7813` UDP h3
+- `7814` mTLS（要求客户端证书）
+- `7815` 第二 origin（跨 origin 重定向）
+- `7816` HTTP CONNECT 代理 / `7817` SOCKS5 代理
 
 端点都是确定性的：`/echo` 回显 method/path/query/headers/body/trailers；`/redirect/*`、
 `/redirect-chain/*`、`/cookies/*`、`/compress/gzip`、`/retry/*`、`/trailers`、`/sse`、
@@ -76,19 +79,21 @@ C++ 与 Go 驱动读同一份 `cases/*.json`：
 
 ## 服务端差分
 
-`diff_server_cpp` 监听 `7820`（嗅探）、`7821`（h2c）、`7822`（TLS）、`7823`（tcp+udp h3）；
-Go 参考服务端监听 `7830`–`7833`。两者注册同一套可观测行为：
+`diff_server_cpp` 监听 `7820`（嗅探）、`7821`（h2c）、`7822`（TLS）、`7823`（tcp+udp h3）、
+`7824`（纯 h1，raw 用例）；Go 参考服务端监听 `7830`–`7833`。两者注册同一套可观测行为：
 
 - 路由：精确 / `{param}` / `{*rest}` / 正则 / host / fallback / 405+Allow / 自动 OPTIONS / HEAD
 - 请求：JSON / form / multipart / chunked / trailers / 100-continue / 1 MiB body cap
 - 语义：状态、header、framing、keep-alive、重定向、gzip、响应 trailers、h1/h2/h3
 - 中间件：CORS、security headers、Basic Auth、request-id、限流
 - 框架层：State、extractor、validation、Session、CSRF、JWT、Host
-- 静态文件：ETag/304、Range/206、SPA fallback、预压缩 `.gz`
+- 静态文件：ETag/304、Range/206、SPA fallback、预压缩 `.gz`/`.br`
+- 原始 HTTP/1.x：CL+TE、重复 CL、obs-fold、431、HTTP/1.0
+- 请求解压：gzip / deflate 415 / 畸形 400 / 超限 413
 - WebSocket
 
 Go 探针按 group 构建：`routing`、`body`、`semantics`、`middleware`、`framework`、
-`static`、`ws`。
+`static`、`ws`、`raw`。
 
 ## 观测与归一化
 
