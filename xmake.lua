@@ -1,6 +1,10 @@
 -- add_rules("mode.debug", "mode.release")
 
-set_languages("c++26")
+-- C++23 is the interface requirement (CMake says cxx_std_23). Keeping the
+-- in-repo build at the same level matters for CI: some xmake releases do not
+-- map "c++26" to a flag, which silently leaves the compiler at its default
+-- (C++17) and then every C++20+ header — glaze included — fails to parse.
+set_languages("c++23")
 
 -- set_warnings("all", "error")
 

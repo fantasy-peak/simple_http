@@ -19,7 +19,7 @@
 | 版本 | `0.9.0`（`include/simple_http/core/version.h`） |
 | 形态 | 纯头文件；`include/` 下没有 `.cpp` |
 | 入口头 | `#include <simple_http.h>` |
-| 标准 | CMake 接口要求 C++23；仓库自带 `xmake.lua` 使用 `c++26` |
+| 标准 | C++23（CMake 接口与仓库自带 `xmake.lua` 一致） |
 | 许可 | MIT |
 | 依赖 | Boost（asio、regex）、OpenSSL、glaze、zlib、brotli；HTTP/3 额外 ngtcp2 + nghttp3；测试用 Catch2 |
 | 构建 | xmake（主）；CMake 只安装 INTERFACE 目标供下游 `find_package` |
@@ -605,7 +605,8 @@ xmake run diff_openapi_server
 xmake run fixture_conformance_server
 ```
 
-- `xmake.lua`：`set_languages("c++26")`。
+- `xmake.lua`：`set_languages("c++23")`，与 CMake 接口一致；不要写成 `c++26`
+  （部分 xmake 版本不识别该值，会静默退回编译器默认标准，glaze 等 C++20 头直接编译失败）。
 - 全局 `-O2 -Wextra`，关闭少量 GCC 误报；目前没有把 warning 当 error。
 - 全局定义 `SIMPLE_HTTP_USE_BOOST_REGEX`。
 - `SIMPLE_HTTP_ENABLE_HTTP3` 只加在需要它的目标（`fixture_conformance_server`、

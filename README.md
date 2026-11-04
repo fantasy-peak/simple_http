@@ -7,7 +7,7 @@ WebSocket — with a coroutine-first API, a version-agnostic request/response mo
 and no locks in the protocol engines.
 
 - **Version**: `0.9.0` (see `include/simple_http/core/version.h`)
-- **Language standard**: the CMake interface requires C++23; the in-repo xmake build uses C++26
+- **Language standard**: C++23 (both the CMake interface and the in-repo xmake build)
 - **License**: MIT
 - **Umbrella header**: `#include <simple_http.h>`
 
@@ -534,8 +534,7 @@ target_link_libraries(my_app PRIVATE simple_http::simple_http)
 The CMake interface declares `cxx_std_23` and carries Boost, OpenSSL, glaze, zlib and
 brotli. Three current details matter:
 
-- The in-repo `xmake.lua` uses `c++26`, while the CMake interface requires C++23. Both
-  build, but CMake consumers should compile with C++23 or newer.
+- The in-repo `xmake.lua` and the CMake interface both require C++23.
 - The CMake INTERFACE target does **not** link ngtcp2/nghttp3, so HTTP/3 is not enabled
   through CMake; use the xmake build or wire those dependencies yourself.
 - The exported `simple_httpTargets.cmake` links `glaze::glaze`, but

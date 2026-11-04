@@ -14,8 +14,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <glaze/glaze.hpp>
+#include <iostream>
 #include <optional>
-#include <print>
 #include <string>
 #include <thread>
 #include <vector>
@@ -514,12 +514,12 @@ int main() {
     });
 
     if (!server.start()) {
-        std::println("bind 127.0.0.1:7795 failed");
+        std::cerr << "bind 127.0.0.1:7795 failed\n";
         return 1;
     }
-    std::println("petshop OpenAPI demo: http://127.0.0.1:7795");
-    std::println("  document: http://127.0.0.1:7795/openapi.json");
-    std::println("  swagger:  http://127.0.0.1:7795/swagger");
+    std::cout << "petshop OpenAPI demo: http://127.0.0.1:7795\n";
+    std::cout << "  document: http://127.0.0.1:7795/openapi.json\n";
+    std::cout << "  swagger:  http://127.0.0.1:7795/swagger\n";
 
     std::signal(SIGINT, request_stop);
     std::signal(SIGTERM, request_stop);

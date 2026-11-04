@@ -22,7 +22,7 @@
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
-#include <print>
+#include <iostream>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -143,7 +143,7 @@ int main() {
     register_routes(h1);
 
     bool ok = sniff.start() && h2c.start() && h1.start();
-    std::println("conformance fixture: :7788 sniffing (ws), :7790 h2c, :7791 h1 (ok={})", ok);
+    std::cout << "conformance fixture: :7788 sniffing (ws), :7790 h2c, :7791 h1 (ok=" << ok << ")\n";
 
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
     // TCP + UDP on the same number: one Server, one router, two transports.
@@ -160,7 +160,7 @@ int main() {
     Server dual{dual_cfg};
     register_routes(dual);
     const bool dual_ok = static_cast<bool>(dual.start());
-    std::println("conformance fixture: :7792 tcp+udp h3 (ok={})", dual_ok);
+    std::cout << "conformance fixture: :7792 tcp+udp h3 (ok=" << dual_ok << ")\n";
     ok = ok && dual_ok;
 #endif
 

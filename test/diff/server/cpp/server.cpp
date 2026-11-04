@@ -21,11 +21,11 @@
 #include <cstdint>
 #include <format>
 #include <fstream>
+#include <iostream>
 #include <iterator>
 #include <map>
 #include <memory>
 #include <optional>
-#include <print>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -211,7 +211,7 @@ std::shared_ptr<StaticFiles> load_static(const std::string &root) {
     auto site = std::make_shared<StaticFiles>(std::move(config));
     std::string error;
     if (!site->load(error)) {
-        std::println(stderr, "static root {}: {}", root, error);
+        std::cerr << "static root " << root << ": " << error << '\n';
         return nullptr;
     }
     return site;
@@ -583,7 +583,7 @@ int main(int argc, char **argv) {
     register_routes(mtls, site);
 
     bool ok = sniff.start() && h2c.start() && h1.start() && tls.start() && mtls.start();
-    std::println("diff server cpp: :7820 sniff :7821 h2c :7822 tls :7824 h1 :7825 mtls (ok={})", ok);
+    std::cout << "diff server cpp: :7820 sniff :7821 h2c :7822 tls :7824 h1 :7825 mtls (ok=" << ok << ")\n";
 
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
     ServerConfig h3_cfg;
@@ -599,7 +599,7 @@ int main(int argc, char **argv) {
     Server h3{h3_cfg};
     register_routes(h3, site);
     const bool h3_ok = static_cast<bool>(h3.start());
-    std::println("diff server cpp: :7823 tcp+udp h3 (ok={})", h3_ok);
+    std::cout << "diff server cpp: :7823 tcp+udp h3 (ok=" << h3_ok << ")\n";
     ok = ok && h3_ok;
 #endif
 
@@ -607,7 +607,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     std::fflush(stdout);
-    std::println("READY diff-server-cpp");
+    std::cout << "READY diff-server-cpp\n";
     std::fflush(stdout);
 
     while (g_stop == 0) {

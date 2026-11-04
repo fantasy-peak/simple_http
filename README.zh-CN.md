@@ -8,7 +8,7 @@
 > over QUIC, and WebSocket.
 
 - **当前版本**：`0.9.0`（见 `include/simple_http/core/version.h`）
-- **语言标准**：库接口要求 C++23；仓库自带的 xmake 构建配置使用 C++26
+- **语言标准**：C++23（CMake 接口与仓库自带 xmake 构建一致）
 - **许可证**：MIT
 - **入口头**：`#include <simple_http.h>`
 
@@ -499,8 +499,7 @@ target_link_libraries(my_app PRIVATE simple_http::simple_http)
 CMake 接口声明 `cxx_std_23`，并携带 Boost、OpenSSL、glaze、zlib、brotli 依赖。
 注意以下三点：
 
-- 仓库内 `xmake.lua` 当前设置的是 `c++26`，CMake 侧要求的是 C++23；两者都能构建，
-  但下游若用 CMake，请按 C++23 或更高标准编译。
+- 仓库内 `xmake.lua` 与 CMake 接口都要求 C++23。
 - CMake 的 INTERFACE 目标**没有**链接 ngtcp2/nghttp3，因此 CMake 下游不会启用
   HTTP/3；需要 HTTP/3 时请使用本仓库的 xmake 构建，或自行把这两个依赖接上。
 - 导出的 `simple_httpTargets.cmake` 链接了 `glaze::glaze`，但
