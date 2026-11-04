@@ -1599,7 +1599,8 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
             // RFC 8441 §3: an extended CONNECT selects a protocol with
             // `:protocol`, must be a CONNECT, and — unlike a plain CONNECT —
             // carries `:scheme` and `:path`. Only "websocket" is acted on; any
-            // other value is left to normal dispatch (which answers 404).
+            // other value is left to normal dispatch (404 when the path is
+            // unknown, 405 when it exists for another method).
             if (seen_protocol) {
                 // RFC 8441 §3: extended CONNECT is only legal once the server
                 // advertised SETTINGS_ENABLE_CONNECT_PROTOCOL=1. With the knob

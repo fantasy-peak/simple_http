@@ -387,6 +387,21 @@ func bodyCases() []caseSpec {
 			Body: []byte("body"), Chunked: true,
 			Trailers: map[string]string{"X-Check": "yes"}},
 		{ID: "body.response_trailers", Method: "GET", Path: "/trailers"},
+		// HTTP/2 keeps a different framing path for trailers, 100-continue and
+		// flow control, so the same behaviors run again over h2c.
+		{ID: "body.request_trailers_h2", Method: "POST", Path: "/trailer-echo",
+			Body: []byte("body"), Chunked: true, Protocol: "h2c",
+			Trailers: map[string]string{"X-Check": "yes"}},
+		{ID: "body.response_trailers_h2", Method: "GET", Path: "/trailers", Protocol: "h2c"},
+		{ID: "body.expect_ok_h2", Method: "POST", Path: "/expect-ok", Protocol: "h2c",
+			Headers: map[string]string{"Expect": "100-continue"}, Body: []byte("hello!")},
+		{ID: "body.large_1m_h2", Method: "POST", Path: "/drain", Protocol: "h2c",
+			Body: bytes.Repeat([]byte("x"), 1<<20)},
+		// HTTP/3: response trailers and a body large enough to cross the initial
+		// QUIC flow-control window.
+		{ID: "body.response_trailers_h3", Method: "GET", Path: "/trailers", Protocol: "h3"},
+		{ID: "body.large_1m_h3", Method: "POST", Path: "/drain", Protocol: "h3",
+			Body: bytes.Repeat([]byte("x"), 1<<20)},
 		{ID: "body.gzip_request", Method: "POST", Path: "/decode",
 			Headers: map[string]string{"Content-Encoding": "gzip"},
 			Body:    gzipBytes([]byte("hello decompressed"))},

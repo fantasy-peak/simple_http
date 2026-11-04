@@ -213,14 +213,376 @@ func statusOf(fields []hpack.HeaderField) string {
 	return ""
 }
 
-func maskedTextFrame(text []byte) []byte {
+func maskedFrame(opcode byte, data []byte, fin bool) []byte {
 	mask := []byte{0x11, 0x22, 0x33, 0x44}
-	frame := []byte{0x81, 0x80 | byte(len(text))}
+	first := opcode
+	if fin {
+		first |= 0x80
+	}
+	if len(data) > 125 {
+		panic("test frame too large for a short length")
+	}
+	frame := []byte{first, 0x80 | byte(len(data))}
 	frame = append(frame, mask...)
-	for i, b := range text {
+	for i, b := range data {
 		frame = append(frame, b^mask[i%4])
 	}
 	return frame
+}
+
+func maskedTextFrame(text []byte) []byte { return maskedFrame(0x1, text, true) }
+
+type serverFrame struct {
+	opcode byte
+	data   []byte
+}
+
+// parseServerFrame decodes one unmasked server frame. ok is false until the
+// accumulated payload holds a complete frame.
+func parseServerFrame(payload []byte) (serverFrame, bool) {
+	if len(payload) < 2 {
+		return serverFrame{}, false
+	}
+	opcode := payload[0] & 0x0f
+	length := int(payload[1] & 0x7f)
+	offset := 2
+	switch length {
+	case 126:
+		if len(payload) < 4 {
+			return serverFrame{}, false
+		}
+		length = int(payload[2])<<8 | int(payload[3])
+		offset = 4
+	case 127:
+		if len(payload) < 10 {
+			return serverFrame{}, false
+		}
+		length = int(binary.BigEndian.Uint64(payload[2:10]))
+		offset = 10
+	}
+	if len(payload) < offset+length {
+		return serverFrame{}, false
+	}
+	return serverFrame{opcode: opcode, data: payload[offset : offset+length]}, true
+}
+
+// extendedConnect sends one RFC 8441 CONNECT and returns the response status.
+// scheme/target are false for the malformed-input checks.
+func extendedConnect(addr, path, protocol string, scheme, target bool) (string, *h2Conn, error) {
+	c, err := dial(addr, 3*time.Second)
+	if err != nil {
+		return "", nil, err
+	}
+	key := base64.StdEncoding.EncodeToString([]byte("0123456789abcdef"))
+	fields := []hpack.HeaderField{
+		{Name: ":method", Value: "CONNECT"},
+		{Name: ":protocol", Value: protocol},
+		{Name: ":authority", Value: addr},
+	}
+	if scheme {
+		fields = append(fields, hpack.HeaderField{Name: ":scheme", Value: "http"})
+	}
+	if target {
+		fields = append(fields, hpack.HeaderField{Name: ":path", Value: path})
+	}
+	fields = append(fields,
+		hpack.HeaderField{Name: "sec-websocket-version", Value: "13"},
+		hpack.HeaderField{Name: "sec-websocket-key", Value: key})
+	if err := c.writeFrame(frameHeaders, flagEndHeaders, 1, encodeFields(fields)); err != nil {
+		_ = c.conn.Close()
+		return "", nil, err
+	}
+	response, err := c.readHeaders(1)
+	if err != nil {
+		_ = c.conn.Close()
+		return "", nil, err
+	}
+	return statusOf(response), c, nil
+}
+
+// openWSConn performs an extended CONNECT for `path` on a fresh h2 connection
+// and returns it once the server answered 200.
+func openWSConn(addr, path string) (*h2Conn, error) {
+	status, c, err := extendedConnect(addr, path, "websocket", true, true)
+	if err != nil {
+		return nil, err
+	}
+	if status != "200" {
+		_ = c.conn.Close()
+		return nil, fmt.Errorf("extended CONNECT status %q", status)
+	}
+	return c, nil
+}
+
+func checkWSBinary(addr string) error {
+	c, err := openWSConn(addr, "/ws/echo")
+	if err != nil {
+		return err
+	}
+	defer c.conn.Close()
+	payload := []byte{0x00, 0x01, 0xff, 0xfe}
+	if err := c.writeFrame(frameData, 0, 1, maskedFrame(0x2, payload, true)); err != nil {
+		return err
+	}
+	frame, err := readServerFrame(c, 1)
+	if err != nil {
+		return err
+	}
+	if frame.opcode != 0x2 || !bytes.Equal(frame.data, payload) {
+		return fmt.Errorf("opcode 0x%x data %x", frame.opcode, frame.data)
+	}
+	return nil
+}
+
+func checkWSFragmented(addr string) error {
+	c, err := openWSConn(addr, "/ws/echo")
+	if err != nil {
+		return err
+	}
+	defer c.conn.Close()
+	if err := c.writeFrame(frameData, 0, 1, maskedFrame(0x1, []byte("hel"), false)); err != nil {
+		return err
+	}
+	if err := c.writeFrame(frameData, 0, 1, maskedFrame(0x0, []byte("lo"), true)); err != nil {
+		return err
+	}
+	frame, err := readServerFrame(c, 1)
+	if err != nil {
+		return err
+	}
+	if frame.opcode != 0x1 || string(frame.data) != "hello" {
+		return fmt.Errorf("opcode 0x%x data %q", frame.opcode, frame.data)
+	}
+	return nil
+}
+
+func checkWSPingPong(addr string) error {
+	c, err := openWSConn(addr, "/ws/echo")
+	if err != nil {
+		return err
+	}
+	defer c.conn.Close()
+	if err := c.writeFrame(frameData, 0, 1, maskedFrame(0x9, []byte("abc"), true)); err != nil {
+		return err
+	}
+	frame, err := readServerFrame(c, 1)
+	if err != nil {
+		return err
+	}
+	if frame.opcode != 0xA || string(frame.data) != "abc" {
+		return fmt.Errorf("opcode 0x%x data %q", frame.opcode, frame.data)
+	}
+	return nil
+}
+
+func checkWSClose(addr string) error {
+	c, err := openWSConn(addr, "/ws/echo")
+	if err != nil {
+		return err
+	}
+	defer c.conn.Close()
+	closePayload := []byte{0x03, 0xE8, 'b', 'y', 'e'} // 1000 + reason
+	if err := c.writeFrame(frameData, 0, 1, maskedFrame(0x8, closePayload, true)); err != nil {
+		return err
+	}
+	frame, err := readServerFrame(c, 1)
+	if err != nil {
+		return err
+	}
+	if frame.opcode != 0x8 || len(frame.data) < 2 || binary.BigEndian.Uint16(frame.data) != 1000 {
+		return fmt.Errorf("close opcode 0x%x data %x", frame.opcode, frame.data)
+	}
+	return nil
+}
+
+func checkWSInvalidUTF8(addr string) error {
+	c, err := openWSConn(addr, "/ws/echo")
+	if err != nil {
+		return err
+	}
+	defer c.conn.Close()
+	if err := c.writeFrame(frameData, 0, 1, maskedFrame(0x1, []byte{0xff, 0xfe}, true)); err != nil {
+		return err
+	}
+	frame, err := readServerFrame(c, 1)
+	if err != nil {
+		return err
+	}
+	if frame.opcode != 0x8 || len(frame.data) < 2 || binary.BigEndian.Uint16(frame.data) != 1007 {
+		return fmt.Errorf("close opcode 0x%x data %x, want 1007", frame.opcode, frame.data)
+	}
+	return nil
+}
+
+func checkWSUnmasked(addr string) error {
+	c, err := openWSConn(addr, "/ws/echo")
+	if err != nil {
+		return err
+	}
+	defer c.conn.Close()
+	// Client-to-server frames must be masked; this is the RFC 6455 §5.1 error.
+	if err := c.writeFrame(frameData, 0, 1, []byte{0x81, 0x05, 'h', 'e', 'l', 'l', 'o'}); err != nil {
+		return err
+	}
+	frame, err := readServerFrame(c, 1)
+	if err != nil {
+		return err
+	}
+	if frame.opcode != 0x8 || len(frame.data) < 2 || binary.BigEndian.Uint16(frame.data) != 1002 {
+		return fmt.Errorf("close opcode 0x%x data %x, want 1002", frame.opcode, frame.data)
+	}
+	return nil
+}
+
+func checkWSRouteMiss(addr string) error {
+	status, c, err := extendedConnect(addr, "/ws/not-a-route", "websocket", true, true)
+	if err != nil {
+		return err
+	}
+	defer c.conn.Close()
+	if status != "404" {
+		return fmt.Errorf("status %q, want 404", status)
+	}
+	return nil
+}
+
+func checkWSUnknownProtocol(addr string) error {
+	// A non-websocket :protocol falls through to normal routing: the path is a
+	// registered ws route, so a plain CONNECT sees the method mismatch (405)
+	// rather than a redirect or an upgrade.
+	status, c, err := extendedConnect(addr, "/ws/echo", "ftp", true, true)
+	if err != nil {
+		return err
+	}
+	defer c.conn.Close()
+	if status != "405" {
+		return fmt.Errorf("status %q, want 405", status)
+	}
+	return nil
+}
+
+func checkWSMissingScheme(addr string) error {
+	// RFC 8441 §3: extended CONNECT without :scheme is a malformed request.
+	_, c, err := extendedConnect(addr, "/ws/echo", "websocket", false, true)
+	if err != nil {
+		// The engine reported it as a stream reset (readHeaders returns that
+		// error), which is the expected shape.
+		return nil
+	}
+	defer c.conn.Close()
+	return fmt.Errorf("missing :scheme was accepted")
+}
+
+// checkH2cUpgrade performs the HTTP/1.1 Upgrade dance and verifies that the
+// original request is replayed as h2 stream 1 after the 101.
+func checkH2cUpgrade(addr string) error {
+	conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	reader := bufio.NewReader(conn)
+	request := "GET /plain HTTP/1.1\r\nHost: " + addr + "\r\n" +
+		"Connection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: \r\n\r\n"
+	if _, err := conn.Write([]byte(request)); err != nil {
+		return err
+	}
+	statusLine, err := reader.ReadString('\n')
+	if err != nil {
+		return err
+	}
+	if !strings.Contains(statusLine, " 101 ") {
+		return fmt.Errorf("status line %q, want 101", statusLine)
+	}
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return err
+		}
+		if line == "\r\n" || line == "\n" {
+			break
+		}
+	}
+
+	c := &h2Conn{conn: conn, r: reader}
+	if _, err := conn.Write([]byte(clientPreface)); err != nil {
+		return err
+	}
+	if err := c.writeFrame(frameSettings, 0, 0, nil); err != nil {
+		return err
+	}
+	var data []byte
+	for {
+		typ, flags, id, payload, err := c.readFrame()
+		if err != nil {
+			return err
+		}
+		switch typ {
+		case frameSettings:
+			if flags&flagAck == 0 {
+				_ = c.writeFrame(frameSettings, flagAck, 0, nil)
+			}
+		case framePing:
+			c.ackPing(payload)
+		case frameHeaders:
+			if id == 1 {
+				fields, err := decodeFields(payload)
+				if err != nil {
+					return err
+				}
+				if status := statusOf(fields); status != "200" {
+					return fmt.Errorf("replayed stream 1 status %q", status)
+				}
+			}
+		case frameData:
+			if id == 1 {
+				data = append(data, payload...)
+				if string(data) == "hello" {
+					return nil
+				}
+			}
+		case frameRSTStream:
+			if id == 1 {
+				return fmt.Errorf("stream 1 reset during replay")
+			}
+		case frameGoAway:
+			return fmt.Errorf("GOAWAY during upgrade")
+		}
+	}
+}
+
+// readServerFrame reads DATA payloads until one complete WebSocket frame is
+// assembled, acknowledging SETTINGS and PING along the way.
+func readServerFrame(c *h2Conn, stream uint32) (serverFrame, error) {
+	var data []byte
+	for {
+		typ, flags, id, payload, err := c.readFrame()
+		if err != nil {
+			return serverFrame{}, err
+		}
+		switch typ {
+		case frameSettings:
+			if flags&flagAck == 0 {
+				_ = c.writeFrame(frameSettings, flagAck, 0, nil)
+			}
+		case framePing:
+			c.ackPing(payload)
+		case frameData:
+			if id == stream {
+				data = append(data, payload...)
+				if frame, ok := parseServerFrame(data); ok {
+					return frame, nil
+				}
+			}
+		case frameRSTStream:
+			if id == stream {
+				return serverFrame{}, fmt.Errorf("stream reset (code 0x%x)", binary.BigEndian.Uint32(payload))
+			}
+		case frameGoAway:
+			return serverFrame{}, fmt.Errorf("GOAWAY before a complete frame")
+		}
+	}
 }
 
 func parseServerTextFrame(payload []byte) (string, bool) {
@@ -392,8 +754,10 @@ func checkRapidReset(addr string) error {
 
 func main() {
 	h2c := flag.String("h2c", "http://127.0.0.1:7821", "plaintext h2c base")
+	sniff := flag.String("sniff", "http://127.0.0.1:7820", "plaintext h1+h2c sniffing base for the upgrade check")
 	flag.Parse()
 	addr := strings.TrimPrefix(strings.TrimPrefix(*h2c, "http://"), "https://")
+	sniffAddr := strings.TrimPrefix(strings.TrimPrefix(*sniff, "http://"), "https://")
 
 	failed := 0
 	check := func(name string, err error) {
@@ -405,7 +769,17 @@ func main() {
 		fmt.Printf("FAIL %s [%s]\n", name, err)
 	}
 	check("h2.websocket_extended_connect", checkExtendedConnect(addr))
+	check("h2.ws_binary", checkWSBinary(addr))
+	check("h2.ws_fragmented", checkWSFragmented(addr))
+	check("h2.ws_ping_pong", checkWSPingPong(addr))
+	check("h2.ws_close", checkWSClose(addr))
+	check("h2.ws_invalid_utf8", checkWSInvalidUTF8(addr))
+	check("h2.ws_unmasked", checkWSUnmasked(addr))
+	check("h2.ws_route_miss", checkWSRouteMiss(addr))
+	check("h2.ws_unknown_protocol", checkWSUnknownProtocol(addr))
+	check("h2.ws_missing_scheme", checkWSMissingScheme(addr))
 	check("h2.rapid_reset", checkRapidReset(addr))
+	check("h2.upgrade", checkH2cUpgrade(sniffAddr))
 	if failed != 0 {
 		os.Exit(1)
 	}

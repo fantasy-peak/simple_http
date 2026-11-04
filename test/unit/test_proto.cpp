@@ -324,6 +324,60 @@ TEST_CASE("proto/response: defaults are filled in but never override", "[proto]"
     }
 }
 
+TEST_CASE("proto/response: header injection is refused at the writer boundary", "[proto]") {
+    asio::io_context ctx;
+
+    // A CR/LF in a field value would splice a second response onto HTTP/1.x.
+    // header() must poison the whole response, so nothing reaches the wire.
+    SECTION("header() rejects a CR/LF value") {
+        auto writer = std::make_shared<FakeResponseSink>();
+        ResponseWriter res{writer};
+        res.header("x-test", "a\r\nInjected: 1");
+        auto ec = run_on(ctx, res.status(status::ok).send("body"));
+        REQUIRE(ec.has_value());
+        CHECK(*ec == asio::error::invalid_argument);
+        CHECK_FALSE(res.started());
+        CHECK(writer->calls == 0);
+        CHECK(writer->chunks.empty());
+    }
+
+    SECTION("header() rejects a NUL and a CR in the name") {
+        auto writer = std::make_shared<FakeResponseSink>();
+        ResponseWriter res{writer};
+        res.header("x-test", std::string{"a\0b", 3});
+        auto ec = run_on(ctx, res.status(status::ok).begin());
+        REQUIRE(ec.has_value());
+        CHECK(*ec == asio::error::invalid_argument);
+        CHECK_FALSE(res.started());
+
+        auto writer2 = std::make_shared<FakeResponseSink>();
+        ResponseWriter res2{writer2};
+        res2.header("x\r\nInjected", "1");
+        auto ec2 = run_on(ctx, res2.status(status::ok).send_bodyless());
+        REQUIRE(ec2.has_value());
+        CHECK(*ec2 == asio::error::invalid_argument);
+        CHECK(writer2->calls == 0);
+    }
+
+    SECTION("replace_header() has the same guard") {
+        auto writer = std::make_shared<FakeResponseSink>();
+        ResponseWriter res{writer};
+        res.replace_header("x-test", "ok\r\nInjected: 1");
+        auto ec = run_on(ctx, res.status(status::ok).send("body"));
+        REQUIRE(ec.has_value());
+        CHECK(*ec == asio::error::invalid_argument);
+        CHECK_FALSE(res.started());
+        CHECK(writer->calls == 0);
+    }
+
+    SECTION("a clean field still passes") {
+        auto writer = std::make_shared<FakeResponseSink>();
+        ResponseWriter res{writer};
+        REQUIRE(run_on(ctx, res.header("x-test", "clean value").send("ok")));
+        CHECK(writer->header("x-test") == "clean value");
+    }
+}
+
 TEST_CASE("proto/response: bodyless, streaming and state forwarding", "[proto]") {
     asio::io_context ctx;
     auto writer = std::make_shared<FakeResponseSink>();

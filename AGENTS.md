@@ -659,7 +659,7 @@ test/run.sh unit '[h2]' # Catch2 过滤
 
 | suite | tier | 内容 |
 |---|---|---|
-| `unit` | fast | 原 Catch2 纯逻辑测试（约 401 用例） |
+| `unit` | fast | 原 Catch2 纯逻辑测试（约 417 用例） |
 | `openapi` | standard | OAS 3.1 元模式 + 文档/路由契约 + Swagger UI |
 | `client-diff` | full | C++ 客户端 ↔ Go 客户端，同一个 Go 服务端 |
 | `server-diff` | full | Go 客户端 → C++ 服务端 ↔ Go 服务端 |
@@ -689,10 +689,13 @@ Python 侧只需要 `httpx`、`jsonschema`、`brotli`（`test/requirements.txt`�
   `target=cpp` / `target=go` 两行。组：`routing`、`body`、`semantics`、
   `middleware`、`framework`、`static`、`ws`、`raw`、`h2raw`。
   `h2raw` 是 C++ 单侧原始 HTTP/2 断言（`test/diff/server/go/h2raw/`）：RFC 8441
-  extended CONNECT，以及「重置已开流后再开新流」的 Rapid Reset 队列溢出
+  extended CONNECT 矩阵（文本/二进制/分片/Ping/Pong/Close、非法 UTF-8、未掩码帧、
+  路由未命中、非 websocket `:protocol`、缺 `:scheme`），h2c Upgrade（101 后
+  stream 1 重放），以及「重置已开流后再开新流」的 Rapid Reset 队列溢出
   `GOAWAY(ENHANCE_YOUR_CALM)`。Go `net/http` 无对应能力，因此输出 PASS/FAIL
   而不是双 target。h2c 夹具（`:7821`）把 `h2_max_queued_streams` 调小，否则
-  RFC 9113 §5.1.2 的 `REFUSED_STREAM` 会先于队列溢出触发。
+  RFC 9113 §5.1.2 的 `REFUSED_STREAM` 会先于队列溢出触发；upgrade 检查走
+  `:7820` 嗅探监听器。
 
 每个组是独立可执行程序（C++ 用 `DIFF_GROUP_*`，Go 用 `-ldflags -X main.defaultGroup`）。
 观测是 JSONL，字段为 `case/target/status/version/headers/body/body_encoding/framing/error/notes`。

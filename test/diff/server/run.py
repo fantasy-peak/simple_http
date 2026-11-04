@@ -171,7 +171,8 @@ def run_h2raw(probe: Path, report_dir: Path, registry: dict) -> int:
     """Raw h2 assertions are C++-only: parse PASS/FAIL rather than diff targets."""
     output = report_dir / "h2raw.log"
     stderr_path = report_dir / "h2raw.stderr"
-    result = run_probe([str(probe), "--h2c", "http://127.0.0.1:7821"], output)
+    result = run_probe([str(probe), "--h2c", "http://127.0.0.1:7821",
+                        "--sniff", "http://127.0.0.1:7820"], output)
     stderr_path.write_text(result.stderr or "", encoding="utf-8")
     report = harness.DiffReport("server-h2raw", registry)
     found = False

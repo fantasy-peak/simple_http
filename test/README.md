@@ -66,8 +66,8 @@ test/run.sh full --parallel 1   # 完全串行，便于定位
   Go 参考服务端；服务端回显 method/header/body，因此差异只可能来自客户端。
 - **server-diff**：同一个 Go 探针把相同请求分别发给 C++ 与 Go 参考服务端，
   每个案例输出 `target=cpp` 与 `target=go` 两行；runner 按 case 配对。`h2raw`
-  组是 C++ 单侧原始 HTTP/2 断言（extended CONNECT、Rapid Reset），由
-  `diff/server/go/h2raw` 输出 PASS/FAIL，不参与双端差分。
+  组是 C++ 单侧原始 HTTP/2 断言（extended CONNECT 矩阵、h2c Upgrade、Rapid
+  Reset），由 `diff/server/go/h2raw` 输出 PASS/FAIL，不参与双端差分。
 - **归一化**（`diff/support/harness.py`）：header 名小写、`allow`/`vary`/`cache-control`
   按集合比较；默认忽略 `date`/`server`/`content-length`/`transfer-encoding`/
   `connection`/`etag`/`last-modified`/`set-cookie` 等传输细节；body 支持
