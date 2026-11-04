@@ -179,7 +179,11 @@ inline bool wildcard_match(std::string_view pattern, std::string_view origin) {
 inline bool origin_allowed(const CorsConfig &cfg, std::string_view origin) {
     const auto &allowed = cfg.allow_origins;
     if (allowed.empty()) {
-        return true;
+        // An empty list means "any origin" only when no predicate was supplied.
+        // With a predicate, the caller asked for a decision to be made; returning
+        // true here ran the predicate never and turned a deny-everything policy
+        // into allow-everything (the fail-open shape).
+        return cfg.allow_origin_fn ? cfg.allow_origin_fn(origin) : true;
     }
     for (const auto &entry : allowed) {
         if (entry == "*" || iequals_ci(entry, origin) ||

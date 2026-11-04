@@ -294,9 +294,15 @@ inline asio::awaitable<bool> StaticFiles::try_serve(const RequestPtr &req, const
             // If-Range: only honour the range when the client's validator still
             // describes this representation; otherwise send the whole thing.
             if (auto ir = req->header(field::if_range)) {
-                const bool matches = ir->starts_with("\"") || ir->starts_with("W/")
-                                         ? etag_matches(*ir, rep->etag)
-                                         : parse_http_date(*ir).value_or(-1) == entry->mtime;
+                // RFC 9110 §13.1.5: If-Range needs a *strong* validator. A weak
+                // ETag (W/"...") must not match even when its opaque tag is the
+                // same, or a range is served from a representation whose bytes
+                // may differ; use strong comparison and fall back to the full
+                // representation otherwise.
+                const bool matches = ir->starts_with("W/")
+                                         ? false
+                                         : (ir->starts_with("\"") ? etag_strong_match(*ir, rep->etag)
+                                                                  : parse_http_date(*ir).value_or(-1) == entry->mtime);
                 if (!matches)
                     range.reset();
             }

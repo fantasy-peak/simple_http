@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <boost/asio.hpp>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -51,8 +52,14 @@ struct InjectedAcceptEncoding {
 
 class DecompressingClientStream final : public ClientStream {
   public:
-    DecompressingClientStream(std::shared_ptr<ClientStream> inner, ResponseDecoding policy)
-        : m_inner(std::move(inner)), m_policy(std::move(policy)) {}
+    // `max_decoded_bytes` bounds the *decoded* body. The codec expands a single
+    // wire chunk in one call, so a caller-side cap checked after read() returns
+    // is too late: a few hundred kilobytes of gzip can become gigabytes of
+    // std::string before read() ever hands it over. 0 keeps the old unbounded
+    // behavior for callers that opt out.
+    DecompressingClientStream(std::shared_ptr<ClientStream> inner, ResponseDecoding policy,
+                              std::size_t max_decoded_bytes = 0)
+        : m_inner(std::move(inner)), m_policy(std::move(policy)), m_max_decoded_bytes(max_decoded_bytes) {}
 
     // --- request side: nothing to decode on the way out ---
     asio::awaitable<error_code> write(std::string data) override { return m_inner->write(std::move(data)); }
@@ -95,7 +102,12 @@ class DecompressingClientStream final : public ClientStream {
             }
             if (chunk->eof) {
                 m_inner_eof = true;
-                m_tail = m_decoder->finish();
+                bool limited = false;
+                m_tail = m_decoder->finish_bounded(remaining_decoded_room(), limited);
+                if (limited) {
+                    co_return std::unexpected{make_error_code(client_errc::body_too_large)};
+                }
+                m_decoded_total += m_tail.size();
                 if (m_decoder->failed()) {
                     // Half a body must not be handed over as if it were whole.
                     co_return std::unexpected{make_error_code(client_errc::body_decode_failed)};
@@ -107,7 +119,16 @@ class DecompressingClientStream final : public ClientStream {
                 }
                 co_return ReadResult{std::string{}, true};
             }
-            std::string out = m_decoder->write(chunk->data);
+            bool limited = false;
+            std::string out = m_decoder->write_bounded(chunk->data, remaining_decoded_room(), limited);
+            if (limited) {
+                // The codec produced more than the configured cap for this
+                // response. Stop before materializing the rest; the stream is
+                // unusable from here, which is exactly what a body-too-large
+                // error means.
+                co_return std::unexpected{make_error_code(client_errc::body_too_large)};
+            }
+            m_decoded_total += out.size();
             if (m_decoder->failed()) {
                 co_return std::unexpected{make_error_code(client_errc::body_decode_failed)};
             }
@@ -186,11 +207,19 @@ class DecompressingClientStream final : public ClientStream {
     }
 
   private:
+    std::size_t remaining_decoded_room() const {
+        if (m_max_decoded_bytes == 0)
+            return std::numeric_limits<std::size_t>::max();
+        return m_decoded_total >= m_max_decoded_bytes ? 0 : m_max_decoded_bytes - m_decoded_total;
+    }
+
     std::shared_ptr<ClientStream> m_inner;
     ResponseDecoding m_policy;
     std::unique_ptr<ContentDecoder> m_decoder;
     std::string m_tail;      // decoded bytes still owed to the caller
     bool m_inner_eof{false}; // the inner stream has reported end-of-body
+    std::size_t m_max_decoded_bytes{0};
+    std::size_t m_decoded_total{0};
 };
 
 // Canonicalises the configured encodings, keeping only those this build can
@@ -233,11 +262,12 @@ inline std::string accept_encoding_value(const std::vector<std::string> &wanted)
 // Wraps `stream` only when this exchange is allowed to decode (the client
 // itself injected Accept-Encoding); otherwise hands the pointer back unchanged.
 inline std::shared_ptr<ClientStream> maybe_decompressing_stream(std::shared_ptr<ClientStream> stream,
-                                                                ResponseDecoding policy) {
+                                                                ResponseDecoding policy,
+                                                                std::size_t max_decoded_bytes = 0) {
     if (!policy.enabled || policy.encodings.empty()) {
         return stream;
     }
-    return std::make_shared<DecompressingClientStream>(std::move(stream), std::move(policy));
+    return std::make_shared<DecompressingClientStream>(std::move(stream), std::move(policy), max_decoded_bytes);
 }
 
 } // namespace simple_http::detail

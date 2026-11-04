@@ -284,6 +284,18 @@ class Router {
             SIMPLE_HTTP_INFO_LOG("static files: ignoring a disabled site");
             return *this;
         }
+        // A static site is a dispatch *stage*, not a route: it has no place to
+        // carry a group prefix or a middleware chain. Registering one inside a
+        // group used to look supported (the group lambda accepts it) while the
+        // site was actually mounted at the root and answered before any group
+        // middleware ran — a silent authorization bypass for deployments that
+        // put authentication on the group. Refuse the registration instead.
+        if (!m_scopes.empty()) {
+            SIMPLE_HTTP_ERROR_LOG("static files: cannot register inside group('{}'); register the site outside the "
+                                  "group and protect its prefix with middleware",
+                                  m_scopes.back().prefix);
+            return *this;
+        }
         m_static.push_back(std::move(site));
         return *this;
     }
@@ -389,10 +401,13 @@ class Router {
     //   });
     //
     // The lambda receives the *same* Router (registration is flat — a group is
-    // a registration scope, not a separate table), so any route form works
-    // inside: route, route_regex, ws_route, http_proxy, static_files, and
-    // nested groups. Global middleware (use() outside a group) and CORS still
-    // run for every request, ahead of the group chain.
+    // a registration scope, not a separate table), so route forms work inside:
+    // route, route_regex, ws_route, http_proxy, and nested groups.
+    // static_files does not: a site is a dispatch stage without a prefix or a
+    // middleware chain, so registering one inside a group is refused (it used
+    // to be mounted at the root, unprotected, while appearing group-scoped).
+    // Global middleware (use() outside a group) and CORS still run for every
+    // request, ahead of the group chain.
     template <typename F> Router &group(std::string prefix, F &&register_routes) {
         return group(std::move(prefix), {}, std::forward<F>(register_routes));
     }

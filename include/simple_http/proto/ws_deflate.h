@@ -174,7 +174,12 @@ inline std::optional<WsDeflateConfig> ws_parse_one_deflate_part(std::string_view
                 return std::nullopt;
             }
             auto bits = bits8_15(pvalue);
-            if (!bits) {
+            // zlib's raw deflate cannot initialise with windowBits 8 (it
+            // returns Z_STREAM_ERROR; only -9..-15 work), so accepting the
+            // offer would advertise a window we cannot encode with and then
+            // fail every compressed message. Decline the extension instead
+            // (RFC 7692 §7.1.2.2 allows the server to reject the offer).
+            if (!bits || *bits == 8) {
                 return std::nullopt;
             }
             offered_server_bits = bits;

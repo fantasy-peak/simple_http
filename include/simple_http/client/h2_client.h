@@ -936,6 +936,19 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
         return true;
     }
 
+    // A field block for a cancelled/unknown stream still has to reach the
+    // decoder: the server's encoder updated its dynamic table when it emitted
+    // the block, so skipping it desynchronizes ours (RFC 9113 §4.3.1) and the
+    // next response on this pooled connection decodes to wrong values or fails.
+    bool decode_discarded_header_block(std::string_view block) {
+        std::vector<codec::HpackHeader> ignored;
+        if (!m_decoder.decode(block, ignored) && !m_decoder.header_list_too_large()) {
+            go_away(codec::H2_COMPRESSION_ERROR);
+            return false;
+        }
+        return true;
+    }
+
     bool on_headers(const codec::H2FrameHeader &hdr, std::string_view payload) {
         if (hdr.stream_id == 0) {
             go_away(codec::H2_PROTOCOL_ERROR);
@@ -951,17 +964,29 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
 
         auto it = m_streams.find(hdr.stream_id);
         if (it == m_streams.end()) {
-            // A skipped header block cannot be resumed by CONTINUATION, so an
-            // unterminated one is fatal.
-            if (!hdr.has_flag(codec::H2_FLAG_END_HEADERS)) {
-                go_away(codec::H2_PROTOCOL_ERROR);
+            if (!tolerate_unknown_stream(hdr))
                 return false;
+            if (hdr.has_flag(codec::H2_FLAG_END_HEADERS)) {
+                return decode_discarded_header_block(block);
             }
-            return tolerate_unknown_stream(hdr);
+            // Consume the CONTINUATION frames, decoding them at END_HEADERS so
+            // the dynamic table stays in sync.
+            m_continuation_stream = hdr.stream_id;
+            m_continuation_discard = true;
+            m_continuation_discard_block.assign(block);
+            return true;
         }
         Stream &st = it->second;
-        if (st.remote_end || st.failed || st.reset)
-            return true; // already over: ignore stragglers
+        if (st.remote_end || st.failed || st.reset) {
+            // Already over: ignore stragglers, but still decode the block.
+            if (hdr.has_flag(codec::H2_FLAG_END_HEADERS)) {
+                return decode_discarded_header_block(block);
+            }
+            m_continuation_stream = hdr.stream_id;
+            m_continuation_discard = true;
+            m_continuation_discard_block.assign(block);
+            return true;
+        }
 
         if (st.header_block.empty()) {
             // END_STREAM is only defined on the frame that starts a block.
@@ -984,6 +1009,22 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
         if (hdr.stream_id == 0 || hdr.stream_id != m_continuation_stream) {
             go_away(codec::H2_PROTOCOL_ERROR);
             return false;
+        }
+        if (m_continuation_discard) {
+            if (payload.size() > m_limits.max_header_bytes ||
+                m_continuation_discard_block.size() > m_limits.max_header_bytes - payload.size()) {
+                go_away(codec::H2_ENHANCE_YOUR_CALM);
+                return false;
+            }
+            m_continuation_discard_block.append(payload);
+            if (hdr.has_flag(codec::H2_FLAG_END_HEADERS)) {
+                const bool decoded = decode_discarded_header_block(m_continuation_discard_block);
+                m_continuation_stream = 0;
+                m_continuation_discard = false;
+                m_continuation_discard_block.clear();
+                return decoded;
+            }
+            return true;
         }
         auto it = m_streams.find(hdr.stream_id);
         if (it == m_streams.end()) {
@@ -1545,6 +1586,8 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
     std::uint32_t m_next_stream_id{1}; // client-initiated ids are odd
     std::uint32_t m_last_stream_id{0};
     std::uint32_t m_continuation_stream{0};
+    bool m_continuation_discard{false};
+    std::string m_continuation_discard_block;
 
     std::int64_t m_conn_send_window{kClientInitialWindow};
     std::int64_t m_conn_recv_window{kClientInitialWindow};

@@ -74,6 +74,21 @@ inline bool etag_matches(std::string_view header_value, std::string_view etag) {
     return false;
 }
 
+// Strong comparison (RFC 9110 §8.8.3.2): neither side may be a weak validator,
+// and the opaque tags must match exactly. This is the comparison `If-Range`
+// requires; a weak validator must be treated as not matching, so the caller
+// falls back to a full response rather than serving a range that may describe
+// different bytes.
+inline bool etag_strong_match(std::string_view header_value, std::string_view etag) {
+    auto strong = [](std::string_view v) {
+        v = trim_ows(v);
+        return !v.starts_with("W/") ? v : std::string_view{};
+    };
+    const auto expected = strong(etag);
+    const auto supplied = strong(header_value);
+    return !expected.empty() && !supplied.empty() && supplied == expected;
+}
+
 // An inclusive byte range.
 struct ByteRange {
     std::uint64_t first{0};

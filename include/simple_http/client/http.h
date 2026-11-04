@@ -473,8 +473,9 @@ class RequestBuilder {
     // response (redirects / cookie jar / pooled-retry / h2c / decompression all
     // handled), and returns a buffered Response.
     [[nodiscard]] asio::awaitable<std::expected<Response, error_code>> send() const;
-    // Explicit streaming: returns the write-end-open Stream, so the caller can
-    // stream the body and then read the response. No buffered body is premade.
+    // Streaming response: the collected body (`body()`/`json()`/`multipart()`)
+    // is written as the first chunk, then the caller drives the rest and calls
+    // finish(). Use Client::open_stream() when there is no builder body.
     [[nodiscard]] asio::awaitable<std::expected<Stream, error_code>> send_stream() const;
 
   private:
@@ -1108,14 +1109,30 @@ inline asio::awaitable<std::expected<Stream, error_code>> RequestBuilder::send_s
     if (m_json_failed) {
         co_return std::unexpected{make_error_code(asio::error::invalid_argument)};
     }
-    co_return co_await m_client->open_stream(build_url(), StreamSpec{m_method,
-                                                                     {},
-                                                                     m_headers,
-                                                                     /*expect_100_continue=*/false,
-                                                                     /*close=*/false,
-                                                                     m_head_timeout,
-                                                                     m_idle_timeout,
-                                                                     m_version});
+    auto stream = co_await m_client->open_stream(build_url(), StreamSpec{m_method,
+                                                                         {},
+                                                                         m_headers,
+                                                                         /*expect_100_continue=*/false,
+                                                                         /*close=*/false,
+                                                                         m_head_timeout,
+                                                                         m_idle_timeout,
+                                                                         m_version});
+    if (!stream) {
+        co_return std::unexpected{stream.error()};
+    }
+    // The builder's body (`body()`/`json()`/`multipart()`) is the request
+    // entity. StreamSpec describes only the head, so without this the body was
+    // silently dropped: `.json(obj).send_stream()` sent no entity while keeping
+    // the JSON Content-Type. Write it as the first chunk and leave the write
+    // end open — the caller still owns finish(), exactly like a hand-driven
+    // stream. (Calling finish() here made the caller's own finish() fail with
+    // body_not_streaming.)
+    if (!m_body.empty()) {
+        if (auto ec = co_await stream->write(std::string{m_body}); ec) {
+            co_return std::unexpected{ec};
+        }
+    }
+    co_return stream;
 }
 
 inline asio::awaitable<std::expected<Response, error_code>> RequestBuilder::send() const {

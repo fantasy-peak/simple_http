@@ -77,7 +77,12 @@ class Jwks {
 
     static std::expected<Jwks, std::string> parse(std::string_view json) {
         JwkDocument document{};
-        if (auto ec = glz::read_json(document, json); ec) {
+        // A JWKS published by a real IdP routinely carries members this verifier
+        // does not use (`use`, `key_ops`, `x5c`, `x5t`, ...). glaze defaults to
+        // rejecting unknown keys, which made the whole document unparseable and
+        // every token fail with "JWT key set unavailable".
+        constexpr auto jwks_opts = glz::opts{.error_on_unknown_keys = false};
+        if (auto ec = glz::read<jwks_opts>(document, json); ec) {
             return std::unexpected(std::string{"invalid JWKS JSON"});
         }
 

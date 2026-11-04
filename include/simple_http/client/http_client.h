@@ -667,7 +667,7 @@ class ClientEngine {
             }
             auto usable = co_await negotiate_and_open(session, target, spec->clone_for_replay(m_executor));
             if (usable) {
-                auto stream = maybe_decompressing_stream(*usable, std::move(decoding));
+                auto stream = maybe_decompressing_stream(*usable, std::move(decoding), m_config.limits.max_body_bytes);
                 stream->set_gate_token(gate_token);
                 if (keep_exchange) {
                     if (gated) {

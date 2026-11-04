@@ -388,6 +388,28 @@ inline Middleware real_ip(std::vector<std::string> trusted_proxies = {}) {
 // is preserved). With this in the chain, routes are registered in canonical
 // form and "/a%2Fb", "//a/b", "/a/./b" all reach them; chi's CleanPath
 // middleware.
+// decode_and_normalize returns a decoded lookup key. Writing it back into the
+// request target verbatim re-introduces the characters the wire form encodes:
+// a decoded '%' can become a fresh escape for the next layer (double decode),
+// and a decoded '?' would be re-split as the query delimiter by set_target.
+// Escape those bytes again so the target stays a valid origin-form and every
+// later decoder sees exactly the one level of encoding the peer sent.
+inline std::string reencode_clean_path(std::string_view normalized) {
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(normalized.size());
+    for (const unsigned char c : normalized) {
+        if (c == '%' || c == '?' || c == '#' || c == ' ' || c < 0x21 || c == 0x7F) {
+            out.push_back('%');
+            out.push_back(kHex[c >> 4]);
+            out.push_back(kHex[c & 0x0F]);
+        } else {
+            out.push_back(static_cast<char>(c));
+        }
+    }
+    return out;
+}
+
 inline Middleware clean_path() {
     return [](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
         const std::string_view raw = req->target();
@@ -401,7 +423,7 @@ inline Middleware clean_path() {
             co_return;
         }
         if (*normalized != path) {
-            req->set_target(*normalized + std::string{query});
+            req->set_target(reencode_clean_path(*normalized) + std::string{query});
         }
         co_await next(std::move(req), std::move(res), ssl);
     };

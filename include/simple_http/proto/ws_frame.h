@@ -190,7 +190,11 @@ class WsFrameParser {
         // error.
         const std::uint8_t rsv_bits = data[0] & 0x70;
         const bool rsv1 = (rsv_bits & 0x40) != 0;
-        if (rsv_bits != 0 && !(m_allow_rsv1 && rsv1 && !is_control)) {
+        // permessage-deflate defines RSV1 on data frames only. Checking merely
+        // that the RSV1 bit was set let RSV2/RSV3 ride along whenever RSV1 was
+        // also set (0x50/0x60/0x70); the mode must be exactly "RSV1 and nothing
+        // else", on a data frame.
+        if (rsv_bits != 0 && !(m_allow_rsv1 && rsv_bits == 0x40 && !is_control)) {
             return Status::Error;
         }
 

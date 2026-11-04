@@ -95,6 +95,11 @@ template <TransportLike Transport> class Http1ResponseSink : public ResponseSink
 
         if (status == status::no_content || status == status::not_modified) {
             // Neither a body nor a Content-Length (RFC 9110 §15.3.5/§15.4.5).
+            // A 304 may legally repeat the selected representation's length, so
+            // only the 204 (and any 1xx) drops a handler-set field here.
+            if (status == status::no_content) {
+                headers.erase("content-length");
+            }
             co_return co_await send_bodyless(status, std::move(headers));
         }
         // A handler must not choose the connection framing: a Transfer-Encoding
@@ -135,6 +140,13 @@ template <TransportLike Transport> class Http1ResponseSink : public ResponseSink
         if (!m_open)
             co_return make_error_code(asio::error::not_connected);
         strip_hop_by_hop(headers);
+        // 204 (and 1xx) must not carry Content-Length (RFC 9110 §15.3.5). A
+        // HEAD response and a 304 are the two bodyless shapes allowed to keep
+        // it — HEAD describes the GET's entity, and a 304 may repeat the
+        // selected representation's length.
+        if (status == status::no_content || (status >= 100 && status < 200)) {
+            headers.erase("content-length");
+        }
         ensure_date(headers);
         std::string out;
         build_head(out, status, headers);
@@ -564,6 +576,17 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
 
             auto &head = parser.head();
             Version version = head.version;
+            // RFC 9112 §3.2.2: for an absolute-form request-target the
+            // authority from the request line overrides the Host field (an
+            // origin server uses the target's host and ignores Host). The
+            // parser keeps the authority separately because the target was
+            // reduced to origin-form; fold it back in here so routing, vhost
+            // selection, logging and the reverse proxy all see one host. Go's
+            // net/http does the same (r.Host comes from the URL).
+            if (head.absolute_form && !head.authority.empty()) {
+                head.headers.erase("host");
+                head.headers.add_lower("host", head.authority);
+            }
             // RFC 9112 §3.2: a request carries exactly one Host. Zero leaves no
             // authority to route on; more than one is ambiguous, and two hops
             // reading different copies is the classic smuggling shape. HTTP/1.0
@@ -889,6 +912,12 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
         }
         if (chunk_len == 0) {
             // Last chunk: consume trailers up to the blank line, then EOF.
+            // The section is a header block, so it is bounded like one: a peer
+            // that streams unbounded trailer fields must not be able to turn a
+            // modest chunked body into a multi-gigabyte vector of pairs (a
+            // 4-byte line is one entry). max_header_bytes is the same bound the
+            // client applies to response trailers.
+            std::size_t trailer_bytes = 0;
             std::string trailer;
             for (;;) {
                 if (!co_await read_line(trailer)) {
@@ -902,23 +931,27 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
                 }
                 if (trailer.empty())
                     break; // the blank line that terminates the trailer section
-                // Trailers are part of the body volume: count them so a peer cannot
-                // stream trailers forever (each line is itself bounded by read_line).
-                m_body_state.total += trailer.size() + 2;
-                if (m_body_state.total > m_limits.max_body_bytes) {
+                // Each line is already bounded by read_line; bound the section
+                // as a whole too, so the number of stored fields is bounded.
+                trailer_bytes += trailer.size() + 2;
+                if (trailer_bytes > m_limits.max_header_bytes) {
                     m_body_state.done = true;
                     co_return std::unexpected(make_error_code(asio::error::message_size));
                 }
-                // Expose the field once the body ends. Framing fields are not
-                // valid trailers (RFC 9110 §6.5.1) and are ignored.
+                // Expose the field once the body ends. Framing and hop-by-hop
+                // fields are not valid trailers (RFC 9110 §6.5.1) and are
+                // ignored: trailers must not be able to inject a second
+                // Content-Length/Host/TE into whatever consumes them.
                 if (auto request = m_body_request.lock()) {
                     const auto colon = trailer.find(':');
                     if (colon != std::string::npos) {
                         const std::string_view name = trim_ows(std::string_view{trailer}.substr(0, colon));
                         const std::string_view value = trim_ows(std::string_view{trailer}.substr(colon + 1));
+                        // The forbidden set is lowercase; the wire name is not.
+                        const std::string lower_name = ascii_lower_copy(name);
                         if (!name.empty() && !contains_ctl(name) && !contains_ctl(value) &&
-                            !is_connection_specific_field(name)) {
-                            request->mutable_trailers().add_lower(ascii_lower_copy(name), std::string{value});
+                            !is_forbidden_trailer_field(lower_name)) {
+                            request->mutable_trailers().add_lower(lower_name, std::string{value});
                         }
                     }
                 }
@@ -1052,6 +1085,16 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
 
         const auto te_values = head.headers.get_all("transfer-encoding");
         if (!te_values.empty()) {
+            // RFC 9112 §6.1: Transfer-Encoding is an HTTP/1.1 framing mechanism.
+            // An HTTP/1.0 peer (or the front end that let one through) does not
+            // frame by chunked, so accepting it here creates a TE.CL split:
+            // this server consumes the chunked body while the front end treats
+            // the same bytes as the next request. Go's net/http ignores TE on
+            // 1.0; refusing is the fail-closed equivalent.
+            if (head.version == Version::Http1) {
+                out.error_status = status::bad_request;
+                return out;
+            }
             std::vector<std::string_view> codings;
             for (auto value : te_values) {
                 while (true) {

@@ -262,15 +262,32 @@ class CompressingResponseSink final : public ResponseSink {
     // upstream may have sent `Vary: Origin`, and overwriting it would break its
     // caching. `Vary: *` already covers everything.
     static void merge_vary(Headers &headers) {
-        auto existing = headers.get("vary");
-        if (!existing) {
+        const auto existing = headers.get_all("vary");
+        if (existing.empty()) {
             headers.add_lower("vary", "Accept-Encoding");
             return;
         }
-        if (value_has_token(*existing, "*") || value_has_token(*existing, "accept-encoding")) {
-            return;
+        // Vary is a list-valued field and may legally be split over several
+        // lines. Reading only the first (Headers::get) and then erasing every
+        // occurrence (Headers::erase removes all) silently dropped the other
+        // dimensions: `Vary: Origin` + `Vary: Cookie` became `Origin,
+        // Accept-Encoding`, and a shared cache could then reuse a personalized
+        // response across users.
+        bool has_star = false;
+        bool has_accept_encoding = false;
+        std::string merged;
+        for (auto value : existing) {
+            if (value_has_token(value, "*"))
+                has_star = true;
+            if (value_has_token(value, "accept-encoding"))
+                has_accept_encoding = true;
+            if (!merged.empty())
+                merged += ", ";
+            merged += value;
         }
-        std::string merged{*existing};
+        if (has_star || has_accept_encoding) {
+            return; // already covers everything we need; leave the fields as sent
+        }
         merged += ", Accept-Encoding";
         headers.erase("vary");
         headers.add_lower("vary", std::move(merged));

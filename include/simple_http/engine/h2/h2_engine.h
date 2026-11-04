@@ -1234,15 +1234,39 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
     // END_HEADERS, the peer's CONTINUATION frames still have to be consumed;
     // they are discarded (bounded by max_header_bytes) rather than treated as a
     // header block for a stream that no longer exists.
-    bool refuse_stream(const codec::H2FrameHeader &hdr, std::size_t payload_size, std::uint32_t error_code_value) {
+    // Every complete field block must pass through the connection's HPACK
+    // decoder, even when its stream is refused or already closed: the peer's
+    // encoder updates its dynamic table when it emits the block, so skipping
+    // the decode leaves our table out of sync and poisons every later block on
+    // the connection (RFC 9113 §4.3.1, RFC 7541 §2.2). The decoded fields are
+    // discarded; only the table side effects matter.
+    bool decode_discarded_header_block(std::string_view block) {
+        std::vector<codec::HpackHeader> ignored;
+        if (!m_decoder.decode(block, ignored) && !m_decoder.header_list_too_large()) {
+            go_away(codec::H2_COMPRESSION_ERROR);
+            return false;
+        }
+        return true; // list-too-large still decoded to the end: table stays in sync
+    }
+
+    // Starts consuming a discarded block whose END_HEADERS has not arrived yet.
+    void begin_discarding_header_block(const codec::H2FrameHeader &hdr, std::string_view block) {
+        m_continuation_stream = hdr.stream_id;
+        m_continuation_discard = true;
+        m_continuation_discard_bytes = block.size();
+        m_continuation_discard_block.assign(block);
+    }
+
+    bool refuse_stream(const codec::H2FrameHeader &hdr, std::string_view block, std::uint32_t error_code_value) {
         if (hdr.stream_id > m_next_peer_stream_id)
             m_next_peer_stream_id = hdr.stream_id;
-        reset_stream(hdr.stream_id, error_code_value);
-        if (!hdr.has_flag(codec::H2_FLAG_END_HEADERS)) {
-            m_continuation_stream = hdr.stream_id;
-            m_continuation_discard = true;
-            m_continuation_discard_bytes = payload_size;
+        if (hdr.has_flag(codec::H2_FLAG_END_HEADERS)) {
+            if (!decode_discarded_header_block(block))
+                return false;
+        } else {
+            begin_discarding_header_block(hdr, block);
         }
+        reset_stream(hdr.stream_id, error_code_value);
         return true;
     }
 
@@ -1274,7 +1298,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         if (hdr.has_flag(codec::H2_FLAG_PRIORITY)) {
             const std::size_t off = hdr.has_flag(codec::H2_FLAG_PADDED) ? 1 : 0;
             if ((codec::read_u32(payload, off) & 0x7FFFFFFFu) == hdr.stream_id) {
-                return refuse_stream(hdr, payload.size(), codec::H2_PROTOCOL_ERROR);
+                return refuse_stream(hdr, block, codec::H2_PROTOCOL_ERROR);
             }
         }
 
@@ -1286,7 +1310,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
             m_streams.size() >= m_limits.h2_max_concurrent_streams) {
             SIMPLE_HTTP_ERROR_LOG("h2: refusing stream {} ({} open, limit {})", hdr.stream_id, m_streams.size(),
                                   m_limits.h2_max_concurrent_streams);
-            return refuse_stream(hdr, payload.size(), codec::H2_REFUSED_STREAM);
+            return refuse_stream(hdr, block, codec::H2_REFUSED_STREAM);
         }
         if (header_block_too_big(m_streams.contains(hdr.stream_id) ? m_streams.at(hdr.stream_id).header_block.size()
                                                                    : 0,
@@ -1304,6 +1328,14 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         // than the frame's flags.
         if (st.half_closed_remote) {
             SIMPLE_HTTP_ERROR_LOG("h2: HEADERS on a half-closed(remote) stream (stream={}); resetting", hdr.stream_id);
+            // Even an illegal HEADERS carries a field block: decode it before
+            // the stream error, or the connection's HPACK table diverges.
+            if (hdr.has_flag(codec::H2_FLAG_END_HEADERS)) {
+                if (!decode_discarded_header_block(block))
+                    return false;
+            } else {
+                begin_discarding_header_block(hdr, block);
+            }
             reset_stream(hdr.stream_id, codec::H2_STREAM_CLOSED);
             return true;
         }
@@ -1365,9 +1397,10 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
             return false;
         }
         if (m_continuation_discard) {
-            // The stream was refused at its HEADERS: consume the rest of the
-            // split head without buffering or decoding it. The byte bound keeps
-            // a peer from turning the discard path into a CONTINUATION flood.
+            // The stream was refused at its HEADERS: the rest of the split head
+            // still has to reach the HPACK decoder to keep the dynamic table in
+            // sync, but its fields are discarded. The byte bound keeps a peer
+            // from turning the discard path into a CONTINUATION flood.
             const bool too_big = payload.size() > m_limits.max_header_bytes ||
                                  m_continuation_discard_bytes > m_limits.max_header_bytes - payload.size();
             if (too_big) {
@@ -1377,10 +1410,14 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                 return false;
             }
             m_continuation_discard_bytes += payload.size();
+            m_continuation_discard_block.append(payload);
             if (hdr.has_flag(codec::H2_FLAG_END_HEADERS)) {
+                const bool decoded = decode_discarded_header_block(m_continuation_discard_block);
                 m_continuation_stream = 0;
                 m_continuation_discard = false;
                 m_continuation_discard_bytes = 0;
+                m_continuation_discard_block.clear();
+                return decoded;
             }
             return true;
         }
@@ -2860,6 +2897,9 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
     // frames to be consumed (and forbids interleaving anything else).
     bool m_continuation_discard = false;
     std::size_t m_continuation_discard_bytes = 0;
+    // Fields are thrown away, but the bytes are decoded so the connection's
+    // HPACK dynamic table mirrors the peer's encoder (RFC 9113 §4.3.1).
+    std::string m_continuation_discard_block;
 
     bool m_alive = true;
     bool m_goaway_sent = false;

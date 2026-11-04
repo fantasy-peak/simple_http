@@ -40,6 +40,58 @@ namespace simple_http {
 // so the request and response sides cannot drift apart.
 namespace h1_detail {
 
+// Where a header block ends and which line endings it used.
+struct HeadEnd {
+    std::size_t pos{std::string::npos};
+    std::size_t sep{0};
+    bool crlf{false};
+    bool lf{false};
+};
+
+// Finds the earliest of the four possible blank-line terminators (CRLFCRLF,
+// CRLF+LF, LF+CRLF, LFLF) at or after `scan_from`. Scanning only the new bytes
+// keeps a head dribbled in one byte per read linear instead of quadratic.
+inline bool locate_head_end(std::string_view bytes, std::size_t scan_from, HeadEnd &term) {
+    const std::array<std::pair<std::string_view, HeadEnd>, 4> terminators{{
+        {"\r\n\r\n", {std::string::npos, 4, true, false}},
+        {"\r\n\n", {std::string::npos, 3, true, true}},
+        {"\n\r\n", {std::string::npos, 4, true, true}},
+        {"\n\n", {std::string::npos, 2, false, true}},
+    }};
+    for (auto [pattern, candidate] : terminators) {
+        candidate.pos = bytes.find(pattern, scan_from);
+        if (candidate.pos == std::string::npos)
+            continue;
+        if (term.pos == std::string::npos || candidate.pos < term.pos)
+            term = candidate;
+    }
+    return term.pos != std::string::npos;
+}
+
+// Rejects a header block that mixes CRLF and bare LF, or that carries a bare CR
+// (which would be smuggled into the next field). `first_lf` and the request
+// line are excluded by the caller when the start line has its own byte rules.
+inline bool line_endings_are_consistent(std::string_view bytes, const HeadEnd &term, std::size_t first_lf) {
+    bool saw_crlf = term.crlf;
+    bool saw_lf = term.lf;
+    for (std::size_t i = 0; i < term.pos; ++i) {
+        if (bytes[i] != '\n')
+            continue;
+        if (i > 0 && bytes[i - 1] == '\r')
+            saw_crlf = true;
+        else
+            saw_lf = true;
+    }
+    if (saw_crlf && saw_lf)
+        return false; // mixed CRLF/LF: two readers could disagree where the head ends
+    const std::size_t fields_from = (first_lf == std::string::npos || first_lf >= term.pos) ? term.pos : first_lf + 1;
+    for (std::size_t i = fields_from; i < term.pos; ++i) {
+        if (bytes[i] == '\r' && (i + 1 == term.pos || bytes[i + 1] != '\n'))
+            return false;
+    }
+    return true;
+}
+
 // Returns the next CRLF/LF-delimited line of `block` and advances `pos` past
 // its terminator (a trailing CR is stripped).
 inline std::string_view next_line(std::string_view block, std::size_t &pos) {
@@ -249,27 +301,8 @@ class H1Parser {
         // differential (a header after the earlier blank line is body to the
         // front end and a header here). So find the earliest of the four
         // forms, then reject a head that mixes the two line-ending styles.
-        struct Terminator {
-            std::size_t pos{std::string::npos};
-            std::size_t sep{0};
-            bool crlf{false};
-            bool lf{false};
-        };
-        Terminator term;
-        const std::array<std::pair<std::string_view, Terminator>, 4> terminators{{
-            {"\r\n\r\n", {std::string::npos, 4, true, false}},
-            {"\r\n\n", {std::string::npos, 3, true, true}},
-            {"\n\r\n", {std::string::npos, 4, true, true}},
-            {"\n\n", {std::string::npos, 2, false, true}},
-        }};
-        for (auto [pattern, candidate] : terminators) {
-            candidate.pos = bytes.find(pattern, m_scan_from);
-            if (candidate.pos == std::string::npos)
-                continue;
-            if (term.pos == std::string::npos || candidate.pos < term.pos)
-                term = candidate;
-        }
-        if (term.pos == std::string::npos) {
+        h1_detail::HeadEnd term;
+        if (!h1_detail::locate_head_end(bytes, m_scan_from, term)) {
             m_scan_from = bytes.size() >= 3 ? bytes.size() - 3 : 0;
             return State::NeedMore;
         }
@@ -278,33 +311,13 @@ class H1Parser {
         // terminator itself contributes (the last field line's ending is the
         // terminator's first half). Any CRLF alongside any bare LF is refused:
         // the pair of interpretations must not disagree about where the head
-        // ended.
-        bool saw_crlf = term.crlf;
-        bool saw_lf = term.lf;
-        for (std::size_t i = 0; i < term.pos; ++i) {
-            if (bytes[i] != '\n')
-                continue;
-            if (i > 0 && bytes[i - 1] == '\r')
-                saw_crlf = true;
-            else
-                saw_lf = true;
-        }
-        if (saw_crlf && saw_lf) {
-            m_error = 40007; // mixed CRLF/LF line endings
-            return State::Error;
-        }
-        // A CR that is not immediately followed by LF is not a line ending at
-        // all; it would be smuggled into the next field. The request line is
-        // excluded: a bare CR in the target is a control byte there and is
-        // reported by parse_request_line (40006), not as a line-ending error.
+        // ended. The request line is excluded from the bare-CR scan: a bare CR
+        // in the target is a control byte there and is reported by
+        // parse_request_line (40006), not as a line-ending error.
         const std::size_t first_lf = bytes.find('\n');
-        const std::size_t fields_from =
-            (first_lf == std::string::npos || first_lf >= term.pos) ? term.pos : first_lf + 1;
-        for (std::size_t i = fields_from; i < term.pos; ++i) {
-            if (bytes[i] == '\r' && (i + 1 == term.pos || bytes[i + 1] != '\n')) {
-                m_error = 40007;
-                return State::Error;
-            }
+        if (!h1_detail::line_endings_are_consistent(bytes, term, first_lf)) {
+            m_error = 40007; // mixed CRLF/LF line endings or a bare CR
+            return State::Error;
         }
 
         const std::size_t end = term.pos;
@@ -328,8 +341,12 @@ class H1Parser {
         // --- header fields ---
         while (pos < block.size()) {
             std::string_view hline = next_line(block, pos);
+            // The block ends at the earliest blank line, so an empty line here
+            // means the line endings disagreed about where the head ended.
+            // Skipping it is what let a field after a blank line be adopted.
             if (hline.empty()) {
-                continue; // defensive; the block excludes the terminating blank line
+                m_error = 40007;
+                return false;
             }
             if (!parse_header_line(hline)) {
                 return false;
@@ -367,9 +384,25 @@ class H1Parser {
         // survives the line-ending strip. A target is later replayed verbatim by
         // the reverse proxy into a synthesized HTTP/1.1 request line, where that
         // CR would start an attacker-authored field. NUL is equally unusable.
+        // Reject the rest of C0/DEL too: a backend that splits the request line
+        // on any whitespace (or treats VT/FF as a delimiter) would disagree with
+        // this parser about method/target boundaries.
         if (contains_ctl(method_tok) || contains_ctl(target) || contains_ctl(version)) {
             m_error = 40006;
             return false;
+        }
+        for (char ch : method_tok) {
+            if (!h1_detail::is_tchar(static_cast<unsigned char>(ch))) {
+                m_error = 40006; // method must be a token (RFC 9110 §5.6.2)
+                return false;
+            }
+        }
+        for (char ch : target) {
+            const auto c = static_cast<unsigned char>(ch);
+            if (c <= 0x20 || c == 0x7F) { // SP is the delimiter; TAB/other C0/DEL invalid
+                m_error = 40006;
+                return false;
+            }
         }
 
         m_head.method_token.assign(method_tok);
@@ -522,23 +555,27 @@ class H1ResponseParser {
 
     // Attempts to parse a complete head. Idempotent while NeedMore.
     State parse_head() {
-        // Same resume cursor as H1Parser: a response head dribbled in small
-        // reads must not re-scan the whole buffer each time.
-        std::size_t end = m_buf.find("\r\n\r\n", m_scan_from);
-        std::size_t sep = 4;
-        if (end == std::string::npos) {
-            // Tolerate bare-LF line endings (some minimal servers / tests).
-            end = m_buf.find("\n\n", m_scan_from);
-            sep = 2;
-            if (end == std::string::npos) {
-                m_scan_from = m_buf.size() >= 3 ? m_buf.size() - 3 : 0;
-                return State::NeedMore;
-            }
+        // Same scanner as H1Parser: the *earliest* blank line wins, so a bare
+        // LF blank line cannot be stepped over in favour of a later CRLFCRLF.
+        // Searching CRLFCRLF first (the old shape) let a peer place a blank
+        // line early and a field after it: a strict reader ended the head at
+        // the blank line, while this one adopted the field — the response
+        // smuggling differential. Mixed line endings are refused for the same
+        // reason.
+        std::string_view bytes{m_buf};
+        h1_detail::HeadEnd term;
+        if (!h1_detail::locate_head_end(bytes, m_scan_from, term)) {
+            m_scan_from = bytes.size() >= 3 ? bytes.size() - 3 : 0;
+            return State::NeedMore;
         }
-        std::string_view block{m_buf.data(), end};
+        const std::size_t first_lf = bytes.find('\n');
+        if (!h1_detail::line_endings_are_consistent(bytes, term, first_lf)) {
+            return State::Error;
+        }
+        std::string_view block{bytes.data(), term.pos};
         if (!parse_block(block))
             return State::Error;
-        m_consumed = end + sep;
+        m_consumed = term.pos + term.sep;
         m_scan_from = 0;
         return State::Done;
     }
@@ -572,8 +609,10 @@ class H1ResponseParser {
             return false;
         while (pos < block.size()) {
             std::string_view hline = h1_detail::next_line(block, pos);
+            // A blank line means the block-end scan and this line scan disagree;
+            // refuse rather than let a field after it be adopted.
             if (hline.empty())
-                continue; // defensive; the block excludes the blank line
+                return false;
             if (h1_detail::parse_field_line(hline, m_head.headers) != h1_detail::FieldLine::Ok)
                 return false;
         }

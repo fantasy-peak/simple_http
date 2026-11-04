@@ -329,11 +329,16 @@ inline Middleware jwt(JwtConfig config = {}) {
         const std::string header_json = base64_url_decode(header_b64);
         const std::string payload_json = base64_url_decode(payload_b64);
         const std::string signature = base64_url_decode(signature_b64);
-        if (auto ec = glz::read_json(jwt_header, header_json); ec) {
+        // Real tokens carry claims this verifier does not need (`jti`, `azp`,
+        // `nonce`, `email`, ...) and headers such as `cty`/`x5c`. glaze defaults
+        // to erroring on an unknown key, which would reject a perfectly valid
+        // token; every key that matters is checked explicitly below.
+        constexpr auto jwt_opts = glz::opts{.error_on_unknown_keys = false};
+        if (auto ec = glz::read<jwt_opts>(jwt_header, header_json); ec) {
             co_await jwt_reject(res, status::unauthorized, "malformed JWT header");
             co_return;
         }
-        if (auto ec = glz::read_json(payload, payload_json); ec) {
+        if (auto ec = glz::read<jwt_opts>(payload, payload_json); ec) {
             co_await jwt_reject(res, status::unauthorized, "malformed JWT payload");
             co_return;
         }
