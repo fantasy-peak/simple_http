@@ -552,6 +552,9 @@ server.serve_swagger_ui("/swagger", "/openapi.json");
 - 没有自己的 idle watchdog；使用 QUIC 协商的 idle timeout。
 - 服务端可 Alt-Svc 通告；支持连接迁移；0-RTT 可配置（默认关）。
 - 服务端 HTTP/3 不支持 WebSocket；`Expect: 100-continue` 是 no-op（nghttp3 无 1xx API）。
+- 缺少 `quic_transport_parameters` 的 ClientHello 按 RFC 9001 §8.2 关闭：
+  `CONNECTION_CLOSE 0x016d`（missing_extension）。OpenSSL 4 的 QUIC-TLS 与
+  `ngtcp2_crypto_ossl` 都不校验这个扩展，检查在本库的 `quic/connection.h`。
 
 ### 5.4 WebSocket
 
@@ -928,6 +931,13 @@ test/run.sh server-diff
 29. **重定向的 origin 边界**：清除 Authorization/Cookie 时必须比较
     scheme + host + port，而不是只比较 host。只比 host 会在端口变化时把凭据
     带到另一个 origin；Go 只比较 hostname，是已知差异，本库更严格。
+30. **QUIC 缺少 quic_transport_parameters**：OpenSSL 4 的 QUIC-TLS 与
+    ngtcp2_crypto_ossl 都不检查这个必需扩展（ossl 的
+    `set_remote_transport_params` 是 no-op，扩展缺失时回调根本不会触发）。
+    服务端必须在 ClientHello 处理完后发现 remote params 仍为空时，
+    用 `ngtcp2_ccerr_set_tls_alert(SSL_AD_MISSING_EXTENSION)` 关闭
+    （线上是 `CONNECTION_CLOSE 0x016d`）。判断要在 TLS 状态已离开
+    `TLS_ST_SR_CLNT_HELLO` 之后做，否则会把分片到达的 ClientHello 误杀。
 
 ---
 

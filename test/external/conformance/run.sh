@@ -44,12 +44,14 @@ PORT_H3=7792
 EXPECT_H2SPEC_PASSED=146
 EXPECT_H1SPEC_TOTAL=33
 EXPECT_H3SPEC_TOTAL=49
-# 47/49 是稳定值（同一二进制连跑多次一致）。剩下两条 TLS 8.2 是套件自身的产物：
-# h3spec 的客户端钩子把自己 ClientHello 里的 quic_transport_parameters 扩展摘掉后，
-# 它自己的 TLS 栈就先抛出 missing_extension（报告里写作 TransportErrorIsSent），
-# 而它的断言 cryptoErrorsIn 只接受 TransportErrorIsReceived —— 于是它看不到我们
-# 在线上回的同一个码。我们的行为与 RFC 9001 §8.2 一致，且与对端发出的一致
-# （双方都是 CONNECTION_CLOSE 0x16d）。
+# 47/49 是稳定值（同一二进制连跑多次一致）。剩下两条是同一个 TLS 8.2 用例的
+# 两个变体：h3spec 的客户端钩子把 ClientHello 里的 quic_transport_parameters
+# 扩展摘掉，期望服务端用 0x016d 关闭。服务端确实发了（-d 可见
+# "receiver: TransportErrorIsReceived TLSMissingExtension"），但该用例的动作
+# 随后仍被 2s 超时 AsyncCancelled 取消，HUnit 的 shouldThrow 看到的不是异常，
+# 于是判失败——这是套件客户端侧的时序/断言问题，不是服务端行为差异。
+# 服务端侧按 RFC 9001 §8.2 的实现见 quic/connection.h（OpenSSL 4 的 QUIC-TLS
+# 与 ngtcp2_crypto_ossl 都不做这个检查，所以由本库补上）。
 EXPECT_H3SPEC_PASSED=47
 
 # h3spec 的二进制名带平台后缀（release 资产就叫 h3spec-linux-x86_64），所以这里

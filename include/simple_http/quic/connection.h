@@ -789,6 +789,27 @@ void QuicConnection<Executor>::on_datagram(std::span<const std::uint8_t> datagra
         finish_close();
         return;
     }
+    if (rv == 0 && ngtcp2_conn_is_server2(m_conn) && !ngtcp2_conn_get_handshake_completed2(m_conn) &&
+        ngtcp2_conn_get_remote_transport_params2(m_conn) == nullptr) {
+        // RFC 9001 §8.2: the ClientHello must carry quic_transport_parameters;
+        // an endpoint that does not receive it closes the connection with
+        // 0x016d (NGTCP2_CRYPTO_ERROR | missing_extension). Neither OpenSSL 4's
+        // QUIC-TLS layer nor ngtcp2_crypto_ossl enforces this — the ossl
+        // helper's set_remote_transport_params() is a no-op and the OpenSSL
+        // "got extension" callback never fires. Enforce it here, but only once
+        // the ClientHello has actually been consumed: while it is still being
+        // read (fragmented across CRYPTO frames) the TLS state stays at
+        // TLS_ST_SR_CLNT_HELLO and the params are legitimately absent so far.
+        SSL *ssl = m_crypto.ssl();
+        const OSSL_HANDSHAKE_STATE state = ssl != nullptr ? SSL_get_state(ssl) : TLS_ST_BEFORE;
+        if (state != TLS_ST_BEFORE && state != TLS_ST_SR_CLNT_HELLO) {
+            SIMPLE_HTTP_ERROR_LOG("quic: ClientHello without quic_transport_parameters; closing");
+            ngtcp2_ccerr_set_tls_alert(&m_last_error, SSL_AD_MISSING_EXTENSION, nullptr, 0);
+            m_has_error = true;
+            close_now();
+            return;
+        }
+    }
     if (rv != 0) {
         // A datagram that arrives for a connection already closing is expected,
         // not an error: the peer has not seen our close yet.
