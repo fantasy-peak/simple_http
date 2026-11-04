@@ -65,6 +65,23 @@ std::string extended_connect_headers_frame(std::uint32_t id) {
     return out;
 }
 
+// A POST head with a distinguishing header, so the dispatcher can tell two
+// concurrent streams apart.
+std::string post_headers_frame(std::uint32_t id, bool end_stream, std::string_view tag) {
+    std::string block;
+    hpack_append_indexed(block, 3); // :method: POST
+    hpack_append_indexed(block, 7); // :scheme: https
+    hpack_append_literal(block, ":path", "/");
+    hpack_append_literal(block, ":authority", "example.com");
+    hpack_append_literal(block, "x-tag", tag);
+    std::uint8_t flags = H2_FLAG_END_HEADERS;
+    if (end_stream)
+        flags |= H2_FLAG_END_STREAM;
+    std::string out;
+    append_frame(out, H2FrameType::Headers, flags, id, block);
+    return out;
+}
+
 std::string rst_frame(std::uint32_t id) {
     std::string out;
     append_frame(out, H2FrameType::RstStream, 0, id, u32be(H2_CANCEL));
@@ -74,6 +91,12 @@ std::string rst_frame(std::uint32_t id) {
 std::string data_frame(std::uint32_t id, std::string_view payload) {
     std::string out;
     append_frame(out, H2FrameType::Data, 0, id, payload);
+    return out;
+}
+
+std::string data_frame_flagged(std::uint32_t id, std::string_view payload, std::uint8_t flags) {
+    std::string out;
+    append_frame(out, H2FrameType::Data, flags, id, payload);
     return out;
 }
 
@@ -410,4 +433,76 @@ TEST_CASE("h2/engine: extended CONNECT is refused when the setting is off", "[h2
     // the extended CONNECT is a connection error, and no handler runs.
     CHECK(has_goaway(transport->written(), codec::H2_PROTOCOL_ERROR));
     CHECK(dispatched.load() == 0);
+}
+
+TEST_CASE("h2/engine: a paused request body does not stall another stream", "[h2]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+
+    // Stream 1 sends far more body than the bounded channel holds and its
+    // handler never reads it. Stream 3 must still be dispatched and answered.
+    std::string in{codec::kH2ClientPreface};
+    append_frame(in, H2FrameType::Settings, 0, 0, "");
+    in += post_headers_frame(1, /*end_stream=*/false, "slow");
+    for (int i = 0; i < 1300; ++i) {
+        in += data_frame(1, "abcd");
+    }
+    in += post_headers_frame(3, /*end_stream=*/true, "fast");
+    transport->push(std::move(in));
+
+    std::atomic<bool> fast_ran{false};
+    auto dispatcher = [&](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res,
+                          SslHandle) -> asio::awaitable<void> {
+        if (req->header("x-tag").value_or(std::string_view{}) == "slow") {
+            co_await park_briefly(); // deliberately never reads the body
+            co_return;
+        }
+        fast_ran.store(true);
+        co_await res->status(status::ok).send("fast");
+    };
+    auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, EngineLimits{});
+    REQUIRE(run_on(ctx, engine->run(dispatcher)));
+
+    CHECK(fast_ran.load());
+    CHECK(transport->written().find("fast") != std::string::npos);
+}
+
+TEST_CASE("h2/engine: END_STREAM during a body pause is not lost", "[h2]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+
+    constexpr std::size_t kChunks = 1300;
+    constexpr std::size_t kLast = 4;
+    // Keep the peer open: the engine must not treat "no more bytes queued" as a
+    // closed connection while the handler is still draining a paused body.
+    transport->hold_open();
+    std::string in{codec::kH2ClientPreface};
+    append_frame(in, H2FrameType::Settings, 0, 0, "");
+    in += post_headers_frame(1, /*end_stream=*/false, "slow");
+    for (std::size_t i = 0; i < kChunks; ++i) {
+        in += data_frame(1, "abcd");
+    }
+    // Arrives while the body channel is full: the engine must remember the
+    // terminator and deliver it only after the handler drains the queue.
+    in += data_frame_flagged(1, "tail", H2_FLAG_END_STREAM);
+    transport->push(std::move(in));
+
+    std::atomic<std::size_t> received{0};
+    std::atomic<bool> read_ok{false};
+    auto dispatcher = [&](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res,
+                          SslHandle) -> asio::awaitable<void> {
+        co_await park_briefly(); // let the channel fill and the END_STREAM park
+        auto body = co_await req->body().read_all();
+        if (body) {
+            received.store(body->size());
+            read_ok.store(true);
+            co_await res->status(status::ok).send(std::to_string(body->size()));
+        }
+        transport->release(); // let the read loop observe EOF and finish
+    };
+    auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, EngineLimits{});
+    REQUIRE(run_on(ctx, engine->run(dispatcher)));
+
+    CHECK(read_ok.load());
+    CHECK(received.load() == kChunks * 4 + kLast);
 }

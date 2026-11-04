@@ -346,6 +346,13 @@ func routingCases() []caseSpec {
 		{ID: "routing.host_lookalike", Method: "GET", Path: "/who", Host: "evil-example.com"},
 		{ID: "routing.fallback", Method: "GET", Path: "/definitely-not-a-route.json"},
 		{ID: "routing.query_duplicate", Method: "GET", Path: "/list?q=a&q=b&page=2"},
+		// The router must see the same method/path/authority over h2 and h3 as
+		// it does over HTTP/1.1.
+		{ID: "routing.template_h2", Method: "GET", Path: "/users/42", Protocol: "h2c"},
+		{ID: "routing.method_not_allowed_h2", Method: "DELETE", Path: "/method", Protocol: "h2c"},
+		{ID: "routing.options_h2", Method: "OPTIONS", Path: "/method", Protocol: "h2c"},
+		{ID: "routing.host_api_h2", Method: "GET", Path: "/who", Host: "api.example.com", Protocol: "h2c"},
+		{ID: "routing.fallback_h3", Method: "GET", Path: "/definitely-not-a-route.json", Protocol: "h3"},
 	}
 }
 
@@ -391,6 +398,11 @@ func bodyCases() []caseSpec {
 		// flow control, so the same behaviors run again over h2c.
 		{ID: "body.request_trailers_h2", Method: "POST", Path: "/trailer-echo",
 			Body: []byte("body"), Chunked: true, Protocol: "h2c",
+			Trailers: map[string]string{"X-Check": "yes"}},
+		// Pins the documented h3 server limitation: the C++ engine drops request
+		// trailers instead of exposing them to the handler.
+		{ID: "body.request_trailers_h3", Method: "POST", Path: "/trailer-echo",
+			Body: []byte("body"), Chunked: true, Protocol: "h3",
 			Trailers: map[string]string{"X-Check": "yes"}},
 		{ID: "body.response_trailers_h2", Method: "GET", Path: "/trailers", Protocol: "h2c"},
 		{ID: "body.expect_ok_h2", Method: "POST", Path: "/expect-ok", Protocol: "h2c",
@@ -454,6 +466,17 @@ func middlewareCases() []caseSpec {
 			Headers: map[string]string{"X-Request-Id": "fixed-id"}},
 		{ID: "middleware.gzip", Method: "GET", Path: "/gzip",
 			Headers: map[string]string{"Accept-Encoding": "gzip"}, Decompress: true},
+		{ID: "middleware.cors_allowed_h2", Method: "GET", Path: "/cors", Protocol: "h2c",
+			Headers: map[string]string{"Origin": "https://app.example.com"}},
+		{ID: "middleware.cors_preflight_h2", Method: "OPTIONS", Path: "/cors", Protocol: "h2c",
+			Headers: map[string]string{
+				"Origin":                         "https://app.example.com",
+				"Access-Control-Request-Method":  "POST",
+				"Access-Control-Request-Headers": "x-test",
+			}},
+		{ID: "middleware.basic_ok_h2", Method: "GET", Path: "/basic", Protocol: "h2c",
+			Headers: map[string]string{"Authorization": "Basic dXNlcjpwYXNz"}},
+		{ID: "middleware.basic_missing_h3", Method: "GET", Path: "/basic", Protocol: "h3"},
 	}
 }
 
@@ -480,6 +503,15 @@ func frameworkCases() []caseSpec {
 		{ID: "framework.host_api", Method: "GET", Path: "/who", Host: "api.example.com"},
 		// The CSRF middleware's exempt_paths route: no token is required.
 		{ID: "framework.csrf_exempt", Method: "POST", Path: "/csrf/exempt"},
+		{ID: "framework.path_h2", Method: "GET", Path: "/users/7", Protocol: "h2c"},
+		{ID: "framework.json_h2", Method: "POST", Path: "/json", Protocol: "h2c",
+			Headers: map[string]string{"Content-Type": "application/json"},
+			Body:    []byte(`{"name":"book","age":3}`)},
+		{ID: "framework.valid_fail_h2", Method: "POST", Path: "/valid", Protocol: "h2c",
+			Headers: map[string]string{"Content-Type": "application/json"},
+			Body:    []byte(`{"name":"","age":0}`)},
+		{ID: "framework.header_ok_h3", Method: "GET", Path: "/header", Protocol: "h3",
+			Headers: map[string]string{"X-Page": "3", "Cookie": "sid=abc"}},
 		// Mutual TLS: the verified client CN on the mTLS listener, and the
 		// handshake failure when no certificate is presented.
 		{ID: "framework.client_cert", Method: "GET", Path: "/client-cert", Protocol: "mtls"},
@@ -499,6 +531,11 @@ func staticCases() []caseSpec {
 			Headers: map[string]string{"Accept-Encoding": "gzip"}, Decompress: true},
 		{ID: "static.precompressed_br", Method: "GET", Path: "/data.txt",
 			Headers: map[string]string{"Accept-Encoding": "br"}},
+		{ID: "static.file_h2", Method: "GET", Path: "/data.txt", Protocol: "h2c"},
+		{ID: "static.range_h2", Method: "GET", Path: "/data.txt", Protocol: "h2c",
+			Headers: map[string]string{"Range": "bytes=0-4"}},
+		{ID: "static.missing_asset_h2", Method: "GET", Path: "/missing-asset.js", Protocol: "h2c"},
+		{ID: "static.file_h3", Method: "GET", Path: "/data.txt", Protocol: "h3"},
 	}
 }
 

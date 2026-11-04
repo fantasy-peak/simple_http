@@ -659,7 +659,7 @@ test/run.sh unit '[h2]' # Catch2 过滤
 
 | suite | tier | 内容 |
 |---|---|---|
-| `unit` | fast | 原 Catch2 纯逻辑测试（约 417 用例） |
+| `unit` | fast | 原 Catch2 纯逻辑测试（约 420 用例） |
 | `openapi` | standard | OAS 3.1 元模式 + 文档/路由契约 + Swagger UI |
 | `client-diff` | full | C++ 客户端 ↔ Go 客户端，同一个 Go 服务端 |
 | `server-diff` | full | Go 客户端 → C++ 服务端 ↔ Go 服务端 |

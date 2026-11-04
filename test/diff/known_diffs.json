@@ -36,6 +36,13 @@
       ],
       "verdict": "acceptable",
       "reason": "Go net/http accepts obsolete line folding in a header value; simple_http rejects it with 400. RFC 9112 §5.2 obsoletes obs-fold and permits rejecting it; rejecting avoids front-end/back-end smuggling splits."
+    },
+    "body.request_trailers_h3": {
+      "fields": [
+        "body"
+      ],
+      "verdict": "acceptable",
+      "reason": "C++ HTTP/3 request trailers are not exposed to handlers (documented limitation: only h1/h2 expose Request::trailers()); Go's quic-go server forwards them to r.Trailer, so /trailer-echo answers yes there and missing here. The case pins the limitation rather than hiding it."
     }
   }
 }

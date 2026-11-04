@@ -165,6 +165,13 @@ class MockTransport {
     // Queues bytes for the next reads.
     void push(std::string bytes) { m_in.push_back(std::move(bytes)); }
 
+    // Keep the peer "open" after the queued bytes run out: reads wait instead
+    // of reporting EOF. Lets a test hold a connection alive while a handler
+    // drains a paused body; release() ends the wait and the next read reports
+    // EOF.
+    void hold_open() { m_hold_open = true; }
+    void release() { m_hold_open = false; }
+
     // Bytes still queued for reading (not yet handed out by async_read_some).
     // Lets a test observe that a bounded consumer stopped pulling from the
     // transport instead of buffering everything.
@@ -184,6 +191,10 @@ class MockTransport {
     bool closed() const { return m_closed; }
 
     asio::awaitable<IoResult> async_read_some(ByteSpan buffer) {
+        while (m_in.empty() && m_hold_open) {
+            asio::steady_timer timer{m_executor, std::chrono::milliseconds(1)};
+            co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+        }
         if (m_in.empty())
             co_return IoResult{make_error_code(asio::error::eof), 0};
         std::string &front = m_in.front();
@@ -236,6 +247,7 @@ class MockTransport {
     std::vector<std::string> m_in;
     std::vector<std::string> m_writes;
     std::string m_written;
+    bool m_hold_open{false};
     bool m_closed{false};
 };
 
