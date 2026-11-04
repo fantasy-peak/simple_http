@@ -1,0 +1,22 @@
+# 构建上下文只用到 Dockerfile、xmake.lua / xmake-requires.lock、include/ 和
+# test/。宿主的构建产物、虚拟环境、缓存与无关目录全部排除，保证镜像里是
+# 一份干净的源码，不会带上宿主的 build/、.xmake、test/.venv 等。
+.git
+.gitignore
+.xmake
+build/
+build-*/
+build-dbg/
+.cache/
+**/.cache/
+env/
+**/.venv/
+test/.venv/
+v2ray-cpp/
+bin/
+compile_commands.json
+__pycache__/
+**/__pycache__/
+*.o
+*.a
+*.so
