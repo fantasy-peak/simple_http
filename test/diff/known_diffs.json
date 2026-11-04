@@ -13,6 +13,13 @@
       ],
       "verdict": "acceptable",
       "reason": "Go's http.Client decides whether to forward Authorization/Cookie on a redirect by hostname only, ignoring the port; simple_http compares the full origin (scheme+host+port) per RFC 9110 §4.3.1 and strips them across a port change. The library is stricter and matches the origin boundary."
+    },
+    "h3.status_204": {
+      "fields": [
+        "framing"
+      ],
+      "verdict": "acceptable",
+      "reason": "quic-go's HTTP/3 reference server emits Content-Length: 0 on a 204 (it fills Content-Length after the handler returns without excluding bodyless statuses). RFC 9110 §8.6 forbids Content-Length on a 204, and nghttp3 deliberately removes that field from the response header list (it tolerates the invalid value 0 on the wire but does not surface it), so simple_http reports framing=none while Go reports content-length. The C++ behavior is the RFC-aligned one."
     }
   },
   "server": {
