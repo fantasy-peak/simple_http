@@ -65,7 +65,7 @@ template <typename ServerT> void register_routes(ServerT &server) {
     server.route(any_methods, "/",
                  [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
                      auto body = co_await req->body().read_all();
-                     co_await res->status(200).send(body ? std::move(*body) : std::string{});
+                     co_await res->status(status::ok).send(body ? std::move(*body) : std::string{});
                  });
 
     // h2spec targets /world; the stress suite chooses 2k/10k/20k bodies with
@@ -74,10 +74,10 @@ template <typename ServerT> void register_routes(ServerT &server) {
                  [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
                      auto body = co_await req->body().read_all();
                      if (!body) {
-                         co_await res->status(400).send("read error");
+                         co_await res->status(status::bad_request).send("read error");
                          co_return;
                      }
-                     co_await res->status(200).send(std::string(query_uint(req->query(), "n", 1024), 'a'));
+                     co_await res->status(status::ok).send(std::string(query_uint(req->query(), "n", 1024), 'a'));
                  });
 
     // Autobahn requires an exact echo: same text/binary type, no extra frames.

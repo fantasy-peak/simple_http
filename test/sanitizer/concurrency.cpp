@@ -60,7 +60,7 @@ asio::awaitable<void> run_client(unsigned short port, int id, int iterations) {
             check(response.has_value(), "GET /plain transport");
             if (response) {
                 auto body = co_await response->text();
-                check(response->status() == 200, "GET /plain status");
+                check(response->status() == status::ok, "GET /plain status");
                 check(body && *body == "ok", "GET /plain body");
             }
         }
@@ -78,7 +78,7 @@ asio::awaitable<void> run_client(unsigned short port, int id, int iterations) {
             check(response.has_value(), "GET /compress transport");
             if (response) {
                 auto body = co_await response->text();
-                check(response->status() == 200, "GET /compress status");
+                check(response->status() == status::ok, "GET /compress status");
                 check(body && body->size() == 4096, "GET /compress body size");
             }
         }
@@ -95,7 +95,7 @@ asio::awaitable<void> run_client(unsigned short port, int id, int iterations) {
             check(response.has_value(), "GET /cross transport");
             if (response) {
                 auto body = co_await response->text();
-                check(response->status() == 200, "GET /cross status");
+                check(response->status() == status::ok, "GET /cross status");
                 check(body && *body == "cross done\n", "GET /cross body");
             }
         }
@@ -146,24 +146,26 @@ int main(int argc, char **argv) {
 
     auto limiter = std::make_shared<middleware::RateLimiter>(/*rate=*/1000.0, /*burst=*/10000,
                                                              /*max_keys=*/64);
-    server.route(any_methods, "/plain",
-                 [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(200).send("ok"); });
+    server.route(any_methods, "/plain", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(status::ok).send("ok");
+    });
     server.route(any_methods, "/echo", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
         auto body = co_await req->body().read_all();
-        co_await res->status(200).send(body ? std::move(*body) : std::string{});
+        co_await res->status(status::ok).send(body ? std::move(*body) : std::string{});
     });
     server.route(any_methods, "/compress", {middleware::compress(CompressionConfig{.min_bytes = 1})},
                  [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-                     co_await res->status(200).content_type("text/plain").send(std::string(4096, 'c'));
+                     co_await res->status(status::ok).content_type("text/plain").send(std::string(4096, 'c'));
                  });
-    server.route(any_methods, "/rate", {middleware::rate_limit(limiter)},
-                 [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(200).send("ok"); });
+    server.route(
+        any_methods, "/rate", {middleware::rate_limit(limiter)},
+        [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(status::ok).send("ok"); });
 
     // The handler starts on the connection executor but the writes happen on a
     // different one. ResponseWriter hops internally; this is the path that
     // catches a missing hop or a lifetime mistake under TSan/ASan.
     server.route(any_methods, "/cross", [&cross_io](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-        if (auto ec = co_await res->status(200).content_type("text/plain").begin()) {
+        if (auto ec = co_await res->status(status::ok).content_type("text/plain").begin()) {
             co_return;
         }
         asio::co_spawn(

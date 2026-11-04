@@ -116,7 +116,7 @@ run_ws_proxy(std::shared_ptr<Transport> client, const ParsedHead &head, std::str
         const error_code ec = connected.error();
         SIMPLE_HTTP_ERROR_LOG("ws-proxy connect {}:{} failed (client {}): {}", target.host, target.port,
                               address_string(client->peer().address()), ec.message());
-        co_await ws_proxy_fail(client, 502);
+        co_await ws_proxy_fail(client, status::bad_gateway);
         co_return false;
     }
     auto backend = std::move(*connected);
@@ -171,7 +171,7 @@ run_ws_proxy(std::shared_ptr<Transport> client, const ParsedHead &head, std::str
             SIMPLE_HTTP_ERROR_LOG("ws-proxy write preamble failed (client {}): {}",
                                   address_string(client->peer().address()), ec.message());
             close_backend();
-            co_await ws_proxy_fail(client, 502);
+            co_await ws_proxy_fail(client, status::bad_gateway);
             co_return false;
         }
     }
@@ -181,11 +181,11 @@ run_ws_proxy(std::shared_ptr<Transport> client, const ParsedHead &head, std::str
         SIMPLE_HTTP_ERROR_LOG("ws-proxy backend handshake failed (client {}): {}",
                               address_string(client->peer().address()), reply.error().message());
         close_backend();
-        co_await ws_proxy_fail(client, 502);
+        co_await ws_proxy_fail(client, status::bad_gateway);
         co_return false;
     }
 
-    if (reply->head.status != 101) {
+    if (reply->head.status != status::switching_protocols) {
         // The backend refused the upgrade. Relay its actual response (head plus
         // whatever body bytes already arrived) instead of inventing a 502; the
         // h1 client sees the same 401/403/302 a direct connection would have
@@ -207,7 +207,7 @@ run_ws_proxy(std::shared_ptr<Transport> client, const ParsedHead &head, std::str
         SIMPLE_HTTP_ERROR_LOG("ws-proxy backend answered 101 with a mismatched Upgrade/accept (client {})",
                               address_string(client->peer().address()));
         close_backend();
-        co_await ws_proxy_fail(client, 502);
+        co_await ws_proxy_fail(client, status::bad_gateway);
         co_return false;
     }
 
@@ -223,7 +223,7 @@ run_ws_proxy(std::shared_ptr<Transport> client, const ParsedHead &head, std::str
             SIMPLE_HTTP_ERROR_LOG("ws-proxy write initial tunnel bytes failed (client {}): {}",
                                   address_string(client->peer().address()), iec.message());
             close_backend();
-            co_await ws_proxy_fail(client, 502);
+            co_await ws_proxy_fail(client, status::bad_gateway);
             co_return false;
         }
     }

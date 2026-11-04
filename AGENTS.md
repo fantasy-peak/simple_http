@@ -406,8 +406,8 @@ for (;;) {
 响应：
 
 ```cpp
-co_await res->status(200).content_type("text/plain").send("hello"); // 一次性
-co_await res->status(200).begin();                                 // 流式
+co_await res->status(status::ok).content_type("text/plain").send("hello"); // 一次性
+co_await res->status(status::ok).begin();                                 // 流式
 co_await res->write("chunk");
 co_await res->finish();
 ```
@@ -502,7 +502,7 @@ server.route({Method::Get}, "/pets/{id}", handler,
         .response<Pet>()
         .summary("get a pet")
         .operation_id("getPet")
-        .error<ErrorBody>(404, "no such pet"));
+        .error<ErrorBody>(status::not_found, "no such pet"));
 
 server.openapi().title("petshop").version("1.0.0");
 server.serve_openapi("/openapi.json");

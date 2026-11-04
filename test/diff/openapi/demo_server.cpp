@@ -154,7 +154,7 @@ void request_stop(int) { g_stop = 1; }
 // A bearer challenge the demo write endpoints answer when the header is wrong,
 // so the security declaration in the document matches what the server does.
 asio::awaitable<void> unauthorized(ResponsePtr res) {
-    co_await res->status(401)
+    co_await res->status(status::unauthorized)
         .header("www-authenticate", "Bearer realm=\"petshop\"")
         .content_type(mime::app_json)
         .send(to_json(ErrorBody{.error = "missing or invalid bearer token"}));
@@ -180,7 +180,7 @@ int main() {
         [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
             PetList list;
             list.items.emplace_back(Pet{.id = 10, .name = "rex", .status = "available"});
-            co_await res->status(200).content_type(mime::app_json).send(to_json(list));
+            co_await res->status(status::ok).content_type(mime::app_json).send(to_json(list));
         },
         openapi::doc()
             .response<PetList>()
@@ -197,14 +197,16 @@ int main() {
         [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
             const auto p = openapi::path_params<PetParams>(*req);
             if (!p || p->id <= 0) {
-                co_await res->status(404).content_type(mime::app_json).send(to_json(ErrorBody{.error = "no such pet"}));
+                co_await res->status(status::not_found)
+                    .content_type(mime::app_json)
+                    .send(to_json(ErrorBody{.error = "no such pet"}));
                 co_return;
             }
             // The declared request header, read for real: a
             // correlation id that is also echoed back as a
             // response header, so the round trip is visible.
             const auto trace = req->header("x-trace-id");
-            res->status(200).content_type(mime::app_json);
+            res->status(status::ok).content_type(mime::app_json);
             if (trace) {
                 res->header("x-trace-id", std::string{*trace});
             }
@@ -220,7 +222,7 @@ int main() {
             .tag("pet")
             .operation_id("getPet")
             .header<std::string>("x-trace-id", {.description = "correlation id, echoed back"})
-            .error<ErrorBody>(404, "no such pet"));
+            .error<ErrorBody>(status::not_found, "no such pet"));
 
     // --- GET /owners/{owner_id}/pets/{pet_id} — two captures in one path ------
     // A path may carry any number of `{name}` segments interleaved with
@@ -232,10 +234,12 @@ int main() {
         [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
             const auto p = openapi::path_params<OwnerPetParams>(*req);
             if (!p || p->owner.empty() || p->pet_id == 0) {
-                co_await res->status(404).content_type(mime::app_json).send(to_json(ErrorBody{.error = "no such pet"}));
+                co_await res->status(status::not_found)
+                    .content_type(mime::app_json)
+                    .send(to_json(ErrorBody{.error = "no such pet"}));
                 co_return;
             }
-            co_await res->status(200)
+            co_await res->status(status::ok)
                 .content_type(mime::app_json)
                 .send(to_json(Pet{.id = static_cast<std::int64_t>(p->pet_id), .name = "rex", .status = "available"}));
         },
@@ -245,7 +249,7 @@ int main() {
             .summary("get a pet of an owner")
             .tag("pet")
             .operation_id("getOwnedPet")
-            .error<ErrorBody>(404, "no such pet"));
+            .error<ErrorBody>(status::not_found, "no such pet"));
 
     // --- GET /orders/{order_id}/items/{item_id} — the axum example, verbatim ---
     // The exact shape from the reference: a Params struct the route template is
@@ -257,12 +261,12 @@ int main() {
         [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
             const auto p = openapi::path_params<OrderItemParams>(*req);
             if (!p) {
-                co_await res->status(404)
+                co_await res->status(status::not_found)
                     .content_type(mime::app_json)
                     .send(to_json(ErrorBody{.error = "no such item"}));
                 co_return;
             }
-            co_await res->status(200)
+            co_await res->status(status::ok)
                 .content_type(mime::app_json)
                 .send(to_json(Order{.id = static_cast<std::int64_t>(p->item_id),
                                     .pet_id = static_cast<std::int64_t>(p->order_id),
@@ -276,7 +280,7 @@ int main() {
             .tag("order")
             .description("two captures in one path, like axum's Path<OrderItemParams>")
             .operation_id("getOrderItem")
-            .error<ErrorBody>(404, "no such item"));
+            .error<ErrorBody>(status::not_found, "no such item"));
 
     // --- POST /pets — request body + 201 + two error responses + security ----
     server.route(
@@ -291,31 +295,31 @@ int main() {
                 co_return;
             }
             if (in->name == "taken") {
-                co_await res->status(409)
+                co_await res->status(status::conflict)
                     .content_type(mime::app_json)
                     .send(to_json(ErrorBody{.error = "name already taken"}));
                 co_return;
             }
             // The declared response header, set for
             // real: doc and wire agree on X-Request-Id.
-            (void)co_await res->status(201)
+            (void)co_await res->status(status::created)
                 .header("x-request-id", "req-42")
                 .content_type(mime::app_json)
                 .send(to_json(Pet{.id = 100, .name = in->name, .status = in->status.value_or("available")}));
         },
         openapi::doc()
             .request_body<CreatePetReq>()
-            .response<Pet>(201)
+            .response<Pet>(status::created)
             .summary("create a pet")
             .tag("pet")
             .description("Add a pet to the store.")
             .operation_id("createPet")
             .security({"bearer"})
             .response_header<std::string>("X-Request-Id", "the request id")
-            .error<ErrorBody>(400, "invalid request body")
-            .error<ErrorBody>(401, "missing or invalid bearer token")
-            .error<ErrorBody>(409, "name already taken")
-            .error<ErrorBody>(422, "request body violates the declared required fields"));
+            .error<ErrorBody>(status::bad_request, "invalid request body")
+            .error<ErrorBody>(status::unauthorized, "missing or invalid bearer token")
+            .error<ErrorBody>(status::conflict, "name already taken")
+            .error<ErrorBody>(status::unprocessable_content, "request body violates the declared required fields"));
 
     // --- GET /orders/{id} — a second resource ---------------------------------
     server.route(
@@ -323,12 +327,12 @@ int main() {
         [](const RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
             const auto id = parse_id(req, "id", 0);
             if (id <= 0) {
-                co_await res->status(404)
+                co_await res->status(status::not_found)
                     .content_type(mime::app_json)
                     .send(to_json(ErrorBody{.error = "no such order"}));
                 co_return;
             }
-            co_await res->status(200)
+            co_await res->status(status::ok)
                 .content_type(mime::app_json)
                 .send(to_json(Order{.id = id, .pet_id = 10, .quantity = 2}));
         },
@@ -337,7 +341,7 @@ int main() {
             .summary("get an order")
             .tag("order")
             .operation_id("getOrder")
-            .error<ErrorBody>(404, "no such order"));
+            .error<ErrorBody>(status::not_found, "no such order"));
 
     // --- POST /orders — writes require the bearer token too -------------------
     server.route(
@@ -351,20 +355,20 @@ int main() {
             if (!in) {
                 co_return;
             }
-            co_await res->status(201)
+            co_await res->status(status::created)
                 .content_type(mime::app_json)
                 .send(to_json(Order{.id = 7, .pet_id = in->pet_id, .quantity = in->quantity.value_or(1)}));
         },
         openapi::doc()
             .request_body<CreateOrderReq>()
-            .response<Order>(201)
+            .response<Order>(status::created)
             .summary("place an order")
             .tag("order")
             .operation_id("placeOrder")
             .security({"bearer"})
-            .error<ErrorBody>(400, "invalid request body")
-            .error<ErrorBody>(401, "missing or invalid bearer token")
-            .error<ErrorBody>(422, "request body violates the declared required fields"));
+            .error<ErrorBody>(status::bad_request, "invalid request body")
+            .error<ErrorBody>(status::unauthorized, "missing or invalid bearer token")
+            .error<ErrorBody>(status::unprocessable_content, "request body violates the declared required fields"));
 
     // --- mixed scalar path-parameter types -------------------------------------
     // string + double + double + unsigned integer in one Params struct: each
@@ -376,12 +380,12 @@ int main() {
         [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
             const auto p = openapi::path_params<GeoParams>(*req);
             if (!p) {
-                co_await res->status(404)
+                co_await res->status(status::not_found)
                     .content_type(mime::app_json)
                     .send(to_json(ErrorBody{.error = "malformed geo coordinate"}));
                 co_return;
             }
-            co_await res->status(200)
+            co_await res->status(status::ok)
                 .content_type(mime::app_json)
                 .send(to_json(GeoReply{.city = p->city, .lat = p->lat, .lng = p->lng, .precision = p->precision}));
         },
@@ -391,7 +395,7 @@ int main() {
             .summary("resolve a geo point")
             .tag("geo")
             .operation_id("resolveGeo")
-            .error<ErrorBody>(404, "malformed coordinate or precision"));
+            .error<ErrorBody>(status::not_found, "malformed coordinate or precision"));
 
     // --- a boolean path parameter
     // ------------------------------------------------- The bool parses exactly
@@ -403,12 +407,12 @@ int main() {
         [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
             const auto p = openapi::path_params<LabParams>(*req);
             if (!p) {
-                co_await res->status(404)
+                co_await res->status(status::not_found)
                     .content_type(mime::app_json)
                     .send(to_json(ErrorBody{.error = "malformed lab run"}));
                 co_return;
             }
-            co_await res->status(200)
+            co_await res->status(status::ok)
                 .content_type(mime::app_json)
                 .send(to_json(LabReply{.experiment = p->experiment, .run = p->run, .fast = p->fast}));
         },
@@ -418,7 +422,7 @@ int main() {
             .summary("inspect a lab run")
             .tag("lab")
             .operation_id("getLabRun")
-            .error<ErrorBody>(404, "malformed run or flag"));
+            .error<ErrorBody>(status::not_found, "malformed run or flag"));
 
     // --- a literal that would otherwise match a template (specificity)
     // ----------- /pets/search is a literal exact route and `search` would also
@@ -429,7 +433,7 @@ int main() {
         [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
             PetList found;
             found.items.emplace_back(Pet{.id = 1, .name = "search-hit", .status = "available"});
-            co_await res->status(200).content_type(mime::app_json).send(to_json(found));
+            co_await res->status(status::ok).content_type(mime::app_json).send(to_json(found));
         },
         openapi::doc()
             .response<PetList>()
@@ -454,13 +458,13 @@ int main() {
             }
             const auto p = openapi::path_params<OwnerParams>(*req);
             if (!p || p->owner_id == 0) {
-                co_await res->status(404)
+                co_await res->status(status::not_found)
                     .content_type(mime::app_json)
                     .send(to_json(ErrorBody{.error = "no such owner"}));
                 co_return;
             }
             if (req->header("x-rate-limited")) {
-                co_await res->status(429)
+                co_await res->status(status::too_many_requests)
                     .header("retry-after", "0")
                     .content_type(mime::app_json)
                     .send(to_json(ErrorBody{.error = "rate limited"}));
@@ -470,7 +474,7 @@ int main() {
             if (!in) {
                 co_return;
             }
-            co_await res->status(201)
+            co_await res->status(status::created)
                 .content_type(mime::app_json)
                 .send(to_json(Pet{.id = static_cast<std::int64_t>(p->owner_id),
                                   .name = in->name,
@@ -479,16 +483,16 @@ int main() {
         openapi::doc()
             .path_params<OwnerParams>()
             .request_body<CreatePetReq>()
-            .response<Pet>(201)
+            .response<Pet>(status::created)
             .summary("add a pet to an owner")
             .tag("pet")
             .description("path param + body + security together.")
             .operation_id("createOwnedPet")
             .security({"bearer"})
-            .error<ErrorBody>(400, "invalid request body")
-            .error<ErrorBody>(401, "missing or invalid bearer token")
-            .error<ErrorBody>(404, "no such owner")
-            .error<ErrorBody>(422, "request body violates the declared required fields")
+            .error<ErrorBody>(status::bad_request, "invalid request body")
+            .error<ErrorBody>(status::unauthorized, "missing or invalid bearer token")
+            .error<ErrorBody>(status::not_found, "no such owner")
+            .error<ErrorBody>(status::unprocessable_content, "request body violates the declared required fields")
             .response(std::move(rate_limited)));
 
     // --- a *plain* route with template captures ---------------------------------
@@ -497,7 +501,7 @@ int main() {
     server.route({Method::Get}, "/echo/{what}/times/{n}", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
         const auto what = req->param("what").value_or("");
         const auto n = req->param("n").value_or("");
-        co_await res->status(200)
+        co_await res->status(status::ok)
             .content_type(mime::text_plain)
             .send(std::string{"what="} + std::string{what} + " n=" + std::string{n});
     });
@@ -505,8 +509,9 @@ int main() {
     // Serve the collected document and a CDN-backed Swagger UI pointing at it.
     server.serve_openapi("/openapi.json");
     server.serve_swagger_ui("/swagger", "/openapi.json");
-    server.fallback(
-        [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(404).send("not found"); });
+    server.fallback([](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(status::not_found).send("not found");
+    });
 
     if (!server.start()) {
         std::println("bind 127.0.0.1:7795 failed");

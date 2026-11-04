@@ -10,7 +10,7 @@
 //   server.route({Method::Post}, "/pets", [](RequestPtr req, ResponsePtr res)
 //                                        -> asio::awaitable<void> {
 //       auto pet = co_await simple_http::read_json_body<Pet>(*req); // 400 on failure
-//       if (!pet) { co_await res->status(400).send("{}"); co_return; }
+//       if (!pet) { co_await res->status(status::bad_request).send("{}"); co_return; }
 //       co_await simple_http::write_json(res, *pet, 201);
 //   });
 //

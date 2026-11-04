@@ -243,7 +243,7 @@ template <typename T> std::string schema_json() {
 // can put in its error body. The response shape (which JSON / which headers)
 // stays the handler's call.
 struct BodyError {
-    int status{400};
+    int status{simple_http::status::bad_request};
     std::string message;
 };
 
@@ -351,8 +351,8 @@ template <typename T> ResponseHeader response_header(std::string description = {
 // schema captured now), `status` and `description` are what the document says.
 // Pass as many as the handler may produce, via Operation::error<T>(...) (or
 // hand a customised one to Operation::response(Response)):
-//     openapi::doc().error<BadRequest>(400, "invalid body")
-//                   .error<Conflict>(409, "name taken"));
+//     openapi::doc().error<BadRequest>(status::bad_request, "invalid body")
+//                   .error<Conflict>(status::conflict, "name taken"));
 template <typename T>
 Response resp(int status, std::string description = {}, std::string content_type = "application/json") {
     return Response{status, std::move(description), std::move(content_type), schema_json<T>()};
@@ -414,8 +414,8 @@ inline SecurityScheme api_key(std::string name, std::string in = "header") {
 //     server.route({Method::Post}, "/pets", handler,
 //         openapi::doc()
 //             .request_body<CreatePetReq>()
-//             .response<Pet>(201)
-//             .error<ErrorBody>(400, "invalid body")
+//             .response<Pet>(status::created)
+//             .error<ErrorBody>(status::bad_request, "invalid body")
 //             .summary("create a pet")
 //             .security({"bearer"}));
 //

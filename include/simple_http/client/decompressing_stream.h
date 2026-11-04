@@ -172,7 +172,7 @@ class DecompressingClientStream final : public ClientStream {
                 // unknown coding) passes through untouched.
             }
         }
-        const bool interim = head->status == 100;
+        const bool interim = head->status == status::continue_;
         set_head(std::move(*head));
         if (interim) {
             // A 100-continue is handed to the caller once, then the final head

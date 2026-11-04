@@ -250,13 +250,13 @@ TEST_CASE("proto/response: set_cookie formats a Set-Cookie header", "[forms]") {
     asio::io_context ctx;
     auto writer = std::make_shared<FakeResponseSink>();
     auto res = std::make_shared<ResponseWriter>(writer);
-    REQUIRE(run_on(ctx, res->status(200).send("")));
+    REQUIRE(run_on(ctx, res->status(status::ok).send("")));
     // (set_cookie is a builder; exercise it directly below.)
     auto writer2 = std::make_shared<FakeResponseSink>();
     auto res2 = std::make_shared<ResponseWriter>(writer2);
     res2->set_cookie("sid", "abc", std::chrono::seconds{3600}, "/", "", true, true, "Lax");
     res2->set_cookie("tricky", "a;b");
-    REQUIRE(run_on(ctx, res2->status(200).send("")));
+    REQUIRE(run_on(ctx, res2->status(status::ok).send("")));
     CHECK(writer2->header(field::set_cookie) == "sid=abc; Path=/; Max-Age=3600; Secure; HttpOnly; SameSite=Lax");
     // The second Set-Cookie is a separate field; Headers::get returns the first.
     CHECK(writer2->last_headers.count(field::set_cookie) == 2);
@@ -273,8 +273,9 @@ TEST_CASE("proto/response: set_cookie formats a Set-Cookie header", "[forms]") {
 TEST_CASE("middleware: redirect_slashes 301s the slash form to the canonical path", "[forms]") {
     Router router;
     router.use(middleware::redirect_slashes());
-    router.route({Method::Get}, "/pets",
-                 [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(200).send("pets"); });
+    router.route({Method::Get}, "/pets", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(status::ok).send("pets");
+    });
 
     asio::io_context ctx;
     {
@@ -286,9 +287,9 @@ TEST_CASE("middleware: redirect_slashes 301s the slash form to the canonical pat
     {
         // The canonical form reaches the route; the root "/" is untouched.
         auto writer = dispatch(ctx, router, make_request(ctx, "/pets"));
-        CHECK(writer->last_status == 200);
+        CHECK(writer->last_status == status::ok);
         auto writer_root = dispatch(ctx, router, make_request(ctx, "/"));
-        CHECK(writer_root->last_status == 404); // no route at "/" — not redirected
+        CHECK(writer_root->last_status == status::not_found); // no route at "/" — not redirected
     }
 }
 
@@ -372,7 +373,7 @@ TEST_CASE("middleware: real_ip resolves from X-Forwarded-For", "[forms]") {
     router.route(any_methods, "/ip", [&](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
         const auto *ip = req->get_state<middleware::ClientIp>();
         seen = ip ? ip->value : "";
-        co_await res->status(200).send("ok");
+        co_await res->status(status::ok).send("ok");
     });
 
     asio::io_context ctx;
@@ -395,7 +396,7 @@ TEST_CASE("middleware: real_ip skips trusted proxies right-to-left", "[forms]") 
     router.route(any_methods, "/ip", [&](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
         const auto *ip = req->get_state<middleware::ClientIp>();
         seen = ip ? ip->value : "";
-        co_await res->status(200).send("ok");
+        co_await res->status(status::ok).send("ok");
     });
 
     asio::io_context ctx;
@@ -417,7 +418,7 @@ TEST_CASE("middleware: clean_path normalizes and rejects traversal", "[forms]") 
     router.use(middleware::clean_path());
     router.route({Method::Get}, "/a/b", [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
         seen.push_back("ab");
-        co_await res->status(200).send("ok");
+        co_await res->status(status::ok).send("ok");
     });
 
     asio::io_context ctx;
@@ -425,7 +426,7 @@ TEST_CASE("middleware: clean_path normalizes and rejects traversal", "[forms]") 
         // Double slashes and dot segments collapse; the clean target reaches the route.
         auto req = make_request(ctx, "/a//./b");
         auto writer = dispatch(ctx, router, req);
-        CHECK(writer->last_status == 200);
+        CHECK(writer->last_status == status::ok);
         CHECK(seen.back() == "ab");
         CHECK(req->path() == "/a/b"); // the request itself was rewritten
     }
@@ -439,7 +440,7 @@ TEST_CASE("middleware: clean_path normalizes and rejects traversal", "[forms]") 
         // A canonical path passes through untouched.
         auto req = make_request(ctx, "/a/b?q=1");
         auto writer = dispatch(ctx, router, req);
-        CHECK(writer->last_status == 200);
+        CHECK(writer->last_status == status::ok);
         CHECK(req->query() == "q=1"); // the query survives
     }
 }
@@ -450,14 +451,14 @@ TEST_CASE("middleware: strip_prefix re-mounts a sub-application at its root", "[
     router.use(middleware::strip_prefix("/api"));
     router.route({Method::Get}, "/users", [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
         seen.push_back("users");
-        co_await res->status(200).send("users");
+        co_await res->status(status::ok).send("users");
     });
 
     asio::io_context ctx;
     {
         auto req = make_request(ctx, "/api/users?page=2");
         auto writer = dispatch(ctx, router, req);
-        CHECK(writer->last_status == 200);
+        CHECK(writer->last_status == status::ok);
         CHECK(writer->last_body == "users");
         CHECK(seen.back() == "users");
         CHECK(req->path() == "/users");
@@ -467,7 +468,7 @@ TEST_CASE("middleware: strip_prefix re-mounts a sub-application at its root", "[
         // The bare prefix maps to "/".
         auto req = make_request(ctx, "/api");
         auto writer = dispatch(ctx, router, req);
-        CHECK(writer->last_status == 404); // no route at "/"
+        CHECK(writer->last_status == status::not_found); // no route at "/"
     }
     {
         // Outside the prefix, the request passes through untouched: no route at
@@ -483,13 +484,13 @@ TEST_CASE("proto/response: set_cookie can delete with a negative Max-Age", "[for
     auto writer = std::make_shared<FakeResponseSink>();
     auto res = std::make_shared<ResponseWriter>(writer);
     res->set_cookie("sid", "", std::chrono::seconds{0}, "/");
-    REQUIRE(run_on(ctx, res->status(200).send("")));
+    REQUIRE(run_on(ctx, res->status(status::ok).send("")));
     CHECK(writer->header(field::set_cookie) == "sid=; Path=/");
 
     // Go's http.SetCookie: a negative MaxAge is "delete now" and emits 0.
     auto writer2 = std::make_shared<FakeResponseSink>();
     auto res2 = std::make_shared<ResponseWriter>(writer2);
     res2->set_cookie("old", "", std::chrono::seconds{-5}, "/");
-    REQUIRE(run_on(ctx, res2->status(200).send("")));
+    REQUIRE(run_on(ctx, res2->status(status::ok).send("")));
     CHECK(writer2->header(field::set_cookie) == "old=; Path=/; Max-Age=0");
 }

@@ -4,7 +4,7 @@
 // chunks. The whole body is never held in memory.
 //
 //   auto written = co_await simple_http::read_body_to_file(req->body(), path);
-//   if (!written) co_await res->status(400).send("upload failed");
+//   if (!written) co_await res->status(status::bad_request).send("upload failed");
 //
 // This is the low-level primitive; multipart/form-data framing (part names,
 // filenames) is handled by read_multipart_stream in proto/multipart_stream.h.

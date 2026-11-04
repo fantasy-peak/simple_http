@@ -441,7 +441,7 @@ class Http1ClientSession final : public ClientSession,
             m_upgrading = false;
             co_return pec;
         }
-        if (m_head.status == 101) {
+        if (m_head.status == status::switching_protocols) {
             m_switched = true; // no head to deliver: the exchange becomes stream 1
             m_body_mode = BodyMode::None;
             m_body_done = true;
@@ -759,7 +759,7 @@ class Http1ClientSession final : public ClientSession,
             const auto &parsed = m_parser.head();
             if (parsed.status >= 200)
                 break;
-            if (parsed.status == 101 && allow_switching)
+            if (parsed.status == status::switching_protocols && allow_switching)
                 break;
             // A 100-continue *we asked for*: hand it to the caller as the head
             // (the "send your body now" signal) instead of swallowing it, and
@@ -768,8 +768,8 @@ class Http1ClientSession final : public ClientSession,
             // read() knows to loop for it rather than treat a bodyless head as
             // end-of-exchange. Once m_awaiting_final is set, any further 100 is
             // just skipped like the other informational responses.
-            if (parsed.status == 100 && m_expect_continue && !m_awaiting_final) {
-                m_head.status = 100;
+            if (parsed.status == status::continue_ && m_expect_continue && !m_awaiting_final) {
+                m_head.status = status::continue_;
                 m_head.version = parsed.version;
                 m_head.headers = parsed.headers;
                 m_head.bodyless = true;
@@ -780,7 +780,7 @@ class Http1ClientSession final : public ClientSession,
                 m_parser.reset_after_head();
                 co_return error_code{};
             }
-            if (parsed.status != 100 && parsed.status != 103) {
+            if (parsed.status != status::continue_ && parsed.status != status::early_hints) {
                 SIMPLE_HTTP_ERROR_LOG("h1 client: unexpected {} from {}", parsed.status, m_authority);
                 co_return make_error_code(client_errc::protocol_error);
             }
@@ -819,7 +819,7 @@ class Http1ClientSession final : public ClientSession,
         // A response to HEAD, or to any request whose response carries no body
         // by definition (RFC 9110 §6.4.1), ends at the head.
         const bool method_head = m_spec->method() == Method::Head;
-        if (method_head || head.status == 204 || head.status == 304) {
+        if (method_head || head.status == status::no_content || head.status == status::not_modified) {
             m_body_mode = BodyMode::None;
             m_body_done = true;
             m_explicit_length = true; // nothing follows: the connection is at a boundary

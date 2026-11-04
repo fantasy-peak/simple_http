@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import http
 import copy
 import json
 import os
@@ -246,13 +247,13 @@ def check_document(reporter: Reporter, document: dict) -> None:
 
 def check_swagger(reporter: Reporter, client: httpx.Client, document_bytes: bytes) -> None:
     response = client.get("/swagger")
-    reporter.check(response.status_code == 200, "GET /swagger returns 200")
+    reporter.check(response.status_code == http.HTTPStatus.OK, "GET /swagger returns 200")
     reporter.check("text/html" in response.headers.get("content-type", ""),
                    "Swagger UI is HTML")
     reporter.check("openapi.json" in response.text and "swagger" in response.text.lower(),
                    "Swagger UI references the spec")
     spec = client.get("/openapi.json")
-    reporter.check(spec.status_code == 200, "GET /openapi.json returns 200")
+    reporter.check(spec.status_code == http.HTTPStatus.OK, "GET /openapi.json returns 200")
     reporter.check(spec.content == document_bytes, "document is deterministic across requests")
     reporter.check(spec.headers.get("content-type", "").startswith("application/json"),
                    "document Content-Type is application/json")
@@ -305,7 +306,7 @@ def check_contract(reporter: Reporter, client: httpx.Client, document: dict) -> 
         for header in (declaration.get("headers") or {}):
             reporter.check(header.lower() in {key.lower() for key in response.headers},
                            f"{name}: declared header {header} present")
-        if probe["status"] == 401:
+        if probe["status"] == http.HTTPStatus.UNAUTHORIZED:
             reporter.check(response.headers.get("www-authenticate", "").lower().startswith("bearer"),
                            f"{name}: bearer challenge present")
 
@@ -328,7 +329,7 @@ def main() -> int:
 
     try:
         response = client.get("/openapi.json")
-        if response.status_code != 200:
+        if response.status_code != http.HTTPStatus.OK:
             reporter.check(False, "GET /openapi.json", f"status {response.status_code}")
             return reporter.summary()
         document = response.json()

@@ -35,8 +35,9 @@ std::shared_ptr<FakeResponseSink> dispatch(asio::io_context &ctx, Router &router
 TEST_CASE("secure headers: the defensive baseline rides every response", "[secure_headers]") {
     Router router;
     router.use(middleware::secure_headers());
-    router.route(any_methods, "/ok",
-                 [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(200).send("ok"); });
+    router.route(any_methods, "/ok", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(status::ok).send("ok");
+    });
 
     asio::io_context ctx;
     auto writer = dispatch(ctx, router, make_request(ctx, "/ok"));
@@ -53,18 +54,19 @@ TEST_CASE("secure headers: the defensive baseline rides every response", "[secur
 TEST_CASE("secure headers: the router's own 404/405 answers get them too", "[secure_headers]") {
     Router router;
     router.use(middleware::secure_headers());
-    router.route({Method::Get}, "/only",
-                 [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(200).send("ok"); });
+    router.route({Method::Get}, "/only", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(status::ok).send("ok");
+    });
 
     asio::io_context ctx;
     {
         auto writer = dispatch(ctx, router, make_request(ctx, "/missing"));
-        CHECK(writer->last_status == 404);
+        CHECK(writer->last_status == status::not_found);
         CHECK(writer->header(field::x_frame_options) == "DENY");
     }
     {
         auto writer = dispatch(ctx, router, make_request(ctx, "/only", Method::Post));
-        CHECK(writer->last_status == 405);
+        CHECK(writer->last_status == status::method_not_allowed);
         CHECK(writer->header(field::x_frame_options) == "DENY");
     }
 }
@@ -76,8 +78,9 @@ TEST_CASE("secure headers: HSTS is written only over TLS and only when configure
     cfg.hsts_include_subdomains = true;
     cfg.hsts_preload = true;
     router.use(middleware::secure_headers(cfg));
-    router.route(any_methods, "/ok",
-                 [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(200).send("ok"); });
+    router.route(any_methods, "/ok", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(status::ok).send("ok");
+    });
 
     asio::io_context ctx;
     {
@@ -104,7 +107,7 @@ TEST_CASE("secure headers: a configured policy is emitted, and a handler overrid
         // A handler that needs a different value replaces the default in place,
         // so the wire sees exactly one X-Frame-Options.
         res->replace_header(field::x_frame_options, "DENY");
-        co_await res->status(200).send("ok");
+        co_await res->status(status::ok).send("ok");
     });
 
     asio::io_context ctx;

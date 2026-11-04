@@ -105,14 +105,14 @@ TEST_CASE("rate limit: a refused request is 429 and never reaches the route", "[
     bool handler_ran = false;
     router.route(any_methods, "/work", [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
         handler_ran = true;
-        co_await res->status(200).send("done");
+        co_await res->status(status::ok).send("done");
     });
 
     asio::io_context ctx;
     {
         // The single token is consumed by the first request.
         auto writer = dispatch(ctx, router, make_request(ctx, "/work"));
-        CHECK(writer->last_status == 200);
+        CHECK(writer->last_status == status::ok);
         CHECK(handler_ran);
     }
     handler_ran = false;
@@ -133,13 +133,13 @@ TEST_CASE("rate limit: per-key middleware limits each key separately", "[rate_li
     bool ran = false;
     router.route(any_methods, "/w", [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
         ran = true;
-        co_await res->status(200).send("ok");
+        co_await res->status(status::ok).send("ok");
     });
 
     asio::io_context ctx;
     {
         auto writer = dispatch(ctx, router, make_request(ctx, "/w"));
-        CHECK(writer->last_status == 200);
+        CHECK(writer->last_status == status::ok);
     }
     {
         auto writer = dispatch(ctx, router, make_request(ctx, "/w"));
@@ -151,7 +151,7 @@ TEST_CASE("rate limit: per-key middleware limits each key separately", "[rate_li
         auto req = make_request(ctx, "/w");
         req->set_state(middleware::ClientIp{"203.0.113.9"});
         auto writer = dispatch(ctx, router, req);
-        CHECK(writer->last_status == 200);
+        CHECK(writer->last_status == status::ok);
         CHECK(ran);
     }
 }

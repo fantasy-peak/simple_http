@@ -278,31 +278,31 @@ TEST_CASE("client/errors: codes, messages and retryability", "[client]") {
 
 TEST_CASE("client/response: ok() and header lookup", "[client]") {
     // The buffered shape, as the convenience send() produces it: a head + body.
-    Response response{ResponseHead{.status = 204}, std::string{}};
+    Response response{ResponseHead{.status = status::no_content}, std::string{}};
     CHECK(response.ok()); // 2xx: 204 is a success, it just has no body
 
-    Response ok200{ResponseHead{.status = 200}, std::string{}};
+    Response ok200{ResponseHead{.status = status::ok}, std::string{}};
     CHECK(ok200.ok());
-    Response ok299{ResponseHead{.status = 299}, std::string{}};
+    Response ok299{ResponseHead{.status = 299}, std::string{}}; // 299: top of 2xx, no named constant
     CHECK(ok299.ok());
-    Response moved{ResponseHead{.status = 301}, std::string{}};
+    Response moved{ResponseHead{.status = status::moved_permanently}, std::string{}};
     CHECK_FALSE(moved.ok());
-    Response notfound{ResponseHead{.status = 404}, std::string{}};
+    Response notfound{ResponseHead{.status = status::not_found}, std::string{}};
     CHECK_FALSE(notfound.ok());
-    Response servererror{ResponseHead{.status = 500}, std::string{}};
+    Response servererror{ResponseHead{.status = status::internal_server_error}, std::string{}};
     CHECK_FALSE(servererror.ok());
 
-    ResponseHead head{.status = 200};
+    ResponseHead head{.status = status::ok};
     head.headers.add("Content-Type", "text/plain");
     Response with_header{std::move(head), std::string{}};
     CHECK(with_header.header("content-type") == "text/plain");
     CHECK_FALSE(with_header.header("missing").has_value());
 
     ResponseHead h2;
-    h2.status = 200;
+    h2.status = status::ok;
     h2.headers.add("x-a", "1");
     CHECK(h2.header("X-A") == "1");
-    CHECK(h2.status == 200);
+    CHECK(h2.status == status::ok);
     CHECK_FALSE(h2.bodyless);
 }
 

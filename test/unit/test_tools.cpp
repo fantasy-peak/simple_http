@@ -79,7 +79,7 @@ TEST_CASE("conditionals: If-None-Match answers 304 and sets validators", "[tools
         auto req = make_request(ctx, "/doc", {{"if-none-match", "\"other\""}});
         bool not_modified = run_on(ctx, maybe_not_modified(req, res, etag, 1700000000)).value_or(false);
         CHECK_FALSE(not_modified);
-        REQUIRE(run_on(ctx, res->status(200).send("body")));
+        REQUIRE(run_on(ctx, res->status(status::ok).send("body")));
         CHECK(writer->header(field::etag) == etag);
         CHECK(writer->header(field::last_modified) == http_date(1700000000));
     }
@@ -135,7 +135,7 @@ TEST_CASE("real_ip: trusted entries accept CIDR prefixes", "[tools]") {
     router.route(any_methods, "/ip", [&](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
         const auto *ip = req->get_state<middleware::ClientIp>();
         seen = ip ? ip->value : "";
-        co_await res->status(200).send("ok");
+        co_await res->status(status::ok).send("ok");
     });
 
     asio::io_context ctx;
@@ -167,8 +167,9 @@ TEST_CASE("access_log: the request id is included when request_id ran", "[tools]
     // request_id inside access_log, so the id is set before the after-phase.
     router.use(middleware::access_log());
     router.use(middleware::request_id());
-    router.route(any_methods, "/ok",
-                 [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(200).send("ok"); });
+    router.route(any_methods, "/ok", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(status::ok).send("ok");
+    });
 
     asio::io_context ctx;
     dispatch(ctx, router, make_request(ctx, "/ok"));

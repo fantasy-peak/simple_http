@@ -41,7 +41,7 @@ TEST_CASE("proto/response: trailer() is emitted by finish_trailers()", "[proto]"
     res.trailer("grpc-status", "0").trailer("server-timing", "db;dur=3");
     CHECK(res.has_trailers());
 
-    REQUIRE(run_on(ctx, res.status(200).begin()));
+    REQUIRE(run_on(ctx, res.status(status::ok).begin()));
     REQUIRE(run_on(ctx, res.write("body")));
     REQUIRE(run_on(ctx, res.finish_trailers()));
 
@@ -56,7 +56,7 @@ TEST_CASE("proto/response: finish_trailers(Headers) rejects CR/LF/NUL", "[proto]
     asio::io_context ctx;
     auto writer = std::make_shared<FakeResponseSink>();
     ResponseWriter res{writer};
-    REQUIRE(run_on(ctx, res.status(200).begin()));
+    REQUIRE(run_on(ctx, res.status(status::ok).begin()));
 
     Headers trailers;
     trailers.add("x-ok", "fine");
@@ -72,13 +72,13 @@ TEST_CASE("proto/response: a second response is refused", "[proto]") {
     auto writer = std::make_shared<FakeResponseSink>();
     ResponseWriter res{writer};
 
-    REQUIRE(run_on(ctx, res.status(200).send("one")));
+    REQUIRE(run_on(ctx, res.status(status::ok).send("one")));
     CHECK(res.started());
-    auto second = run_on(ctx, res.status(500).send("two"));
+    auto second = run_on(ctx, res.status(status::internal_server_error).send("two"));
     REQUIRE(second.has_value());
     CHECK(*second == make_error_code(asio::error::invalid_argument));
     CHECK(writer->calls == 1);
-    CHECK(writer->last_status == 200);
+    CHECK(writer->last_status == status::ok);
     CHECK(writer->last_body == "one");
 }
 
@@ -88,7 +88,7 @@ TEST_CASE("proto/response: finish() delivers accumulated trailers", "[proto]") {
     ResponseWriter res{writer};
 
     res.trailer("grpc-status", "0");
-    REQUIRE(run_on(ctx, res.status(200).begin()));
+    REQUIRE(run_on(ctx, res.status(status::ok).begin()));
     REQUIRE(run_on(ctx, res.write("part")));
     // A final body chunk rides as an ordinary chunk before the trailer section.
     REQUIRE(run_on(ctx, res.finish("tail")));
@@ -105,7 +105,7 @@ TEST_CASE("proto/response: one-shot send() with trailers starts a stream", "[pro
     ResponseWriter res{writer};
 
     res.trailer("x-tail", "yes");
-    REQUIRE(run_on(ctx, res.status(200).send("payload")));
+    REQUIRE(run_on(ctx, res.status(status::ok).send("payload")));
 
     CHECK(writer->begun);      // framed as a stream, not one-shot
     CHECK(writer->calls == 2); // send_headers + send_trailers
@@ -120,7 +120,7 @@ TEST_CASE("proto/response: a CR/LF in a trailer field poisons the response", "[p
     ResponseWriter res{writer};
 
     res.trailer("x-bad", "a\r\nInjected: 1");
-    auto ec = run_on(ctx, res.status(200).finish_trailers());
+    auto ec = run_on(ctx, res.status(status::ok).finish_trailers());
     REQUIRE(ec.has_value());
     CHECK(*ec == asio::error::invalid_argument);
     CHECK_FALSE(writer->sent_trailers);
@@ -135,7 +135,7 @@ TEST_CASE("h1/engine: trailers ride the chunked terminator", "[h1]") {
 
     auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res,
                          SslHandle) -> asio::awaitable<void> {
-        co_await res->status(200).content_type("application/grpc").begin();
+        co_await res->status(status::ok).content_type("application/grpc").begin();
         co_await res->write("hello");
         res->trailer("grpc-status", "0");
         co_await res->finish();
@@ -174,7 +174,7 @@ TEST_CASE("h2/engine: trailers are a trailing HEADERS frame with END_STREAM", "[
 
     auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res,
                          SslHandle) -> asio::awaitable<void> {
-        co_await res->status(200).content_type("application/grpc").begin();
+        co_await res->status(status::ok).content_type("application/grpc").begin();
         co_await res->write("hello");
         res->trailer("grpc-status", "0");
         co_await res->finish();
@@ -239,7 +239,7 @@ TEST_CASE("h1/engine: an HTTP/1.0 streamed body is close-delimited, not chunk-fr
 
     auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res,
                          SslHandle) -> asio::awaitable<void> {
-        co_await res->status(200).content_type("text/plain").begin();
+        co_await res->status(status::ok).content_type("text/plain").begin();
         co_await res->write("first ");
         co_await res->write("second");
         res->trailer("x-checksum", "abc123");
@@ -269,7 +269,7 @@ TEST_CASE("h1/engine: one-shot send() with trailers on HTTP/1.0 keeps its Conten
     auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res,
                          SslHandle) -> asio::awaitable<void> {
         res->trailer("x-checksum", "abc123");
-        co_await res->status(200).content_type("text/plain").send("hello");
+        co_await res->status(status::ok).content_type("text/plain").send("hello");
     };
 
     auto engine = std::make_shared<Http1Engine<MockTransport>>(transport);
@@ -292,7 +292,7 @@ TEST_CASE("h1/engine: a HEAD response with trailers keeps its Content-Length", "
     auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res,
                          SslHandle) -> asio::awaitable<void> {
         res->trailer("x-checksum", "abc123");
-        co_await res->status(200).content_type("text/plain").send("hello");
+        co_await res->status(status::ok).content_type("text/plain").send("hello");
     };
 
     auto engine = std::make_shared<Http1Engine<MockTransport>>(transport);
@@ -315,7 +315,7 @@ TEST_CASE("h1/engine: a 204 with trailers stays bodyless", "[h1]") {
     auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res,
                          SslHandle) -> asio::awaitable<void> {
         res->trailer("x-checksum", "abc123");
-        co_await res->status(204).send("must not appear");
+        co_await res->status(status::no_content).send("must not appear");
     };
 
     auto engine = std::make_shared<Http1Engine<MockTransport>>(transport);
@@ -350,7 +350,7 @@ TEST_CASE("h2/engine: a HEAD response with trailers sends headers and reports su
     auto dispatcher = [&send_ec](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res,
                                  SslHandle) -> asio::awaitable<void> {
         res->trailer("x-checksum", "abc123");
-        send_ec = co_await res->status(200).content_type("text/plain").send("hello");
+        send_ec = co_await res->status(status::ok).content_type("text/plain").send("hello");
     };
 
     auto engine = std::make_shared<Http2Engine<MockTransport>>(transport);
@@ -401,7 +401,7 @@ TEST_CASE("h2/engine: a streamed HEAD response ends the stream without an error"
     error_code finish_ec = make_error_code(asio::error::would_block); // sentinel
     auto dispatcher = [&](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res,
                           SslHandle) -> asio::awaitable<void> {
-        begin_ec = co_await res->status(200).content_type("text/plain").begin();
+        begin_ec = co_await res->status(status::ok).content_type("text/plain").begin();
         write_ec = co_await res->write("dropped");
         res->trailer("x-checksum", "abc123");
         finish_ec = co_await res->finish_trailers();
@@ -446,7 +446,9 @@ TEST_CASE("h2/engine: a 204 response never carries a DATA frame", "[h2]") {
     transport->push(std::move(in));
 
     auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res,
-                         SslHandle) -> asio::awaitable<void> { co_await res->status(204).send("must not appear"); };
+                         SslHandle) -> asio::awaitable<void> {
+        co_await res->status(status::no_content).send("must not appear");
+    };
 
     auto engine = std::make_shared<Http2Engine<MockTransport>>(transport);
     REQUIRE(run_on(ctx, engine->run(dispatcher)));

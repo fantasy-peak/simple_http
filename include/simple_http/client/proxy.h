@@ -507,7 +507,7 @@ asio::awaitable<error_code> http_connect(Stream &stream, const ProxyConfig &prox
             continue; // interim response; the real one follows
         if (*status >= 200 && *status < 300)
             co_return error_code{};
-        if (*status == 407) {
+        if (*status == status::proxy_authentication_required) {
             SIMPLE_HTTP_ERROR_LOG("client proxy: CONNECT {} answered 407", target_authority);
             co_return make_error_code(client_errc::proxy_auth_failed);
         }

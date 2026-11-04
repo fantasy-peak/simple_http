@@ -13,6 +13,8 @@ inline constexpr std::string_view reason_phrase(int status) noexcept {
         return "Continue";
     case 101:
         return "Switching Protocols";
+    case 103:
+        return "Early Hints";
     case 200:
         return "OK";
     case 201:
@@ -47,6 +49,8 @@ inline constexpr std::string_view reason_phrase(int status) noexcept {
         return "Method Not Allowed";
     case 406:
         return "Not Acceptable";
+    case 407:
+        return "Proxy Authentication Required";
     case 408:
         return "Request Timeout";
     case 409:
@@ -65,6 +69,8 @@ inline constexpr std::string_view reason_phrase(int status) noexcept {
         return "Range Not Satisfiable";
     case 417:
         return "Expectation Failed";
+    case 422:
+        return "Unprocessable Content";
     case 426:
         return "Upgrade Required";
     case 429:
@@ -96,6 +102,7 @@ namespace status {
 
 inline constexpr int continue_ = 100;
 inline constexpr int switching_protocols = 101;
+inline constexpr int early_hints = 103;
 inline constexpr int ok = 200;
 inline constexpr int created = 201;
 inline constexpr int accepted = 202;
@@ -113,6 +120,7 @@ inline constexpr int forbidden = 403;
 inline constexpr int not_found = 404;
 inline constexpr int method_not_allowed = 405;
 inline constexpr int not_acceptable = 406;
+inline constexpr int proxy_authentication_required = 407;
 inline constexpr int request_timeout = 408;
 inline constexpr int conflict = 409;
 inline constexpr int gone = 410;
@@ -122,6 +130,7 @@ inline constexpr int uri_too_long = 414;
 inline constexpr int unsupported_media_type = 415;
 inline constexpr int range_not_satisfiable = 416;
 inline constexpr int expectation_failed = 417;
+inline constexpr int unprocessable_content = 422;
 inline constexpr int upgrade_required = 426;
 inline constexpr int too_many_requests = 429;
 inline constexpr int request_header_fields_too_large = 431;

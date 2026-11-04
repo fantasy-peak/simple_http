@@ -27,7 +27,7 @@ RequestPtr make_request(asio::io_context &ctx, std::string path, Method method =
 Handler flag_handler(bool &ran, std::string body = "real") {
     return make_handler([&ran, body = std::move(body)](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
         ran = true;
-        co_await res->status(200).send(body);
+        co_await res->status(status::ok).send(body);
     });
 }
 

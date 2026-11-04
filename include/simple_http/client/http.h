@@ -234,7 +234,7 @@ class Stream {
             }
             co_return head.error();
         }
-        if (head->status == 100) {
+        if (head->status == status::continue_) {
             // The interim head was handed to us; the final response still
             // follows, so the next read_head() must parse it.
             m_stream->clear_head_cache();
@@ -1019,7 +1019,7 @@ class Client {
         // already past that point and must report the final response (its body
         // is what read() returns). read_head() caches nothing for the interim, so
         // the next call parses the final head.
-        while ((*head)->status == 100) {
+        while ((*head)->status == status::continue_) {
             head = co_await detail::await_with_deadline(stream->read_head(), head_deadline.limit, head_deadline.reason);
             if (!head || !*head)
                 co_return std::unexpected{head ? (*head).error() : head.error()};

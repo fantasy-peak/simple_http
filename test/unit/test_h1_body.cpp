@@ -48,7 +48,7 @@ BodyOutcome run_chunked(std::string request, EngineLimits limits = {}) {
         if (auto value = req->trailers().get("x-check")) {
             out.trailer = std::string{*value};
         }
-        co_await res->status(200).send("ok");
+        co_await res->status(status::ok).send("ok");
     };
 
     auto engine = std::make_shared<Http1Engine<MockTransport>>(transport, limits);

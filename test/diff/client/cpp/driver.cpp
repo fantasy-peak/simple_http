@@ -853,7 +853,7 @@ asio::awaitable<void> run_body_group() {
                 }
                 data += value;
             }
-            obs.status = 200;
+            obs.status = status::ok;
             set_body(obs, std::move(data));
         }
         emit(std::move(obs));
@@ -884,7 +884,7 @@ asio::awaitable<void> run_body_group() {
                 }
                 data += value;
             }
-            obs.status = 200;
+            obs.status = status::ok;
             set_body(obs, std::move(data));
         }
         emit(std::move(obs));
@@ -1001,13 +1001,13 @@ asio::awaitable<void> run_policy_group() {
         cfg.default_version = HttpVersionPolicy::Http11;
         cfg.default_h2c = H2cMode::Off;
         cfg.retry.max_retries = 2;
-        cfg.retry.retry_statuses = {429};
+        cfg.retry.retry_statuses = {status::too_many_requests};
         cfg.retry.initial_backoff = 1ms;
         Client client{co_await asio::this_coro::executor, cfg};
         (void)co_await client.get(base + "/retry/reset").send();
         auto obs = co_await get_observation(client, base + "/retry/2", "policy.retry_opt_in");
         obs.mode = "cpp-only";
-        if (!obs.error && (obs.status != 200 || obs.body != "ok")) {
+        if (!obs.error && (obs.status != status::ok || obs.body != "ok")) {
             obs.error = "assert_failed";
         }
         emit(std::move(obs));

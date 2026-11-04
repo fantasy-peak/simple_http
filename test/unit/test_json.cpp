@@ -68,7 +68,7 @@ TEST_CASE("proto/json: write_json sends a one-shot JSON response", "[json]") {
     auto ec = run_on(ctx, write_json(res, Pet{3, "yuki"}, 201));
     REQUIRE(ec.has_value());
     CHECK(*ec == error_code{});
-    CHECK(writer->last_status == 201);
+    CHECK(writer->last_status == status::created);
     CHECK(writer->header(field::content_type) == mime::app_json);
     CHECK(writer->last_body == R"({"id":3,"name":"yuki"})");
 }

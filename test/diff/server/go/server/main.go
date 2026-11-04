@@ -206,13 +206,13 @@ func whoHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case host == "api.example.com:8080":
-		writeText(w, 200, "port")
+		writeText(w, http.StatusOK, "port")
 	case withoutPort == "api.example.com":
-		writeText(w, 200, "api")
+		writeText(w, http.StatusOK, "api")
 	case strings.HasSuffix(withoutPort, ".example.com"):
-		writeText(w, 200, "sub")
+		writeText(w, http.StatusOK, "sub")
 	default:
-		writeText(w, 200, "root")
+		writeText(w, http.StatusOK, "root")
 	}
 }
 
@@ -482,7 +482,7 @@ func fileExists(name string) bool {
 
 func makeHandler(state *serverState, staticRoot string) http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/plain", func(w http.ResponseWriter, r *http.Request) { writeText(w, 200, "hello") })
+	mux.HandleFunc("/plain", func(w http.ResponseWriter, r *http.Request) { writeText(w, http.StatusOK, "hello") })
 	mux.HandleFunc("/echo", echoHandler)
 	mux.HandleFunc("/multipart", multipartHandler)
 	mux.HandleFunc("/client-cert", func(w http.ResponseWriter, r *http.Request) {
@@ -490,7 +490,7 @@ func makeHandler(state *serverState, staticRoot string) http.Handler {
 		if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
 			cn = r.TLS.PeerCertificates[0].Subject.CommonName
 		}
-		writeText(w, 200, cn)
+		writeText(w, http.StatusOK, cn)
 	})
 	mux.HandleFunc("/status/", func(w http.ResponseWriter, r *http.Request) {
 		code, err := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/status/"))
@@ -514,13 +514,13 @@ func makeHandler(state *serverState, staticRoot string) http.Handler {
 		}
 		switch r.URL.Path {
 		case "/files/static":
-			writeText(w, 200, "static")
+			writeText(w, http.StatusOK, "static")
 		default:
 			rest := strings.TrimPrefix(r.URL.Path, "/files/")
 			if strings.Contains(rest, "/") {
-				writeText(w, 200, "rest="+rest)
+				writeText(w, http.StatusOK, "rest="+rest)
 			} else {
-				writeText(w, 200, "id="+rest)
+				writeText(w, http.StatusOK, "id="+rest)
 			}
 		}
 	})
@@ -528,13 +528,13 @@ func makeHandler(state *serverState, staticRoot string) http.Handler {
 		if !allow(w, r, "GET") {
 			return
 		}
-		writeText(w, 200, "api path: "+r.URL.Path)
+		writeText(w, http.StatusOK, "api path: "+r.URL.Path)
 	})
 	mux.HandleFunc("/method", func(w http.ResponseWriter, r *http.Request) {
 		if !allow(w, r, "GET, POST") {
 			return
 		}
-		writeText(w, 200, "method:"+r.Method)
+		writeText(w, http.StatusOK, "method:"+r.Method)
 	})
 	mux.HandleFunc("/users/", func(w http.ResponseWriter, r *http.Request) {
 		if !allow(w, r, "GET") {
@@ -546,13 +546,13 @@ func makeHandler(state *serverState, staticRoot string) http.Handler {
 			writeError(w, 400, "invalid_path", "invalid or missing path parameters", nil)
 			return
 		}
-		writeText(w, 200, "id="+strconv.FormatInt(value, 10))
+		writeText(w, http.StatusOK, "id="+strconv.FormatInt(value, 10))
 	})
 	mux.HandleFunc("/state", func(w http.ResponseWriter, r *http.Request) {
 		if !allow(w, r, "GET") {
 			return
 		}
-		writeText(w, 200, "from-state")
+		writeText(w, http.StatusOK, "from-state")
 	})
 	mux.HandleFunc("/list", func(w http.ResponseWriter, r *http.Request) {
 		if !allow(w, r, "GET") {
@@ -563,7 +563,7 @@ func makeHandler(state *serverState, staticRoot string) http.Handler {
 			writeError(w, 400, "invalid_query", "invalid or missing query parameters", nil)
 			return
 		}
-		writeText(w, 200, r.URL.Query().Get("q")+":"+strconv.Itoa(page))
+		writeText(w, http.StatusOK, r.URL.Query().Get("q")+":"+strconv.Itoa(page))
 	})
 	mux.HandleFunc("/json", func(w http.ResponseWriter, r *http.Request) {
 		if !allow(w, r, "POST") {
@@ -574,7 +574,7 @@ func makeHandler(state *serverState, staticRoot string) http.Handler {
 			writeError(w, 400, "invalid_json", "malformed JSON request body", "Invalid argument")
 			return
 		}
-		writeText(w, 201, in.Name+":"+strconv.Itoa(in.Age))
+		writeText(w, http.StatusCreated, in.Name+":"+strconv.Itoa(in.Age))
 	})
 	mux.HandleFunc("/valid", func(w http.ResponseWriter, r *http.Request) {
 		if !allow(w, r, "POST") {
@@ -596,22 +596,22 @@ func makeHandler(state *serverState, staticRoot string) http.Handler {
 			writeError(w, 422, "validation_failed", "request validation failed", details)
 			return
 		}
-		writeText(w, 201, in.Name)
+		writeText(w, http.StatusCreated, in.Name)
 	})
 	mux.HandleFunc("/form", func(w http.ResponseWriter, r *http.Request) {
 		if !allow(w, r, "POST") {
 			return
 		}
 		if err := r.ParseForm(); err != nil {
-			writeText(w, 400, "invalid form")
+			writeText(w, http.StatusBadRequest, "invalid form")
 			return
 		}
 		age, err := strconv.Atoi(r.PostForm.Get("age"))
 		if err != nil {
-			writeText(w, 400, "invalid form")
+			writeText(w, http.StatusBadRequest, "invalid form")
 			return
 		}
-		writeText(w, 201, r.PostForm.Get("name")+":"+strconv.Itoa(age))
+		writeText(w, http.StatusCreated, r.PostForm.Get("name")+":"+strconv.Itoa(age))
 	})
 	mux.HandleFunc("/header", func(w http.ResponseWriter, r *http.Request) {
 		if !allow(w, r, "GET") {
@@ -632,10 +632,10 @@ func makeHandler(state *serverState, staticRoot string) http.Handler {
 			writeError(w, 400, "missing_cookie", "missing required cookie", "sid")
 			return
 		}
-		writeText(w, 200, strconv.Itoa(page)+":"+cookie.Value)
+		writeText(w, http.StatusOK, strconv.Itoa(page)+":"+cookie.Value)
 	})
 	mux.HandleFunc("/backend", func(w http.ResponseWriter, r *http.Request) {
-		writeText(w, 200, "backend")
+		writeText(w, http.StatusOK, "backend")
 	})
 	proxyTarget, _ := url.Parse("http://127.0.0.1:7830")
 	proxy := httputil.NewSingleHostReverseProxy(proxyTarget)
@@ -648,44 +648,44 @@ func makeHandler(state *serverState, staticRoot string) http.Handler {
 		encoding := strings.ToLower(r.Header.Get("Content-Encoding"))
 		switch encoding {
 		case "":
-			writeText(w, 200, "ce=none;cl=none;"+string(data))
+			writeText(w, http.StatusOK, "ce=none;cl=none;"+string(data))
 			return
 		case "gzip":
 		default:
-			writeText(w, 415, "unsupported content coding")
+			writeText(w, http.StatusUnsupportedMediaType, "unsupported content coding")
 			return
 		}
 		reader, err := gzip.NewReader(bytes.NewReader(data))
 		if err != nil {
-			writeText(w, 400, "decode error")
+			writeText(w, http.StatusBadRequest, "decode error")
 			return
 		}
 		decoded, err := io.ReadAll(io.LimitReader(reader, (1<<20)+1))
 		_ = reader.Close()
 		if err != nil {
-			writeText(w, 400, "decode error")
+			writeText(w, http.StatusBadRequest, "decode error")
 			return
 		}
 		if len(decoded) > 1<<20 {
-			writeText(w, 413, "decode error")
+			writeText(w, http.StatusRequestEntityTooLarge, "decode error")
 			return
 		}
-		writeText(w, 200, "ce=none;cl=none;"+string(decoded))
+		writeText(w, http.StatusOK, "ce=none;cl=none;"+string(decoded))
 	})
 	mux.HandleFunc("/delay", func(w http.ResponseWriter, r *http.Request) {
 		ms, _ := strconv.Atoi(r.URL.Query().Get("ms"))
 		if ms > 0 {
 			time.Sleep(time.Duration(ms) * time.Millisecond)
 		}
-		writeText(w, 200, "delayed")
+		writeText(w, http.StatusOK, "delayed")
 	})
 	mux.HandleFunc("/drain", func(w http.ResponseWriter, r *http.Request) {
 		body := readAll(r)
-		writeText(w, 200, "received "+strconv.Itoa(len(body))+" bytes")
+		writeText(w, http.StatusOK, "received "+strconv.Itoa(len(body))+" bytes")
 	})
 	mux.HandleFunc("/stream", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
-		w.WriteHeader(200)
+		w.WriteHeader(http.StatusOK)
 		for i := 0; i < 3; i++ {
 			_, _ = io.WriteString(w, "part"+strconv.Itoa(i)+" ")
 		}
@@ -694,14 +694,14 @@ func makeHandler(state *serverState, staticRoot string) http.Handler {
 	mux.HandleFunc("/trailers", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Trailer", "X-Checksum")
 		w.Header().Set("Content-Type", "text/plain")
-		w.WriteHeader(200)
+		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "body")
 		w.Header().Set("X-Checksum", "abc123")
 	})
 	mux.HandleFunc("/sse", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-cache")
-		w.WriteHeader(200)
+		w.WriteHeader(http.StatusOK)
 		for i := 1; i <= 3; i++ {
 			_, _ = fmt.Fprintf(w, "event: tick\nid: %d\ndata: value-%d\n\n", i, i)
 		}
@@ -712,14 +712,14 @@ func makeHandler(state *serverState, staticRoot string) http.Handler {
 		if value == "" {
 			value = "missing"
 		}
-		writeText(w, 200, value)
+		writeText(w, http.StatusOK, value)
 	})
 	mux.HandleFunc("/expect-ok", func(w http.ResponseWriter, r *http.Request) {
 		body := readAll(r)
-		writeText(w, 200, "got "+strconv.Itoa(len(body)))
+		writeText(w, http.StatusOK, "got "+strconv.Itoa(len(body)))
 	})
 	mux.HandleFunc("/expect-reject", func(w http.ResponseWriter, r *http.Request) {
-		writeText(w, 417, "no")
+		writeText(w, http.StatusExpectationFailed, "no")
 	})
 	mux.HandleFunc("/who", whoHandler)
 	mux.HandleFunc("/gzip", compressionHandler)
@@ -732,7 +732,7 @@ func makeHandler(state *serverState, staticRoot string) http.Handler {
 			id = randomToken(8)
 		}
 		w.Header().Set("X-Request-Id", id)
-		writeText(w, 200, id)
+		writeText(w, http.StatusOK, id)
 	})
 	mux.HandleFunc("/rate", func(w http.ResponseWriter, r *http.Request) {
 		state.mu.Lock()
@@ -741,10 +741,10 @@ func makeHandler(state *serverState, staticRoot string) http.Handler {
 		state.mu.Unlock()
 		if hits > 1 {
 			w.Header().Set("Retry-After", "1000")
-			writeText(w, 429, "too many requests")
+			writeText(w, http.StatusTooManyRequests, "too many requests")
 			return
 		}
-		writeText(w, 200, "ok")
+		writeText(w, http.StatusOK, "ok")
 	})
 	mux.HandleFunc("/session/set", func(w http.ResponseWriter, r *http.Request) {
 		if !allow(w, r, "POST") {
@@ -768,20 +768,20 @@ func makeHandler(state *serverState, staticRoot string) http.Handler {
 		uid, ok := state.sessions[id]["uid"]
 		state.mu.Unlock()
 		if ok {
-			writeText(w, 200, uid)
+			writeText(w, http.StatusOK, uid)
 		} else {
-			writeText(w, 200, "none")
+			writeText(w, http.StatusOK, "none")
 		}
 	})
 	mux.HandleFunc("/csrf/token", func(w http.ResponseWriter, r *http.Request) {
-		writeText(w, 200, csrfToken(w, r))
+		writeText(w, http.StatusOK, csrfToken(w, r))
 	})
 	mux.HandleFunc("/csrf/submit", func(w http.ResponseWriter, r *http.Request) {
 		token := csrfToken(w, r)
 		supplied := r.Header.Get("X-Csrf-Token")
 		if token == "" || subtle.ConstantTimeCompare([]byte(token), []byte(supplied)) != 1 {
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			w.WriteHeader(403)
+			w.WriteHeader(http.StatusForbidden)
 			_, _ = io.WriteString(w, "CSRF token invalid")
 			return
 		}

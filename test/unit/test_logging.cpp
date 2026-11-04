@@ -57,7 +57,8 @@ TEST_CASE("core/logging: Attr overloads keep the value type", "[core][logging]")
 
 TEST_CASE("core/logging: the JSON formatter emits typed, escaped fields", "[core][logging]") {
     const Attr attrs[] = {
-        {"method", "GET"}, {"status", std::int64_t{200}}, {"duration_ms", 1.5}, {"ok", true}, {"path", "/a\"b\\c\nd"},
+        {"method", "GET"},       {"status", std::int64_t{status::ok}}, {"duration_ms", 1.5}, {"ok", true},
+        {"path", "/a\"b\\c\nd"},
     };
     const LogRecord record{LogLevel::Warn, "access", std::source_location::current(), "request", attrs};
 
@@ -80,7 +81,7 @@ TEST_CASE("core/logging: log_with_attrs reaches the sink with its fields", "[cor
     CapturingSink *captured = sink.get();
     SinkScope scope{sink};
 
-    const Attr attrs[] = {{"method", "POST"}, {"status", std::int64_t{201}}};
+    const Attr attrs[] = {{"method", "POST"}, {"status", std::int64_t{status::created}}};
     log_with_attrs(LogLevel::Info, "access", std::source_location::current(), "request", attrs);
 
     REQUIRE(captured->recs.size() == 1);

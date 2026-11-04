@@ -270,7 +270,7 @@ TEST_CASE("h1/response parser: a plain response head", "[h1]") {
     parser.feed("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nServer: x\r\n\r\nhello");
 
     REQUIRE(parser.parse_head() == H1ResponseParser::State::Done);
-    CHECK(parser.head().status == 200);
+    CHECK(parser.head().status == status::ok);
     CHECK(parser.head().version == Version::Http11);
     CHECK(parser.head().headers.get("content-length") == "5");
     CHECK(parser.head().headers.get("server") == "x");
@@ -282,16 +282,19 @@ TEST_CASE("h1/response parser: reason phrase is optional, versions and codes", "
         H1ResponseParser parser;
         parser.feed("HTTP/1.1 200\r\n\r\n");
         REQUIRE(parser.parse_head() == H1ResponseParser::State::Done);
-        CHECK(parser.head().status == 200);
+        CHECK(parser.head().status == status::ok);
     }
     {
         H1ResponseParser parser;
         parser.feed("HTTP/1.0 301 Moved Permanently\r\n\r\n");
         REQUIRE(parser.parse_head() == H1ResponseParser::State::Done);
         CHECK(parser.head().version == Version::Http1);
-        CHECK(parser.head().status == 301);
+        CHECK(parser.head().status == status::moved_permanently);
     }
-    for (int code : {100, 101, 103, 204, 304, 599}) {
+    // The last code is deliberately unknown: any syntactically valid status must
+    // survive parsing even when it has no named constant.
+    for (int code : {status::continue_, status::switching_protocols, status::early_hints, status::no_content,
+                     status::not_modified, 599}) {
         H1ResponseParser parser;
         parser.feed("HTTP/1.1 " + std::to_string(code) + " whatever\r\n\r\n");
         REQUIRE(parser.parse_head() == H1ResponseParser::State::Done);
@@ -344,7 +347,7 @@ TEST_CASE("h1/response parser: incremental input and bare LF", "[h1]") {
             REQUIRE(state == H1ResponseParser::State::Done);
         }
     }
-    CHECK(parser.head().status == 204);
+    CHECK(parser.head().status == status::no_content);
     CHECK(parser.head().headers.get("x-empty") == "1");
 }
 
@@ -354,12 +357,12 @@ TEST_CASE("h1/response parser: reset_after_head skips an informational response"
                 "OK\r\nContent-Length: 2\r\n\r\nok");
 
     REQUIRE(parser.parse_head() == H1ResponseParser::State::Done);
-    CHECK(parser.head().status == 103);
+    CHECK(parser.head().status == status::early_hints);
     CHECK(parser.head().headers.get("link") == "</a>");
 
     parser.reset_after_head(); // what the client does before the final head
     REQUIRE(parser.parse_head() == H1ResponseParser::State::Done);
-    CHECK(parser.head().status == 200);
+    CHECK(parser.head().status == status::ok);
     CHECK(parser.head().headers.get("content-length") == "2");
     CHECK(parser.remainder() == "ok");
 }
@@ -433,7 +436,7 @@ TEST_CASE("ws proxy: the shared handshake applies the Go-style header policy", "
     CHECK(chained.find("x-forwarded-for: 1.1.1.1, 203.0.113.9\r\n") != std::string::npos);
 
     ParsedResponseHead ok;
-    ok.status = 101;
+    ok.status = status::switching_protocols;
     ok.headers.add("connection", "Upgrade");
     ok.headers.add("upgrade", "websocket");
     ok.headers.add("sec-websocket-accept", ws_accept_key("key"));

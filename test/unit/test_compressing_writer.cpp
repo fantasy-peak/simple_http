@@ -188,24 +188,24 @@ TEST_CASE("compressing_writer: headers that forbid or predate compression", "[co
         CHECK(inner->last_body == already);
         CHECK_FALSE(inner->has_header("vary")); // nothing was negotiated, so no Vary
     }
-    SECTION("a byte range must stay addressable") { run_case(text_headers(), 206, false, "206"); }
+    SECTION("a byte range must stay addressable") { run_case(text_headers(), status::partial_content, false, "206"); }
     SECTION("Content-Range header") {
         Headers h = text_headers();
         h.add("content-range", "bytes 0-99/1000");
-        run_case(std::move(h), 200, false, "content-range");
+        run_case(std::move(h), status::ok, false, "content-range");
     }
     SECTION("Cache-Control: no-transform (RFC 9110 7.7)") {
         Headers h = text_headers();
         h.add("cache-control", "public, no-transform");
-        run_case(std::move(h), 200, false, "no-transform");
+        run_case(std::move(h), status::ok, false, "no-transform");
     }
-    SECTION("HEAD") { run_case(text_headers(), 200, true, "head"); }
+    SECTION("HEAD") { run_case(text_headers(), status::ok, true, "head"); }
     SECTION("a type that is already entropy-coded") {
         Headers h;
         h.add("content-type", "image/png");
-        run_case(std::move(h), 200, false, "image/png");
+        run_case(std::move(h), status::ok, false, "image/png");
     }
-    SECTION("no content-type at all") { run_case(Headers{}, 200, false, "no content-type"); }
+    SECTION("no content-type at all") { run_case(Headers{}, status::ok, false, "no content-type"); }
 }
 
 TEST_CASE("compressing_writer: small and incompressible bodies pass through", "[compression]") {

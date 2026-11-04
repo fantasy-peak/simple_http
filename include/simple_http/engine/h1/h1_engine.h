@@ -93,7 +93,7 @@ template <TransportLike Transport> class Http1ResponseSink : public ResponseSink
         if (!m_open)
             co_return make_error_code(asio::error::not_connected);
 
-        if (status == 204 || status == 304) {
+        if (status == status::no_content || status == status::not_modified) {
             // Neither a body nor a Content-Length (RFC 9110 §15.3.5/§15.4.5).
             co_return co_await send_bodyless(status, std::move(headers));
         }
@@ -531,7 +531,8 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
             auto state = parser.parse_head(m_in.view());
             while (state == H1Parser::State::NeedMore) {
                 if (m_in.size() > m_limits.max_header_bytes) {
-                    co_await send_error_response(431); // Request Header Fields Too Large
+                    co_await send_error_response(
+                        status::request_header_fields_too_large); // Request Header Fields Too Large
                     co_return;
                 }
                 std::array<std::byte, 8192> tmp; // no init: read_some fills [0,n)
@@ -543,7 +544,7 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
                 state = parser.parse_head(m_in.view());
             }
             if (state == H1Parser::State::Error) {
-                co_await send_error_response(400);
+                co_await send_error_response(status::bad_request);
                 co_return;
             }
             // The loop above checks the limit only while the head is
@@ -551,7 +552,7 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
             // complete in the final read would otherwise be parsed and served:
             // the size test must also run once the parser says Done.
             if (parser.consumed() > m_limits.max_header_bytes) {
-                co_await send_error_response(431);
+                co_await send_error_response(status::request_header_fields_too_large);
                 co_return;
             }
 
@@ -575,7 +576,7 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
             {
                 const std::size_t hosts = head.headers.count("host");
                 if (hosts > 1 || (hosts == 0 && version == Version::Http11)) {
-                    co_await send_error_response(400, {}, version);
+                    co_await send_error_response(status::bad_request, {}, version);
                     co_return;
                 }
             }
@@ -596,7 +597,7 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
                 // RFC 6455 §4.1: the handshake is a GET with no body. Any body
                 // bytes would otherwise be read as the peer's first frames.
                 if (framing.has_body) {
-                    co_await send_error_response(400, {}, version);
+                    co_await send_error_response(status::bad_request, {}, version);
                     co_return;
                 }
                 std::string_view ws_path = request_path(head.target);
@@ -668,7 +669,7 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
 
                 // Upgrade requested but no proxy/route matched: reply 404 and
                 // close.
-                co_await send_error_response(404, {}, version);
+                co_await send_error_response(status::not_found, {}, version);
                 co_return;
             }
 
@@ -1044,7 +1045,7 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
     BodyFraming parse_body_framing(const ParsedHead &head) const {
         BodyFraming out;
         if (head.headers.count("content-length") > 1) {
-            out.error_status = 400;
+            out.error_status = status::bad_request;
             return out;
         }
         out.content_length = head.headers.get("content-length");
@@ -1057,7 +1058,7 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
                     const std::size_t comma = value.find(',');
                     const std::string_view token = trim_ows(value.substr(0, comma));
                     if (token.empty()) {
-                        out.error_status = 400;
+                        out.error_status = status::bad_request;
                         return out;
                     }
                     codings.push_back(token);
@@ -1072,21 +1073,21 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
                     continue;
                 }
                 if (i + 1 != codings.size()) {
-                    out.error_status = 400; // chunked must be the final coding
+                    out.error_status = status::bad_request; // chunked must be the final coding
                     return out;
                 }
                 if (codings.size() != 1) {
-                    out.error_status = 501; // another coding we do not decode
+                    out.error_status = status::not_implemented; // another coding we do not decode
                     return out;
                 }
                 out.chunked = true;
             }
             if (!out.chunked) {
-                out.error_status = 501;
+                out.error_status = status::not_implemented;
                 return out;
             }
             if (out.content_length) {
-                out.error_status = 400; // TE + CL: refuse the ambiguity
+                out.error_status = status::bad_request; // TE + CL: refuse the ambiguity
                 return out;
             }
             out.has_body = true;
@@ -1097,10 +1098,10 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
             std::uint64_t len = 0;
             switch (parse_uint(*out.content_length, 10, m_limits.max_body_bytes, len)) {
             case NumParse::Invalid:
-                out.error_status = 400;
+                out.error_status = status::bad_request;
                 return out;
             case NumParse::Overflow:
-                out.error_status = 413;
+                out.error_status = status::payload_too_large;
                 return out;
             case NumParse::Ok:
                 break;
@@ -1243,7 +1244,7 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
         auto key = request->header("sec-websocket-key");
         if (!key) {
             // is_websocket_upgrade() guarantees the key; defensive only.
-            co_await send_error_response(400, {}, request->version());
+            co_await send_error_response(status::bad_request, {}, request->version());
             co_return false;
         }
         std::string resp = "HTTP/1.1 101 Switching Protocols\r\n"
@@ -1331,13 +1332,14 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
     asio::awaitable<bool> check_ws_version(const ParsedHead &head) {
         const auto version = head.headers.get("sec-websocket-version");
         if (!version) {
-            co_await send_error_response(400, {}, head.version); // a handshake without a version is malformed
+            co_await send_error_response(status::bad_request, {},
+                                         head.version); // a handshake without a version is malformed
             co_return false;
         }
         if (*version != "13") {
             Headers extra;
             extra.add_lower("sec-websocket-version", "13");
-            co_await send_error_response(426, std::move(extra), head.version);
+            co_await send_error_response(status::upgrade_required, std::move(extra), head.version);
             co_return false;
         }
         co_return true;

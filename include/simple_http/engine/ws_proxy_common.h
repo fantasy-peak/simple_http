@@ -433,7 +433,7 @@ asio::awaitable<void> ws_proxy_relay_refusal_body(Socket &backend, std::string &
 // Upgrade type; the accept key check protects the h2 leg, where the proxy
 // synthesized the key and the frontend cannot see it).
 inline bool ws_validate_101(const ParsedResponseHead &head, std::string_view expected_accept) {
-    if (head.status != 101)
+    if (head.status != status::switching_protocols)
         return false;
     bool connection_upgrade = false;
     for (auto conn : head.headers.get_all("connection")) {

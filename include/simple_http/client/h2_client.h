@@ -1090,10 +1090,10 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
             // Informational (1xx): not the final response. An asked-for
             // 100-continue is published to the caller so the automatic stream
             // can send its body; every other 1xx is dropped (RFC 9113 §8.1).
-            if (status == 100 && st.expect_continue && !st.interim_100_sent) {
+            if (status == status::continue_ && st.expect_continue && !st.interim_100_sent) {
                 st.interim_100_sent = true;
                 ResponseHead interim{};
-                interim.status = 100;
+                interim.status = status::continue_;
                 interim.version = Version::Http2;
                 interim.headers = std::move(headers);
                 interim.bodyless = true;

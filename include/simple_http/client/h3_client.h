@@ -797,9 +797,9 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         // is surfaced — it is what a caller waiting on `Expect` needs.
         const int status = parse_status(st.status_text);
         if (!st.head_seen && status >= 100 && status < 200) {
-            if (status == 100) {
+            if (status == status::continue_) {
                 ResponseHead interim;
-                interim.status = 100;
+                interim.status = status::continue_;
                 interim.version = Version::Http3;
                 interim.bodyless = true;
                 st.interim = std::move(interim);
@@ -819,7 +819,7 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
             }
             st.head.status = status;
             st.head.version = Version::Http3;
-            st.head.bodyless = fin || status == 204 || status == 304 || st.is_head;
+            st.head.bodyless = fin || status == status::no_content || status == status::not_modified || st.is_head;
             for (auto &[name, value] : st.header_tmp)
                 st.head.headers.add_lower(std::move(name), std::move(value));
             st.header_tmp.clear();

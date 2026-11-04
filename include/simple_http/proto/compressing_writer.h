@@ -218,7 +218,7 @@ class CompressingResponseSink final : public ResponseSink {
 
     // Everything that can be decided without looking at the body.
     bool eligible(int status, const Headers &headers) const {
-        if (status == 204 || status == 304 || status == 206) {
+        if (status == status::no_content || status == status::not_modified || status == status::partial_content) {
             return false; // no body, or a byte range that must stay addressable
         }
         if (headers.contains("content-encoding")) {

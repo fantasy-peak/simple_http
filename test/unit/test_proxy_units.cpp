@@ -263,11 +263,11 @@ TEST_CASE("client/proxy: CONNECT request and status parsing", "[client][proxy]")
 
     auto ok = parse_connect_status("HTTP/1.1 200 Connection established\r\n\r\n");
     REQUIRE(ok.has_value());
-    CHECK(*ok == 200);
+    CHECK(*ok == status::ok);
 
     auto auth_required = parse_connect_status("HTTP/1.1 407 Proxy Authentication Required\r\n\r\n");
     REQUIRE(auth_required.has_value());
-    CHECK(*auth_required == 407);
+    CHECK(*auth_required == status::proxy_authentication_required);
 
     CHECK_FALSE(parse_connect_status("garbage\r\n\r\n").has_value());
     CHECK_FALSE(parse_connect_status("HTTP/1.1 20\r\n\r\n").has_value());

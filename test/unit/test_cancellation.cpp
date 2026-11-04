@@ -99,7 +99,7 @@ TEST_CASE("middleware: timeout answers 504 when the handler overruns", "[cancell
         asio::steady_timer t{co_await asio::this_coro::executor};
         t.expires_after(std::chrono::seconds(5));
         co_await t.async_wait(asio::use_awaitable); // the deadline must cancel this
-        co_await res->status(200).send("too late");
+        co_await res->status(status::ok).send("too late");
     });
 
     asio::io_context ctx;
@@ -115,12 +115,13 @@ TEST_CASE("middleware: timeout answers 504 when the handler overruns", "[cancell
 TEST_CASE("middleware: timeout leaves a handler that finishes in time alone", "[cancellation]") {
     Router router;
     router.use(middleware::timeout(std::chrono::seconds(5)));
-    router.route({Method::Get}, "/fast",
-                 [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(200).send("ok"); });
+    router.route({Method::Get}, "/fast", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(status::ok).send("ok");
+    });
 
     asio::io_context ctx;
     auto writer = run_chain(ctx, router, make_request(ctx, "/fast"));
-    CHECK(writer->last_status == 200);
+    CHECK(writer->last_status == status::ok);
     CHECK(writer->last_body == "ok");
 }
 
@@ -128,7 +129,7 @@ TEST_CASE("middleware: timeout does not kill a stream that keeps producing", "[c
     Router router;
     router.use(middleware::timeout(std::chrono::milliseconds(50)));
     router.route({Method::Get}, "/stream", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(200).content_type("text/plain").begin();
+        co_await res->status(status::ok).content_type("text/plain").begin();
         // Ten chunks, 20 ms apart: ~200 ms total, four times the deadline, but
         // never idle for more than 20 ms — the stream must survive.
         for (int i = 0; i < 10; ++i) {
@@ -151,7 +152,7 @@ TEST_CASE("middleware: timeout aborts a stream that goes silent", "[cancellation
     Router router;
     router.use(middleware::timeout(std::chrono::milliseconds(50)));
     router.route({Method::Get}, "/stall", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(200).content_type("text/plain").begin();
+        co_await res->status(status::ok).content_type("text/plain").begin();
         co_await res->write("first");
         asio::steady_timer t{co_await asio::this_coro::executor};
         t.expires_after(std::chrono::seconds(5)); // then silence
@@ -186,7 +187,7 @@ TEST_CASE("middleware: timeout fires the token for work the handler left running
                      asio::steady_timer t{exec};
                      t.expires_after(std::chrono::seconds(5));
                      co_await t.async_wait(asio::use_awaitable); // the deadline must cancel this
-                     co_await res->status(200).send("too late");
+                     co_await res->status(status::ok).send("too late");
                  });
 
     asio::io_context ctx;

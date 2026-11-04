@@ -68,7 +68,7 @@ void set_body(RequestPtr &req, std::string body) {
 
 Handler text_handler(std::string text) {
     return make_handler([text = std::move(text)](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(200).send(text);
+        co_await res->status(status::ok).send(text);
     });
 }
 
@@ -100,14 +100,14 @@ TEST_CASE("framework: application state is shared, type-keyed and nullable", "[f
     router.state(std::make_shared<AppState>(AppState{"shared"}));
     router.route({Method::Get}, "/state", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
         const AppState *state = req->app_state<AppState>();
-        co_await res->status(200).send(state ? state->name : "missing");
+        co_await res->status(status::ok).send(state ? state->name : "missing");
     });
 
     CHECK(dispatch(ctx, router, make_request(ctx, "/state"))->last_body == "shared");
 
     Router without;
     without.route({Method::Get}, "/state", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(200).send(req->app_state<AppState>() ? "present" : "missing");
+        co_await res->status(status::ok).send(req->app_state<AppState>() ? "present" : "missing");
     });
     CHECK(dispatch(ctx, without, make_request(ctx, "/state"))->last_body == "missing");
 }
@@ -136,7 +136,7 @@ TEST_CASE("framework: host child routers share application state", "[framework][
     router.host("api.example.com", [](Router &api) {
         api.route({Method::Get}, "/state", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
             const AppState *state = req->app_state<AppState>();
-            co_await res->status(200).send(state ? state->name : "missing");
+            co_await res->status(status::ok).send(state ? state->name : "missing");
         });
     });
 
@@ -148,11 +148,11 @@ TEST_CASE("framework: {*rest} captures the remaining path", "[framework][wildcar
     Router router;
     router.route({Method::Get}, "/files/static", text_handler("static"));
     router.route({Method::Get}, "/files/{id}", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(200).send("id=" + std::string{*req->param("id")});
+        co_await res->status(status::ok).send("id=" + std::string{*req->param("id")});
     });
     router.route({Method::Get}, "/files/{*rest}", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
         auto rest = req->param("rest");
-        co_await res->status(200).send("rest=" + std::string{rest.value_or("")});
+        co_await res->status(status::ok).send("rest=" + std::string{rest.value_or("")});
     });
 
     CHECK(dispatch(ctx, router, make_request(ctx, "/files/static"))->last_body == "static");
@@ -169,27 +169,27 @@ TEST_CASE("framework: Path/Query/State extractors run before the handler", "[fra
     router.route({Method::Get}, "/users/{id}",
                  extract<Path<UserParams>, State<AppState>>([](const UserParams &params, AppState *state, RequestPtr,
                                                                ResponsePtr res) -> asio::awaitable<void> {
-                     co_await res->status(200).send(std::to_string(params.id) + ":" + state->name);
+                     co_await res->status(status::ok).send(std::to_string(params.id) + ":" + state->name);
                  }));
 
     router.route(
         {Method::Get}, "/list",
         extract<Query<ListQuery>>([](const ListQuery &query, RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-            co_await res->status(200).send(query.q + ":" + std::to_string(query.page));
+            co_await res->status(status::ok).send(query.q + ":" + std::to_string(query.page));
         }));
 
     CHECK(dispatch(ctx, router, make_request(ctx, "/users/42"))->last_body == "42:state");
     CHECK(dispatch(ctx, router, make_request(ctx, "/list?q=x&page=2"))->last_body == "x:2");
 
     // A missing path capture is a 400, and the handler is not entered.
-    CHECK(dispatch(ctx, router, make_request(ctx, "/users/not-an-int"))->last_status == 400);
+    CHECK(dispatch(ctx, router, make_request(ctx, "/users/not-an-int"))->last_status == status::bad_request);
 
     // The State extractor is a configuration error when the type is absent.
     Router no_state;
     no_state.route(
         {Method::Get}, "/state",
         extract<State<AppState>>([](AppState *, RequestPtr, ResponsePtr) -> asio::awaitable<void> { co_return; }));
-    CHECK(dispatch(ctx, no_state, make_request(ctx, "/state"))->last_status == 500);
+    CHECK(dispatch(ctx, no_state, make_request(ctx, "/state"))->last_status == status::internal_server_error);
 }
 
 TEST_CASE("framework: Header and Cookie extractors parse typed values", "[framework][extract]") {
@@ -198,7 +198,7 @@ TEST_CASE("framework: Header and Cookie extractors parse typed values", "[framew
     router.route({Method::Get}, "/headers",
                  extract<Header<int, "x-page">, Cookie<std::string, "sid">>(
                      [](int page, std::string sid, RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-                         co_await res->status(200).send(std::to_string(page) + ":" + sid);
+                         co_await res->status(status::ok).send(std::to_string(page) + ":" + sid);
                      }));
 
     auto req = make_request(ctx, "/headers");
@@ -213,7 +213,7 @@ TEST_CASE("framework: extract supports a trailing SslHandle parameter", "[framew
     router.route({Method::Get}, "/users/{id}",
                  extract<Path<UserParams>>(
                      [](const UserParams &params, RequestPtr, ResponsePtr res, SslHandle ssl) -> asio::awaitable<void> {
-                         co_await res->status(200).send(std::to_string(params.id) + (ssl ? ":tls" : ":plain"));
+                         co_await res->status(status::ok).send(std::to_string(params.id) + (ssl ? ":tls" : ":plain"));
                      }));
     CHECK(dispatch(ctx, router, make_request(ctx, "/users/7"))->last_body == "7:plain");
 }
@@ -223,11 +223,11 @@ TEST_CASE("framework: Json/Form extractors consume the body once", "[framework][
     Router router;
     router.route({Method::Post}, "/json",
                  extract<Json<CreateUser>>([](CreateUser user, RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-                     co_await res->status(201).send(user.name + ":" + std::to_string(user.age));
+                     co_await res->status(status::created).send(user.name + ":" + std::to_string(user.age));
                  }));
     router.route({Method::Post}, "/form",
                  extract<Form<CreateUser>>([](CreateUser user, RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-                     co_await res->status(201).send(user.name + ":" + std::to_string(user.age));
+                     co_await res->status(status::created).send(user.name + ":" + std::to_string(user.age));
                  }));
 
     auto json = make_request(ctx, "/json", Method::Post);
@@ -240,7 +240,7 @@ TEST_CASE("framework: Json/Form extractors consume the body once", "[framework][
 
     auto bad = make_request(ctx, "/json", Method::Post);
     set_body(bad, "{not json");
-    CHECK(dispatch(ctx, router, bad)->last_status == 400);
+    CHECK(dispatch(ctx, router, bad)->last_status == status::bad_request);
 }
 
 TEST_CASE("framework: Valid<E> turns a Validator failure into 422 with details", "[framework][validation]") {
@@ -249,17 +249,17 @@ TEST_CASE("framework: Valid<E> turns a Validator failure into 422 with details",
     router.route(
         {Method::Post}, "/users",
         extract<Valid<Json<CreateUser>>>([](CreateUser user, RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-            co_await res->status(201).send(user.name);
+            co_await res->status(status::created).send(user.name);
         }));
 
     auto ok = make_request(ctx, "/users", Method::Post);
     set_body(ok, R"({"name":"ada","age":36})");
-    CHECK(dispatch(ctx, router, ok)->last_status == 201);
+    CHECK(dispatch(ctx, router, ok)->last_status == status::created);
 
     auto bad = make_request(ctx, "/users", Method::Post);
     set_body(bad, R"({"name":"ada","age":0})");
     auto sink = dispatch(ctx, router, bad);
-    CHECK(sink->last_status == 422);
+    CHECK(sink->last_status == status::unprocessable_content);
     CHECK(sink->last_body.find("validation_failed") != std::string::npos);
     CHECK(sink->last_body.find("age") != std::string::npos);
 }
@@ -303,16 +303,16 @@ TEST_CASE("framework: session creates, loads and persists server-side data", "[f
     router.route({Method::Post}, "/set", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
         auto *s = session(*req);
         if (!s) {
-            co_await res->status(500).send("no session");
+            co_await res->status(status::internal_server_error).send("no session");
             co_return;
         }
         s->set("uid", "42");
-        co_await res->status(204).send("");
+        co_await res->status(status::no_content).send("");
     });
     router.route({Method::Get}, "/get", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
         auto *s = session(*req);
         auto uid = s ? s->get("uid") : std::nullopt;
-        co_await res->status(200).send(uid ? std::string{*uid} : "none");
+        co_await res->status(status::ok).send(uid ? std::string{*uid} : "none");
     });
     router.route({Method::Get}, "/rotate", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
         auto *s = session(*req);
@@ -320,7 +320,7 @@ TEST_CASE("framework: session creates, loads and persists server-side data", "[f
             s->regenerate_id();
             s->set("uid", "99");
         }
-        co_await res->status(200).send("rotated");
+        co_await res->status(status::ok).send("rotated");
     });
 
     auto first = make_request(ctx, "/set", Method::Post);
@@ -356,11 +356,11 @@ TEST_CASE("framework: CSRF is a double-submit check for unsafe methods", "[frame
     router.use(middleware::csrf(CsrfConfig{.cookie_name = "csrf", .secure = false}));
     bool submitted = false;
     router.route({Method::Get}, "/token", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(200).send(std::string{csrf_token(*req)});
+        co_await res->status(status::ok).send(std::string{csrf_token(*req)});
     });
     router.route({Method::Post}, "/submit", [&submitted](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
         submitted = true;
-        co_await res->status(204).send("");
+        co_await res->status(status::no_content).send("");
     });
 
     auto token_sink = dispatch(ctx, router, make_request(ctx, "/token"));
@@ -372,13 +372,13 @@ TEST_CASE("framework: CSRF is a double-submit check for unsafe methods", "[frame
     auto good = make_request(ctx, "/submit", Method::Post);
     good->mutable_headers().add("cookie", "csrf=" + token);
     good->mutable_headers().add("x-csrf-token", token);
-    CHECK(dispatch(ctx, router, good)->last_status == 204);
+    CHECK(dispatch(ctx, router, good)->last_status == status::no_content);
     CHECK(submitted);
 
     submitted = false;
     auto bad = make_request(ctx, "/submit", Method::Post);
     bad->mutable_headers().add("cookie", "csrf=" + token);
-    CHECK(dispatch(ctx, router, bad)->last_status == 403);
+    CHECK(dispatch(ctx, router, bad)->last_status == status::forbidden);
     CHECK_FALSE(submitted);
 }
 
@@ -530,17 +530,19 @@ TEST_CASE("framework: JWT verifies HS256, claims and scopes", "[framework][jwt]"
     router.route({Method::Get}, "/me", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
         const Principal *identity = principal(*req);
         if (!identity) {
-            co_await res->status(500).send("no principal");
+            co_await res->status(status::internal_server_error).send("no principal");
             co_return;
         }
         std::string scopes;
         for (const auto &scope : identity->scopes) {
             scopes += (scopes.empty() ? "" : ",") + scope;
         }
-        co_await res->status(200).send(identity->subject + ":" + scopes);
+        co_await res->status(status::ok).send(identity->subject + ":" + scopes);
     });
     router.route({Method::Get}, "/write", {middleware::require_scope("write")},
-                 [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(204).send(""); });
+                 [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+                     co_await res->status(status::no_content).send("");
+                 });
 
     const std::string header = R"({"alg":"HS256","typ":"JWT"})";
     const std::string payload = jwt_payload("alice", "read write", now_unix() + 3600);
@@ -552,26 +554,26 @@ TEST_CASE("framework: JWT verifies HS256, claims and scopes", "[framework][jwt]"
 
     auto missing = make_request(ctx, "/me");
     auto missing_sink = dispatch(ctx, router, missing);
-    CHECK(missing_sink->last_status == 401);
+    CHECK(missing_sink->last_status == status::unauthorized);
     CHECK(missing_sink->header("www-authenticate").find("invalid_token") != std::string::npos);
 
     auto wrong_signature = make_request(ctx, "/me");
     wrong_signature->mutable_headers().add("authorization", "Bearer " + hs256_token(header, payload, "wrong"));
-    CHECK(dispatch(ctx, router, wrong_signature)->last_status == 401);
+    CHECK(dispatch(ctx, router, wrong_signature)->last_status == status::unauthorized);
 
     auto expired = make_request(ctx, "/me");
     expired->mutable_headers().add(
         "authorization", "Bearer " + hs256_token(header, jwt_payload("alice", "read", now_unix() - 3600), "secret"));
-    CHECK(dispatch(ctx, router, expired)->last_status == 401);
+    CHECK(dispatch(ctx, router, expired)->last_status == status::unauthorized);
 
     auto unscoped = make_request(ctx, "/write");
     unscoped->mutable_headers().add(
         "authorization", "Bearer " + hs256_token(header, jwt_payload("alice", "read", now_unix() + 3600), "secret"));
-    CHECK(dispatch(ctx, router, unscoped)->last_status == 403);
+    CHECK(dispatch(ctx, router, unscoped)->last_status == status::forbidden);
 
     auto scoped = make_request(ctx, "/write");
     scoped->mutable_headers().add("authorization", "Bearer " + token);
-    CHECK(dispatch(ctx, router, scoped)->last_status == 204);
+    CHECK(dispatch(ctx, router, scoped)->last_status == status::no_content);
 }
 
 TEST_CASE("framework: JWT rejects malformed, unsigned and mismatched tokens", "[framework][jwt]") {
@@ -600,7 +602,7 @@ TEST_CASE("framework: JWT rejects malformed, unsigned and mismatched tokens", "[
     }));
     router.route({Method::Get}, "/me", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
         const Principal *identity = principal(*req);
-        co_await res->status(200).send(identity ? identity->subject : std::string{"none"});
+        co_await res->status(status::ok).send(identity ? identity->subject : std::string{"none"});
     });
     router.route({Method::Get}, "/admin", {middleware::require_role("admin")}, text_handler("admin"));
 
@@ -611,26 +613,26 @@ TEST_CASE("framework: JWT rejects malformed, unsigned and mismatched tokens", "[
 
     // exp / nbf / iss / aud claims.
     CHECK(dispatch(ctx, router, bearer(hs256_token(header, claims("iss", "aud", now - 3600, 0, admin_roles), "secret")))
-              ->last_status == 401);
+              ->last_status == status::unauthorized);
     CHECK(dispatch(ctx, router,
                    bearer(hs256_token(header, claims("iss", "aud", now + 3600, now + 3600, admin_roles), "secret")))
-              ->last_status == 401);
+              ->last_status == status::unauthorized);
     CHECK(
         dispatch(ctx, router, bearer(hs256_token(header, claims("other", "aud", now + 3600, 0, admin_roles), "secret")))
-            ->last_status == 401);
+            ->last_status == status::unauthorized);
     CHECK(
         dispatch(ctx, router, bearer(hs256_token(header, claims("iss", "other", now + 3600, 0, admin_roles), "secret")))
-            ->last_status == 401);
+            ->last_status == status::unauthorized);
     // require_exp is on by default.
     CHECK(dispatch(ctx, router, bearer(hs256_token(header, R"({"sub":"alice","iss":"iss","aud":"aud"})", "secret")))
-              ->last_status == 401);
+              ->last_status == status::unauthorized);
 
     // Signature and algorithm allowlist.
     CHECK(dispatch(ctx, router, bearer(hs256_token(header, claims("iss", "aud", now + 3600, 0, admin_roles), "wrong")))
-              ->last_status == 401);
+              ->last_status == status::unauthorized);
     const std::string unsigned_token = base64_url_encode(R"({"alg":"none"})") + "." +
                                        base64_url_encode(claims("iss", "aud", now + 3600, 0, admin_roles)) + ".";
-    CHECK(dispatch(ctx, router, bearer(unsigned_token))->last_status == 401);
+    CHECK(dispatch(ctx, router, bearer(unsigned_token))->last_status == status::unauthorized);
 
     TestKey rsa = make_rsa_key();
     Router rs_only;
@@ -643,20 +645,20 @@ TEST_CASE("framework: JWT rejects malformed, unsigned and mismatched tokens", "[
     rs_only.route({Method::Get}, "/me", text_handler("rs"));
     // Algorithm confusion: an HS256 token must not be accepted by an RS256-only
     // verifier even though its MAC would verify.
-    CHECK(dispatch(ctx, rs_only, bearer(valid))->last_status == 401);
+    CHECK(dispatch(ctx, rs_only, bearer(valid))->last_status == status::unauthorized);
 
     // Malformed compact JWS and a non-Bearer scheme.
-    CHECK(dispatch(ctx, router, bearer("not-a-jwt"))->last_status == 401);
-    CHECK(dispatch(ctx, router, bearer("a.b"))->last_status == 401);
+    CHECK(dispatch(ctx, router, bearer("not-a-jwt"))->last_status == status::unauthorized);
+    CHECK(dispatch(ctx, router, bearer("a.b"))->last_status == status::unauthorized);
     {
         auto req = make_request(ctx, "/me");
         req->mutable_headers().add("authorization", "Basic abc");
-        CHECK(dispatch(ctx, router, req)->last_status == 401);
+        CHECK(dispatch(ctx, router, req)->last_status == status::unauthorized);
     }
 
     // require_role: a valid but under-privileged token is 403, not 401.
     const std::string user_token = hs256_token(header, claims("iss", "aud", now + 3600, 0, user_roles), "secret");
-    CHECK(dispatch(ctx, router, bearer(user_token, "/admin"))->last_status == 403);
+    CHECK(dispatch(ctx, router, bearer(user_token, "/admin"))->last_status == status::forbidden);
     CHECK(dispatch(ctx, router, bearer(valid, "/admin"))->last_body == "admin");
 
     // optional=true: no header passes through anonymously; an invalid token is
@@ -671,12 +673,12 @@ TEST_CASE("framework: JWT rejects malformed, unsigned and mismatched tokens", "[
     }));
     optional.route({Method::Get}, "/me", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
         const Principal *identity = principal(*req);
-        co_await res->status(200).send(identity ? identity->subject : std::string{"none"});
+        co_await res->status(status::ok).send(identity ? identity->subject : std::string{"none"});
     });
     CHECK(dispatch(ctx, optional, make_request(ctx, "/me"))->last_body == "none");
     CHECK(
         dispatch(ctx, optional, bearer(hs256_token(header, claims("iss", "aud", now + 3600, 0, admin_roles), "wrong")))
-            ->last_status == 401);
+            ->last_status == status::unauthorized);
 }
 
 TEST_CASE("framework: JWT verifies RS256 and ES256 signatures", "[framework][jwt]") {
@@ -757,13 +759,13 @@ TEST_CASE("framework: JWKS selects RSA/EC keys by kid", "[framework][jwt][jwks]"
 
     CHECK(with_token(make_token(rsa.key.get(), "RS256", "rsa1"))->last_body == "ok");
     CHECK(with_token(make_token(ec.key.get(), "ES256", "ec1"))->last_body == "ok");
-    CHECK(with_token(make_token(rsa.key.get(), "RS256", "nope"))->last_status == 401);
+    CHECK(with_token(make_token(rsa.key.get(), "RS256", "nope"))->last_status == status::unauthorized);
     // No kid is fine when the algorithm leaves exactly one candidate...
     CHECK(with_token(make_no_kid_token(rsa.key.get(), "RS256"))->last_body == "ok");
     {
         const std::string header = R"({"alg":"ES256","typ":"JWT","kid":"rsa1"})";
         const std::string input = base64_url_encode(header) + "." + base64_url_encode(payload);
-        CHECK(with_token(jws(header, payload, sign_evp(rsa.key.get(), input)))->last_status == 401);
+        CHECK(with_token(jws(header, payload, sign_evp(rsa.key.get(), input)))->last_status == status::unauthorized);
     }
 
     // ...but is rejected when several keys share the algorithm.
@@ -777,7 +779,7 @@ TEST_CASE("framework: JWKS selects RSA/EC keys by kid", "[framework][jwt][jwks]"
     ambiguous.route({Method::Get}, "/me", text_handler("ambiguous"));
     auto ambiguous_request = make_request(ctx, "/me");
     ambiguous_request->mutable_headers().add("authorization", "Bearer " + make_no_kid_token(rsa.key.get(), "RS256"));
-    CHECK(dispatch(ctx, ambiguous, ambiguous_request)->last_status == 401);
+    CHECK(dispatch(ctx, ambiguous, ambiguous_request)->last_status == status::unauthorized);
 
     // A single key is usable without a kid.
     Router single;

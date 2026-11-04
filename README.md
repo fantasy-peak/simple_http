@@ -144,7 +144,7 @@ int main() {
     Server server{cfg};
     server.route({Method::Get}, "/hello",
                  [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-                     co_await res->status(200).content_type(mime::text_plain).send("Hello World!");
+                     co_await res->status(status::ok).content_type(mime::text_plain).send("Hello World!");
                  });
 
     auto started = server.start(); // std::expected<StartReport, StartupError>
@@ -183,21 +183,21 @@ server.route({Method::Get}, "/users/{id}",
              [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
                  auto id = req->param("id"); // std::optional<std::string_view>
                  if (!id) {
-                     co_await res->status(400).send("bad id");
+                     co_await res->status(status::bad_request).send("bad id");
                      co_return;
                  }
-                 co_await res->status(200).send("user " + std::string{*id});
+                 co_await res->status(status::ok).send("user " + std::string{*id});
              });
 
 server.group("/api", {middleware::basic_auth("svc", "s3cret")}, [](Router &api) {
     api.route({Method::Get, Method::Post}, "/items",
               [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-                  co_await res->status(200).send("items");
+                  co_await res->status(status::ok).send("items");
               });
 });
 
 server.fallback([](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-    co_await res->status(404).send("not found");
+    co_await res->status(status::not_found).send("not found");
 });
 ```
 
@@ -276,14 +276,14 @@ server.route({Method::Get}, "/pets/{id}",
     [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
         auto p = openapi::path_params<PetParams>(*req);
         auto body = glz::write_json(Pet{.id = p->id, .name = "rex"});
-        co_await res->status(200).content_type(mime::app_json).send(body ? *body : "{}");
+        co_await res->status(status::ok).content_type(mime::app_json).send(body ? *body : "{}");
     },
     openapi::doc()
         .path_params<PetParams>()
         .response<Pet>()
         .summary("get a pet")
         .operation_id("getPet")
-        .error<ErrorBody>(404, "no such pet"));
+        .error<ErrorBody>(status::not_found, "no such pet"));
 
 server.serve_openapi("/openapi.json");
 server.serve_swagger_ui("/swagger", "/openapi.json");
@@ -324,11 +324,11 @@ server.state(std::make_shared<AppState>(AppState{db}));
 server.route({Method::Get}, "/users", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
     const AppState *state = req->app_state<AppState>();
     if (!state) {
-        co_await res->status(500).send("state missing");
+        co_await res->status(status::internal_server_error).send("state missing");
         co_return;
     }
     auto rows = co_await state->db->query(...);
-    co_await res->status(200).send(rows);
+    co_await res->status(status::ok).send(rows);
 });
 ```
 
@@ -350,13 +350,13 @@ server.route({Method::Get}, "/users/{id}",
     extract<Path<UserParams>, State<AppState>>(
         [](const UserParams &p, AppState *state, RequestPtr, ResponsePtr res)
             -> asio::awaitable<void> {
-            co_await res->status(200).send(std::to_string(p.id));
+            co_await res->status(status::ok).send(std::to_string(p.id));
         }));
 
 server.route({Method::Post}, "/users",
     extract<Valid<Json<CreateUser>>>(
         [](CreateUser in, RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-            co_await res->status(201).send(in.name);
+            co_await res->status(status::created).send(in.name);
         }));
 ```
 
@@ -399,7 +399,7 @@ server.route({Method::Post}, "/login",
             s->regenerate_id();     // session-fixation defense
             s->set("uid", "42");
         }
-        co_await res->status(204).send("");
+        co_await res->status(status::no_content).send("");
     });
 ```
 
@@ -423,7 +423,7 @@ server.use(middleware::require_scope("users:write"));
 
 server.route({Method::Get}, "/me", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
     const Principal *principal = simple_http::principal(*req);
-    co_await res->status(200).send(principal ? principal->subject : "");
+    co_await res->status(status::ok).send(principal ? principal->subject : "");
 });
 ```
 
@@ -460,7 +460,7 @@ server.host("*.example.com", [](Router &sub) {
 
 server.route({Method::Get}, "/files/{*rest}",
     [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(200).send(std::string{req->param("rest").value_or("")});
+        co_await res->status(status::ok).send(std::string{req->param("rest").value_or("")});
     });
 ```
 
@@ -621,13 +621,13 @@ cfg.tls = TlsConfig{
 server.route({Method::Get}, "/whoami",
     [](RequestPtr, ResponsePtr res, SslHandle ssl) -> asio::awaitable<void> {
         if (!ssl) {
-            co_await res->status(400).send("plaintext");
+            co_await res->status(status::bad_request).send("plaintext");
             co_return;
         }
         X509 *cert = SSL_get1_peer_certificate(*ssl);
         if (cert)
             X509_free(cert);
-        co_await res->status(200).send("ok");
+        co_await res->status(status::ok).send("ok");
     });
 ```
 
@@ -766,10 +766,10 @@ Exceeding `max_body_bytes` produces 413; exceeding `max_header_bytes` produces 4
 
 ```cpp
 // one-shot
-co_await res->status(200).content_type("text/plain").send("hello");
+co_await res->status(status::ok).content_type("text/plain").send("hello");
 
 // streamed (chunked on HTTP/1.1, DATA frames on HTTP/2)
-co_await res->status(200).begin();
+co_await res->status(status::ok).begin();
 co_await res->write("first ");
 co_await res->finish("last");
 ```
@@ -786,7 +786,7 @@ res->set_cookie("session", "abc", std::chrono::seconds{3600},
                 "/", "", true, true, "Lax");
 
 // response trailers (RFC 9110 §6.5): only on a streamed response
-co_await res->status(200).begin();
+co_await res->status(status::ok).begin();
 co_await res->write("body");
 res->trailer("x-checksum", "abc123");
 co_await res->finish_trailers();
@@ -857,7 +857,7 @@ if (!n) {
                          {.code = "upload_failed", .message = n.error().message()});
     co_return;
 }
-co_await res->status(201).send(std::to_string(*n));
+co_await res->status(status::created).send(std::to_string(*n));
 ```
 
 ### Forms, JSON, parameters and multipart

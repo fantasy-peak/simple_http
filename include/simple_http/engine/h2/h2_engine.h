@@ -183,7 +183,7 @@ template <TransportLike Transport> class Http2ResponseSink : public ResponseSink
         m_continue_sent = true;
         // A 1xx block carries only :status (RFC 9113 §8.1); submit_headers
         // already skips Date/Alt-Svc for status < 200.
-        eng->submit_headers(m_stream_id, 100, Headers{}, /*end_stream=*/false);
+        eng->submit_headers(m_stream_id, status::continue_, Headers{}, /*end_stream=*/false);
         eng->flush();
         co_return error_code{};
     }
@@ -2436,7 +2436,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
             asio::co_spawn(
                 m_executor,
                 [self, writer, stream_id]() -> asio::awaitable<void> {
-                    (void)co_await writer->send_bodyless(404, Headers{});
+                    (void)co_await writer->send_bodyless(status::not_found, Headers{});
                     // There is no tunnel on this stream, so close its read side:
                     // inbound DATA then returns its flow-control credit instead of
                     // being banked for a reader that will never exist (see
@@ -2499,7 +2499,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
 
         // RFC 8441 §4: a 2xx response *is* the acceptance; there is no
         // Sec-WebSocket-Accept over HTTP/2, and the stream stays open.
-        if (auto ec = co_await sink->send_headers(200, std::move(response_headers)); ec)
+        if (auto ec = co_await sink->send_headers(status::ok, std::move(response_headers)); ec)
             co_return false;
 
         auto adapter = std::make_shared<WsStreamAdapter>(this->weak_from_this(), stream_id, m_executor);
@@ -2554,7 +2554,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
             const error_code ec = connected.error();
             SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy connect {}:{} failed (client {}): {}", target.host, target.port,
                                   address_string(peer.address()), ec.message());
-            co_await fail(502);
+            co_await fail(status::bad_gateway);
             co_return false;
         }
         auto backend = std::move(*connected);
@@ -2572,7 +2572,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
             SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy: refusing a request target with CR/LF/NUL (client {})",
                                   address_string(peer.address()));
             close_backend();
-            co_await fail(400);
+            co_await fail(status::bad_request);
             co_return false;
         }
         std::string replay_target = std::move(*replay);
@@ -2590,7 +2590,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                 SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy backend handshake write failed (client {}): {}",
                                       address_string(peer.address()), wec.message());
                 close_backend();
-                co_await fail(502);
+                co_await fail(status::bad_gateway);
                 co_return false;
             }
         }
@@ -2600,11 +2600,11 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
             SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy backend handshake failed (client {}): {}",
                                   address_string(peer.address()), reply.error().message());
             close_backend();
-            co_await fail(502);
+            co_await fail(status::bad_gateway);
             co_return false;
         }
 
-        if (reply->head.status != 101) {
+        if (reply->head.status != status::switching_protocols) {
             // Surface the backend's actual refusal status and end-to-end fields
             // (WWW-Authenticate, Location, …), not an invented 502. The body is
             // not relayed: an h2 extended-CONNECT response is terminated at the
@@ -2628,7 +2628,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
             SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy backend answered 101 with a mismatched Upgrade/accept (client {})",
                                   address_string(peer.address()));
             close_backend();
-            co_await fail(502);
+            co_await fail(status::bad_gateway);
             co_return false;
         }
 
@@ -2644,7 +2644,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                 continue;
             response_headers.add_lower(name, value);
         }
-        if (auto ec = co_await sink->send_headers(200, std::move(response_headers)); ec) {
+        if (auto ec = co_await sink->send_headers(status::ok, std::move(response_headers)); ec) {
             close_backend();
             co_return false;
         }

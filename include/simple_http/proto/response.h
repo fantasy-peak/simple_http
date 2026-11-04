@@ -8,8 +8,8 @@
 // sink hops onto the connection executor internally).
 //
 // Two usage modes:
-//   one-shot:  co_await res.status(200).header("k","v").send("body");
-//   streaming: co_await res.status(200).begin();
+//   one-shot:  co_await res.status(status::ok).header("k","v").send("body");
+//   streaming: co_await res.status(status::ok).begin();
 //              co_await res.write("chunk"); ...; co_await res.finish();
 
 #include <atomic>
@@ -238,7 +238,7 @@ class ResponseWriter {
     // Accumulates one trailer field (RFC 9110 §6.5), sent when the response ends
     // via finish() or finish_trailers(). Trailer fields must not be pseudo-headers
     // or framing headers; a CR/LF/NUL is refused exactly as it is for header().
-    //   co_await res->status(200).begin();
+    //   co_await res->status(status::ok).begin();
     //   co_await res->write(chunk);
     //   res->trailer("server-timing", "db;dur=53");
     //   co_await res->finish();
@@ -295,7 +295,7 @@ class ResponseWriter {
     }
 
     // Server-Sent Events (SSE, text/event-stream): a thin stream wrapper.
-    //   co_await res->status(200).sse_begin();
+    //   co_await res->status(status::ok).sse_begin();
     //   co_await res->sse_event("hello");               // data: hello\n\n
     //   co_await res->sse_event("l1\nl2");              // two data: lines, one event
     //   co_await res->sse_event("payload", "update", "42", ""); // + event: and id:
@@ -395,7 +395,7 @@ class ResponseWriter {
     }
 
     std::shared_ptr<ResponseSink> m_writer;
-    int m_status{200};
+    int m_status{status::ok};
     Headers m_headers;
     // Trailer fields accumulated with trailer(); sent by finish()/finish_trailers().
     Headers m_trailers;

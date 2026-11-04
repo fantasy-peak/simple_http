@@ -291,7 +291,7 @@ TEST_CASE("h2/engine: an early response does not abort the rest of the request b
 
     // An auth/limit-style handler: answer without ever reading the body.
     auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res,
-                         SslHandle) -> asio::awaitable<void> { co_await res->status(200).send("denied"); };
+                         SslHandle) -> asio::awaitable<void> { co_await res->status(status::ok).send("denied"); };
     auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, limits);
     REQUIRE(run_on(ctx, engine->run(dispatcher)));
 

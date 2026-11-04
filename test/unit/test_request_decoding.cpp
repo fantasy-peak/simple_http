@@ -222,7 +222,7 @@ TEST_CASE("decompress_request: unsupported coding is 415 before the handler", "[
     auto mw = middleware::decompress_request();
     REQUIRE(run_on(ctx, mw(req, res, SslHandle{}, next)));
     CHECK_FALSE(called);
-    CHECK(sink->last_status == 415);
+    CHECK(sink->last_status == status::unsupported_media_type);
     CHECK(sink->header("accept-encoding") == "gzip, br");
 }
 
@@ -273,7 +273,7 @@ TEST_CASE("decompress_request: a body already read cannot be decoded", "[request
 
     auto mw = middleware::decompress_request();
     REQUIRE(run_on(ctx, mw(req, res, SslHandle{}, next)));
-    CHECK(sink->last_status == 500);
+    CHECK(sink->last_status == status::internal_server_error);
 }
 
 TEST_CASE("request decoding: bounded decoder stops at the budget", "[request-decoding]") {

@@ -128,24 +128,26 @@ TEST_CASE("openapi: routes carrying operation descriptors register and collect s
     Router router;
     router.route(
         {Method::Get}, "/users/{id}",
-        [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(200).send("user"); },
+        [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(status::ok).send("user"); },
         openapi::doc().response<UserProfile>());
     router.route(
         {Method::Post}, "/users",
-        [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(201).send("created"); },
+        [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+            co_await res->status(status::created).send("created");
+        },
         openapi::doc()
             .request_body<CreateUserReq>()
             .response<UserProfile>()
             .summary("create a user")
             .tag("user")
             .query<std::string>("origin", {.description = "where from"})
-            .error<ErrorBody>(400, "invalid request body")
-            .error<ErrorBody>(409, "name already taken"));
+            .error<ErrorBody>(status::bad_request, "invalid request body")
+            .error<ErrorBody>(status::conflict, "name already taken"));
 
     // The registration is a normal route: dispatch works exactly as untyped.
     asio::io_context ctx;
     CHECK(dispatch(ctx, router, "/users/{id}", Method::Get)->last_body == "user");
-    CHECK(dispatch(ctx, router, "/users", Method::Post)->last_status == 201);
+    CHECK(dispatch(ctx, router, "/users", Method::Post)->last_status == status::created);
     CHECK(dispatch(ctx, router, "/users", Method::Post)->last_body == "created");
     // A wrong method is still the router's 405.
     CHECK(dispatch(ctx, router, "/users", Method::Get)->last_status == status::method_not_allowed);
@@ -241,7 +243,7 @@ TEST_CASE("openapi: document and Swagger UI are served", "[openapi]") {
     Router router;
     router.route(
         {Method::Get}, "/users/{id}",
-        [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(200).send("user"); },
+        [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(status::ok).send("user"); },
         openapi::doc().response<UserProfile>());
     router.serve_openapi("/openapi.json");
     router.serve_swagger_ui("/swagger", "/openapi.json");

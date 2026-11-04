@@ -108,7 +108,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t *data, std::size_t size
         volatile std::size_t sink = body ? body->size() : 0;
         (void)sink;
         if (body) {
-            (void)co_await response->status(200).send("ok");
+            (void)co_await response->status(status::ok).send("ok");
         }
     };
     asio::co_spawn(ctx, engine->run(dispatch), asio::detached);

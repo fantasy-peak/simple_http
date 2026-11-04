@@ -14,7 +14,7 @@
 //         extract<Path<UserParams>, Json<CreateUser>>(
 //             [](const UserParams &p, CreateUser in, RequestPtr req, ResponsePtr res)
 //                 -> asio::awaitable<void> {
-//                 co_await res->status(201).send("ok");
+//                 co_await res->status(status::created).send("ok");
 //             }));
 //
 // Extracted values are passed first, then the Request and Response. A handler
@@ -47,7 +47,7 @@ namespace simple_http {
 // populate the JsonError body, and `details` is an optional JSON fragment (the
 // validation extractor puts the field-error array there).
 struct HttpError {
-    int status{400};
+    int status{simple_http::status::bad_request};
     std::string code;
     std::string message;
     std::string details;
@@ -57,7 +57,9 @@ struct HttpError {
 // decoded representation exceeded the configured limit (413). Everything else
 // stays a bad request; the handler can inspect the original error if it needs
 // to distinguish further.
-inline int body_error_status(const error_code &ec) { return ec == asio::error::message_size ? 413 : 400; }
+inline int body_error_status(const error_code &ec) {
+    return ec == asio::error::message_size ? status::payload_too_large : status::bad_request;
+}
 
 // Renders an HttpError as the library's standard JSON error body.
 inline asio::awaitable<void> render_http_error(ResponsePtr res, const HttpError &error) {
@@ -126,7 +128,8 @@ template <typename T> struct Extractor<Path<T>> {
     static asio::awaitable<std::expected<T, HttpError>> run(Request &req) {
         auto value = path_params<T>(req);
         if (!value) {
-            co_return std::unexpected(HttpError{400, "invalid_path", "invalid or missing path parameters", {}});
+            co_return std::unexpected(
+                HttpError{status::bad_request, "invalid_path", "invalid or missing path parameters", {}});
         }
         co_return std::move(*value);
     }
@@ -138,7 +141,8 @@ template <typename T> struct Extractor<Query<T>> {
     static asio::awaitable<std::expected<T, HttpError>> run(Request &req) {
         auto value = query_params<T>(req);
         if (!value) {
-            co_return std::unexpected(HttpError{400, "invalid_query", "invalid or missing query parameters", {}});
+            co_return std::unexpected(
+                HttpError{status::bad_request, "invalid_query", "invalid or missing query parameters", {}});
         }
         co_return std::move(*value);
     }
@@ -168,7 +172,7 @@ template <typename T> struct Extractor<Form<T>> {
         }
         auto value = parse_params<T>(*form);
         if (!value) {
-            co_return std::unexpected(HttpError{400, "invalid_form", "invalid form field types", {}});
+            co_return std::unexpected(HttpError{status::bad_request, "invalid_form", "invalid form field types", {}});
         }
         co_return std::move(*value);
     }
@@ -180,8 +184,10 @@ template <typename T> struct Extractor<State<T>> {
     static asio::awaitable<std::expected<T *, HttpError>> run(Request &req) {
         T *state = req.app_state<T>();
         if (!state) {
-            co_return std::unexpected(
-                HttpError{500, "state_missing", "application state is not configured for this route", {}});
+            co_return std::unexpected(HttpError{status::internal_server_error,
+                                                "state_missing",
+                                                "application state is not configured for this route",
+                                                {}});
         }
         co_return state;
     }
@@ -213,12 +219,12 @@ template <typename T, FixedString Name> struct Extractor<Header<T, Name>> {
         const auto value = req.header(Name.view());
         if (!value) {
             co_return std::unexpected(
-                HttpError{400, "missing_header", "missing required header", std::string{Name.view()}});
+                HttpError{status::bad_request, "missing_header", "missing required header", std::string{Name.view()}});
         }
         auto parsed = detail::parse_scalar<T>(*value);
         if (!parsed) {
             co_return std::unexpected(
-                HttpError{400, "invalid_header", "invalid header value", std::string{Name.view()}});
+                HttpError{status::bad_request, "invalid_header", "invalid header value", std::string{Name.view()}});
         }
         co_return std::move(*parsed);
     }
@@ -231,12 +237,12 @@ template <typename T, FixedString Name> struct Extractor<Cookie<T, Name>> {
         const auto value = req.cookie(Name.view());
         if (!value) {
             co_return std::unexpected(
-                HttpError{400, "missing_cookie", "missing required cookie", std::string{Name.view()}});
+                HttpError{status::bad_request, "missing_cookie", "missing required cookie", std::string{Name.view()}});
         }
         auto parsed = detail::parse_scalar<T>(*value);
         if (!parsed) {
             co_return std::unexpected(
-                HttpError{400, "invalid_cookie", "invalid cookie value", std::string{Name.view()}});
+                HttpError{status::bad_request, "invalid_cookie", "invalid cookie value", std::string{Name.view()}});
         }
         co_return std::move(*parsed);
     }
@@ -252,8 +258,8 @@ template <typename E> struct Extractor<Valid<E>> {
         }
         auto valid = Validator<value_type>::validate(*value);
         if (!valid) {
-            co_return std::unexpected(
-                HttpError{422, "validation_failed", "request validation failed", field_errors_json(valid.error())});
+            co_return std::unexpected(HttpError{status::unprocessable_content, "validation_failed",
+                                                "request validation failed", field_errors_json(valid.error())});
         }
         co_return std::move(*value);
     }

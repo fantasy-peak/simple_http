@@ -302,8 +302,8 @@ TEST_CASE("proto/response: defaults are filled in but never override", "[proto]"
 
     {
         ResponseWriter res{writer};
-        REQUIRE(run_on(ctx, res.status(201).send("created")));
-        CHECK(writer->last_status == 201);
+        REQUIRE(run_on(ctx, res.status(status::created).send("created")));
+        CHECK(writer->last_status == status::created);
         CHECK(writer->last_body == "created");
         CHECK(writer->header("content-type") == "text/plain"); // default
         CHECK(writer->header("server") == std::string{server_product});
@@ -313,7 +313,7 @@ TEST_CASE("proto/response: defaults are filled in but never override", "[proto]"
     {
         auto w2 = std::make_shared<FakeResponseSink>();
         ResponseWriter res{w2};
-        REQUIRE(run_on(ctx, res.status(200)
+        REQUIRE(run_on(ctx, res.status(status::ok)
                                 .content_type("application/json")
                                 .header("server", "mine")
                                 .header("date", "Sun, 06 Nov 1994 08:49:37 GMT")
@@ -336,13 +336,13 @@ TEST_CASE("proto/response: bodyless, streaming and state forwarding", "[proto]")
     writer->ver = Version::Http2;
     CHECK(res.version() == Version::Http2);
 
-    REQUIRE(run_on(ctx, res.status(204).send_bodyless()));
+    REQUIRE(run_on(ctx, res.status(status::no_content).send_bodyless()));
     CHECK(writer->sent_bodyless);
-    CHECK(writer->last_status == 204);
+    CHECK(writer->last_status == status::no_content);
     CHECK(writer->last_body.empty());
     CHECK(writer->header("server") == std::string{server_product}); // defaults apply here too
 
-    REQUIRE(run_on(ctx, res.status(200).begin()));
+    REQUIRE(run_on(ctx, res.status(status::ok).begin()));
     CHECK(writer->begun);
     REQUIRE(run_on(ctx, res.write("a")));
     REQUIRE(run_on(ctx, res.finish("b")));

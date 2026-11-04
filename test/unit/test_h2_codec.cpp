@@ -150,11 +150,11 @@ TEST_CASE("h2/hpack: literals, indexed fields and :status shortcuts", "[h2]") {
     CHECK((static_cast<unsigned char>(named[0]) & 0xF0) == 0x00);
     CHECK((static_cast<unsigned char>(named[0]) & 0x0F) == 1);
 
-    std::string status;
-    hpack_append_status(status, 200);
-    CHECK(hex_of(status) == "88"); // one byte from the static table
-    hpack_append_status(status, 204);
-    CHECK(hex_of(status) == "8889");
+    std::string block;
+    hpack_append_status(block, status::ok);
+    CHECK(hex_of(block) == "88"); // one byte from the static table
+    hpack_append_status(block, status::no_content);
+    CHECK(hex_of(block) == "8889");
 
     std::string uncommon;
     hpack_append_status(uncommon, 418); // not in the table: a literal

@@ -27,12 +27,12 @@ TEST_CASE("error_body: details is included when present", "[proto][json]") {
 }
 
 TEST_CASE("problem_details: RFC 9457 members are serialized", "[proto][json]") {
-    simple_http::ProblemDetails problem{"https://example.test/errors/oops", "Oops", 422, "the body is invalid",
-                                        "/pets/1"};
+    simple_http::ProblemDetails problem{"https://example.test/errors/oops", "Oops",
+                                        simple_http::status::unprocessable_content, "the body is invalid", "/pets/1"};
     const auto json = serialize(problem);
     CHECK(json.find("\"type\":\"https://example.test/errors/oops\"") != std::string::npos);
     CHECK(json.find("\"title\":\"Oops\"") != std::string::npos);
-    CHECK(json.find("\"status\":422") != std::string::npos);
+    CHECK(json.find("\"status\":" + std::to_string(simple_http::status::unprocessable_content)) != std::string::npos);
     CHECK(json.find("\"detail\":\"the body is invalid\"") != std::string::npos);
     CHECK(json.find("\"instance\":\"/pets/1\"") != std::string::npos);
 }

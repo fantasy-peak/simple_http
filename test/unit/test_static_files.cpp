@@ -195,7 +195,7 @@ TEST_CASE("static: a file that vanishes after the scan is a miss, not an empty 2
 
     auto preloaded = get(*site, ctx, "/index.html");
     CHECK(preloaded.handled);
-    CHECK(preloaded.writer->last_status == 200);
+    CHECK(preloaded.writer->last_status == status::ok);
 
     // ...and the one that has to read must report a miss, so the caller's 404
     // path answers instead of the server inventing an empty 200.
@@ -336,7 +336,7 @@ TEST_CASE("static: preload respects both the per-file cap and the budget", "[sta
         asio::io_context ctx;
         auto r = get(*site, ctx, "/app.js");
         CHECK(r.handled);
-        CHECK(r.writer->last_status == 200);
+        CHECK(r.writer->last_status == status::ok);
         CHECK(r.writer->last_body == "console.log('app');");
     }
 }
@@ -394,7 +394,7 @@ TEST_CASE("static: a GET carries the headers a cache needs", "[static]") {
     auto r = get(*site, ctx, "/app.js");
 
     CHECK(r.handled);
-    CHECK(r.writer->last_status == 200);
+    CHECK(r.writer->last_status == status::ok);
     CHECK(r.writer->last_body == "console.log('app');");
 
     CHECK(r.writer->has_header("etag"));
@@ -414,7 +414,7 @@ TEST_CASE("static: HEAD carries a GET's length and no body", "[static]") {
     auto r = serve(*site, ctx, make_request(ctx, "/app.js", Method::Head));
 
     CHECK(r.handled);
-    CHECK(r.writer->last_status == 200);
+    CHECK(r.writer->last_status == status::ok);
     CHECK(r.writer->sent_bodyless);
     CHECK(r.writer->last_body.empty());
 
@@ -433,7 +433,7 @@ TEST_CASE("static: an empty file gets an explicit zero length", "[static]") {
     auto r = get(*site, ctx, "/empty.txt");
 
     CHECK(r.handled);
-    CHECK(r.writer->last_status == 200);
+    CHECK(r.writer->last_status == status::ok);
     // Explicit, because HTTP/1.1 would otherwise frame it as chunked and HTTP/2
     // as END_STREAM — two different byte sequences for one file.
     REQUIRE(r.writer->has_header("content-length"));
@@ -455,7 +455,7 @@ TEST_CASE("static: a conditional hit is a 304 with no length", "[static]") {
         add_header(req, "if-none-match", etag);
         auto r = serve(*site, ctx, req);
         CHECK(r.handled);
-        CHECK(r.writer->last_status == 304);
+        CHECK(r.writer->last_status == status::not_modified);
         CHECK(r.writer->sent_bodyless);
         // RFC 9110 §15.4.5: a 304 carries no content-length.
         CHECK_FALSE(r.writer->has_header("content-length"));
@@ -465,7 +465,7 @@ TEST_CASE("static: a conditional hit is a 304 with no length", "[static]") {
         auto req = make_request(ctx, "/app.js");
         add_header(req, "if-none-match", "\"something-else\"");
         auto r = serve(*site, ctx, req);
-        CHECK(r.writer->last_status == 200);
+        CHECK(r.writer->last_status == status::ok);
         CHECK_FALSE(r.writer->last_body.empty());
     }
     {
@@ -473,7 +473,7 @@ TEST_CASE("static: a conditional hit is a 304 with no length", "[static]") {
         auto req = make_request(ctx, "/app.js");
         add_header(req, "if-modified-since", http_date(entry->mtime + 10));
         auto r = serve(*site, ctx, req);
-        CHECK(r.writer->last_status == 304);
+        CHECK(r.writer->last_status == status::not_modified);
     }
     {
         // If-None-Match wins over If-Modified-Since when both are present and the
@@ -482,7 +482,7 @@ TEST_CASE("static: a conditional hit is a 304 with no length", "[static]") {
         add_header(req, "if-none-match", "\"nope\"");
         add_header(req, "if-modified-since", http_date(entry->mtime + 10));
         auto r = serve(*site, ctx, req);
-        CHECK(r.writer->last_status == 200);
+        CHECK(r.writer->last_status == status::ok);
     }
 }
 
@@ -500,7 +500,7 @@ TEST_CASE("static: a range is a 206 over the identity representation", "[static]
     auto r = serve(*site, ctx, req);
 
     CHECK(r.handled);
-    CHECK(r.writer->last_status == 206);
+    CHECK(r.writer->last_status == status::partial_content);
     CHECK(r.writer->last_body == "console"); // bytes 0-6 inclusive
     CHECK(r.writer->header("content-range") == "bytes 0-6/19");
     CHECK(r.writer->header("content-length") == "7");
@@ -518,7 +518,7 @@ TEST_CASE("static: an unsatisfiable range is a 416 that does not hang the client
     auto r = serve(*site, ctx, req);
 
     CHECK(r.handled);
-    CHECK(r.writer->last_status == 416);
+    CHECK(r.writer->last_status == status::range_not_satisfiable);
     CHECK(r.writer->header("content-range") == "bytes */19");
 
     // send() with an empty body, NOT send_bodyless(): only 204/304 and HEAD are
@@ -540,7 +540,7 @@ TEST_CASE("static: a malformed path is answered here, not served", "[static]") {
         INFO("raw: " << raw);
         auto r = get(*site, ctx, raw);
         CHECK(r.handled); // answered, not passed on
-        CHECK(r.writer->last_status == 400);
+        CHECK(r.writer->last_status == status::bad_request);
         CHECK(r.writer->header("cache-control") == "no-store");
         // The handler answers; the engine drains the (unread) request body and
         // owns the connection. Closing here would RST the response away.
@@ -559,7 +559,7 @@ TEST_CASE("static: a method other than GET/HEAD is resolved before it is rejecte
         // A path that exists: 405, with an Allow.
         auto r = serve(*site, ctx, make_request(ctx, "/index.html", Method::Post));
         CHECK(r.handled);
-        CHECK(r.writer->last_status == 405);
+        CHECK(r.writer->last_status == status::method_not_allowed);
         CHECK(r.writer->header("allow") == "GET, HEAD");
         CHECK(r.writer->last_body == "405 Method Not Allowed");
     }
@@ -587,7 +587,7 @@ TEST_CASE("static: pre-compressed siblings are negotiated, never re-compressed",
 
     {
         auto r = fetch("gzip, deflate, br");
-        CHECK(r.writer->last_status == 200);
+        CHECK(r.writer->last_status == status::ok);
         REQUIRE(r.writer->has_header("content-encoding"));
         CHECK(r.writer->header("content-encoding") == "br");
         CHECK(r.writer->last_body == "BROTLI:console.log('app');");
@@ -610,7 +610,7 @@ TEST_CASE("static: pre-compressed siblings are negotiated, never re-compressed",
         // Everything refused, identity included: 406.
         auto r = fetch("br;q=0, gzip;q=0, identity;q=0");
         CHECK(r.handled);
-        CHECK(r.writer->last_status == 406);
+        CHECK(r.writer->last_status == status::not_acceptable);
     }
 }
 
@@ -625,7 +625,7 @@ TEST_CASE("static: the 404 page is served when there is one", "[static]") {
     auto req = make_request(ctx, "/nope");
     REQUIRE(run_on(ctx, site->serve_not_found(req, res)));
 
-    CHECK(writer->last_status == 404);
+    CHECK(writer->last_status == status::not_found);
     CHECK(writer->last_body == "<html>not found</html>");
     CHECK(writer->header("content-type") == "text/html; charset=utf-8");
 }
@@ -641,7 +641,7 @@ TEST_CASE("static: the 404 is plain text when the site has no page", "[static]")
     auto req = make_request(ctx, "/nope");
     REQUIRE(run_on(ctx, site->serve_not_found(req, res)));
 
-    CHECK(writer->last_status == 404);
+    CHECK(writer->last_status == status::not_found);
     CHECK(writer->last_body == "404 Not Found");
     CHECK(writer->header("content-type") == "text/plain; charset=utf-8");
 }
@@ -676,7 +676,7 @@ TEST_CASE("static: no response ever carries a header twice", "[static]") {
 
     {
         auto r = get(*site, ctx, "/app.js");
-        REQUIRE(r.writer->last_status == 200);
+        REQUIRE(r.writer->last_status == status::ok);
         check_once(r.writer, "200");
     }
     {
@@ -688,31 +688,31 @@ TEST_CASE("static: no response ever carries a header twice", "[static]") {
         const StaticEntry *entry = site->find("/app.js");
         add_header(req, "if-none-match", entry->identity.etag);
         auto r = serve(*site, ctx, req);
-        REQUIRE(r.writer->last_status == 304);
+        REQUIRE(r.writer->last_status == status::not_modified);
         check_once(r.writer, "304");
     }
     {
         auto req = make_request(ctx, "/app.js");
         add_header(req, "range", "bytes=0-2");
         auto r = serve(*site, ctx, req);
-        REQUIRE(r.writer->last_status == 206);
+        REQUIRE(r.writer->last_status == status::partial_content);
         check_once(r.writer, "206");
     }
     {
         auto req = make_request(ctx, "/app.js");
         add_header(req, "range", "bytes=999-");
         auto r = serve(*site, ctx, req);
-        REQUIRE(r.writer->last_status == 416);
+        REQUIRE(r.writer->last_status == status::range_not_satisfiable);
         check_once(r.writer, "416");
     }
     {
         auto r = serve(*site, ctx, make_request(ctx, "/app.js", Method::Head));
-        REQUIRE(r.writer->last_status == 200);
+        REQUIRE(r.writer->last_status == status::ok);
         check_once(r.writer, "HEAD");
     }
     {
         auto r = get(*site, ctx, "/spa/deep/link");
-        REQUIRE(r.writer->last_status == 200);
+        REQUIRE(r.writer->last_status == status::ok);
         check_once(r.writer, "SPA fallback");
     }
     {
@@ -751,7 +751,7 @@ TEST_CASE("static: SPA fallback answers an unmatched path with the index", "[sta
     auto r = get(*site, ctx, "/spa/deep/link");
 
     CHECK(r.handled);
-    CHECK(r.writer->last_status == 200);
+    CHECK(r.writer->last_status == status::ok);
     CHECK(r.writer->last_body == "<html>root index</html>");
 
     // No validators: a client that cached this URL with the index's ETag would
@@ -780,7 +780,7 @@ TEST_CASE("static: SPA fallback leaves extensionless lookups alone", "[static]")
     // A path with no dot is a client-side route.
     auto route = get(*site, ctx, "/user/123");
     CHECK(route.handled);
-    CHECK(route.writer->last_status == 200);
+    CHECK(route.writer->last_status == status::ok);
 
     // With the guard turned off, even a dotted path falls back.
     StaticFilesConfig any = standard_config(fx);

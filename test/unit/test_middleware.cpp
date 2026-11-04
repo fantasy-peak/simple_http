@@ -39,7 +39,7 @@ TEST_CASE("middleware: request_id adopts, generates, echoes and publishes", "[mi
     router.route(any_methods, "/echo", [&](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
         const auto *id = req->get_state<middleware::RequestId>();
         seen = id ? id->value : "";
-        co_await res->status(200).send("ok");
+        co_await res->status(status::ok).send("ok");
     });
 
     asio::io_context ctx;
@@ -65,8 +65,9 @@ TEST_CASE("middleware: access_log records after the chain with the real status",
     Router router;
     ScopedLog capture;
     router.use(middleware::access_log());
-    router.route({Method::Get}, "/ok",
-                 [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(202).send("ok"); });
+    router.route({Method::Get}, "/ok", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(status::accepted).send("ok");
+    });
 
     asio::io_context ctx;
     dispatch(ctx, router, make_request(ctx, "/ok"));
@@ -77,7 +78,7 @@ TEST_CASE("middleware: access_log records after the chain with the real status",
     CHECK(rec.message == "request");
     CHECK(rec.attr("method") == "GET");
     CHECK(rec.attr("path") == "/ok");
-    CHECK(rec.attr("status") == "202");
+    CHECK(rec.attr("status") == std::to_string(status::accepted));
 }
 
 TEST_CASE("middleware: recovery turns a throwing middleware into a 500", "[middleware]") {
@@ -89,7 +90,7 @@ TEST_CASE("middleware: recovery turns a throwing middleware into a 500", "[middl
         co_return;
     });
     router.route(any_methods, "/never", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(200).send("never"); // unreachable: the chain throws first
+        co_await res->status(status::ok).send("never"); // unreachable: the chain throws first
     });
 
     asio::io_context ctx;
@@ -111,7 +112,7 @@ TEST_CASE("middleware: basic_auth accepts the right pair and 401s the rest", "[m
     router.use(middleware::basic_auth("svc", "s3cret"));
     router.route(any_methods, "/secure", [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
         handler_ran = true;
-        co_await res->status(200).send("data");
+        co_await res->status(status::ok).send("data");
     });
 
     asio::io_context ctx;
@@ -128,7 +129,7 @@ TEST_CASE("middleware: basic_auth accepts the right pair and 401s the rest", "[m
         auto req = make_request(ctx, "/secure");
         req->mutable_headers().add_lower(std::string{field::authorization}, "Basic " + base64_encode("svc:s3cret"));
         auto writer = dispatch(ctx, router, req);
-        CHECK(writer->last_status == 200);
+        CHECK(writer->last_status == status::ok);
         CHECK(handler_ran);
     }
     handler_ran = false;

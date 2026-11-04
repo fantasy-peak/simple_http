@@ -22,7 +22,7 @@
 //                 s->regenerate_id();          // session-fixation defense
 //                 s->set("uid", "42");
 //             }
-//             co_await res->status(204).send("");
+//             co_await res->status(status::no_content).send("");
 //         });
 //
 // The cookie carries only an opaque id; values live in the store and are never

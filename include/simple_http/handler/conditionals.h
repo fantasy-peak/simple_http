@@ -8,7 +8,7 @@
 //   if (co_await simple_http::maybe_not_modified(req, res, etag, mtime_unix)) {
 //       co_return; // answered 304, bodyless — no body was produced
 //   }
-//   co_await res->status(200).send(body);
+//   co_await res->status(status::ok).send(body);
 
 #include <boost/asio/awaitable.hpp>
 #include <cstdint>

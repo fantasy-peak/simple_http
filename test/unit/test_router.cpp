@@ -28,7 +28,7 @@ RequestPtr make_request(asio::io_context &ctx, std::string path, Method method =
 // observable.
 Handler body_handler(std::string body) {
     return make_handler([body = std::move(body)](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(200).send(body);
+        co_await res->status(status::ok).send(body);
     });
 }
 
@@ -62,7 +62,7 @@ TEST_CASE("router: exact, regex and fallback matching", "[router]") {
     CHECK(dispatch("/api/users")->last_body == "regex");
     CHECK(dispatch("/nothing-here")->last_body == "fallback");
     // An exact route wins over a regex that would also match.
-    CHECK(dispatch("/exact")->last_status == 200);
+    CHECK(dispatch("/exact")->last_status == status::ok);
 }
 
 TEST_CASE("router: a literal dead end falls back to a template sibling", "[router]") {
@@ -101,7 +101,7 @@ TEST_CASE("router: dispatch without a fallback answers 404", "[router]") {
     auto req = make_request(ctx, "/missing");
     auto res = std::make_shared<ResponseWriter>(writer);
     REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
-    CHECK(writer->last_status == 404);
+    CHECK(writer->last_status == status::not_found);
     CHECK(writer->last_body.empty());
 }
 
@@ -111,7 +111,7 @@ TEST_CASE("router: middleware short-circuits and sees the request", "[router]") 
     router.use([&](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
         mw_called = true;
         if (req->path() == "/blocked") {
-            co_await res->status(403).send("denied");
+            co_await res->status(status::forbidden).send("denied");
             co_return; // answered here: the route must not run
         }
         co_await next(std::move(req), std::move(res), ssl);
@@ -126,7 +126,7 @@ TEST_CASE("router: middleware short-circuits and sees the request", "[router]") 
         auto res = std::make_shared<ResponseWriter>(writer);
         REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
         CHECK(mw_called);
-        CHECK(writer->last_status == 403);
+        CHECK(writer->last_status == status::forbidden);
         CHECK(writer->last_body == "denied");
     }
     {
@@ -158,7 +158,7 @@ TEST_CASE("router: middleware wraps the handler — before, after, and ordering"
     });
     router.route(any_methods, "/chain", [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
         trace.push_back("handler");
-        co_await res->status(200).send("ok");
+        co_await res->status(status::ok).send("ok");
     });
 
     asio::io_context ctx;
@@ -166,7 +166,7 @@ TEST_CASE("router: middleware wraps the handler — before, after, and ordering"
     auto req = make_request(ctx, "/chain");
     auto res = std::make_shared<ResponseWriter>(writer);
     REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
-    CHECK(writer->last_status == 200);
+    CHECK(writer->last_status == status::ok);
     CHECK(writer->last_body == "ok");
     // A middleware chain nests: before phases in registration order, then the
     // handler, then the after phases unwound in reverse.
@@ -179,7 +179,7 @@ TEST_CASE("router: middleware short-circuits by not calling next", "[router]") {
     router.use([&](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
         trace.push_back("gate:before");
         if (req->path() == "/blocked") {
-            co_await res->status(403).send("denied");
+            co_await res->status(status::forbidden).send("denied");
             co_return; // answered here: the rest of the chain must not run
         }
         co_await next(std::move(req), std::move(res), ssl);
@@ -198,7 +198,7 @@ TEST_CASE("router: middleware short-circuits by not calling next", "[router]") {
         auto req = make_request(ctx, "/blocked");
         auto res = std::make_shared<ResponseWriter>(writer);
         REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
-        CHECK(writer->last_status == 403);
+        CHECK(writer->last_status == status::forbidden);
         CHECK(writer->last_body == "denied");
         CHECK(trace == std::vector<std::string>{"gate:before"});
     }
@@ -220,8 +220,9 @@ TEST_CASE("router: the after-phase observes the response", "[router]") {
         co_await next(req, res, ssl); // copy: keep our reference for the after-phase
         seen_status = res->status();
     });
-    router.route(any_methods, "/created",
-                 [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(201).send("made"); });
+    router.route(any_methods, "/created", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(status::created).send("made");
+    });
 
     asio::io_context ctx;
     {
@@ -229,7 +230,7 @@ TEST_CASE("router: the after-phase observes the response", "[router]") {
         auto req = make_request(ctx, "/created");
         auto res = std::make_shared<ResponseWriter>(writer);
         REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
-        CHECK(seen_status == 201);
+        CHECK(seen_status == status::created);
     }
     seen_status = 0;
     {
@@ -240,8 +241,8 @@ TEST_CASE("router: the after-phase observes the response", "[router]") {
         auto req = make_request(ctx, "/nothing-here");
         auto res = std::make_shared<ResponseWriter>(writer);
         REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
-        CHECK(writer->last_status == 404);
-        CHECK(seen_status == 404);
+        CHECK(writer->last_status == status::not_found);
+        CHECK(seen_status == status::not_found);
     }
 }
 
@@ -263,11 +264,11 @@ TEST_CASE("router: middleware state flows to the handler", "[router]") {
     });
     router.route(any_methods, "/who", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
         const AuthPrincipal *user = req->get_state<AuthPrincipal>();
-        co_await res->status(200).send(user ? user->name : "anonymous");
+        co_await res->status(status::ok).send(user ? user->name : "anonymous");
     });
     // A different type than the one set is not found.
     router.route(any_methods, "/none", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(200).send(req->get_state<std::string>() ? "string" : "no-string");
+        co_await res->status(status::ok).send(req->get_state<std::string>() ? "string" : "no-string");
     });
 
     asio::io_context ctx;
@@ -300,7 +301,7 @@ TEST_CASE("router: cors is the outermost middleware whatever the registration or
     bool route_ran = false;
     router.route(any_methods, "/api", [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
         route_ran = true;
-        co_await res->status(200).send("real");
+        co_await res->status(status::ok).send("real");
     });
 
     asio::io_context ctx;
@@ -323,7 +324,7 @@ TEST_CASE("router: cors is the outermost middleware whatever the registration or
         auto req = make_request(ctx, "/api");
         req->mutable_headers().add_lower("origin", "https://app.example");
         auto writer = dispatch(ctx, router, req);
-        CHECK(writer->last_status == 200);
+        CHECK(writer->last_status == status::ok);
         CHECK(writer->last_body == "real");
         CHECK(writer->header(field::access_control_allow_origin) == "*");
         CHECK(user_ran);
@@ -345,7 +346,7 @@ TEST_CASE("router: compose_middleware builds a standalone chain", "[router]") {
     };
     Next terminal = [&](RequestPtr, ResponsePtr res, SslHandle) -> asio::awaitable<void> {
         trace.push_back("terminal");
-        co_await res->status(200).send("ok");
+        co_await res->status(status::ok).send("ok");
     };
 
     asio::io_context ctx;
@@ -372,7 +373,7 @@ TEST_CASE("router: per-route middleware wraps only its own handler", "[router]")
                  }},
                  [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
                      trace.push_back("protected-handler");
-                     co_await res->status(200).send("secret");
+                     co_await res->status(status::ok).send("secret");
                  });
     // A route without per-route middleware is untouched: the global chain runs,
     // the per-route chain does not.
@@ -381,14 +382,14 @@ TEST_CASE("router: per-route middleware wraps only its own handler", "[router]")
     asio::io_context ctx;
     {
         auto writer = dispatch(ctx, router, make_request(ctx, "/protected"));
-        CHECK(writer->last_status == 200);
+        CHECK(writer->last_status == status::ok);
         CHECK(writer->last_body == "secret");
         CHECK(trace == std::vector<std::string>{"global", "per-route:before", "protected-handler", "per-route:after"});
     }
     trace.clear();
     {
         auto writer = dispatch(ctx, router, make_request(ctx, "/open"));
-        CHECK(writer->last_status == 200);
+        CHECK(writer->last_status == status::ok);
         CHECK(writer->last_body == "open");
         CHECK(trace == std::vector<std::string>{"global"});
     }
@@ -407,18 +408,18 @@ TEST_CASE("router: per-route middleware short-circuits its route", "[router]") {
     Router router;
     bool handler_ran = false;
     router.route(any_methods, "/admin", {[&](RequestPtr, ResponsePtr res, SslHandle, Next) -> asio::awaitable<void> {
-                     co_await res->status(403).send("denied"); // never calls next()
+                     co_await res->status(status::forbidden).send("denied"); // never calls next()
                  }},
                  [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
                      handler_ran = true;
-                     co_await res->status(200).send("admin");
+                     co_await res->status(status::ok).send("admin");
                  });
     router.route(any_methods, "/public", body_handler("public"));
 
     asio::io_context ctx;
     {
         auto writer = dispatch(ctx, router, make_request(ctx, "/admin"));
-        CHECK(writer->last_status == 403);
+        CHECK(writer->last_status == status::forbidden);
         CHECK_FALSE(handler_ran);
     }
     {
@@ -438,7 +439,7 @@ TEST_CASE("router: group applies prefix and group middleware to its routes only"
                  [&](Router &api) {
                      api.route(any_methods, "/users", [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
                          trace.push_back("users");
-                         co_await res->status(200).send("users");
+                         co_await res->status(status::ok).send("users");
                      });
                      // A nested group accumulates the prefix and its own
                      // middleware, which runs between the outer group and the handler.
@@ -452,27 +453,27 @@ TEST_CASE("router: group applies prefix and group middleware to its routes only"
                          [&](Router &adm) {
                              adm.route(any_methods, "/kick", [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
                                  trace.push_back("kick");
-                                 co_await res->status(200).send("kicked");
+                                 co_await res->status(status::ok).send("kicked");
                              });
                          });
                  });
     // A route outside the group does not get the prefix or the group middleware.
     router.route(any_methods, "/health", [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
         trace.push_back("health");
-        co_await res->status(200).send("ok");
+        co_await res->status(status::ok).send("ok");
     });
 
     asio::io_context ctx;
     {
         auto writer = dispatch(ctx, router, make_request(ctx, "/api/users"));
-        CHECK(writer->last_status == 200);
+        CHECK(writer->last_status == status::ok);
         CHECK(writer->last_body == "users");
         CHECK(trace == std::vector<std::string>{"group:before", "users", "group:after"});
     }
     trace.clear();
     {
         auto writer = dispatch(ctx, router, make_request(ctx, "/api/admin/kick"));
-        CHECK(writer->last_status == 200);
+        CHECK(writer->last_status == status::ok);
         CHECK(writer->last_body == "kicked");
         CHECK(trace ==
               std::vector<std::string>{"group:before", "nested:before", "kick", "nested:after", "group:after"});
@@ -489,7 +490,7 @@ TEST_CASE("router: group applies prefix and group middleware to its routes only"
         // The group prefix is really a path prefix: /api/users misses nothing,
         // /api (bare) does.
         auto writer = dispatch(ctx, router, make_request(ctx, "/api"));
-        CHECK(writer->last_status == 404);
+        CHECK(writer->last_status == status::not_found);
     }
 }
 
@@ -503,12 +504,12 @@ TEST_CASE("router: use() inside a group scopes to that group", "[router]") {
         });
         mq.route(any_methods, "/pull", [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
             trace.push_back("pull");
-            co_await res->status(200).send("msg");
+            co_await res->status(status::ok).send("msg");
         });
     });
     router.route(any_methods, "/plain", [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
         trace.push_back("plain");
-        co_await res->status(200).send("plain");
+        co_await res->status(status::ok).send("plain");
     });
 
     asio::io_context ctx;
@@ -544,13 +545,13 @@ TEST_CASE("router: group middleware, global middleware and per-route middleware 
                              }},
                              [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
                                  trace.push_back("handler");
-                                 co_await res->status(200).send("ok");
+                                 co_await res->status(status::ok).send("ok");
                              });
                  });
 
     asio::io_context ctx;
     auto writer = dispatch(ctx, router, make_request(ctx, "/g/x"));
-    CHECK(writer->last_status == 200);
+    CHECK(writer->last_status == status::ok);
     // Outer chain first: global, then group, then per-route, then the handler.
     CHECK(trace == std::vector<std::string>{"global", "group", "per-route", "handler"});
 }
@@ -559,7 +560,7 @@ TEST_CASE("router: regex routes are scoped to a group prefix", "[router]") {
     Router router;
     router.group("/api", [&](Router &api) {
         api.route_regex({Method::Get}, "^/items/(\\d+)$", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-            co_await res->status(200).send("item");
+            co_await res->status(status::ok).send("item");
         });
         // A pattern with metacharacters in the prefix is still literal.
         api.route_regex({Method::Get}, "/raw.*", body_handler("raw"));
@@ -568,14 +569,14 @@ TEST_CASE("router: regex routes are scoped to a group prefix", "[router]") {
     asio::io_context ctx;
     {
         auto writer = dispatch(ctx, router, make_request(ctx, "/api/items/42"));
-        CHECK(writer->last_status == 200);
+        CHECK(writer->last_status == status::ok);
         CHECK(writer->last_body == "item");
     }
     {
         // A path the group prefix rejects must not match even if the inner
         // pattern would: the '^' anchor stays at the head.
         auto writer = dispatch(ctx, router, make_request(ctx, "/nope/items/42"));
-        CHECK(writer->last_status == 404);
+        CHECK(writer->last_status == status::not_found);
     }
     {
         auto writer = dispatch(ctx, router, make_request(ctx, "/api/raw-deal"));
@@ -690,7 +691,7 @@ TEST_CASE("router: reverse-proxy routes are found and rewritten", "[router]") {
         auto res = std::make_shared<ResponseWriter>(writer);
         ScopedLog capture;
         REQUIRE(run_on(ctx, dead_backend.dispatch(req, res, std::nullopt), std::chrono::seconds(2)));
-        CHECK(writer->last_status == 502);
+        CHECK(writer->last_status == status::bad_gateway);
         CHECK(writer->last_body == "Bad Gateway");
         CHECK_FALSE(capture.records.empty()); // the failed upstream is logged
     }
@@ -705,7 +706,7 @@ TEST_CASE("router: reverse-proxy routes are found and rewritten", "[router]") {
         auto res = std::make_shared<ResponseWriter>(writer);
         ScopedLog capture;
         REQUIRE(run_on(ctx, both.dispatch(req, res, std::nullopt), std::chrono::seconds(2)));
-        CHECK(writer->last_status == 200);
+        CHECK(writer->last_status == status::ok);
         CHECK(writer->last_body == "local");
         CHECK(capture.records.empty()); // the proxy was never consulted
     }
@@ -756,7 +757,7 @@ TEST_CASE("router: invalid regexes are dropped, not thrown", "[router]") {
     auto res = std::make_shared<ResponseWriter>(writer);
     REQUIRE(run_on(ctx, router.dispatch(req, res,
                                         std::nullopt))); // no route: the built-in 404
-    CHECK(writer->last_status == 404);
+    CHECK(writer->last_status == status::not_found);
 }
 
 TEST_CASE("router: a registered handler is found by path, first registration wins", "[router]") {
@@ -843,7 +844,7 @@ TEST_CASE("router: a declining static stage cannot leave a request unanswered", 
     auto res = std::make_shared<ResponseWriter>(writer);
     REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
 
-    CHECK(writer->last_status == 404); // written by the router, not left hanging
+    CHECK(writer->last_status == status::not_found); // written by the router, not left hanging
 }
 
 TEST_CASE("router: registering a disabled site is a no-op, not a silent 404 machine", "[router]") {
