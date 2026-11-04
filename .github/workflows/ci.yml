@@ -1,0 +1,91 @@
+name: ci
+
+on:
+  push:
+    branches: ["main", "test", "dev"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The runners have fewer cores than the development box; keep xmake from
+  # oversubscribing and OOMing while the package graph compiles.
+  XMAKE_JOBS: "4"
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      # Reclaim the preinstalled toolchains the runner does not need. Building
+      # Boost, OpenSSL 4, ngtcp2 and nghttp3 from source needs the space.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config autoconf automake libtool perl zip unzip
+
+      # The differential runners build their Go probes and reference servers
+      # from test/diff/go.mod.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: test/diff/go.mod
+          cache-dependency-path: test/diff/go.sum
+
+      # OpenAPI verification uses httpx/jsonschema/brotli; test/run.py picks up
+      # test/.venv/bin/python automatically when it exists.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: test/requirements.txt
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m venv test/.venv
+          test/.venv/bin/pip install --disable-pip-version-check -r test/requirements.txt
+
+      - uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: latest
+
+      # xmake builds Boost/OpenSSL/ngtcp2/nghttp3 from source; the package cache
+      # is the difference between a 10-minute and a 40-minute job.
+      - name: Cache xmake packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.xmake
+            build
+          key: xmake-${{ runner.os }}-${{ hashFiles('xmake.lua') }}
+          restore-keys: |
+            xmake-${{ runner.os }}-
+
+      - name: Configure
+        run: xmake f -y -m release
+
+      # Each suite builds the targets it needs through test/run.py; running them
+      # as separate steps keeps a failure attributable to one suite.
+      - name: Unit + OpenAPI
+        run: test/run.sh standard --jobs "$XMAKE_JOBS"
+
+      - name: Client differential (C++ vs Go)
+        run: test/run.sh client-diff --jobs "$XMAKE_JOBS"
+
+      - name: Server differential (C++ vs Go)
+        run: test/run.sh server-diff --jobs "$XMAKE_JOBS"
+
+      - name: Concurrency smoke (sanitizer fixture, uninstrumented)
+        run: test/run.sh concurrency --jobs "$XMAKE_JOBS"

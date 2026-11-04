@@ -672,6 +672,9 @@ test/run.sh unit '[h2]' # Catch2 过滤
 
 C++ 二进制由 xmake 构建；Go 参考服务端与探针由各 runner 用 `go build` 构建
 （`test/diff/go.mod` 固定 `x/net`、`gorilla/websocket`、`quic-go`）。
+CI（`.github/workflows/ci.yml`）在 push/PR 上跑 `standard`（unit + openapi）、
+`client-diff`、`server-diff` 与 `concurrency`；conformance/stress 需要外部工具和
+更长的时间，仍按 §7.3 手动执行。
 Python 侧只需要 `httpx`、`jsonschema`、`brotli`（`test/requirements.txt`）。
 
 ### 7.2 差分测试
