@@ -19,10 +19,10 @@
 #include <charconv>
 #include <chrono>
 #include <cmath>
-#include <limits>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -30,9 +30,9 @@
 #include <utility>
 #include <vector>
 
+#include "../core/http_date.h"
 #include "../core/http_method.h" // RetryPolicy::condition names Method
 #include "../core/limits.h"
-#include "../core/http_date.h"
 #include "../core/resolve.h"     // ResolveFn (shared with the WebSocket proxy)
 #include "../core/tls_version.h" // TlsMinVersion (shared with the server)
 #include "../core/types.h"
@@ -182,7 +182,6 @@ inline std::chrono::milliseconds retry_after_delay(std::string_view value) {
     }
     return {};
 }
-
 
 // TLS knobs for a client connection.
 struct TlsClientConfig {
@@ -488,6 +487,7 @@ enum class client_errc : int {
     trailers_not_supported, // request trailers are not implemented for this protocol
     proxy_error,            // the proxy refused the tunnel, or its reply was malformed
     proxy_auth_failed,      // the proxy rejected the configured credentials
+    invalid_header,         // a request header name/value is not a valid HTTP field
 };
 
 } // namespace simple_http
@@ -567,6 +567,8 @@ class ClientErrorCategory : public boost::system::error_category {
             return "the proxy refused the tunnel or its reply was malformed";
         case client_errc::proxy_auth_failed:
             return "the proxy rejected the configured credentials";
+        case client_errc::invalid_header:
+            return "a request header name or value is invalid";
         default:
             return "unknown client error";
         }

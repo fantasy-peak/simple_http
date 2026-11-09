@@ -292,6 +292,11 @@ class ClientSession {
     virtual bool reusable() const = 0;
     virtual bool keepable() const = 0;
     virtual bool multiplexes() const = 0;
+    // Whether an exchange is still in flight. A cached session that is merely
+    // busy (H1) or draining (H2 after GOAWAY) must not be closed: the in-flight
+    // request would fail with connection_reset. take_cached() uses this to dial
+    // a throwaway connection instead.
+    virtual bool has_active_exchange() const { return false; }
     virtual Version version() const = 0;
     virtual std::string_view authority() const = 0;
     virtual asio::any_io_executor executor() const = 0;

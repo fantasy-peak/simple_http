@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <random>
@@ -1616,10 +1617,17 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
                 malformed("TE with a value other than trailers");
                 return true;
             }
-            if (trailers)
+            if (trailers) {
+                // RFC 9110 §6.5.1: framing/routing/hop-by-hop fields do not
+                // belong in a trailer section.
+                if (is_forbidden_trailer_field(f.name)) {
+                    malformed("forbidden trailer field");
+                    return true;
+                }
                 st.request->mutable_trailers().add_lower(std::move(f.name), std::move(f.value));
-            else
+            } else {
                 st.request->mutable_headers().add_lower(std::move(f.name), std::move(f.value));
+            }
         }
 
         // §8.3.1: a request carries :method, :scheme and :path — CONNECT is the
@@ -1669,11 +1677,19 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
                 }
             }
             // §8.1.2.6: content-length is a non-negative decimal integer. The body
-            // that follows is then held to it — see on_data().
+            // that follows is then held to it — see on_data() and
+            // dispatch_stream(). Duplicate fields are ambiguous (the smuggling
+            // shape); a value above INT64_MAX would wrap negative and silently
+            // disable the check.
+            if (st.request->headers().count("content-length") > 1) {
+                malformed("duplicate content-length");
+                return true;
+            }
             if (auto declared = st.request->header("content-length")) {
                 std::uint64_t value = 0;
                 auto [ptr, ec] = std::from_chars(declared->data(), declared->data() + declared->size(), value);
-                if (ec != std::errc{} || ptr != declared->data() + declared->size()) {
+                if (ec != std::errc{} || ptr != declared->data() + declared->size() ||
+                    value > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
                     malformed("invalid content-length");
                     return true;
                 }
@@ -2276,6 +2292,17 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
         auto it = m_streams.find(stream_id);
         if (it == m_streams.end() || it->second.dispatched)
             return true;
+        // §8.1.2.6: a request whose peer half is already closed must have sent
+        // exactly the declared content-length. END_STREAM on the header block
+        // used to bypass on_data()'s short-body check entirely.
+        if (it->second.half_closed_remote && it->second.declared_content_length >= 0 &&
+            it->second.body_received != it->second.declared_content_length) {
+            SIMPLE_HTTP_ERROR_LOG("h2: request body short of content-length at END_STREAM (stream={}, declared={}, "
+                                  "seen={})",
+                                  stream_id, it->second.declared_content_length, it->second.body_received);
+            reset_stream(stream_id, codec::H2_PROTOCOL_ERROR);
+            return true;
+        }
         // Mark the head accepted immediately: a HEADERS arriving later on this
         // stream is then a trailing block, whether or not its handler has started.
         it->second.dispatched = true;

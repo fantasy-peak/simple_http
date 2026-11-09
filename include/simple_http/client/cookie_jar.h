@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -36,6 +37,15 @@ namespace simple_http {
 
 class CookieJar {
   public:
+    // Optional public-suffix policy. Without one the jar rejects
+    // single-label Domain attributes (the `Domain=com` / `Domain=io` shape) and
+    // IP literals, but cannot distinguish `co.uk` from a registrable domain;
+    // pass a real PSL-backed predicate for that.
+    using PublicSuffixFn = std::function<bool(std::string_view)>;
+
+    CookieJar() = default;
+    explicit CookieJar(PublicSuffixFn is_public_suffix) : m_public_suffix(std::move(is_public_suffix)) {}
+
     // Records every Set-Cookie in `headers`, scoped by `url`. Expired cookies
     // (Max-Age in the past / a past Expires) are dropped from the jar.
     void store(std::string_view url, const Headers &headers) {
@@ -55,8 +65,12 @@ class CookieJar {
             }
             // RFC 6265 §5.3 step 6: a Domain attribute that does not cover the
             // request host makes the whole cookie invalid (it is not silently
-            // broadened to the host).
-            if (!cookie->host_only && !domain_matches(cookie->domain, parsed.host)) {
+            // broadened to the host). A public suffix (or a single label such
+            // as "com") is rejected too: otherwise evil.com could set
+            // Domain=com and have the cookie sent to every .com origin sharing
+            // this jar.
+            if (!cookie->host_only &&
+                (!domain_matches(cookie->domain, parsed.host) || !domain_is_acceptable(cookie->domain))) {
                 continue;
             }
             // Same (name, domain, path) replaces the previous cookie. An
@@ -167,6 +181,31 @@ class CookieJar {
             return false;
         }
         return true;
+    }
+
+    static bool looks_like_ip(std::string_view domain) {
+        if (domain.find(':') != std::string_view::npos)
+            return true; // IPv6 literal
+        bool digits_and_dots = domain.find('.') != std::string_view::npos;
+        for (char c : domain) {
+            if ((c < '0' || c > '9') && c != '.') {
+                digits_and_dots = false;
+                break;
+            }
+        }
+        return digits_and_dots;
+    }
+
+    // Whether a Domain attribute may scope a cookie at all. A single-label
+    // domain is a public suffix (com, io, local...), and an IP literal has no
+    // subdomains; both are host-only in practice. The optional predicate adds
+    // the full public-suffix check (co.uk, github.io, ...).
+    bool domain_is_acceptable(std::string_view domain) const {
+        if (domain.empty() || domain.find('.') == std::string_view::npos)
+            return false;
+        if (looks_like_ip(domain))
+            return false;
+        return !m_public_suffix || !m_public_suffix(domain);
     }
 
     static bool domain_matches(std::string_view cookie_domain, std::string_view host) {
@@ -321,6 +360,7 @@ class CookieJar {
     }
 
     mutable std::mutex m_mutex;
+    PublicSuffixFn m_public_suffix;
     std::vector<Cookie> m_cookies;
 };
 

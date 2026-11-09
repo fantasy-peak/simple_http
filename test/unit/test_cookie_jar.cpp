@@ -95,3 +95,25 @@ TEST_CASE("client/cookie_jar: Secure cookies only go over https", "[client][cook
     CHECK(jar.cookie_header("https://example.com/") == "s=1");
     CHECK(jar.cookie_header("http://example.com/").empty());
 }
+
+// A single-label Domain is a public suffix: accepting it lets a hostile origin
+// (evil.com) plant a cookie that this jar then sends to every .com host it
+// talks to.
+TEST_CASE("client/cookie_jar: a single-label Domain is rejected", "[client][cookie][security]") {
+    CookieJar jar;
+    set_cookie(jar, "http://evil.com/", "a=b; Domain=com; Path=/");
+
+    CHECK(jar.size() == 0);
+    CHECK(jar.cookie_header("http://victim.com/").empty());
+    CHECK(jar.cookie_header("http://evil.com/").empty());
+}
+
+TEST_CASE("client/cookie_jar: the optional public-suffix predicate is honoured", "[client][cookie][security]") {
+    CookieJar jar{[](std::string_view domain) { return domain == "co.uk"; }};
+    set_cookie(jar, "http://evil.co.uk/", "a=b; Domain=co.uk; Path=/");
+    CHECK(jar.size() == 0);
+    CHECK(jar.cookie_header("http://victim.co.uk/").empty());
+
+    set_cookie(jar, "http://evil.co.uk/", "a=b; Domain=evil.co.uk; Path=/");
+    CHECK(jar.cookie_header("http://evil.co.uk/") == "a=b");
+}

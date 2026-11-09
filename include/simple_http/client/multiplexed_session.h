@@ -52,6 +52,7 @@ class MultiplexedClientSession : public ClientSession, public std::enable_shared
     }
 
     bool multiplexes() const override { return true; }
+    bool has_active_exchange() const override { return m_active_streams.load(std::memory_order_acquire) > 0; }
 
     std::string_view authority() const override { return m_authority; }
     asio::any_io_executor executor() const override { return m_executor; }

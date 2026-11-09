@@ -1017,6 +1017,32 @@ test/run.sh server-diff
     否则 `listener → acceptor → handler → listener` 或
     `core → pool → io_context → handler → core` 在 teardown 时成环。
     连接计数在弱引用过期时跳过（此时 Server 已销毁，计数无意义）。
+47. **H1 客户端 chunk 大小必须溢出检查并流式交付**：`size = size*16+d` 要比较
+    `(max-d)/16`；不能等整个 chunk 进入 `m_in` 再返回（单个巨大 chunk 会无界分配，
+    `size+2` 回绕还会让 `std::string::compare` 抛 `out_of_range`）。
+48. **H1 客户端响应头要和请求侧一样严格**：只接受 CRLF（拒绝裸 LF/裸 CR 与混用）、
+    字段名必须是 token、拒绝 obs-fold、拒绝值内 CTL、拒绝重复/溢出 `Content-Length`
+    以及 TE+CL；状态码必须是 3 位 100..599，并接受 HTTP/1.0 且设置
+    `ResponseHead::bodyless`。
+49. **客户端请求头在序列化处做最后校验**：h1/h2/h3 的请求头编码统一拒绝非法字段名
+    与含 CTL 的值，返回 `client_errc::invalid_header`；不能只依赖调用方自觉。
+50. **`Client::take_cached()` 不得关闭仍在使用的会话**：H1 busy / H2 draining
+    （有在飞流）时返回 `nullptr` 拨一次性连接；关闭会让正在进行的请求以
+    `connection_reset` 失败。失败的读/头操作要 `release_exchange()`，否则死会话会
+    一直显示为 “active”。
+51. **客户端解压与重定向 body 必须有界**：缓冲 `send()` 用 `write_bounded` /
+    `finish_bounded`；3xx body 用有界丢弃（超过阈值就 cancel 后换新连接），
+    不能 `read_all(..., 0, ...)`。
+52. **服务端 TLS 握手受 `idle_timeout` 约束**：只完成 TCP、不发 ClientHello 的连接
+    必须被定时器关闭，否则可长期占用 `max_connections` 槽位。
+53. **CookieJar 拒绝单标签 Domain**：`Domain=com` 这种公共后缀会让 cookie 泄漏到
+    所有同后缀站点；默认拒绝单标签与 IP，完整 PSL 通过
+    `CookieJar(PublicSuffixFn)` 注入。
+54. **HTTP/1.0 不接受 chunked，也不发送 100 Continue**：`parse_body_framing` 按版本
+    拒绝 TE；`expect_continue` 只对 1.1 生效；h2c Upgrade 同样要求 1.1。
+55. **H2 的 content-length 在 END_STREAM 时必须核对**：HEADERS/CONTINUATION 直接带
+    END_STREAM 时也要比较 `declared_content_length == body_received`；重复 CL、
+    超过 INT64_MAX 的 CL、trailer 里的 framing/hop-by-hop 字段都要拒绝。
 
 ---
 
@@ -1030,6 +1056,8 @@ test/run.sh server-diff
 - 出站代理不覆盖 HTTP/3。
 - `NO_PROXY` 不支持 CIDR / 通配。
 - 客户端单连接模型：每个 origin 一条连接，其他 origin 一次性连接；没有传统连接池。
+- `CookieJar` 默认只拒绝单标签 Domain 与 IP 字面量；完整的公共后缀判断需要构造时注入
+  `CookieJar::PublicSuffixFn`，库不内置 PSL 数据。
 - 客户端 WebSocket 不协商 permessage-deflate。
 - CORS 不处理 WebSocket 升级。
 - Host 路由只作用于 HTTP dispatch；WebSocket 查找仍 host-agnostic，Host 子 Router 有独立

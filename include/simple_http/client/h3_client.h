@@ -27,6 +27,7 @@
 
 #include <nghttp3/nghttp3.h>
 
+#include "../core/compat.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -38,7 +39,6 @@
 #include <deque>
 #include <memory>
 #include <optional>
-#include "../core/compat.h"
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -49,8 +49,8 @@
 #include "../core/http_method.h"
 #include "../core/limits.h"
 #include "../core/logging.h"
-#include "../core/result.h"
 #include "../core/resolve.h"
+#include "../core/result.h"
 #include "../core/types.h"
 #include "../core/version.h"
 #include "../engine/h3/h3_callbacks.h"
@@ -123,7 +123,6 @@ template <typename Executor> class QuicClientUdp : public std::enable_shared_fro
     }
 
   public:
-
     // Unblocks receive_loop. The connection's run() calls this when it ends.
     void close() {
         error_code ec;
@@ -190,7 +189,6 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
     };
 
   public:
-
     // Dial and start a QUIC connection to `target`.
     //
     // `ssl_ctx` is the client's already-configured TLS context (verification,
@@ -276,8 +274,8 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
             return;
         }
 
-        auto session =
-            std::make_shared<Http3ClientSession>(state->ex, std::move(conn), std::move(udp), state->target, state->limits);
+        auto session = std::make_shared<Http3ClientSession>(state->ex, std::move(conn), std::move(udp), state->target,
+                                                            state->limits);
         SIMPLE_HTTP_DEBUG_LOG("h3 client: connection built, waiting for handshake");
         session->start(attempt_timeout, [session, done = std::move(done)](error_code ec) mutable {
             if (ec) {
@@ -296,7 +294,8 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         }
         std::chrono::milliseconds slice = state->connect_timeout;
         if (state->connect_timeout.count() > 0) {
-            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(state->deadline - Clock::now());
+            const auto remaining =
+                std::chrono::duration_cast<std::chrono::milliseconds>(state->deadline - Clock::now());
             if (remaining.count() <= 0) {
                 std::move(state->done)(make_error_code(client_errc::connect_timeout), nullptr);
                 return;
@@ -343,10 +342,9 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
                 // (v4 first) and each non-final attempt is capped at
                 // kAttemptCap: a dead IPv6 route or a bad anycast address then
                 // costs seconds, not the whole deadline.
-                const auto v4_end = std::stable_partition(endpoints.begin(), endpoints.end(),
-                                                          [](const asio::ip::tcp::endpoint &e) {
-                                                              return e.address().is_v4();
-                                                          });
+                const auto v4_end =
+                    std::stable_partition(endpoints.begin(), endpoints.end(),
+                                          [](const asio::ip::tcp::endpoint &e) { return e.address().is_v4(); });
                 for (auto v4 = endpoints.begin(), v6 = v4_end; v4 != v4_end || v6 != endpoints.end();) {
                     if (v4 != v4_end) {
                         state->ordered.emplace_back(v4->address(), v4->port());
@@ -420,22 +418,20 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
             // declared, positive length means the Body has bytes to read: an
             // absent body (-1) has nothing fed, and reading it would wait
             // forever.
-            auto submit = [self, request, id = *id, fresh](std::string up_front,
-                                                           OpenCompletion completion) mutable {
+            auto submit = [self, request, id = *id, fresh](std::string up_front, OpenCompletion completion) mutable {
                 self->submit_open(request, id, fresh, std::move(up_front), std::move(completion));
             };
             if (!request->stream_body() && request->content_length() > 0) {
-                request->body().async_read_all(
-                    [self, id = *id, submit = std::move(submit), done = std::move(done)](
-                        error_code ec, std::string body) mutable {
-                        if (ec) {
-                            if (auto it = self->m_streams.find(id); it != self->m_streams.end())
-                                self->erase_stream(it->first);
-                            std::move(done)(ec, nullptr);
-                            return;
-                        }
-                        submit(std::move(body), std::move(done));
-                    });
+                request->body().async_read_all([self, id = *id, submit = std::move(submit),
+                                                done = std::move(done)](error_code ec, std::string body) mutable {
+                    if (ec) {
+                        if (auto it = self->m_streams.find(id); it != self->m_streams.end())
+                            self->erase_stream(it->first);
+                        std::move(done)(ec, nullptr);
+                        return;
+                    }
+                    submit(std::move(body), std::move(done));
+                });
                 return;
             }
             submit(std::string{}, std::move(done));
@@ -540,8 +536,7 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
                 return;
             }
             self->await_out_space(
-                id, [self, id, data = std::move(data), finish_write = std::move(finish_write)](
-                        error_code ec) mutable {
+                id, [self, id, data = std::move(data), finish_write = std::move(finish_write)](error_code ec) mutable {
                     if (ec) {
                         finish_write(ec);
                         return;
@@ -1029,7 +1024,9 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
 
     // --- trailer section (RFC 9110 §6.5, RFC 9114 §4.1) -------------------
 
-    bool on_trailers_begin(std::int64_t stream_id) noexcept override { return m_streams.find(stream_id) != m_streams.end(); }
+    bool on_trailers_begin(std::int64_t stream_id) noexcept override {
+        return m_streams.find(stream_id) != m_streams.end();
+    }
 
     void on_trailer(std::int64_t stream_id, std::int32_t /*token*/, std::string_view name,
                     std::string_view value) noexcept override {
@@ -1344,8 +1341,15 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         nva.push_back(make_nv(":method", owned.back()));
         owned.emplace_back("https");
         nva.push_back(make_nv(":scheme", owned.back()));
-        owned.emplace_back(request.header("host").value_or(m_authority));
-        nva.push_back(make_nv(":authority", owned.back()));
+        {
+            const auto host_override = request.header("host");
+            const std::string_view authority = host_override ? *host_override : std::string_view{m_authority};
+            if (contains_ctl(authority)) {
+                return make_error_code(client_errc::invalid_header);
+            }
+            owned.emplace_back(authority);
+            nva.push_back(make_nv(":authority", owned.back()));
+        }
         owned.emplace_back(target);
         nva.push_back(make_nv(":path", owned.back()));
 
@@ -1353,9 +1357,9 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         for (const auto &[name, value] : request.headers()) {
             if (name.empty() || name.front() == ':' || is_connection_specific_field(name) || name == "host")
                 continue;
-            if (contains_ctl(name) || contains_ctl(value)) {
-                SIMPLE_HTTP_ERROR_LOG("h3 client: dropping header '{}' with CR/LF/NUL", name);
-                continue;
+            if (!is_http_token(name) || contains_ctl(name) || contains_ctl(value)) {
+                SIMPLE_HTTP_ERROR_LOG("h3 client: invalid header '{}'", name);
+                return make_error_code(client_errc::invalid_header);
             }
             if (name == "user-agent")
                 saw_agent = true;

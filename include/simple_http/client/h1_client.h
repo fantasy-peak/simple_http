@@ -101,6 +101,7 @@ class Http1ClientSession final : public ClientSession,
     }
     bool keepable() const override { return alive() && !m_close_after; }
     bool multiplexes() const override { return false; }
+    bool has_active_exchange() const override { return m_busy; }
     Version version() const override { return Version::Http11; }
     std::string_view authority() const override { return m_authority; }
     asio::any_io_executor executor() const override { return m_executor; }
@@ -120,12 +121,9 @@ class Http1ClientSession final : public ClientSession,
     // release_exchange, and Response holds the stream), so without this check a
     // stale stream would write into — or read from — whatever exchange the
     // connection is running now.
-    bool is_current(const Http1ClientStream<Transport> *caller) const {
-        return m_current.lock().get() == caller;
-    }
+    bool is_current(const Http1ClientStream<Transport> *caller) const { return m_current.lock().get() == caller; }
 
-    void exchange_write(std::string data, bool last, WriteCompletion done,
-                        const Http1ClientStream<Transport> *caller) {
+    void exchange_write(std::string data, bool last, WriteCompletion done, const Http1ClientStream<Transport> *caller) {
         auto self = this->shared_from_this();
         hop([self, data = std::move(data), last, done = std::move(done), caller]() mutable {
             if (!self->is_current(caller)) {
@@ -135,8 +133,7 @@ class Http1ClientSession final : public ClientSession,
             self->do_exchange_write(std::move(data), last, std::move(done));
         });
     }
-    void exchange_write_trailers(Headers trailers, WriteCompletion done,
-                                 const Http1ClientStream<Transport> *caller) {
+    void exchange_write_trailers(Headers trailers, WriteCompletion done, const Http1ClientStream<Transport> *caller) {
         auto self = this->shared_from_this();
         hop([self, trailers = std::move(trailers), done = std::move(done), caller]() mutable {
             if (!self->is_current(caller)) {
@@ -200,6 +197,8 @@ class Http1ClientSession final : public ClientSession,
 
     void release_exchange() {
         m_busy = false;
+        m_chunk_remaining = 0;
+        m_chunk_need_crlf = false;
         if (m_current_done)
             m_current_done->store(true, std::memory_order_release);
         if (auto current = m_current.lock()) {
@@ -249,6 +248,8 @@ class Http1ClientSession final : public ClientSession,
         m_awaiting_final = false;
         m_head_parsed = false;
         m_body_complete = false;
+        m_chunk_remaining = 0;
+        m_chunk_need_crlf = false;
         m_connection_error = {};
         m_in.clear();
         m_trailers = Headers{};
@@ -317,6 +318,22 @@ class Http1ClientSession final : public ClientSession,
                                  });
     }
 
+    // A field name must re-parse as the same token and a value must not carry a
+    // control byte (HTAB excepted). Anything else is spliced verbatim into the
+    // head below, where a CRLF value would start an attacker-authored field or
+    // a whole second request.
+    static bool invalid_request_field(std::string_view name, std::string_view value) {
+        if (!is_http_token(name))
+            return true;
+        for (unsigned char c : value) {
+            if (c == '\t')
+                continue;
+            if (c < 0x20 || c == 0x7F)
+                return true;
+        }
+        return false;
+    }
+
     error_code build_request_head(const Request &request, std::string &out) {
         if (contains_ctl(request.method_token()) || contains_ctl(request.target())) {
             return make_error_code(client_errc::invalid_spec);
@@ -331,6 +348,9 @@ class Http1ClientSession final : public ClientSession,
         std::string host_value;
         bool has_connection = false;
         for (const auto &[name, value] : request.headers()) {
+            if (invalid_request_field(name, value)) {
+                return make_error_code(client_errc::invalid_header);
+            }
             if (name == "host") {
                 has_host = true;
                 host_value = value;
@@ -496,8 +516,10 @@ class Http1ClientSession final : public ClientSession,
                 // caller sends the body anyway. Poisoning the exchange here
                 // (closing the transport) made the fallback impossible.
                 // Protocol/transport errors remain fatal.
-                if (ec != asio::error::operation_aborted)
+                if (ec != asio::error::operation_aborted) {
                     self->fail_exchange(ec);
+                    self->release_exchange();
+                }
                 std::move(done)(ec);
                 return;
             }
@@ -507,6 +529,26 @@ class Http1ClientSession final : public ClientSession,
 
     // Reads status line + fields (and any body bytes already buffered),
     // transparently skipping interim 1xx responses other than a final one.
+    //
+    // This parser is deliberately as strict as the server's H1Parser:
+    //   * every line ending must be CRLF, and a bare LF/CR anywhere in the head
+    //     is rejected (a front end that delimited the head differently is the
+    //     response-smuggling differential this closes);
+    //   * field names must be tokens, obs-fold is rejected, and values may not
+    //     carry control bytes;
+    //   * duplicate Content-Length, Transfer-Encoding + Content-Length, and
+    //     unsupported transfer codings are protocol errors;
+    //   * the status code is exactly three digits in 100..599.
+    static bool has_forbidden_field_value(std::string_view value) {
+        for (unsigned char c : value) {
+            if (c == '\t')
+                continue;
+            if (c < 0x20 || c == 0x7F)
+                return true;
+        }
+        return false;
+    }
+
     template <typename Handler> void read_head(Handler &&handler) {
         auto done = std::forward<Handler>(handler);
         const auto marker = m_in.find("\r\n\r\n");
@@ -524,43 +566,105 @@ class Http1ClientSession final : public ClientSession,
             });
             return;
         }
-        const std::string block = m_in.substr(0, marker + 4);
+        // A head that arrives in one read can be larger than the bound without
+        // ever hitting the NeedMore branch above.
+        if (marker + 4 > m_limits.max_header_bytes) {
+            done(make_error_code(client_errc::header_too_large));
+            return;
+        }
+        std::string block = m_in.substr(0, marker + 4);
         m_in.erase(0, marker + 4);
+
+        // Reject mixed / bare line endings before splitting. Otherwise a bare
+        // LF inside a field line is just a byte in the value, while a front end
+        // that treats it as a line ending sees a different set of fields.
+        for (std::size_t i = 0; i < block.size(); ++i) {
+            if (block[i] == '\n' && (i == 0 || block[i - 1] != '\r')) {
+                done(make_error_code(client_errc::protocol_error));
+                return;
+            }
+            if (block[i] == '\r' && (i + 1 >= block.size() || block[i + 1] != '\n')) {
+                done(make_error_code(client_errc::protocol_error));
+                return;
+            }
+        }
+
         const auto line_end = block.find("\r\n");
         if (line_end == std::string::npos) {
             done(make_error_code(client_errc::protocol_error));
             return;
         }
         const std::string_view status_line{block.data(), line_end};
-        // "HTTP/1.1 200 OK"
         const auto sp1 = status_line.find(' ');
-        if (sp1 == std::string_view::npos || status_line.substr(0, sp1) != "HTTP/1.1") {
+        if (sp1 == std::string_view::npos) {
+            done(make_error_code(client_errc::protocol_error));
+            return;
+        }
+        ResponseHead head;
+        const std::string_view version = status_line.substr(0, sp1);
+        if (version == "HTTP/1.1") {
+            head.version = Version::Http11;
+        } else if (version == "HTTP/1.0") {
+            head.version = Version::Http1;
+        } else {
             done(make_error_code(client_errc::protocol_error));
             return;
         }
         const auto sp2 = status_line.find(' ', sp1 + 1);
+        const std::string_view code =
+            status_line.substr(sp1 + 1, sp2 == std::string_view::npos ? std::string_view::npos : sp2 - sp1 - 1);
+        if (code.size() != 3) {
+            done(make_error_code(client_errc::protocol_error));
+            return;
+        }
         int status = 0;
-        for (std::size_t i = sp1 + 1; i < (sp2 == std::string_view::npos ? status_line.size() : sp2); ++i) {
-            if (status_line[i] < '0' || status_line[i] > '9') {
+        for (char c : code) {
+            if (c < '0' || c > '9') {
                 done(make_error_code(client_errc::protocol_error));
                 return;
             }
-            status = status * 10 + (status_line[i] - '0');
+            status = status * 10 + (c - '0');
         }
-        ResponseHead head;
+        if (status < 100 || status > 599) {
+            done(make_error_code(client_errc::protocol_error));
+            return;
+        }
         head.status = status;
-        head.version = Version::Http11;
+
         std::size_t pos = line_end + 2;
-        while (pos + 1 < block.size()) {
+        while (pos < block.size()) {
             const auto end = block.find("\r\n", pos);
-            if (end == std::string::npos || end == pos)
-                break;
-            const std::string_view line{block.data() + pos, end - pos};
-            const auto colon = line.find(':');
-            if (colon != std::string_view::npos) {
-                head.headers.add_lower(ascii_lower_copy(trim_ows(line.substr(0, colon))),
-                                       std::string{trim_ows(line.substr(colon + 1))});
+            if (end == std::string::npos) {
+                done(make_error_code(client_errc::protocol_error));
+                return;
             }
+            if (end == pos) {
+                // The terminating blank line (the second CRLF of the marker);
+                // an earlier one would have been the marker, and mixed line
+                // endings were already rejected above.
+                break;
+            }
+            const std::string_view line{block.data() + pos, end - pos};
+            if (line.front() == ' ' || line.front() == '\t') {
+                done(make_error_code(client_errc::protocol_error)); // obs-fold
+                return;
+            }
+            const auto colon = line.find(':');
+            if (colon == std::string_view::npos || colon == 0) {
+                done(make_error_code(client_errc::protocol_error));
+                return;
+            }
+            const std::string_view name = line.substr(0, colon);
+            if (!is_http_token(name)) {
+                done(make_error_code(client_errc::protocol_error));
+                return;
+            }
+            const std::string_view value = trim_ows(line.substr(colon + 1));
+            if (has_forbidden_field_value(value)) {
+                done(make_error_code(client_errc::protocol_error));
+                return;
+            }
+            head.headers.add_lower(ascii_lower_copy(name), std::string{value});
             pos = end + 2;
         }
 
@@ -583,39 +687,64 @@ class Http1ClientSession final : public ClientSession,
             return;
         }
 
-        m_status = status;
-        m_head_parsed = true;
-        m_close_after = m_close_after || header_has_token(head.headers, "connection", "close");
-        ResponseHead parsed_head = std::move(head);
-        if (auto current = m_current.lock()) {
-            current->set_head(parsed_head);
-        }
-
         const bool head_request = m_spec && m_spec->method() == Method::Head;
         const bool bodyless = head_request || status == 204 || status == 304;
+        head.bodyless = bodyless;
+
+        // Framing: one Content-Length or one Transfer-Encoding: chunked. A
+        // sender must not mix the two; duplicate CL is the response-smuggling
+        // shape, and an unsupported transfer coding cannot be decoded here.
+        const auto te = head.headers.get_all("transfer-encoding");
+        m_body_remaining = 0;
+        m_chunk_remaining = 0;
+        m_chunk_need_crlf = false;
         m_body_complete = false;
-        if (bodyless) {
-            m_body_mode = BodyMode::None;
-            m_body_complete = true;
-            done(error_code{});
-            return;
-        }
-        if (header_has_token(parsed_head.headers, "transfer-encoding", "chunked")) {
+        if (!te.empty()) {
+            if (head.headers.count("content-length") != 0 || te.size() != 1 ||
+                !iequals_ci(trim_ows(te.front()), "chunked")) {
+                done(make_error_code(client_errc::protocol_error));
+                return;
+            }
             m_body_mode = BodyMode::Chunked;
-        } else if (const auto cl = parsed_head.header("content-length")) {
+        } else if (head.headers.count("content-length") > 1) {
+            done(make_error_code(client_errc::protocol_error));
+            return;
+        } else if (const auto cl = head.header("content-length")) {
+            if (cl->empty()) {
+                done(make_error_code(client_errc::protocol_error));
+                return;
+            }
             std::uint64_t value = 0;
             for (char c : *cl) {
                 if (c < '0' || c > '9') {
                     done(make_error_code(client_errc::protocol_error));
                     return;
                 }
-                value = value * 10 + static_cast<std::uint64_t>(c - '0');
+                const auto d = static_cast<std::uint64_t>(c - '0');
+                if (value > (std::numeric_limits<std::uint64_t>::max() - d) / 10) {
+                    done(make_error_code(client_errc::protocol_error));
+                    return;
+                }
+                value = value * 10 + d;
             }
             m_body_remaining = value;
             m_body_mode = value == 0 ? BodyMode::None : BodyMode::Fixed;
             m_body_complete = value == 0;
         } else {
             m_body_mode = BodyMode::EofDelimited;
+        }
+
+        if (bodyless) {
+            m_body_mode = BodyMode::None;
+            m_body_remaining = 0;
+            m_body_complete = true;
+        }
+
+        m_status = status;
+        m_head_parsed = true;
+        m_close_after = m_close_after || header_has_token(head.headers, "connection", "close");
+        if (auto current = m_current.lock()) {
+            current->set_head(std::move(head));
         }
         done(error_code{});
     }
@@ -667,7 +796,11 @@ class Http1ClientSession final : public ClientSession,
     }
 
     void fail_read(ReadCompletion done, error_code ec) {
+        // A failed read ends this exchange: mark the connection unusable and
+        // release the busy flag so the next request may replace the session
+        // instead of treating a dead exchange as still active.
         fail_exchange(ec);
+        release_exchange();
         std::move(done)(ec, ReadResult{});
     }
 
@@ -695,86 +828,108 @@ class Http1ClientSession final : public ClientSession,
     }
 
     void read_chunked(ReadCompletion done) {
-        const auto nl = m_in.find("\r\n");
-        if (nl == std::string::npos) {
-            if (m_in.size() > m_limits.max_header_bytes) {
+        // Consume the CRLF that terminates the previous chunk first. It is
+        // tracked out of band so a chunk whose data was already delivered can
+        // still verify the terminator on the next read.
+        if (m_chunk_need_crlf) {
+            if (m_in.size() < 2) {
+                auto self = this->shared_from_this();
+                read_more([self, done = std::move(done)](error_code ec, std::size_t) mutable {
+                    if (ec) {
+                        self->fail_read(std::move(done), ec);
+                        return;
+                    }
+                    self->read_chunked(std::move(done));
+                });
+                return;
+            }
+            if (m_in.compare(0, 2, "\r\n") != 0) {
                 fail_read(std::move(done), make_error_code(client_errc::protocol_error));
                 return;
             }
-            auto self = this->shared_from_this();
-            read_more([self, done = std::move(done)](error_code ec, std::size_t) mutable {
-                if (ec) {
-                    self->fail_read(std::move(done), ec);
-                    return;
-                }
-                self->read_chunked(std::move(done));
-            });
-            return;
+            m_in.erase(0, 2);
+            m_chunk_need_crlf = false;
         }
-        std::string_view size_line{m_in.data(), nl};
-        if (auto semi = size_line.find(';'); semi != std::string_view::npos)
-            size_line = size_line.substr(0, semi);
-        std::uint64_t size = 0;
-        bool any = false;
-        for (char c : size_line) {
-            unsigned d;
-            if (c >= '0' && c <= '9')
-                d = static_cast<unsigned>(c - '0');
-            else if (c >= 'a' && c <= 'f')
-                d = 10u + static_cast<unsigned>(c - 'a');
-            else if (c >= 'A' && c <= 'F')
-                d = 10u + static_cast<unsigned>(c - 'A');
-            else {
-                fail_read(std::move(done), make_error_code(client_errc::protocol_error));
-                return;
-            }
-            size = size * 16 + d;
-            any = true;
-        }
-        if (!any) {
-            fail_read(std::move(done), make_error_code(client_errc::protocol_error));
-            return;
-        }
-        m_in.erase(0, nl + 2);
-        if (size == 0) {
-            // Consume the trailer section up to the blank line.
-            read_trailers(std::move(done));
-            return;
-        }
-        if (m_in.size() < size + 2) {
-            auto self = this->shared_from_this();
-            read_more([self, done = std::move(done), size](error_code ec, std::size_t) mutable {
-                if (ec) {
-                    self->fail_read(std::move(done), ec);
-                    return;
-                }
-                self->read_chunked_data(std::move(done), size);
-            });
-            return;
-        }
-        read_chunked_data(std::move(done), size);
-    }
 
-    void read_chunked_data(ReadCompletion done, std::uint64_t size) {
-        if (m_in.size() < size + 2) {
-            auto self = this->shared_from_this();
-            read_more([self, done = std::move(done), size](error_code ec, std::size_t) mutable {
-                if (ec) {
-                    self->fail_read(std::move(done), ec);
+        if (m_chunk_remaining == 0) {
+            const auto nl = m_in.find("\r\n");
+            if (nl == std::string::npos) {
+                if (m_in.size() > m_limits.max_header_bytes) {
+                    fail_read(std::move(done), make_error_code(client_errc::protocol_error));
                     return;
                 }
-                self->read_chunked_data(std::move(done), size);
-            });
+                auto self = this->shared_from_this();
+                read_more([self, done = std::move(done)](error_code ec, std::size_t) mutable {
+                    if (ec) {
+                        self->fail_read(std::move(done), ec);
+                        return;
+                    }
+                    self->read_chunked(std::move(done));
+                });
+                return;
+            }
+            std::string_view size_line{m_in.data(), nl};
+            if (auto semi = size_line.find(';'); semi != std::string_view::npos)
+                size_line = size_line.substr(0, semi);
+            std::uint64_t size = 0;
+            bool any = false;
+            for (char c : size_line) {
+                unsigned d;
+                if (c >= '0' && c <= '9')
+                    d = static_cast<unsigned>(c - '0');
+                else if (c >= 'a' && c <= 'f')
+                    d = 10u + static_cast<unsigned>(c - 'a');
+                else if (c >= 'A' && c <= 'F')
+                    d = 10u + static_cast<unsigned>(c - 'A');
+                else {
+                    fail_read(std::move(done), make_error_code(client_errc::protocol_error));
+                    return;
+                }
+                // Overflow-checked: a wrapping chunk size used to turn into a
+                // small length (or an out-of-range std::string position below).
+                if (size > (std::numeric_limits<std::uint64_t>::max() - d) / 16) {
+                    fail_read(std::move(done), make_error_code(client_errc::protocol_error));
+                    return;
+                }
+                size = size * 16 + d;
+                any = true;
+            }
+            if (!any) {
+                fail_read(std::move(done), make_error_code(client_errc::protocol_error));
+                return;
+            }
+            m_in.erase(0, nl + 2);
+            if (size == 0) {
+                // Consume the trailer section up to the blank line.
+                read_trailers(std::move(done));
+                return;
+            }
+            m_chunk_remaining = size;
+        }
+
+        // Deliver only the bytes that have actually arrived. Buffering the
+        // whole chunk before returning any of it made one large chunk an
+        // unbounded allocation and hid the app-level body cap until it was too
+        // late.
+        if (!m_in.empty()) {
+            const std::size_t take = static_cast<std::size_t>(std::min<std::uint64_t>(m_chunk_remaining, m_in.size()));
+            std::string chunk = m_in.substr(0, take);
+            m_in.erase(0, take);
+            m_chunk_remaining -= take;
+            if (m_chunk_remaining == 0)
+                m_chunk_need_crlf = true;
+            std::move(done)(error_code{}, ReadResult::chunk(std::move(chunk)));
             return;
         }
-        if (static_cast<std::size_t>(size) + 2 > m_in.size() ||
-            m_in.compare(static_cast<std::size_t>(size), 2, "\r\n") != 0) {
-            fail_read(std::move(done), make_error_code(client_errc::protocol_error));
-            return;
-        }
-        std::string chunk = m_in.substr(0, static_cast<std::size_t>(size));
-        m_in.erase(0, static_cast<std::size_t>(size) + 2);
-        std::move(done)(error_code{}, ReadResult::chunk(std::move(chunk)));
+
+        auto self = this->shared_from_this();
+        read_more([self, done = std::move(done)](error_code ec, std::size_t) mutable {
+            if (ec) {
+                self->fail_read(std::move(done), ec);
+                return;
+            }
+            self->read_chunked(std::move(done));
+        });
     }
 
     void read_trailers(ReadCompletion done) {
@@ -863,6 +1018,12 @@ class Http1ClientSession final : public ClientSession,
     int m_status{0};
     BodyMode m_body_mode{BodyMode::None};
     std::uint64_t m_body_remaining{0};
+    // Chunked body state: bytes left in the current chunk, and whether the
+    // CRLF that follows it still has to be consumed. The chunk is streamed out
+    // as its bytes arrive; the whole chunk is never buffered (a peer can
+    // declare a multi-gigabyte chunk).
+    std::uint64_t m_chunk_remaining{0};
+    bool m_chunk_need_crlf{false};
     bool m_body_complete{false};
     Headers m_trailers;
 };

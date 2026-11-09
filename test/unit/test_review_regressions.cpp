@@ -79,8 +79,8 @@ TEST_CASE("review: invoke_handler completes a handler that throws synchronously"
 
     bool done_called = false;
     HandlerCompletion done = asio::any_completion_handler<void()>([&done_called]() { done_called = true; });
-    auto handler = make_handler(
-        [](RequestPtr, ResponsePtr, HandlerCompletion) { throw std::runtime_error("handler boom"); });
+    auto handler =
+        make_handler([](RequestPtr, ResponsePtr, HandlerCompletion) { throw std::runtime_error("handler boom"); });
 
     invoke_handler(handler, req, res, SslHandle{}, std::move(done));
     ctx.run_for(std::chrono::milliseconds(200));
@@ -99,9 +99,7 @@ TEST_CASE("review: buffered Response::async_read_all returns the buffered body",
     Response response{head, "hello"};
 
     std::optional<std::pair<error_code, std::string>> got;
-    response.async_read_all(0, [&got](error_code ec, std::string body) {
-        got = std::make_pair(ec, std::move(body));
-    });
+    response.async_read_all(0, [&got](error_code ec, std::string body) { got = std::make_pair(ec, std::move(body)); });
     ctx.run_for(std::chrono::milliseconds(200));
 
     REQUIRE(got.has_value());
@@ -115,7 +113,10 @@ TEST_CASE("review: buffered Response::async_read_all returns the buffered body",
 TEST_CASE("review: a finished h1 stream cannot act on the next exchange", "[review][regression]") {
     using Session = detail::Http1ClientSession<MockTransport>;
     asio::io_context ctx;
-    auto pump = [&ctx] { ctx.restart(); ctx.run_for(std::chrono::milliseconds(500)); };
+    auto pump = [&ctx] {
+        ctx.restart();
+        ctx.run_for(std::chrono::milliseconds(500));
+    };
     auto transport = std::make_shared<MockTransport>(ctx.get_executor());
     auto session = std::make_shared<Session>(transport, "example.com", EngineLimits{});
 
@@ -161,8 +162,8 @@ TEST_CASE("review: a finished h1 stream cannot act on the next exchange", "[revi
     pump();
 
     REQUIRE(stale_ec.has_value());
-    CHECK(*stale_ec);                                          // stale handle rejected
-    CHECK(transport->written() == written_before);             // nothing reached the wire
+    CHECK(*stale_ec);                              // stale handle rejected
+    CHECK(transport->written() == written_before); // nothing reached the wire
 }
 
 // Chunked trailers are per-exchange state. A keep-alive connection must not
@@ -170,7 +171,10 @@ TEST_CASE("review: a finished h1 stream cannot act on the next exchange", "[revi
 TEST_CASE("review: h1 response trailers do not leak into the next exchange", "[review][regression]") {
     using Session = detail::Http1ClientSession<MockTransport>;
     asio::io_context ctx;
-    auto pump = [&ctx] { ctx.restart(); ctx.run_for(std::chrono::milliseconds(500)); };
+    auto pump = [&ctx] {
+        ctx.restart();
+        ctx.run_for(std::chrono::milliseconds(500));
+    };
     auto transport = std::make_shared<MockTransport>(ctx.get_executor());
     auto session = std::make_shared<Session>(transport, "example.com", EngineLimits{});
 
@@ -274,8 +278,8 @@ TEST_CASE("review: decompression forwards the caller's cancellation slot", "[rev
 
     asio::cancellation_signal signal;
     bool completed = false;
-    stream->async_read(asio::bind_cancellation_slot(signal.slot(),
-                                                    [&completed](error_code, ReadResult) { completed = true; }));
+    stream->async_read(
+        asio::bind_cancellation_slot(signal.slot(), [&completed](error_code, ReadResult) { completed = true; }));
     ctx.restart();
     ctx.run_for(std::chrono::milliseconds(200));
 
@@ -287,8 +291,8 @@ TEST_CASE("review: decompression forwards the caller's cancellation slot", "[rev
 namespace {
 void append_h2_frame(std::string &out, codec::H2FrameType type, std::uint8_t flags, std::uint32_t stream_id,
                      std::string_view payload) {
-    codec::serialize_frame_header(out, static_cast<std::uint32_t>(payload.size()),
-                                  static_cast<std::uint8_t>(type), flags, stream_id);
+    codec::serialize_frame_header(out, static_cast<std::uint32_t>(payload.size()), static_cast<std::uint8_t>(type),
+                                  flags, stream_id);
     out.append(payload);
 }
 } // namespace
@@ -299,7 +303,10 @@ void append_h2_frame(std::string &out, codec::H2FrameType type, std::uint8_t fla
 TEST_CASE("review: h2 delivers a buffered body after the connection closes", "[review][regression]") {
     using Session = detail::Http2ClientSession<MockTransport>;
     asio::io_context ctx;
-    auto pump = [&ctx] { ctx.restart(); ctx.run_for(std::chrono::milliseconds(200)); };
+    auto pump = [&ctx] {
+        ctx.restart();
+        ctx.run_for(std::chrono::milliseconds(200));
+    };
     auto transport = std::make_shared<MockTransport>(ctx.get_executor());
     transport->hold_open();
 
@@ -367,7 +374,10 @@ TEST_CASE("review: h2 delivers a buffered body after the connection closes", "[r
 TEST_CASE("review: auto Expect-continue timeout still sends the body", "[review][regression]") {
     using Session = detail::Http1ClientSession<MockTransport>;
     asio::io_context ctx;
-    auto pump = [&ctx] { ctx.restart(); ctx.run_for(std::chrono::milliseconds(200)); };
+    auto pump = [&ctx] {
+        ctx.restart();
+        ctx.run_for(std::chrono::milliseconds(200));
+    };
     auto transport = std::make_shared<MockTransport>(ctx.get_executor());
     transport->hold_open();
     auto session = std::make_shared<Session>(transport, "example.com", EngineLimits{});
@@ -404,7 +414,10 @@ TEST_CASE("review: auto Expect-continue timeout still sends the body", "[review]
 TEST_CASE("review: a parked h2 reader keeps the stream's terminal error", "[review][regression]") {
     using Session = detail::Http2ClientSession<MockTransport>;
     asio::io_context ctx;
-    auto pump = [&ctx] { ctx.restart(); ctx.run_for(std::chrono::milliseconds(200)); };
+    auto pump = [&ctx] {
+        ctx.restart();
+        ctx.run_for(std::chrono::milliseconds(200));
+    };
     auto transport = std::make_shared<MockTransport>(ctx.get_executor());
     transport->hold_open();
 
@@ -495,11 +508,9 @@ TEST_CASE("middleware: callback form is accepted by make_middleware", "[middlewa
     auto res = std::make_shared<ResponseWriter>(sink);
     std::vector<std::string> order;
 
-    auto mw = make_middleware([&order](RequestPtr req, ResponsePtr res, SslHandle, Next next,
-                                       HandlerCompletion done) {
+    auto mw = make_middleware([&order](RequestPtr req, ResponsePtr res, SslHandle, Next next, HandlerCompletion done) {
         order.push_back("before");
-        next(std::move(req), std::move(res), SslHandle{},
-             HandlerCompletion([&order, done = std::move(done)]() mutable {
+        next(std::move(req), std::move(res), SslHandle{}, HandlerCompletion([&order, done = std::move(done)]() mutable {
                  order.push_back("after");
                  std::move(done)();
              }));
@@ -534,11 +545,12 @@ TEST_CASE("middleware: coroutine form is accepted by make_middleware", "[middlew
     auto res = std::make_shared<ResponseWriter>(sink);
     std::vector<std::string> order;
 
-    auto mw = make_middleware([&order](RequestPtr req, ResponsePtr res, SslHandle, CoroNext next) -> asio::awaitable<void> {
-        order.push_back("before");
-        co_await next(std::move(req), std::move(res), SslHandle{});
-        order.push_back("after");
-    });
+    auto mw =
+        make_middleware([&order](RequestPtr req, ResponsePtr res, SslHandle, CoroNext next) -> asio::awaitable<void> {
+            order.push_back("before");
+            co_await next(std::move(req), std::move(res), SslHandle{});
+            order.push_back("after");
+        });
     Next terminal = [&order](RequestPtr, ResponsePtr, SslHandle, HandlerCompletion done) {
         order.push_back("next");
         std::move(done)();
@@ -595,4 +607,141 @@ TEST_CASE("review: async ResolveFn completion is marshalled to the caller execut
     // context.
     auto &hook_ctx = asio::query(*hook_executor, asio::execution::context);
     CHECK(&hook_ctx == static_cast<asio::execution_context *>(&ctx));
+}
+
+// A chunk size that overflows uint64 used to wrap (and reach std::string with
+// an out-of-range position). It must be a protocol error, not a crash.
+TEST_CASE("review: h1 client rejects a chunk size that overflows uint64", "[review][regression][client]") {
+    using Session = detail::Http1ClientSession<MockTransport>;
+    asio::io_context ctx;
+    auto pump = [&ctx] {
+        ctx.restart();
+        ctx.run_for(std::chrono::milliseconds(500));
+    };
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    auto session = std::make_shared<Session>(transport, "example.com", EngineLimits{});
+
+    auto request = std::make_shared<Request>(Version::Http11, ctx.get_executor());
+    request->set_method(Method::Get);
+    request->set_target("/x");
+    std::shared_ptr<detail::ClientStream> stream;
+    session->open_stream(request, [&stream](error_code ec, std::shared_ptr<detail::ClientStream> s) {
+        if (!ec)
+            stream = std::move(s);
+    });
+    pump();
+    REQUIRE(stream);
+
+    transport->push("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n"
+                    "10000000000000000\r\nX");
+    std::optional<error_code> head_ec;
+    stream->async_read_head([&head_ec](error_code ec, detail::ResponseHead) { head_ec = ec; });
+    pump();
+    REQUIRE(head_ec.has_value());
+    CHECK_FALSE(*head_ec);
+
+    std::optional<error_code> read_ec;
+    stream->async_read([&read_ec](error_code ec, ReadResult) { read_ec = ec; });
+    pump();
+    REQUIRE(read_ec.has_value());
+    CHECK(*read_ec == make_error_code(client_errc::protocol_error));
+}
+
+// Duplicate Content-Length is the response-smuggling shape: different readers
+// disagree about where the body ends and the next response starts.
+TEST_CASE("review: h1 client rejects duplicate response Content-Length", "[review][regression][client]") {
+    using Session = detail::Http1ClientSession<MockTransport>;
+    asio::io_context ctx;
+    auto pump = [&ctx] {
+        ctx.restart();
+        ctx.run_for(std::chrono::milliseconds(500));
+    };
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    auto session = std::make_shared<Session>(transport, "example.com", EngineLimits{});
+
+    auto request = std::make_shared<Request>(Version::Http11, ctx.get_executor());
+    request->set_method(Method::Get);
+    request->set_target("/x");
+    std::shared_ptr<detail::ClientStream> stream;
+    session->open_stream(request, [&stream](error_code ec, std::shared_ptr<detail::ClientStream> s) {
+        if (!ec)
+            stream = std::move(s);
+    });
+    pump();
+    REQUIRE(stream);
+
+    transport->push("HTTP/1.1 200 OK\r\ncontent-length: 5\r\ncontent-length: 10\r\n\r\nHELLOWORLD");
+    std::optional<error_code> ec_out;
+    stream->async_read_head([&ec_out](error_code ec, detail::ResponseHead) { ec_out = ec; });
+    pump();
+    REQUIRE(ec_out.has_value());
+    CHECK(*ec_out == make_error_code(client_errc::protocol_error));
+}
+
+// A bare LF inside a field line is a byte in the value here but a line ending
+// to another reader: the response-smuggling differential.
+TEST_CASE("review: h1 client rejects a bare LF inside the response head", "[review][regression][client]") {
+    using Session = detail::Http1ClientSession<MockTransport>;
+    asio::io_context ctx;
+    auto pump = [&ctx] {
+        ctx.restart();
+        ctx.run_for(std::chrono::milliseconds(500));
+    };
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    auto session = std::make_shared<Session>(transport, "example.com", EngineLimits{});
+
+    auto request = std::make_shared<Request>(Version::Http11, ctx.get_executor());
+    request->set_method(Method::Get);
+    request->set_target("/x");
+    std::shared_ptr<detail::ClientStream> stream;
+    session->open_stream(request, [&stream](error_code ec, std::shared_ptr<detail::ClientStream> s) {
+        if (!ec)
+            stream = std::move(s);
+    });
+    pump();
+    REQUIRE(stream);
+
+    transport->push("HTTP/1.1 200 OK\r\nx-test: a\nb\r\ncontent-length: 0\r\n\r\n");
+    std::optional<error_code> ec_out;
+    stream->async_read_head([&ec_out](error_code ec, detail::ResponseHead) { ec_out = ec; });
+    pump();
+    REQUIRE(ec_out.has_value());
+    CHECK(*ec_out == make_error_code(client_errc::protocol_error));
+}
+
+// HTTP/1.0 is a valid response version and bodyless must be published.
+TEST_CASE("review: h1 client accepts HTTP/1.0 and publishes bodyless", "[review][regression][client]") {
+    using Session = detail::Http1ClientSession<MockTransport>;
+    asio::io_context ctx;
+    auto pump = [&ctx] {
+        ctx.restart();
+        ctx.run_for(std::chrono::milliseconds(500));
+    };
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    auto session = std::make_shared<Session>(transport, "example.com", EngineLimits{});
+
+    auto request = std::make_shared<Request>(Version::Http11, ctx.get_executor());
+    request->set_method(Method::Get);
+    request->set_target("/x");
+    std::shared_ptr<detail::ClientStream> stream;
+    session->open_stream(request, [&stream](error_code ec, std::shared_ptr<detail::ClientStream> s) {
+        if (!ec)
+            stream = std::move(s);
+    });
+    pump();
+    REQUIRE(stream);
+
+    transport->push("HTTP/1.0 204 No Content\r\n\r\n");
+    std::optional<detail::ResponseHead> head;
+    std::optional<error_code> ec_out;
+    stream->async_read_head([&](error_code ec, detail::ResponseHead h) {
+        ec_out = ec;
+        head = std::move(h);
+    });
+    pump();
+    REQUIRE(ec_out.has_value());
+    CHECK_FALSE(*ec_out);
+    REQUIRE(head.has_value());
+    CHECK(head->version == Version::Http1);
+    CHECK(head->bodyless);
 }

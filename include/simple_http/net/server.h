@@ -195,8 +195,8 @@ class Server {
         return *this;
     }
     template <typename F>
-    Server &route_regex(std::vector<Method> methods, const std::string &pattern,
-                        std::vector<Middleware> middlewares, F &&handler) {
+    Server &route_regex(std::vector<Method> methods, const std::string &pattern, std::vector<Middleware> middlewares,
+                        F &&handler) {
         m_router->route_regex(std::move(methods), pattern, std::move(middlewares), std::forward<F>(handler));
         return *this;
     }
@@ -230,8 +230,7 @@ class Server {
         m_router->host(std::move(pattern), std::forward<F>(register_routes));
         return *this;
     }
-    template <typename F>
-    Server &host(std::string pattern, std::vector<Middleware> middlewares, F &&register_routes) {
+    template <typename F> Server &host(std::string pattern, std::vector<Middleware> middlewares, F &&register_routes) {
         m_router->host(std::move(pattern), std::move(middlewares), std::forward<F>(register_routes));
         return *this;
     }
@@ -746,9 +745,8 @@ class Server {
     static std::shared_ptr<std::function<void()>> register_closer(const std::shared_ptr<Core> &core,
                                                                   std::shared_ptr<Transport> transport) {
         auto exec = transport->get_executor();
-        auto closer = std::make_shared<std::function<void()>>([transport, exec] {
-            asio::post(exec, [transport] { transport->close(); });
-        });
+        auto closer = std::make_shared<std::function<void()>>(
+            [transport, exec] { asio::post(exec, [transport] { transport->close(); }); });
         core->register_closer(closer);
         return closer;
     }
@@ -764,7 +762,24 @@ class Server {
             auto closer = register_closer(core, transport);
             std::weak_ptr<ListenerState> weak_listener = listener;
             std::weak_ptr<Core> weak_core = core;
-            transport->async_handshake([weak_listener, weak_core, transport, closer](error_code handshake_ec) {
+            // A peer that completes the TCP handshake and then sends no (or a
+            // dribbled) ClientHello must not hold a connection slot forever.
+            // The same idle budget the engines use after the handshake bounds
+            // this phase; closing the transport unwinds the pending handshake.
+            auto handshake_timer = std::make_shared<asio::steady_timer>(transport->get_executor());
+            auto handshake_done = std::make_shared<std::atomic<bool>>(false);
+            const auto handshake_timeout = core->limits.idle_timeout;
+            if (handshake_timeout.count() > 0) {
+                handshake_timer->expires_after(handshake_timeout);
+                handshake_timer->async_wait([transport, handshake_done](error_code tec) {
+                    if (!tec && !handshake_done->load(std::memory_order_acquire))
+                        transport->close();
+                });
+            }
+            transport->async_handshake([weak_listener, weak_core, transport, closer, handshake_timer,
+                                        handshake_done](error_code handshake_ec) {
+                handshake_done->store(true, std::memory_order_release);
+                handshake_timer->cancel();
                 auto alive = weak_listener.lock();
                 if (handshake_ec || !alive) {
                     transport->close();

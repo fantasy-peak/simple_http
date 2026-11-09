@@ -683,6 +683,9 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
         // on the Request is an explicit override (reverse proxy preserve_host);
         // otherwise the connection target owns it.
         if (const auto host_override = request.header("host")) {
+            if (contains_ctl(*host_override)) {
+                return make_error_code(client_errc::invalid_header);
+            }
             codec::hpack_append_literal(block, ":authority", *host_override);
         } else {
             codec::hpack_append_literal(block, ":authority", m_authority);
@@ -697,9 +700,13 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
         for (const auto &[name, value] : request.headers()) {
             if (name.empty() || name.front() == ':' || is_connection_specific(name))
                 continue;
-            if (contains_ctl(name) || contains_ctl(value)) {
-                SIMPLE_HTTP_ERROR_LOG("h2 client: dropping header '{}' with CR/LF/NUL", name);
-                continue;
+            if (!is_http_token(name) || contains_ctl(name) || contains_ctl(value)) {
+                // Refuse the request instead of silently dropping the field: a
+                // caller that put CR/LF into a value is trying to inject a
+                // header, and a mismatch between what it asked for and what
+                // went on the wire is worse than a clear error.
+                SIMPLE_HTTP_ERROR_LOG("h2 client: invalid header '{}'", name);
+                return make_error_code(client_errc::invalid_header);
             }
             if (name == "user-agent")
                 saw_agent = true;
@@ -1576,8 +1583,7 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
                 // A reset/failed stream closed the space; report why it died
                 // rather than a generic session_closed.
                 const auto state = outcome->get();
-                if (state == StreamState::Reset || state == StreamState::Failed ||
-                    state == StreamState::Disconnect) {
+                if (state == StreamState::Reset || state == StreamState::Failed || state == StreamState::Disconnect) {
                     std::move(done)(outcome_error(*outcome));
                 } else {
                     std::move(done)(make_error_code(client_errc::session_closed));

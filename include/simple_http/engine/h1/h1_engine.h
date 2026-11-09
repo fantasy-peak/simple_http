@@ -624,7 +624,7 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
 
         // h2c cleartext upgrade (RFC 9113 §3.2): answer 101 and continue the
         // connection as HTTP/2, replaying this request as stream 1.
-        if (m_allow_h2c && is_h2c_upgrade(head)) {
+        if (m_allow_h2c && version == Version::Http11 && is_h2c_upgrade(head)) {
             do_h2c_upgrade(head, framing);
             return;
         }
@@ -633,7 +633,11 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
         request->set_method_token(std::move(head.method_token));
         request->set_target(std::move(head.target));
 
-        const bool expect_continue = framing.has_body && header_has_token(head.headers, "expect", "100-continue");
+        // RFC 9110 §10.1.1: a server MUST NOT send 100 Continue to an HTTP/1.0
+        // client; ignoring the expectation makes the peer send the body
+        // immediately, which is the 1.0 behaviour.
+        const bool expect_continue =
+            version != Version::Http1 && framing.has_body && header_has_token(head.headers, "expect", "100-continue");
         setup_body_framing(framing.chunked, framing.content_length);
         m_body_state.expect_continue = expect_continue;
         m_continue_sent->store(false, std::memory_order_relaxed);
@@ -1173,6 +1177,13 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
         BodyFraming out;
         const auto te = head.headers.get("transfer-encoding");
         const auto cl = head.headers.get("content-length");
+        // RFC 9112 §6.1: Transfer-Encoding is an HTTP/1.1 frame; a 1.0 request
+        // carrying it must be rejected rather than decoded as chunked (a front
+        // end that ignores TE for 1.0 would otherwise disagree about framing).
+        if (head.version == Version::Http1 && te) {
+            out.error_status = status::bad_request;
+            return out;
+        }
         if (te) {
             if (!value_has_token(*te, "chunked")) {
                 out.error_status = status::not_implemented;
