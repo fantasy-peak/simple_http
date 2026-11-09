@@ -392,6 +392,17 @@ class Router {
         return *this;
     }
 
+    // Same shape normalization as route(): a callback or (C++20) coroutine
+    // WebSocket handler can be registered directly.
+    template <typename F, std::enable_if_t<!std::is_same_v<std::decay_t<F>, WsHandler>, int> = 0>
+    Router &ws_route(std::string path, F &&handler) {
+        return ws_route(std::move(path), make_ws_handler(std::forward<F>(handler)));
+    }
+    template <typename F, std::enable_if_t<!std::is_same_v<std::decay_t<F>, WsHandler>, int> = 0>
+    Router &ws_route(std::string path, std::vector<Middleware> middlewares, F &&handler) {
+        return ws_route(std::move(path), std::move(middlewares), make_ws_handler(std::forward<F>(handler)));
+    }
+
     Router &ws_route_regex(const std::string &pattern, WsHandler handler) {
         return ws_route_regex(pattern, {}, std::move(handler));
     }
@@ -406,6 +417,15 @@ class Router {
             SIMPLE_HTTP_ERROR_LOG("invalid ws route regex [{}]: {}", pattern, e.what());
         }
         return *this;
+    }
+
+    template <typename F, std::enable_if_t<!std::is_same_v<std::decay_t<F>, WsHandler>, int> = 0>
+    Router &ws_route_regex(const std::string &pattern, F &&handler) {
+        return ws_route_regex(pattern, make_ws_handler(std::forward<F>(handler)));
+    }
+    template <typename F, std::enable_if_t<!std::is_same_v<std::decay_t<F>, WsHandler>, int> = 0>
+    Router &ws_route_regex(const std::string &pattern, std::vector<Middleware> middlewares, F &&handler) {
+        return ws_route_regex(pattern, std::move(middlewares), make_ws_handler(std::forward<F>(handler)));
     }
 
     const WsRouteEntry *find_ws_exact(std::string_view path) const {

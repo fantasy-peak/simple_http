@@ -517,6 +517,16 @@ TEST_CASE("middleware: callback form is accepted by make_middleware", "[middlewa
 }
 
 #if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+TEST_CASE("router: coroutine websocket handler is accepted directly", "[router][middleware][review]") {
+    Router router;
+    router.ws_route("/ws", [](RequestPtr, std::shared_ptr<WebSocket>) -> asio::awaitable<void> { co_return; });
+    CHECK(router.find_ws_exact("/ws") != nullptr);
+
+    router.ws_route_regex("^/chat/[0-9]+$",
+                          [](RequestPtr, std::shared_ptr<WebSocket>) -> asio::awaitable<void> { co_return; });
+    CHECK(router.find_ws_regex("/chat/42") != nullptr);
+}
+
 TEST_CASE("middleware: coroutine form is accepted by make_middleware", "[middleware][review]") {
     asio::io_context ctx;
     auto req = std::make_shared<Request>(Version::Http11, ctx.get_executor());
