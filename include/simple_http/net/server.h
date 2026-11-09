@@ -194,12 +194,24 @@ class Server {
         m_router->route_regex(std::move(methods), pattern, std::forward<F>(handler));
         return *this;
     }
+    template <typename F>
+    Server &route_regex(std::vector<Method> methods, const std::string &pattern,
+                        std::vector<Middleware> middlewares, F &&handler) {
+        m_router->route_regex(std::move(methods), pattern, std::move(middlewares), std::forward<F>(handler));
+        return *this;
+    }
     template <typename F> Server &fallback(F &&handler) {
         m_router->fallback(std::forward<F>(handler));
         return *this;
     }
     Server &use(Middleware middleware) {
         m_router->use(std::move(middleware));
+        return *this;
+    }
+    // Forwards the callback/coroutine shape exactly like Router::use.
+    template <typename F, std::enable_if_t<!std::is_same_v<std::decay_t<F>, Middleware>, int> = 0>
+    Server &use(F &&middleware) {
+        m_router->use(std::forward<F>(middleware));
         return *this;
     }
     Server &cors(CorsConfig config) {
@@ -218,6 +230,11 @@ class Server {
         m_router->host(std::move(pattern), std::forward<F>(register_routes));
         return *this;
     }
+    template <typename F>
+    Server &host(std::string pattern, std::vector<Middleware> middlewares, F &&register_routes) {
+        m_router->host(std::move(pattern), std::move(middlewares), std::forward<F>(register_routes));
+        return *this;
+    }
     template <typename F> Server &ws_route(std::string path, F &&handler) {
         m_router->ws_route(std::move(path), make_ws_handler(std::forward<F>(handler)));
         return *this;
@@ -228,6 +245,11 @@ class Server {
     }
     template <typename F> Server &ws_route_regex(const std::string &pattern, F &&handler) {
         m_router->ws_route_regex(pattern, make_ws_handler(std::forward<F>(handler)));
+        return *this;
+    }
+    template <typename F>
+    Server &ws_route_regex(const std::string &pattern, std::vector<Middleware> middlewares, F &&handler) {
+        m_router->ws_route_regex(pattern, std::move(middlewares), make_ws_handler(std::forward<F>(handler)));
         return *this;
     }
     template <typename T> Server &state(std::shared_ptr<T> value) {

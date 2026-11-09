@@ -30,6 +30,8 @@
 // trusted from the client. The id is generated with RAND_bytes (OpenSSL) and is
 // base64url-encoded without padding.
 
+#include <boost/asio/post.hpp>
+
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -262,8 +264,13 @@ inline Middleware session(std::shared_ptr<SessionStore> store, SessionConfig con
             return;
         }
         auto cookie = req->cookie(config.cookie_name);
+        // SessionStore is a public extension point: a Redis/DB implementation
+        // may complete on its own thread. Everything below the store callback
+        // (request state, the handler chain, the engine completion) is model-A
+        // state and must run on the connection executor.
+        auto exec = req->executor();
 
-        auto after_load = [store, config, req, res, ssl, next,
+        auto after_load = [store, config, req, res, ssl, next, exec,
                            done = std::move(done)](error_code ec, std::optional<SessionData> loaded) mutable {
             std::string id;
             SessionData data;
@@ -287,19 +294,27 @@ inline Middleware session(std::shared_ptr<SessionStore> store, SessionConfig con
                 set_cookie(current->id());
             }
 
-            auto after_chain = [store, config, current, original_id, done = std::move(done)]() mutable {
-                auto save_if_dirty = [store, config, current, done = std::move(done)]() mutable {
+            auto after_chain = [store, config, current, original_id, exec, done = std::move(done)]() mutable {
+                auto finish = [exec, done = std::move(done)]() mutable {
+                    asio::dispatch(exec, [done = std::move(done)]() mutable { std::move(done)(); });
+                };
+                auto save_if_dirty = [store, config, current, finish = std::move(finish)]() mutable {
                     if (!current->dirty()) {
-                        std::move(done)();
+                        finish();
                         return;
                     }
                     SessionData out = current->data();
                     out.expires_unix = config.max_age.count() > 0 ? now_unix() + config.max_age.count() : 0;
-                    store->save(std::string{current->id()}, out, finish_with(std::move(done)));
+                    store->save(std::string{current->id()}, out,
+                                [finish = std::move(finish)](error_code) mutable { finish(); });
                 };
                 if (!original_id.empty() && current->id() != original_id) {
                     store->destroy(original_id,
-                                   [save_if_dirty = std::move(save_if_dirty)](error_code) mutable { save_if_dirty(); });
+                                   [exec, save_if_dirty = std::move(save_if_dirty)](error_code) mutable {
+                                       asio::dispatch(exec, [save_if_dirty = std::move(save_if_dirty)]() mutable {
+                                           save_if_dirty();
+                                       });
+                                   });
                     return;
                 }
                 save_if_dirty();
@@ -307,10 +322,17 @@ inline Middleware session(std::shared_ptr<SessionStore> store, SessionConfig con
             next(std::move(req), std::move(res), ssl, std::move(after_chain));
         };
 
+        auto hop_after_load = [exec, after_load = std::move(after_load)](
+                                  error_code ec, std::optional<SessionData> loaded) mutable {
+            asio::dispatch(exec, [after_load = std::move(after_load), ec, loaded = std::move(loaded)]() mutable {
+                after_load(ec, std::move(loaded));
+            });
+        };
+
         if (cookie && !cookie->empty()) {
-            store->load(std::string{*cookie}, std::move(after_load));
+            store->load(std::string{*cookie}, std::move(hop_after_load));
         } else {
-            after_load(error_code{}, std::nullopt);
+            hop_after_load(error_code{}, std::nullopt);
         }
     };
 }
