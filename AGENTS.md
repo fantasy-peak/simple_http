@@ -302,13 +302,22 @@ using ResponsePtr = std::shared_ptr<ResponseWriter>;
 // awaitable<void>(RequestPtr, shared_ptr<WebSocket>)
 ```
 
-中间件：
+中间件（C++20 构建两种形状都可用；C++17 只有回调式）：
 
 ```cpp
-using Next = std::function<asio::awaitable<void>(RequestPtr, ResponsePtr, SslHandle)>;
+using Next = CallbackHandler; // void(RequestPtr, ResponsePtr, SslHandle, HandlerCompletion)
 using Middleware =
-    std::function<asio::awaitable<void>(RequestPtr, ResponsePtr, SslHandle, Next)>;
+    std::function<void(RequestPtr, ResponsePtr, SslHandle, Next, HandlerCompletion)>;
+#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+using CoroNext = std::function<asio::awaitable<void>(RequestPtr, ResponsePtr, SslHandle)>;
+#endif
 ```
+
+- `use()` / `make_middleware()` 接受回调式或协程式；`make_middlewares(...)`
+  用于 `group()` / `route()` / `ws_route()` 的 `std::vector<Middleware>` 参数混合两种形状。
+- 协程式内部用 `async_compose` 把 `Next` 适配成 awaitable，保留 associated
+  executor / allocator / cancellation slot。
+- Router 仍然是运行时注册表，内部统一为 type-erased `Middleware`；不要把链模板化。
 
 - `use()` 按注册顺序嵌套，最外层先跑；CORS 始终最外层。
 - `group(prefix, mws, registrar)`：前缀 + 组中间件，可嵌套。

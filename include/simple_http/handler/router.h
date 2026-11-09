@@ -350,6 +350,13 @@ class Router {
         return *this;
     }
 
+    // Accepts the callback or (C++20) coroutine middleware shape directly.
+    // A plain Middleware still binds to the non-template overload above.
+    template <typename F, std::enable_if_t<!std::is_same_v<std::decay_t<F>, Middleware>, int> = 0>
+    Router &use(F &&middleware) {
+        return use(make_middleware(std::forward<F>(middleware)));
+    }
+
     // --- CORS ---
     // A policy in; the middleware it compiles to is always the outermost
     // element of the dispatch chain (a preflight is answered here and never

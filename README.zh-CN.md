@@ -612,19 +612,37 @@ Handler 抛出异常时引擎会返回 500；若响应头已经发出，则关�
 
 ### 中间件
 
-中间件形状对齐 Go `net/http` / axum `from_fn`：
+中间件形状对齐 Go `net/http` / axum `from_fn`，同时支持协程和回调两种写法。
+C++20 构建（`BOOST_ASIO_HAS_CO_AWAIT`）两种都可用；C++17 构建只有回调形式。
 
 ```cpp
+// C++20：协程形式，co_await next(...) 继续链路
 server.use([](RequestPtr req, ResponsePtr res, SslHandle ssl,
-              Next next) -> asio::awaitable<void> {
+              CoroNext next) -> asio::awaitable<void> {
     auto t0 = std::chrono::steady_clock::now();          // before
     co_await next(std::move(req), std::move(res), ssl);  // 继续链路
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                   std::chrono::steady_clock::now() - t0).count();
     SIMPLE_HTTP_INFO_LOG("status={} elapsed={}ms", res->status(), ms); // after
 });
+
+// C++17 或回调形式：把完成回调传给 next
+server.use([](RequestPtr req, ResponsePtr res, SslHandle ssl,
+              Next next, HandlerCompletion done) {
+    auto t0 = std::chrono::steady_clock::now();
+    next(std::move(req), std::move(res), ssl,
+         [res, t0, done = std::move(done)]() mutable {
+             auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - t0).count();
+             SIMPLE_HTTP_INFO_LOG("status={} elapsed={}ms", res->status(), ms);
+             std::move(done)();
+         });
+});
 ```
 
+- `use()` 直接接受两种形状；需要显式归一化时用 `make_middleware(...)`。
+- `group()` / `route()` / `ws_route()` 的 `std::vector<Middleware>` 参数可用
+  `make_middlewares(...)` 混合传入两种形状。
 - 不调用 `next()` 即短路。
 - `use()` 按注册顺序嵌套，最外层先跑；CORS 始终位于最外层。
 - 组中间件只作用于 `group()` 内注册的路由；per-route 中间件只包这一条路由。

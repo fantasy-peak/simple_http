@@ -653,19 +653,38 @@ turns this into a chain-level policy.
 
 ### Middleware
 
-The middleware shape matches Go `net/http` / axum `from_fn`:
+The middleware shape matches Go `net/http` / axum `from_fn` and supports both
+coroutine and callback forms. A C++20 build (where Boost.Asio provides co_await)
+accepts both; a C++17 build keeps only the callback form.
 
 ```cpp
+// C++20: coroutine form
 server.use([](RequestPtr req, ResponsePtr res, SslHandle ssl,
-              Next next) -> asio::awaitable<void> {
+              CoroNext next) -> asio::awaitable<void> {
     auto t0 = std::chrono::steady_clock::now();          // before
     co_await next(std::move(req), std::move(res), ssl);  // run the chain
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                   std::chrono::steady_clock::now() - t0).count();
     SIMPLE_HTTP_INFO_LOG("status={} elapsed={}ms", res->status(), ms); // after
 });
+
+// C++17 (and C++20): callback form
+server.use([](RequestPtr req, ResponsePtr res, SslHandle ssl,
+              Next next, HandlerCompletion done) {
+    auto t0 = std::chrono::steady_clock::now();
+    next(std::move(req), std::move(res), ssl,
+         [res, t0, done = std::move(done)]() mutable {
+             auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - t0).count();
+             SIMPLE_HTTP_INFO_LOG("status={} elapsed={}ms", res->status(), ms);
+             std::move(done)();
+         });
+});
 ```
 
+- `use()` accepts either shape directly; use `make_middleware(...)` to normalize
+  explicitly, and `make_middlewares(...)` to mix both in the
+  `std::vector<Middleware>` arguments of `group()` / `route()` / `ws_route()`.
 - Not calling `next()` short-circuits the chain.
 - `use()` nests in registration order, outermost first; CORS is always the outermost.
 - Group middleware applies only inside `group()`; per-route middleware wraps only that

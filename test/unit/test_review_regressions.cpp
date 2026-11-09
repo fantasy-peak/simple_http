@@ -488,6 +488,61 @@ TEST_CASE("review: a bare IPv6 authority is rejected", "[review][regression]") {
     CHECK(detail::parse_url("http://[fe80::1]/").has_value());
 }
 
+TEST_CASE("middleware: callback form is accepted by make_middleware", "[middleware][review]") {
+    asio::io_context ctx;
+    auto req = std::make_shared<Request>(Version::Http11, ctx.get_executor());
+    auto sink = std::make_shared<FakeResponseSink>(ctx.get_executor());
+    auto res = std::make_shared<ResponseWriter>(sink);
+    std::vector<std::string> order;
+
+    auto mw = make_middleware([&order](RequestPtr req, ResponsePtr res, SslHandle, Next next,
+                                       HandlerCompletion done) {
+        order.push_back("before");
+        next(std::move(req), std::move(res), SslHandle{},
+             HandlerCompletion([&order, done = std::move(done)]() mutable {
+                 order.push_back("after");
+                 std::move(done)();
+             }));
+    });
+    Next terminal = [&order](RequestPtr, ResponsePtr, SslHandle, HandlerCompletion done) {
+        order.push_back("next");
+        std::move(done)();
+    };
+    bool finished = false;
+    mw(req, res, SslHandle{}, terminal, HandlerCompletion([&finished] { finished = true; }));
+    ctx.run_for(std::chrono::milliseconds(200));
+
+    CHECK(order == std::vector<std::string>{"before", "next", "after"});
+    CHECK(finished);
+}
+
+#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+TEST_CASE("middleware: coroutine form is accepted by make_middleware", "[middleware][review]") {
+    asio::io_context ctx;
+    auto req = std::make_shared<Request>(Version::Http11, ctx.get_executor());
+    auto sink = std::make_shared<FakeResponseSink>(ctx.get_executor());
+    auto res = std::make_shared<ResponseWriter>(sink);
+    std::vector<std::string> order;
+
+    auto mw = make_middleware([&order](RequestPtr req, ResponsePtr res, SslHandle, CoroNext next) -> asio::awaitable<void> {
+        order.push_back("before");
+        co_await next(std::move(req), std::move(res), SslHandle{});
+        order.push_back("after");
+    });
+    Next terminal = [&order](RequestPtr, ResponsePtr, SslHandle, HandlerCompletion done) {
+        order.push_back("next");
+        std::move(done)();
+    };
+    bool finished = false;
+    mw(req, res, SslHandle{}, terminal, HandlerCompletion([&finished] { finished = true; }));
+    ctx.restart();
+    ctx.run_for(std::chrono::milliseconds(500));
+
+    CHECK(order == std::vector<std::string>{"before", "next", "after"});
+    CHECK(finished);
+}
+#endif
+
 // An asynchronous ResolveFn may complete on its own thread. The completion must
 // still run on the caller's executor, or Client's cached-session state and the
 // dial/socket setup race with the connection executor.
