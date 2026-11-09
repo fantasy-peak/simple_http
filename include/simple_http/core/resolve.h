@@ -7,23 +7,29 @@
 // An application that has its own asynchronous DNS client (a cache, c-ares,
 // DoH, a private upstream, …) can provide the endpoints instead:
 //
-//     cfg.resolve = [](std::string host, std::string port,
+//     cfg.resolve = [](std::string host, std::uint16_t port,
+//                      simple_http::asio::any_io_executor ex,
 //                      simple_http::ResolveCompletion done) {
-//         // Must be non-blocking and pass endpoints in the order they should
-//         // be tried. It may complete synchronously or from any thread; the
-//         // result is posted back to the caller's executor.
-//         my_dns.async_resolve(std::move(host), std::move(done));
+//         // Called on the caller's executor, which is `ex`. Start the lookup
+//         // there (or arrange for its answer to be posted there) and invoke
+//         // `done` exactly once. It may complete synchronously or from any
+//         // thread; the result is marshalled back to `ex` either way.
+//         my_dns.async_resolve(std::move(host), ex, std::move(done));
 //     };
 //
-// The callback form is deliberately a token-style initiating function rather
-// than a coroutine: the port must work when built as C++17, and the completion
-// handler carries the caller's associated executor / allocator. The completion
-// is always marshalled to that executor, so an asynchronous hook never touches
-// connection state from its own thread. An empty list with no error is treated as host_not_found by callers;
-// IP literals need no query.
+// The executor is passed explicitly rather than recovered from `done`: the
+// completion handler is type-erased (asio::any_completion_handler), and its
+// associated executor erases to any_completion_executor, which cannot be
+// converted back into an any_io_executor. Handing the concrete executor over
+// keeps an awaitable DNS client (a cache, c-ares, DoH, ...) usable from this
+// callback-shaped hook without coroutine adapters or executor downcasts.
+//
+// The hook is a token-style initiating function rather than a coroutine so the
+// port keeps working when built as C++17. An empty list with no error is
+// treated as host_not_found by callers; IP literals need no query.
 
 #include <boost/asio/any_completion_handler.hpp>
-#include <boost/asio/bind_executor.hpp>
+#include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/compose.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/ip/tcp.hpp>
@@ -41,9 +47,10 @@ namespace asio = boost::asio;
 
 using ResolveCompletion = asio::any_completion_handler<void(error_code, std::vector<asio::ip::tcp::endpoint>)>;
 
-// (host, port, completion). Empty host + empty port is never passed; an empty
-// endpoint list with error_code{} means "no addresses".
-using ResolveFn = std::function<void(std::string host, std::string port, ResolveCompletion done)>;
+// (host, port, executor, completion). Empty host + empty port is never passed;
+// an empty endpoint list with error_code{} means "no addresses".
+using ResolveFn =
+    std::function<void(std::string host, std::uint16_t port, asio::any_io_executor ex, ResolveCompletion done)>;
 
 namespace detail {
 
@@ -67,31 +74,23 @@ class ResolveOp {
                 // moved-from function/string (bad_function_call, empty host).
                 ResolveFn resolve = m_resolve;
                 std::string host = m_host;
-                std::string service = std::to_string(m_port);
-                // Bind the composed operation's executor to the handler the
-                // hook receives: a plain lambda carries no associated executor,
-                // so an asynchronous hook (a DNS cache, c-ares, DoH, ...) would
-                // otherwise complete on whatever thread it runs on instead of
-                // the caller's. That is a data race with everything else on the
-                // connection executor, not just a lost wakeup.
+                // The caller's executor, handed to the hook so an asynchronous
+                // DNS client can run the lookup on the connection's thread. No
+                // type erasure is involved: this is the concrete executor the
+                // composed operation was given.
                 auto executor = self.get_executor();
-                resolve(std::move(host), std::move(service),
-                        asio::bind_executor(
-                            executor,
-                            [self = std::move(self), executor](error_code rec,
-                                                               std::vector<asio::ip::tcp::endpoint> endpoints) mutable {
-                                // The hook may complete synchronously or from
-                                // its own thread. bind_executor only sets the
-                                // associated executor: it does not dispatch, so
-                                // the completion would still run inline or on
-                                // the hook's thread (racing the connection
-                                // executor). Post unconditionally.
-                                asio::post(
-                                    executor,
-                                    [self = std::move(self), rec, endpoints = std::move(endpoints)]() mutable {
-                                        self.complete(rec, std::move(endpoints));
-                                    });
-                            }));
+                resolve(std::move(host), m_port, executor,
+                        [self = std::move(self), executor](error_code rec,
+                                                           std::vector<asio::ip::tcp::endpoint> endpoints) mutable {
+                            // The hook may complete synchronously or from its
+                            // own thread (c-ares, a resolver thread). Post
+                            // unconditionally: an asio operation must not
+                            // complete from its initiating function, and the
+                            // answer has to land on the caller's executor.
+                            asio::post(executor, [self = std::move(self), rec, endpoints = std::move(endpoints)]() mutable {
+                                self.complete(rec, std::move(endpoints));
+                            });
+                        });
                 return;
             }
             m_resolver.async_resolve(m_host, std::to_string(m_port), std::move(self));

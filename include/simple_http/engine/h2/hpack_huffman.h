@@ -12,8 +12,8 @@
 #include <string>
 
 namespace simple_http::codec {
-#define HUFFMAN_ERROR 1
-#define HUFFMAN_OK 0
+#define SIMPLE_HTTP_HUFFMAN_ERROR 1
+#define SIMPLE_HTTP_HUFFMAN_OK 0
 
 typedef struct {
     unsigned char next;
@@ -4240,20 +4240,20 @@ inline int http_huffman_decode(unsigned char *state, unsigned char *src, size_t 
     }
     while (src != end) {
         ch = *src++;
-        if (http_huffman_decode_bits(state, &ending, ch >> 4, outstr) != HUFFMAN_OK) {
-            return HUFFMAN_ERROR;
+        if (http_huffman_decode_bits(state, &ending, ch >> 4, outstr) != SIMPLE_HTTP_HUFFMAN_OK) {
+            return SIMPLE_HTTP_HUFFMAN_ERROR;
         }
-        if (http_huffman_decode_bits(state, &ending, ch & 0xf, outstr) != HUFFMAN_OK) {
-            return HUFFMAN_ERROR;
+        if (http_huffman_decode_bits(state, &ending, ch & 0xf, outstr) != SIMPLE_HTTP_HUFFMAN_OK) {
+            return SIMPLE_HTTP_HUFFMAN_ERROR;
         }
     }
     if (last) {
         if (!ending) {
-            return HUFFMAN_ERROR;
+            return SIMPLE_HTTP_HUFFMAN_ERROR;
         }
         *state = 0;
     }
-    return HUFFMAN_OK;
+    return SIMPLE_HTTP_HUFFMAN_OK;
 }
 
 inline int http_huffman_decode_bits(unsigned char *state, unsigned char *ending, unsigned int bits,
@@ -4261,14 +4261,14 @@ inline int http_huffman_decode_bits(unsigned char *state, unsigned char *ending,
     http_huffman_decode_code_t code;
     code = http_huffman_decode_tables[*state][bits];
     if (code.next == *state) {
-        return HUFFMAN_ERROR;
+        return SIMPLE_HTTP_HUFFMAN_ERROR;
     }
     if (code.emit) {
         outstr.push_back(code.sym);
     }
     *ending = code.ending;
     *state = code.next;
-    return HUFFMAN_OK;
+    return SIMPLE_HTTP_HUFFMAN_OK;
 }
 
 inline int http_huffman_encode(unsigned char *src, unsigned int len, std::string &outstr) {

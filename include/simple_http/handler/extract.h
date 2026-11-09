@@ -26,7 +26,7 @@
 // extractor to run Validator<T> (see validation.h).
 //
 // The Json/Form extractors depend on glaze and are therefore only available
-// when SIMPLE_HTTP_CPP17_ENABLE_GLAZE is set (see core/glaze_support.h). Path,
+// when SIMPLE_HTTP_HAS_GLAZE is set (see core/glaze_support.h). Path,
 // Query, State, Header, Cookie and Valid<...> work in a plain C++17 build;
 // Path/Query themselves also use glaze reflection, so they are gated too.
 
@@ -102,12 +102,6 @@ inline void render_http_error(const std::shared_ptr<ResponseWriter> &res, const 
 // literal name a type) need C++20. A plain C++17 build does not get the
 // Header/Cookie extractors; every other extractor works.
 #if defined(__cplusplus) && __cplusplus >= 202002L
-#define SIMPLE_HTTP_CPP17_STRING_NTTP 1
-#else
-#define SIMPLE_HTTP_CPP17_STRING_NTTP 0
-#endif
-
-#if SIMPLE_HTTP_CPP17_STRING_NTTP
 template <std::size_t N> struct FixedString {
     std::array<char, N> value{};
     constexpr FixedString(const char (&s)[N]) {
@@ -118,7 +112,7 @@ template <std::size_t N> struct FixedString {
     [[nodiscard]] constexpr std::string_view view() const { return {value.data(), N - 1}; }
 };
 template <std::size_t N> FixedString(const char (&)[N]) -> FixedString<N>;
-#endif // SIMPLE_HTTP_CPP17_STRING_NTTP
+#endif // C++20 class-type NTTP
 
 // --- extractor declarations -------------------------------------------------
 
@@ -137,7 +131,7 @@ template <typename T> struct Form {
 template <typename T> struct State {
     using value_type = T *;
 };
-#if SIMPLE_HTTP_CPP17_STRING_NTTP
+#if defined(__cplusplus) && __cplusplus >= 202002L
 template <typename T, FixedString Name> struct Header {
     using value_type = T;
     static constexpr std::string_view name = Name.view();
@@ -163,7 +157,7 @@ template <typename E> struct Extractor {
 //     static void async_run(Request &, std::function<void(HttpError, T)>);
 // A completion with HttpError::status == 0 is success.
 
-#if SIMPLE_HTTP_CPP17_ENABLE_GLAZE
+#if SIMPLE_HTTP_HAS_GLAZE
 template <typename T> struct Extractor<Path<T>> {
     using value_type = T;
 
@@ -233,7 +227,7 @@ template <typename T> struct Extractor<Form<T>> {
                      }));
     }
 };
-#endif // SIMPLE_HTTP_CPP17_ENABLE_GLAZE
+#endif // SIMPLE_HTTP_HAS_GLAZE
 
 template <typename T> struct Extractor<State<T>> {
     using value_type = T *;
@@ -261,7 +255,7 @@ template <typename T> std::optional<T> parse_scalar(std::string_view value) {
     if constexpr (std::is_same_v<T, std::string>) {
         return std::string{value};
     } else {
-#if SIMPLE_HTTP_CPP17_ENABLE_GLAZE
+#if SIMPLE_HTTP_HAS_GLAZE
         T out{};
         if (auto ec = glz::read_json(out, value); ec) {
             return std::nullopt;
@@ -277,7 +271,7 @@ template <typename T> std::optional<T> parse_scalar(std::string_view value) {
 
 } // namespace detail
 
-#if SIMPLE_HTTP_CPP17_STRING_NTTP
+#if defined(__cplusplus) && __cplusplus >= 202002L
 template <typename T, FixedString Name> struct Extractor<Header<T, Name>> {
     using value_type = T;
 
@@ -317,7 +311,7 @@ template <typename T, FixedString Name> struct Extractor<Cookie<T, Name>> {
         done(detail::extract_ok(), std::move(*parsed));
     }
 };
-#endif // SIMPLE_HTTP_CPP17_STRING_NTTP
+#endif // C++20 class-type NTTP
 
 template <typename E> struct Extractor<Valid<E>> {
     using value_type = typename Extractor<E>::value_type;
@@ -442,7 +436,7 @@ void invoke_extracted(std::shared_ptr<F> fn, Tuple values, RequestPtr req, Respo
             [&](auto &&...args) { (*fn)(std::forward<decltype(args)>(args)..., std::move(req), std::move(res)); },
             std::move(values));
         std::move(done)();
-#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+#if defined(BOOST_ASIO_HAS_CO_AWAIT)
     } else if constexpr (detail::extracted_coro_ssl<D, Tuple>::value) {
         detail::execute_extracted_coroutine(req, res, std::move(done), fn,
                                             std::tuple_cat(std::move(values), std::make_tuple(req, res, ssl)));
@@ -512,7 +506,7 @@ template <typename... Es, typename F> Handler extract(F &&fn) {
     using Fn = std::decay_t<F>;
     static_assert(detail::extracted_callback_ssl<Fn, values>::value || detail::extracted_callback<Fn, values>::value ||
                       detail::extracted_sync_ssl<Fn, values>::value || detail::extracted_sync<Fn, values>::value
-#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+#if defined(BOOST_ASIO_HAS_CO_AWAIT)
                       || detail::extracted_coro_ssl<Fn, values>::value || detail::extracted_coro<Fn, values>::value
 #endif
                   ,

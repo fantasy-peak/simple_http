@@ -403,13 +403,13 @@ TEST_CASE("h2/huffman: RFC 7541 vectors and round trips", "[h2]") {
         std::string encoded;
         const std::string value = "www.example.com";
         CHECK(http_huffman_encode(reinterpret_cast<unsigned char *>(const_cast<char *>(value.data())),
-                                  static_cast<unsigned int>(value.size()), encoded) == HUFFMAN_OK);
+                                  static_cast<unsigned int>(value.size()), encoded) == SIMPLE_HTTP_HUFFMAN_OK);
         CHECK(hex_of(encoded) == "f1e3c2e5f23a6ba0ab90f4ff");
 
         unsigned char state = 0;
         std::string decoded;
         CHECK(http_huffman_decode(&state, reinterpret_cast<unsigned char *>(const_cast<char *>(encoded.data())),
-                                  encoded.size(), decoded, 1) == HUFFMAN_OK);
+                                  encoded.size(), decoded, 1) == SIMPLE_HTTP_HUFFMAN_OK);
         CHECK(decoded == value);
     }
     {
@@ -419,13 +419,13 @@ TEST_CASE("h2/huffman: RFC 7541 vectors and round trips", "[h2]") {
             value.push_back(static_cast<char>(c));
         std::string encoded;
         REQUIRE(http_huffman_encode(reinterpret_cast<unsigned char *>(value.data()),
-                                    static_cast<unsigned int>(value.size()), encoded) == HUFFMAN_OK);
+                                    static_cast<unsigned int>(value.size()), encoded) == SIMPLE_HTTP_HUFFMAN_OK);
         CHECK(encoded.size() <= value.size()); // the table never expands ASCII
 
         unsigned char state = 0;
         std::string decoded;
         REQUIRE(http_huffman_decode(&state, reinterpret_cast<unsigned char *>(encoded.data()), encoded.size(), decoded,
-                                    1) == HUFFMAN_OK);
+                                    1) == SIMPLE_HTTP_HUFFMAN_OK);
         CHECK(decoded == value);
     }
 }

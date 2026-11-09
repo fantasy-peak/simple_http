@@ -294,7 +294,7 @@ inline void log_with_attrs(LogLevel level, std::string_view category, source_loc
 
 #if SIMPLE_HTTP_ENABLE_LOG
 // `category` is a string_view; use "" when the call site has no module tag.
-#define SIMPLE_HTTP_LOG_AT(level, category, ...)                                                                       \
+#define SIMPLE_HTTP_LOG_AT_IMPL(level, category, ...)                                                                       \
     do {                                                                                                               \
         if constexpr (SIMPLE_HTTP_LOG_ACTIVE_LEVEL <= 0) {                                                             \
             ::simple_http::log(level, category, ::simple_http::source_location::current(), __VA_ARGS__);               \
@@ -303,12 +303,12 @@ inline void log_with_attrs(LogLevel level, std::string_view category, source_loc
         }                                                                                                              \
     } while (false)
 #else
-#define SIMPLE_HTTP_LOG_AT(level, category, ...) ((void)0)
+#define SIMPLE_HTTP_LOG_AT_IMPL(level, category, ...) ((void)0)
 #endif
 
-#define SIMPLE_HTTP_TRACE_LOG(...) SIMPLE_HTTP_LOG_AT(::simple_http::LogLevel::Trace, "", __VA_ARGS__)
-#define SIMPLE_HTTP_DEBUG_LOG(...) SIMPLE_HTTP_LOG_AT(::simple_http::LogLevel::Debug, "", __VA_ARGS__)
-#define SIMPLE_HTTP_INFO_LOG(...) SIMPLE_HTTP_LOG_AT(::simple_http::LogLevel::Info, "", __VA_ARGS__)
-#define SIMPLE_HTTP_WARN_LOG(...) SIMPLE_HTTP_LOG_AT(::simple_http::LogLevel::Warn, "", __VA_ARGS__)
-#define SIMPLE_HTTP_ERROR_LOG(...) SIMPLE_HTTP_LOG_AT(::simple_http::LogLevel::Error, "", __VA_ARGS__)
-#define SIMPLE_HTTP_CRITICAL_LOG(...) SIMPLE_HTTP_LOG_AT(::simple_http::LogLevel::Critical, "", __VA_ARGS__)
+#define SIMPLE_HTTP_TRACE_LOG(...) SIMPLE_HTTP_LOG_AT_IMPL(::simple_http::LogLevel::Trace, "", __VA_ARGS__)
+#define SIMPLE_HTTP_DEBUG_LOG(...) SIMPLE_HTTP_LOG_AT_IMPL(::simple_http::LogLevel::Debug, "", __VA_ARGS__)
+#define SIMPLE_HTTP_INFO_LOG(...) SIMPLE_HTTP_LOG_AT_IMPL(::simple_http::LogLevel::Info, "", __VA_ARGS__)
+#define SIMPLE_HTTP_WARN_LOG(...) SIMPLE_HTTP_LOG_AT_IMPL(::simple_http::LogLevel::Warn, "", __VA_ARGS__)
+#define SIMPLE_HTTP_ERROR_LOG(...) SIMPLE_HTTP_LOG_AT_IMPL(::simple_http::LogLevel::Error, "", __VA_ARGS__)
+#define SIMPLE_HTTP_CRITICAL_LOG(...) SIMPLE_HTTP_LOG_AT_IMPL(::simple_http::LogLevel::Critical, "", __VA_ARGS__)

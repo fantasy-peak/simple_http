@@ -3,10 +3,10 @@
 // Dispatcher: the seam between an engine and the handler layer (C++17 port).
 //
 // This is the one header in the port allowed to mention coroutine types. The
-// C++17 build compiles the coroutine branch out entirely
-// (SIMPLE_HTTP_CPP17_CORO_HANDLERS == 0); a downstream build compiled as C++20
-// gets automatic adaptation of coroutine handlers, so the same registration
-// call works with either style:
+// coroutine branch is compiled only when Boost.Asio provides co_await
+// (BOOST_ASIO_HAS_CO_AWAIT, i.e. a C++20-or-later build); such a build gets
+// automatic adaptation of coroutine handlers, so the same registration call
+// works with either style:
 //
 //   server.route({Method::Get}, "/hello",
 //       [](RequestPtr, ResponsePtr res, HandlerCompletion done) {   // callback
@@ -35,9 +35,6 @@
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/bind_cancellation_slot.hpp>
 #include <boost/asio/co_spawn.hpp>
-#define SIMPLE_HTTP_CPP17_CORO_HANDLERS 1
-#else
-#define SIMPLE_HTTP_CPP17_CORO_HANDLERS 0
 #endif
 
 #include <chrono>
@@ -77,7 +74,7 @@ using HandlerCompletion = asio::any_completion_handler<void()>;
 // connection.
 using CallbackHandler = std::function<void(RequestPtr, ResponsePtr, SslHandle, HandlerCompletion)>;
 
-#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+#if defined(BOOST_ASIO_HAS_CO_AWAIT)
 // The coroutine shape, available only when the translation unit is compiled
 // with coroutine support.
 using CoroHandler = std::function<asio::awaitable<void>(RequestPtr, ResponsePtr, SslHandle)>;
@@ -96,7 +93,7 @@ using WsUpgrade = std::function<void(RequestPtr, ResponsePtr, CallbackWsHandler,
 using WsHandlerFn = std::function<void(RequestPtr, ResponsePtr, SslHandle, WsUpgrade, WsUpgradeCompletion)>;
 using WsLookup = std::function<std::optional<WsHandlerFn>(std::string_view path)>;
 
-#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+#if defined(BOOST_ASIO_HAS_CO_AWAIT)
 using CoroWsHandler = std::function<asio::awaitable<void>(RequestPtr, std::shared_ptr<WebSocket>)>;
 using WsHandler = std::variant<CallbackWsHandler, CoroWsHandler>;
 #else
@@ -117,7 +114,7 @@ template <typename F> struct result_ssl<F, std::void_t<std::invoke_result_t<F &,
     using type = std::invoke_result_t<F &, RequestPtr, ResponsePtr, SslHandle>;
     static constexpr bool valid = true;
     static constexpr bool is_void = std::is_same_v<type, void>;
-#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+#if defined(BOOST_ASIO_HAS_CO_AWAIT)
     static constexpr bool is_coro = std::is_same_v<type, asio::awaitable<void>>;
 #else
     static constexpr bool is_coro = false;
@@ -133,7 +130,7 @@ template <typename F> struct result_two<F, std::void_t<std::invoke_result_t<F &,
     using type = std::invoke_result_t<F &, RequestPtr, ResponsePtr>;
     static constexpr bool valid = true;
     static constexpr bool is_void = std::is_same_v<type, void>;
-#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+#if defined(BOOST_ASIO_HAS_CO_AWAIT)
     static constexpr bool is_coro = std::is_same_v<type, asio::awaitable<void>>;
 #else
     static constexpr bool is_coro = false;
@@ -148,7 +145,7 @@ constexpr bool is_callback_handler = std::is_invocable_v<F &, RequestPtr, Respon
 
 template <typename F> constexpr bool is_sync_handler_ssl = result_ssl<F>::valid && result_ssl<F>::is_void;
 template <typename F> constexpr bool is_sync_handler = result_two<F>::valid && result_two<F>::is_void;
-#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+#if defined(BOOST_ASIO_HAS_CO_AWAIT)
 template <typename F> constexpr bool is_coro_handler_ssl = result_ssl<F>::valid && result_ssl<F>::is_coro;
 template <typename F> constexpr bool is_coro_handler = result_two<F>::valid && result_two<F>::is_coro;
 #endif
@@ -157,7 +154,7 @@ template <typename F, typename = void> struct ws_result {
     static constexpr bool valid = false;
     static constexpr bool is_coro = false;
 };
-#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+#if defined(BOOST_ASIO_HAS_CO_AWAIT)
 template <typename F>
 struct ws_result<F, std::void_t<std::invoke_result_t<F &, RequestPtr, std::shared_ptr<WebSocket>>>> {
     using type = std::invoke_result_t<F &, RequestPtr, std::shared_ptr<WebSocket>>;
@@ -188,7 +185,7 @@ template <typename F> CallbackHandler make_callback_handler(F &&fn) {
                 fn(std::move(req), std::move(res));
                 std::move(done)();
             });
-#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+#if defined(BOOST_ASIO_HAS_CO_AWAIT)
     } else if constexpr (is_coro_handler_ssl<D>) {
         return CallbackHandler(
             [fn = std::forward<F>(fn)](RequestPtr req, ResponsePtr res, SslHandle ssl, HandlerCompletion done) mutable {
@@ -211,7 +208,7 @@ template <typename F> CallbackHandler make_callback_handler(F &&fn) {
     }
 }
 
-#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+#if defined(BOOST_ASIO_HAS_CO_AWAIT)
 // Detection traits and execution helper for handlers whose extracted values are
 // prepended to (RequestPtr, ResponsePtr[, SslHandle]). They live here, next to
 // the rest of the coroutine adapter, so that extract.h -- like every other
@@ -281,7 +278,7 @@ void execute_extracted_coroutine(const RequestPtr &req, const ResponsePtr &res, 
 // synchronous function, or -- in a C++20 build -- a coroutine) into a Handler.
 template <typename F> Handler make_handler(F &&fn) {
     using D = std::decay_t<F>;
-#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+#if defined(BOOST_ASIO_HAS_CO_AWAIT)
     if constexpr (std::is_same_v<D, Handler>) {
         return std::forward<F>(fn);
     } else if constexpr (std::is_same_v<D, CoroHandler>) {
@@ -304,7 +301,7 @@ inline void invoke_handler(const Handler &handler, RequestPtr req, ResponsePtr r
                            HandlerCompletion done) {
     const RequestPtr req_keep = req;
     const ResponsePtr fallback = res;
-#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+#if defined(BOOST_ASIO_HAS_CO_AWAIT)
     if (std::holds_alternative<CoroHandler>(handler)) {
         const CoroHandler &fn = std::get<CoroHandler>(handler);
         detail::execute_coroutine(req, res, std::move(done),
@@ -312,7 +309,7 @@ inline void invoke_handler(const Handler &handler, RequestPtr req, ResponsePtr r
         return;
     }
 #endif
-#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+#if defined(BOOST_ASIO_HAS_CO_AWAIT)
     const CallbackHandler &fn = std::get<0>(handler);
 #else
     const CallbackHandler &fn = handler;
@@ -360,7 +357,7 @@ inline void invoke_handler(const Handler &handler, RequestPtr req, ResponsePtr r
 
 template <typename F> WsHandler make_ws_handler(F &&fn) {
     using D = std::decay_t<F>;
-#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+#if defined(BOOST_ASIO_HAS_CO_AWAIT)
     if constexpr (std::is_same_v<D, WsHandler>) {
         return std::forward<F>(fn);
     } else if constexpr (detail::ws_result<D>::valid && detail::ws_result<D>::is_coro) {
@@ -380,7 +377,7 @@ template <typename F> WsHandler make_ws_handler(F &&fn) {
 // Runs a raw WebSocket handler and completes `done` when it finishes.
 inline void invoke_ws_handler(const WsHandler &handler, RequestPtr req, std::shared_ptr<WebSocket> ws,
                               HandlerCompletion done) {
-#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+#if defined(BOOST_ASIO_HAS_CO_AWAIT)
     if (std::holds_alternative<CoroWsHandler>(handler)) {
         const CoroWsHandler &fn = std::get<CoroWsHandler>(handler);
         auto executor = req ? req->executor() : asio::any_io_executor{};
@@ -391,7 +388,7 @@ inline void invoke_ws_handler(const WsHandler &handler, RequestPtr req, std::sha
         return;
     }
 #endif
-#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+#if defined(BOOST_ASIO_HAS_CO_AWAIT)
     const CallbackWsHandler &fn = std::get<0>(handler);
 #else
     const CallbackWsHandler &fn = handler;
@@ -429,7 +426,7 @@ inline WriteCompletion finish_with(HandlerCompletion done) {
 // Adapts the stored WsHandler variant to the callback form the engine's upgrade
 // terminal invokes after the handshake.
 inline CallbackWsHandler to_callback_ws_handler(WsHandler handler) {
-#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+#if defined(BOOST_ASIO_HAS_CO_AWAIT)
     if (std::holds_alternative<CoroWsHandler>(handler)) {
         CoroWsHandler fn = std::get<CoroWsHandler>(std::move(handler));
         return [fn = std::move(fn)](RequestPtr req, std::shared_ptr<WebSocket> ws, HandlerCompletion done) mutable {

@@ -8,12 +8,12 @@
 #define SIMPLE_HTTP_VERSION_MINOR 9
 #define SIMPLE_HTTP_VERSION_PATCH 0
 
-#define SIMPLE_HTTP_STR_HELPER(x) #x
-#define SIMPLE_HTTP_STR(x) SIMPLE_HTTP_STR_HELPER(x)
+#define SIMPLE_HTTP_STRINGIZE_IMPL(x) #x
+#define SIMPLE_HTTP_STRINGIZE(x) SIMPLE_HTTP_STRINGIZE_IMPL(x)
 
 #define SIMPLE_HTTP_VERSION_STR                                                                                        \
-    SIMPLE_HTTP_STR(SIMPLE_HTTP_VERSION_MAJOR)                                                                         \
-    "." SIMPLE_HTTP_STR(SIMPLE_HTTP_VERSION_MINOR) "." SIMPLE_HTTP_STR(SIMPLE_HTTP_VERSION_PATCH)
+    SIMPLE_HTTP_STRINGIZE(SIMPLE_HTTP_VERSION_MAJOR)                                                                         \
+    "." SIMPLE_HTTP_STRINGIZE(SIMPLE_HTTP_VERSION_MINOR) "." SIMPLE_HTTP_STRINGIZE(SIMPLE_HTTP_VERSION_PATCH)
 
 #define SIMPLE_HTTP_VERSION_CODE                                                                                       \
     ((SIMPLE_HTTP_VERSION_MAJOR) * 10000 + (SIMPLE_HTTP_VERSION_MINOR) * 100 + (SIMPLE_HTTP_VERSION_PATCH))

@@ -2,7 +2,7 @@
 
 #include "../core/glaze_support.h"
 
-#if SIMPLE_HTTP_CPP17_ENABLE_GLAZE
+#if SIMPLE_HTTP_HAS_GLAZE
 
 // OpenAPI integration glue: JSON Schemas from C++ types via glaze's
 // compile-time reflection. An aggregate struct is reflected with no metadata
@@ -591,4 +591,4 @@ inline void record_operation(OpenApiSpec &spec, const Operation &op, const std::
 } // namespace openapi
 } // namespace simple_http
 
-#endif // SIMPLE_HTTP_CPP17_ENABLE_GLAZE
+#endif // SIMPLE_HTTP_HAS_GLAZE

@@ -516,7 +516,7 @@ TEST_CASE("middleware: callback form is accepted by make_middleware", "[middlewa
     CHECK(finished);
 }
 
-#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+#if defined(BOOST_ASIO_HAS_CO_AWAIT)
 TEST_CASE("router: coroutine websocket handler is accepted directly", "[router][middleware][review]") {
     Router router;
     router.ws_route("/ws", [](RequestPtr, std::shared_ptr<WebSocket>) -> asio::awaitable<void> { co_return; });
@@ -562,7 +562,12 @@ TEST_CASE("review: async ResolveFn completion is marshalled to the caller execut
     const auto caller_thread = std::this_thread::get_id();
 
     std::thread worker;
-    ResolveFn hook = [&worker](std::string, std::string, ResolveCompletion done) {
+    std::optional<asio::any_io_executor> hook_executor;
+    ResolveFn hook = [&worker, &hook_executor](std::string, std::uint16_t, asio::any_io_executor hook_ex,
+                                               ResolveCompletion done) {
+        // The hook is handed the caller's concrete executor, so it can run an
+        // awaitable DNS client there instead of recovering one from `done`.
+        hook_executor = hook_ex;
         worker = std::thread([done = std::move(done)]() mutable {
             std::vector<asio::ip::tcp::endpoint> endpoints{
                 asio::ip::tcp::endpoint{asio::ip::make_address("192.0.2.1"), 80}};
@@ -584,4 +589,10 @@ TEST_CASE("review: async ResolveFn completion is marshalled to the caller execut
 
     REQUIRE(completed_on.has_value());
     CHECK(*completed_on == caller_thread);
+    REQUIRE(hook_executor.has_value());
+    // The exact executor type is an implementation detail (async_compose may
+    // wrap it); what the hook contract promises is the caller's execution
+    // context.
+    auto &hook_ctx = asio::query(*hook_executor, asio::execution::context);
+    CHECK(&hook_ctx == static_cast<asio::execution_context *>(&ctx));
 }

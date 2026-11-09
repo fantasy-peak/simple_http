@@ -27,7 +27,7 @@
 
 #include "../core/glaze_support.h"
 
-#if SIMPLE_HTTP_CPP17_ENABLE_GLAZE
+#if SIMPLE_HTTP_HAS_GLAZE
 
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/compose.hpp>
@@ -134,4 +134,4 @@ auto async_write_json(std::shared_ptr<ResponseWriter> response, const T &value, 
 
 } // namespace simple_http
 
-#endif // SIMPLE_HTTP_CPP17_ENABLE_GLAZE
+#endif // SIMPLE_HTTP_HAS_GLAZE

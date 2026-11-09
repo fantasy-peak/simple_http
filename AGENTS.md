@@ -308,7 +308,7 @@ using ResponsePtr = std::shared_ptr<ResponseWriter>;
 using Next = CallbackHandler; // void(RequestPtr, ResponsePtr, SslHandle, HandlerCompletion)
 using Middleware =
     std::function<void(RequestPtr, ResponsePtr, SslHandle, Next, HandlerCompletion)>;
-#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+#if defined(BOOST_ASIO_HAS_CO_AWAIT)
 using CoroNext = std::function<asio::awaitable<void>(RequestPtr, ResponsePtr, SslHandle)>;
 #endif
 ```

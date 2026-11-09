@@ -29,7 +29,7 @@
 
 #include "../core/glaze_support.h"
 
-#if SIMPLE_HTTP_CPP17_ENABLE_GLAZE
+#if SIMPLE_HTTP_HAS_GLAZE
 
 #include <array>
 #include <chrono>
@@ -449,4 +449,4 @@ inline Middleware require_role(std::string role) {
 
 } // namespace simple_http
 
-#endif // SIMPLE_HTTP_CPP17_ENABLE_GLAZE
+#endif // SIMPLE_HTTP_HAS_GLAZE

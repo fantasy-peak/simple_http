@@ -21,7 +21,7 @@
 
 #include "../core/glaze_support.h"
 
-#if SIMPLE_HTTP_CPP17_ENABLE_GLAZE
+#if SIMPLE_HTTP_HAS_GLAZE
 
 #include <optional>
 #include <string>
@@ -98,4 +98,4 @@ template <typename T> std::optional<T> parse_params(const QueryParams &q) {
 
 } // namespace simple_http
 
-#endif // SIMPLE_HTTP_CPP17_ENABLE_GLAZE
+#endif // SIMPLE_HTTP_HAS_GLAZE

@@ -20,7 +20,7 @@
 #include <openssl/hmac.h>
 
 static_assert(__cplusplus > 202002L, "glaze smoke must build as C++23");
-static_assert(SIMPLE_HTTP_CPP17_ENABLE_GLAZE == 1, "glaze helpers must be enabled in a C++23 build");
+static_assert(SIMPLE_HTTP_HAS_GLAZE == 1, "glaze helpers must be enabled in a C++23 build");
 
 struct Pet {
     std::int64_t id{};

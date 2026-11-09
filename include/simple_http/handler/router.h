@@ -54,7 +54,7 @@
 #include "../core/types.h"
 #include "../engine/dispatcher.h"
 #include "../openapi/openapi_doc.h"
-#if SIMPLE_HTTP_CPP17_ENABLE_GLAZE
+#if SIMPLE_HTTP_HAS_GLAZE
 #include "../openapi/openapi.h"
 #endif
 #include "cors.h"
@@ -141,7 +141,7 @@ class Router {
     Router &route(std::vector<Method> methods, std::string path, std::vector<Middleware> middlewares, F &&handler,
                   Doc doc = {}) {
         auto scoped_registration = scoped(std::move(path), std::move(middlewares));
-#if SIMPLE_HTTP_CPP17_ENABLE_GLAZE
+#if SIMPLE_HTTP_HAS_GLAZE
         // The descriptor's path-parameter binding is checked before anything is
         // registered: a mismatch is a loud skip, not a runtime 404 or a silent
         // divergence between the document and the route table.
@@ -159,7 +159,7 @@ class Router {
         auto entry =
             make_route_entry(methods, make_handler(std::forward<F>(handler)), std::move(scoped_registration.second));
         Router &result = insert_route(methods, scoped_registration.first, std::move(entry));
-#if SIMPLE_HTTP_CPP17_ENABLE_GLAZE
+#if SIMPLE_HTTP_HAS_GLAZE
         if constexpr (!std::is_same_v<std::decay_t<Doc>, openapi::NoDoc>) {
             openapi::record_operation(*m_openapi, doc, methods, scoped_registration.first);
         }

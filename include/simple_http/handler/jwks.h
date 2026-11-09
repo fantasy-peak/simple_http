@@ -32,7 +32,7 @@
 
 #include "../core/glaze_support.h"
 
-#if SIMPLE_HTTP_CPP17_ENABLE_GLAZE
+#if SIMPLE_HTTP_HAS_GLAZE
 
 #include <boost/asio/compose.hpp>
 #include <memory>
@@ -272,4 +272,4 @@ template <typename Token> auto async_fetch_jwks_json(Client &client, std::string
 
 } // namespace simple_http
 
-#endif // SIMPLE_HTTP_CPP17_ENABLE_GLAZE
+#endif // SIMPLE_HTTP_HAS_GLAZE

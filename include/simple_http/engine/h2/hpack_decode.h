@@ -29,7 +29,7 @@
 #include <utility>
 #include <vector>
 
-#include "hpack_huffman.h"      // http_huffman_decode, HUFFMAN_OK
+#include "hpack_huffman.h"      // http_huffman_decode, SIMPLE_HTTP_HUFFMAN_OK
 #include "hpack_static_table.h" // http2_header_static_table
 
 namespace simple_http::codec {
@@ -181,7 +181,7 @@ inline bool HpackDecoder::decode_string(std::string_view block, std::size_t &pos
         const std::size_t decoded_at = out.size();
         unsigned char state = 0;
         if (http_huffman_decode(&state, reinterpret_cast<unsigned char *>(const_cast<char *>(block.data() + pos)),
-                                static_cast<std::size_t>(len), out, 1) != HUFFMAN_OK) {
+                                static_cast<std::size_t>(len), out, 1) != SIMPLE_HTTP_HUFFMAN_OK) {
             m_error = 40144;
             return false;
         }

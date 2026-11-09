@@ -33,7 +33,7 @@
 
 #include "../engine/dispatcher.h"
 
-#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+#if defined(BOOST_ASIO_HAS_CO_AWAIT)
 #include <boost/asio/compose.hpp>
 #include <boost/asio/use_awaitable.hpp>
 #endif
@@ -46,7 +46,7 @@ using Next = CallbackHandler;
 // handler), so a middleware calling next(...) is exactly "wrap the handler".
 using Middleware = std::function<void(RequestPtr, ResponsePtr, SslHandle, Next, HandlerCompletion)>;
 
-#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+#if defined(BOOST_ASIO_HAS_CO_AWAIT)
 // Coroutine form: `co_await next(req, res, ssl)` instead of passing a
 // completion handler. Only available when Boost.Asio provides co_await
 // (C++20 builds); a C++17 build keeps the callback form above.
@@ -61,7 +61,7 @@ template <typename F>
 struct is_callback_middleware<F, std::void_t<std::invoke_result_t<F &, RequestPtr, ResponsePtr, SslHandle, Next,
                                                                   HandlerCompletion>>> : std::true_type {};
 
-#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+#if defined(BOOST_ASIO_HAS_CO_AWAIT)
 template <typename F, typename = void> struct is_coro_middleware : std::false_type {};
 template <typename F>
 struct is_coro_middleware<F, std::void_t<std::invoke_result_t<F &, RequestPtr, ResponsePtr, SslHandle, CoroNext>>>
@@ -112,7 +112,7 @@ template <typename F> Middleware make_middleware(F &&fn) {
     } else if constexpr (middleware_detail::is_callback_middleware<D>::value) {
         return Middleware(std::forward<F>(fn));
     }
-#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+#if defined(BOOST_ASIO_HAS_CO_AWAIT)
     else if constexpr (middleware_detail::is_coro_middleware<D>::value) {
         return Middleware([fn = std::forward<F>(fn)](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next,
                                                      HandlerCompletion done) mutable {

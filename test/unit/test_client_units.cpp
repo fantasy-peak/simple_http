@@ -359,10 +359,9 @@ TEST_CASE("client/resolve: the hook wins, an empty hook falls back to asio", "[c
     asio::io_context ctx;
     auto ex = ctx.get_executor();
 
-    ResolveFn hook = [](std::string, std::string port, ResolveCompletion done) {
-        const auto p = static_cast<std::uint16_t>(std::stoul(port));
+    ResolveFn hook = [](std::string, std::uint16_t port, asio::any_io_executor, ResolveCompletion done) {
         std::vector<asio::ip::tcp::endpoint> endpoints{
-            asio::ip::tcp::endpoint{asio::ip::make_address("192.0.2.1"), p}};
+            asio::ip::tcp::endpoint{asio::ip::make_address("192.0.2.1"), port}};
         std::move(done)(error_code{}, std::move(endpoints));
     };
 

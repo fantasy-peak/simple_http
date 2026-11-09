@@ -719,7 +719,7 @@ TEST_CASE("router: websocket proxy routes and their rewrite", "[router]") {
     exact.host = "127.0.0.1";
     exact.port = 7788;
     exact.rewrite_path = "/chat";
-    exact.resolve = [](std::string, std::string, ResolveCompletion done) {
+    exact.resolve = [](std::string, std::uint16_t, asio::any_io_executor, ResolveCompletion done) {
         std::move(done)(error_code{}, std::vector<asio::ip::tcp::endpoint>{});
     };
     router.ws_proxy("/wsproxy", exact);

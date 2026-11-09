@@ -13,7 +13,7 @@
 //   g++ -std=c++23 -I cpp17/include ...        // helpers enabled
 //   g++ -std=c++17 -I cpp17/include ...        // helpers disabled
 //
-// Override with -DSIMPLE_HTTP_CPP17_ENABLE_GLAZE=0 to opt out, or =1 to force
+// Override with -DSIMPLE_HTTP_HAS_GLAZE=0 to opt out, or =1 to force
 // enablement. Forcing it on for a compiler that reports an old __cplusplus (or
 // for a build without glaze on the include path) is the caller's decision and
 // fails at the #include below.
@@ -22,18 +22,18 @@
 // fine because the gated APIs are header-only templates and nothing in the
 // ungated surface depends on them.
 
-#if !defined(SIMPLE_HTTP_CPP17_ENABLE_GLAZE)
+#if !defined(SIMPLE_HTTP_HAS_GLAZE)
 #if defined(__cplusplus) && __cplusplus > 202002L && defined(__has_include)
 #if __has_include(<glaze/glaze.hpp>)
-#define SIMPLE_HTTP_CPP17_ENABLE_GLAZE 1
+#define SIMPLE_HTTP_HAS_GLAZE 1
 #else
-#define SIMPLE_HTTP_CPP17_ENABLE_GLAZE 0
+#define SIMPLE_HTTP_HAS_GLAZE 0
 #endif
 #else
-#define SIMPLE_HTTP_CPP17_ENABLE_GLAZE 0
+#define SIMPLE_HTTP_HAS_GLAZE 0
 #endif
 #endif
 
-#if SIMPLE_HTTP_CPP17_ENABLE_GLAZE
+#if SIMPLE_HTTP_HAS_GLAZE
 #include <glaze/glaze.hpp>
 #endif
