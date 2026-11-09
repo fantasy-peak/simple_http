@@ -380,8 +380,9 @@ server.route({Method::Post}, "/login",
     });
 ```
 
-Cookie 只存不透明 id，数据在 `SessionStore` 里；接口是 awaitable 的，Redis/数据库
-适配器由使用者在消费侧实现。默认 `MemorySessionStore` 是进程内、带锁实现。CSRF 使用
+Cookie 只存不透明 id，数据在 `SessionStore` 里；接口使用 `any_completion_handler` 完成回调，
+`save` 按值接收 `SessionData`（异步存储可以安全保留），Redis/数据库适配器由使用者在消费侧
+实现。默认 `MemorySessionStore` 是进程内、带锁实现。CSRF 使用
 double-submit：安全请求建立 cookie，非安全请求必须在 header 中回显。无法设置 header 的
 HTML 表单需要在 handler 里自行校验隐藏字段或写适配器。
 

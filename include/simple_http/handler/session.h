@@ -101,8 +101,11 @@ class SessionStore {
     virtual ~SessionStore() = default;
     // Completion: void(error_code, std::optional<SessionData>). The id is passed
     // by value so an asynchronous store never holds a view into the request.
+    // `save` also takes the data by value: an asynchronous store may keep it
+    // past this call, and a reference would dangle once the middleware's
+    // temporary SessionData is destroyed.
     virtual void load(std::string id, LoadCompletion done) = 0;
-    virtual void save(std::string id, const SessionData &data, WriteCompletion done) = 0;
+    virtual void save(std::string id, SessionData data, WriteCompletion done) = 0;
     virtual void destroy(std::string id, WriteCompletion done) = 0;
 };
 
@@ -129,7 +132,7 @@ class MemorySessionStore final : public SessionStore {
         std::move(done)(error_code{}, std::move(out));
     }
 
-    void save(std::string id, const SessionData &data, WriteCompletion done) override {
+    void save(std::string id, SessionData data, WriteCompletion done) override {
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             evict_expired();
@@ -138,7 +141,7 @@ class MemorySessionStore final : public SessionStore {
                 // stores are not a cache; this is a safety valve, not an LRU.
                 m_sessions.erase(m_sessions.begin());
             }
-            m_sessions[std::move(id)] = data;
+            m_sessions[std::move(id)] = std::move(data);
         }
         std::move(done)(error_code{});
     }
@@ -305,7 +308,7 @@ inline Middleware session(std::shared_ptr<SessionStore> store, SessionConfig con
                     }
                     SessionData out = current->data();
                     out.expires_unix = config.max_age.count() > 0 ? now_unix() + config.max_age.count() : 0;
-                    store->save(std::string{current->id()}, out,
+                    store->save(std::string{current->id()}, std::move(out),
                                 [finish = std::move(finish)](error_code) mutable { finish(); });
                 };
                 if (!original_id.empty() && current->id() != original_id) {

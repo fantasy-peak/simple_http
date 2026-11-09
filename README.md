@@ -404,8 +404,10 @@ server.route({Method::Post}, "/login",
 ```
 
 The cookie carries only an opaque id; values live in the `SessionStore`. The interface
-is awaitable, so a Redis/database adapter is a consumer-side implementation. The default
-`MemorySessionStore` is in-process and lock-protected. CSRF is double-submit: a safe
+uses `any_completion_handler` completions; `save` takes `SessionData` by value, so an
+asynchronous store can keep it safely. A Redis/database adapter is a consumer-side
+implementation. The default `MemorySessionStore` is in-process and lock-protected.
+CSRF is double-submit: a safe
 request establishes the cookie, and an unsafe request must echo it in the header. Form
 posts that cannot set a header should validate the hidden field themselves or use a
 small adapter.

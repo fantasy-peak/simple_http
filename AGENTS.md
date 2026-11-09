@@ -381,7 +381,9 @@ const Principal *p = principal(*req);
 
 - `extract<...>` 返回普通 `Handler`，不影响 route/group/middleware/OpenAPI。
 - 同一次提取最多一个 body 提取器（`Json`/`Form`）。
-- `SessionStore` 是 awaitable 接口；`MemorySessionStore` 带锁，Redis/DB 适配器放消费侧。
+- `SessionStore` 使用 `any_completion_handler` 完成回调；`load` 返回 `optional<SessionData>`，
+  `save` 按值接收 `SessionData`（异步存储可安全保留），`MemorySessionStore` 带锁，Redis/DB
+  适配器放消费侧。
 - JWT 强制算法 allowlist，拒绝 `none`；`exp` 默认必填；JWKS 支持静态/手动拉取文档
   （RSA/EC/oct，按 `kid` 选），不做签发/OAuth2/OIDC。
 - Host 路由：`server.host(pattern, registrar)`；`*.example.com` 不匹配裸域或
