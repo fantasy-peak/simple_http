@@ -25,9 +25,9 @@ RequestPtr make_request(asio::io_context &ctx, std::string path) {
 }
 
 std::shared_ptr<FakeResponseSink> dispatch(asio::io_context &ctx, Router &router, RequestPtr req) {
-    auto writer = std::make_shared<FakeResponseSink>();
+    auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
     auto res = std::make_shared<ResponseWriter>(writer);
-    REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
+    REQUIRE(run_on(ctx, await_dispatch(router, req, res)));
     return writer;
 }
 
@@ -105,7 +105,7 @@ TEST_CASE("rate limit: a refused request is 429 and never reaches the route", "[
     bool handler_ran = false;
     router.route(any_methods, "/work", [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
         handler_ran = true;
-        co_await res->status(status::ok).send("done");
+        co_await res->status(status::ok).async_send("done", asio::use_awaitable);
     });
 
     asio::io_context ctx;
@@ -133,7 +133,7 @@ TEST_CASE("rate limit: per-key middleware limits each key separately", "[rate_li
     bool ran = false;
     router.route(any_methods, "/w", [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
         ran = true;
-        co_await res->status(status::ok).send("ok");
+        co_await res->status(status::ok).async_send("ok", asio::use_awaitable);
     });
 
     asio::io_context ctx;

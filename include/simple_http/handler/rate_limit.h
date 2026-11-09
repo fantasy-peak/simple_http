@@ -249,14 +249,15 @@ inline std::string request_key(const RequestPtr &req) {
 // burst are answered 429 with Retry-After and never reach the rest of the
 // chain.
 inline Middleware rate_limit(std::shared_ptr<TokenBucket> bucket) {
-    return [bucket = std::move(bucket)](RequestPtr req, ResponsePtr res, SslHandle ssl,
-                                        Next next) -> asio::awaitable<void> {
+    return [bucket = std::move(bucket)](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next,
+                                        HandlerCompletion done) {
         if (!bucket->try_acquire()) {
             res->header(field::retry_after, std::to_string(bucket->seconds_until_token()));
-            co_await res->status(status::too_many_requests).send("too many requests");
-            co_return; // answered here
+            res->status(status::too_many_requests);
+            res->async_send("too many requests", finish_with(std::move(done)));
+            return; // answered here
         }
-        co_await next(std::move(req), std::move(res), ssl);
+        next(std::move(req), std::move(res), ssl, std::move(done));
     };
 }
 
@@ -266,16 +267,17 @@ inline Middleware rate_limit(std::shared_ptr<TokenBucket> bucket) {
 inline Middleware rate_limit(std::shared_ptr<RateLimiter> limiter,
                              std::function<std::string(const RequestPtr &)> key_from = detail::request_key) {
     return [limiter = std::move(limiter), key_from = std::move(key_from)](
-               RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
+               RequestPtr req, ResponsePtr res, SslHandle ssl, Next next, HandlerCompletion done) {
         auto key = key_from(req);
         if (!limiter->try_acquire(key)) {
             // The per-key bucket knows when it refills, so the response carries
             // the same Retry-After as the shared-bucket limiter.
             res->header(field::retry_after, std::to_string(limiter->seconds_until_token(key)));
-            co_await res->status(status::too_many_requests).send("too many requests");
-            co_return; // answered here
+            res->status(status::too_many_requests);
+            res->async_send("too many requests", finish_with(std::move(done)));
+            return; // answered here
         }
-        co_await next(std::move(req), std::move(res), ssl);
+        next(std::move(req), std::move(res), ssl, std::move(done));
     };
 }
 

@@ -27,16 +27,16 @@ RequestPtr make_request(asio::io_context &ctx, std::string path, Method method =
 Handler flag_handler(bool &ran, std::string body = "real") {
     return make_handler([&ran, body = std::move(body)](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
         ran = true;
-        co_await res->status(status::ok).send(body);
+        co_await res->status(status::ok).async_send(body, asio::use_awaitable);
     });
 }
 
 // Dispatches one request and hands back the fake writer, so a case reads as
 // request -> assertions on the recorded status, body and headers.
 std::shared_ptr<FakeResponseSink> dispatch(asio::io_context &ctx, Router &router, RequestPtr req) {
-    auto writer = std::make_shared<FakeResponseSink>();
+    auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
     auto res = std::make_shared<ResponseWriter>(writer);
-    REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
+    REQUIRE(run_on(ctx, await_dispatch(router, req, res)));
     return writer;
 }
 

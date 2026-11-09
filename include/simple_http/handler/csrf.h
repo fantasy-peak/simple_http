@@ -63,15 +63,15 @@ struct CsrfConfig {
 namespace middleware {
 
 inline Middleware csrf(CsrfConfig config = {}) {
-    return [config = std::move(config)](RequestPtr req, ResponsePtr res, SslHandle ssl,
-                                        Next next) -> asio::awaitable<void> {
+    return [config = std::move(config)](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next,
+                                        HandlerCompletion done) {
         const Method method = req->method();
         const bool safe =
             method == Method::Get || method == Method::Head || method == Method::Options || method == Method::Trace;
 
         bool exempt = false;
         for (const auto &prefix : config.exempt_paths) {
-            if (req->path() == prefix || (prefix.ends_with('/') && req->path().starts_with(prefix))) {
+            if (req->path() == prefix || (ends_with(prefix, "/") && starts_with(req->path(), prefix))) {
                 exempt = true;
                 break;
             }
@@ -95,13 +95,12 @@ inline Middleware csrf(CsrfConfig config = {}) {
             if (token.empty() || !supplied || !constant_time_equal(token, *supplied)) {
                 res->status(status::forbidden);
                 res->content_type("text/plain; charset=utf-8");
-                (void)co_await res->send("CSRF token invalid");
-                co_return;
+                res->async_send("CSRF token invalid", finish_with(std::move(done)));
+                return;
             }
         }
 
-        co_await next(std::move(req), std::move(res), ssl);
-        co_return;
+        next(std::move(req), std::move(res), ssl, std::move(done));
     };
 }
 

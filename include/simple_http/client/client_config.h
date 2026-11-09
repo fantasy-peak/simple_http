@@ -8,7 +8,7 @@
 // ClientConfig carries the policy that applies to every connection it opens
 // (TLS knobs, timeouts, protocol limits, connection-pool sizing, hooks).
 //
-// Fallible client operations report failure as std::expected<…, error_code>
+// Fallible synchronous client helpers report failure as result<T>
 // (never exceptions), like the rest of the library. Transport failures surface
 // as the underlying asio error_code; failures the client itself decides on use
 // client_errc below.
@@ -16,7 +16,10 @@
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/system/error_code.hpp>
+#include <charconv>
 #include <chrono>
+#include <cmath>
+#include <limits>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -29,6 +32,7 @@
 
 #include "../core/http_method.h" // RetryPolicy::condition names Method
 #include "../core/limits.h"
+#include "../core/http_date.h"
 #include "../core/resolve.h"     // ResolveFn (shared with the WebSocket proxy)
 #include "../core/tls_version.h" // TlsMinVersion (shared with the server)
 #include "../core/types.h"
@@ -99,6 +103,7 @@ struct RetryPolicy {
     // How many retries after the first attempt. 0 = the historical behavior
     // (at most the one free stale-kept-connection replay).
     std::size_t max_retries{0};
+
     // Delay before the first retry; each further retry multiplies it by
     // backoff_multiplier, capped at max_backoff (0 = no cap). 0 = no delay.
     std::chrono::milliseconds initial_backoff{0};
@@ -129,6 +134,55 @@ struct RetryPolicy {
     std::vector<int> retry_statuses{};
     bool retry_status_on_non_idempotent{false};
 };
+
+// The delay before retry number `ordinal` (1-based): the initial backoff
+// multiplied by backoff_multiplier per retry, capped at max_backoff.
+inline std::chrono::milliseconds retry_delay(const RetryPolicy &policy, std::size_t ordinal) {
+    if (policy.initial_backoff.count() <= 0)
+        return {};
+    double ms = static_cast<double>(policy.initial_backoff.count());
+    for (std::size_t i = 1; i < ordinal; ++i)
+        ms *= policy.backoff_multiplier;
+    // Guard before the cast to int64_t: a long chain with a multiplier > 1 can
+    // push `ms` to +inf (or a negative multiplier can make it non-positive), and
+    // converting either to int64_t is undefined behavior.
+    if (!(ms > 0.0))
+        return {};
+    if (policy.max_backoff.count() > 0 && ms > static_cast<double>(policy.max_backoff.count()))
+        ms = static_cast<double>(policy.max_backoff.count());
+    const auto max_count = std::chrono::milliseconds::max().count();
+    if (ms >= static_cast<double>(max_count))
+        return std::chrono::milliseconds{max_count};
+    return std::chrono::milliseconds{static_cast<std::int64_t>(ms)};
+}
+
+// Parses a Retry-After value: either delta-seconds or an IMF-fixdate. A
+// hostile value is capped at one hour.
+inline std::chrono::milliseconds retry_after_delay(std::string_view value) {
+    while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
+        value.remove_prefix(1);
+    }
+    while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) {
+        value.remove_suffix(1);
+    }
+    if (value.empty()) {
+        return {};
+    }
+    std::int64_t seconds = 0;
+    const auto [ptr, ec] = std::from_chars(value.data(), value.data() + value.size(), seconds);
+    if (ec == std::errc{} && ptr == value.data() + value.size() && seconds >= 0) {
+        constexpr std::int64_t kMaxSeconds = 3600;
+        seconds = std::min(seconds, kMaxSeconds);
+        return std::chrono::milliseconds{seconds * 1000};
+    }
+    if (auto date = parse_http_date(value); date && *date > now_unix()) {
+        constexpr std::int64_t kMaxSeconds = 3600;
+        const std::int64_t delta = std::min(*date - now_unix(), kMaxSeconds);
+        return std::chrono::milliseconds{delta * 1000};
+    }
+    return {};
+}
+
 
 // TLS knobs for a client connection.
 struct TlsClientConfig {
@@ -338,7 +392,11 @@ struct ClientConfig {
     // default: a client is usually the one waiting on data, so a bigger window
     // keeps a fast link busy while still bounding per-stream memory (credit is
     // returned only as the application consumes, see h2_client.h).
-    EngineLimits limits{.h2_initial_window = 1 << 20};
+    EngineLimits limits = [] {
+        EngineLimits value;
+        value.h2_initial_window = 1 << 20;
+        return value;
+    }();
 
     // Request retry policy (see RetryPolicy). 0 retries = the historical
     // behavior.

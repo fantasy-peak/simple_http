@@ -74,25 +74,25 @@ TEST_CASE("proto/body: feed, read and end-of-body", "[proto]") {
     body.finish();
 
     // The channel carries the frames in order; finish() delivers end-of-body.
-    auto first = run_on(ctx, body.read());
+    auto first = run_on(ctx, body_read(body));
     REQUIRE(first.has_value());
     REQUIRE(first->has_value());
     CHECK_FALSE((*first)->eof);
     CHECK((*first)->data == "hello ");
 
-    auto second = run_on(ctx, body.read());
+    auto second = run_on(ctx, body_read(body));
     REQUIRE(second.has_value());
     REQUIRE(second->has_value());
     CHECK((*second)->data == "world");
 
-    auto third = run_on(ctx, body.read());
+    auto third = run_on(ctx, body_read(body));
     REQUIRE(third.has_value());
     REQUIRE(third->has_value());
     CHECK((*third)->eof);
     CHECK(body.eof());
 
     // Once ended, read() keeps reporting the end without touching the channel.
-    auto fourth = run_on(ctx, body.read());
+    auto fourth = run_on(ctx, body_read(body));
     REQUIRE(fourth.has_value());
     REQUIRE(fourth->has_value());
     CHECK((*fourth)->eof);
@@ -105,7 +105,7 @@ TEST_CASE("proto/body: read_all concatenates, fail() surfaces the error", "[prot
         REQUIRE(body.feed("ab"));
         REQUIRE(body.feed("cd"));
         body.finish();
-        auto all = run_on(ctx, body.read_all());
+        auto all = run_on(ctx, body_read_all(body));
         REQUIRE(all.has_value());
         REQUIRE(all->has_value());
         CHECK(**all == "abcd");
@@ -114,7 +114,7 @@ TEST_CASE("proto/body: read_all concatenates, fail() surfaces the error", "[prot
         asio::io_context ctx;
         Body body{ctx.get_executor()};
         body.finish(); // an empty body reads as an empty string
-        auto all = run_on(ctx, body.read_all());
+        auto all = run_on(ctx, body_read_all(body));
         REQUIRE(all.has_value());
         REQUIRE(all->has_value());
         CHECK((*all)->empty());
@@ -123,7 +123,7 @@ TEST_CASE("proto/body: read_all concatenates, fail() surfaces the error", "[prot
         asio::io_context ctx;
         Body body{ctx.get_executor()};
         body.fail(make_error_code(asio::error::connection_reset));
-        auto frame = run_on(ctx, body.read());
+        auto frame = run_on(ctx, body_read(body));
         REQUIRE(frame.has_value());
         REQUIRE_FALSE(frame->has_value());
         CHECK(frame->error() == asio::error::connection_reset);
@@ -144,18 +144,18 @@ TEST_CASE("proto/body: the channel is bounded and the consume hook skips empty "
     std::size_t consumed = 0;
     body.set_on_consumed([&](std::size_t n) { consumed += n; });
 
-    auto first = run_on(ctx, body.read());
+    auto first = run_on(ctx, body_read(body));
     REQUIRE(first.has_value());
     REQUIRE(first->has_value());
     CHECK((*first)->data == "1");
     CHECK(consumed == 1); // only non-empty chunks are reported as consumed
 
-    auto second = run_on(ctx, body.read());
+    auto second = run_on(ctx, body_read(body));
     REQUIRE(second.has_value());
     REQUIRE(second->has_value());
     CHECK((*second)->data == "2");
 
-    auto third = run_on(ctx, body.read());
+    auto third = run_on(ctx, body_read(body));
     REQUIRE(third.has_value());
     REQUIRE(third->has_value());
     CHECK((*third)->data.empty());
@@ -178,12 +178,12 @@ TEST_CASE("proto/body: the terminator survives a full channel", "[proto]") {
         CHECK_FALSE(body.feed("y")); // full: the producer learns it and keeps the frame
         body.finish();               // no room — must still be delivered
 
-        auto first = run_on(ctx, body.read());
+        auto first = run_on(ctx, body_read(body));
         REQUIRE(first.has_value());
         REQUIRE(first->has_value());
         CHECK((*first)->data == "x");
 
-        auto second = run_on(ctx, body.read());
+        auto second = run_on(ctx, body_read(body));
         REQUIRE(second.has_value());
         REQUIRE(second->has_value());
         CHECK((*second)->eof);
@@ -195,12 +195,12 @@ TEST_CASE("proto/body: the terminator survives a full channel", "[proto]") {
         REQUIRE(body.feed("x"));
         body.fail(make_error_code(asio::error::connection_reset));
 
-        auto first = run_on(ctx, body.read());
+        auto first = run_on(ctx, body_read(body));
         REQUIRE(first.has_value());
         REQUIRE(first->has_value());
         CHECK((*first)->data == "x");
 
-        auto second = run_on(ctx, body.read());
+        auto second = run_on(ctx, body_read(body));
         REQUIRE(second.has_value());
         REQUIRE_FALSE(second->has_value());
         CHECK(second->error() == asio::error::connection_reset);
@@ -213,21 +213,23 @@ TEST_CASE("proto/body: pull mode reads on demand and never touches the channel",
     CHECK_FALSE(body.is_pull());
 
     int calls = 0;
-    body.set_pull_provider([&calls]() -> asio::awaitable<std::expected<ReadResult, error_code>> {
+    body.set_pull_provider([&calls](Body::ReadCompletion done) {
         ++calls;
-        if (calls == 1)
-            co_return ReadResult::chunk("pulled");
-        co_return ReadResult::end();
+        if (calls == 1) {
+            std::move(done)(error_code{}, ReadResult::chunk("pulled"));
+            return;
+        }
+        std::move(done)(error_code{}, ReadResult::end());
     });
     CHECK(body.is_pull());
 
-    auto first = run_on(ctx, body.read());
+    auto first = run_on(ctx, body_read(body));
     REQUIRE(first.has_value());
     REQUIRE(first->has_value());
     CHECK((*first)->data == "pulled");
     CHECK_FALSE(body.eof());
 
-    auto second = run_on(ctx, body.read());
+    auto second = run_on(ctx, body_read(body));
     REQUIRE(second.has_value());
     REQUIRE(second->has_value());
     CHECK((*second)->eof);
@@ -235,7 +237,7 @@ TEST_CASE("proto/body: pull mode reads on demand and never touches the channel",
 
     // eof sticks: the provider is not consulted again.
     int before = calls;
-    auto third = run_on(ctx, body.read());
+    auto third = run_on(ctx, body_read(body));
     REQUIRE(third.has_value());
     CHECK((*third)->eof);
     CHECK(calls == before);
@@ -298,11 +300,11 @@ TEST_CASE("proto/request: typed state survives a move", "[proto]") {
 
 TEST_CASE("proto/response: defaults are filled in but never override", "[proto]") {
     asio::io_context ctx;
-    auto writer = std::make_shared<FakeResponseSink>();
+    auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
 
     {
         ResponseWriter res{writer};
-        REQUIRE(run_on(ctx, res.status(status::created).send("created")));
+        REQUIRE(run_on(ctx, res.status(status::created).async_send("created", asio::use_awaitable)));
         CHECK(writer->last_status == status::created);
         CHECK(writer->last_body == "created");
         CHECK(writer->header("content-type") == "text/plain"); // default
@@ -311,13 +313,13 @@ TEST_CASE("proto/response: defaults are filled in but never override", "[proto]"
         CHECK_FALSE(writer->header("date").empty());
     }
     {
-        auto w2 = std::make_shared<FakeResponseSink>();
+        auto w2 = std::make_shared<FakeResponseSink>(ctx.get_executor());
         ResponseWriter res{w2};
         REQUIRE(run_on(ctx, res.status(status::ok)
                                 .content_type("application/json")
                                 .header("server", "mine")
                                 .header("date", "Sun, 06 Nov 1994 08:49:37 GMT")
-                                .send("{}")));
+                                .async_send("{}", asio::use_awaitable)));
         CHECK(w2->header("content-type") == "application/json");
         CHECK(w2->header("server") == "mine"); // explicit values win
         CHECK(w2->header("date") == "Sun, 06 Nov 1994 08:49:37 GMT");
@@ -330,81 +332,81 @@ TEST_CASE("proto/response: header injection is refused at the writer boundary", 
     // A CR/LF in a field value would splice a second response onto HTTP/1.x.
     // header() must poison the whole response, so nothing reaches the wire.
     SECTION("header() rejects a CR/LF value") {
-        auto writer = std::make_shared<FakeResponseSink>();
+        auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
         ResponseWriter res{writer};
         res.header("x-test", "a\r\nInjected: 1");
-        auto ec = run_on(ctx, res.status(status::ok).send("body"));
+        auto ec = run_on(ctx, as_ec(res.status(status::ok).async_send("body", asio::as_tuple(asio::use_awaitable))));
         REQUIRE(ec.has_value());
-        CHECK(*ec == asio::error::invalid_argument);
+        CHECK(ec->value() == asio::error::invalid_argument);
         CHECK_FALSE(res.started());
         CHECK(writer->calls == 0);
         CHECK(writer->chunks.empty());
     }
 
     SECTION("header() rejects a NUL and a CR in the name") {
-        auto writer = std::make_shared<FakeResponseSink>();
+        auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
         ResponseWriter res{writer};
         res.header("x-test", std::string{"a\0b", 3});
-        auto ec = run_on(ctx, res.status(status::ok).begin());
+        auto ec = run_on(ctx, as_ec(res.status(status::ok).async_begin(asio::as_tuple(asio::use_awaitable))));
         REQUIRE(ec.has_value());
-        CHECK(*ec == asio::error::invalid_argument);
+        CHECK(ec->value() == asio::error::invalid_argument);
         CHECK_FALSE(res.started());
 
-        auto writer2 = std::make_shared<FakeResponseSink>();
+        auto writer2 = std::make_shared<FakeResponseSink>(ctx.get_executor());
         ResponseWriter res2{writer2};
         res2.header("x\r\nInjected", "1");
-        auto ec2 = run_on(ctx, res2.status(status::ok).send_bodyless());
+        auto ec2 = run_on(ctx, as_ec(res2.status(status::ok).async_send_bodyless(asio::as_tuple(asio::use_awaitable))));
         REQUIRE(ec2.has_value());
-        CHECK(*ec2 == asio::error::invalid_argument);
+        CHECK(ec2->value() == asio::error::invalid_argument);
         CHECK(writer2->calls == 0);
     }
 
     SECTION("replace_header() has the same guard") {
-        auto writer = std::make_shared<FakeResponseSink>();
+        auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
         ResponseWriter res{writer};
         res.replace_header("x-test", "ok\r\nInjected: 1");
-        auto ec = run_on(ctx, res.status(status::ok).send("body"));
+        auto ec = run_on(ctx, as_ec(res.status(status::ok).async_send("body", asio::as_tuple(asio::use_awaitable))));
         REQUIRE(ec.has_value());
-        CHECK(*ec == asio::error::invalid_argument);
+        CHECK(ec->value() == asio::error::invalid_argument);
         CHECK_FALSE(res.started());
         CHECK(writer->calls == 0);
     }
 
     SECTION("a clean field still passes") {
-        auto writer = std::make_shared<FakeResponseSink>();
+        auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
         ResponseWriter res{writer};
-        REQUIRE(run_on(ctx, res.header("x-test", "clean value").send("ok")));
+        REQUIRE(run_on(ctx, res.header("x-test", "clean value").async_send("ok", asio::use_awaitable)));
         CHECK(writer->header("x-test") == "clean value");
     }
 }
 
 TEST_CASE("proto/response: bodyless, streaming and state forwarding", "[proto]") {
     asio::io_context ctx;
-    auto writer = std::make_shared<FakeResponseSink>();
+    auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
     ResponseWriter res{writer};
 
-    auto open = run_on(ctx, res.connected());
+    auto open = run_on(ctx, await_connected([&](auto done) { res.async_connected(std::move(done)); }));
     REQUIRE(open.has_value());
     CHECK(*open);
     CHECK(res.version() == Version::Http11);
     writer->ver = Version::Http2;
     CHECK(res.version() == Version::Http2);
 
-    REQUIRE(run_on(ctx, res.status(status::no_content).send_bodyless()));
+    REQUIRE(run_on(ctx, res.status(status::no_content).async_send_bodyless(asio::use_awaitable)));
     CHECK(writer->sent_bodyless);
     CHECK(writer->last_status == status::no_content);
     CHECK(writer->last_body.empty());
     CHECK(writer->header("server") == std::string{server_product}); // defaults apply here too
 
-    REQUIRE(run_on(ctx, res.status(status::ok).begin()));
+    REQUIRE(run_on(ctx, res.status(status::ok).async_begin(asio::use_awaitable)));
     CHECK(writer->begun);
-    REQUIRE(run_on(ctx, res.write("a")));
-    REQUIRE(run_on(ctx, res.finish("b")));
+    REQUIRE(run_on(ctx, res.async_write("a", asio::use_awaitable)));
+    REQUIRE(run_on(ctx, res.async_finish("b", asio::use_awaitable)));
     CHECK(writer->chunks == std::vector<std::string>{"a", "b"});
     CHECK(writer->finished);
 
-    REQUIRE(run_on(ctx, res.close()));
-    auto closed = run_on(ctx, res.connected());
+    REQUIRE(run_on(ctx, res.async_close(asio::use_awaitable)));
+    auto closed = run_on(ctx, await_connected([&](auto done) { res.async_connected(std::move(done)); }));
     REQUIRE(closed.has_value());
     CHECK_FALSE(*closed);
 }
@@ -413,15 +415,16 @@ TEST_CASE("proto/response: a writer error is reported to the caller", "[proto]")
     // The fake reports success; a writer that fails must surface through send().
     class FailingWriter : public FakeResponseSink {
       public:
-        asio::awaitable<error_code> send(int, Headers, std::string) override {
-            co_return make_error_code(asio::error::broken_pipe);
+        using FakeResponseSink::FakeResponseSink;
+        void send(int, Headers, std::string, WriteCompletion done) override {
+            std::move(done)(make_error_code(asio::error::broken_pipe));
         }
     };
 
     asio::io_context ctx;
-    auto writer = std::make_shared<FailingWriter>();
+    auto writer = std::make_shared<FailingWriter>(ctx.get_executor());
     ResponseWriter res{writer};
-    auto ec = run_on(ctx, res.send("x"));
+    auto ec = run_on(ctx, as_ec(res.async_send("x", asio::as_tuple(asio::use_awaitable))));
     REQUIRE(ec.has_value());
     CHECK(*ec == asio::error::broken_pipe);
 }

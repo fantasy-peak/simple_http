@@ -184,7 +184,7 @@ TEST_CASE("h2/engine: a reset flood cannot outrun the executing-handler cap", "[
     };
 
     auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, limits);
-    REQUIRE(run_on(ctx, engine->run(dispatcher)));
+    REQUIRE(run_on(ctx, run_engine(*engine, dispatcher)));
 
     CHECK(peak.load() >= 1); // handlers really ran
     CHECK(peak.load() <= static_cast<int>(limits.h2_max_concurrent_streams));
@@ -207,7 +207,7 @@ TEST_CASE("h2/engine: a request body above max_body_bytes is refused", "[h2]") {
     auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter>,
                          SslHandle) -> asio::awaitable<void> { co_await park_briefly(); };
     auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, limits);
-    REQUIRE(run_on(ctx, engine->run(dispatcher)));
+    REQUIRE(run_on(ctx, run_engine(*engine, dispatcher)));
 
     CHECK(has_rst_stream(transport->written(), 1, codec::H2_ENHANCE_YOUR_CALM));
 }
@@ -233,7 +233,7 @@ TEST_CASE("h2/engine: DATA already in flight for a refused stream is not a conne
     auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter>,
                          SslHandle) -> asio::awaitable<void> { co_await park_briefly(); };
     auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, limits);
-    REQUIRE(run_on(ctx, engine->run(dispatcher)));
+    REQUIRE(run_on(ctx, run_engine(*engine, dispatcher)));
 
     CHECK(has_rst_stream(transport->written(), 3, codec::H2_REFUSED_STREAM));
     CHECK_FALSE(has_goaway(transport->written(), codec::H2_PROTOCOL_ERROR));
@@ -261,7 +261,7 @@ TEST_CASE("h2/engine: a refused split head still drains its CONTINUATION frames"
     auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter>,
                          SslHandle) -> asio::awaitable<void> { co_await park_briefly(); };
     auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, limits);
-    REQUIRE(run_on(ctx, engine->run(dispatcher)));
+    REQUIRE(run_on(ctx, run_engine(*engine, dispatcher)));
 
     CHECK(has_rst_stream(transport->written(), 3, codec::H2_REFUSED_STREAM));
     CHECK_FALSE(has_goaway(transport->written(), codec::H2_PROTOCOL_ERROR));
@@ -292,7 +292,7 @@ TEST_CASE("h2/engine: well-behaved concurrency below the cap still runs", "[h2]"
     };
 
     auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, limits);
-    REQUIRE(run_on(ctx, engine->run(dispatcher)));
+    REQUIRE(run_on(ctx, run_engine(*engine, dispatcher)));
 
     CHECK(finished.load() == 3);
     // No queue was involved, so nothing was punished.
@@ -314,9 +314,9 @@ TEST_CASE("h2/engine: an early response does not abort the rest of the request b
 
     // An auth/limit-style handler: answer without ever reading the body.
     auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res,
-                         SslHandle) -> asio::awaitable<void> { co_await res->status(status::ok).send("denied"); };
+                         SslHandle) -> asio::awaitable<void> { co_await res->status(status::ok).async_send("denied", asio::use_awaitable); };
     auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, limits);
-    REQUIRE(run_on(ctx, engine->run(dispatcher)));
+    REQUIRE(run_on(ctx, run_engine(*engine, dispatcher)));
 
     // The response is complete while the peer's side is still open. The engine
     // must keep the exchange alive (the client may still be sending) and drop
@@ -339,7 +339,7 @@ TEST_CASE("h2/engine: a GOAWAY shorter than 8 bytes is FRAME_SIZE_ERROR", "[h2]"
     auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter>,
                          SslHandle) -> asio::awaitable<void> { co_return; };
     auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, EngineLimits{});
-    REQUIRE(run_on(ctx, engine->run(dispatcher)));
+    REQUIRE(run_on(ctx, run_engine(*engine, dispatcher)));
 
     CHECK(has_goaway(transport->written(), codec::H2_FRAME_SIZE_ERROR));
 }
@@ -357,7 +357,7 @@ TEST_CASE("h2/engine: a self-dependent PRIORITY on an idle stream is a connectio
     auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter>,
                          SslHandle) -> asio::awaitable<void> { co_return; };
     auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, EngineLimits{});
-    REQUIRE(run_on(ctx, engine->run(dispatcher)));
+    REQUIRE(run_on(ctx, run_engine(*engine, dispatcher)));
 
     // RST_STREAM on an idle stream is itself illegal (§5.4.2), so this is a
     // connection error rather than a stream error.
@@ -377,7 +377,7 @@ TEST_CASE("h2/engine: a zero WINDOW_UPDATE on an idle stream is a connection err
     auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter>,
                          SslHandle) -> asio::awaitable<void> { co_return; };
     auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, EngineLimits{});
-    REQUIRE(run_on(ctx, engine->run(dispatcher)));
+    REQUIRE(run_on(ctx, run_engine(*engine, dispatcher)));
 
     CHECK(has_goaway(transport->written(), codec::H2_PROTOCOL_ERROR));
     CHECK_FALSE(has_rst_stream(transport->written(), 3, codec::H2_PROTOCOL_ERROR));
@@ -403,7 +403,7 @@ TEST_CASE("h2/engine: SETTINGS that push a stream window past 2^31-1 is FLOW_CON
     auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter>,
                          SslHandle) -> asio::awaitable<void> { co_await park_briefly(); };
     auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, EngineLimits{});
-    REQUIRE(run_on(ctx, engine->run(dispatcher)));
+    REQUIRE(run_on(ctx, run_engine(*engine, dispatcher)));
 
     CHECK(has_goaway(transport->written(), codec::H2_FLOW_CONTROL_ERROR));
 }
@@ -427,7 +427,7 @@ TEST_CASE("h2/engine: extended CONNECT is refused when the setting is off", "[h2
         co_return;
     };
     auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, limits);
-    REQUIRE(run_on(ctx, engine->run(dispatcher)));
+    REQUIRE(run_on(ctx, run_engine(*engine, dispatcher)));
 
     // RFC 8441 §3: the server advertised ENABLE_CONNECT_PROTOCOL=0, so using
     // the extended CONNECT is a connection error, and no handler runs.
@@ -458,10 +458,10 @@ TEST_CASE("h2/engine: a paused request body does not stall another stream", "[h2
             co_return;
         }
         fast_ran.store(true);
-        co_await res->status(status::ok).send("fast");
+        co_await res->status(status::ok).async_send("fast", asio::use_awaitable);
     };
     auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, EngineLimits{});
-    REQUIRE(run_on(ctx, engine->run(dispatcher)));
+    REQUIRE(run_on(ctx, run_engine(*engine, dispatcher)));
 
     CHECK(fast_ran.load());
     CHECK(transport->written().find("fast") != std::string::npos);
@@ -492,16 +492,16 @@ TEST_CASE("h2/engine: END_STREAM during a body pause is not lost", "[h2]") {
     auto dispatcher = [&](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res,
                           SslHandle) -> asio::awaitable<void> {
         co_await park_briefly(); // let the channel fill and the END_STREAM park
-        auto body = co_await req->body().read_all();
+        auto body = co_await body_read_all(req->body());
         if (body) {
             received.store(body->size());
             read_ok.store(true);
-            co_await res->status(status::ok).send(std::to_string(body->size()));
+            co_await res->status(status::ok).async_send(std::to_string(body->size()), asio::use_awaitable);
         }
         transport->release(); // let the read loop observe EOF and finish
     };
     auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, EngineLimits{});
-    REQUIRE(run_on(ctx, engine->run(dispatcher)));
+    REQUIRE(run_on(ctx, run_engine(*engine, dispatcher)));
 
     CHECK(read_ok.load());
     CHECK(received.load() == kChunks * 4 + kLast);

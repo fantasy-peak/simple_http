@@ -23,15 +23,12 @@
 // project that already uses a validator library can adapt it in one function.
 
 #include <cstddef>
-#include <expected>
 #include <initializer_list>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
-
-#include <glaze/glaze.hpp>
 
 namespace simple_http {
 
@@ -43,10 +40,22 @@ struct FieldError {
     std::string message;
 };
 
+// The result of a validation: an empty error list means success. A tiny value
+// type rather than expected<void, ...> keeps the C++17 port free of another
+// dependency while preserving the "check, then read errors" shape.
+struct ValidationResult {
+    std::vector<FieldError> errors;
+
+    [[nodiscard]] bool has_value() const { return errors.empty(); }
+    [[nodiscard]] explicit operator bool() const { return errors.empty(); }
+    std::vector<FieldError> &error() { return errors; }
+    const std::vector<FieldError> &error() const { return errors; }
+};
+
 // The opt-in validation hook. The primary template accepts everything; a
 // caller specializes it for a type it wants validated.
 template <typename T> struct Validator {
-    static std::expected<void, std::vector<FieldError>> validate(const T &) { return {}; }
+    static ValidationResult validate(const T &) { return {}; }
 };
 
 // --- convenience predicates -------------------------------------------------
@@ -102,8 +111,42 @@ inline void push_if(std::vector<FieldError> &errors, std::optional<FieldError> e
 // Renders field errors as the `details` string of the JSON error body. Kept out
 // of the error type so callers can replace the whole body shape.
 inline std::string field_errors_json(const std::vector<FieldError> &errors) {
-    auto json = glz::write_json(errors);
-    return json ? std::move(*json) : std::string{"[]"};
+    auto escape = [](std::string_view text) {
+        std::string out;
+        for (char c : text) {
+            switch (c) {
+            case '"':
+                out += "\\\"";
+                break;
+            case '\\':
+                out += "\\\\";
+                break;
+            case '\n':
+                out += "\\n";
+                break;
+            case '\r':
+                out += "\\r";
+                break;
+            case '\t':
+                out += "\\t";
+                break;
+            default:
+                out.push_back(c);
+            }
+        }
+        return out;
+    };
+    std::string out = "[";
+    bool first = true;
+    for (const auto &error : errors) {
+        if (!first)
+            out.push_back(',');
+        first = false;
+        out += "{\"field\":\"" + escape(error.field) + "\",\"code\":\"" + escape(error.code) + "\",\"message\":\"" +
+               escape(error.message) + "\"}";
+    }
+    out.push_back(']');
+    return out;
 }
 
 } // namespace simple_http

@@ -18,10 +18,13 @@
 
 #include "simple_http.h"
 
+#include "../support/coro_compat.h"
+
 namespace {
 
 namespace asio = boost::asio;
 using namespace simple_http;
+using namespace simple_http::test;
 
 // Minimal in-memory transport: the engine reads the seeded bytes and reports
 // EOF, so a body that is still waiting for more input terminates instead of
@@ -32,7 +35,62 @@ class FuzzTransport {
 
     void push(std::string bytes) { m_in = std::move(bytes); }
 
-    asio::awaitable<IoResult> async_read_some(ByteSpan buffer) {
+    template <typename Token> auto async_read_some(ByteSpan buffer, Token &&token) {
+        return asio::async_initiate<Token, void(error_code, std::size_t)>(
+            [this, buffer](auto handler) {
+                asio::co_spawn(m_executor, do_read_some(buffer),
+                               [handler = std::move(handler)](std::exception_ptr, IoResult r) mutable {
+                                   std::move(handler)(r.first, r.second);
+                               });
+            },
+            token);
+    }
+
+    template <typename Token> auto async_read(ByteSpan buffer, Token &&token) {
+        return asio::async_initiate<Token, void(error_code, std::size_t)>(
+            [this, buffer](auto handler) {
+                asio::co_spawn(m_executor, do_read(buffer),
+                               [handler = std::move(handler)](std::exception_ptr, IoResult r) mutable {
+                                   std::move(handler)(r.first, r.second);
+                               });
+            },
+            token);
+    }
+
+    template <typename Token> auto async_write(ConstByteSpan buffer, Token &&token) {
+        return asio::async_initiate<Token, void(error_code, std::size_t)>(
+            [this, buffer](auto handler) {
+                asio::co_spawn(m_executor, do_write(buffer),
+                               [handler = std::move(handler)](std::exception_ptr, IoResult r) mutable {
+                                   std::move(handler)(r.first, r.second);
+                               });
+            },
+            token);
+    }
+
+    template <typename Token> auto async_write_seq(boost::span<const ConstByteSpan> buffers, Token &&token) {
+        return asio::async_initiate<Token, void(error_code, std::size_t)>(
+            [this, buffers](auto handler) {
+                asio::co_spawn(m_executor, do_write_seq(buffers),
+                               [handler = std::move(handler)](std::exception_ptr, IoResult r) mutable {
+                                   std::move(handler)(r.first, r.second);
+                               });
+            },
+            token);
+    }
+
+    template <typename Token> auto async_shutdown(Token &&token) {
+        return asio::async_initiate<Token, void(error_code)>(
+            [](auto handler) { std::move(handler)(error_code{}); }, token);
+    }
+
+    auto get_executor() { return m_executor; }
+    asio::ip::tcp::endpoint peer() const { return {}; }
+    SslHandle tls_handle() const { return std::nullopt; }
+    void close() {}
+
+  private:
+    asio::awaitable<IoResult> do_read_some(ByteSpan buffer) {
         if (m_offset >= m_in.size()) {
             co_return IoResult{make_error_code(asio::error::eof), 0};
         }
@@ -42,10 +100,10 @@ class FuzzTransport {
         co_return IoResult{error_code{}, take};
     }
 
-    asio::awaitable<IoResult> async_read(ByteSpan buffer) {
+    asio::awaitable<IoResult> do_read(ByteSpan buffer) {
         std::size_t got = 0;
         while (got < buffer.size()) {
-            auto [ec, n] = co_await async_read_some(buffer.subspan(got));
+            auto [ec, n] = co_await do_read_some(buffer.subspan(got));
             got += n;
             if (ec) {
                 co_return IoResult{ec, got};
@@ -54,12 +112,12 @@ class FuzzTransport {
         co_return IoResult{error_code{}, got};
     }
 
-    asio::awaitable<IoResult> async_write(ConstByteSpan buffer) {
+    asio::awaitable<IoResult> do_write(ConstByteSpan buffer) {
         m_written.append(reinterpret_cast<const char *>(buffer.data()), buffer.size());
         co_return IoResult{error_code{}, buffer.size()};
     }
 
-    asio::awaitable<IoResult> async_write_seq(std::span<const ConstByteSpan> buffers) {
+    asio::awaitable<IoResult> do_write_seq(boost::span<const ConstByteSpan> buffers) {
         std::size_t total = 0;
         for (const ConstByteSpan buffer : buffers) {
             m_written.append(reinterpret_cast<const char *>(buffer.data()), buffer.size());
@@ -67,12 +125,6 @@ class FuzzTransport {
         }
         co_return IoResult{error_code{}, total};
     }
-
-    auto get_executor() { return m_executor; }
-    asio::ip::tcp::endpoint peer() const { return {}; }
-    SslHandle tls_handle() const { return std::nullopt; }
-    asio::awaitable<void> shutdown() { co_return; }
-    void close() {}
 
   private:
     asio::any_io_executor m_executor;
@@ -102,16 +154,17 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t *data, std::size_t size
     // `run` stores a reference to the Dispatcher, and the coroutine outlives the
     // statement that starts it: bind the lambda to a named std::function so it
     // cannot dangle across ctx.run_for().
-    Dispatcher dispatch = [](std::shared_ptr<Request> request, std::shared_ptr<ResponseWriter> response,
-                             SslHandle) -> asio::awaitable<void> {
-        auto body = co_await request->body().read_all();
+    auto dispatch = [](std::shared_ptr<Request> request, std::shared_ptr<ResponseWriter> response,
+                       SslHandle) -> asio::awaitable<void> {
+        auto body = co_await body_read_all(request->body());
         volatile std::size_t sink = body ? body->size() : 0;
         (void)sink;
         if (body) {
-            (void)co_await response->status(status::ok).send("ok");
+            (void)co_await response->status(status::ok).async_send("ok", asio::use_awaitable);
         }
     };
-    asio::co_spawn(ctx, engine->run(dispatch), asio::detached);
+    auto callback = detail::make_callback_handler(dispatch);
+    engine->run(std::move(callback), {}, {}, {}, {}, [] {});
     // The transport reports EOF once the seeded bytes run out, so a well-formed
     // or truncated body always terminates the engine.
     ctx.run_for(std::chrono::milliseconds(100));

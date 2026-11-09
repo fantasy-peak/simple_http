@@ -28,16 +28,16 @@ RequestPtr make_request(asio::io_context &ctx, std::string path, Method method =
 // observable.
 Handler body_handler(std::string body) {
     return make_handler([body = std::move(body)](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(status::ok).send(body);
+        co_await res->status(status::ok).async_send(body, asio::use_awaitable);
     });
 }
 
 // Dispatches one request and hands back the fake writer, so a case reads as
 // request -> assertions on the recorded status, body and headers.
 std::shared_ptr<FakeResponseSink> dispatch(asio::io_context &ctx, Router &router, RequestPtr req) {
-    auto writer = std::make_shared<FakeResponseSink>();
+    auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
     auto res = std::make_shared<ResponseWriter>(writer);
-    REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
+    REQUIRE(run_on(ctx, await_dispatch(router, req, res)));
     return writer;
 }
 
@@ -51,10 +51,10 @@ TEST_CASE("router: exact, regex and fallback matching", "[router]") {
 
     asio::io_context ctx;
     auto dispatch = [&](const std::string &path) {
-        auto writer = std::make_shared<FakeResponseSink>();
+        auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
         auto req = make_request(ctx, path);
         auto res = std::make_shared<ResponseWriter>(writer);
-        REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
+        REQUIRE(run_on(ctx, await_dispatch(router, req, res)));
         return writer;
     };
 
@@ -97,10 +97,10 @@ TEST_CASE("router: dispatch without a fallback answers 404", "[router]") {
     router.route({Method::Get}, "/only", body_handler("only"));
 
     asio::io_context ctx;
-    auto writer = std::make_shared<FakeResponseSink>();
+    auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
     auto req = make_request(ctx, "/missing");
     auto res = std::make_shared<ResponseWriter>(writer);
-    REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
+    REQUIRE(run_on(ctx, await_dispatch(router, req, res)));
     CHECK(writer->last_status == status::not_found);
     CHECK(writer->last_body.empty());
 }
@@ -108,32 +108,32 @@ TEST_CASE("router: dispatch without a fallback answers 404", "[router]") {
 TEST_CASE("router: middleware short-circuits and sees the request", "[router]") {
     Router router;
     bool mw_called = false;
-    router.use([&](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
+    router.use(coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
         mw_called = true;
         if (req->path() == "/blocked") {
-            co_await res->status(status::forbidden).send("denied");
+            co_await res->status(status::forbidden).async_send("denied", asio::use_awaitable);
             co_return; // answered here: the route must not run
         }
         co_await next(std::move(req), std::move(res), ssl);
-    });
+    }));
     router.route(any_methods, "/blocked", body_handler("should not run"));
     router.route(any_methods, "/allowed", body_handler("allowed"));
 
     asio::io_context ctx;
     {
-        auto writer = std::make_shared<FakeResponseSink>();
+        auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
         auto req = make_request(ctx, "/blocked");
         auto res = std::make_shared<ResponseWriter>(writer);
-        REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
+        REQUIRE(run_on(ctx, await_dispatch(router, req, res)));
         CHECK(mw_called);
         CHECK(writer->last_status == status::forbidden);
         CHECK(writer->last_body == "denied");
     }
     {
-        auto writer = std::make_shared<FakeResponseSink>();
+        auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
         auto req = make_request(ctx, "/allowed");
         auto res = std::make_shared<ResponseWriter>(writer);
-        REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
+        REQUIRE(run_on(ctx, await_dispatch(router, req, res)));
         CHECK(writer->last_body == "allowed");
     }
 }
@@ -144,28 +144,28 @@ TEST_CASE("router: middleware wraps the handler — before, after, and ordering"
     // Outermost first: mw1 sees the request before mw2, and its after-phase
     // (the code after next() resumes) runs last. use() runs in registration
     // order.
-    router.use([&](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
+    router.use(coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
         trace.push_back("mw1:before");
         // A copy keeps this layer's own reference, so the after-phase below can
         // still touch req/res once next() has returned.
         co_await next(req, res, ssl);
         trace.push_back("mw1:after");
-    });
-    router.use([&](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
+    }));
+    router.use(coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
         trace.push_back("mw2:before");
         co_await next(std::move(req), std::move(res), ssl);
         trace.push_back("mw2:after");
-    });
+    }));
     router.route(any_methods, "/chain", [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
         trace.push_back("handler");
-        co_await res->status(status::ok).send("ok");
+        co_await res->status(status::ok).async_send("ok", asio::use_awaitable);
     });
 
     asio::io_context ctx;
-    auto writer = std::make_shared<FakeResponseSink>();
+    auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
     auto req = make_request(ctx, "/chain");
     auto res = std::make_shared<ResponseWriter>(writer);
-    REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
+    REQUIRE(run_on(ctx, await_dispatch(router, req, res)));
     CHECK(writer->last_status == status::ok);
     CHECK(writer->last_body == "ok");
     // A middleware chain nests: before phases in registration order, then the
@@ -176,38 +176,38 @@ TEST_CASE("router: middleware wraps the handler — before, after, and ordering"
 TEST_CASE("router: middleware short-circuits by not calling next", "[router]") {
     Router router;
     std::vector<std::string> trace;
-    router.use([&](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
+    router.use(coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
         trace.push_back("gate:before");
         if (req->path() == "/blocked") {
-            co_await res->status(status::forbidden).send("denied");
+            co_await res->status(status::forbidden).async_send("denied", asio::use_awaitable);
             co_return; // answered here: the rest of the chain must not run
         }
         co_await next(std::move(req), std::move(res), ssl);
         trace.push_back("gate:after");
-    });
-    router.use([&](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
+    }));
+    router.use(coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
         trace.push_back("inner");
         co_await next(std::move(req), std::move(res), ssl);
-    });
+    }));
     router.route(any_methods, "/blocked", body_handler("should not run"));
     router.route(any_methods, "/allowed", body_handler("allowed"));
 
     asio::io_context ctx;
     {
-        auto writer = std::make_shared<FakeResponseSink>();
+        auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
         auto req = make_request(ctx, "/blocked");
         auto res = std::make_shared<ResponseWriter>(writer);
-        REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
+        REQUIRE(run_on(ctx, await_dispatch(router, req, res)));
         CHECK(writer->last_status == status::forbidden);
         CHECK(writer->last_body == "denied");
         CHECK(trace == std::vector<std::string>{"gate:before"});
     }
     trace.clear();
     {
-        auto writer = std::make_shared<FakeResponseSink>();
+        auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
         auto req = make_request(ctx, "/allowed");
         auto res = std::make_shared<ResponseWriter>(writer);
-        REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
+        REQUIRE(run_on(ctx, await_dispatch(router, req, res)));
         CHECK(writer->last_body == "allowed");
         CHECK(trace == std::vector<std::string>{"gate:before", "inner", "gate:after"});
     }
@@ -216,20 +216,20 @@ TEST_CASE("router: middleware short-circuits by not calling next", "[router]") {
 TEST_CASE("router: the after-phase observes the response", "[router]") {
     Router router;
     int seen_status = 0;
-    router.use([&](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
+    router.use(coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
         co_await next(req, res, ssl); // copy: keep our reference for the after-phase
         seen_status = res->status();
-    });
+    }));
     router.route(any_methods, "/created", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(status::created).send("made");
+        co_await res->status(status::created).async_send("made", asio::use_awaitable);
     });
 
     asio::io_context ctx;
     {
-        auto writer = std::make_shared<FakeResponseSink>();
+        auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
         auto req = make_request(ctx, "/created");
         auto res = std::make_shared<ResponseWriter>(writer);
-        REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
+        REQUIRE(run_on(ctx, await_dispatch(router, req, res)));
         CHECK(seen_status == status::created);
     }
     seen_status = 0;
@@ -237,10 +237,10 @@ TEST_CASE("router: the after-phase observes the response", "[router]") {
         // A request nothing serves answers the router's built-in 404, which the
         // after-phase sees too — a logging middleware reports real answers, not
         // "the handler did not run".
-        auto writer = std::make_shared<FakeResponseSink>();
+        auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
         auto req = make_request(ctx, "/nothing-here");
         auto res = std::make_shared<ResponseWriter>(writer);
-        REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
+        REQUIRE(run_on(ctx, await_dispatch(router, req, res)));
         CHECK(writer->last_status == status::not_found);
         CHECK(seen_status == status::not_found);
     }
@@ -254,36 +254,36 @@ TEST_CASE("router: middleware state flows to the handler", "[router]") {
     Router router;
     // Two middlewares set the same type: last set wins, so the handler sees the
     // inner middleware's principal.
-    router.use([&](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
+    router.use(coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
         req->set_state(AuthPrincipal{"outer", false});
         co_await next(std::move(req), std::move(res), ssl);
-    });
-    router.use([&](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
+    }));
+    router.use(coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
         req->set_state(AuthPrincipal{"alice", true});
         co_await next(std::move(req), std::move(res), ssl);
-    });
+    }));
     router.route(any_methods, "/who", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
         const AuthPrincipal *user = req->get_state<AuthPrincipal>();
-        co_await res->status(status::ok).send(user ? user->name : "anonymous");
+        co_await res->status(status::ok).async_send(user ? user->name : "anonymous", asio::use_awaitable);
     });
     // A different type than the one set is not found.
     router.route(any_methods, "/none", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(status::ok).send(req->get_state<std::string>() ? "string" : "no-string");
+        co_await res->status(status::ok).async_send(req->get_state<std::string>() ? "string" : "no-string", asio::use_awaitable);
     });
 
     asio::io_context ctx;
     {
-        auto writer = std::make_shared<FakeResponseSink>();
+        auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
         auto req = make_request(ctx, "/who");
         auto res = std::make_shared<ResponseWriter>(writer);
-        REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
+        REQUIRE(run_on(ctx, await_dispatch(router, req, res)));
         CHECK(writer->last_body == "alice");
     }
     {
-        auto writer = std::make_shared<FakeResponseSink>();
+        auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
         auto req = make_request(ctx, "/none");
         auto res = std::make_shared<ResponseWriter>(writer);
-        REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
+        REQUIRE(run_on(ctx, await_dispatch(router, req, res)));
         CHECK(writer->last_body == "no-string");
     }
 }
@@ -293,15 +293,15 @@ TEST_CASE("router: cors is the outermost middleware whatever the registration or
     bool user_ran = false;
     // Registered first, but cors() below must still end up ahead of it: a
     // preflight is answered before the user middleware ever sees the request.
-    router.use([&](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
+    router.use(coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
         user_ran = true;
         co_await next(std::move(req), std::move(res), ssl);
-    });
+    }));
     router.cors(CorsConfig{});
     bool route_ran = false;
     router.route(any_methods, "/api", [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
         route_ran = true;
-        co_await res->status(status::ok).send("real");
+        co_await res->status(status::ok).async_send("real", asio::use_awaitable);
     });
 
     asio::io_context ctx;
@@ -334,46 +334,46 @@ TEST_CASE("router: cors is the outermost middleware whatever the registration or
 
 TEST_CASE("router: compose_middleware builds a standalone chain", "[router]") {
     std::vector<std::string> trace;
-    Middleware a = [&](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
+    Middleware a = coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
         trace.push_back("a:before");
         co_await next(std::move(req), std::move(res), ssl);
         trace.push_back("a:after");
-    };
-    Middleware b = [&](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
+    });
+    Middleware b = coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
         trace.push_back("b:before");
         co_await next(std::move(req), std::move(res), ssl);
         trace.push_back("b:after");
-    };
-    Next terminal = [&](RequestPtr, ResponsePtr res, SslHandle) -> asio::awaitable<void> {
+    });
+    Next terminal = [&](RequestPtr, ResponsePtr res, SslHandle, HandlerCompletion done) {
         trace.push_back("terminal");
-        co_await res->status(status::ok).send("ok");
+        res->status(status::ok).async_send("ok", finish_with(std::move(done)));
     };
 
     asio::io_context ctx;
-    auto writer = std::make_shared<FakeResponseSink>();
+    auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
     auto req = make_request(ctx, "/x");
     auto res = std::make_shared<ResponseWriter>(writer);
     auto chain = compose_middleware({std::move(a), std::move(b)}, std::move(terminal));
-    REQUIRE(run_on(ctx, chain(req, res, std::nullopt)));
+    REQUIRE(run_on(ctx, await_next(chain, req, res)));
     CHECK(trace == std::vector<std::string>{"a:before", "b:before", "terminal", "b:after", "a:after"});
 }
 
 TEST_CASE("router: per-route middleware wraps only its own handler", "[router]") {
     Router router;
     std::vector<std::string> trace;
-    router.use([&](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
+    router.use(coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
         trace.push_back("global");
         co_await next(std::move(req), std::move(res), ssl);
-    });
+    }));
     router.route({Method::Get}, "/protected",
-                 {[&](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
+                 {coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
                      trace.push_back("per-route:before");
                      co_await next(std::move(req), std::move(res), ssl);
                      trace.push_back("per-route:after");
-                 }},
+                 })},
                  [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
                      trace.push_back("protected-handler");
-                     co_await res->status(status::ok).send("secret");
+                     co_await res->status(status::ok).async_send("secret", asio::use_awaitable);
                  });
     // A route without per-route middleware is untouched: the global chain runs,
     // the per-route chain does not.
@@ -407,12 +407,13 @@ TEST_CASE("router: per-route middleware wraps only its own handler", "[router]")
 TEST_CASE("router: per-route middleware short-circuits its route", "[router]") {
     Router router;
     bool handler_ran = false;
-    router.route(any_methods, "/admin", {[&](RequestPtr, ResponsePtr res, SslHandle, Next) -> asio::awaitable<void> {
-                     co_await res->status(status::forbidden).send("denied"); // never calls next()
-                 }},
+    router.route(any_methods, "/admin",
+                 {coro_middleware([&](RequestPtr, ResponsePtr res, SslHandle, CoroutineNext) -> asio::awaitable<void> {
+                     co_await res->status(status::forbidden).async_send("denied", asio::use_awaitable); // never calls next()
+                 })},
                  [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
                      handler_ran = true;
-                     co_await res->status(status::ok).send("admin");
+                     co_await res->status(status::ok).async_send("admin", asio::use_awaitable);
                  });
     router.route(any_methods, "/public", body_handler("public"));
 
@@ -431,36 +432,36 @@ TEST_CASE("router: per-route middleware short-circuits its route", "[router]") {
 TEST_CASE("router: group applies prefix and group middleware to its routes only", "[router]") {
     Router router;
     std::vector<std::string> trace;
-    router.group("/api", {[&](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
+    router.group("/api", {coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
                      trace.push_back("group:before");
                      co_await next(std::move(req), std::move(res), ssl);
                      trace.push_back("group:after");
-                 }},
+                 })},
                  [&](Router &api) {
                      api.route(any_methods, "/users", [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
                          trace.push_back("users");
-                         co_await res->status(status::ok).send("users");
+                         co_await res->status(status::ok).async_send("users", asio::use_awaitable);
                      });
                      // A nested group accumulates the prefix and its own
                      // middleware, which runs between the outer group and the handler.
                      api.group(
                          "/admin",
-                         {[&](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
+                         {coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
                              trace.push_back("nested:before");
                              co_await next(std::move(req), std::move(res), ssl);
                              trace.push_back("nested:after");
-                         }},
+                         })},
                          [&](Router &adm) {
                              adm.route(any_methods, "/kick", [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
                                  trace.push_back("kick");
-                                 co_await res->status(status::ok).send("kicked");
+                                 co_await res->status(status::ok).async_send("kicked", asio::use_awaitable);
                              });
                          });
                  });
     // A route outside the group does not get the prefix or the group middleware.
     router.route(any_methods, "/health", [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
         trace.push_back("health");
-        co_await res->status(status::ok).send("ok");
+        co_await res->status(status::ok).async_send("ok", asio::use_awaitable);
     });
 
     asio::io_context ctx;
@@ -498,18 +499,18 @@ TEST_CASE("router: use() inside a group scopes to that group", "[router]") {
     Router router;
     std::vector<std::string> trace;
     router.group("/mq", [&](Router &mq) {
-        mq.use([&](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
+        mq.use(coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
             trace.push_back("scoped");
             co_await next(std::move(req), std::move(res), ssl);
-        });
+        }));
         mq.route(any_methods, "/pull", [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
             trace.push_back("pull");
-            co_await res->status(status::ok).send("msg");
+            co_await res->status(status::ok).async_send("msg", asio::use_awaitable);
         });
     });
     router.route(any_methods, "/plain", [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
         trace.push_back("plain");
-        co_await res->status(status::ok).send("plain");
+        co_await res->status(status::ok).async_send("plain", asio::use_awaitable);
     });
 
     asio::io_context ctx;
@@ -529,23 +530,23 @@ TEST_CASE("router: use() inside a group scopes to that group", "[router]") {
 TEST_CASE("router: group middleware, global middleware and per-route middleware nest in order", "[router]") {
     Router router;
     std::vector<std::string> trace;
-    router.use([&](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
+    router.use(coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
         trace.push_back("global");
         co_await next(std::move(req), std::move(res), ssl);
-    });
-    router.group("/g", {[&](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
+    }));
+    router.group("/g", {coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
                      trace.push_back("group");
                      co_await next(std::move(req), std::move(res), ssl);
-                 }},
+                 })},
                  [&](Router &g) {
                      g.route(any_methods, "/x",
-                             {[&](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
+                             {coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
                                  trace.push_back("per-route");
                                  co_await next(std::move(req), std::move(res), ssl);
-                             }},
+                             })},
                              [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
                                  trace.push_back("handler");
-                                 co_await res->status(status::ok).send("ok");
+                                 co_await res->status(status::ok).async_send("ok", asio::use_awaitable);
                              });
                  });
 
@@ -560,7 +561,7 @@ TEST_CASE("router: regex routes are scoped to a group prefix", "[router]") {
     Router router;
     router.group("/api", [&](Router &api) {
         api.route_regex({Method::Get}, "^/items/(\\d+)$", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-            co_await res->status(status::ok).send("item");
+            co_await res->status(status::ok).async_send("item", asio::use_awaitable);
         });
         // A pattern with metacharacters in the prefix is still literal.
         api.route_regex({Method::Get}, "/raw.*", body_handler("raw"));
@@ -587,10 +588,10 @@ TEST_CASE("router: regex routes are scoped to a group prefix", "[router]") {
 TEST_CASE("router: a proxy route in a group keeps the prefix and group middleware", "[router]") {
     Router router;
     std::size_t middleware_runs = 0;
-    Middleware mw = [&](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
+    Middleware mw = coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
         ++middleware_runs;
         co_await next(std::move(req), std::move(res), ssl);
-    };
+    });
     HttpProxyTarget target;
     target.host = "127.0.0.1";
     target.port = 9;
@@ -629,9 +630,9 @@ TEST_CASE("router: ws_proxy scopes its path, and refuses a group with middleware
         // registering it there is failed closed instead of silently dropping
         // auth middleware.
         Router router;
-        Middleware mw = [](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
+        Middleware mw = coro_middleware([](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
             co_await next(std::move(req), std::move(res), ssl);
-        };
+        });
         router.group("/api", {mw}, [&](Router &api) { api.ws_proxy("/ws", WsProxyTarget{}); });
         CHECK_FALSE(router.find_ws_proxy("/api/ws").has_value());
         CHECK_FALSE(router.find_ws_proxy("/ws").has_value());
@@ -686,11 +687,11 @@ TEST_CASE("router: reverse-proxy routes are found and rewritten", "[router]") {
         // The short connect timeout travels with the route's own client.
         Router dead_backend;
         dead_backend.http_proxy("/p", HttpProxyTarget{"127.0.0.1", 1, {}}, proxy_cfg);
-        auto writer = std::make_shared<FakeResponseSink>();
+        auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
         auto req = make_request(ctx, "/p");
         auto res = std::make_shared<ResponseWriter>(writer);
         ScopedLog capture;
-        REQUIRE(run_on(ctx, dead_backend.dispatch(req, res, std::nullopt), std::chrono::seconds(2)));
+        REQUIRE(run_on(ctx, await_dispatch(dead_backend, req, res), std::chrono::seconds(2)));
         CHECK(writer->last_status == status::bad_gateway);
         CHECK(writer->last_body == "Bad Gateway");
         CHECK_FALSE(capture.records.empty()); // the failed upstream is logged
@@ -701,11 +702,11 @@ TEST_CASE("router: reverse-proxy routes are found and rewritten", "[router]") {
         Router both;
         both.http_proxy("/p", HttpProxyTarget{"127.0.0.1", 1, {}}, proxy_cfg);
         both.route({Method::Get}, "/p", body_handler("local"));
-        auto writer = std::make_shared<FakeResponseSink>();
+        auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
         auto req = make_request(ctx, "/p");
         auto res = std::make_shared<ResponseWriter>(writer);
         ScopedLog capture;
-        REQUIRE(run_on(ctx, both.dispatch(req, res, std::nullopt), std::chrono::seconds(2)));
+        REQUIRE(run_on(ctx, await_dispatch(both, req, res), std::chrono::seconds(2)));
         CHECK(writer->last_status == status::ok);
         CHECK(writer->last_body == "local");
         CHECK(capture.records.empty()); // the proxy was never consulted
@@ -718,9 +719,8 @@ TEST_CASE("router: websocket proxy routes and their rewrite", "[router]") {
     exact.host = "127.0.0.1";
     exact.port = 7788;
     exact.rewrite_path = "/chat";
-    exact.resolve = [](std::string,
-                       std::string) -> asio::awaitable<std::pair<error_code, std::vector<asio::ip::tcp::endpoint>>> {
-        co_return std::pair<error_code, std::vector<asio::ip::tcp::endpoint>>{};
+    exact.resolve = [](std::string, std::string, ResolveCompletion done) {
+        std::move(done)(error_code{}, std::vector<asio::ip::tcp::endpoint>{});
     };
     router.ws_proxy("/wsproxy", exact);
 
@@ -752,11 +752,10 @@ TEST_CASE("router: invalid regexes are dropped, not thrown", "[router]") {
 
     CHECK_FALSE(router.find_http_proxy("/broken").has_value());
     asio::io_context ctx;
-    auto writer = std::make_shared<FakeResponseSink>();
+    auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
     auto req = make_request(ctx, "/broken");
     auto res = std::make_shared<ResponseWriter>(writer);
-    REQUIRE(run_on(ctx, router.dispatch(req, res,
-                                        std::nullopt))); // no route: the built-in 404
+    REQUIRE(run_on(ctx, await_dispatch(router, req, res))); // no route: the built-in 404
     CHECK(writer->last_status == status::not_found);
 }
 
@@ -767,10 +766,10 @@ TEST_CASE("router: a registered handler is found by path, first registration win
                  body_handler("second")); // emplace keeps the first
 
     asio::io_context ctx;
-    auto writer = std::make_shared<FakeResponseSink>();
+    auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
     auto req = make_request(ctx, "/dup");
     auto res = std::make_shared<ResponseWriter>(writer);
-    REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
+    REQUIRE(run_on(ctx, await_dispatch(router, req, res)));
     CHECK(writer->last_body == "first");
 }
 
@@ -801,10 +800,10 @@ TEST_CASE("router: the static stage sits between the routes and the fallback", "
 
     asio::io_context ctx;
     auto dispatch = [&](const std::string &path) {
-        auto writer = std::make_shared<FakeResponseSink>();
+        auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
         auto req = make_request(ctx, path);
         auto res = std::make_shared<ResponseWriter>(writer);
-        REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
+        REQUIRE(run_on(ctx, await_dispatch(router, req, res)));
         return writer;
     };
 
@@ -839,10 +838,10 @@ TEST_CASE("router: a declining static stage cannot leave a request unanswered", 
     router.static_files(site);
 
     asio::io_context ctx;
-    auto writer = std::make_shared<FakeResponseSink>();
+    auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
     auto req = make_request(ctx, "/not-in-the-site");
     auto res = std::make_shared<ResponseWriter>(writer);
-    REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
+    REQUIRE(run_on(ctx, await_dispatch(router, req, res)));
 
     CHECK(writer->last_status == status::not_found); // written by the router, not left hanging
 }
@@ -859,10 +858,10 @@ TEST_CASE("router: registering a disabled site is a no-op, not a silent 404 mach
     router.route({Method::Get}, "/", body_handler("route still works"));
 
     asio::io_context ctx;
-    auto writer = std::make_shared<FakeResponseSink>();
+    auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
     auto req = make_request(ctx, "/");
     auto res = std::make_shared<ResponseWriter>(writer);
-    REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
+    REQUIRE(run_on(ctx, await_dispatch(router, req, res)));
 
     CHECK(writer->last_body == "route still works");
 }
@@ -871,10 +870,10 @@ TEST_CASE("router: registering a disabled site is a no-op, not a silent 404 mach
 
 // Dispatches one request on its own router state and returns the writer.
 auto method_dispatch = [](Router &router, asio::io_context &ctx, const std::string &path, Method m) {
-    auto writer = std::make_shared<FakeResponseSink>();
+    auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
     auto req = make_request(ctx, path, m);
     auto res = std::make_shared<ResponseWriter>(writer);
-    REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
+    REQUIRE(run_on(ctx, await_dispatch(router, req, res)));
     return writer;
 };
 

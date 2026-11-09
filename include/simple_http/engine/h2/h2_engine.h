@@ -25,7 +25,6 @@
 
 #include <array>
 #include <boost/asio.hpp>
-#include <boost/asio/experimental/awaitable_operators.hpp>
 #include <boost/asio/experimental/channel.hpp>
 #include <charconv>
 #include <chrono>
@@ -55,6 +54,7 @@
 #include "../../proto/request.h"
 #include "../../proto/response.h"
 #include "../../proto/response_writer.h"
+#include "../../proto/websocket.h"
 #include "../../transport/transport.h" // SslHandle, TransportLike
 #include "../dispatcher.h"
 #include "../ws_proxy_common.h"
@@ -67,7 +67,7 @@ namespace simple_http {
 
 namespace asio = boost::asio;
 
-template <TransportLike Transport> class Http2Engine;
+template <typename Transport> class Http2Engine;
 
 // Default HTTP/2 flow-control window (RFC 7540 §6.9.2): 65,535 octets.
 inline constexpr std::int32_t kH2InitialWindow = 65535;
@@ -121,182 +121,196 @@ inline constexpr std::size_t kQueueCompactDivisor = 3;
 // anyway).
 inline constexpr std::size_t kMaxFramedPerPass = 256u << 10; // 256 KiB
 
-// ResponseSink for a single HTTP/2 stream. Holds a weak_ptr to the engine so
-// it can be used safely from any thread and after the connection has closed.
-template <TransportLike Transport> class Http2ResponseSink : public ResponseSink {
+// ResponseSink for a single HTTP/2 stream. Holds a weak_ptr to the engine so it
+// can be used safely from any thread and after the connection has closed.
+template <typename Transport>
+class Http2ResponseSink final : public ResponseSink, public std::enable_shared_from_this<Http2ResponseSink<Transport>> {
   public:
-    using Executor = decltype(std::declval<Transport &>().get_executor());
+    using Executor = asio::any_io_executor;
 
     Http2ResponseSink(std::weak_ptr<Http2Engine<Transport>> engine, std::uint32_t stream_id, Executor exec)
-        : m_engine(std::move(engine)), m_stream_id(stream_id), m_executor(exec) {}
+        : m_engine(std::move(engine)), m_stream_id(stream_id), m_executor(std::move(exec)) {}
 
-    asio::awaitable<error_code> send(int status, Headers headers, std::string body) override {
-        co_await hop();
-        auto eng = m_engine.lock();
-        if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
-            co_return make_error_code(asio::error::not_connected);
-        }
-        // A response to HEAD has no body: END_STREAM on the HEADERS frame, and the
-        // headers still carry the Content-Length a GET would have produced.
-        //
-        // Only a HEAD is given that length explicitly. HTTP/2 does not need
-        // content-length to frame a body - END_STREAM delimits it - so adding one
-        // to every one-shot response would be redundant. A HEAD is the exception:
-        // nothing else in the response conveys the size that was deliberately not
-        // sent, so without this a `HEAD /world` over HTTP/2 answered `200 +
-        // content-type + server` where the same route over HTTP/1.1 answered
-        // `content-length: 1024` (h1_engine.h send() sets it for HEAD too).
-        ensure_date(headers);
-        const bool head = eng->method_is_head(m_stream_id);
-        if (head) {
-            headers.erase("content-length");
-            headers.add_lower("content-length", std::to_string(body.size()));
-        }
-        eng->submit_headers(m_stream_id, status, headers, /*end_stream=*/head);
-        if (!head)
-            eng->enqueue_body(m_stream_id, std::move(body), /*last=*/true);
-        co_return error_code{};
+    void send(int status, Headers headers, std::string body, WriteCompletion done) override {
+        on_executor([self = this->shared_from_this(), status, headers = std::move(headers), body = std::move(body),
+                     done = std::move(done)]() mutable {
+            auto eng = self->m_engine.lock();
+            if (!eng || !eng->alive() || !eng->stream_writable(self->m_stream_id)) {
+                std::move(done)(make_error_code(asio::error::not_connected));
+                return;
+            }
+            ensure_date(headers);
+            const bool head = eng->method_is_head(self->m_stream_id);
+            if (head) {
+                headers.erase("content-length");
+                headers.add_lower("content-length", std::to_string(body.size()));
+            }
+            eng->submit_headers(self->m_stream_id, status, headers, /*end_stream=*/head);
+            if (!head)
+                eng->enqueue_body(self->m_stream_id, std::move(body), /*last=*/true);
+            std::move(done)(error_code{});
+        });
     }
 
-    asio::awaitable<error_code> send_bodyless(int status, Headers headers) override {
-        co_await hop();
-        auto eng = m_engine.lock();
-        if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
-            co_return make_error_code(asio::error::not_connected);
-        }
-        ensure_date(headers);
-        // Nothing follows the HEADERS frame: END_STREAM ends the stream (RFC 9113
-        // §8.1).
-        eng->submit_headers(m_stream_id, status, headers, /*end_stream=*/true);
-        co_return error_code{};
+    void send_bodyless(int status, Headers headers, WriteCompletion done) override {
+        on_executor(
+            [self = this->shared_from_this(), status, headers = std::move(headers), done = std::move(done)]() mutable {
+                auto eng = self->m_engine.lock();
+                if (!eng || !eng->alive() || !eng->stream_writable(self->m_stream_id)) {
+                    std::move(done)(make_error_code(asio::error::not_connected));
+                    return;
+                }
+                ensure_date(headers);
+                eng->submit_headers(self->m_stream_id, status, headers, /*end_stream=*/true);
+                std::move(done)(error_code{});
+            });
     }
 
-    asio::awaitable<error_code> send_continue() override {
-        co_await hop();
-        auto eng = m_engine.lock();
-        if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
-            co_return make_error_code(asio::error::not_connected);
-        }
-        if (m_continue_sent) {
-            co_return error_code{};
-        }
-        m_continue_sent = true;
-        // A 1xx block carries only :status (RFC 9113 §8.1); submit_headers
-        // already skips Date/Alt-Svc for status < 200.
-        eng->submit_headers(m_stream_id, status::continue_, Headers{}, /*end_stream=*/false);
-        eng->flush();
-        co_return error_code{};
+    void send_continue(WriteCompletion done) override {
+        on_executor([self = this->shared_from_this(), done = std::move(done)]() mutable {
+            auto eng = self->m_engine.lock();
+            if (!eng || !eng->alive() || !eng->stream_writable(self->m_stream_id)) {
+                std::move(done)(make_error_code(asio::error::not_connected));
+                return;
+            }
+            if (!self->m_continue_sent) {
+                self->m_continue_sent = true;
+                eng->submit_headers(self->m_stream_id, status::continue_, Headers{}, /*end_stream=*/false);
+                eng->flush();
+            }
+            std::move(done)(error_code{});
+        });
     }
 
-    asio::awaitable<error_code> send_headers(int status, Headers headers) override {
-        co_await hop();
-        auto eng = m_engine.lock();
-        if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
-            co_return make_error_code(asio::error::not_connected);
-        }
-        ensure_date(headers);
-        // A streamed response has no length it can promise - END_STREAM delimits
-        // it - so a handler-supplied Content-Length must not survive next to it.
-        // HTTP/1.1's sink erases it for the same reason (h1_engine.h,
-        // send_headers): a message carrying two framings is a response-splitting
-        // vector for any intermediary, and a wrong one here would be repeated
-        // downstream by the reverse proxy.
-        headers.erase("content-length");
-        eng->submit_headers(m_stream_id, status, headers,
-                            /*end_stream=*/eng->method_is_head(m_stream_id));
-        eng->flush();
-        co_return error_code{};
+    void send_headers(int status, Headers headers, WriteCompletion done) override {
+        on_executor(
+            [self = this->shared_from_this(), status, headers = std::move(headers), done = std::move(done)]() mutable {
+                auto eng = self->m_engine.lock();
+                if (!eng || !eng->alive() || !eng->stream_writable(self->m_stream_id)) {
+                    std::move(done)(make_error_code(asio::error::not_connected));
+                    return;
+                }
+                ensure_date(headers);
+                headers.erase("content-length");
+                eng->submit_headers(self->m_stream_id, status, headers,
+                                    /*end_stream=*/eng->method_is_head(self->m_stream_id));
+                eng->flush();
+                std::move(done)(error_code{});
+            });
     }
 
-    asio::awaitable<error_code> send_chunk(std::string data) override {
-        co_await hop();
-        auto eng = m_engine.lock();
-        if (!eng || !eng->alive()) {
-            co_return make_error_code(asio::error::not_connected);
-        }
-        // Check the cached HEAD flag before stream_writable(): a response to HEAD
-        // ends the stream with its HEADERS frame, and the entry is retired right
-        // there. Looking the method up in the stream table (or checking
-        // writability first) would report not_connected for a body that must
-        // simply be dropped.
-        if (m_head_request)
-            co_return error_code{}; // HEAD: no body
-        if (!eng->stream_writable(m_stream_id))
-            co_return make_error_code(asio::error::not_connected);
-        // Backpressure: block while this stream's queue is over the high mark, so
-        // a fast producer (reverse proxy) is paced by the peer's window.
-        if (auto ec = co_await eng->await_out_space(m_stream_id); ec)
-            co_return ec;
-        eng->enqueue_body(m_stream_id, std::move(data), /*last=*/false);
-        co_return error_code{};
+    void send_chunk(std::string data, WriteCompletion done) override {
+        on_executor([self = this->shared_from_this(), data = std::move(data), done = std::move(done)]() mutable {
+            auto eng = self->m_engine.lock();
+            if (!eng || !eng->alive()) {
+                std::move(done)(make_error_code(asio::error::not_connected));
+                return;
+            }
+            if (self->m_head_request) {
+                std::move(done)(error_code{});
+                return;
+            }
+            if (!eng->stream_writable(self->m_stream_id)) {
+                std::move(done)(make_error_code(asio::error::not_connected));
+                return;
+            }
+            auto self_keep = self;
+            eng->await_out_space(self->m_stream_id, [self_keep, eng, data = std::move(data),
+                                                     done = std::move(done)](error_code ec) mutable {
+                if (ec) {
+                    std::move(done)(ec);
+                    return;
+                }
+                eng->enqueue_body(self_keep->m_stream_id, std::move(data), /*last=*/false);
+                std::move(done)(error_code{});
+            });
+        });
     }
 
-    asio::awaitable<error_code> send_last(std::string data) override {
-        co_await hop();
-        auto eng = m_engine.lock();
-        if (!eng || !eng->alive()) {
-            co_return make_error_code(asio::error::not_connected);
-        }
-        if (m_head_request)
-            co_return error_code{}; // HEAD: no body
-        if (!eng->stream_writable(m_stream_id))
-            co_return make_error_code(asio::error::not_connected);
-        if (auto ec = co_await eng->await_out_space(m_stream_id); ec)
-            co_return ec;
-        eng->enqueue_body(m_stream_id, std::move(data), /*last=*/true);
-        co_return error_code{};
+    void send_last(std::string data, WriteCompletion done) override {
+        on_executor([self = this->shared_from_this(), data = std::move(data), done = std::move(done)]() mutable {
+            auto eng = self->m_engine.lock();
+            if (!eng || !eng->alive()) {
+                std::move(done)(make_error_code(asio::error::not_connected));
+                return;
+            }
+            if (self->m_head_request) {
+                std::move(done)(error_code{});
+                return;
+            }
+            if (!eng->stream_writable(self->m_stream_id)) {
+                std::move(done)(make_error_code(asio::error::not_connected));
+                return;
+            }
+            auto self_keep = self;
+            eng->await_out_space(self->m_stream_id, [self_keep, eng, data = std::move(data),
+                                                     done = std::move(done)](error_code ec) mutable {
+                if (ec) {
+                    std::move(done)(ec);
+                    return;
+                }
+                eng->enqueue_body(self_keep->m_stream_id, std::move(data), /*last=*/true);
+                std::move(done)(error_code{});
+            });
+        });
     }
 
-    asio::awaitable<error_code> send_trailers(Headers trailers) override {
-        co_await hop();
-        auto eng = m_engine.lock();
-        if (!eng || !eng->alive()) {
-            co_return make_error_code(asio::error::not_connected);
-        }
-        if (m_head_request)
-            co_return error_code{}; // HEAD: no body, so no trailer section either
-        if (!eng->stream_writable(m_stream_id))
-            co_return make_error_code(asio::error::not_connected);
-        eng->submit_trailers(m_stream_id, trailers);
-        co_return error_code{};
+    void send_trailers(Headers trailers, WriteCompletion done) override {
+        on_executor(
+            [self = this->shared_from_this(), trailers = std::move(trailers), done = std::move(done)]() mutable {
+                auto eng = self->m_engine.lock();
+                if (!eng || !eng->alive()) {
+                    std::move(done)(make_error_code(asio::error::not_connected));
+                    return;
+                }
+                if (self->m_head_request) {
+                    std::move(done)(error_code{});
+                    return;
+                }
+                if (!eng->stream_writable(self->m_stream_id)) {
+                    std::move(done)(make_error_code(asio::error::not_connected));
+                    return;
+                }
+                eng->submit_trailers(self->m_stream_id, trailers);
+                std::move(done)(error_code{});
+            });
     }
 
-    asio::awaitable<bool> connected() const override {
-        // The hop matters here more than anywhere: stream_writable() walks the
-        // engine's stream table, which the connection executor is inserting into
-        // and erasing from concurrently.
-        co_await hop();
-        auto eng = m_engine.lock();
-        // A reset/finished stream cannot take a response either: report the
-        // response as unwritable so callers (e.g. a proxy's 502 path) stop
-        // rather than trying to write onto a dead stream.
-        co_return eng && eng->alive() && eng->stream_writable(m_stream_id);
+    void connected(ConnectedCompletion done) const override {
+        on_executor([self = this->shared_from_this(), done = std::move(done)]() mutable {
+            auto eng = self->m_engine.lock();
+            std::move(done)(error_code{}, eng && eng->alive() && eng->stream_writable(self->m_stream_id));
+        });
     }
-    asio::awaitable<void> close() override {
-        co_await hop(); // close_stream() touches the same table
-        if (auto eng = m_engine.lock()) {
-            eng->close_stream(m_stream_id);
-        }
+
+    void close(WriteCompletion done) override {
+        on_executor([self = this->shared_from_this(), done = std::move(done)]() mutable {
+            if (auto eng = self->m_engine.lock()) {
+                eng->close_stream(self->m_stream_id);
+            }
+            std::move(done)(error_code{});
+        });
     }
+
     Version version() const override { return Version::Http2; }
+    asio::any_io_executor get_executor() const override { return m_executor; }
     bool head_request() const noexcept override { return m_head_request; }
 
-    // Cached when the handler starts (the parsed method is only available then).
-    // The write methods need it after the HEADERS frame has already retired the
-    // stream, when a stream-table lookup would no longer find the request.
     void set_head_request(bool head) noexcept { m_head_request = head; }
 
   private:
-    asio::awaitable<void> hop() const { co_await asio::dispatch(asio::bind_executor(m_executor, asio::use_awaitable)); }
+    template <typename Fn> void on_executor(Fn &&fn) const {
+        asio::dispatch(asio::bind_executor(asio::any_io_executor{m_executor}, std::forward<Fn>(fn)));
+    }
 
     std::weak_ptr<Http2Engine<Transport>> m_engine;
     std::uint32_t m_stream_id;
-    Executor m_executor;
+    asio::any_io_executor m_executor;
     bool m_head_request{false};
-    bool m_continue_sent{false}; // an interim 100 was already emitted for this stream
+    bool m_continue_sent{false};
 };
 
-template <TransportLike Transport> class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> {
+template <typename Transport> class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> {
   public:
     using Executor = decltype(std::declval<Transport &>().get_executor());
 
@@ -317,83 +331,71 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
     Http2Engine(const Http2Engine &) = delete;
     Http2Engine &operator=(const Http2Engine &) = delete;
 
-    // Serve the connection until it closes. `dispatch` runs a handler per stream.
-    // `prior_knowledge_bytes` (if any) are bytes already consumed during protocol
-    // detection — for prior-knowledge h2 they are the client preface and are fed
-    // to the parser first.
-    asio::awaitable<void> run(Dispatcher dispatch, std::string prior_knowledge_bytes = {}, WsLookup ws_lookup = {},
-                              WsLookup ws_regex_lookup = {}, WsProxyLookup ws_proxy_lookup = {}) {
+    // Serves the connection until it closes. `prior_knowledge_bytes` are bytes
+    // already consumed during protocol detection (the client preface for
+    // prior-knowledge h2). `on_done` runs exactly once, after the transport has
+    // been shut down and closed.
+    void run(Dispatcher dispatch, std::string prior_knowledge_bytes, WsLookup ws_lookup, WsProxyLookup ws_proxy_lookup,
+             WsLookup ws_regex_lookup, std::function<void()> on_done) {
         m_dispatch = std::move(dispatch);
         m_ws_lookup = std::move(ws_lookup);
-        m_ws_regex_lookup = std::move(ws_regex_lookup);
         m_ws_proxy_lookup = std::move(ws_proxy_lookup);
+        m_ws_regex_lookup = std::move(ws_regex_lookup);
+        m_on_done = std::move(on_done);
         queue_settings();
         m_recv_buf = std::move(prior_knowledge_bytes);
-        co_await serve_loops();
-        co_return;
+        serve_loops();
     }
 
-    // Serve an h2c upgrade: the client's base64url HTTP2-Settings seed the peer
-    // SETTINGS, and the original HTTP/1.1 request is replayed as stream 1.
-    asio::awaitable<void> run_h2c(Dispatcher dispatch, const std::string &settings_b64, Method method,
-                                  std::string target, Headers headers, std::string body,
-                                  std::string prior_knowledge_bytes = {}, WsLookup ws_lookup = {},
-                                  WsLookup ws_regex_lookup = {}, WsProxyLookup ws_proxy_lookup = {}) {
+    // Serves a connection upgraded from HTTP/1.1 (RFC 9113 §3.2). The client's
+    // base64url HTTP2-Settings seed the peer SETTINGS, and the original HTTP/1.1
+    // request is replayed as stream 1, already complete (its body arrived with
+    // the upgrade request). `prior_knowledge_bytes` are the bytes read past that
+    // request -- the client's connection preface and whatever followed it.
+    void run_h2c(Dispatcher dispatch, std::string settings_b64, Method method, std::string method_token,
+                 std::string target, Headers headers, std::string body, std::string prior_knowledge_bytes,
+                 WsLookup ws_lookup, WsProxyLookup ws_proxy_lookup, WsLookup ws_regex_lookup,
+                 std::function<void()> on_done) {
         m_dispatch = std::move(dispatch);
         m_ws_lookup = std::move(ws_lookup);
-        m_ws_regex_lookup = std::move(ws_regex_lookup);
         m_ws_proxy_lookup = std::move(ws_proxy_lookup);
-        // Apply the client's SETTINGS payload (raw settings frame body).
+        m_ws_regex_lookup = std::move(ws_regex_lookup);
+        m_on_done = std::move(on_done);
+
         std::string settings = base64_url_decode(settings_b64);
         // A SETTINGS body is a whole number of 6-octet entries (RFC 9113 §6.5).
-        // on_settings() enforces that for a SETTINGS frame on the wire; this path
-        // decodes a header and used to skip the check, and apply_settings_payload
-        // silently ignores a trailing partial entry — so a corrupt HTTP2-Settings
-        // header would be applied as if it were well-formed. base64_url_decode
-        // stopping at the first invalid character is what makes that reachable:
-        // one bad byte truncates the payload instead of failing it.
+        // apply_settings_payload() ignores a trailing partial entry, so a
+        // truncated base64url value must be rejected here.
         if (settings.size() % 6 != 0) {
             go_away(codec::H2_FRAME_SIZE_ERROR);
-            // serve_loops() has not started, so no write loop will flush this
-            // GOAWAY; send it directly before the connection goes.
-            co_await flush_out_directly();
-            co_return;
+            serve_loops();
+            return;
         }
         apply_settings_payload(settings);
         if (m_goaway_sent) {
-            // The h2c HTTP2-Settings were rejected; same missing write loop.
-            co_await flush_out_directly();
-            co_return;
+            serve_loops();
+            return;
         }
         queue_settings();
 
-        // Seed stream 1 from the initial request and dispatch it.
-        auto &st = ensure_stream(1);
+        // Replay the upgrade request as stream 1. Its body is already complete,
+        // so the read side is closed; without half_closed_remote the stream
+        // would never retire and would leak an executing-handler slot.
+        Stream &st = ensure_stream(1);
         st.request->set_method(method);
-        st.request->set_method_token(std::string{to_string(method)});
+        st.request->set_method_token(std::move(method_token));
         st.request->set_target(std::move(target));
         st.request->mutable_headers() = std::move(headers);
-        if (!body.empty())
+        if (!body.empty()) {
             (void)st.request->body().feed(std::move(body));
+        }
         (void)st.request->body().finish();
-        // The upgraded request arrived in full as HTTP/1.1 - body included - so
-        // its read side is already closed. Without this the stream can never
-        // satisfy maybe_complete_stream() (which is what retires a finished
-        // stream) and stays in the table for the connection's life: one leaked
-        // entry per upgraded connection, still counted against
-        // h2_max_concurrent_streams. Measured with the limit at 2: the upgraded
-        // request was answered 200 and ended, and the *next* new stream on that
-        // connection was refused with REFUSED_STREAM.
         st.half_closed_remote = true;
-        m_next_peer_stream_id = 1; // the upgraded request's id is the highest seen so far
+        m_next_peer_stream_id = 1;
         (void)dispatch_stream(1);
 
-        // Bytes already read past the HTTP/1.1 upgrade request: the client's
-        // connection preface and whatever followed it. Handed to the reader
-        // instead of dropped (see Http1Engine::do_h2c_upgrade).
         m_recv_buf = std::move(prior_knowledge_bytes);
-        co_await serve_loops();
-        co_return;
+        serve_loops();
     }
 
     bool alive() const { return m_alive; }
@@ -543,23 +545,28 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
     // every producer (the write loop's low-watermark refill) and consumer (this
     // wait) runs on the connection executor, so the thread-safe variant would
     // pay a mutex per window update for a guarantee nothing here uses.
-    asio::awaitable<error_code> await_out_space(std::uint32_t stream_id) {
-        for (;;) {
-            auto it = m_streams.find(stream_id);
-            if (it == m_streams.end())
-                co_return make_error_code(asio::error::operation_aborted);
-            if (it->second.out_queued <= kOutHighWatermark)
-                co_return error_code{};
-            if (!it->second.out_space) {
-                it->second.out_space = std::make_shared<asio::experimental::channel<void(error_code)>>(m_executor, 1);
-            }
-            // Keep the channel alive across the wait: the stream entry itself may
-            // be erased (and the channel closed, waking us) while we are parked.
-            auto space = it->second.out_space;
-            auto [ec] = co_await space->async_receive(asio::as_tuple(asio::use_awaitable));
-            if (ec)
-                co_return make_error_code(asio::error::operation_aborted);
+    void await_out_space(std::uint32_t stream_id, WriteCompletion done) {
+        auto it = m_streams.find(stream_id);
+        if (it == m_streams.end()) {
+            std::move(done)(make_error_code(asio::error::operation_aborted));
+            return;
         }
+        if (it->second.out_queued <= kOutHighWatermark) {
+            std::move(done)(error_code{});
+            return;
+        }
+        if (!it->second.out_space) {
+            it->second.out_space = std::make_shared<asio::experimental::channel<void(error_code)>>(m_executor, 1);
+        }
+        auto space = it->second.out_space;
+        auto self = this->shared_from_this();
+        space->async_receive([self, stream_id, space, done = std::move(done)](error_code ec) mutable {
+            if (ec) {
+                std::move(done)(make_error_code(asio::error::operation_aborted));
+                return;
+            }
+            self->await_out_space(stream_id, std::move(done));
+        });
     }
 
     // Abort a stream with the given error code (RST_STREAM).
@@ -591,7 +598,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
     //
     // Deliberately *not* reset_stream(): this response may already be complete
     // and merely queued. HTTP/1.1's sink writes to the socket inside send()
-    // (`co_await write_raw(...)`), so a handler that does send() and then
+    // (`async_write`), so a handler that does send() and then
     // close() - which is exactly what the static-file stage does for its 400 and
     // 405 replies, "closing keeps the engine from draining a request body that
     // was never going to be used" - has its response on the wire before close()
@@ -722,14 +729,12 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         bool finish_pending = false;
 
         // --- HTTP/2 WebSocket (RFC 8441) ---
-        // Set once the request head carried `:protocol: websocket`. From then on
-        // DATA on this stream is tunnel bytes, not a request body.
         bool websocket = false;
-        std::string protocol;                                                   // the raw `:protocol` value (RFC 8441)
-        std::string ws_inbox;                                                   // inbound tunnel bytes, ordered
-        bool ws_eof = false;                                                    // the peer ended its half (END_STREAM)
-        bool ws_closed = false;                                                 // we tore the tunnel down
-        std::shared_ptr<asio::experimental::channel<void(error_code)>> ws_wake; // wakes a parked reader
+        std::string protocol;   // raw `:protocol` value
+        std::string ws_inbox;   // inbound tunnel bytes, ordered
+        bool ws_eof = false;    // the peer ended its half (END_STREAM)
+        bool ws_closed = false; // we tore the tunnel down
+        std::shared_ptr<asio::experimental::channel<void(error_code)>> ws_wake;
 
         bool out_drained() const { return out_finished && out_empty(); }
     };
@@ -907,160 +912,165 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
 
     // --- serve loops ---
 
-    asio::awaitable<void> serve_loops() {
-        using namespace asio::experimental::awaitable_operators;
+    void serve_loops() {
         m_deadline = std::chrono::steady_clock::now() + m_limits.idle_timeout;
-        flush(); // push our initial SETTINGS
+        m_alive = true;
+        flush();
         if (m_limits.idle_timeout.count() > 0) {
-            co_await (read_loop() || write_loop() || watchdog());
-        } else {
-            // Same convention as h1 and net/connection.h: <= 0 disables the
-            // idle deadline (racing a zero-length timer would close instantly).
-            co_await (read_loop() || write_loop());
+            arm_watchdog();
         }
-        m_alive = false;
-        // Release every producer still parked on outbound backpressure: the write
-        // loop is gone, so nothing will ever drain their queues. Also fail the
-        // request body of every stream still in the table: a handler parked in
-        // body().read() (dispatched at END_HEADERS) must observe the connection's
-        // death, or it waits forever and keeps this engine alive with it.
-        for (auto &entry : m_streams) {
-            if (entry.second.request) {
-                (void)entry.second.request->body().fail(make_error_code(asio::error::connection_reset));
-                entry.second.request->cancel(); // connection gone: signal every handler
+        read_loop();
+        write_loop();
+    }
+
+    void arm_watchdog() {
+        auto self = this->shared_from_this();
+        m_watchdog->expires_at(m_deadline);
+        m_watchdog->async_wait([self](error_code ec) {
+            if (ec || self->m_finished)
+                return;
+            if (std::chrono::steady_clock::now() >= self->m_deadline) {
+                self->m_transport->close();
+                return;
             }
-            if (entry.second.out_space)
-                entry.second.out_space->close();
-            entry.second.ws_closed = true;
-            if (entry.second.ws_wake)
-                entry.second.ws_wake->close();
+            self->arm_watchdog();
+        });
+    }
+
+    void read_loop() {
+        if (m_finished)
+            return;
+        if (!parse_available()) {
+            finish_connection();
+            return;
         }
-        // Whichever loop finished first cancels the others, and a cancelled
-        // async_write drops its buffer - so the GOAWAY the write loop had just
-        // taken may never reach the wire, leaving the peer with a bare TCP close
-        // and no explanation. Re-serialize it here and write it directly (RFC 9113
-        // §6.8 allows an endpoint to send GOAWAY more than once, so re-sending is
-        // safe).
+        auto self = this->shared_from_this();
+        m_transport->async_read_some(
+            ByteSpan{m_read_scratch.data(), m_read_scratch.size()}, [self](error_code ec, std::size_t n) {
+                if (ec) {
+                    self->finish_connection();
+                    return;
+                }
+                self->m_deadline = std::chrono::steady_clock::now() + self->m_limits.idle_timeout;
+                self->m_recv_buf.append(reinterpret_cast<const char *>(self->m_read_scratch.data()), n);
+                if (!self->parse_available()) {
+                    self->finish_connection();
+                    return;
+                }
+                self->flush();
+                self->read_loop();
+            });
+    }
+
+    void write_loop() {
+        if (m_finished)
+            return;
+        fill_data_frames();
+        if (!m_out.empty()) {
+            auto chunk = std::make_shared<std::string>(std::move(m_out));
+            m_out.clear();
+            m_deadline = std::chrono::steady_clock::now() + m_limits.idle_timeout;
+            auto self = this->shared_from_this();
+            m_write_in_flight = true;
+            m_transport->async_write(ConstByteSpan{reinterpret_cast<const std::byte *>(chunk->data()), chunk->size()},
+                                     [self, chunk](error_code ec, std::size_t) {
+                                         self->m_write_in_flight = false;
+                                         if (self->m_finished) {
+                                             self->finish_connection();
+                                             return;
+                                         }
+                                         if (ec) {
+                                             self->finish_connection();
+                                             return;
+                                         }
+                                         self->write_loop();
+                                     });
+            return;
+        }
+        if (m_streams.empty()) {
+            std::string().swap(m_out);
+        }
+        if (m_goaway_sent && streams_all_done()) {
+            finish_connection();
+            return;
+        }
+        auto self = this->shared_from_this();
+        m_notify.async_receive([self](error_code ec) {
+            if (ec) {
+                self->finish_connection();
+                return;
+            }
+            self->write_loop();
+        });
+    }
+
+    void finish_connection() {
+        if (!m_finished) {
+            m_finished = true;
+            m_alive = false;
+            m_watchdog->cancel();
+            m_notify.close();
+            for (auto &entry : m_streams) {
+                if (entry.second.request) {
+                    (void)entry.second.request->body().fail(make_error_code(asio::error::connection_reset));
+                    entry.second.request->cancel();
+                }
+                if (entry.second.out_space)
+                    entry.second.out_space->close();
+                entry.second.ws_closed = true;
+                if (entry.second.ws_wake)
+                    entry.second.ws_wake->close();
+            }
+        }
+        // An in-flight write owns the transport; waiting for it avoids two
+        // concurrent async_write operations corrupting the byte stream. Its
+        // completion calls back here.
+        if (m_write_in_flight)
+            return;
+        if (m_finish_started)
+            return;
+        m_finish_started = true;
         if (m_goaway_sent) {
-            m_out.clear(); // queued DATA is moot on a connection error
+            // Keep whatever is already queued. The RST_STREAM that refused the
+            // offending stream is still meaningful to the peer, and the write
+            // loop may not have flushed it before the read loop saw the error.
+            // The GOAWAY follows it; whole frames only, so the stream stays
+            // parseable.
             std::string payload;
             codec::append_u32(payload, m_next_peer_stream_id);
             codec::append_u32(payload, m_goaway_error);
             append_frame(codec::H2FrameType::Goaway, 0, 0, payload);
         }
-        // Flush with a deadline: a peer that stopped reading must not keep the
-        // connection (and this coroutine) alive.
-        co_await (flush_pending_output() || flush_deadline());
-        // TLS gets a close_notify before the socket goes; plaintext's
-        // shutdown() is a no-op.
-        co_await m_transport->shutdown();
-        m_transport->close();
-        co_return;
-    }
-
-    // Write m_out synchronously, for phases where no write loop exists yet
-    // (the h2c handshake's GOAWAY before serve_loops()).
-    asio::awaitable<void> flush_out_directly() {
-        if (m_out.empty())
-            co_return;
-        auto bytes = std::as_bytes(std::span<const char>{m_out.data(), m_out.size()});
-        (void)co_await m_transport->async_write(bytes);
+        auto self = this->shared_from_this();
+        auto shutdown = [self]() {
+            self->m_transport->async_shutdown([self](error_code) {
+                self->m_transport->close();
+                self->complete_on_done();
+            });
+        };
+        if (m_out.empty()) {
+            shutdown();
+            return;
+        }
+        auto chunk = std::make_shared<std::string>(std::move(m_out));
         m_out.clear();
+        m_write_in_flight = true;
+        m_transport->async_write(
+            ConstByteSpan{reinterpret_cast<const std::byte *>(chunk->data()), chunk->size()},
+            asio::cancel_after(std::chrono::seconds(2), [self, chunk, shutdown](error_code, std::size_t) {
+                self->m_write_in_flight = false;
+                shutdown();
+            }));
     }
 
-    // Best-effort flush of the serialized output left behind by the write loop.
-    asio::awaitable<void> flush_pending_output() {
-        if (m_out.empty())
-            co_return;
-        auto bytes = std::as_bytes(std::span<const char>{m_out.data(), m_out.size()});
-        auto [ec, n] = co_await m_transport->async_write(bytes);
-        (void)n;
-        m_out.clear();
-        if (ec)
-            co_return;
-        co_return;
-    }
-
-    // Deadline for the teardown flush above: never let a non-reading peer keep
-    // the connection (and its coroutine frame) alive.
-    asio::awaitable<void> flush_deadline() {
-        asio::steady_timer timer{m_executor};
-        timer.expires_after(std::chrono::seconds(2));
-        co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
-        co_return;
-    }
-
-    asio::awaitable<void> read_loop() {
-        // Parse any bytes carried over from protocol detection first.
-        if (!parse_available())
-            co_return;
-        std::array<std::byte, 32 * 1024> buf; // no init: read_some fills [0,n)
-        for (;;) {
-            m_deadline = std::chrono::steady_clock::now() + m_limits.idle_timeout;
-            auto [ec, n] = co_await m_transport->async_read_some(std::span<std::byte>{buf});
-            if (ec)
-                break; // EOF or transport error ends the connection
-            m_recv_buf.append(reinterpret_cast<const char *>(buf.data()), n);
-            if (!parse_available())
-                break; // protocol error -> GOAWAY queued, stop
-            flush();
+    void complete_on_done() {
+        if (m_done_called)
+            return;
+        m_done_called = true;
+        auto on_done = std::move(m_on_done);
+        if (on_done) {
+            on_done();
         }
-        co_return;
-    }
-
-    asio::awaitable<void> write_loop() {
-        // Hoisted out of the loop deliberately. Swapping into a fresh local each
-        // pass hands m_out's capacity to a string that dies at the end of that
-        // pass, so m_out regrew from nothing on every write (a malloc per pass,
-        // for the life of the connection). With the buffer held here the two
-        // strings trade capacities instead, and neither reallocates again.
-        std::string chunk;
-        for (;;) {
-            fill_data_frames(); // frame as much stream DATA as flow control allows
-            while (!m_out.empty()) {
-                chunk.clear();
-                chunk.swap(m_out);
-                // Writing is connection activity: refresh the idle deadline so the
-                // watchdog does not reap a connection that is busy sending (e.g.
-                // streaming a large response to a slow client).
-                m_deadline = std::chrono::steady_clock::now() + m_limits.idle_timeout;
-                // Composed async_write: whole buffer or error, no partial-write loop.
-                auto [ec, n] =
-                    co_await m_transport->async_write(std::as_bytes(std::span<const char>{chunk.data(), chunk.size()}));
-                (void)n;
-                if (ec)
-                    co_return;
-                fill_data_frames(); // a handler may have queued more while we wrote
-            }
-            // Idle: no stream is active on this connection right now. An
-            // xhttp/stream-one client pools many such connections (Go/xray keeps
-            // tens alive with keepalive PINGs), and each would otherwise pin its
-            // output buffers' capacity (m_out + chunk, hundreds of KiB after a
-            // large response) for as long as it is held - a per-connection floor
-            // that grows with the pool. Give the capacity back between requests;
-            // the next response reallocates. gated on an empty stream table so an
-            // in-flight response never pays a realloc per chunk.
-            if (m_streams.empty()) {
-                std::string().swap(m_out);
-                std::string().swap(chunk);
-            }
-            if (m_goaway_sent && streams_all_done())
-                co_return;
-            auto [ec] = co_await m_notify.async_receive(asio::as_tuple(asio::use_awaitable));
-            if (ec)
-                co_return;
-        }
-    }
-
-    asio::awaitable<void> watchdog() {
-        asio::steady_timer timer{m_executor};
-        for (;;) {
-            timer.expires_at(m_deadline);
-            co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
-            if (std::chrono::steady_clock::now() >= m_deadline)
-                break; // idle timeout elapsed
-        }
-        co_return;
     }
 
     bool streams_all_done() const {
@@ -1182,7 +1192,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         }
         const std::uint32_t dependency = codec::read_u32(payload, 0) & 0x7FFFFFFFu;
         if (dependency == hdr.stream_id) {
-            if (m_streams.contains(hdr.stream_id)) {
+            if (m_streams.find(hdr.stream_id) != m_streams.end()) {
                 reset_stream(hdr.stream_id, codec::H2_PROTOCOL_ERROR);
                 return true;
             }
@@ -1312,9 +1322,9 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                                   m_limits.h2_max_concurrent_streams);
             return refuse_stream(hdr, block, codec::H2_REFUSED_STREAM);
         }
-        if (header_block_too_big(m_streams.contains(hdr.stream_id) ? m_streams.at(hdr.stream_id).header_block.size()
-                                                                   : 0,
-                                 block.size())) {
+        if (header_block_too_big(
+                m_streams.find(hdr.stream_id) != m_streams.end() ? m_streams.at(hdr.stream_id).header_block.size() : 0,
+                block.size())) {
             SIMPLE_HTTP_ERROR_LOG("h2: header block exceeds {} bytes (stream={})", m_limits.max_header_bytes,
                                   hdr.stream_id);
             go_away(codec::H2_ENHANCE_YOUR_CALM);
@@ -1375,7 +1385,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                 return true;
             if (end_stream) {
                 it->second.half_closed_remote = true;
-                mark_ws_remote_end(it->second); // extended CONNECT: the head ends the tunnel's read side
+                mark_ws_remote_end(it->second);
                 (void)it->second.request->body().finish();
             }
             // Dispatch as soon as the request head is complete. The handler runs
@@ -1442,7 +1452,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
             if (it2 == m_streams.end())
                 return true;
             if (it2->second.half_closed_remote) {
-                mark_ws_remote_end(it2->second); // END_STREAM arrived on the (split) head
+                mark_ws_remote_end(it2->second);
                 (void)it2->second.request->body().finish();
             }
             return dispatch_stream(hdr.stream_id);
@@ -1634,15 +1644,8 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                 }
             }
             // RFC 8441 §3: an extended CONNECT selects a protocol with
-            // `:protocol`, must be a CONNECT, and — unlike a plain CONNECT —
-            // carries `:scheme` and `:path`. Only "websocket" is acted on; any
-            // other value is left to normal dispatch (404 when the path is
-            // unknown, 405 when it exists for another method).
+            // `:protocol`, must be a CONNECT, and carries `:scheme` and `:path`.
             if (seen_protocol) {
-                // RFC 8441 §3: extended CONNECT is only legal once the server
-                // advertised SETTINGS_ENABLE_CONNECT_PROTOCOL=1. With the knob
-                // off we advertise 0, so a client that uses it anyway is a
-                // connection error — not a request we quietly upgrade.
                 if (!m_limits.h2_enable_connect_protocol) {
                     SIMPLE_HTTP_ERROR_LOG("h2: extended CONNECT while ENABLE_CONNECT_PROTOCOL=0 (stream={})",
                                           stream_id);
@@ -1765,21 +1768,10 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
             if (padding > 0)
                 credit_consumed(st, padding);
 
-            // RFC 8441: on an extended-CONNECT stream DATA is tunnel bytes, not a
-            // request body. Buffer it for the WebSocket transport and return the
-            // flow-control credit only as the tunnel consumes it, so a stalled
-            // handler cannot make the engine buffer without bound.
+            // RFC 8441: on an extended-CONNECT stream DATA is tunnel bytes.
             if (st.websocket) {
                 if (!data.empty()) {
                     if (st.ws_closed) {
-                        // The tunnel is gone: refused (no ws route), a failed proxy
-                        // handshake, or a handler that already returned. Nothing
-                        // will ever read ws_inbox, so hand the connection credit
-                        // straight back instead of banking bytes nobody drains -
-                        // banked bytes keep the shared connection window debited
-                        // for the rest of the connection's life. Measured: 1 MiB
-                        // of DATA on a 404'd extended CONNECT left the connection
-                        // unable to send any request body on *any* stream.
                         credit_consumed(st, static_cast<std::int64_t>(data.size()));
                     } else {
                         st.recv_owed_conn += static_cast<std::int64_t>(data.size());
@@ -1790,7 +1782,7 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
                 }
                 if (hdr.has_flag(codec::H2_FLAG_END_STREAM)) {
                     st.half_closed_remote = true;
-                    mark_ws_remote_end(st); // tunnel EOF; shared with the head-END_STREAM path
+                    mark_ws_remote_end(st);
                     maybe_complete_stream(hdr.stream_id);
                 }
                 return true;
@@ -1994,15 +1986,14 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         // drain now, so it must not be left waiting on a queue that is gone.
         if (it->second.out_space)
             it->second.out_space->close();
-        // Wake a WebSocket reader parked on this stream, so its adapter observes
-        // the stream's disappearance instead of waiting forever.
         if (it->second.ws_wake)
             it->second.ws_wake->close();
         // A stream reset while its handler was still queued (Rapid Reset): drop
         // the queue entry so the bound is not spent on a stream that is gone.
         // The handler itself, if one was already running, keeps its slot and
         // releases it via handler_finished().
-        std::erase(m_pending_dispatch, stream_id);
+        m_pending_dispatch.erase(std::remove(m_pending_dispatch.begin(), m_pending_dispatch.end(), stream_id),
+                                 m_pending_dispatch.end());
         m_streams.erase(it);
     }
 
@@ -2310,55 +2301,49 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
             return;
         it->second.handler_started = true;
         ++m_active_handlers;
-        // RFC 8441: an extended-CONNECT WebSocket stream runs the ws middleware
-        // chain and, if it reaches the terminal, becomes a tunnel.
         if (it->second.websocket) {
             dispatch_ws_stream(stream_id);
             return;
         }
         auto request = it->second.request;
         auto writer = it->second.writer;
-        // Remember the method on the sink before the response starts: once a HEAD
-        // response's HEADERS frame ends the stream, the entry is retired and the
-        // stream table can no longer answer "was this a HEAD?".
         writer->set_head_request(request->method() == Method::Head);
-        // RFC 9110 §10.1.1: answer an Expect: 100-continue lazily on the
-        // handler's first body read, so a handler that rejects the upload can
-        // still send a final status. The body is pushed on HTTP/2, so Body's
-        // first-read hook is the equivalent of the HTTP/1.x pull point.
         if (const auto expect = request->header("expect"); expect && header_has_token(*expect, "100-continue")) {
             std::weak_ptr<Http2ResponseSink<Transport>> weak_writer = writer;
-            request->body().set_first_read_hook([weak_writer]() -> asio::awaitable<error_code> {
+            request->body().set_first_read_hook([weak_writer](asio::any_completion_handler<void(error_code)> done) {
                 if (auto w = weak_writer.lock()) {
-                    co_return co_await w->send_continue();
+                    w->send_continue(std::move(done));
+                    return;
                 }
-                co_return error_code{};
+                std::move(done)(error_code{});
             });
         }
-        auto self = this->shared_from_this(); // keep engine alive across suspensions
-        std::uint32_t sid = stream_id;
-        asio::co_spawn(
-            m_executor,
-            [self, request, writer, sid]() -> asio::awaitable<void> {
-                // Same wrapper as h1: see the note there. `writer` stays in the
-                // engine's hands for stream bookkeeping; only the Response gets
-                // the compressing view.
-                auto response = std::make_shared<ResponseWriter>(
-                    maybe_compress_writer(writer, self->m_executor, request, request->method() == Method::Head));
-                try {
-                    co_await self->m_dispatch(request, response, self->m_transport->tls_handle());
-                } catch (const std::exception &e) {
-                    SIMPLE_HTTP_ERROR_LOG("h2 handler(stream={}) threw: {}", sid, e.what());
-                    self->reset_stream(sid, codec::H2_INTERNAL_ERROR);
-                } catch (...) {
-                    SIMPLE_HTTP_ERROR_LOG("h2 handler(stream={}) threw unknown exception", sid);
-                    self->reset_stream(sid, codec::H2_INTERNAL_ERROR);
-                }
-                self->flush();
-                self->handler_finished(sid);
-                co_return;
-            },
-            asio::detached);
+        auto self = this->shared_from_this();
+        auto response = std::make_shared<ResponseWriter>(
+            maybe_compress_writer(writer, self->m_executor, request, request->method() == Method::Head));
+        auto completed = std::make_shared<bool>(false);
+        // Keep the request and response alive until the handler signals
+        // completion: a callback handler that starts an async body read and
+        // returns must not have its Body (or writer) destroyed by a stream
+        // reset while that read is still pending.
+        auto finish = [self, stream_id, completed, request, response]() mutable {
+            if (*completed)
+                return;
+            *completed = true;
+            self->flush();
+            self->handler_finished(stream_id);
+        };
+        try {
+            m_dispatch(request, response, m_transport->tls_handle(), finish);
+        } catch (const std::exception &e) {
+            SIMPLE_HTTP_ERROR_LOG("h2 handler(stream={}) threw: {}", stream_id, e.what());
+            self->reset_stream(stream_id, codec::H2_INTERNAL_ERROR);
+            finish();
+        } catch (...) {
+            SIMPLE_HTTP_ERROR_LOG("h2 handler(stream={}) threw unknown exception", stream_id);
+            self->reset_stream(stream_id, codec::H2_INTERNAL_ERROR);
+            finish();
+        }
     }
 
     // A dispatched handler (ordinary or WebSocket) has returned: free its slot
@@ -2404,25 +2389,28 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
     // --- HTTP/2 WebSocket (RFC 8441) ---
 
     // Engine-side half of one extended-CONNECT stream, handed to WsBackendImpl
-    // through Http2WsTransport. A nested class so it can reach the engine's
-    // stream table directly.
+    // through Http2WsTransport.
     class WsStreamAdapter final : public H2WsStream {
       public:
-        WsStreamAdapter(std::weak_ptr<Http2Engine> engine, std::uint32_t id, Executor exec)
+        WsStreamAdapter(std::weak_ptr<Http2Engine> engine, std::uint32_t id, asio::any_io_executor exec)
             : m_engine(std::move(engine)), m_id(id), m_exec(std::move(exec)) {}
 
         asio::any_io_executor get_executor() override { return m_exec; }
 
-        asio::awaitable<IoResult> read_some(std::span<std::byte> out) override {
-            if (auto eng = m_engine.lock())
-                co_return co_await eng->ws_stream_read(m_id, out);
-            co_return IoResult{make_error_code(asio::error::operation_aborted), 0};
+        void read_some(ByteSpan out, IoCompletion done) override {
+            if (auto eng = m_engine.lock()) {
+                eng->ws_stream_read(m_id, out, std::move(done));
+                return;
+            }
+            std::move(done)(make_error_code(asio::error::operation_aborted), 0);
         }
 
-        asio::awaitable<IoResult> write_seq(std::span<const ConstByteSpan> bufs) override {
-            if (auto eng = m_engine.lock())
-                co_return co_await eng->ws_stream_write(m_id, bufs);
-            co_return IoResult{make_error_code(asio::error::operation_aborted), 0};
+        void write_seq(boost::span<const ConstByteSpan> buffers, IoCompletion done) override {
+            if (auto eng = m_engine.lock()) {
+                eng->ws_stream_write(m_id, buffers, std::move(done));
+                return;
+            }
+            std::move(done)(make_error_code(asio::error::operation_aborted), 0);
         }
 
         void close() override {
@@ -2433,17 +2421,15 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
       private:
         std::weak_ptr<Http2Engine> m_engine;
         std::uint32_t m_id;
-        Executor m_exec;
+        asio::any_io_executor m_exec;
     };
 
     // Dispatch an extended-CONNECT WebSocket stream: run the ws middleware chain
-    // (global + group + per-route) and, if it reaches the terminal, upgrade. With
-    // no matching ws route the stream is answered 404 and ended.
+    // and, if it reaches the terminal, upgrade. With no matching ws route the
+    // stream is answered 404 and ended.
     void dispatch_ws_stream(std::uint32_t stream_id) {
         auto it = m_streams.find(stream_id);
         if (it == m_streams.end()) {
-            // The stream vanished between start_handler and here: release the slot
-            // taken for it, or the leak would stall the dispatch queue.
             handler_finished(stream_id);
             return;
         }
@@ -2451,79 +2437,48 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         auto writer = it->second.writer;
         const std::string path{request->path()};
         std::optional<WsHandlerFn> handler_fn;
-        auto self = this->shared_from_this();
         if (m_ws_lookup)
             handler_fn = m_ws_lookup(path);
+        auto self = this->shared_from_this();
         // Nginx order: local exact ws route beats a proxy route, which beats a
         // local regex ws route.
         if (!handler_fn && m_ws_proxy_lookup) {
             if (auto target = m_ws_proxy_lookup(path)) {
-                asio::co_spawn(
-                    m_executor,
-                    [self, request, stream_id, target = std::move(*target)]() mutable -> asio::awaitable<void> {
-                        (void)co_await self->run_h2_ws_proxy(stream_id, std::move(request), std::move(target));
-                        self->handler_finished(stream_id);
-                    },
-                    asio::detached);
+                auto run = std::make_shared<H2WsProxyRun>(self, stream_id, request, writer, std::move(*target));
+                run->start();
                 return;
             }
         }
         if (!handler_fn && m_ws_regex_lookup)
             handler_fn = m_ws_regex_lookup(path);
         if (!handler_fn) {
-            asio::co_spawn(
-                m_executor,
-                [self, writer, stream_id]() -> asio::awaitable<void> {
-                    (void)co_await writer->send_bodyless(status::not_found, Headers{});
-                    // There is no tunnel on this stream, so close its read side:
-                    // inbound DATA then returns its flow-control credit instead of
-                    // being banked for a reader that will never exist (see
-                    // on_data).
-                    self->ws_stream_close(stream_id);
-                    self->handler_finished(stream_id);
-                },
-                asio::detached);
+            writer->send_bodyless(status::not_found, Headers{}, [self, stream_id](error_code) {
+                self->ws_stream_close(stream_id);
+                self->handler_finished(stream_id);
+            });
             return;
         }
-        asio::co_spawn(
-            m_executor,
-            [self, request, writer, stream_id, handler = std::move(*handler_fn)]() mutable -> asio::awaitable<void> {
-                auto response = std::make_shared<ResponseWriter>(writer);
-                auto upgrade = [self, stream_id](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res,
-                                                 WsHandler h) -> asio::awaitable<bool> {
-                    co_return co_await self->do_ws_upgrade(stream_id, std::move(req), std::move(res), std::move(h));
-                };
-                try {
-                    (void)co_await handler(request, response, self->m_transport->tls_handle(), std::move(upgrade));
-                } catch (const std::exception &e) {
-                    SIMPLE_HTTP_ERROR_LOG("h2 ws handler(stream={}) threw: {}", stream_id, e.what());
-                    self->reset_stream(stream_id, codec::H2_INTERNAL_ERROR);
-                } catch (...) {
-                    SIMPLE_HTTP_ERROR_LOG("h2 ws handler(stream={}) threw unknown exception", stream_id);
-                    self->reset_stream(stream_id, codec::H2_INTERNAL_ERROR);
-                }
-                self->handler_finished(stream_id);
-                co_return;
-            },
-            asio::detached);
+        auto response = std::make_shared<ResponseWriter>(writer);
+        auto upgrade = [self, stream_id](RequestPtr req, ResponsePtr res, CallbackWsHandler h,
+                                         WsUpgradeCompletion done) mutable {
+            self->do_ws_upgrade(stream_id, std::move(req), std::move(res), std::move(h), std::move(done));
+        };
+        (*handler_fn)(request, response, m_transport->tls_handle(), upgrade,
+                      [self, stream_id](error_code, bool) { self->handler_finished(stream_id); });
     }
 
     // The ws middleware chain's terminal: accept the tunnel with a 200 head and
     // run the handler over a WsBackendImpl backed by this stream.
-    asio::awaitable<bool> do_ws_upgrade(std::uint32_t stream_id, std::shared_ptr<Request> request,
-                                        std::shared_ptr<ResponseWriter> res, WsHandler handler) {
+    void do_ws_upgrade(std::uint32_t stream_id, std::shared_ptr<Request> request, std::shared_ptr<ResponseWriter> res,
+                       CallbackWsHandler handler, WsUpgradeCompletion done) {
         auto it = m_streams.find(stream_id);
-        if (it == m_streams.end())
-            co_return false;
+        if (it == m_streams.end()) {
+            std::move(done)(make_error_code(asio::error::not_connected), false);
+            return;
+        }
         auto sink = it->second.writer;
 
-        // permessage-deflate (RFC 7692) is negotiated with the same headers as
-        // over HTTP/1.1, carried inside the extended CONNECT request/response.
         Headers response_headers = res->headers();
-        // Same rule as the h1 handshake: the acceptance head is built from the
-        // writer's fields directly, so ResponseWriter's defaults never ran.
-        // Server identifies the library unless a middleware chose one; the sink
-        // adds Date itself (a 200 is not exempt, unlike the h1 101).
         if (!response_headers.contains("server"))
             response_headers.add_lower("server", std::string{server_product});
         WsDeflateConfig deflate;
@@ -2535,244 +2490,30 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
             }
         }
 
-        // RFC 8441 §4: a 2xx response *is* the acceptance; there is no
-        // Sec-WebSocket-Accept over HTTP/2, and the stream stays open.
-        if (auto ec = co_await sink->send_headers(status::ok, std::move(response_headers)); ec)
-            co_return false;
-
-        auto adapter = std::make_shared<WsStreamAdapter>(this->weak_from_this(), stream_id, m_executor);
-        auto transport = std::make_shared<Http2WsTransport>(adapter);
-        auto backend = std::make_shared<WsBackendImpl<Http2WsTransport>>(transport, m_limits.max_body_bytes,
-                                                                         m_limits.idle_timeout, /*expect_masked=*/true,
-                                                                         m_limits.ws_read_ahead_bytes, deflate);
-        auto ws = std::make_shared<WebSocket>(std::move(backend));
-        asio::co_spawn(m_executor, ws->run_writer(), asio::detached);
-        try {
-            co_await handler(std::move(request), ws); // copy: keep ours for the graceful close
-        } catch (const std::exception &e) {
-            SIMPLE_HTTP_ERROR_LOG("h2 ws handler(stream={}) threw: {}", stream_id, e.what());
-        } catch (...) {
-            SIMPLE_HTTP_ERROR_LOG("h2 ws handler(stream={}) threw unknown exception", stream_id);
-        }
-        (void)co_await ws->close();
-        co_return true;
-    }
-
-    // --- HTTP/2 WebSocket reverse proxy (RFC 8441 frontend, HTTP/1.1 backend) ---
-
-    // Byte-level WebSocket reverse proxy over HTTP/2. The frontend handshake is
-    // an extended CONNECT (already matched), so we synthesize an ordinary
-    // HTTP/1.1 upgrade to the backend, wait for its 101, answer the h2 stream
-    // with 200, then splice bytes verbatim. Because the proxy is the *client* on
-    // both sides, masking, fragmentation, control frames and permessage-deflate
-    // pass through unchanged.
-    asio::awaitable<bool> run_h2_ws_proxy(std::uint32_t stream_id, std::shared_ptr<Request> request,
-                                          WsProxyTarget target) {
-        using namespace asio::experimental::awaitable_operators;
-        auto it = m_streams.find(stream_id);
-        if (it == m_streams.end())
-            co_return false;
-        auto sink = it->second.writer;
-        const auto idle = m_limits.idle_timeout;
-
-        const auto peer = m_transport->peer();
-        std::string peer_address = address_string_if_specified(peer.address());
-        const bool client_is_tls = m_transport->tls_handle().has_value();
-
-        auto fail = [this, sink, stream_id](int status, Headers headers = {}) -> asio::awaitable<void> {
-            (void)co_await sink->send_bodyless(status, std::move(headers));
-            // The tunnel is not happening, whatever the reason: close its read
-            // side so inbound DATA is credited back rather than banked (on_data).
-            ws_stream_close(stream_id);
-            co_return;
-        };
-
-        auto connected = co_await detail::ws_proxy_connect(m_executor, target);
-        if (!connected) {
-            const error_code ec = connected.error();
-            SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy connect {}:{} failed (client {}): {}", target.host, target.port,
-                                  address_string(peer.address()), ec.message());
-            co_await fail(status::bad_gateway);
-            co_return false;
-        }
-        auto backend = std::move(*connected);
-
-        auto close_backend = [backend]() { detail::ws_proxy_close(*backend); };
-
-        // Rewrite the path and keep the client's query string — see run_ws_proxy
-        // (h1) for why dropping it breaks session-carrying endpoints.
-        // The h2 frontend only ever had a '?' when the query was non-empty.
-        const auto inbound_query = request->query();
-        auto replay = detail::ws_proxy_replay_target(
-            target.rewrite_path, request->path(),
-            inbound_query.empty() ? std::nullopt : std::optional<std::string_view>{inbound_query});
-        if (!replay) {
-            SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy: refusing a request target with CR/LF/NUL (client {})",
-                                  address_string(peer.address()));
-            close_backend();
-            co_await fail(status::bad_request);
-            co_return false;
-        }
-        std::string replay_target = std::move(*replay);
-
-        const std::string key = detail::make_ws_client_key();
-        const auto inbound_host = request->header("host");
-        std::string head =
-            detail::build_ws_upgrade_head(request->headers(), inbound_host ? *inbound_host : std::string_view{},
-                                          replay_target, target, peer_address, client_is_tls, key);
-        {
-            auto [wec, w] = co_await asio::async_write(*backend, asio::buffer(head.data(), head.size()),
-                                                       asio::as_tuple(asio::use_awaitable));
-            (void)w;
-            if (wec) {
-                SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy backend handshake write failed (client {}): {}",
-                                      address_string(peer.address()), wec.message());
-                close_backend();
-                co_await fail(status::bad_gateway);
-                co_return false;
-            }
-        }
-
-        auto reply = co_await detail::ws_proxy_read_reply(*backend, m_limits.max_header_bytes, target.connect_timeout);
-        if (!reply) {
-            SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy backend handshake failed (client {}): {}",
-                                  address_string(peer.address()), reply.error().message());
-            close_backend();
-            co_await fail(status::bad_gateway);
-            co_return false;
-        }
-
-        if (reply->head.status != status::switching_protocols) {
-            // Surface the backend's actual refusal status and end-to-end fields
-            // (WWW-Authenticate, Location, …), not an invented 502. The body is
-            // not relayed: an h2 extended-CONNECT response is terminated at the
-            // headers here, and the peer's status is the actionable part.
-            Headers response_headers;
-            for (const auto &[name, value] : reply->head.headers) {
-                if (is_hop_by_hop_field(name) || name == "content-length" || name == "transfer-encoding")
-                    continue;
-                if (contains_ctl(name) || contains_ctl(value))
-                    continue;
-                response_headers.add_lower(name, value);
-            }
-            SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy backend refused the upgrade with {} (client {})", reply->head.status,
-                                  address_string(peer.address()));
-            close_backend();
-            co_await fail(reply->head.status, std::move(response_headers));
-            co_return false;
-        }
-
-        if (!detail::ws_validate_101(reply->head, ws_accept_key(key))) {
-            SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy backend answered 101 with a mismatched Upgrade/accept (client {})",
-                                  address_string(peer.address()));
-            close_backend();
-            co_await fail(status::bad_gateway);
-            co_return false;
-        }
-
-        // Forward the backend's negotiated fields into the h2 200, minus the
-        // HTTP/1.1-only / hop-by-hop ones (the h2 client must not see Upgrade,
-        // Connection or Sec-WebSocket-Accept).
-        Headers response_headers;
-        for (const auto &[name, value] : reply->head.headers) {
-            if (is_hop_by_hop_field(name) || name == "sec-websocket-accept" || name == "content-length" ||
-                name == "transfer-encoding")
-                continue;
-            if (contains_ctl(name) || contains_ctl(value))
-                continue;
-            response_headers.add_lower(name, value);
-        }
-        if (auto ec = co_await sink->send_headers(status::ok, std::move(response_headers)); ec) {
-            close_backend();
-            co_return false;
-        }
-
-        std::string initial{std::move(reply->initial)};
-        auto deadline = std::chrono::steady_clock::now() + idle;
-
-        auto backend_to_client = [&]() -> asio::awaitable<void> {
-            if (!initial.empty()) {
-                if (auto ec = co_await ws_stream_write_bytes(
-                        stream_id, std::as_bytes(std::span<const char>{initial.data(), initial.size()}));
-                    ec)
-                    co_return;
-                initial.clear();
-            }
-            std::array<std::byte, 16384> buf{};
-            for (;;) {
-                auto [rec2, n] = co_await backend->async_read_some(asio::buffer(buf.data(), buf.size()),
-                                                                   asio::as_tuple(asio::use_awaitable));
-                if (rec2 || n == 0) {
-                    // The backend is done sending. End the tunnel's read side,
-                    // which also wakes client_to_backend; unlike the old `||`
-                    // race this happens only after the direction really ended.
-                    ws_stream_close(stream_id);
-                    break;
+        auto self = this->shared_from_this();
+        sink->send_headers(
+            status::ok, std::move(response_headers),
+            [self, stream_id, request, handler, deflate, done = std::move(done)](error_code ec) mutable {
+                if (ec) {
+                    std::move(done)(ec, false);
+                    return;
                 }
-                deadline = std::chrono::steady_clock::now() + idle;
-                if (auto ec = co_await ws_stream_write_bytes(stream_id, std::span<const std::byte>{buf.data(), n}); ec)
-                    break;
-                deadline = std::chrono::steady_clock::now() + idle;
-            }
-        };
-        auto client_to_backend = [&]() -> asio::awaitable<void> {
-            std::array<std::byte, 16384> buf{};
-            for (;;) {
-                auto [rec2, n] = co_await ws_stream_read(stream_id, std::span<std::byte>{buf.data(), buf.size()});
-                if (rec2 || n == 0) {
-                    // Client half-close (END_STREAM): stop sending to the
-                    // backend, but leave the opposite direction running so the
-                    // backend's Close frame and trailing messages still arrive.
-                    error_code sec;
-                    backend->shutdown(asio::ip::tcp::socket::shutdown_send, sec);
-                    break;
-                }
-                deadline = std::chrono::steady_clock::now() + idle;
-                auto [wec, w] = co_await asio::async_write(*backend, asio::buffer(buf.data(), n),
-                                                           asio::as_tuple(asio::use_awaitable));
-                (void)w;
-                if (wec)
-                    break;
-                deadline = std::chrono::steady_clock::now() + idle;
-            }
-        };
-        // Go's io.Copy pair: both directions run to completion (a half-close in
-        // one does not cancel the other), with the idle watchdog as the only
-        // early exit. This matches the h1 tunnel, which fixed the same mistake.
-        if (idle.count() > 0) {
-            auto outcome = co_await ((backend_to_client() && client_to_backend()) ||
-                                     detail::ws_tunnel_idle_guard(m_executor, deadline));
-            if (const auto *timed_out = std::get_if<bool>(&outcome); timed_out && *timed_out) {
-                SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy tunnel idle for {}s (client {})",
-                                      std::chrono::duration_cast<std::chrono::seconds>(idle).count(), peer_address);
-            }
-        } else {
-            co_await (backend_to_client() && client_to_backend());
-        }
-        close_backend();
-        ws_stream_close(stream_id);
-        co_return true;
+                auto adapter = std::make_shared<WsStreamAdapter>(self->weak_from_this(), stream_id, self->m_executor);
+                auto transport = std::make_shared<Http2WsTransport<WsStreamAdapter>>(adapter);
+                auto backend = std::make_shared<WsBackendImpl<Http2WsTransport<WsStreamAdapter>>>(
+                    transport, self->m_limits.max_body_bytes, self->m_limits.idle_timeout, /*expect_masked=*/true,
+                    self->m_limits.ws_read_ahead_bytes, deflate);
+                auto ws = std::make_shared<WebSocket>(std::move(backend));
+                ws->run_writer();
+                invoke_ws_handler(WsHandler(handler), request, ws, [ws, done = std::move(done)]() mutable {
+                    ws->async_close(
+                        [done = std::move(done)](error_code) mutable { std::move(done)(error_code{}, true); });
+                });
+            });
     }
 
-    // Raw byte write onto the tunnel stream (the proxy's backend->client half):
-    // frames the bytes as DATA, honoring flow control.
-    asio::awaitable<error_code> ws_stream_write_bytes(std::uint32_t id, std::span<const std::byte> data) {
-        auto it = m_streams.find(id);
-        if (it == m_streams.end() || it->second.end_stream_sent)
-            co_return make_error_code(asio::error::not_connected);
-        if (auto ec = co_await await_out_space(id); ec)
-            co_return ec;
-        enqueue_body(id, std::string(reinterpret_cast<const char *>(data.data()), data.size()), /*last=*/false);
-        co_return error_code{};
-    }
-
-    // The peer ended its half of a stream (END_STREAM). For a WebSocket tunnel
-    // that is the reader's EOF, and it has to be recorded wherever the end can
-    // arrive — a DATA frame, or the request head itself. On an extended CONNECT
-    // whose HEADERS carry END_STREAM nothing else will ever set it: RFC 9113 §5.1
-    // forbids further DATA on a half-closed(remote) stream, so the tunnel reader
-    // would park on ws_wake until the idle watchdog fired (measured: the peer
-    // half-closing at CONNECT time got no reply for 120s).
+    // The peer ended its half of a stream (END_STREAM): for a tunnel that is the
+    // reader's EOF, wherever the end arrives (a DATA frame or the request head).
     static void mark_ws_remote_end(Stream &st) {
         if (!st.websocket)
             return;
@@ -2782,61 +2523,72 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
     }
 
     // Inbound tunnel read: hands the ws backend buffered DATA bytes and returns
-    // flow-control credit for exactly what it consumed. Parks on ws_wake until
-    // bytes arrive, the peer ends its half, or the stream is torn down.
-    asio::awaitable<IoResult> ws_stream_read(std::uint32_t id, std::span<std::byte> out) {
-        for (;;) {
-            auto it = m_streams.find(id);
-            if (it == m_streams.end())
-                co_return IoResult{make_error_code(asio::error::connection_reset), 0};
-            Stream &st = it->second;
-            if (!st.ws_inbox.empty()) {
-                const std::size_t n = std::min<std::size_t>(out.size(), st.ws_inbox.size());
-                std::memcpy(out.data(), st.ws_inbox.data(), n);
-                st.ws_inbox.erase(0, n);
-                st.recv_owed_conn -= static_cast<std::int64_t>(n);
-                if (st.recv_owed_conn < 0)
-                    st.recv_owed_conn = 0;
-                credit_consumed(st, static_cast<std::int64_t>(n));
-                flush();
-                co_return IoResult{error_code{}, n};
-            }
-            if (st.ws_closed)
-                co_return IoResult{make_error_code(asio::error::operation_aborted), 0};
-            if (st.ws_eof)
-                co_return IoResult{make_error_code(asio::error::eof), 0};
-            if (!st.ws_wake)
-                st.ws_wake = std::make_shared<asio::experimental::channel<void(error_code)>>(m_executor, 1);
-            auto wake = st.ws_wake;
-            // Re-look-up after every wake: the stream entry may have been erased
-            // while we were parked.
-            (void)co_await wake->async_receive(asio::as_tuple(asio::use_awaitable));
+    // flow-control credit for exactly what it consumed.
+    void ws_stream_read(std::uint32_t id, ByteSpan out, H2WsStream::IoCompletion done) {
+        auto it = m_streams.find(id);
+        if (it == m_streams.end()) {
+            std::move(done)(make_error_code(asio::error::connection_reset), 0);
+            return;
         }
+        Stream &st = it->second;
+        if (!st.ws_inbox.empty()) {
+            const std::size_t n = std::min<std::size_t>(out.size(), st.ws_inbox.size());
+            std::memcpy(out.data(), st.ws_inbox.data(), n);
+            st.ws_inbox.erase(0, n);
+            st.recv_owed_conn -= static_cast<std::int64_t>(n);
+            if (st.recv_owed_conn < 0)
+                st.recv_owed_conn = 0;
+            credit_consumed(st, static_cast<std::int64_t>(n));
+            flush();
+            std::move(done)(error_code{}, n);
+            return;
+        }
+        if (st.ws_closed) {
+            std::move(done)(make_error_code(asio::error::operation_aborted), 0);
+            return;
+        }
+        if (st.ws_eof) {
+            std::move(done)(make_error_code(asio::error::eof), 0);
+            return;
+        }
+        if (!st.ws_wake)
+            st.ws_wake = std::make_shared<asio::experimental::channel<void(error_code)>>(m_executor, 1);
+        auto wake = st.ws_wake;
+        auto self = this->shared_from_this();
+        wake->async_receive([self, id, out, done = std::move(done)](error_code) mutable {
+            self->ws_stream_read(id, out, std::move(done));
+        });
     }
 
     // Outbound tunnel write: frames every buffer as DATA on this stream, waiting
     // on the same backpressure the response path uses.
-    asio::awaitable<IoResult> ws_stream_write(std::uint32_t id, std::span<const ConstByteSpan> bufs) {
+    void ws_stream_write(std::uint32_t id, boost::span<const ConstByteSpan> bufs, H2WsStream::IoCompletion done) {
         std::size_t total = 0;
         for (const auto &b : bufs)
             total += b.size();
         {
             auto it = m_streams.find(id);
-            if (it == m_streams.end() || it->second.end_stream_sent)
-                co_return IoResult{make_error_code(asio::error::not_connected), 0};
+            if (it == m_streams.end() || it->second.end_stream_sent) {
+                std::move(done)(make_error_code(asio::error::not_connected), 0);
+                return;
+            }
         }
-        if (auto ec = co_await await_out_space(id); ec)
-            co_return IoResult{ec, 0};
         std::string data;
         data.reserve(total);
         for (const auto &b : bufs)
             data.append(reinterpret_cast<const char *>(b.data()), b.size());
-        enqueue_body(id, std::move(data), /*last=*/false);
-        co_return IoResult{error_code{}, total};
+        auto self = this->shared_from_this();
+        await_out_space(id, [self, id, total, data = std::move(data), done = std::move(done)](error_code ec) mutable {
+            if (ec) {
+                std::move(done)(ec, 0);
+                return;
+            }
+            self->enqueue_body(id, std::move(data), /*last=*/false);
+            std::move(done)(error_code{}, total);
+        });
     }
 
-    // Ends the tunnel with END_STREAM and wakes any parked reader. Never closes
-    // the rest of the HTTP/2 connection.
+    // Ends the tunnel with END_STREAM and wakes any parked reader.
     void ws_stream_close(std::uint32_t id) {
         auto it = m_streams.find(id);
         if (it == m_streams.end())
@@ -2850,20 +2602,319 @@ template <TransportLike Transport> class Http2Engine : public std::enable_shared
         flush();
     }
 
+    // --- h2 extended-CONNECT WebSocket reverse proxy ---
+    //
+    // The frontend handshake is an extended CONNECT (already matched), so we
+    // synthesize an ordinary HTTP/1.1 upgrade to the backend, wait for its 101,
+    // answer the h2 stream with 200, then splice bytes verbatim. Because the
+    // proxy is the *client* on both sides, masking, fragmentation, control
+    // frames and permessage-deflate pass through unchanged.
+    class H2WsProxyRun : public std::enable_shared_from_this<H2WsProxyRun> {
+      public:
+        H2WsProxyRun(std::shared_ptr<Http2Engine> engine, std::uint32_t stream_id, std::shared_ptr<Request> request,
+                     std::shared_ptr<Http2ResponseSink<Transport>> sink, WsProxyTarget target)
+            : m_engine(std::move(engine)), m_id(stream_id), m_request(std::move(request)), m_sink(std::move(sink)),
+              m_target(std::move(target)), m_timer(m_engine->m_executor) {}
+
+        void start() {
+            auto self = this->shared_from_this();
+            detail::async_ws_proxy_connect(
+                m_engine->m_executor, m_target,
+                [self](error_code ec, std::shared_ptr<asio::ip::tcp::socket> backend) mutable {
+                    self->on_connected(ec, std::move(backend));
+                });
+        }
+
+      private:
+        void on_connected(error_code ec, std::shared_ptr<asio::ip::tcp::socket> backend) {
+            if (ec) {
+                SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy connect {}:{} failed (client {}): {}", m_target.host, m_target.port,
+                                      address_string(m_engine->m_transport->peer().address()), ec.message());
+                fail(status::bad_gateway);
+                return;
+            }
+            m_backend = std::move(backend);
+
+            const auto query = m_request->query();
+            auto replay =
+                detail::ws_proxy_replay_target(m_target.rewrite_path, m_request->path(),
+                                               query.empty() ? std::nullopt : std::optional<std::string_view>{query});
+            if (!replay) {
+                SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy: refusing a request target with CR/LF/NUL (client {})",
+                                      address_string(m_engine->m_transport->peer().address()));
+                close_backend();
+                fail(status::bad_request);
+                return;
+            }
+            const std::string replay_target = std::move(*replay);
+
+            m_key = detail::make_ws_client_key();
+            const auto inbound_host = m_request->header("host");
+            const bool client_is_tls = m_engine->m_transport->tls_handle().has_value();
+            auto head = std::make_shared<std::string>(detail::build_ws_upgrade_head(
+                m_request->headers(), inbound_host ? *inbound_host : std::string_view{}, replay_target, m_target,
+                address_string_if_specified(m_engine->m_transport->peer().address()), client_is_tls, m_key));
+            auto self = this->shared_from_this();
+            asio::async_write(*m_backend, asio::buffer(head->data(), head->size()),
+                              [self, head](error_code wec, std::size_t) mutable {
+                                  if (wec) {
+                                      SIMPLE_HTTP_ERROR_LOG(
+                                          "h2 ws-proxy backend handshake write failed (client {}): {}",
+                                          address_string(self->m_engine->m_transport->peer().address()), wec.message());
+                                      self->close_backend();
+                                      self->fail(status::bad_gateway);
+                                      return;
+                                  }
+                                  self->read_reply();
+                              });
+        }
+
+        void read_reply() {
+            auto self = this->shared_from_this();
+            detail::async_ws_proxy_read_reply(*m_backend, m_engine->m_limits.max_header_bytes, m_target.connect_timeout,
+                                              [self](error_code ec, detail::WsProxyReplyHead reply) mutable {
+                                                  self->on_reply(ec, std::move(reply));
+                                              });
+        }
+
+        void on_reply(error_code ec, detail::WsProxyReplyHead reply) {
+            if (ec) {
+                SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy backend handshake failed (client {}): {}",
+                                      address_string(m_engine->m_transport->peer().address()), ec.message());
+                close_backend();
+                fail(status::bad_gateway);
+                return;
+            }
+
+            if (reply.head.status != status::switching_protocols) {
+                // Surface the backend's actual refusal status and end-to-end
+                // fields (WWW-Authenticate, Location, ...), not an invented 502.
+                // The body is not relayed: an h2 extended-CONNECT response ends
+                // at the headers, and the peer's status is the actionable part.
+                Headers response_headers;
+                for (const auto &[name, value] : reply.head.headers) {
+                    if (is_hop_by_hop_field(name) || name == "content-length" || name == "transfer-encoding")
+                        continue;
+                    if (contains_ctl(name) || contains_ctl(value))
+                        continue;
+                    response_headers.add_lower(name, value);
+                }
+                SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy backend refused the upgrade with {} (client {})", reply.head.status,
+                                      address_string(m_engine->m_transport->peer().address()));
+                close_backend();
+                fail(reply.head.status, std::move(response_headers));
+                return;
+            }
+
+            if (!detail::ws_validate_101(reply.head, ws_accept_key(m_key))) {
+                SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy backend answered 101 with a mismatched Upgrade/accept (client {})",
+                                      address_string(m_engine->m_transport->peer().address()));
+                close_backend();
+                fail(status::bad_gateway);
+                return;
+            }
+
+            // Forward the backend's negotiated fields into the h2 200, minus the
+            // HTTP/1.1-only / hop-by-hop ones (the h2 client must not see
+            // Upgrade, Connection or Sec-WebSocket-Accept).
+            Headers response_headers;
+            for (const auto &[name, value] : reply.head.headers) {
+                if (is_hop_by_hop_field(name) || name == "sec-websocket-accept" || name == "content-length" ||
+                    name == "transfer-encoding")
+                    continue;
+                if (contains_ctl(name) || contains_ctl(value))
+                    continue;
+                response_headers.add_lower(name, value);
+            }
+            auto self = this->shared_from_this();
+            m_initial = std::move(reply.initial);
+            m_sink->send_headers(status::ok, std::move(response_headers), [self](error_code ec2) mutable {
+                if (ec2) {
+                    self->close_backend();
+                    self->finish();
+                    return;
+                }
+                self->start_tunnel();
+            });
+        }
+
+        void start_tunnel() {
+            touch();
+            arm_timer();
+            // The backend may have sent tunnel bytes in the same read as its
+            // 101; forward them before the first read.
+            if (!m_initial.empty()) {
+                auto initial = std::make_shared<std::string>(std::move(m_initial));
+                auto self = this->shared_from_this();
+                ConstByteSpan one{reinterpret_cast<const std::byte *>(initial->data()), initial->size()};
+                m_engine->ws_stream_write(m_id, boost::span<const ConstByteSpan>{&one, 1},
+                                          [self, initial](error_code ec, std::size_t) mutable {
+                                              if (ec) {
+                                                  self->close_backend();
+                                                  self->finish();
+                                                  return;
+                                              }
+                                              self->touch();
+                                              self->pump_backend_to_client();
+                                              self->pump_client_to_backend();
+                                          });
+                return;
+            }
+            pump_backend_to_client();
+            pump_client_to_backend();
+        }
+
+        void touch() { m_deadline = std::chrono::steady_clock::now() + m_engine->m_limits.idle_timeout; }
+
+        void arm_timer() {
+            if (m_engine->m_limits.idle_timeout.count() <= 0)
+                return;
+            m_timer.expires_at(m_deadline);
+            auto self = this->shared_from_this();
+            m_timer.async_wait([self](error_code ec) {
+                if (!ec)
+                    self->on_idle();
+            });
+        }
+
+        void on_idle() {
+            if (std::chrono::steady_clock::now() < m_deadline) {
+                // touch() does not re-arm: without this the tunnel's idle
+                // timeout disappears after the first tick.
+                arm_timer();
+                return;
+            }
+            SIMPLE_HTTP_ERROR_LOG("h2 ws-proxy tunnel idle (client {})",
+                                  address_string(m_engine->m_transport->peer().address()));
+            close_backend();
+            m_engine->ws_stream_close(m_id);
+        }
+
+        void pump_backend_to_client() {
+            auto buf = std::make_shared<std::array<std::byte, 16384>>();
+            auto self = this->shared_from_this();
+            m_backend->async_read_some(
+                asio::buffer(buf->data(), buf->size()), [self, buf](error_code ec, std::size_t n) mutable {
+                    if (ec || n == 0) {
+                        // The backend is done: end the
+                        // tunnel's read side, which also
+                        // wakes the other direction.
+                        self->m_b2c_done = true;
+                        self->m_engine->ws_stream_close(self->m_id);
+                        self->maybe_finish();
+                        return;
+                    }
+                    self->touch();
+                    ConstByteSpan one{buf->data(), n};
+                    self->m_engine->ws_stream_write(self->m_id, boost::span<const ConstByteSpan>{&one, 1},
+                                                    [self, buf](error_code wec, std::size_t) mutable {
+                                                        if (wec) {
+                                                            self->m_b2c_done = true;
+                                                            self->maybe_finish();
+                                                            return;
+                                                        }
+                                                        self->touch();
+                                                        self->pump_backend_to_client();
+                                                    });
+                });
+        }
+
+        void pump_client_to_backend() {
+            auto buf = std::make_shared<std::array<std::byte, 16384>>();
+            auto self = this->shared_from_this();
+            m_engine->ws_stream_read(m_id, ByteSpan{buf->data(), buf->size()},
+                                     [self, buf](error_code ec, std::size_t n) mutable {
+                                         if (ec || n == 0) {
+                                             // Client half-close (END_STREAM): stop sending to the
+                                             // backend, but leave the opposite direction running so
+                                             // the backend's Close frame still arrives.
+                                             error_code sec;
+                                             self->m_backend->shutdown(asio::ip::tcp::socket::shutdown_send, sec);
+                                             self->m_c2b_done = true;
+                                             self->maybe_finish();
+                                             return;
+                                         }
+                                         self->touch();
+                                         asio::async_write(*self->m_backend, asio::buffer(buf->data(), n),
+                                                           [self, buf](error_code wec, std::size_t) mutable {
+                                                               if (wec) {
+                                                                   self->m_c2b_done = true;
+                                                                   self->maybe_finish();
+                                                                   return;
+                                                               }
+                                                               self->touch();
+                                                               self->pump_client_to_backend();
+                                                           });
+                                     });
+        }
+
+        void maybe_finish() {
+            if (!m_b2c_done || !m_c2b_done || m_finished)
+                return;
+            m_finished = true;
+            m_timer.cancel();
+            finish();
+        }
+
+        void fail(int status_code, Headers headers = {}) {
+            auto self = this->shared_from_this();
+            m_sink->send_bodyless(status_code, std::move(headers), [self](error_code) mutable {
+                self->m_engine->ws_stream_close(self->m_id);
+                self->finish();
+            });
+        }
+
+        void close_backend() {
+            if (m_backend)
+                detail::ws_proxy_close(*m_backend);
+        }
+
+        void finish() {
+            if (m_completed)
+                return;
+            m_completed = true;
+            m_timer.cancel();
+            close_backend();
+            m_engine->ws_stream_close(m_id);
+            m_engine->handler_finished(m_id);
+        }
+
+        std::shared_ptr<Http2Engine> m_engine;
+        std::uint32_t m_id;
+        std::shared_ptr<Request> m_request;
+        std::shared_ptr<Http2ResponseSink<Transport>> m_sink;
+        WsProxyTarget m_target;
+
+        std::shared_ptr<asio::ip::tcp::socket> m_backend;
+        std::string m_key;
+        std::string m_initial;
+        asio::steady_timer m_timer;
+        std::chrono::steady_clock::time_point m_deadline{};
+        bool m_b2c_done{false};
+        bool m_c2b_done{false};
+        bool m_finished{false};
+        bool m_completed{false};
+    };
+
     // --- members (touched only on the connection executor) ---
     std::shared_ptr<Transport> m_transport;
     Executor m_executor;
-    // Thread the connection is bound to (model A). Used to run body-consumption
-    // bookkeeping inline instead of posting it when the reader is already here.
     const std::thread::id m_thread_id{std::this_thread::get_id()};
     asio::experimental::channel<void(error_code)> m_notify;
     EngineLimits m_limits;
     std::chrono::steady_clock::time_point m_deadline{};
+    std::shared_ptr<asio::steady_timer> m_watchdog{std::make_shared<asio::steady_timer>(m_executor)};
+    std::function<void()> m_on_done;
+    bool m_finished{false};
+    bool m_finish_started{false};
+    bool m_write_in_flight{false};
+    bool m_done_called{false};
+    std::array<std::byte, 32 * 1024> m_read_scratch{};
 
     Dispatcher m_dispatch;
     WsLookup m_ws_lookup;            // local exact ws routes (RFC 8441), empty if none
-    WsLookup m_ws_regex_lookup;      // local regex ws routes, empty if none
     WsProxyLookup m_ws_proxy_lookup; // byte-level ws reverse-proxy routes, empty if none
+    WsLookup m_ws_regex_lookup;      // local regex ws routes, empty if none
     codec::HpackDecoder m_decoder;   // connection-scoped (read loop only)
     // Connection-scoped scratch buffers. Every write path already runs on the
     // connection executor (model A), so one buffer each is enough; they keep

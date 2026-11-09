@@ -1,23 +1,22 @@
 #pragma once
 
-// TlsTransport: a TLS byte-stream transport over asio::ssl::stream<Socket>.
+// TlsTransport: a TLS byte-stream transport over asio::ssl::stream<Socket>
+// (C++17 token-only port).
 //
 // Performs the server handshake and exposes the ALPN-negotiated protocol so the
-// connection layer can pick the right engine (h2 vs http/1.1). Satisfies the
-// TransportLike concept.
+// connection layer can pick the right engine (h2 vs http/1.1).
 
 #include <openssl/ssl.h>
 
 #include <algorithm>
 #include <array>
 #include <boost/asio.hpp>
-#include <boost/asio/experimental/awaitable_operators.hpp>
+#include <boost/asio/cancel_after.hpp>
 #include <boost/asio/ssl.hpp>
 #include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <memory>
-#include <span>
 #include <string_view>
 #include <utility>
 
@@ -35,11 +34,9 @@ template <typename Socket> class TlsTransport {
     explicit TlsTransport(std::shared_ptr<Stream> stream, asio::ip::tcp::endpoint peer = {})
         : m_stream(std::move(stream)), m_peer(std::move(peer)) {}
 
-    // Performs the server-side TLS handshake. Must be awaited before I/O.
-    asio::awaitable<error_code> handshake() {
-        auto [ec] =
-            co_await m_stream->async_handshake(asio::ssl::stream_base::server, asio::as_tuple(asio::use_awaitable));
-        co_return ec;
+    // Performs the server-side TLS handshake. Completion: void(error_code).
+    template <typename Token> auto async_handshake(Token &&token) {
+        return m_stream->async_handshake(asio::ssl::stream_base::server, std::forward<Token>(token));
     }
 
     // The ALPN protocol negotiated during the handshake ("h2", "http/1.1", ...),
@@ -51,22 +48,22 @@ template <typename Socket> class TlsTransport {
         return std::string_view{reinterpret_cast<const char *>(proto), len};
     }
 
-    asio::awaitable<IoResult> async_read_some(ByteSpan buffer) {
-        co_return co_await detail::stream_read_some(*m_stream, buffer);
+    template <typename Token> auto async_read_some(ByteSpan buffer, Token &&token) {
+        return detail::async_stream_read_some(*m_stream, buffer, std::forward<Token>(token));
     }
 
-    asio::awaitable<IoResult> async_read(ByteSpan buffer) {
-        co_return co_await detail::stream_read_exact(*m_stream, buffer);
+    template <typename Token> auto async_read(ByteSpan buffer, Token &&token) {
+        return detail::async_stream_read_exact(*m_stream, buffer, std::forward<Token>(token));
     }
 
-    asio::awaitable<IoResult> async_write(ConstByteSpan buffer) {
-        co_return co_await detail::stream_write_all(*m_stream, buffer);
+    template <typename Token> auto async_write(ConstByteSpan buffer, Token &&token) {
+        return detail::async_stream_write_all(*m_stream, buffer, std::forward<Token>(token));
     }
 
     // Writes several buffers as one TLS record batch, so a frame header and its
     // payload need not be concatenated first.
-    asio::awaitable<IoResult> async_write_seq(std::span<const ConstByteSpan> buffers) {
-        co_return co_await detail::stream_write_seq(*m_stream, buffers);
+    template <typename Token> auto async_write_seq(boost::span<const ConstByteSpan> buffers, Token &&token) {
+        return detail::async_stream_write_seq(*m_stream, buffers, std::forward<Token>(token));
     }
 
     auto get_executor() { return m_stream->get_executor(); }
@@ -76,25 +73,18 @@ template <typename Socket> class TlsTransport {
     SslHandle tls_handle() const { return m_stream->native_handle(); }
 
     // Send close_notify before the TCP socket goes away. Without it the peer
-    // sees a bare FIN and reports a truncated TLS stream (Python: SSLEOFError,
-    // OpenSSL: stream_truncated) instead of a clean end of data.
+    // sees a bare FIN and reports a truncated TLS stream instead of a clean end
+    // of data.
     //
     // Bounded because asio's async_shutdown also waits for the peer's
-    // close_notify; a peer that never sends one must not delay teardown.
-    asio::awaitable<void> shutdown(std::chrono::milliseconds limit = std::chrono::milliseconds(250)) {
-        if (!m_stream)
-            co_return;
-        using namespace asio::experimental::awaitable_operators;
-        auto close_notify = [this]() -> asio::awaitable<void> {
-            error_code ec;
-            co_await m_stream->async_shutdown(asio::redirect_error(asio::use_awaitable, ec));
-        };
-        auto deadline = [limit]() -> asio::awaitable<void> {
-            asio::steady_timer timer{co_await asio::this_coro::executor};
-            timer.expires_after(limit);
-            co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
-        };
-        co_await (close_notify() || deadline());
+    // close_notify; cancel_after turns a peer that never sends one into an
+    // operation_aborted rather than a delayed teardown.
+    template <typename Token> auto async_shutdown(std::chrono::milliseconds limit, Token &&token) {
+        return m_stream->async_shutdown(asio::cancel_after(limit, std::forward<Token>(token)));
+    }
+
+    template <typename Token> auto async_shutdown(Token &&token) {
+        return async_shutdown(std::chrono::milliseconds{250}, std::forward<Token>(token));
     }
 
     void close() { shutdown_socket(m_stream->lowest_layer()); }
@@ -110,10 +100,7 @@ template <typename Socket> class TlsTransport {
 using TlsStreamTransport = TlsTransport<asio::ip::tcp::socket>;
 
 // TLS over a TLS connection: the client's origin TLS runs inside the TLS
-// connection it already established to an HTTPS proxy. asio's ssl::stream
-// accepts another ssl::stream as its next layer (both are byte streams), and
-// lowest_layer() still bottoms out at the TCP socket. The outer SSL object is
-// the origin's, so alpn_selected()/tls_handle() report what dial() needs.
+// connection it already established to an HTTPS proxy.
 using NestedTlsTransport = TlsTransport<asio::ssl::stream<asio::ip::tcp::socket>>;
 #ifdef BOOST_ASIO_HAS_LOCAL_SOCKETS
 using TlsUnixTransport = TlsTransport<asio::local::stream_protocol::socket>;

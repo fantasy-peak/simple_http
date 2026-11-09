@@ -25,6 +25,7 @@
 #include <string_view>
 #include <vector>
 
+#include "../core/compat.h"
 #include "../core/http_date.h" // parse_http_date
 #include "../core/http_field.h"
 #include "../core/types.h" // iequals_ci (Domain matching)
@@ -39,7 +40,8 @@ class CookieJar {
     // (Max-Age in the past / a past Expires) are dropped from the jar.
     void store(std::string_view url, const Headers &headers) {
         std::lock_guard<std::mutex> lock(m_mutex);
-        const detail::Url parsed = detail::parse_url(url).value_or(detail::Url{});
+        const auto parsed_result = detail::parse_url(url);
+        const detail::Url parsed = parsed_result ? *parsed_result : detail::Url{};
         if (parsed.host.empty()) {
             return; // no host to scope a cookie to
         }
@@ -79,10 +81,13 @@ class CookieJar {
     // matches. Cookies are joined without regard to duplicate names.
     std::string cookie_header(std::string_view url) const {
         std::lock_guard<std::mutex> lock(m_mutex);
-        const detail::Url parsed = detail::parse_url(url).value_or(detail::Url{});
+        const auto parsed_result = detail::parse_url(url);
+        const detail::Url parsed = parsed_result ? *parsed_result : detail::Url{};
         std::string out;
         for (const auto &cookie : m_cookies) {
-            if (!matches(cookie, parsed)) {
+            // A jar may outlive the cookie's Max-Age/Expires; RFC 6265 §5.4
+            // requires filtering at send time, not only when storing.
+            if (expired(cookie) || !matches(cookie, parsed)) {
                 continue;
             }
             if (!out.empty()) {
@@ -129,7 +134,7 @@ class CookieJar {
         if (domain == "::1" || domain == "[::1]") {
             return true;
         }
-        if (domain.starts_with("127.")) {
+        if (starts_with(domain, "127.")) {
             return true;
         }
         const auto dot = domain.rfind('.');
@@ -171,7 +176,11 @@ class CookieJar {
         if (iequals_ci(host, cookie_domain)) {
             return true;
         }
-        if (host.size() > cookie_domain.size() && host.ends_with(cookie_domain) &&
+        // Domain matching is case-insensitive (RFC 6265 §5.1.3). The exact
+        // branch already uses iequals_ci; the suffix must too, or a host with
+        // any uppercase letter silently rejects every sub-domain cookie.
+        if (host.size() > cookie_domain.size() &&
+            iequals_ci(host.substr(host.size() - cookie_domain.size()), cookie_domain) &&
             host[host.size() - cookie_domain.size() - 1] == '.') {
             return true;
         }
@@ -179,7 +188,7 @@ class CookieJar {
     }
 
     static bool path_matches(std::string_view cookie_path, std::string_view request_path) {
-        if (request_path.starts_with(cookie_path)) {
+        if (starts_with(request_path, cookie_path)) {
             // A cookie Path of "/" matches everything; otherwise the match must
             // end on a segment boundary ("/api" does not match "/apix").
             return cookie_path.size() == 1 /* "/" */ || request_path.size() == cookie_path.size() ||

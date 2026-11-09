@@ -24,7 +24,14 @@
 #include <utility>
 #include <vector>
 
+#include <boost/asio/any_completion_handler.hpp>
+#include <boost/asio/any_completion_handler.hpp>
+#include <boost/asio/associated_cancellation_slot.hpp>
+#include <boost/asio/async_result.hpp>
+#include <boost/asio/bind_cancellation_slot.hpp>
+
 #include "../core/content_encoding.h"
+#include "../core/http_status.h"
 #include "../core/types.h"
 #include "client_config.h"
 #include "client_stream.h"
@@ -50,94 +57,39 @@ struct InjectedAcceptEncoding {
     std::vector<std::string> encodings;
 };
 
-class DecompressingClientStream final : public ClientStream {
+class DecompressingClientStream final : public ClientStream,
+                                         public std::enable_shared_from_this<DecompressingClientStream> {
   public:
-    // `max_decoded_bytes` bounds the *decoded* body. The codec expands a single
-    // wire chunk in one call, so a caller-side cap checked after read() returns
-    // is too late: a few hundred kilobytes of gzip can become gigabytes of
-    // std::string before read() ever hands it over. 0 keeps the old unbounded
-    // behavior for callers that opt out.
     DecompressingClientStream(std::shared_ptr<ClientStream> inner, ResponseDecoding policy,
                               std::size_t max_decoded_bytes = 0)
         : m_inner(std::move(inner)), m_policy(std::move(policy)), m_max_decoded_bytes(max_decoded_bytes) {}
 
-    // --- request side: nothing to decode on the way out ---
-    asio::awaitable<error_code> write(std::string data) override { return m_inner->write(std::move(data)); }
-    asio::awaitable<error_code> finish(std::string data) override { return m_inner->finish(std::move(data)); }
-    asio::awaitable<error_code> finish_trailers(Headers trailers) override {
-        co_return co_await m_inner->finish_trailers(std::move(trailers));
+    void write(std::string data, WriteCompletion done) override { m_inner->write(std::move(data), std::move(done)); }
+    void finish(std::string data, WriteCompletion done) override { m_inner->finish(std::move(data), std::move(done)); }
+    void finish_trailers(Headers trailers, WriteCompletion done) override {
+        m_inner->finish_trailers(std::move(trailers), std::move(done));
     }
+    void cancel(WriteCompletion done) override { m_inner->cancel(std::move(done)); }
 
-    // --- response side ---
-    asio::awaitable<std::expected<ReadResult, error_code>> read() override {
-        // The head is what decides whether there is anything to decode, so it has
-        // to be read before the first body byte goes out. A caller that goes
-        // straight to read()/read_all() - as opposed to the convenience layer,
-        // which reads the head first - would otherwise get the encoded bytes
-        // passed through untouched. read_head() caches, so this costs a check.
-        if (auto head = co_await read_head(); !head) {
-            co_return std::unexpected{head.error()};
-        }
-
-        if (!m_decoder) {
-            co_return co_await m_inner->read();
-        }
-
-        // An eof ReadResult carries no data - the aggregate path drops it - so
-        // anything the decoder still held back goes out as a chunk of its own,
-        // before the end-of-body is reported.
-        if (!m_tail.empty()) {
-            std::string out = std::move(m_tail);
-            m_tail.clear();
-            co_return ReadResult{std::move(out), false};
-        }
-        if (m_inner_eof) {
-            co_return ReadResult{std::string{}, true};
-        }
-
-        for (;;) {
-            auto chunk = co_await m_inner->read();
-            if (!chunk) {
-                co_return std::unexpected{chunk.error()};
+    void read(ReadCompletion done) override {
+        auto completion = std::make_shared<ReadCompletion>(std::move(done));
+        auto self = shared_from_this();
+        // Carry the caller's slot through the internal head read too: the
+        // composed head operation takes its cancellation state from this token,
+        // and await_head() forwards it to the inner stream.
+        auto slot = asio::get_associated_cancellation_slot(*completion);
+        auto handler = [self, completion](error_code hec, ResponseHead) mutable {
+            if (hec) {
+                auto callback = std::move(*completion);
+                std::move(callback)(hec, ReadResult{});
+                return;
             }
-            if (chunk->eof) {
-                m_inner_eof = true;
-                bool limited = false;
-                m_tail = m_decoder->finish_bounded(remaining_decoded_room(), limited);
-                if (limited) {
-                    co_return std::unexpected{make_error_code(client_errc::body_too_large)};
-                }
-                m_decoded_total += m_tail.size();
-                if (m_decoder->failed()) {
-                    // Half a body must not be handed over as if it were whole.
-                    co_return std::unexpected{make_error_code(client_errc::body_decode_failed)};
-                }
-                if (!m_tail.empty()) {
-                    std::string out = std::move(m_tail);
-                    m_tail.clear();
-                    co_return ReadResult{std::move(out), false};
-                }
-                co_return ReadResult{std::string{}, true};
-            }
-            bool limited = false;
-            std::string out = m_decoder->write_bounded(chunk->data, remaining_decoded_room(), limited);
-            if (limited) {
-                // The codec produced more than the configured cap for this
-                // response. Stop before materializing the rest; the stream is
-                // unusable from here, which is exactly what a body-too-large
-                // error means.
-                co_return std::unexpected{make_error_code(client_errc::body_too_large)};
-            }
-            m_decoded_total += out.size();
-            if (m_decoder->failed()) {
-                co_return std::unexpected{make_error_code(client_errc::body_decode_failed)};
-            }
-            if (!out.empty()) {
-                co_return ReadResult{std::move(out), false};
-            }
-            // The codec is buffering; pull again rather than hand the caller an
-            // empty chunk it would have to special-case. The inner read() ends
-            // the loop by reporting eof or an error.
+            self->read_impl(std::move(completion));
+        };
+        if (slot.is_connected()) {
+            async_read_head(asio::bind_cancellation_slot(slot, std::move(handler)));
+        } else {
+            async_read_head(std::move(handler));
         }
     }
 
@@ -147,66 +99,148 @@ class DecompressingClientStream final : public ClientStream {
     }
 
     bool finished() const override { return m_inner->finished(); }
-    // The trailer section is parsed by the inner stream after the body; the
-    // decoder sits between the caller and it, so it must forward them (and the
-    // reverse proxy reads them through this layer).
     [[nodiscard]] const Headers &response_trailers() const noexcept override { return m_inner->response_trailers(); }
     Version version() const override { return m_inner->version(); }
     std::uint32_t id() const override { return m_inner->id(); }
-    asio::awaitable<void> cancel() override { co_return co_await m_inner->cancel(); }
 
-  protected:
-    asio::awaitable<error_code> await_head() override {
-        // The inner await_head() is protected, so go through its public
-        // read_head(); the head is cached, so this stays idempotent.
-        auto head = co_await m_inner->read_head();
-        if (!head) {
-            co_return head.error();
-        }
-        // A HEAD response (and 204/304) may still carry the Content-Encoding a
-        // GET would have used, but there is no body to decode. Installing a
-        // decoder there makes read() call finish() with no input, which every
-        // codec reports as a truncated stream (body_decode_failed).
-        if (!head->bodyless) {
-            const auto values = head->headers.get_all("content-encoding");
-            if (values.size() == 1) {
-                const auto coding = parse_content_coding(values.front());
-                std::string canonical;
-                if (coding == ContentCoding::Gzip) {
-                    canonical = "gzip";
-                } else if (coding == ContentCoding::Brotli) {
-                    canonical = "br";
-                }
-                const bool advertised =
-                    !canonical.empty() && std::find(m_policy.encodings.begin(), m_policy.encodings.end(), canonical) !=
-                                              m_policy.encodings.end();
-                if (advertised) {
-                    m_decoder = make_decoder(canonical);
-                    if (m_decoder) {
-                        head->headers.erase("content-encoding");
-                        head->headers.erase("content-length");
-                        head->uncompressed = true;
+    void await_head(WriteCompletion done) override {
+        auto self = shared_from_this();
+        // The forwarding lambda below has no associators of its own. Preserve
+        // the caller's cancellation slot explicitly, or Stream's head deadline
+        // cannot abort the inner read (and the awaitable hangs forever).
+        auto slot = asio::get_associated_cancellation_slot(done);
+        auto handler = [self, done = std::move(done)](error_code ec, ResponseHead head) mutable {
+            if (ec) {
+                std::move(done)(ec);
+                return;
+            }
+            if (!head.bodyless) {
+                const auto values = head.headers.get_all("content-encoding");
+                if (values.size() == 1) {
+                    const auto coding = parse_content_coding(values.front());
+                    std::string canonical;
+                    if (coding == ContentCoding::Gzip) {
+                        canonical = "gzip";
+                    } else if (coding == ContentCoding::Brotli) {
+                        canonical = "br";
+                    }
+                    const bool advertised = !canonical.empty() &&
+                                            std::find(self->m_policy.encodings.begin(), self->m_policy.encodings.end(),
+                                                      canonical) != self->m_policy.encodings.end();
+                    if (advertised) {
+                        self->m_decoder = make_decoder(canonical);
+                        if (self->m_decoder) {
+                            head.headers.erase("content-encoding");
+                            head.headers.erase("content-length");
+                            head.uncompressed = true;
+                        }
                     }
                 }
-                // Anything we did not advertise (including an explicit
-                // caller-set Accept-Encoding, a multi-coding list, or an
-                // unknown coding) passes through untouched.
             }
+            const bool interim = head.status == status::continue_;
+            self->set_head(std::move(head));
+            if (interim) {
+                self->reset_head();
+            }
+            std::move(done)(error_code{});
+        };
+        if (slot.is_connected()) {
+            m_inner->async_read_head(asio::bind_cancellation_slot(slot, std::move(handler)));
+        } else {
+            m_inner->async_read_head(std::move(handler));
         }
-        const bool interim = head->status == status::continue_;
-        set_head(std::move(*head));
-        if (interim) {
-            // A 100-continue is handed to the caller once, then the final head
-            // follows. The base read_head() returns *m_head immediately, so
-            // publishing it with m_head_ready left false gives the caller the
-            // interim now and re-enters await_head() on the next call. Caching
-            // it would make a read_head() loop spin on 100 forever.
-            reset_head();
-        }
-        co_return error_code{};
     }
 
+    asio::any_io_executor head_executor() const override { return m_inner->head_executor(); }
+
   private:
+    // Forward to the inner stream while preserving the caller's cancellation
+    // slot. A plain lambda would drop it, so Stream's body-idle deadline could
+    // never abort a parked inner read.
+    template <typename Handler> void forward_read(const std::shared_ptr<ReadCompletion> &completion, Handler &&handler) {
+        auto slot = asio::get_associated_cancellation_slot(*completion);
+        if (slot.is_connected()) {
+            m_inner->read(asio::bind_cancellation_slot(slot, std::forward<Handler>(handler)));
+        } else {
+            m_inner->read(std::forward<Handler>(handler));
+        }
+    }
+
+    void read_impl(std::shared_ptr<ReadCompletion> completion) {
+        if (!m_decoder) {
+            forward_read(completion, [completion](error_code ec, ReadResult result) mutable {
+                auto callback = std::move(*completion);
+                std::move(callback)(ec, std::move(result));
+            });
+            return;
+        }
+        if (!m_tail.empty()) {
+            std::string out = std::move(m_tail);
+            m_tail.clear();
+            auto callback = std::move(*completion);
+            std::move(callback)(error_code{}, ReadResult{std::move(out), false});
+            return;
+        }
+        if (m_inner_eof) {
+            auto callback = std::move(*completion);
+            std::move(callback)(error_code{}, ReadResult{std::string{}, true});
+            return;
+        }
+        auto self = shared_from_this();
+        forward_read(completion, [self, completion](error_code ec, ReadResult chunk) mutable {
+            if (ec) {
+                auto callback = std::move(*completion);
+                std::move(callback)(ec, ReadResult{});
+                return;
+            }
+            if (chunk.eof) {
+                self->m_inner_eof = true;
+                bool limited = false;
+                self->m_tail = self->m_decoder->finish_bounded(self->remaining_decoded_room(), limited);
+                if (limited) {
+                    auto callback = std::move(*completion);
+                    std::move(callback)(make_error_code(client_errc::body_too_large), ReadResult{});
+                    return;
+                }
+                self->m_decoded_total += self->m_tail.size();
+                if (self->m_decoder->failed()) {
+                    auto callback = std::move(*completion);
+                    std::move(callback)(make_error_code(client_errc::body_decode_failed), ReadResult{});
+                    return;
+                }
+                if (!self->m_tail.empty()) {
+                    std::string out = std::move(self->m_tail);
+                    self->m_tail.clear();
+                    auto callback = std::move(*completion);
+                    std::move(callback)(error_code{}, ReadResult{std::move(out), false});
+                    return;
+                }
+                auto callback = std::move(*completion);
+                std::move(callback)(error_code{}, ReadResult{std::string{}, true});
+                return;
+            }
+            bool limited = false;
+            std::string out = self->m_decoder->write_bounded(chunk.data, self->remaining_decoded_room(), limited);
+            if (limited) {
+                auto callback = std::move(*completion);
+                std::move(callback)(make_error_code(client_errc::body_too_large), ReadResult{});
+                return;
+            }
+            self->m_decoded_total += out.size();
+            if (self->m_decoder->failed()) {
+                auto callback = std::move(*completion);
+                std::move(callback)(make_error_code(client_errc::body_decode_failed), ReadResult{});
+                return;
+            }
+            if (!out.empty()) {
+                auto callback = std::move(*completion);
+                std::move(callback)(error_code{}, ReadResult{std::move(out), false});
+                return;
+            }
+            self->read_impl(std::move(completion));
+        });
+    }
+
     std::size_t remaining_decoded_room() const {
         if (m_max_decoded_bytes == 0)
             return std::numeric_limits<std::size_t>::max();
@@ -216,8 +250,8 @@ class DecompressingClientStream final : public ClientStream {
     std::shared_ptr<ClientStream> m_inner;
     ResponseDecoding m_policy;
     std::unique_ptr<ContentDecoder> m_decoder;
-    std::string m_tail;      // decoded bytes still owed to the caller
-    bool m_inner_eof{false}; // the inner stream has reported end-of-body
+    std::string m_tail;
+    bool m_inner_eof{false};
     std::size_t m_max_decoded_bytes{0};
     std::size_t m_decoded_total{0};
 };

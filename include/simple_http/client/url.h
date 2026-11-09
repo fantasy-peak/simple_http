@@ -9,8 +9,8 @@
 // sending). Relative or scheme-less input is rejected with client_errc::bad_url
 // rather than guessed at.
 
+#include "../core/result.h"
 #include <cstdint>
-#include <expected>
 #include <string>
 #include <string_view>
 
@@ -96,19 +96,19 @@ inline bool url_valid_port(std::string_view s, std::uint16_t &out) {
 // Parses an absolute http:// or https:// URL. On failure the returned
 // error_code is client_errc::unsupported_scheme (a well-formed URL for another
 // scheme) or client_errc::bad_url.
-inline std::expected<Url, error_code> parse_url(std::string_view url) {
+inline result<Url> parse_url(std::string_view url) {
     // scheme "://"
     const auto sep = url.find("://");
     if (sep == std::string_view::npos || sep == 0) {
-        return std::unexpected{make_error_code(client_errc::bad_url)};
+        return make_error_code(client_errc::bad_url);
     }
     std::string scheme = ascii_lower_copy(url.substr(0, sep));
     for (char c : scheme) {
         if (!detail::url_scheme_char(c))
-            return std::unexpected{make_error_code(client_errc::bad_url)};
+            return make_error_code(client_errc::bad_url);
     }
     if (scheme != "http" && scheme != "https") {
-        return std::unexpected{make_error_code(client_errc::unsupported_scheme)};
+        return make_error_code(client_errc::unsupported_scheme);
     }
 
     std::string_view rest = url.substr(sep + 3);
@@ -123,7 +123,7 @@ inline std::expected<Url, error_code> parse_url(std::string_view url) {
         authority = authority.substr(at + 1);
     }
     if (authority.empty()) {
-        return std::unexpected{make_error_code(client_errc::bad_url)};
+        return make_error_code(client_errc::bad_url);
     }
 
     Url out;
@@ -135,28 +135,32 @@ inline std::expected<Url, error_code> parse_url(std::string_view url) {
         // bracket, so the host may keep its own colons.
         auto close = authority.find(']');
         if (close == std::string_view::npos)
-            return std::unexpected{make_error_code(client_errc::bad_url)};
+            return make_error_code(client_errc::bad_url);
         out.host = std::string{authority.substr(1, close - 1)};
         std::string_view after = authority.substr(close + 1);
         if (!after.empty()) {
             if (after.front() != ':')
-                return std::unexpected{make_error_code(client_errc::bad_url)};
+                return make_error_code(client_errc::bad_url);
             port_str = after.substr(1);
         }
         if (out.host.empty())
-            return std::unexpected{make_error_code(client_errc::bad_url)};
+            return make_error_code(client_errc::bad_url);
     } else if (auto colon = authority.rfind(':'); colon != std::string_view::npos) {
         out.host = std::string{authority.substr(0, colon)};
+        // A non-bracketed IPv6 literal ("fe80::1") is split at its last colon
+        // into host "fe80:" and port "1". RFC 3986 §3.2.2 requires brackets.
+        if (out.host.find(':') != std::string::npos)
+            return make_error_code(client_errc::bad_url);
         port_str = authority.substr(colon + 1);
     } else {
         out.host = std::string{authority};
     }
     if (out.host.empty()) {
-        return std::unexpected{make_error_code(client_errc::bad_url)};
+        return make_error_code(client_errc::bad_url);
     }
     if (!port_str.empty() || authority.back() == ':') {
         if (!detail::url_valid_port(port_str, out.port)) {
-            return std::unexpected{make_error_code(client_errc::bad_url)};
+            return make_error_code(client_errc::bad_url);
         }
     }
 
@@ -175,7 +179,7 @@ inline std::expected<Url, error_code> parse_url(std::string_view url) {
     // Reject control bytes outright: they would be spliced into a request line
     // or header downstream, which can split the message in two.
     if (contains_ctl(out.host) || contains_ctl(out.target)) {
-        return std::unexpected{make_error_code(client_errc::bad_url)};
+        return make_error_code(client_errc::bad_url);
     }
     return out;
 }

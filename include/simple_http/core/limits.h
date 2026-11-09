@@ -10,7 +10,6 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <format>
 #include <string>
 
 #include "compression.h"
@@ -137,7 +136,7 @@ struct EngineLimits {
     [[nodiscard]] std::string render_alt_svc(std::uint16_t quic_port) const {
         if (!h3_alt_svc || quic_port == 0)
             return {};
-        return std::format("h3=\":{}\"; ma={}", quic_port, h3_alt_svc_max_age);
+        return "h3=\":" + std::to_string(quic_port) + "\"; ma=" + std::to_string(h3_alt_svc_max_age);
     }
 
     // The rendered field, written verbatim into every HTTP/1.x and HTTP/2

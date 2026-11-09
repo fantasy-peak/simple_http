@@ -1,30 +1,38 @@
 #pragma once
 
-// Outbound proxy support for the client layer: proxy-URL parsing, selection
-// from explicit configuration or the environment (HTTP_PROXY / HTTPS_PROXY /
-// ALL_PROXY / NO_PROXY), and the two tunnel handshakes.
+// Outbound proxy support for the client layer (C++17 token-only port):
+// proxy-URL parsing, selection from explicit configuration or the environment
+// (HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / NO_PROXY), and the two tunnel
+// handshakes.
 //
 // The handshakes are templated on an Asio byte stream (a tcp::socket, or an
 // ssl::stream<tcp::socket> when the proxy itself speaks TLS), so the engine
 // runs them on the proxy leg before the target's own TLS starts. Nothing here
 // owns a transport: the caller keeps the socket and wraps it afterwards.
+//
+// Every asynchronous helper is an Asio initiation taking an explicit token:
+//   async_proxy_write(stream, data, token)      -> void(error_code)
+//   async_http_connect(stream, proxy, auth, token) -> void(error_code)
+//   async_socks5_connect(stream, proxy, host, port, token) -> void(error_code)
 
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstddef>
 #include <cstdlib>
-#include <expected>
 #include <optional>
-#include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <boost/asio.hpp>
 
 #include "../core/base64.h"
+#include "../core/compat.h"
+#include "../core/http_status.h"
 #include "../core/logging.h"
+#include "../core/result.h"
 #include "../core/types.h"
 #include "../transport/transport.h"
 #include "client_config.h"
@@ -104,13 +112,13 @@ inline bool valid_proxy_host(std::string_view host) {
 // like curl: proxies are addressed by authority only. Any malformed input is
 // client_errc::proxy_error - the caller must fail closed rather than fall back
 // to a direct connection.
-inline std::expected<ProxyConfig, error_code> parse_proxy_url(std::string_view raw) {
+inline result<ProxyConfig> parse_proxy_url(std::string_view raw) {
     while (!raw.empty() && std::isspace(static_cast<unsigned char>(raw.front())))
         raw.remove_prefix(1);
     while (!raw.empty() && std::isspace(static_cast<unsigned char>(raw.back())))
         raw.remove_suffix(1);
     if (raw.empty())
-        return std::unexpected{make_error_code(client_errc::proxy_error)};
+        return result<ProxyConfig>(make_error_code(client_errc::proxy_error));
 
     std::string_view scheme = "http";
     std::string_view rest = raw;
@@ -129,13 +137,13 @@ inline std::expected<ProxyConfig, error_code> parse_proxy_url(std::string_view r
         // deliberately performs no DNS lookup for a proxied target.
         out.kind = ProxyKind::Socks5;
     } else {
-        return std::unexpected{make_error_code(client_errc::proxy_error)};
+        return result<ProxyConfig>(make_error_code(client_errc::proxy_error));
     }
 
     if (auto end = rest.find_first_of("/?#"); end != std::string_view::npos)
         rest = rest.substr(0, end);
     if (rest.empty())
-        return std::unexpected{make_error_code(client_errc::proxy_error)};
+        return result<ProxyConfig>(make_error_code(client_errc::proxy_error));
 
     std::string_view userinfo;
     if (auto at = rest.rfind('@'); at != std::string_view::npos) {
@@ -143,18 +151,18 @@ inline std::expected<ProxyConfig, error_code> parse_proxy_url(std::string_view r
         rest = rest.substr(at + 1);
     }
     if (rest.empty())
-        return std::unexpected{make_error_code(client_errc::proxy_error)};
+        return result<ProxyConfig>(make_error_code(client_errc::proxy_error));
 
     std::string_view port_str;
     if (rest.front() == '[') {
         const auto close = rest.find(']');
         if (close == std::string_view::npos)
-            return std::unexpected{make_error_code(client_errc::proxy_error)};
+            return result<ProxyConfig>(make_error_code(client_errc::proxy_error));
         out.host = std::string{rest.substr(1, close - 1)};
         std::string_view after = rest.substr(close + 1);
         if (!after.empty()) {
             if (after.front() != ':')
-                return std::unexpected{make_error_code(client_errc::proxy_error)};
+                return result<ProxyConfig>(make_error_code(client_errc::proxy_error));
             port_str = after.substr(1);
         }
     } else if (auto colon = rest.rfind(':'); colon != std::string_view::npos) {
@@ -164,10 +172,10 @@ inline std::expected<ProxyConfig, error_code> parse_proxy_url(std::string_view r
         out.host = std::string{rest};
     }
     if (!valid_proxy_host(out.host))
-        return std::unexpected{make_error_code(client_errc::proxy_error)};
+        return result<ProxyConfig>(make_error_code(client_errc::proxy_error));
     if (!port_str.empty() || rest.back() == ':') {
         if (!url_valid_port(port_str, out.port))
-            return std::unexpected{make_error_code(client_errc::proxy_error)};
+            return result<ProxyConfig>(make_error_code(client_errc::proxy_error));
     }
 
     if (!userinfo.empty()) {
@@ -175,19 +183,19 @@ inline std::expected<ProxyConfig, error_code> parse_proxy_url(std::string_view r
         const std::string_view user = colon == std::string_view::npos ? userinfo : userinfo.substr(0, colon);
         const std::string_view pass = colon == std::string_view::npos ? std::string_view{} : userinfo.substr(colon + 1);
         if (!percent_decode(user, out.username) || !percent_decode(pass, out.password))
-            return std::unexpected{make_error_code(client_errc::proxy_error)};
+            return result<ProxyConfig>(make_error_code(client_errc::proxy_error));
         // The header is `Basic base64(user ":" password)`, so a colon in the
         // user part cannot be represented and would silently authenticate as a
         // different identity.
         if (out.username.find(':') != std::string::npos || contains_ctl(out.username) || contains_ctl(out.password))
-            return std::unexpected{make_error_code(client_errc::proxy_error)};
+            return result<ProxyConfig>(make_error_code(client_errc::proxy_error));
     }
     return out;
 }
 
-inline std::expected<void, error_code> validate_proxy(const ProxyConfig &proxy) {
+inline result<void> validate_proxy(const ProxyConfig &proxy) {
     if (!valid_proxy_host(proxy.host))
-        return std::unexpected{make_error_code(client_errc::proxy_error)};
+        return result<void>(make_error_code(client_errc::proxy_error));
     return {};
 }
 
@@ -363,14 +371,14 @@ struct ProxyEnvironment {
 // evaluated first: ClientConfig::no_proxy always applies; the environment's
 // NO_PROXY is used only for environment-selected proxies and only when the
 // config list is empty.
-inline std::expected<std::optional<ProxyConfig>, error_code>
-select_proxy(const ClientConfig &config, const ClientTarget &target, const ProxyEnvironment &env) {
+inline result<std::optional<ProxyConfig>> select_proxy(const ClientConfig &config, const ClientTarget &target,
+                                                       const ProxyEnvironment &env) {
     const auto config_rules = parse_no_proxy(config.no_proxy);
     if (config.proxy) {
         if (!config_rules.empty() && no_proxy_matches(config_rules, target.host, target.effective_port()))
             return std::optional<ProxyConfig>{};
         if (auto ok = validate_proxy(*config.proxy); !ok)
-            return std::unexpected{ok.error()};
+            return result<std::optional<ProxyConfig>>(ok.error());
         return std::optional<ProxyConfig>{*config.proxy};
     }
     if (!config.proxy_from_env)
@@ -388,27 +396,63 @@ select_proxy(const ClientConfig &config, const ClientTarget &target, const Proxy
         return std::optional<ProxyConfig>{};
     auto parsed = parse_proxy_url(chosen);
     if (!parsed)
-        return std::unexpected{parsed.error()};
+        return result<std::optional<ProxyConfig>>(parsed.error());
     return std::optional<ProxyConfig>{std::move(*parsed)};
 }
 
-inline std::expected<std::optional<ProxyConfig>, error_code> select_proxy(const ClientConfig &config,
-                                                                          const ClientTarget &target) {
+inline result<std::optional<ProxyConfig>> select_proxy(const ClientConfig &config, const ClientTarget &target) {
     return select_proxy(config, target, ProxyEnvironment::from_environment());
 }
 
 // --- tunnel handshakes -------------------------------------------------------
 
-template <typename Stream> asio::awaitable<error_code> proxy_write(Stream &stream, std::string_view data) {
-    auto [ec, n] = co_await stream_write_all(stream, std::as_bytes(std::span<const char>{data.data(), data.size()}));
-    (void)n;
-    co_return ec;
+template <typename Stream> struct ProxyWriteOp {
+    Stream &stream;
+    // Heap-owned: passing std::move(self) moves the composed operation, and a
+    // small string (SSO) moved between copies would leave the async write
+    // pointing into the moved-from object's inline buffer.
+    std::shared_ptr<std::string> data;
+    bool started{false};
+
+    asio::any_io_executor get_executor() const noexcept { return stream.get_executor(); }
+
+    template <typename Self> void operator()(Self &self, error_code ec = {}, std::size_t = 0) {
+        if (!started) {
+            started = true;
+            async_stream_write_all(stream,
+                                   ConstByteSpan{reinterpret_cast<const std::byte *>(data->data()), data->size()},
+                                   std::move(self));
+            return;
+        }
+        self.complete(ec);
+    }
+};
+
+template <typename Stream, typename Token> auto async_proxy_write(Stream &stream, std::string data, Token &&token) {
+    return asio::async_compose<Token, void(error_code)>(
+        ProxyWriteOp<Stream>{stream, std::make_shared<std::string>(std::move(data))}, token, stream.get_executor());
 }
 
-template <typename Stream> asio::awaitable<error_code> proxy_read_exact(Stream &stream, std::span<std::byte> buf) {
-    auto [ec, n] = co_await stream_read_exact(stream, buf);
-    (void)n;
-    co_return ec;
+template <typename Stream> struct ProxyReadExactOp {
+    Stream &stream;
+    ByteSpan buffer;
+    bool started{false};
+
+    asio::any_io_executor get_executor() const noexcept { return stream.get_executor(); }
+
+    template <typename Self> void operator()(Self &self, error_code ec = {}, std::size_t = 0) {
+        if (!started) {
+            started = true;
+            async_stream_read_exact(stream, buffer, std::move(self));
+            return;
+        }
+        self.complete(ec);
+    }
+};
+
+template <typename Stream, typename Token> auto async_proxy_read_exact(Stream &stream, ByteSpan buffer, Token &&token) {
+    return asio::async_compose<Token, void(error_code)>(ProxyReadExactOp<Stream>{stream, buffer}, token,
+                                                        stream.get_executor());
 }
 
 inline std::string build_connect_request(const ProxyConfig &proxy, std::string_view authority) {
@@ -432,88 +476,151 @@ inline std::string build_connect_request(const ProxyConfig &proxy, std::string_v
 }
 
 // Parses the status code of one response head ("HTTP/1.x NNN ...").
-inline std::expected<int, error_code> parse_connect_status(std::string_view head) {
+inline result<int> parse_connect_status(std::string_view head) {
     const auto eol = head.find("\r\n");
     if (eol == std::string_view::npos)
-        return std::unexpected{make_error_code(client_errc::proxy_error)};
+        return result<int>(make_error_code(client_errc::proxy_error));
     const std::string_view line = head.substr(0, eol);
-    if (!line.starts_with("HTTP/"))
-        return std::unexpected{make_error_code(client_errc::proxy_error)};
+    if (line.size() < 5 || line.substr(0, 5) != "HTTP/")
+        return result<int>(make_error_code(client_errc::proxy_error));
     const auto space = line.find(' ');
     if (space == std::string_view::npos || line.size() < space + 4)
-        return std::unexpected{make_error_code(client_errc::proxy_error)};
+        return result<int>(make_error_code(client_errc::proxy_error));
     int status = 0;
     for (std::size_t i = 1; i <= 3; ++i) {
         const char c = line[space + i];
         if (c < '0' || c > '9')
-            return std::unexpected{make_error_code(client_errc::proxy_error)};
+            return result<int>(make_error_code(client_errc::proxy_error));
         status = status * 10 + (c - '0');
     }
     if (line.size() > space + 4 && line[space + 4] != ' ')
-        return std::unexpected{make_error_code(client_errc::proxy_error)};
+        return result<int>(make_error_code(client_errc::proxy_error));
     return status;
 }
 
 // Reads response heads one byte at a time, so the first tunnel byte after the
 // CONNECT response is never swallowed. A proxy head is tiny (typically < 100
-// bytes) and this runs once per connection.
-template <typename Stream>
-asio::awaitable<std::expected<std::string, error_code>> read_http_head(Stream &stream, std::size_t cap) {
+// bytes) and this runs once per connection. Completion: void(error_code,
+// std::string); the string is only meaningful when the error is empty.
+template <typename Stream> struct ReadHttpHeadOp {
+    Stream &stream;
+    std::size_t cap;
     std::string head;
-    std::array<std::byte, 1> byte{};
-    for (;;) {
-        auto [ec, n] = co_await stream_read_some(stream, std::span<std::byte>{byte});
-        if (ec)
-            co_return std::unexpected{ec};
-        if (n == 0)
-            co_return std::unexpected{make_error_code(client_errc::proxy_error)};
-        head.push_back(static_cast<char>(byte[0]));
-        if (head.size() > cap)
-            co_return std::unexpected{make_error_code(client_errc::proxy_error)};
-        if (head.size() >= 4 && head.compare(head.size() - 4, 4, "\r\n\r\n") == 0)
-            co_return head;
+    // Shared, not a member array: passing std::move(self) to the read moves the
+    // composed operation, and a buffer pointing into a moved-from member array
+    // would never receive the bytes (the live copy has a different array).
+    std::shared_ptr<std::array<std::byte, 1>> byte{std::make_shared<std::array<std::byte, 1>>()};
+    bool started{false};
+
+    asio::any_io_executor get_executor() const noexcept { return stream.get_executor(); }
+
+    template <typename Self> void operator()(Self &self, error_code ec = {}, std::size_t n = 0) {
+        if (!started) {
+            started = true;
+            async_stream_read_some(stream, ByteSpan{byte->data(), byte->size()}, std::move(self));
+            return;
+        }
+        if (ec) {
+            self.complete(ec, std::string{});
+            return;
+        }
+        if (n == 0) {
+            self.complete(make_error_code(client_errc::proxy_error), std::string{});
+            return;
+        }
+        head.push_back(static_cast<char>((*byte)[0]));
+        if (head.size() > cap) {
+            self.complete(make_error_code(client_errc::proxy_error), std::string{});
+            return;
+        }
+        if (head.size() >= 4 && head.compare(head.size() - 4, 4, "\r\n\r\n") == 0) {
+            self.complete(error_code{}, head);
+            return;
+        }
+        async_stream_read_some(stream, ByteSpan{byte->data(), byte->size()}, std::move(self));
     }
+};
+
+template <typename Stream, typename Token> auto async_read_http_head(Stream &stream, std::size_t cap, Token &&token) {
+    return asio::async_compose<Token, void(error_code, std::string)>(ReadHttpHeadOp<Stream>{stream, cap}, token,
+                                                                     stream.get_executor());
 }
 
 // Establishes a CONNECT tunnel to `target_authority` over `stream` (plaintext or
 // TLS to the proxy). 2xx succeeds; 407 is proxy_auth_failed; anything else is
 // proxy_error. Interim 1xx heads are skipped.
 //
-// The authority is taken by value: a coroutine copies its parameters into the
-// frame only when it is *created*, but the frame may not be awaited until after
-// the caller's full-expression ends - a string_view into a temporary
-// target.authority() would already be dangling there (measured: a truncated
-// authority produced a malformed CONNECT).
-template <typename Stream>
-asio::awaitable<error_code> http_connect(Stream &stream, const ProxyConfig &proxy, std::string target_authority) {
-    if (target_authority.empty() || contains_ctl(target_authority))
-        co_return make_error_code(client_errc::proxy_error);
-    if (auto ec = co_await proxy_write(stream, build_connect_request(proxy, target_authority)); ec) {
-        SIMPLE_HTTP_ERROR_LOG("client proxy: CONNECT write failed: {}", ec.message());
-        co_return ec;
+// The authority is kept by value: the operation is started immediately, but the
+// caller's temporary that produced the authority may be gone by the first
+// asynchronous step, and a string_view into it would dangle.
+template <typename Stream> struct HttpConnectOp {
+    Stream &stream;
+    ProxyConfig proxy;
+    std::string authority;
+    int stage{0};
+
+    asio::any_io_executor get_executor() const noexcept { return stream.get_executor(); }
+
+    template <typename Self> void operator()(Self &self, error_code ec = {}, std::string head = {}) {
+        switch (stage) {
+        case 0:
+            if (authority.empty() || contains_ctl(authority)) {
+                self.complete(make_error_code(client_errc::proxy_error));
+                return;
+            }
+            stage = 1;
+            async_proxy_write(stream, build_connect_request(proxy, authority), std::move(self));
+            return;
+        case 1:
+            if (ec) {
+                SIMPLE_HTTP_ERROR_LOG("client proxy: CONNECT write failed: {}", ec.message());
+                self.complete(ec);
+                return;
+            }
+            stage = 2;
+            async_read_http_head(stream, 16 * 1024, std::move(self));
+            return;
+        case 2: {
+            if (ec) {
+                SIMPLE_HTTP_ERROR_LOG("client proxy: CONNECT response read failed: {}", ec.message());
+                self.complete(ec);
+                return;
+            }
+            auto status = parse_connect_status(head);
+            if (!status) {
+                SIMPLE_HTTP_ERROR_LOG("client proxy: malformed CONNECT response");
+                self.complete(status.error());
+                return;
+            }
+            if (*status >= 100 && *status < 200) {
+                stage = 2;
+                async_read_http_head(stream, 16 * 1024, std::move(self));
+                return;
+            }
+            if (*status >= 200 && *status < 300) {
+                self.complete(error_code{});
+                return;
+            }
+            if (*status == status::proxy_authentication_required) {
+                SIMPLE_HTTP_ERROR_LOG("client proxy: CONNECT {} answered 407", authority);
+                self.complete(make_error_code(client_errc::proxy_auth_failed));
+                return;
+            }
+            SIMPLE_HTTP_ERROR_LOG("client proxy: CONNECT {} answered {}", authority, *status);
+            self.complete(make_error_code(client_errc::proxy_error));
+            return;
+        }
+        default:
+            self.complete(make_error_code(client_errc::proxy_error));
+            return;
+        }
     }
-    for (;;) {
-        auto head = co_await read_http_head(stream, 16 * 1024);
-        if (!head) {
-            SIMPLE_HTTP_ERROR_LOG("client proxy: CONNECT response read failed: {}", head.error().message());
-            co_return head.error();
-        }
-        auto status = parse_connect_status(*head);
-        if (!status) {
-            SIMPLE_HTTP_ERROR_LOG("client proxy: malformed CONNECT response: {}", head->substr(0, 120));
-            co_return status.error();
-        }
-        if (*status >= 100 && *status < 200)
-            continue; // interim response; the real one follows
-        if (*status >= 200 && *status < 300)
-            co_return error_code{};
-        if (*status == status::proxy_authentication_required) {
-            SIMPLE_HTTP_ERROR_LOG("client proxy: CONNECT {} answered 407", target_authority);
-            co_return make_error_code(client_errc::proxy_auth_failed);
-        }
-        SIMPLE_HTTP_ERROR_LOG("client proxy: CONNECT {} answered {}", target_authority, *status);
-        co_return make_error_code(client_errc::proxy_error);
-    }
+};
+
+template <typename Stream, typename Token>
+auto async_http_connect(Stream &stream, ProxyConfig proxy, std::string target_authority, Token &&token) {
+    return asio::async_compose<Token, void(error_code)>(
+        HttpConnectOp<Stream>{stream, std::move(proxy), std::move(target_authority)}, token, stream.get_executor());
 }
 
 inline void append_u16_be(std::string &out, std::uint16_t value) {
@@ -524,112 +631,215 @@ inline void append_u16_be(std::string &out, std::uint16_t value) {
 // SOCKS5 CONNECT (RFC 1928) with the optional username/password method
 // (RFC 1929). The target is always handed over as written: a name goes out as
 // ATYP=3 (the proxy resolves it), an IP literal as ATYP=1/4.
-template <typename Stream>
-asio::awaitable<error_code> socks5_connect(Stream &stream, const ProxyConfig &proxy, std::string host,
-                                           std::uint16_t port) {
-    const bool use_auth = !proxy.username.empty();
-    if (proxy.username.size() > 255 || proxy.password.size() > 255)
-        co_return make_error_code(client_errc::proxy_auth_failed);
+template <typename Stream> struct Socks5ConnectOp {
+    Stream &stream;
+    ProxyConfig proxy;
+    std::string host;
+    std::uint16_t port{0};
 
-    std::string greeting;
-    greeting.push_back(0x05);
-    greeting.push_back(static_cast<char>(use_auth ? 2 : 1));
-    greeting.push_back(0x00);
-    if (use_auth)
-        greeting.push_back(0x02);
-    if (auto ec = co_await proxy_write(stream, greeting); ec)
-        co_return ec;
-
-    std::array<std::byte, 2> selection{};
-    if (auto ec = co_await proxy_read_exact(stream, selection); ec)
-        co_return ec;
-    if (static_cast<unsigned char>(selection[0]) != 0x05)
-        co_return make_error_code(client_errc::proxy_error);
-    const auto method = static_cast<unsigned char>(selection[1]);
-    if (method == 0xFF)
-        co_return make_error_code(client_errc::proxy_auth_failed);
-    if (method == 0x02) {
-        if (!use_auth)
-            co_return make_error_code(client_errc::proxy_auth_failed);
-        std::string auth;
-        auth.push_back(0x01);
-        auth.push_back(static_cast<char>(proxy.username.size()));
-        auth += proxy.username;
-        auth.push_back(static_cast<char>(proxy.password.size()));
-        auth += proxy.password;
-        if (auto ec = co_await proxy_write(stream, auth); ec)
-            co_return ec;
-        std::array<std::byte, 2> reply{};
-        if (auto ec = co_await proxy_read_exact(stream, reply); ec)
-            co_return ec;
-        if (static_cast<unsigned char>(reply[0]) != 0x01)
-            co_return make_error_code(client_errc::proxy_error);
-        if (static_cast<unsigned char>(reply[1]) != 0x00) {
-            SIMPLE_HTTP_ERROR_LOG("client proxy: SOCKS5 authentication rejected");
-            co_return make_error_code(client_errc::proxy_auth_failed);
-        }
-    } else if (method != 0x00) {
-        co_return make_error_code(client_errc::proxy_error); // a method we never offered
-    }
-
+    int stage{0};
     std::string request;
-    request.push_back(0x05); // version
-    request.push_back(0x01); // CONNECT
-    request.push_back(0x00); // reserved
-    error_code addr_ec;
-    const auto addr = asio::ip::make_address(std::string{host}, addr_ec);
-    if (!addr_ec && addr.is_v4()) {
-        request.push_back(0x01);
-        const auto bytes = addr.to_v4().to_bytes();
-        request.append(reinterpret_cast<const char *>(bytes.data()), bytes.size());
-    } else if (!addr_ec && addr.is_v6()) {
-        request.push_back(0x04);
-        const auto bytes = addr.to_v6().to_bytes();
-        request.append(reinterpret_cast<const char *>(bytes.data()), bytes.size());
-    } else {
-        if (host.empty() || host.size() > 255 || contains_ctl(host))
-            co_return make_error_code(client_errc::proxy_error);
-        request.push_back(0x03);
-        request.push_back(static_cast<char>(host.size()));
-        request.append(host);
-    }
-    append_u16_be(request, port);
-    if (auto ec = co_await proxy_write(stream, request); ec)
-        co_return ec;
+    // Heap-owned: see ReadHttpHeadOp -- the operation is moved between steps.
+    std::shared_ptr<std::array<std::byte, 2>> two{std::make_shared<std::array<std::byte, 2>>()};
+    std::shared_ptr<std::array<std::byte, 4>> four{std::make_shared<std::array<std::byte, 4>>()};
+    std::shared_ptr<std::array<std::byte, 1>> one{std::make_shared<std::array<std::byte, 1>>()};
+    std::shared_ptr<std::vector<std::byte>> discard;
 
-    std::array<std::byte, 4> reply{};
-    if (auto ec = co_await proxy_read_exact(stream, reply); ec)
-        co_return ec;
-    if (static_cast<unsigned char>(reply[0]) != 0x05)
-        co_return make_error_code(client_errc::proxy_error);
-    const auto rep = static_cast<unsigned char>(reply[1]);
-    const auto atyp = static_cast<unsigned char>(reply[3]);
-    if (rep != 0x00) {
-        SIMPLE_HTTP_ERROR_LOG("client proxy: SOCKS5 CONNECT {}:{} rejected (rep={})", host, port,
-                              static_cast<unsigned>(rep));
-        co_return make_error_code(client_errc::proxy_error);
+    asio::any_io_executor get_executor() const noexcept { return stream.get_executor(); }
+
+    // Builds the CONNECT request; returns false when the target name cannot be
+    // encoded (empty / too long / control bytes).
+    bool build_request() {
+        request.clear();
+        request.push_back(0x05); // version
+        request.push_back(0x01); // CONNECT
+        request.push_back(0x00); // reserved
+        error_code addr_ec;
+        const auto addr = asio::ip::make_address(std::string{host}, addr_ec);
+        if (!addr_ec && addr.is_v4()) {
+            request.push_back(0x01);
+            const auto bytes = addr.to_v4().to_bytes();
+            request.append(reinterpret_cast<const char *>(bytes.data()), bytes.size());
+        } else if (!addr_ec && addr.is_v6()) {
+            request.push_back(0x04);
+            const auto bytes = addr.to_v6().to_bytes();
+            request.append(reinterpret_cast<const char *>(bytes.data()), bytes.size());
+        } else {
+            if (host.empty() || host.size() > 255 || contains_ctl(host))
+                return false;
+            request.push_back(0x03);
+            request.push_back(static_cast<char>(host.size()));
+            request.append(host);
+        }
+        append_u16_be(request, port);
+        return true;
     }
-    // Consume the bound address + port so the stream is positioned at the
-    // tunnel's first byte. The reply's own ATYP decides its length.
-    std::size_t address_len = 0;
-    if (atyp == 0x01) {
-        address_len = 4;
-    } else if (atyp == 0x04) {
-        address_len = 16;
-    } else if (atyp == 0x03) {
-        std::array<std::byte, 1> len{};
-        if (auto ec = co_await proxy_read_exact(stream, len); ec)
-            co_return ec;
-        address_len = static_cast<unsigned char>(len[0]);
-    } else {
-        co_return make_error_code(client_errc::proxy_error);
+
+    template <typename Self> void operator()(Self &self, error_code ec = {}, std::size_t = 0) {
+        const bool use_auth = !proxy.username.empty();
+        switch (stage) {
+        case 0: {
+            if (proxy.username.size() > 255 || proxy.password.size() > 255) {
+                self.complete(make_error_code(client_errc::proxy_auth_failed));
+                return;
+            }
+            std::string greeting;
+            greeting.push_back(0x05);
+            greeting.push_back(static_cast<char>(use_auth ? 2 : 1));
+            greeting.push_back(0x00);
+            if (use_auth)
+                greeting.push_back(0x02);
+            stage = 1;
+            async_proxy_write(stream, std::move(greeting), std::move(self));
+            return;
+        }
+        case 1:
+            if (ec) {
+                self.complete(ec);
+                return;
+            }
+            stage = 2;
+            async_proxy_read_exact(stream, ByteSpan{two->data(), two->size()}, std::move(self));
+            return;
+        case 2: {
+            if (ec) {
+                self.complete(ec);
+                return;
+            }
+            if (static_cast<unsigned char>((*two)[0]) != 0x05) {
+                self.complete(make_error_code(client_errc::proxy_error));
+                return;
+            }
+            const auto method = static_cast<unsigned char>((*two)[1]);
+            if (method == 0xFF) {
+                self.complete(make_error_code(client_errc::proxy_auth_failed));
+                return;
+            }
+            if (method == 0x02) {
+                if (!use_auth) {
+                    self.complete(make_error_code(client_errc::proxy_auth_failed));
+                    return;
+                }
+                std::string auth;
+                auth.push_back(0x01);
+                auth.push_back(static_cast<char>(proxy.username.size()));
+                auth += proxy.username;
+                auth.push_back(static_cast<char>(proxy.password.size()));
+                auth += proxy.password;
+                stage = 3;
+                async_proxy_write(stream, std::move(auth), std::move(self));
+                return;
+            }
+            if (method != 0x00) {
+                self.complete(make_error_code(client_errc::proxy_error)); // a method we never offered
+                return;
+            }
+            if (!build_request()) {
+                self.complete(make_error_code(client_errc::proxy_error));
+                return;
+            }
+            stage = 5;
+            async_proxy_write(stream, std::move(request), std::move(self));
+            return;
+        }
+        case 3:
+            if (ec) {
+                self.complete(ec);
+                return;
+            }
+            stage = 4;
+            async_proxy_read_exact(stream, ByteSpan{two->data(), two->size()}, std::move(self));
+            return;
+        case 4:
+            if (ec) {
+                self.complete(ec);
+                return;
+            }
+            if (static_cast<unsigned char>((*two)[0]) != 0x01) {
+                self.complete(make_error_code(client_errc::proxy_error));
+                return;
+            }
+            if (static_cast<unsigned char>((*two)[1]) != 0x00) {
+                SIMPLE_HTTP_ERROR_LOG("client proxy: SOCKS5 authentication rejected");
+                self.complete(make_error_code(client_errc::proxy_auth_failed));
+                return;
+            }
+            if (!build_request()) {
+                self.complete(make_error_code(client_errc::proxy_error));
+                return;
+            }
+            stage = 5;
+            async_proxy_write(stream, std::move(request), std::move(self));
+            return;
+        case 5:
+            if (ec) {
+                self.complete(ec);
+                return;
+            }
+            stage = 6;
+            async_proxy_read_exact(stream, ByteSpan{four->data(), four->size()}, std::move(self));
+            return;
+        case 6: {
+            if (ec) {
+                self.complete(ec);
+                return;
+            }
+            if (static_cast<unsigned char>((*four)[0]) != 0x05) {
+                self.complete(make_error_code(client_errc::proxy_error));
+                return;
+            }
+            const auto rep = static_cast<unsigned char>((*four)[1]);
+            const auto atyp = static_cast<unsigned char>((*four)[3]);
+            if (rep != 0x00) {
+                SIMPLE_HTTP_ERROR_LOG("client proxy: SOCKS5 CONNECT {}:{} rejected (rep={})", host, port,
+                                      static_cast<unsigned>(rep));
+                self.complete(make_error_code(client_errc::proxy_error));
+                return;
+            }
+            // Consume the bound address + port so the stream is positioned at
+            // the tunnel's first byte. The reply's own ATYP decides its length.
+            std::size_t address_len = 0;
+            if (atyp == 0x01) {
+                address_len = 4;
+            } else if (atyp == 0x04) {
+                address_len = 16;
+            } else if (atyp == 0x03) {
+                stage = 7;
+                async_proxy_read_exact(stream, ByteSpan{one->data(), one->size()}, std::move(self));
+                return;
+            } else {
+                self.complete(make_error_code(client_errc::proxy_error));
+                return;
+            }
+            discard = std::make_shared<std::vector<std::byte>>(address_len + 2, std::byte{0});
+            stage = 8;
+            async_proxy_read_exact(stream, ByteSpan{discard->data(), discard->size()}, std::move(self));
+            return;
+        }
+        case 7:
+            if (ec) {
+                self.complete(ec);
+                return;
+            }
+            discard = std::make_shared<std::vector<std::byte>>(
+                static_cast<std::size_t>(static_cast<unsigned char>((*one)[0])) + 2, std::byte{0});
+            stage = 8;
+            async_proxy_read_exact(stream, ByteSpan{discard->data(), discard->size()}, std::move(self));
+            return;
+        case 8:
+            self.complete(ec);
+            return;
+        default:
+            self.complete(make_error_code(client_errc::proxy_error));
+            return;
+        }
     }
-    std::vector<std::byte> discard(address_len + 2);
-    if (!discard.empty()) {
-        if (auto ec = co_await proxy_read_exact(stream, discard); ec)
-            co_return ec;
-    }
-    co_return error_code{};
+};
+
+template <typename Stream, typename Token>
+auto async_socks5_connect(Stream &stream, ProxyConfig proxy, std::string host, std::uint16_t port, Token &&token) {
+    return asio::async_compose<Token, void(error_code)>(
+        Socks5ConnectOp<Stream>{stream, std::move(proxy), std::move(host), port}, token, stream.get_executor());
 }
 
 } // namespace simple_http::detail

@@ -67,17 +67,27 @@ Headers text_headers() {
 }
 
 // Runs one writer call and asserts it reported success.
-template <typename T> void ok(asio::io_context &ctx, asio::awaitable<T> op) {
-    auto result = run_on(ctx, std::move(op));
-    REQUIRE(result.has_value());
-    CHECK_FALSE(static_cast<bool>(*result));
+// The sink's contract is still a completion handler; drive it directly so the
+// test observes the exact status/headers the sink produces (a ResponseWriter
+// would add its own defaults first).
+template <typename F> void ok(asio::io_context &ctx, F &&start) {
+    bool done = false;
+    error_code result{make_error_code(asio::error::would_block)};
+    start([&](error_code ec) {
+        result = ec;
+        done = true;
+    });
+    ctx.restart();
+    ctx.run_for(std::chrono::seconds(5));
+    REQUIRE(done);
+    CHECK_FALSE(static_cast<bool>(result));
 }
 
 } // namespace
 
 TEST_CASE("compressing_writer: installed only when the client accepts a codec", "[compression]") {
     asio::io_context ctx;
-    auto inner = std::make_shared<FakeResponseSink>();
+    auto inner = std::make_shared<FakeResponseSink>(ctx.get_executor());
 
     // A client that names no codec we produce can never be compressed: the
     // writer is returned untouched, so nothing is allocated.
@@ -95,13 +105,14 @@ TEST_CASE("compressing_writer: installed only when the client accepts a codec", 
 
 TEST_CASE("compressing_writer: a mounted policy compresses a one-shot text response", "[compression]") {
     asio::io_context ctx;
-    auto inner = std::make_shared<FakeResponseSink>();
+    auto inner = std::make_shared<FakeResponseSink>(ctx.get_executor());
     const CompressionConfig cfg = policy();
     auto req = make_request(ctx, "gzip", &cfg);
-    CompressingResponseSink writer(inner, ctx.get_executor(), req, false);
+    auto writer_holder = std::make_shared<CompressingResponseSink>(inner, ctx.get_executor(), req, false);
+    auto &writer = *writer_holder;
 
     const std::string body = big_text();
-    ok(ctx, writer.send(200, text_headers(), body));
+    ok(ctx, [&](auto done) { writer.send(200, text_headers(), body, std::move(done)); });
 
     CHECK(inner->calls == 1);
     CHECK(inner->header("content-encoding") == "gzip");
@@ -112,13 +123,14 @@ TEST_CASE("compressing_writer: a mounted policy compresses a one-shot text respo
 
 TEST_CASE("compressing_writer: no mounted policy means pass-through", "[compression]") {
     asio::io_context ctx;
-    auto inner = std::make_shared<FakeResponseSink>();
+    auto inner = std::make_shared<FakeResponseSink>(ctx.get_executor());
     // Client accepts a codec, but no route policy covers the request.
     auto req = make_request(ctx, "gzip, br", nullptr);
-    CompressingResponseSink writer(inner, ctx.get_executor(), req, false);
+    auto writer_holder = std::make_shared<CompressingResponseSink>(inner, ctx.get_executor(), req, false);
+    auto &writer = *writer_holder;
 
     const std::string body = big_text();
-    ok(ctx, writer.send(200, text_headers(), body));
+    ok(ctx, [&](auto done) { writer.send(200, text_headers(), body, std::move(done)); });
 
     CHECK_FALSE(inner->has_header("content-encoding"));
     CHECK(inner->last_body == body);
@@ -129,12 +141,13 @@ TEST_CASE("compressing_writer: Content-Length follows the protocol", "[compressi
 
     SECTION("HTTP/2 gets the compressed length (its engine never recomputes)") {
         asio::io_context ctx;
-        auto inner = std::make_shared<FakeResponseSink>();
+        auto inner = std::make_shared<FakeResponseSink>(ctx.get_executor());
         inner->ver = Version::Http2;
         const CompressionConfig cfg = policy();
         auto req = make_request(ctx, "gzip", &cfg);
-        CompressingResponseSink writer(inner, ctx.get_executor(), req, false);
-        ok(ctx, writer.send(200, text_headers(), body));
+        auto writer_holder = std::make_shared<CompressingResponseSink>(inner, ctx.get_executor(), req, false);
+        auto &writer = *writer_holder;
+        ok(ctx, [&](auto done) { writer.send(200, text_headers(), body, std::move(done)); });
 
         REQUIRE(inner->has_header("content-length"));
         CHECK(inner->header("content-length") == std::to_string(inner->last_body.size()));
@@ -142,12 +155,13 @@ TEST_CASE("compressing_writer: Content-Length follows the protocol", "[compressi
 
     SECTION("HTTP/1.x gets none (its engine writes its own)") {
         asio::io_context ctx;
-        auto inner = std::make_shared<FakeResponseSink>();
+        auto inner = std::make_shared<FakeResponseSink>(ctx.get_executor());
         inner->ver = Version::Http11;
         const CompressionConfig cfg = policy();
         auto req = make_request(ctx, "gzip", &cfg);
-        CompressingResponseSink writer(inner, ctx.get_executor(), req, false);
-        ok(ctx, writer.send(200, text_headers(), body));
+        auto writer_holder = std::make_shared<CompressingResponseSink>(inner, ctx.get_executor(), req, false);
+        auto &writer = *writer_holder;
+        ok(ctx, [&](auto done) { writer.send(200, text_headers(), body, std::move(done)); });
 
         // A second Content-Length would be a smuggling vector downstream.
         CHECK_FALSE(inner->has_header("content-length"));
@@ -159,11 +173,12 @@ TEST_CASE("compressing_writer: headers that forbid or predate compression", "[co
 
     const auto run_case = [&](Headers headers, int status, bool head, const char *label) {
         asio::io_context ctx;
-        auto inner = std::make_shared<FakeResponseSink>();
+        auto inner = std::make_shared<FakeResponseSink>(ctx.get_executor());
         const CompressionConfig cfg = policy();
         auto req = make_request(ctx, "gzip", &cfg);
-        CompressingResponseSink writer(inner, ctx.get_executor(), req, head);
-        ok(ctx, writer.send(status, std::move(headers), body));
+        auto writer_holder = std::make_shared<CompressingResponseSink>(inner, ctx.get_executor(), req, head);
+        auto &writer = *writer_holder;
+        ok(ctx, [&](auto done) { writer.send(status, std::move(headers), body, std::move(done)); });
 
         INFO(label);
         CHECK_FALSE(inner->has_header("content-encoding"));
@@ -174,15 +189,16 @@ TEST_CASE("compressing_writer: headers that forbid or predate compression", "[co
         // Encoded as "br" on purpose: if the decorator compressed anyway and
         // rewrote the field, it would read back as "gzip" and this catches it.
         asio::io_context ctx;
-        auto inner = std::make_shared<FakeResponseSink>();
+        auto inner = std::make_shared<FakeResponseSink>(ctx.get_executor());
         const CompressionConfig cfg = policy();
         auto req = make_request(ctx, "gzip", &cfg);
-        CompressingResponseSink writer(inner, ctx.get_executor(), req, false);
+        auto writer_holder = std::make_shared<CompressingResponseSink>(inner, ctx.get_executor(), req, false);
+        auto &writer = *writer_holder;
 
         Headers h = text_headers();
         h.add("content-encoding", "br");
         const std::string already = "pretend this is brotli on the wire";
-        ok(ctx, writer.send(200, std::move(h), already));
+        ok(ctx, [&](auto done) { writer.send(200, std::move(h), already, std::move(done)); });
 
         CHECK(inner->header("content-encoding") == "br"); // preserved, not double-encoded
         CHECK(inner->last_body == already);
@@ -211,12 +227,13 @@ TEST_CASE("compressing_writer: headers that forbid or predate compression", "[co
 TEST_CASE("compressing_writer: small and incompressible bodies pass through", "[compression]") {
     SECTION("below min_bytes") {
         asio::io_context ctx;
-        auto inner = std::make_shared<FakeResponseSink>();
+        auto inner = std::make_shared<FakeResponseSink>(ctx.get_executor());
         const CompressionConfig cfg = policy(1024);
         auto req = make_request(ctx, "gzip", &cfg);
-        CompressingResponseSink writer(inner, ctx.get_executor(), req, false);
+        auto writer_holder = std::make_shared<CompressingResponseSink>(inner, ctx.get_executor(), req, false);
+        auto &writer = *writer_holder;
         const std::string body = "tiny";
-        ok(ctx, writer.send(200, text_headers(), body));
+        ok(ctx, [&](auto done) { writer.send(200, text_headers(), body, std::move(done)); });
 
         CHECK_FALSE(inner->has_header("content-encoding"));
         CHECK(inner->last_body == body);
@@ -224,12 +241,13 @@ TEST_CASE("compressing_writer: small and incompressible bodies pass through", "[
 
     SECTION("compression would make it bigger") {
         asio::io_context ctx;
-        auto inner = std::make_shared<FakeResponseSink>();
+        auto inner = std::make_shared<FakeResponseSink>(ctx.get_executor());
         const CompressionConfig cfg = policy();
         auto req = make_request(ctx, "gzip", &cfg);
-        CompressingResponseSink writer(inner, ctx.get_executor(), req, false);
+        auto writer_holder = std::make_shared<CompressingResponseSink>(inner, ctx.get_executor(), req, false);
+        auto &writer = *writer_holder;
         const std::string body = incompressible(8192);
-        ok(ctx, writer.send(200, text_headers(), body));
+        ok(ctx, [&](auto done) { writer.send(200, text_headers(), body, std::move(done)); });
 
         // The win is checked before any header is touched, so this is a clean
         // pass-through rather than a body that grew.
@@ -241,15 +259,16 @@ TEST_CASE("compressing_writer: small and incompressible bodies pass through", "[
 
 TEST_CASE("compressing_writer: Vary and ETag are maintained", "[compression]") {
     asio::io_context ctx;
-    auto inner = std::make_shared<FakeResponseSink>();
+    auto inner = std::make_shared<FakeResponseSink>(ctx.get_executor());
     const CompressionConfig cfg = policy();
     auto req = make_request(ctx, "gzip", &cfg);
-    CompressingResponseSink writer(inner, ctx.get_executor(), req, false);
+    auto writer_holder = std::make_shared<CompressingResponseSink>(inner, ctx.get_executor(), req, false);
+    auto &writer = *writer_holder;
 
     Headers headers = text_headers();
     headers.add("vary", "Origin");
     headers.add("etag", "\"v1\"");
-    ok(ctx, writer.send(200, std::move(headers), big_text()));
+    ok(ctx, [&](auto done) { writer.send(200, std::move(headers), big_text(), std::move(done)); });
 
     // Merged, not overwritten: the upstream's Vary still has to hold.
     CHECK(inner->header("vary") == "Origin, Accept-Encoding");
@@ -259,17 +278,18 @@ TEST_CASE("compressing_writer: Vary and ETag are maintained", "[compression]") {
 
 TEST_CASE("compressing_writer: streaming", "[compression]") {
     asio::io_context ctx;
-    auto inner = std::make_shared<FakeResponseSink>();
+    auto inner = std::make_shared<FakeResponseSink>(ctx.get_executor());
     inner->ver = Version::Http2; // so the length rule is exercised the strict way
     const CompressionConfig cfg = policy();
     auto req = make_request(ctx, "gzip", &cfg);
-    CompressingResponseSink writer(inner, ctx.get_executor(), req, false);
-    ok(ctx, writer.send_headers(200, text_headers()));
+    auto writer_holder = std::make_shared<CompressingResponseSink>(inner, ctx.get_executor(), req, false);
+    auto &writer = *writer_holder;
+    ok(ctx, [&](auto done) { writer.send_headers(200, text_headers(), std::move(done)); });
 
     const std::string part1 = big_text();
     const std::string part2 = big_text();
-    ok(ctx, writer.send_chunk(part1));
-    ok(ctx, writer.send_last(part2));
+    ok(ctx, [&](auto done) { writer.send_chunk(part1, std::move(done)); });
+    ok(ctx, [&](auto done) { writer.send_last(part2, std::move(done)); });
 
     CHECK(inner->begun);
     CHECK(inner->finished);
@@ -290,19 +310,20 @@ TEST_CASE("compressing_writer: a codec that buffers emits nothing, not an empty 
           "chunk",
           "[compression]") {
     asio::io_context ctx;
-    auto inner = std::make_shared<FakeResponseSink>();
+    auto inner = std::make_shared<FakeResponseSink>(ctx.get_executor());
     const CompressionConfig cfg = policy();
     auto req = make_request(ctx, "gzip", &cfg);
-    CompressingResponseSink writer(inner, ctx.get_executor(), req, false);
-    ok(ctx, writer.send_headers(200, text_headers()));
+    auto writer_holder = std::make_shared<CompressingResponseSink>(inner, ctx.get_executor(), req, false);
+    auto &writer = *writer_holder;
+    ok(ctx, [&](auto done) { writer.send_headers(200, text_headers(), std::move(done)); });
 
     // One byte at a time: the codec will not produce output for most of these,
     // and each empty result must be swallowed rather than forwarded.
     const std::string body = big_text();
     for (char c : body) {
-        ok(ctx, writer.send_chunk(std::string(1, c)));
+        ok(ctx, [&](auto done) { writer.send_chunk(std::string(1, c), std::move(done)); });
     }
-    ok(ctx, writer.send_last({}));
+    ok(ctx, [&](auto done) { writer.send_last({}, std::move(done)); });
 
     std::string streamed;
     for (const std::string &chunk : inner->chunks) {
@@ -314,37 +335,39 @@ TEST_CASE("compressing_writer: a codec that buffers emits nothing, not an empty 
 
 TEST_CASE("compressing_writer: bodyless and control responses pass straight through", "[compression]") {
     asio::io_context ctx;
-    auto inner = std::make_shared<FakeResponseSink>();
+    auto inner = std::make_shared<FakeResponseSink>(ctx.get_executor());
     const CompressionConfig cfg = policy();
     auto req = make_request(ctx, "gzip", &cfg);
-    CompressingResponseSink writer(inner, ctx.get_executor(), req, false);
+    auto writer_holder = std::make_shared<CompressingResponseSink>(inner, ctx.get_executor(), req, false);
+    auto &writer = *writer_holder;
 
     Headers headers = text_headers();
-    ok(ctx, writer.send_bodyless(204, headers));
+    ok(ctx, [&](auto done) { writer.send_bodyless(204, headers, std::move(done)); });
     CHECK(inner->sent_bodyless);
     CHECK_FALSE(inner->has_header("content-encoding"));
 
-    ok(ctx, writer.send_continue());
+    ok(ctx, [&](auto done) { writer.send_continue(std::move(done)); });
     CHECK(inner->continues == 1);
 
-    auto open = run_on(ctx, writer.connected());
+    auto open = run_on(ctx, await_connected([&](auto done) { writer.connected(std::move(done)); }));
     REQUIRE(open.has_value());
     CHECK(*open);
     CHECK(writer.version() == Version::Http11);
-    REQUIRE(run_on(ctx, writer.close()));
+    REQUIRE(run_on(ctx, await_error([&](auto done) { writer.close(std::move(done)); })));
     CHECK_FALSE(inner->open);
     CHECK_FALSE(inner->has_header("content-encoding"));
 }
 
 TEST_CASE("compressing_writer: brotli is used when negotiated", "[compression]") {
     asio::io_context ctx;
-    auto inner = std::make_shared<FakeResponseSink>();
+    auto inner = std::make_shared<FakeResponseSink>(ctx.get_executor());
     const CompressionConfig cfg = policy();
     auto req = make_request(ctx, "br", &cfg);
-    CompressingResponseSink writer(inner, ctx.get_executor(), req, false);
+    auto writer_holder = std::make_shared<CompressingResponseSink>(inner, ctx.get_executor(), req, false);
+    auto &writer = *writer_holder;
 
     const std::string body = big_text();
-    ok(ctx, writer.send(200, text_headers(), body));
+    ok(ctx, [&](auto done) { writer.send(200, text_headers(), body, std::move(done)); });
 
     CHECK(inner->header("content-encoding") == "br");
     CHECK(decompress_all("br", inner->last_body) == body);
@@ -356,8 +379,8 @@ TEST_CASE("middleware::compress: mounting sets the per-request policy", "[compre
     auto run_mw = [&](const Middleware &mw, std::string target) {
         auto req = make_request(ctx, "gzip", nullptr, std::move(target));
         ResponsePtr res; // the middleware never touches the response
-        Next next = [](RequestPtr, ResponsePtr, SslHandle) -> asio::awaitable<void> { co_return; };
-        REQUIRE(run_on(ctx, mw(req, res, std::nullopt, next)));
+        Next next = [](RequestPtr, ResponsePtr, SslHandle, HandlerCompletion done) { std::move(done)(); };
+        REQUIRE(run_on(ctx, await_void([&](auto done) { mw(req, res, std::nullopt, next, std::move(done)); })));
         return req;
     };
 

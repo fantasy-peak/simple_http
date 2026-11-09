@@ -33,8 +33,11 @@
 
 #include "simple_http.h"
 
+#include "../../../support/coro_compat.h"
+
 namespace asio = boost::asio;
 using namespace simple_http;
+using namespace simple_http::test;
 using namespace std::chrono_literals;
 
 namespace {
@@ -462,12 +465,7 @@ Observation observe_headers(const Headers &headers, int status, Version version)
 
 asio::awaitable<Observation> observe_response(Response &response) {
     Observation obs = observe_headers(response.headers(), response.status(), response.version());
-    auto body = co_await response.text();
-    if (!body) {
-        obs.error = classify(body.error());
-        co_return obs;
-    }
-    set_body(obs, std::move(*body));
+    set_body(obs, response.text());
     co_return obs;
 }
 
@@ -488,29 +486,29 @@ asio::awaitable<Observation> run_case(const TestCase &c) {
         for (const auto &header : c.request.headers) {
             multipart_options.spec.headers.add(header.name, header.value);
         }
-        auto opened = co_await MultipartStreamWriter::open(client, url, std::move(multipart_options));
+        auto opened = co_await client_open_multipart(client, url, std::move(multipart_options));
         if (!opened) {
             obs.error = classify(opened.error());
             co_return obs;
         }
         for (const auto &part : c.request.body->parts) {
             if (part.filename.empty()) {
-                if (auto ec = co_await opened->field(part.name, part.data)) {
+                if (auto ec = co_await mp_field(**opened, part.name, part.data)) {
                     obs.error = classify(ec);
                     co_return obs;
                 }
             } else {
-                if (auto ec = co_await opened->file_data(part.name, part.filename, part.content_type, part.data)) {
+                if (auto ec = co_await mp_file_data(**opened, part.name, part.filename, part.content_type, part.data)) {
                     obs.error = classify(ec);
                     co_return obs;
                 }
             }
         }
-        if (auto ec = co_await opened->finish()) {
+        if (auto ec = co_await finish_any(**opened)) {
             obs.error = classify(ec);
             co_return obs;
         }
-        auto head = co_await opened->stream().read_head();
+        auto head = co_await stream_read_head(*(*opened)->stream());
         if (!head) {
             obs.error = classify(head.error());
             co_return obs;
@@ -518,7 +516,7 @@ asio::awaitable<Observation> run_case(const TestCase &c) {
         obs = observe_headers(head->headers, head->status, head->version);
         obs.case_id = c.id;
         obs.mode = c.mode;
-        auto body = co_await opened->stream().read_all();
+        auto body = co_await stream_read_all(*(*opened)->stream());
         if (!body) {
             obs.error = classify(body.error());
             co_return obs;
@@ -541,13 +539,13 @@ asio::awaitable<Observation> run_case(const TestCase &c) {
         if (!saw_agent) {
             spec.headers.add("user-agent", "diff-probe");
         }
-        auto opened = co_await client.open_stream(url, std::move(spec));
+        auto opened = co_await client_open_stream(client, url, std::move(spec));
         if (!opened) {
             obs.error = classify(opened.error());
             co_return obs;
         }
-        (void)co_await opened->finish();
-        auto head = co_await opened->read_head();
+        (void)co_await finish_any(**opened);
+        auto head = co_await stream_read_head(**opened);
         if (!head) {
             obs.error = classify(head.error());
             co_return obs;
@@ -555,13 +553,13 @@ asio::awaitable<Observation> run_case(const TestCase &c) {
         obs = observe_headers(head->headers, head->status, head->version);
         obs.case_id = c.id;
         obs.mode = c.mode;
-        auto body = co_await opened->read_all();
+        auto body = co_await stream_read_all(**opened);
         if (!body) {
             obs.error = classify(body.error());
             co_return obs;
         }
         set_body(obs, std::move(*body));
-        for (const auto &[name, value] : opened->trailers()) {
+        for (const auto &[name, value] : (*opened)->trailers()) {
             obs.notes["trailer." + name] = value;
         }
         co_return obs;
@@ -593,7 +591,7 @@ asio::awaitable<Observation> run_case(const TestCase &c) {
     if (c.client.max_body_bytes != 0) {
         builder.max_body_bytes(c.client.max_body_bytes);
     }
-    auto response = co_await builder.send();
+    auto response = co_await client_send(builder);
     if (!response) {
         obs.error = classify(response.error());
         co_return obs;
@@ -645,20 +643,20 @@ asio::awaitable<void> run_body_group() {
     {
         Observation obs;
         obs.case_id = "body.streaming_multipart";
-        auto opened = co_await MultipartStreamWriter::open(client, base + "/multipart", {.boundary = "DIFFBOUNDARY"});
+        auto opened = co_await client_open_multipart(client, base + "/multipart", {.boundary = "DIFFBOUNDARY"});
         if (!opened) {
             obs.error = classify(opened.error());
         } else {
-            (void)co_await opened->field("title", "hello");
-            (void)co_await opened->file_data("upload", "notes.txt", "text/plain", "file data");
-            (void)co_await opened->finish();
-            auto head = co_await opened->stream().read_head();
+            (void)co_await mp_field(**opened, "title", "hello");
+            (void)co_await mp_file_data(**opened, "upload", "notes.txt", "text/plain", "file data");
+            (void)co_await finish_any(**opened);
+            auto head = co_await stream_read_head(*(*opened)->stream());
             if (!head) {
                 obs.error = classify(head.error());
             } else {
                 obs = observe_headers(head->headers, head->status, head->version);
                 obs.case_id = "body.streaming_multipart";
-                auto body = co_await opened->stream().read_all();
+                auto body = co_await stream_read_all(*(*opened)->stream());
                 if (!body) {
                     obs.error = classify(body.error());
                 } else {
@@ -685,19 +683,19 @@ asio::awaitable<void> run_body_group() {
         StreamSpec upload_spec;
         upload_spec.method = Method::Put;
         upload_spec.headers.add("user-agent", "diff-probe");
-        auto opened = co_await client.open_stream(base + "/echo", std::move(upload_spec));
+        auto opened = co_await client_open_stream(client, base + "/echo", std::move(upload_spec));
         if (!opened) {
             obs.error = classify(opened.error());
         } else {
-            (void)co_await stream_file_body(*opened, path.string());
-            (void)co_await opened->finish();
-            auto head = co_await opened->read_head();
+            (void)co_await as_ec(async_stream_file_body(*opened, path.string(), 0, asio::as_tuple(asio::use_awaitable)));
+            (void)co_await finish_any(**opened);
+            auto head = co_await stream_read_head(**opened);
             if (!head) {
                 obs.error = classify(head.error());
             } else {
                 obs = observe_headers(head->headers, head->status, head->version);
                 obs.case_id = "body.file_upload";
-                auto body = co_await opened->read_all();
+                auto body = co_await stream_read_all(**opened);
                 if (!body) {
                     obs.error = classify(body.error());
                 } else {
@@ -715,19 +713,19 @@ asio::awaitable<void> run_body_group() {
         Observation obs;
         obs.case_id = "body.expect_ok";
         auto opened =
-            co_await client.open_stream(base + "/expect-ok", {.method = Method::Post, .auto_expect_continue = true});
+            co_await client_open_stream(client, base + "/expect-ok", {.method = Method::Post, .auto_expect_continue = true});
         if (!opened) {
             obs.error = classify(opened.error());
         } else {
-            (void)co_await opened->write("hello!");
-            (void)co_await opened->finish();
-            auto head = co_await opened->read_head();
+            (void)co_await stream_write(**opened, "hello!");
+            (void)co_await finish_any(**opened);
+            auto head = co_await stream_read_head(**opened);
             if (!head) {
                 obs.error = classify(head.error());
             } else {
                 obs = observe_headers(head->headers, head->status, head->version);
                 obs.case_id = "body.expect_ok";
-                auto body = co_await opened->read_all();
+                auto body = co_await stream_read_all(**opened);
                 if (!body) {
                     obs.error = classify(body.error());
                 } else {
@@ -742,22 +740,22 @@ asio::awaitable<void> run_body_group() {
     {
         Observation obs;
         obs.case_id = "body.expect_reject";
-        auto opened = co_await client.open_stream(base + "/expect-reject",
+        auto opened = co_await client_open_stream(client, base + "/expect-reject",
                                                   {.method = Method::Post, .auto_expect_continue = true});
         if (!opened) {
             obs.error = classify(opened.error());
         } else {
-            const auto ec = co_await opened->write("body");
+            const auto ec = co_await stream_write(**opened, "body");
             if (ec && ec != make_error_code(client_errc::expectation_failed)) {
                 obs.error = classify(ec);
             } else {
-                auto head = co_await opened->read_head();
+                auto head = co_await stream_read_head(**opened);
                 if (!head) {
                     obs.error = classify(head.error());
                 } else {
                     obs = observe_headers(head->headers, head->status, head->version);
                     obs.case_id = "body.expect_reject";
-                    auto body = co_await opened->read_all();
+                    auto body = co_await stream_read_all(**opened);
                     if (!body) {
                         obs.error = classify(body.error());
                     } else {
@@ -776,21 +774,21 @@ asio::awaitable<void> run_body_group() {
         StreamSpec spec;
         spec.method = Method::Post;
         spec.headers.add("trailer", "x-check");
-        auto opened = co_await client.open_stream(base + "/request-trailer", std::move(spec));
+        auto opened = co_await client_open_stream(client, base + "/request-trailer", std::move(spec));
         if (!opened) {
             obs.error = classify(opened.error());
         } else {
-            (void)co_await opened->write("body");
+            (void)co_await stream_write(**opened, "body");
             Headers trailers;
             trailers.add("x-check", "yes");
-            (void)co_await opened->finish_trailers(std::move(trailers));
-            auto head = co_await opened->read_head();
+            (void)co_await stream_finish_trailers(**opened, std::move(trailers));
+            auto head = co_await stream_read_head(**opened);
             if (!head) {
                 obs.error = classify(head.error());
             } else {
                 obs = observe_headers(head->headers, head->status, head->version);
                 obs.case_id = "body.request_trailers";
-                auto body = co_await opened->read_all();
+                auto body = co_await stream_read_all(**opened);
                 if (!body) {
                     obs.error = classify(body.error());
                 } else {
@@ -805,23 +803,23 @@ asio::awaitable<void> run_body_group() {
     {
         Observation obs;
         obs.case_id = "body.response_trailers";
-        auto opened = co_await client.open_stream(base + "/trailers");
+        auto opened = co_await client_open_stream(client, base + "/trailers");
         if (!opened) {
             obs.error = classify(opened.error());
         } else {
-            (void)co_await opened->finish();
-            auto head = co_await opened->read_head();
+            (void)co_await finish_any(**opened);
+            auto head = co_await stream_read_head(**opened);
             if (!head) {
                 obs.error = classify(head.error());
             } else {
                 obs = observe_headers(head->headers, head->status, head->version);
                 obs.case_id = "body.response_trailers";
-                auto body = co_await opened->read_all();
+                auto body = co_await stream_read_all(**opened);
                 if (!body) {
                     obs.error = classify(body.error());
                 } else {
                     set_body(obs, std::move(*body));
-                    if (const auto value = opened->trailers().get("x-checksum")) {
+                    if (const auto value = (*opened)->trailers().get("x-checksum")) {
                         obs.notes["trailer.x-checksum"] = std::string{*value};
                     }
                 }
@@ -834,13 +832,13 @@ asio::awaitable<void> run_body_group() {
     {
         Observation obs;
         obs.case_id = "body.sse";
-        auto sse = co_await SseStream::open(client, base + "/sse");
+        auto sse = co_await client_open_sse(client, base + "/sse");
         if (!sse) {
             obs.error = classify(sse.error());
         } else {
             std::string data;
             for (;;) {
-                auto event = co_await (*sse).next();
+                auto event = co_await sse_next(**sse);
                 if (!event) {
                     break;
                 }
@@ -865,13 +863,13 @@ asio::awaitable<void> run_body_group() {
         obs.case_id = "body.sse_resume";
         SseOptions options;
         options.last_event_id = "2";
-        auto sse = co_await SseStream::open(client, base + "/sse-resume", options);
+        auto sse = co_await client_open_sse(client, base + "/sse-resume", options);
         if (!sse) {
             obs.error = classify(sse.error());
         } else {
             std::string data;
             for (;;) {
-                auto event = co_await (*sse).next();
+                auto event = co_await sse_next(**sse);
                 if (!event) {
                     break;
                 }
@@ -905,7 +903,7 @@ asio::awaitable<void> run_body_group() {
 // ---------------------------------------------------------------------------
 
 asio::awaitable<Observation> get_observation(Client &client, const std::string &url, const std::string &case_id) {
-    auto response = co_await client.get(url).header("user-agent", "diff-probe").send();
+    auto response = co_await client_send(client.get(url).header("user-agent", "diff-probe"));
     Observation obs;
     obs.case_id = case_id;
     if (!response) {
@@ -927,7 +925,7 @@ asio::awaitable<void> run_policy_group() {
         cfg.default_h2c = H2cMode::Off;
         cfg.cookie_jar = std::make_shared<CookieJar>();
         Client client{co_await asio::this_coro::executor, cfg};
-        (void)co_await client.get(base + "/cookies/set").send();
+        (void)co_await client_send(client.get(base + "/cookies/set"));
         emit(co_await get_observation(client, base + "/cookies", "policy.cookies"));
     }
 
@@ -950,7 +948,7 @@ asio::awaitable<void> run_policy_group() {
         cfg.default_version = HttpVersionPolicy::Http11;
         cfg.default_h2c = H2cMode::Off;
         Client client{co_await asio::this_coro::executor, cfg};
-        auto response = co_await client.get(base + path).header("user-agent", "diff-probe").timeout(head, idle).send();
+        auto response = co_await client_send(client.get(base + path).header("user-agent", "diff-probe").timeout(head, idle));
         Observation obs;
         obs.case_id = case_id;
         obs.mode = "cpp-only";
@@ -991,7 +989,7 @@ asio::awaitable<void> run_policy_group() {
         cfg.default_version = HttpVersionPolicy::Http11;
         cfg.default_h2c = H2cMode::Off;
         Client client{co_await asio::this_coro::executor, cfg};
-        (void)co_await client.get(base + "/retry/reset").send();
+        (void)co_await client_send(client.get(base + "/retry/reset"));
         emit(co_await get_observation(client, base + "/retry/2", "policy.retry_default_off"));
     }
 
@@ -1004,7 +1002,7 @@ asio::awaitable<void> run_policy_group() {
         cfg.retry.retry_statuses = {status::too_many_requests};
         cfg.retry.initial_backoff = 1ms;
         Client client{co_await asio::this_coro::executor, cfg};
-        (void)co_await client.get(base + "/retry/reset").send();
+        (void)co_await client_send(client.get(base + "/retry/reset"));
         auto obs = co_await get_observation(client, base + "/retry/2", "policy.retry_opt_in");
         obs.mode = "cpp-only";
         if (!obs.error && (obs.status != status::ok || obs.body != "ok")) {
@@ -1022,7 +1020,7 @@ asio::awaitable<void> run_ws_group() {
     ClientConfig cfg;
     cfg.default_version = HttpVersionPolicy::Http11;
     Client client{co_await asio::this_coro::executor, cfg};
-    auto opened = co_await client.open_websocket("ws://127.0.0.1:7810/ws");
+    auto opened = co_await client_open_websocket(client, "ws://127.0.0.1:7810/ws");
     if (!opened) {
         for (const char *name : {"ws.text", "ws.binary", "ws.large"}) {
             Observation obs;
@@ -1038,10 +1036,10 @@ asio::awaitable<void> run_ws_group() {
     {
         Observation obs;
         obs.case_id = "ws.text";
-        if (auto ec = co_await ws->write_text("hello")) {
+        if (auto ec = co_await ws_write_text(*ws, "hello")) {
             obs.error = classify(ec);
         } else {
-            auto message = co_await ws->read();
+            auto message = co_await ws_read(*ws);
             if (!message) {
                 obs.error = classify(message.error());
             } else {
@@ -1055,10 +1053,10 @@ asio::awaitable<void> run_ws_group() {
         Observation obs;
         obs.case_id = "ws.binary";
         const std::string binary{"\x00\x01\xff\xfe", 4};
-        if (auto ec = co_await ws->write_binary(binary)) {
+        if (auto ec = co_await ws_write_binary(*ws, binary)) {
             obs.error = classify(ec);
         } else {
-            auto message = co_await ws->read();
+            auto message = co_await ws_read(*ws);
             if (!message) {
                 obs.error = classify(message.error());
             } else {
@@ -1071,10 +1069,10 @@ asio::awaitable<void> run_ws_group() {
     {
         Observation obs;
         obs.case_id = "ws.large";
-        if (auto ec = co_await ws->write_text(std::string(64 * 1024, 'x'))) {
+        if (auto ec = co_await ws_write_text(*ws, std::string(64 * 1024, 'x'))) {
             obs.error = classify(ec);
         } else {
-            auto message = co_await ws->read();
+            auto message = co_await ws_read(*ws);
             if (!message) {
                 obs.error = classify(message.error());
             } else {

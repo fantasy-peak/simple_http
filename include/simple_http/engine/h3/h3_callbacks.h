@@ -25,7 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
-#include <span>
+#include "../../core/compat.h"
 #include <string_view>
 
 namespace simple_http::h3 {
@@ -61,7 +61,7 @@ class H3CallbackSink {
                             std::string_view /*value*/) noexcept {}
     virtual void on_trailers_end(std::int64_t /*stream_id*/, bool /*fin*/) noexcept {}
     // Request body bytes.
-    virtual void on_data(std::int64_t stream_id, std::span<const std::uint8_t> data) noexcept = 0;
+    virtual void on_data(std::int64_t stream_id, boost::span<const std::uint8_t> data) noexcept = 0;
     // The request is complete: FIN and a well-formed message.
     virtual void on_end_stream(std::int64_t stream_id) noexcept = 0;
 
@@ -100,7 +100,7 @@ class H3CallbackSink {
         cb.recv_data = [](nghttp3_conn *, std::int64_t stream_id, const std::uint8_t *data, std::size_t datalen,
                           void *conn_user_data, void *) -> int {
             static_cast<H3CallbackSink *>(conn_user_data)
-                ->on_data(stream_id, std::span<const std::uint8_t>{data, datalen});
+                ->on_data(stream_id, boost::span<const std::uint8_t>{data, datalen});
             return 0;
         };
         cb.acked_stream_data = [](nghttp3_conn *, std::int64_t stream_id, std::uint64_t datalen, void *conn_user_data,

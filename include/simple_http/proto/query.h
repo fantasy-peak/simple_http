@@ -11,8 +11,8 @@
 //   for (std::string_view v : q.get_all("tag")) { /* repeated names */ }
 //
 //   // a urlencoded request body (Content-Type: application/x-www-form-urlencoded)
-//   auto body = co_await req->body().read_all();
-//   auto form = QueryParams::parse(*body);
+//   req->body().async_read_all(token);   // void(error_code, std::string)
+//   auto form = QueryParams::parse(raw);
 
 #include <cstddef>
 #include <optional>

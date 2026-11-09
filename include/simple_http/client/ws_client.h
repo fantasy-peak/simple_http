@@ -1,73 +1,48 @@
 #pragma once
 
-// Client-side WebSocket (RFC 6455): upgrade a dialed connection to WebSocket
-// and hand it to the same WebSocket handle the server gives its handlers.
+// Client-side WebSocket (RFC 6455), C++17 token-only port.
 //
-// The client side of the server's ws_route: the server receives the upgrade
-// request and answers 101; here we *send* the upgrade request and verify the
-// 101 + Sec-WebSocket-Accept. After the handshake the connection is a WebSocket
-// stream, and the frame encoding/decoding, the write pump, ping/pong and close
-// handling already exist in proto/websocket.h (WsBackendImpl) — reused as-is,
-// since WsBackend is transport-agnostic.
-//
-// API (all on http::Client):
-//   auto ws = co_await client.open_websocket("ws://host/chat", {.headers = ...});
-//   ws->write_text("hi"); auto msg = co_await ws->read(); ...
-//
-// The resulting WebSocket behaves exactly like a server-side one: read() pulls
-// whole messages (reassembling fragments, answering ping/close), write_text/
-// write_binary serialize through one write pump, close() sends a Close frame.
+// The client sends the upgrade request, verifies the 101 and
+// Sec-WebSocket-Accept, then hands the connection to the same
+// WsBackendImpl/WebSocket used by the server. Completion signature:
+// void(error_code, std::shared_ptr<WebSocket>).
 
 #include <array>
 #include <boost/asio.hpp>
-#include <boost/asio/experimental/awaitable_operators.hpp>
+#include <boost/asio/any_completion_handler.hpp>
+#include <boost/asio/async_result.hpp>
 #include <boost/asio/steady_timer.hpp>
-#include <cctype> // std::tolower (accept-key header scan)
+#include <cctype>
 #include <cstddef>
 #include <cstring>
-#include <expected>
 #include <memory>
-#include <random> // std::random_device (Sec-WebSocket-Key nonce)
-#include <span>
+#include <random>
 #include <string>
 #include <string_view>
 #include <utility>
 
-#include "../core/base64.h"  // ws key generation
-#include "../core/logging.h" // SIMPLE_HTTP_ERROR_LOG
-#include "../core/types.h"   // contains_ctl, client_errc
-#include "../core/version.h" // client_product
+#include "../core/base64.h"
+#include "../core/compat.h"
+#include "../core/logging.h"
+#include "../core/types.h"
+#include "../core/version.h"
 #include "../proto/headers.h"
-#include "../proto/websocket.h" // WsBackendImpl / WebSocket / ws_accept_key
+#include "../proto/websocket.h"
 #include "client_config.h"
-#include "http_client.h" // detail::ClientEngine::dial_transport
 
 namespace simple_http {
 
 namespace asio = boost::asio;
 
-// Per-connection knobs for the WebSocket client. 0 keeps the ClientConfig
-// default.
 struct WebSocketSpec {
-    Headers headers; // extra request headers (e.g. auth)
-    // Origin to send. Empty = not sent (a browser would send one; a non-browser
-    // client need not).
+    Headers headers;
     std::string origin;
-    // Max frame payload accepted from the peer. 0 = 16 MiB.
     std::size_t max_payload{0};
-    // Inbound read-ahead cap in bytes (see WsBackendImpl). 0 = library default
-    // (4 MiB). Bounds the memory a server can make the client buffer by sending
-    // faster than the application reads.
     std::size_t read_ahead_bytes{0};
 };
 
 namespace detail {
 
-// Generates the Sec-WebSocket-Key: base64 of 16 random bytes (RFC 6455
-// §4.1: the key is a base64-encoded 16-byte random nonce). The bytes come from
-// std::random_device (the OS entropy source) rather than std::rand(), which is
-// unseeded (a fixed sequence per process), not thread-safe, and trivially
-// predictable — a poor nonce even for a value that is not a secret.
 inline std::string ws_client_key() {
     unsigned char random[16];
     std::random_device rd;
@@ -76,17 +51,12 @@ inline std::string ws_client_key() {
     return base64_encode(std::string_view{reinterpret_cast<const char *>(random), sizeof(random)});
 }
 
-// Performs the WebSocket handshake on an established transport: sends the
-// upgrade request, reads the response head, verifies the 101 and the accept
-// key. On success returns a WebSocket over the transport (pump already
-// started). `path` is the origin-form target; extra headers arrived in `spec`.
-template <typename Transport>
-asio::awaitable<std::expected<std::shared_ptr<WebSocket>, error_code>>
-ws_upgrade_impl(std::shared_ptr<Transport> transport, std::string authority, std::string path,
-                const WebSocketSpec &spec, std::chrono::milliseconds idle_timeout) {
-    using asio::as_tuple;
-    using asio::use_awaitable;
+using WsOpenCompletion = asio::any_completion_handler<void(error_code, std::shared_ptr<WebSocket>)>;
 
+template <typename Transport>
+void async_ws_upgrade_impl(std::shared_ptr<Transport> transport, std::string authority, std::string path,
+                           WebSocketSpec spec, std::chrono::milliseconds idle_timeout,
+                           std::chrono::milliseconds handshake_timeout, WsOpenCompletion done) {
     const std::string key = ws_client_key();
     std::string request;
     request += "GET " + (path.empty() ? std::string{"/"} : path) + " HTTP/1.1\r\n";
@@ -101,7 +71,8 @@ ws_upgrade_impl(std::shared_ptr<Transport> transport, std::string authority, std
     for (const auto &[name, value] : spec.headers) {
         if (contains_ctl(name) || contains_ctl(value)) {
             transport->close();
-            co_return std::unexpected{make_error_code(asio::error::invalid_argument)};
+            std::move(done)(make_error_code(asio::error::invalid_argument), nullptr);
+            return;
         }
         request += name;
         request += ": ";
@@ -112,109 +83,133 @@ ws_upgrade_impl(std::shared_ptr<Transport> transport, std::string authority, std
     request += client_product;
     request += "\r\n\r\n";
 
-    if (auto [ec, n] =
-            co_await transport->async_write(std::as_bytes(std::span<const char>{request.data(), request.size()}));
-        ec) {
-        (void)n;
-        transport->close();
-        co_return std::unexpected{ec};
-    }
-
-    // Read the response head: up to the \r\n\r\n, bounded (a hostile peer could
-    // stream headers forever).
-    std::string response;
-    std::array<std::byte, 512> buf{};
-    std::size_t const kMaxHead = 16384;
-    while (response.find("\r\n\r\n") == std::string::npos) {
-        if (response.size() > kMaxHead) {
-            transport->close();
-            co_return std::unexpected{make_error_code(client_errc::header_too_large)};
-        }
-        auto [ec, n] = co_await transport->async_read_some(std::span<std::byte>{buf});
-        if (ec) {
-            transport->close();
-            co_return std::unexpected{ec};
-        }
-        response.append(reinterpret_cast<const char *>(buf.data()), n);
-    }
-    const std::size_t head_end = response.find("\r\n\r\n") + 4;
-    const std::string head = response.substr(0, head_end);
-    const std::string_view extra = std::string_view{response}.substr(head_end); // first frame bytes
-
-    // Status line: "HTTP/1.1 101 ...".
-    if (!head.starts_with("HTTP/1.1 101")) {
-        SIMPLE_HTTP_ERROR_LOG("ws client: upgrade to {} refused (not 101)", authority);
-        transport->close();
-        co_return std::unexpected{make_error_code(client_errc::protocol_error)};
-    }
-    // The Subprotocol / extension offer is the server's choice; nothing to
-    // validate there. The accept key is the one mandatory check.
-    std::string_view accept;
-    for (std::size_t pos = 0;;) {
-        const std::size_t nl = head.find("\r\n", pos);
-        if (nl == std::string::npos || nl >= head_end)
-            break;
-        const std::string_view line = std::string_view{head}.substr(pos, nl - pos);
-        if (line.empty())
-            break;
-        const std::size_t colon = line.find(':');
-        if (colon != std::string_view::npos) {
-            std::string_view name = line.substr(0, colon);
-            // Compare case-insensitively, like the server's own header parser.
-            std::string lower;
-            lower.reserve(name.size());
-            for (char c : name)
-                lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-            if (lower == "sec-websocket-accept") {
-                std::string_view value = line.substr(colon + 1);
-                while (!value.empty() && (value.front() == ' ' || value.front() == '\t'))
-                    value.remove_prefix(1);
-                accept = value;
+    auto request_keep = std::make_shared<std::string>(std::move(request));
+    auto response = std::make_shared<std::string>();
+    auto read_buf = std::make_shared<std::array<std::byte, 512>>();
+    auto step = std::make_shared<std::function<void()>>();
+    auto completion = std::make_shared<WsOpenCompletion>(std::move(done));
+    auto timer = std::make_shared<asio::steady_timer>(transport->get_executor());
+    auto timed_out = std::make_shared<bool>(false);
+    if (handshake_timeout.count() > 0) {
+        timer->expires_after(handshake_timeout);
+        timer->async_wait([transport, timed_out](error_code ec) {
+            if (!ec) {
+                *timed_out = true;
+                transport->close();
             }
+        });
+    }
+    auto finish = [completion, timer, timed_out](error_code ec, std::shared_ptr<WebSocket> ws) mutable {
+        timer->cancel();
+        if (ec && *timed_out)
+            ec = make_error_code(client_errc::response_head_timeout);
+        auto callback = std::move(*completion);
+        std::move(callback)(ec, std::move(ws));
+    };
+
+    // Weak self-reference, like middleware::timeout: the function owns the
+    // continuation stored in `step`, so a strong capture would cycle. The
+    // pending read handler holds `keep` for as long as the step is in flight.
+    std::weak_ptr<std::function<void()>> weak_step = step;
+    *step = [transport, request_keep, response, read_buf, key, spec, idle_timeout, authority, finish,
+             weak_step]() mutable {
+        auto keep = weak_step.lock();
+        if (!keep) {
+            return;
         }
-        pos = nl + 2;
-    }
-    if (accept != ws_accept_key(key)) {
-        transport->close();
-        co_return std::unexpected{make_error_code(client_errc::protocol_error)};
-    }
+        // Read more of the head.
+        constexpr std::size_t kMaxHead = 16384;
+        transport->async_read_some(
+            ByteSpan{read_buf->data(), read_buf->size()},
+            [transport, request_keep, response, read_buf, key, spec, idle_timeout, authority, finish,
+             keep](error_code ec, std::size_t n) mutable {
+                if (ec) {
+                    transport->close();
+                    finish(ec, nullptr);
+                    return;
+                }
+                response->append(reinterpret_cast<const char *>(read_buf->data()), n);
+                if (response->find("\r\n\r\n") == std::string::npos) {
+                    if (response->size() > kMaxHead) {
+                        transport->close();
+                        finish(make_error_code(client_errc::header_too_large), nullptr);
+                        return;
+                    }
+                    (*keep)();
+                    return;
+                }
+                const std::size_t head_end = response->find("\r\n\r\n") + 4;
+                const std::string head = response->substr(0, head_end);
+                const std::string extra = response->substr(head_end);
+                if (!starts_with(head, "HTTP/1.1 101")) {
+                    SIMPLE_HTTP_ERROR_LOG("ws client: upgrade to {} refused (not 101)", authority);
+                    transport->close();
+                    finish(make_error_code(client_errc::protocol_error), nullptr);
+                    return;
+                }
+                // Accept-key check.
+                std::string_view accept;
+                for (std::size_t pos = 0;;) {
+                    const std::size_t nl = head.find("\r\n", pos);
+                    if (nl == std::string::npos || nl >= head_end)
+                        break;
+                    const std::string_view line = std::string_view{head}.substr(pos, nl - pos);
+                    if (line.empty())
+                        break;
+                    const std::size_t colon = line.find(':');
+                    if (colon != std::string_view::npos) {
+                        std::string lower;
+                        for (char c : line.substr(0, colon))
+                            lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+                        if (lower == "sec-websocket-accept") {
+                            std::string_view value = line.substr(colon + 1);
+                            while (!value.empty() && (value.front() == ' ' || value.front() == '\t'))
+                                value.remove_prefix(1);
+                            accept = value;
+                        }
+                    }
+                    pos = nl + 2;
+                }
+                if (accept != ws_accept_key(key)) {
+                    transport->close();
+                    finish(make_error_code(client_errc::protocol_error), nullptr);
+                    return;
+                }
+                auto backend = std::make_shared<WsBackendImpl<Transport>>(
+                    transport, spec.max_payload != 0 ? spec.max_payload : 16u * 1024 * 1024, idle_timeout,
+                    /*expect_masked=*/false, spec.read_ahead_bytes);
+                backend->feed(extra);
+                auto ws = std::make_shared<WebSocket>(std::move(backend));
+                ws->run_writer();
+                finish(error_code{}, std::move(ws));
+            });
+    };
 
-    auto backend = std::make_shared<WsBackendImpl<Transport>>(
-        transport, spec.max_payload != 0 ? spec.max_payload : 16u * 1024 * 1024, idle_timeout,
-        /*expect_masked=*/false, // server frames are unmasked
-        spec.read_ahead_bytes);
-    backend->feed(extra); // bytes already read past the head: the peer's first frame
-
-    auto ws = std::make_shared<WebSocket>(std::move(backend));
-    asio::co_spawn(transport->get_executor(), ws->run_writer(), asio::detached);
-    co_return ws;
+    transport->async_write(
+        ConstByteSpan{reinterpret_cast<const std::byte *>(request_keep->data()), request_keep->size()},
+        [transport, request_keep, response, read_buf, key, spec, idle_timeout, authority, finish,
+         step](error_code ec, std::size_t) mutable {
+            if (ec) {
+                transport->close();
+                finish(ec, nullptr);
+                return;
+            }
+            (*step)();
+        });
 }
 
-// The handshake read is bounded by the caller's response-head budget. Without
-// it a peer that accepts the TCP/TLS connection and then says nothing keeps
-// open_websocket() parked forever: the WebSocket idle watchdog only starts
-// after the 101, and connect_timeout covers the dial, not this read.
-template <typename Transport>
-asio::awaitable<std::expected<std::shared_ptr<WebSocket>, error_code>>
-ws_upgrade(std::shared_ptr<Transport> transport, std::string authority, std::string path, const WebSocketSpec &spec,
-           std::chrono::milliseconds idle_timeout, std::chrono::milliseconds handshake_timeout) {
-    if (handshake_timeout.count() <= 0) {
-        co_return co_await ws_upgrade_impl(std::move(transport), std::move(authority), std::move(path), spec,
-                                           idle_timeout);
-    }
-    using namespace asio::experimental::awaitable_operators;
-    auto deadline = [handshake_timeout]() -> asio::awaitable<void> {
-        asio::steady_timer timer{co_await asio::this_coro::executor};
-        timer.expires_after(handshake_timeout);
-        co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
-    };
-    auto outcome =
-        co_await (ws_upgrade_impl(transport, std::move(authority), std::move(path), spec, idle_timeout) || deadline());
-    if (auto *value = std::get_if<std::expected<std::shared_ptr<WebSocket>, error_code>>(&outcome)) {
-        co_return std::move(*value);
-    }
-    transport->close();
-    co_return std::unexpected{make_error_code(client_errc::response_head_timeout)};
+// The handshake read is bounded by the caller's response-head budget.
+template <typename Transport, typename Token>
+auto async_ws_upgrade(std::shared_ptr<Transport> transport, std::string authority, std::string path, WebSocketSpec spec,
+                      std::chrono::milliseconds idle_timeout, std::chrono::milliseconds handshake_timeout,
+                      Token &&token) {
+    return asio::async_initiate<Token, void(error_code, std::shared_ptr<WebSocket>)>(
+        [transport, authority = std::move(authority), path = std::move(path), spec = std::move(spec), idle_timeout,
+         handshake_timeout](auto handler) mutable {
+            async_ws_upgrade_impl(std::move(transport), std::move(authority), std::move(path), std::move(spec),
+                                  idle_timeout, handshake_timeout, std::move(handler));
+        },
+        token);
 }
 
 } // namespace detail

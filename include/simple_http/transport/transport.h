@@ -1,15 +1,15 @@
 #pragma once
 
-// Transport: the byte-stream abstraction protocol engines run on.
+// Transport: the byte-stream abstraction protocol engines run on (C++17 port).
 //
 // A protocol engine (HTTP/1.x, HTTP/2, HTTP/3) is templated on a Transport and
 // only performs async reads/writes of bytes, plus close/peer/tls_handle. It
-// never names a concrete socket type. TCP (plain/TLS) satisfy this today; a
-// QUIC transport will satisfy it later, so no engine code changes when HTTP/3
-// lands.
+// never names a concrete socket type.
 //
-// The Transport concept documents the required surface. Concrete transports are
-// defined in tcp_transport.h / tls_transport.h.
+// Every operation is an Asio initiating function with the conventional
+// completion signature void(error_code, std::size_t). The helpers below wrap
+// the plain asio operations on a stream; the concrete transports are in
+// tcp_transport.h / tls_transport.h.
 
 #include <openssl/ssl.h>
 
@@ -17,12 +17,11 @@
 #include <array>
 #include <boost/asio.hpp>
 #include <cassert>
-#include <concepts>
 #include <cstddef>
 #include <optional>
-#include <span>
 #include <utility>
 
+#include "../core/compat.h"
 #include "../core/types.h"
 
 namespace simple_http {
@@ -33,47 +32,39 @@ namespace asio = boost::asio;
 // std::nullopt for plaintext transports.
 using SslHandle = std::optional<SSL *>;
 
-using ByteSpan = std::span<std::byte>;
-using ConstByteSpan = std::span<const std::byte>;
-
 // The result of an async I/O op: an error_code and the number of bytes moved.
+// On the wire this is the pair of completion arguments.
 using IoResult = std::pair<error_code, std::size_t>;
 
 namespace detail {
 
-// Most buffers one scatter-gather write accepts; see stream_write_seq.
+// Most buffers one scatter-gather write accepts; see async_stream_write_seq.
 inline constexpr std::size_t kMaxWriteBuffers = 8;
 
 // The I/O primitives every stream-based transport needs. Plain sockets and
 // asio::ssl::stream share the same composed-operation shapes; keeping the four
 // bodies here means a change to error/partial-write handling cannot drift
 // between TcpTransport and TlsTransport.
-template <typename Stream> asio::awaitable<IoResult> stream_read_some(Stream &stream, ByteSpan buffer) {
-    auto [ec, n] = co_await stream.async_read_some(asio::buffer(buffer.data(), buffer.size()),
-                                                   asio::as_tuple(asio::use_awaitable));
-    co_return IoResult{ec, n};
+template <typename Stream, typename Token> auto async_stream_read_some(Stream &stream, ByteSpan buffer, Token &&token) {
+    return stream.async_read_some(asio::buffer(buffer.data(), buffer.size()), std::forward<Token>(token));
 }
 
-// Reads exactly `buffer.size()` bytes. Composed operation: it completes when
-// the buffer is full, or with an error (EOF included) after a partial read -
-// the result still reports the bytes read.
-template <typename Stream> asio::awaitable<IoResult> stream_read_exact(Stream &stream, ByteSpan buffer) {
-    auto [ec, n] = co_await asio::async_read(stream, asio::buffer(buffer.data(), buffer.size()),
-                                             asio::as_tuple(asio::use_awaitable));
-    co_return IoResult{ec, n};
+// Reads exactly `buffer.size()` bytes (composed). On error it still reports how
+// many bytes were read, because asio::async_read's completion carries that.
+template <typename Stream, typename Token>
+auto async_stream_read_exact(Stream &stream, ByteSpan buffer, Token &&token) {
+    return asio::async_read(stream, asio::buffer(buffer.data(), buffer.size()), std::forward<Token>(token));
 }
 
-template <typename Stream> asio::awaitable<IoResult> stream_write_all(Stream &stream, ConstByteSpan buffer) {
-    auto [ec, n] = co_await asio::async_write(stream, asio::buffer(buffer.data(), buffer.size()),
-                                              asio::as_tuple(asio::use_awaitable));
-    co_return IoResult{ec, n};
+template <typename Stream, typename Token>
+auto async_stream_write_all(Stream &stream, ConstByteSpan buffer, Token &&token) {
+    return asio::async_write(stream, asio::buffer(buffer.data(), buffer.size()), std::forward<Token>(token));
 }
 
 // Writes several buffers as one operation (one writev / TLS record batch), so a
-// frame header and its payload need not be concatenated first. Composed: it
-// completes only once every byte has been written.
-template <typename Stream>
-asio::awaitable<IoResult> stream_write_seq(Stream &stream, std::span<const ConstByteSpan> buffers) {
+// frame header and its payload need not be concatenated first.
+template <typename Stream, typename Token>
+auto async_stream_write_seq(Stream &stream, boost::span<const ConstByteSpan> buffers, Token &&token) {
     // Bounded by the iovec this builds. Callers pass a handful at most, so the
     // cap is a backstop rather than a real limit — dropping buffers past it
     // would write a *shorter* message and still report success, which is silent
@@ -83,9 +74,49 @@ asio::awaitable<IoResult> stream_write_seq(Stream &stream, std::span<const Const
     std::array<asio::const_buffer, kMaxWriteBuffers> bufs{};
     for (std::size_t i = 0; i < count; ++i)
         bufs[i] = asio::buffer(buffers[i].data(), buffers[i].size());
-    auto [ec, n] = co_await asio::async_write(stream, std::span<const asio::const_buffer>{bufs.data(), count},
-                                              asio::as_tuple(asio::use_awaitable));
-    co_return IoResult{ec, n};
+    // Pass the array itself, not a span over it: asio copies the *sequence
+    // object* into the composed operation, and a span copy is only a view.
+    // With a span, a write large enough to need a second async_write_some
+    // would read the buffer descriptors out of the dead stack frame (observed
+    // as a WebSocket echo stalling after exactly 128 KiB). The trailing
+    // zero-length entries are valid buffers and are skipped by the
+    // scatter-gather machinery.
+    return asio::async_write(stream, bufs, std::forward<Token>(token));
+}
+
+// Adapts a void(error_code, size_t) I/O operation to a void(error_code)
+// completion. Callers that do not care about the byte count (a write that
+// already knows it must move every byte, a shutdown) use this rather than
+// discarding the count in a lambda, which would strip the associated
+// cancellation slot.
+template <typename Start> struct ErrorOnlyOp {
+    Start start;
+    asio::any_io_executor ex;
+    bool started{false};
+
+    asio::any_io_executor get_executor() const noexcept { return ex; }
+
+    template <typename Self> void operator()(Self &self, error_code ec = {}, std::size_t = 0) {
+        if (!started) {
+            started = true;
+            // See the note in response.h: the handler construction moves this
+            // operation (and `start`) into the handler.
+            auto action = std::move(start);
+            action(asio::any_completion_handler<void(error_code, std::size_t)>(std::move(self)));
+            return;
+        }
+        self.complete(ec);
+    }
+};
+
+template <typename Token, typename Start>
+auto async_error_only(asio::any_io_executor ex, Token &&token, Start &&start) {
+    // Two copies: the operation takes one, async_compose's I/O object gets the
+    // other. Argument evaluation order is unspecified, so passing `ex` twice
+    // while moving one of them can leave the I/O object empty.
+    auto object = ex;
+    return asio::async_compose<Token, void(error_code)>(
+        ErrorOnlyOp<std::decay_t<Start>>{std::forward<Start>(start), std::move(ex)}, token, object);
 }
 
 } // namespace detail
@@ -100,29 +131,5 @@ template <typename Socket> inline void shutdown_socket(Socket &s) {
         s.close(ec);
     }
 }
-
-template <typename T>
-concept TransportLike = requires(T t, ByteSpan mut, ConstByteSpan buf, std::span<const ConstByteSpan> seq) {
-    // Read some bytes into `mut`; resolves with (ec, bytes_read).
-    { t.async_read_some(mut) } -> std::same_as<asio::awaitable<IoResult>>;
-    // Read exactly `mut.size()` bytes (composed); on error it reports how many
-    // bytes were read, so a caller can still act on a partial read.
-    { t.async_read(mut) } -> std::same_as<asio::awaitable<IoResult>>;
-    // Write all of `buf`; resolves with (ec, bytes_written).
-    { t.async_write(buf) } -> std::same_as<asio::awaitable<IoResult>>;
-    // Write every buffer as one operation — a single writev where the platform
-    // has one — so a head and its body, or a frame and its payload, need not be
-    // concatenated into a scratch buffer first. Also composed: it completes only
-    // once every byte has been written.
-    { t.async_write_seq(seq) } -> std::same_as<asio::awaitable<IoResult>>;
-    // The executor this transport (and its connection) is bound to.
-    { t.get_executor() };
-    // Remote peer endpoint (default-constructed for peerless transports).
-    { t.peer() } -> std::convertible_to<asio::ip::tcp::endpoint>;
-    // Native TLS handle, or nullopt for plaintext.
-    { t.tls_handle() } -> std::convertible_to<SslHandle>;
-    // Best-effort orderly shutdown + close.
-    { t.close() } -> std::same_as<void>;
-};
 
 } // namespace simple_http

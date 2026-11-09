@@ -23,6 +23,12 @@
 namespace simple_http {
 namespace openapi {
 
+// The default "no descriptor": Router::route's trailing parameter type, so a
+// route that passes nothing is not documented. Declared in this glaze-free
+// header so it exists even when the glaze-gated openapi.h is disabled in a
+// C++17 build.
+struct NoDoc {};
+
 // A declared response header (OAS `responses.<code>.headers.<name>`) — the
 // value type's inline schema (see openapi.h::response_header<T>).
 struct ResponseHeader {

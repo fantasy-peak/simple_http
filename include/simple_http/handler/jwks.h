@@ -1,51 +1,59 @@
 #pragma once
 
-// JSON Web Key Set (RFC 7517) support for the JWT verifier.
+// JSON Web Key Set (RFC 7517) support for the JWT verifier -- C++17 port.
 //
 // The middleware accepts a static JWKS document (`JwtConfig::jwks_json`) and
 // selects a key by the token's `kid`, or falls back to the single key when the
 // set has exactly one. Supported key types:
 //
-//   * RSA  — `kty:"RSA"`, `n`, `e`
-//   * EC   — `kty:"EC"`, `crv:"P-256"`, `x`, `y`
-//   * oct  — `kty:"oct"`, `k` (an HS* shared secret)
+//   * RSA  -- `kty:"RSA"`, `n`, `e`
+//   * EC   -- `kty:"EC"`, `crv:"P-256"`, `x`, `y`
+//   * oct  -- `kty:"oct"`, `k` (an HS* shared secret)
 //
 // Fetching is deliberately a small helper, not hidden inside the middleware:
 // the caller fetches the document (usually at startup) and passes the JSON to
 // JwtConfig. That keeps the middleware synchronous and makes key rotation /
 // refresh an explicit policy:
 //
-//     auto body = co_await simple_http::fetch_jwks_json(client, jwks_url);
-//     if (body)
-//         server.use(middleware::jwt(JwtConfig{
-//             .algorithms = {"RS256"},
-//             .jwks_json = *body,
-//             .issuer = "...", .audience = "...",
-//         }));
+//     simple_http::async_fetch_jwks_json(
+//         client, jwks_url,
+//         [&server](simple_http::error_code ec, std::string body) mutable {
+//             if (!ec)
+//                 server.use(simple_http::middleware::jwt(simple_http::JwtConfig{... .jwks_json = body ...}));
+//         });
 //
 // The document is parsed once, at middleware construction. A JWKS refresh means
 // constructing a new middleware (or recreating the server's chain); automatic
 // background refresh is not part of this layer.
+//
+// This header is part of the glaze-gated surface (core/glaze_support.h): the
+// document parser uses glaze reflection, so a plain C++17 build does not see
+// it.
 
-#include <atomic>
-#include <expected>
+#include "../core/glaze_support.h"
+
+#if SIMPLE_HTTP_CPP17_ENABLE_GLAZE
+
+#include <boost/asio/compose.hpp>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
-#include <glaze/glaze.hpp>
 #include <openssl/bn.h>
 #include <openssl/core_names.h>
 #include <openssl/evp.h>
 #include <openssl/param_build.h>
 
-#include "../client/http.h" // fetch_jwks_json (Client; no handler dependency)
+#include "../client/http.h" // async_fetch_jwks_json (Client; no handler dependency)
 #include "../core/base64.h"
 #include "../core/logging.h"
+#include <optional>
 
 namespace simple_http {
+
+namespace asio = boost::asio;
 
 struct JwkDocument {
     struct Key {
@@ -75,7 +83,7 @@ class Jwks {
   public:
     Jwks() = default;
 
-    static std::expected<Jwks, std::string> parse(std::string_view json) {
+    static std::optional<Jwks> parse(std::string_view json) {
         JwkDocument document{};
         // A JWKS published by a real IdP routinely carries members this verifier
         // does not use (`use`, `key_ops`, `x5c`, `x5t`, ...). glaze defaults to
@@ -83,7 +91,7 @@ class Jwks {
         // every token fail with "JWT key set unavailable".
         constexpr auto jwks_opts = glz::opts{.error_on_unknown_keys = false};
         if (auto ec = glz::read<jwks_opts>(document, json); ec) {
-            return std::unexpected(std::string{"invalid JWKS JSON"});
+            return std::nullopt;
         }
 
         Jwks out;
@@ -106,9 +114,9 @@ class Jwks {
             out.m_keys.push_back(std::move(key));
         }
         if (out.m_keys.empty()) {
-            return std::unexpected(std::string{"JWKS contains no usable keys"});
+            return std::nullopt;
         }
-        return out;
+        return std::optional<Jwks>(std::move(out));
     }
 
     // Selects a key for a token. A non-empty kid must match exactly; an empty
@@ -219,19 +227,49 @@ class Jwks {
     std::vector<JwkKey> m_keys;
 };
 
+namespace detail {
+
+struct FetchJwksOp {
+    Client &client;
+    std::string url;
+    std::size_t max_bytes;
+    std::shared_ptr<Response> response;
+
+    asio::any_io_executor get_executor() const noexcept { return client.executor(); }
+
+    // Initiation: start the buffered send. Completion arrives in the Response
+    // overload below.
+    template <typename Self> void operator()(Self &self) { client.get(url).send(std::move(self)); }
+
+    template <typename Self> void operator()(Self &self, error_code ec, Response sent) {
+        if (ec) {
+            self.complete(ec, std::string{});
+            return;
+        }
+        response = std::make_shared<Response>(std::move(sent));
+        response->async_read_all(max_bytes, std::move(self));
+    }
+
+    template <typename Self> void operator()(Self &self, error_code ec, std::string body) {
+        self.complete(ec, std::move(body));
+    }
+};
+
+} // namespace detail
+
 // Fetches a JWKS document. The caller decides when to refresh it and how to
 // react to a fetch failure; this is intentionally not a background cache.
-inline asio::awaitable<std::expected<std::string, error_code>> fetch_jwks_json(Client &client, std::string url,
-                                                                               std::size_t max_bytes = 1 << 20) {
-    auto response = co_await client.get(std::move(url)).send();
-    if (!response) {
-        co_return std::unexpected{response.error()};
-    }
-    auto body = co_await response->read_all(max_bytes);
-    if (!body) {
-        co_return std::unexpected{body.error()};
-    }
-    co_return std::move(*body);
+// Completion signature: void(error_code, std::string).
+template <typename Token>
+auto async_fetch_jwks_json(Client &client, std::string url, std::size_t max_bytes, Token &&token) {
+    return asio::async_compose<Token, void(error_code, std::string)>(
+        detail::FetchJwksOp{client, std::move(url), max_bytes}, token, client.executor());
+}
+
+template <typename Token> auto async_fetch_jwks_json(Client &client, std::string url, Token &&token) {
+    return async_fetch_jwks_json(client, std::move(url), 1 << 20, std::forward<Token>(token));
 }
 
 } // namespace simple_http
+
+#endif // SIMPLE_HTTP_CPP17_ENABLE_GLAZE

@@ -1,76 +1,91 @@
 #pragma once
 
-// HTTP/2 WebSocket stream transport (RFC 8441).
+// Adapter that makes one HTTP/2 extended-CONNECT stream look like a byte-stream
+// Transport to WsBackendImpl (RFC 8441). The TLS connection is already
+// established, so this only moves bytes: reads come from the stream's inbound
+// DATA queue, writes become outbound DATA frames.
 //
-// An extended CONNECT stream (`:method = CONNECT`, `:protocol = websocket`) is
-// a bidirectional byte pipe carried in DATA frames on one HTTP/2 stream. The
-// WebSocket frame codec is protocol-agnostic and lives behind the `Transport`
-// seam (see proto/websocket.h), so rather than duplicate it for HTTP/2 the
-// engine hands `WsBackendImpl` a transport backed by that single stream.
-//
-// `H2WsStream` is the engine-side half: the engine implements it per stream and
-// performs the DATA framing, flow control and read wake-ups. `Http2WsTransport`
-// is the concrete Transport-like adapter WsBackendImpl is templated on.
-//
-// The real transport was called out in the RFC 8441 gap; keeping this adapter a
-// plain byte stream means masking, fragmentation, Ping/Pong, Close ordering and
-// permessage-deflate all keep working unchanged over HTTP/2.
+// The adapter is token-based like every other transport in the C++17 port: the
+// engine's read/write helpers take an any_completion_handler, and the adapter's
+// async_read_some / async_write_seq / async_write forward the caller's token to
+// them, preserving its associated executor and cancellation slot.
 
-#include <boost/asio.hpp>
+#include <array>
+#include <boost/asio/any_completion_handler.hpp>
+#include <boost/asio/any_io_executor.hpp>
+#include <boost/asio/async_result.hpp>
 #include <cstddef>
 #include <memory>
-#include <span>
 #include <utility>
 
-#include "../../transport/transport.h" // IoResult, ConstByteSpan
+#include "../../core/compat.h"
+#include "../../core/types.h"
+#include "../../transport/transport.h"
 
 namespace simple_http {
 
 namespace asio = boost::asio;
 
-// Engine-side view of one extended-CONNECT stream, implemented by the HTTP/2
-// engine. All three operations run on the connection executor.
 class H2WsStream {
   public:
-    virtual ~H2WsStream() = default;
+    using IoCompletion = asio::any_completion_handler<void(error_code, std::size_t)>;
 
-    // Reads up to out.size() inbound WebSocket bytes. Completes with
-    // (eof/aborted, 0) once the peer ended its half or the stream is gone.
-    virtual asio::awaitable<IoResult> read_some(std::span<std::byte> out) = 0;
-    // Sends every buffer, concatenated, as outgoing WebSocket bytes, honoring
-    // the peer's flow-control window.
-    virtual asio::awaitable<IoResult> write_seq(std::span<const ConstByteSpan> bufs) = 0;
-    // Ends the stream (END_STREAM) and wakes any parked reader. Idempotent; does
-    // not touch the rest of the HTTP/2 connection.
+    virtual ~H2WsStream() = default;
+    virtual void read_some(ByteSpan out, IoCompletion done) = 0;
+    virtual void write_seq(boost::span<const ConstByteSpan> buffers, IoCompletion done) = 0;
     virtual void close() = 0;
     virtual asio::any_io_executor get_executor() = 0;
 };
 
-// A Transport-like byte stream over one HTTP/2 stream, handed to WsBackendImpl.
-// It only needs the surface WsBackendImpl actually calls: get_executor,
-// async_read_some, async_write_seq and close.
-class Http2WsTransport {
+template <typename Adapter> class Http2WsTransport {
   public:
-    // An inbound EOF here is the client's END_STREAM (half-close): the outbound
-    // direction stays open for the handler's reply. See websocket.h.
+    explicit Http2WsTransport(std::shared_ptr<Adapter> adapter) : m_adapter(std::move(adapter)) {}
+
+    // A peer's END_STREAM on an extended-CONNECT stream ends only its sending
+    // direction; writes stay legal until the application closes.
     static constexpr bool kReadEofIsHalfClose = true;
 
-    explicit Http2WsTransport(std::shared_ptr<H2WsStream> stream)
-        : m_stream(std::move(stream)), m_executor(m_stream->get_executor()) {}
+    asio::any_io_executor get_executor() { return m_adapter->get_executor(); }
 
-    [[nodiscard]] asio::any_io_executor get_executor() const { return m_executor; }
-
-    asio::awaitable<IoResult> async_read_some(std::span<std::byte> out) { co_return co_await m_stream->read_some(out); }
-
-    template <typename Buffers> asio::awaitable<IoResult> async_write_seq(const Buffers &bufs) {
-        co_return co_await m_stream->write_seq(std::span<const ConstByteSpan>{bufs});
+    template <typename Token> auto async_read_some(ByteSpan out, Token &&token) {
+        auto adapter = m_adapter;
+        return asio::async_initiate<Token, void(error_code, std::size_t)>(
+            [adapter, out](auto handler) mutable { adapter->read_some(out, std::move(handler)); }, token);
     }
 
-    void close() { m_stream->close(); }
+    template <typename Token> auto async_write_seq(boost::span<const ConstByteSpan> buffers, Token &&token) {
+        auto adapter = m_adapter;
+        return asio::async_initiate<Token, void(error_code, std::size_t)>(
+            [adapter, buffers](auto handler) mutable { adapter->write_seq(buffers, std::move(handler)); }, token);
+    }
+
+    template <typename Token> auto async_write(ConstByteSpan buffer, Token &&token) {
+        auto adapter = m_adapter;
+        return asio::async_initiate<Token, void(error_code, std::size_t)>(
+            [adapter, buffer](auto handler) mutable {
+                const std::array<ConstByteSpan, 1> buffers{buffer};
+                adapter->write_seq(boost::span<const ConstByteSpan>{buffers.data(), buffers.size()},
+                                   std::move(handler));
+            },
+            token);
+    }
+
+    template <typename Token> auto async_read(ByteSpan buffer, Token &&token) {
+        return async_read_some(buffer, std::forward<Token>(token));
+    }
+
+    template <typename Token> auto async_shutdown(Token &&token) {
+        return asio::async_initiate<Token, void(error_code)>([](auto handler) { std::move(handler)(error_code{}); },
+                                                             token);
+    }
+
+    void close() { m_adapter->close(); }
+
+    asio::ip::tcp::endpoint peer() const { return {}; }
+    SslHandle tls_handle() const { return std::nullopt; }
 
   private:
-    std::shared_ptr<H2WsStream> m_stream;
-    asio::any_io_executor m_executor;
+    std::shared_ptr<Adapter> m_adapter;
 };
 
 } // namespace simple_http

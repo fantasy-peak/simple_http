@@ -1,6 +1,6 @@
 #pragma once
 
-// Shared WebSocket reverse-proxy handshake helpers.
+// Shared WebSocket reverse-proxy handshake helpers (C++17 token-only port).
 //
 // Both frontends use the same upstream leg:
 //   * HTTP/1.1 Upgrade (h1 frontend, and h2 frontend translated by the engine);
@@ -12,30 +12,31 @@
 // connect budget. The two engines keep their own tunnel loops because one side
 // is a Transport and the other is an h2 stream, but the handshake must not
 // drift between them.
+//
+// Every asynchronous helper is an Asio initiation with an explicit token.
 
 #include <algorithm>
 #include <array>
 #include <boost/asio.hpp>
 #include <boost/asio/cancel_after.hpp>
-#include <boost/asio/experimental/awaitable_operators.hpp>
 #include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <expected>
 #include <memory>
 #include <optional>
 #include <random>
-#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
-#include <variant>
 #include <vector>
 
 #include "../core/base64.h"
+#include "../core/compat.h"
+#include "../core/http_field.h"
 #include "../core/http_status.h"
 #include "../core/logging.h"
+#include "../core/resolve.h"
 #include "../core/types.h"
 #include "../proto/headers.h"
 #include "../proto/ws_frame.h" // ws_accept_key
@@ -192,9 +193,9 @@ template <typename Socket> void ws_proxy_close(Socket &backend) {
 // otherwise the frontend's path, always carrying the frontend's query string
 // (session tokens and code-server's reconnectionToken live there). `query` is
 // nullopt when the inbound target had no '?' at all; an engaged empty view means
-// the target ended in a bare '?', which is replayed verbatim (an h1 proxy
-// historically preserved it). Returns nullopt when the result contains
-// CR/LF/NUL — the caller answers 400 and must not splice it into a request line.
+// the target ended in a bare '?', which is replayed verbatim. Returns nullopt
+// when the result contains CR/LF/NUL -- the caller answers 400 and must not
+// splice it into a request line.
 inline std::optional<std::string> ws_proxy_replay_target(std::string_view rewrite_path, std::string_view path,
                                                          std::optional<std::string_view> query) {
     std::string target{rewrite_path.empty() ? path : rewrite_path};
@@ -207,77 +208,6 @@ inline std::optional<std::string> ws_proxy_replay_target(std::string_view rewrit
     if (contains_ctl(target))
         return std::nullopt;
     return target;
-}
-
-// Idle watchdog for a byte-level tunnel: returns true when `deadline` has
-// passed without the tunnel finishing, false when the competing transfer
-// cancelled it. The deadline is refreshed by every successful read/write, so it
-// is taken by reference and re-read on each wake-up: copying it would freeze the
-// first value and turn the idle timeout into a hard lifetime cap. The referent
-// lives in the calling coroutine's frame, which stays alive until the `||` race
-// returns.
-template <typename Executor>
-asio::awaitable<bool> ws_tunnel_idle_guard(const Executor &executor,
-                                           const std::chrono::steady_clock::time_point &deadline) {
-    for (;;) {
-        if (std::chrono::steady_clock::now() >= deadline)
-            co_return true;
-        asio::steady_timer timer{executor};
-        timer.expires_at(deadline);
-        auto [ec] = co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
-        if (ec)
-            co_return false; // cancelled: the tunnel already finished
-    }
-}
-
-// One bounded read from the backend. `timeout == 0` means no deadline (the
-// route's connect budget disabled); otherwise the operation is cancelled with
-// asio::error::timed_out. Every handshake/refusal read goes through this so a
-// backend that accepts and then says nothing cannot pin the frontend forever.
-template <typename Socket>
-asio::awaitable<std::pair<error_code, std::size_t>> ws_proxy_read_some(Socket &socket, std::span<std::byte> buf,
-                                                                       std::chrono::steady_clock::duration timeout) {
-    if (timeout.count() <= 0) {
-        auto [ec, n] =
-            co_await socket.async_read_some(asio::buffer(buf.data(), buf.size()), asio::as_tuple(asio::use_awaitable));
-        co_return std::pair{ec, n};
-    }
-    auto [ec, n] = co_await socket.async_read_some(asio::buffer(buf.data(), buf.size()),
-                                                   asio::cancel_after(timeout, asio::as_tuple(asio::use_awaitable)));
-    co_return std::pair{ec, n};
-}
-
-// Reads and parses the backend's response head. Bounded by `max_header_bytes`;
-// anything after the head is returned as `initial` so no tunnel byte is lost.
-template <typename Socket>
-asio::awaitable<std::expected<WsProxyReplyHead, error_code>>
-ws_proxy_read_reply(Socket &socket, std::size_t max_header_bytes, std::chrono::steady_clock::duration timeout) {
-    H1ResponseParser parser;
-    std::string raw;
-    std::array<std::byte, 4096> buf{};
-    for (;;) {
-        const auto state = parser.parse_head();
-        if (state == H1ResponseParser::State::Done) {
-            const std::size_t consumed = parser.consumed();
-            WsProxyReplyHead out;
-            out.head = parser.head();
-            out.raw = raw.substr(0, consumed);
-            out.initial = raw.substr(consumed);
-            co_return out;
-        }
-        if (state == H1ResponseParser::State::Error) {
-            co_return std::unexpected{make_error_code(asio::error::invalid_argument)};
-        }
-        if (raw.size() > max_header_bytes) {
-            co_return std::unexpected{make_error_code(asio::error::no_buffer_space)};
-        }
-        auto [ec, n] = co_await ws_proxy_read_some(socket, std::span<std::byte>{buf}, timeout);
-        if (ec || n == 0) {
-            co_return std::unexpected{ec ? ec : make_error_code(asio::error::eof)};
-        }
-        raw.append(reinterpret_cast<const char *>(buf.data()), n);
-        parser.feed(std::string_view{reinterpret_cast<const char *>(buf.data()), n});
-    }
 }
 
 // Tracks where an HTTP/1.1 body ends without buffering or decoding it. Only the
@@ -338,8 +268,6 @@ class H1ChunkedEndScanner {
                 m_state = c == '\n' ? State::TrailerStart : State::Done;
                 break;
             case State::TrailerEndLf:
-                // The terminating blank line's LF; anything else is malformed,
-                // and either way the relay stops here.
                 m_state = State::Done;
                 break;
             case State::Done:
@@ -370,65 +298,6 @@ class H1ChunkedEndScanner {
     std::uint64_t m_remaining{0};
 };
 
-// Appends a non-101 refusal body to `out` (which already holds the head and the
-// bytes returned as `initial`) until the response ends. Content-Length is
-// honored exactly; chunked runs to its terminating chunk; anything else is
-// close-delimited and stops at EOF. Bounded in bytes and in time.
-template <typename Socket>
-asio::awaitable<void> ws_proxy_relay_refusal_body(Socket &backend, std::string &out, std::string_view initial,
-                                                  const Headers &headers, std::chrono::steady_clock::duration timeout) {
-    constexpr std::size_t kMaxRefusalBodyBytes = 4 * 1024 * 1024;
-    const std::size_t body_start = out.size() - initial.size();
-    std::array<std::byte, 8192> buf{};
-
-    std::uint64_t want = 0;
-    bool has_length = false;
-    if (auto cl = headers.get("content-length")) {
-        auto [ptr, ec] = std::from_chars(cl->data(), cl->data() + cl->size(), want);
-        has_length = ec == std::errc{} && ptr == cl->data() + cl->size();
-    }
-    bool chunked = false;
-    for (auto value : headers.get_all("transfer-encoding")) {
-        if (value_has_token(value, "chunked"))
-            chunked = true;
-    }
-    // RFC 9112 §6.3: Transfer-Encoding overrides Content-Length. Honoring both
-    // would stop at a byte count the sender did not frame the body with.
-    if (chunked)
-        has_length = false;
-
-    auto body_size = [&] { return out.size() - body_start; };
-    auto over_cap = [&] { return body_size() >= kMaxRefusalBodyBytes; };
-
-    if (has_length && initial.size() >= want) {
-        co_return; // the head read already carried the whole body
-    }
-
-    H1ChunkedEndScanner scanner;
-    if (chunked)
-        scanner.feed(initial);
-
-    std::uint64_t left = has_length ? want - std::min<std::uint64_t>(want, initial.size()) : 0;
-    for (;;) {
-        if (over_cap())
-            co_return;
-        if (has_length && left == 0)
-            co_return;
-        if (chunked && scanner.done())
-            co_return;
-        const std::size_t ask =
-            has_length ? static_cast<std::size_t>(std::min<std::uint64_t>(buf.size(), left)) : buf.size();
-        auto [ec, n] = co_await ws_proxy_read_some(backend, std::span<std::byte>{buf.data(), ask}, timeout);
-        if (ec || n == 0)
-            co_return; // EOF is the end for a close-delimited body, and an error ends the relay
-        out.append(reinterpret_cast<const char *>(buf.data()), n);
-        if (chunked)
-            scanner.feed(std::string_view{reinterpret_cast<const char *>(buf.data()), n});
-        if (has_length)
-            left -= std::min<std::uint64_t>(left, n);
-    }
-}
-
 // A 101 is only usable if it actually switched to WebSocket (Go checks the
 // Upgrade type; the accept key check protects the h2 leg, where the proxy
 // synthesized the key and the frontend cannot see it).
@@ -455,57 +324,248 @@ inline bool ws_validate_101(const ParsedResponseHead &head, std::string_view exp
     return true;
 }
 
-// Resolves, connects and applies the route's connect budget on the connection
-// executor. The socket is returned alive; the caller owns it.
-template <typename Executor>
-asio::awaitable<std::expected<std::shared_ptr<asio::ip::tcp::socket>, error_code>>
-ws_proxy_connect(const Executor &executor, const WsProxyTarget &target) {
-    using namespace asio::experimental::awaitable_operators;
-    auto socket = std::make_shared<asio::ip::tcp::socket>(executor);
-    // Same policy as the client layer (ClientConfig::tcp_nodelay): on by
-    // default, best-effort, applied before the dial. A WebSocket tunnel is
-    // latency-sensitive and often writes small frames, so Nagle would add a
-    // delayed-ACK stall per message.
-    if (target.tcp_nodelay) {
-        error_code ne;
-        socket->set_option(asio::ip::tcp::no_delay(true), ne);
-    }
+// --- asynchronous helpers ----------------------------------------------------
 
-    auto connect_op = [&]() -> asio::awaitable<error_code> {
-        auto [rec, endpoints] = co_await resolve_endpoints(target.resolve, target.host, target.port, executor);
-        if (rec)
-            co_return rec;
-        if (endpoints.empty())
-            co_return make_error_code(asio::error::host_not_found);
-        auto [cec, _] = co_await asio::async_connect(*socket, endpoints, asio::as_tuple(asio::use_awaitable));
-        (void)_;
-        co_return cec;
-    };
+// Reads and parses the backend's response head. Bounded by `max_header_bytes`;
+// anything after the head is returned as `initial` so no tunnel byte is lost.
+// Completion: void(error_code, WsProxyReplyHead).
+//
+// The mutable state lives behind a shared_ptr: passing `std::move(self)` to an
+// Asio operation moves the composed operation, and a buffer bound to a member
+// array would point into the moved-from copy. Sharing the state keeps the
+// read buffer, parser and accumulated bytes in one heap object that every copy
+// of the operation refers to.
+template <typename Socket> struct WsReadReplyState {
+    explicit WsReadReplyState(Socket &s, std::size_t cap, std::chrono::steady_clock::duration t)
+        : socket(s), max_header_bytes(cap), timeout(t) {}
 
-    error_code ec;
-    if (target.connect_timeout.count() > 0) {
-        auto timer_op = [&]() -> asio::awaitable<void> {
-            asio::steady_timer timer{executor};
-            timer.expires_after(target.connect_timeout);
-            auto [tec] = co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
-            (void)tec;
-            co_return;
-        };
-        auto outcome = co_await (connect_op() || timer_op());
-        if (auto *value = std::get_if<error_code>(&outcome)) {
-            ec = *value;
+    Socket &socket;
+    std::size_t max_header_bytes;
+    std::chrono::steady_clock::duration timeout;
+    H1ResponseParser parser;
+    std::string raw;
+    std::array<std::byte, 4096> buf{};
+    bool started{false};
+};
+
+template <typename Socket> struct WsReadReplyOp {
+    std::shared_ptr<WsReadReplyState<Socket>> state;
+
+    asio::any_io_executor get_executor() const noexcept { return state->socket.get_executor(); }
+
+    template <typename Self> void operator()(Self &self, error_code ec = {}, std::size_t n = 0) {
+        auto &st = *state;
+        if (!st.started) {
+            st.started = true;
         } else {
-            ec = make_error_code(asio::error::timed_out);
+            if (ec || n == 0) {
+                self.complete(ec ? ec : make_error_code(asio::error::eof), WsProxyReplyHead{});
+                return;
+            }
+            st.raw.append(reinterpret_cast<const char *>(st.buf.data()), n);
+            st.parser.feed(std::string_view{reinterpret_cast<const char *>(st.buf.data()), n});
         }
-    } else {
-        ec = co_await connect_op();
+        const auto state_now = st.parser.parse_head();
+        if (state_now == H1ResponseParser::State::Done) {
+            const std::size_t consumed = st.parser.consumed();
+            // The head may complete in the same read that pushes it over the
+            // bound; the NeedMore check below would never run. Same rule as the
+            // h1 request parser (AGENTS §9.28).
+            if (consumed > st.max_header_bytes) {
+                self.complete(make_error_code(asio::error::no_buffer_space), WsProxyReplyHead{});
+                return;
+            }
+            WsProxyReplyHead out;
+            out.head = st.parser.head();
+            out.raw = st.raw.substr(0, consumed);
+            out.initial = st.raw.substr(consumed);
+            self.complete(error_code{}, std::move(out));
+            return;
+        }
+        if (state_now == H1ResponseParser::State::Error) {
+            self.complete(make_error_code(asio::error::invalid_argument), WsProxyReplyHead{});
+            return;
+        }
+        if (st.raw.size() > st.max_header_bytes) {
+            self.complete(make_error_code(asio::error::no_buffer_space), WsProxyReplyHead{});
+            return;
+        }
+        if (st.timeout.count() > 0) {
+            st.socket.async_read_some(asio::buffer(st.buf.data(), st.buf.size()),
+                                      asio::cancel_after(st.timeout, std::move(self)));
+        } else {
+            st.socket.async_read_some(asio::buffer(st.buf.data(), st.buf.size()), std::move(self));
+        }
     }
-    if (ec) {
-        error_code ignored;
-        socket->close(ignored);
-        co_return std::unexpected{ec};
+};
+
+template <typename Socket, typename Token>
+auto async_ws_proxy_read_reply(Socket &socket, std::size_t max_header_bytes,
+                               std::chrono::steady_clock::duration timeout, Token &&token) {
+    return asio::async_compose<Token, void(error_code, WsProxyReplyHead)>(
+        WsReadReplyOp<Socket>{std::make_shared<WsReadReplyState<Socket>>(socket, max_header_bytes, timeout)}, token,
+        socket.get_executor());
+}
+
+// Appends a non-101 refusal body to `out` (which already holds the head and the
+// bytes returned as `initial`) until the response ends. Content-Length is
+// honored exactly; chunked runs to its terminating chunk; anything else is
+// close-delimited and stops at EOF. Bounded in bytes and in time.
+template <typename Socket> struct WsRelayRefusalState {
+    WsRelayRefusalState(Socket &s, std::string &o, std::size_t initial, Headers h,
+                        std::chrono::steady_clock::duration t)
+        : socket(s), out(o), initial_size(initial), headers(std::move(h)), timeout(t) {}
+
+    Socket &socket;
+    std::string &out;
+    std::size_t initial_size;
+    Headers headers;
+    std::chrono::steady_clock::duration timeout;
+
+    std::uint64_t want{0};
+    bool has_length{false};
+    bool chunked{false};
+    H1ChunkedEndScanner scanner;
+    std::uint64_t left{0};
+    std::size_t body_start{0};
+    std::array<std::byte, 8192> buf{};
+    bool started{false};
+
+    static constexpr std::size_t kMaxRefusalBodyBytes = 4 * 1024 * 1024;
+
+    void prepare() {
+        body_start = out.size() - initial_size;
+        if (auto cl = headers.get("content-length")) {
+            auto [ptr, e] = std::from_chars(cl->data(), cl->data() + cl->size(), want);
+            has_length = e == std::errc{} && ptr == cl->data() + cl->size();
+        }
+        for (auto value : headers.get_all("transfer-encoding")) {
+            if (value_has_token(value, "chunked"))
+                chunked = true;
+        }
+        // RFC 9112 §6.3: Transfer-Encoding overrides Content-Length.
+        if (chunked)
+            has_length = false;
+        if (chunked)
+            scanner.feed(out.substr(out.size() - initial_size));
+        left = has_length ? want - std::min<std::uint64_t>(want, initial_size) : 0;
     }
-    co_return socket;
+
+    std::size_t body_size() const { return out.size() - body_start; }
+};
+
+template <typename Socket> struct WsRelayRefusalOp {
+    std::shared_ptr<WsRelayRefusalState<Socket>> state;
+
+    asio::any_io_executor get_executor() const noexcept { return state->socket.get_executor(); }
+
+    template <typename Self> void operator()(Self &self, error_code ec = {}, std::size_t n = 0) {
+        auto &st = *state;
+        if (!st.started) {
+            st.started = true;
+            st.prepare();
+            if ((st.has_length && st.initial_size >= st.want) || (st.has_length && st.left == 0) ||
+                (st.chunked && st.scanner.done())) {
+                self.complete(error_code{});
+                return;
+            }
+        } else {
+            if (ec || n == 0) {
+                self.complete(error_code{});
+                return;
+            }
+            st.out.append(reinterpret_cast<const char *>(st.buf.data()), n);
+            if (st.chunked)
+                st.scanner.feed(std::string_view{reinterpret_cast<const char *>(st.buf.data()), n});
+            if (st.has_length)
+                st.left -= std::min<std::uint64_t>(st.left, n);
+        }
+        if (st.body_size() >= WsRelayRefusalState<Socket>::kMaxRefusalBodyBytes || (st.has_length && st.left == 0) ||
+            (st.chunked && st.scanner.done())) {
+            self.complete(error_code{});
+            return;
+        }
+        const std::size_t ask =
+            st.has_length ? static_cast<std::size_t>(std::min<std::uint64_t>(st.buf.size(), st.left)) : st.buf.size();
+        if (st.timeout.count() > 0) {
+            st.socket.async_read_some(asio::buffer(st.buf.data(), ask),
+                                      asio::cancel_after(st.timeout, std::move(self)));
+        } else {
+            st.socket.async_read_some(asio::buffer(st.buf.data(), ask), std::move(self));
+        }
+    }
+};
+
+template <typename Socket, typename Token>
+auto async_ws_proxy_relay_refusal_body(Socket &socket, std::string &out, std::string_view initial, Headers headers,
+                                       std::chrono::steady_clock::duration timeout, Token &&token) {
+    return asio::async_compose<Token, void(error_code)>(
+        WsRelayRefusalOp<Socket>{
+            std::make_shared<WsRelayRefusalState<Socket>>(socket, out, initial.size(), std::move(headers), timeout)},
+        token, socket.get_executor());
+}
+
+// Resolves, connects and applies the route's connect budget on the connection
+// executor. Completion: void(error_code, shared_ptr<tcp::socket>).
+//
+// Implemented with async_initiate + an explicitly shared state rather than a
+// composed operation: the two steps complete with different argument types
+// (vector<endpoint> then endpoint), and a single composed operator() overload
+// set cannot be both the token for the resolver and for the connect.
+template <typename Executor, typename Token>
+auto async_ws_proxy_connect(Executor executor, WsProxyTarget target, Token &&token) {
+    return asio::async_initiate<Token, void(error_code, std::shared_ptr<asio::ip::tcp::socket>)>(
+        [executor, target = std::move(target)](auto handler) mutable {
+            struct State {
+                State(Executor ex, WsProxyTarget t,
+                      asio::any_completion_handler<void(error_code, std::shared_ptr<asio::ip::tcp::socket>)> h)
+                    : executor(ex), target(std::move(t)), done(std::move(h)) {}
+                Executor executor;
+                WsProxyTarget target;
+                std::shared_ptr<asio::ip::tcp::socket> socket;
+                asio::any_completion_handler<void(error_code, std::shared_ptr<asio::ip::tcp::socket>)> done;
+            };
+            auto state = std::make_shared<State>(executor, std::move(target), std::move(handler));
+            state->socket = std::make_shared<asio::ip::tcp::socket>(state->executor);
+            // Same policy as the client layer (ClientConfig::tcp_nodelay): on by
+            // default, best-effort, applied before the dial. A WebSocket tunnel
+            // is latency-sensitive and often writes small frames, so Nagle would
+            // add a delayed-ACK stall per message.
+            if (state->target.tcp_nodelay) {
+                error_code ne;
+                state->socket->set_option(asio::ip::tcp::no_delay(true), ne);
+            }
+            async_resolve_endpoints(
+                state->target.resolve, state->target.host, state->target.port, state->executor,
+                [state](error_code ec, std::vector<asio::ip::tcp::endpoint> endpoints) {
+                    if (ec) {
+                        std::move(state->done)(ec, nullptr);
+                        return;
+                    }
+                    if (endpoints.empty()) {
+                        std::move(state->done)(make_error_code(asio::error::host_not_found), nullptr);
+                        return;
+                    }
+                    auto on_connect = [state](error_code cec, asio::ip::tcp::endpoint) {
+                        if (cec) {
+                            error_code ignored;
+                            state->socket->close(ignored);
+                            std::move(state->done)(
+                                cec == asio::error::operation_aborted ? make_error_code(asio::error::timed_out) : cec,
+                                nullptr);
+                            return;
+                        }
+                        std::move(state->done)(error_code{}, state->socket);
+                    };
+                    if (state->target.connect_timeout.count() > 0) {
+                        asio::async_connect(*state->socket, endpoints,
+                                            asio::cancel_after(state->target.connect_timeout, std::move(on_connect)));
+                    } else {
+                        asio::async_connect(*state->socket, endpoints, std::move(on_connect));
+                    }
+                });
+        },
+        token);
 }
 
 } // namespace detail

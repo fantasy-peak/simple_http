@@ -24,9 +24,9 @@ RequestPtr make_request(asio::io_context &ctx, std::string path, Method method =
 }
 
 std::shared_ptr<FakeResponseSink> dispatch(asio::io_context &ctx, Router &router, RequestPtr req) {
-    auto writer = std::make_shared<FakeResponseSink>();
+    auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
     auto res = std::make_shared<ResponseWriter>(writer);
-    REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
+    REQUIRE(run_on(ctx, await_dispatch(router, req, res)));
     return writer;
 }
 
@@ -39,7 +39,7 @@ TEST_CASE("middleware: request_id adopts, generates, echoes and publishes", "[mi
     router.route(any_methods, "/echo", [&](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
         const auto *id = req->get_state<middleware::RequestId>();
         seen = id ? id->value : "";
-        co_await res->status(status::ok).send("ok");
+        co_await res->status(status::ok).async_send("ok", asio::use_awaitable);
     });
 
     asio::io_context ctx;
@@ -66,7 +66,7 @@ TEST_CASE("middleware: access_log records after the chain with the real status",
     ScopedLog capture;
     router.use(middleware::access_log());
     router.route({Method::Get}, "/ok", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(status::accepted).send("ok");
+        co_await res->status(status::accepted).async_send("ok", asio::use_awaitable);
     });
 
     asio::io_context ctx;
@@ -85,12 +85,11 @@ TEST_CASE("middleware: recovery turns a throwing middleware into a 500", "[middl
     Router router;
     ScopedLog capture;
     router.use(middleware::recovery());
-    router.use([](RequestPtr, ResponsePtr, SslHandle, Next) -> asio::awaitable<void> {
+    router.use([](RequestPtr, ResponsePtr, SslHandle, Next, HandlerCompletion) {
         throw std::runtime_error("boom");
-        co_return;
     });
     router.route(any_methods, "/never", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(status::ok).send("never"); // unreachable: the chain throws first
+        co_await res->status(status::ok).async_send("never", asio::use_awaitable); // unreachable: the chain throws first
     });
 
     asio::io_context ctx;
@@ -112,7 +111,7 @@ TEST_CASE("middleware: basic_auth accepts the right pair and 401s the rest", "[m
     router.use(middleware::basic_auth("svc", "s3cret"));
     router.route(any_methods, "/secure", [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
         handler_ran = true;
-        co_await res->status(status::ok).send("data");
+        co_await res->status(status::ok).async_send("data", asio::use_awaitable);
     });
 
     asio::io_context ctx;
@@ -165,13 +164,19 @@ TEST_CASE("middleware: real_ip trusts forwarded headers only from a trusted peer
     auto run_mw = [](RequestPtr req, std::vector<std::string> trusted) -> asio::awaitable<std::optional<std::string>> {
         auto mw = middleware::real_ip(std::move(trusted));
         std::optional<std::string> seen;
-        Next next = [&seen](RequestPtr r, ResponsePtr, SslHandle) -> asio::awaitable<void> {
+        Next next = [&seen](RequestPtr r, ResponsePtr, SslHandle, HandlerCompletion done) {
             if (auto *ip = r->get_state<middleware::ClientIp>()) {
                 seen = ip->value;
             }
-            co_return;
+            std::move(done)();
         };
-        co_await mw(std::move(req), nullptr, std::nullopt, std::move(next));
+        auto token = asio::use_awaitable;
+        co_await asio::async_initiate<decltype(token), void()>(
+            [&](auto handler) {
+                mw(std::move(req), nullptr, std::nullopt, std::move(next),
+                   [handler = std::move(handler)]() mutable { std::move(handler)(); });
+            },
+            token);
         co_return seen;
     };
     auto run = [&](RequestPtr req, std::vector<std::string> trusted) -> std::optional<std::string> {

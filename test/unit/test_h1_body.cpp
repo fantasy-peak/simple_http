@@ -37,7 +37,7 @@ BodyOutcome run_chunked(std::string request, EngineLimits limits = {}) {
     BodyOutcome out;
     auto dispatcher = [&out](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res,
                              SslHandle) -> asio::awaitable<void> {
-        auto body = co_await req->body().read_all();
+        auto body = co_await body_read_all(req->body());
         if (!body) {
             out.ec = body.error();
             co_return;
@@ -48,11 +48,11 @@ BodyOutcome run_chunked(std::string request, EngineLimits limits = {}) {
         if (auto value = req->trailers().get("x-check")) {
             out.trailer = std::string{*value};
         }
-        co_await res->status(status::ok).send("ok");
+        co_await res->status(status::ok).async_send("ok", asio::use_awaitable);
     };
 
     auto engine = std::make_shared<Http1Engine<MockTransport>>(transport, limits);
-    out.completed = run_on(ctx, engine->run(dispatcher));
+    out.completed = run_on(ctx, run_engine(*engine, dispatcher));
     return out;
 }
 

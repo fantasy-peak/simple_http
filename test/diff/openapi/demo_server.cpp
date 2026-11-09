@@ -125,9 +125,9 @@ template <typename T> std::string to_json(const T &value) {
 // runtime half of the document's requestBody schema.
 template <typename TReq> asio::awaitable<std::optional<TReq>> read_body_api(RequestPtr req, ResponsePtr res) {
     openapi::BodyError err;
-    auto in = co_await openapi::read_body<TReq>(*req, err);
+    auto in = co_await openapi::async_read_body<TReq>(*req, err, asio::use_awaitable);
     if (!in) {
-        co_await res->status(err.status).content_type(mime::app_json).send(to_json(ErrorBody{.error = err.message}));
+        co_await res->status(err.status).content_type(mime::app_json).async_send(to_json(ErrorBody{.error = err.message}), asio::use_awaitable);
     }
     co_return in;
 }
@@ -157,7 +157,7 @@ asio::awaitable<void> unauthorized(ResponsePtr res) {
     co_await res->status(status::unauthorized)
         .header("www-authenticate", "Bearer realm=\"petshop\"")
         .content_type(mime::app_json)
-        .send(to_json(ErrorBody{.error = "missing or invalid bearer token"}));
+        .async_send(to_json(ErrorBody{.error = "missing or invalid bearer token"}), asio::use_awaitable);
     co_return;
 }
 
@@ -180,7 +180,7 @@ int main() {
         [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
             PetList list;
             list.items.emplace_back(Pet{.id = 10, .name = "rex", .status = "available"});
-            co_await res->status(status::ok).content_type(mime::app_json).send(to_json(list));
+            co_await res->status(status::ok).content_type(mime::app_json).async_send(to_json(list), asio::use_awaitable);
         },
         openapi::doc()
             .response<PetList>()
@@ -199,7 +199,7 @@ int main() {
             if (!p || p->id <= 0) {
                 co_await res->status(status::not_found)
                     .content_type(mime::app_json)
-                    .send(to_json(ErrorBody{.error = "no such pet"}));
+                    .async_send(to_json(ErrorBody{.error = "no such pet"}), asio::use_awaitable);
                 co_return;
             }
             // The declared request header, read for real: a
@@ -210,7 +210,7 @@ int main() {
             if (trace) {
                 res->header("x-trace-id", std::string{*trace});
             }
-            co_await res->send(to_json(Pet{.id = p->id, .name = "rex", .status = "available"}));
+            co_await res->async_send(to_json(Pet{.id = p->id, .name = "rex", .status = "available"}), asio::use_awaitable);
         },
         // The `id` path parameter comes from PetParams: name from
         // the field, schema from its type, required. Nothing to
@@ -236,12 +236,12 @@ int main() {
             if (!p || p->owner.empty() || p->pet_id == 0) {
                 co_await res->status(status::not_found)
                     .content_type(mime::app_json)
-                    .send(to_json(ErrorBody{.error = "no such pet"}));
+                    .async_send(to_json(ErrorBody{.error = "no such pet"}), asio::use_awaitable);
                 co_return;
             }
             co_await res->status(status::ok)
                 .content_type(mime::app_json)
-                .send(to_json(Pet{.id = static_cast<std::int64_t>(p->pet_id), .name = "rex", .status = "available"}));
+                .async_send(to_json(Pet{.id = static_cast<std::int64_t>(p->pet_id), .name = "rex", .status = "available"}), asio::use_awaitable);
         },
         openapi::doc()
             .path_params<OwnerPetParams>()
@@ -263,15 +263,15 @@ int main() {
             if (!p) {
                 co_await res->status(status::not_found)
                     .content_type(mime::app_json)
-                    .send(to_json(ErrorBody{.error = "no such item"}));
+                    .async_send(to_json(ErrorBody{.error = "no such item"}), asio::use_awaitable);
                 co_return;
             }
             co_await res->status(status::ok)
                 .content_type(mime::app_json)
-                .send(to_json(Order{.id = static_cast<std::int64_t>(p->item_id),
+                .async_send(to_json(Order{.id = static_cast<std::int64_t>(p->item_id),
                                     .pet_id = static_cast<std::int64_t>(p->order_id),
                                     .quantity = 1,
-                                    .status = "placed"}));
+                                    .status = "placed"}), asio::use_awaitable);
         },
         openapi::doc()
             .path_params<OrderItemParams>()
@@ -297,7 +297,7 @@ int main() {
             if (in->name == "taken") {
                 co_await res->status(status::conflict)
                     .content_type(mime::app_json)
-                    .send(to_json(ErrorBody{.error = "name already taken"}));
+                    .async_send(to_json(ErrorBody{.error = "name already taken"}), asio::use_awaitable);
                 co_return;
             }
             // The declared response header, set for
@@ -305,7 +305,7 @@ int main() {
             (void)co_await res->status(status::created)
                 .header("x-request-id", "req-42")
                 .content_type(mime::app_json)
-                .send(to_json(Pet{.id = 100, .name = in->name, .status = in->status.value_or("available")}));
+                .async_send(to_json(Pet{.id = 100, .name = in->name, .status = in->status.value_or("available")}), asio::use_awaitable);
         },
         openapi::doc()
             .request_body<CreatePetReq>()
@@ -329,12 +329,12 @@ int main() {
             if (id <= 0) {
                 co_await res->status(status::not_found)
                     .content_type(mime::app_json)
-                    .send(to_json(ErrorBody{.error = "no such order"}));
+                    .async_send(to_json(ErrorBody{.error = "no such order"}), asio::use_awaitable);
                 co_return;
             }
             co_await res->status(status::ok)
                 .content_type(mime::app_json)
-                .send(to_json(Order{.id = id, .pet_id = 10, .quantity = 2}));
+                .async_send(to_json(Order{.id = id, .pet_id = 10, .quantity = 2}), asio::use_awaitable);
         },
         openapi::doc()
             .response<Order>()
@@ -357,7 +357,7 @@ int main() {
             }
             co_await res->status(status::created)
                 .content_type(mime::app_json)
-                .send(to_json(Order{.id = 7, .pet_id = in->pet_id, .quantity = in->quantity.value_or(1)}));
+                .async_send(to_json(Order{.id = 7, .pet_id = in->pet_id, .quantity = in->quantity.value_or(1)}), asio::use_awaitable);
         },
         openapi::doc()
             .request_body<CreateOrderReq>()
@@ -382,12 +382,12 @@ int main() {
             if (!p) {
                 co_await res->status(status::not_found)
                     .content_type(mime::app_json)
-                    .send(to_json(ErrorBody{.error = "malformed geo coordinate"}));
+                    .async_send(to_json(ErrorBody{.error = "malformed geo coordinate"}), asio::use_awaitable);
                 co_return;
             }
             co_await res->status(status::ok)
                 .content_type(mime::app_json)
-                .send(to_json(GeoReply{.city = p->city, .lat = p->lat, .lng = p->lng, .precision = p->precision}));
+                .async_send(to_json(GeoReply{.city = p->city, .lat = p->lat, .lng = p->lng, .precision = p->precision}), asio::use_awaitable);
         },
         openapi::doc()
             .path_params<GeoParams>()
@@ -409,12 +409,12 @@ int main() {
             if (!p) {
                 co_await res->status(status::not_found)
                     .content_type(mime::app_json)
-                    .send(to_json(ErrorBody{.error = "malformed lab run"}));
+                    .async_send(to_json(ErrorBody{.error = "malformed lab run"}), asio::use_awaitable);
                 co_return;
             }
             co_await res->status(status::ok)
                 .content_type(mime::app_json)
-                .send(to_json(LabReply{.experiment = p->experiment, .run = p->run, .fast = p->fast}));
+                .async_send(to_json(LabReply{.experiment = p->experiment, .run = p->run, .fast = p->fast}), asio::use_awaitable);
         },
         openapi::doc()
             .path_params<LabParams>()
@@ -433,7 +433,7 @@ int main() {
         [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
             PetList found;
             found.items.emplace_back(Pet{.id = 1, .name = "search-hit", .status = "available"});
-            co_await res->status(status::ok).content_type(mime::app_json).send(to_json(found));
+            co_await res->status(status::ok).content_type(mime::app_json).async_send(to_json(found), asio::use_awaitable);
         },
         openapi::doc()
             .response<PetList>()
@@ -460,14 +460,14 @@ int main() {
             if (!p || p->owner_id == 0) {
                 co_await res->status(status::not_found)
                     .content_type(mime::app_json)
-                    .send(to_json(ErrorBody{.error = "no such owner"}));
+                    .async_send(to_json(ErrorBody{.error = "no such owner"}), asio::use_awaitable);
                 co_return;
             }
             if (req->header("x-rate-limited")) {
                 co_await res->status(status::too_many_requests)
                     .header("retry-after", "0")
                     .content_type(mime::app_json)
-                    .send(to_json(ErrorBody{.error = "rate limited"}));
+                    .async_send(to_json(ErrorBody{.error = "rate limited"}), asio::use_awaitable);
                 co_return;
             }
             auto in = co_await read_body_api<CreatePetReq>(req, res);
@@ -476,9 +476,9 @@ int main() {
             }
             co_await res->status(status::created)
                 .content_type(mime::app_json)
-                .send(to_json(Pet{.id = static_cast<std::int64_t>(p->owner_id),
+                .async_send(to_json(Pet{.id = static_cast<std::int64_t>(p->owner_id),
                                   .name = in->name,
-                                  .status = in->status.value_or("available")}));
+                                  .status = in->status.value_or("available")}), asio::use_awaitable);
         },
         openapi::doc()
             .path_params<OwnerParams>()
@@ -503,14 +503,14 @@ int main() {
         const auto n = req->param("n").value_or("");
         co_await res->status(status::ok)
             .content_type(mime::text_plain)
-            .send(std::string{"what="} + std::string{what} + " n=" + std::string{n});
+            .async_send(std::string{"what="} + std::string{what} + " n=" + std::string{n}, asio::use_awaitable);
     });
 
     // Serve the collected document and a CDN-backed Swagger UI pointing at it.
     server.serve_openapi("/openapi.json");
     server.serve_swagger_ui("/swagger", "/openapi.json");
     server.fallback([](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(status::not_found).send("not found");
+        co_await res->status(status::not_found).async_send("not found", asio::use_awaitable);
     });
 
     if (!server.start()) {

@@ -58,6 +58,29 @@ target_link_libraries(simple_http INTERFACE
     glaze::glaze
 )
 
+# C++17 token-only port (parallel implementation). Deliberately not installed
+# yet: both umbrella headers are called simple_http.h, so installing both into
+# the same include root would make them overwrite each other. In-tree consumers
+# link exactly one of the two targets.
+add_library(simple_http_cpp17 INTERFACE)
+target_include_directories(simple_http_cpp17 INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/cpp17/include>
+)
+target_compile_features(simple_http_cpp17 INTERFACE cxx_std_17)
+# glaze backs the feature-gated JSON / typed-params / OpenAPI / JWT helpers
+# (cpp17/include/simple_http/core/glaze_support.h). The headers only include it
+# when the *consumer* compiles as C++23; a plain C++17 consumer sees none of
+# that code, and linking the header-only target is harmless either way.
+target_link_libraries(simple_http_cpp17 INTERFACE
+    Boost::boost
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    ZLIB::ZLIB
+    brotli::brotlienc
+    brotli::brotlidec
+    glaze::glaze
+)
+
 install(DIRECTORY include/ DESTINATION include)
 
 install(TARGETS simple_http

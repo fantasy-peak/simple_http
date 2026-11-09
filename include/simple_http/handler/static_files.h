@@ -43,7 +43,8 @@
 // while the pre-compressed siblings sit unused — correct, just not the cheapest
 // path.
 
-#include <boost/asio/awaitable.hpp>
+#include <boost/asio/any_completion_handler.hpp>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -143,11 +144,11 @@ class StaticFiles {
     // Serves the request when it names something this table knows. Returns true
     // once a complete response has been written; false — with nothing written —
     // when the path is not ours, so the caller's 404 path takes it.
-    asio::awaitable<bool> try_serve(const RequestPtr &req, const ResponsePtr &res) const;
+    void try_serve(const RequestPtr &req, const ResponsePtr &res, asio::any_completion_handler<void(bool)> done) const;
 
     // The site's own 404 page when there is one, a plain-text body otherwise.
     // Always writes a response.
-    asio::awaitable<void> serve_not_found(const RequestPtr &req, const ResponsePtr &res) const;
+    void serve_not_found(const RequestPtr &req, const ResponsePtr &res, HandlerCompletion done) const;
 
   private:
     // Whether an unmatched path may be answered from spa_fallback.
@@ -167,7 +168,8 @@ inline bool StaticFiles::spa_eligible(std::string_view normalized) const {
     return last.find('.') == std::string_view::npos;
 }
 
-inline asio::awaitable<bool> StaticFiles::try_serve(const RequestPtr &req, const ResponsePtr &res) const {
+inline void StaticFiles::try_serve(const RequestPtr &req, const ResponsePtr &res,
+                                   asio::any_completion_handler<void(bool)> done) const {
     PathError err{};
     auto normalized = decode_and_normalize(req->path(), err);
     if (!normalized) {
@@ -180,17 +182,18 @@ inline asio::awaitable<bool> StaticFiles::try_serve(const RequestPtr &req, const
         res->status(status::bad_request);
         detail::apply_common_headers(m_config.server_header, res, "text/plain; charset=utf-8", "no-store", std::nullopt,
                                      0);
-        (void)co_await res->send("400 Bad Request");
-        // Do NOT close here: the request body may still be unread, and closing a
-        // socket with unread data sends RST, which can discard this response.
-        // The engine drains (bounded by max_body_bytes) and closes/reuses.
-        co_return true;
+        // Do NOT close here: an unread request body makes close() send RST,
+        // which can discard this response; the engine drains it.
+        res->async_send("400 Bad Request", [done = std::move(done)](error_code) mutable { std::move(done)(true); });
+        return;
     }
 
     // A decoded form that looks reserved steps aside rather than serving, even
     // when a file exists at that path.
-    if (reserved(*normalized))
-        co_return false;
+    if (reserved(*normalized)) {
+        std::move(done)(false);
+        return;
+    }
 
     const StaticEntry *entry = m_table.find(*normalized);
     bool spa_hit = false;
@@ -198,8 +201,10 @@ inline asio::awaitable<bool> StaticFiles::try_serve(const RequestPtr &req, const
         entry = m_table.find("/" + m_config.spa_fallback);
         spa_hit = entry != nullptr;
     }
-    if (entry == nullptr)
-        co_return false; // not ours: the caller renders 404
+    if (entry == nullptr) {
+        std::move(done)(false); // not ours: the caller renders 404
+        return;
+    }
 
     const auto method = req->method();
     if (method != Method::Get && method != Method::Head) {
@@ -213,10 +218,9 @@ inline asio::awaitable<bool> StaticFiles::try_serve(const RequestPtr &req, const
         res->header(field::allow, "GET, HEAD");
         res->header(field::cache_control, "no-store");
         res->content_type("text/plain; charset=utf-8");
-        (void)co_await res->send("405 Method Not Allowed");
-        // Same as the 400 above: closing with an unread body resets the
-        // connection and can lose the response. Let the engine drain it.
-        co_return true;
+        res->async_send("405 Method Not Allowed",
+                        [done = std::move(done)](error_code) mutable { std::move(done)(true); });
+        return;
     }
 
     const auto accept_encoding = parse_accept_encoding(req->header(field::accept_encoding).value_or(""));
@@ -240,8 +244,9 @@ inline asio::awaitable<bool> StaticFiles::try_serve(const RequestPtr &req, const
             res->status(status::not_acceptable);
             detail::apply_common_headers(m_config.server_header, res, "text/plain; charset=utf-8", "no-store",
                                          std::nullopt, 0);
-            (void)co_await res->send("406 Not Acceptable");
-            co_return true;
+            res->async_send("406 Not Acceptable",
+                            [done = std::move(done)](error_code) mutable { std::move(done)(true); });
+            return;
         }
     }
 
@@ -272,15 +277,15 @@ inline asio::awaitable<bool> StaticFiles::try_serve(const RequestPtr &req, const
                 apply_headers();
                 // No content-length on a 304 (RFC 9110 §15.4.5), and no body: the
                 // response ends at the header block.
-                (void)co_await res->send_bodyless();
-                co_return true;
+                res->async_send_bodyless([done = std::move(done)](error_code) mutable { std::move(done)(true); });
+                return;
             }
         } else if (auto ims = req->header(field::if_modified_since)) {
             if (auto t = parse_http_date(*ims); t && entry->mtime <= *t) {
                 res->status(status::not_modified);
                 apply_headers();
-                (void)co_await res->send_bodyless();
-                co_return true;
+                res->async_send_bodyless([done = std::move(done)](error_code) mutable { std::move(done)(true); });
+                return;
             }
         }
     }
@@ -299,10 +304,10 @@ inline asio::awaitable<bool> StaticFiles::try_serve(const RequestPtr &req, const
                 // same, or a range is served from a representation whose bytes
                 // may differ; use strong comparison and fall back to the full
                 // representation otherwise.
-                const bool matches = ir->starts_with("W/")
+                const bool matches = starts_with(*ir, "W/")
                                          ? false
-                                         : (ir->starts_with("\"") ? etag_strong_match(*ir, rep->etag)
-                                                                  : parse_http_date(*ir).value_or(-1) == entry->mtime);
+                                         : (starts_with(*ir, "\"") ? etag_strong_match(*ir, rep->etag)
+                                                                   : parse_http_date(*ir).value_or(-1) == entry->mtime);
                 if (!matches)
                     range.reset();
             }
@@ -317,8 +322,8 @@ inline asio::awaitable<bool> StaticFiles::try_serve(const RequestPtr &req, const
             // the client waits for the idle watchdog to fire instead of reading
             // a response that is already complete.
             res->header(field::content_length, "0");
-            (void)co_await res->send("");
-            co_return true;
+            res->async_send("", [done = std::move(done)](error_code) mutable { std::move(done)(true); });
+            return;
         }
         // Otherwise parse_range declined (multi-range or a malformed spec): fall
         // through and send the full representation, which RFC 9110 permits.
@@ -329,13 +334,15 @@ inline asio::awaitable<bool> StaticFiles::try_serve(const RequestPtr &req, const
         // The file disappeared between startup and now. Treat it as a miss so the
         // normal 404 path answers, rather than emitting an empty 200.
         SIMPLE_HTTP_WARN_LOG("static: {} vanished after startup scan", rep->disk_path);
-        co_return false;
+        std::move(done)(false);
+        return;
     }
 
     res->status(range ? status::partial_content : status::ok);
     apply_headers();
     if (range) {
-        res->header(field::content_range, std::format("bytes {}-{}/{}", range->first, range->last, rep->size));
+        res->header(field::content_range, "bytes " + std::to_string(range->first) + "-" + std::to_string(range->last) +
+                                              "/" + std::to_string(rep->size));
     }
     if (range) {
         // A 206 describes only the bytes being sent, including when the
@@ -367,20 +374,19 @@ inline asio::awaitable<bool> StaticFiles::try_serve(const RequestPtr &req, const
     }
 
     if (is_head) {
-        (void)co_await res->send_bodyless();
-        co_return true;
+        res->async_send_bodyless([done = std::move(done)](error_code) mutable { std::move(done)(true); });
+        return;
     }
 
     if (range) {
-        (void)co_await res->send(
-            body->substr(static_cast<std::size_t>(range->first), static_cast<std::size_t>(range->length())));
+        res->async_send(body->substr(static_cast<std::size_t>(range->first), static_cast<std::size_t>(range->length())),
+                        [done = std::move(done)](error_code) mutable { std::move(done)(true); });
     } else {
-        (void)co_await res->send(std::move(*body));
+        res->async_send(std::move(*body), [done = std::move(done)](error_code) mutable { std::move(done)(true); });
     }
-    co_return true;
 }
 
-inline asio::awaitable<void> StaticFiles::serve_not_found(const RequestPtr &req, const ResponsePtr &res) const {
+inline void StaticFiles::serve_not_found(const RequestPtr &req, const ResponsePtr &res, HandlerCompletion done) const {
     res->status(status::not_found);
     if (!m_config.server_header.empty())
         res->header(field::server, m_config.server_header);
@@ -405,11 +411,10 @@ inline asio::awaitable<void> StaticFiles::serve_not_found(const RequestPtr &req,
 
     if (req->method() == Method::Head) {
         res->header(field::content_length, std::to_string(payload.size()));
-        (void)co_await res->send_bodyless();
-        co_return;
+        res->async_send_bodyless(finish_with(std::move(done)));
+        return;
     }
-    (void)co_await res->send(std::move(payload));
-    co_return;
+    res->async_send(std::move(payload), finish_with(std::move(done)));
 }
 
 } // namespace simple_http

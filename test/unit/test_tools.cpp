@@ -29,9 +29,9 @@ RequestPtr make_request(asio::io_context &ctx, std::string target,
 }
 
 std::shared_ptr<FakeResponseSink> dispatch(asio::io_context &ctx, Router &router, RequestPtr req) {
-    auto writer = std::make_shared<FakeResponseSink>();
+    auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
     auto res = std::make_shared<ResponseWriter>(writer);
-    REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
+    REQUIRE(run_on(ctx, await_dispatch(router, req, res)));
     return writer;
 }
 
@@ -61,10 +61,10 @@ TEST_CASE("conditionals: If-None-Match answers 304 and sets validators", "[tools
     asio::io_context ctx;
     const auto etag = make_etag(1700000000, 100, "id");
     {
-        auto writer = std::make_shared<FakeResponseSink>();
+        auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
         auto res = std::make_shared<ResponseWriter>(writer);
         auto req = make_request(ctx, "/doc", {{"if-none-match", std::string{etag}}});
-        bool not_modified = run_on(ctx, maybe_not_modified(req, res, etag, 1700000000)).value_or(false);
+        bool not_modified = run_on(ctx, async_maybe_not_modified(req, res, etag, 1700000000, asio::use_awaitable)).value_or(false);
         CHECK(not_modified);
         CHECK(writer->last_status == status::not_modified);
         CHECK(writer->sent_bodyless); // 304 is bodyless, no frame
@@ -74,21 +74,21 @@ TEST_CASE("conditionals: If-None-Match answers 304 and sets validators", "[tools
         // A different validator: the 200 path, but the validators ride along
         // once the handler sends (a fresh Response; maybe_not_modified only
         // staged the headers until now).
-        auto writer = std::make_shared<FakeResponseSink>();
+        auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
         auto res = std::make_shared<ResponseWriter>(writer);
         auto req = make_request(ctx, "/doc", {{"if-none-match", "\"other\""}});
-        bool not_modified = run_on(ctx, maybe_not_modified(req, res, etag, 1700000000)).value_or(false);
+        bool not_modified = run_on(ctx, async_maybe_not_modified(req, res, etag, 1700000000, asio::use_awaitable)).value_or(false);
         CHECK_FALSE(not_modified);
-        REQUIRE(run_on(ctx, res->status(status::ok).send("body")));
+        REQUIRE(run_on(ctx, res->status(status::ok).async_send("body", asio::use_awaitable)));
         CHECK(writer->header(field::etag) == etag);
         CHECK(writer->header(field::last_modified) == http_date(1700000000));
     }
     {
         // "*" matches anything current.
-        auto writer = std::make_shared<FakeResponseSink>();
+        auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
         auto res = std::make_shared<ResponseWriter>(writer);
         auto req = make_request(ctx, "/doc", {{"if-none-match", "*"}});
-        bool not_modified = run_on(ctx, maybe_not_modified(req, res, etag, 1700000000)).value_or(false);
+        bool not_modified = run_on(ctx, async_maybe_not_modified(req, res, etag, 1700000000, asio::use_awaitable)).value_or(false);
         CHECK(not_modified);
     }
 }
@@ -98,20 +98,20 @@ TEST_CASE("conditionals: If-Modified-Since and non-GET skip", "[tools]") {
     const auto etag = make_etag(1700000000, 100, "id");
     {
         // Client's If-Modified-Since is not newer than the resource: 304.
-        auto writer = std::make_shared<FakeResponseSink>();
+        auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
         auto res = std::make_shared<ResponseWriter>(writer);
         auto req = make_request(ctx, "/doc",
                                 {{"if-modified-since", http_date(1700000000 + 5000)}}); // client newer -> not modified
-        bool not_modified = run_on(ctx, maybe_not_modified(req, res, etag, 1700000000)).value_or(false);
+        bool not_modified = run_on(ctx, async_maybe_not_modified(req, res, etag, 1700000000, asio::use_awaitable)).value_or(false);
         CHECK(not_modified);
     }
     {
         // Only If-Modified-Since, no ETag path.
-        auto writer = std::make_shared<FakeResponseSink>();
+        auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
         auto res = std::make_shared<ResponseWriter>(writer);
         auto req =
             make_request(ctx, "/doc", {{"if-modified-since", http_date(1600000000)}}); // resource newer -> modified
-        bool not_modified = run_on(ctx, maybe_not_modified(req, res, "", 1700000000)).value_or(false);
+        bool not_modified = run_on(ctx, async_maybe_not_modified(req, res, "", 1700000000, asio::use_awaitable)).value_or(false);
         CHECK_FALSE(not_modified);
     }
     {
@@ -119,9 +119,9 @@ TEST_CASE("conditionals: If-Modified-Since and non-GET skip", "[tools]") {
         auto req = make_request(ctx, "/doc");
         req->set_method(Method::Post);
         req->mutable_headers().add_lower("if-none-match", std::string{etag});
-        auto writer = std::make_shared<FakeResponseSink>();
+        auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
         auto res = std::make_shared<ResponseWriter>(writer);
-        bool not_modified = run_on(ctx, maybe_not_modified(req, res, etag, 1700000000)).value_or(false);
+        bool not_modified = run_on(ctx, async_maybe_not_modified(req, res, etag, 1700000000, asio::use_awaitable)).value_or(false);
         CHECK_FALSE(not_modified);
     }
 }
@@ -135,7 +135,7 @@ TEST_CASE("real_ip: trusted entries accept CIDR prefixes", "[tools]") {
     router.route(any_methods, "/ip", [&](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
         const auto *ip = req->get_state<middleware::ClientIp>();
         seen = ip ? ip->value : "";
-        co_await res->status(status::ok).send("ok");
+        co_await res->status(status::ok).async_send("ok", asio::use_awaitable);
     });
 
     asio::io_context ctx;
@@ -162,16 +162,16 @@ TEST_CASE("real_ip: trusted entries accept CIDR prefixes", "[tools]") {
 
 TEST_CASE("access_log: the request id is included when request_id ran", "[tools]") {
     Router router;
-    auto writer0 = std::make_shared<FakeResponseSink>();
+    asio::io_context ctx;
+    auto writer0 = std::make_shared<FakeResponseSink>(ctx.get_executor());
     ScopedLog capture;
     // request_id inside access_log, so the id is set before the after-phase.
     router.use(middleware::access_log());
     router.use(middleware::request_id());
     router.route(any_methods, "/ok", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(status::ok).send("ok");
+        co_await res->status(status::ok).async_send("ok", asio::use_awaitable);
     });
 
-    asio::io_context ctx;
     dispatch(ctx, router, make_request(ctx, "/ok"));
     REQUIRE(capture.records.size() >= 1);
     // The record carries the generated id as a structured attr.

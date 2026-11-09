@@ -44,7 +44,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <span>
+#include "../core/compat.h"
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -185,7 +185,7 @@ template <typename ConnectionType> class SharedCidRegistry {
         // forwards every packet through here.
         asio::post(it->second.exec, [conn = std::move(conn), data = std::move(datagram), from]() mutable {
             conn->on_datagram(
-                std::span<const std::uint8_t>{reinterpret_cast<const std::uint8_t *>(data.data()), data.size()}, from);
+                boost::span<const std::uint8_t>{reinterpret_cast<const std::uint8_t *>(data.data()), data.size()}, from);
         });
         return true;
     }
@@ -205,8 +205,10 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
 
     // What to do with a connection once it exists. The server supplies this; it
     // is where the HTTP/3 engine is built, which is what keeps this file free of
-    // any knowledge of HTTP.
-    using ServeFn = std::function<asio::awaitable<void>(std::shared_ptr<Connection>)>;
+    // any knowledge of HTTP. `done` is called when the protocol engine has
+    // finished; the endpoint then waits for the connection itself to close and
+    // releases its bookkeeping.
+    using ServeFn = std::function<void(std::shared_ptr<Connection>, std::function<void()>)>;
 
     QuicEndpoint(Executor exec, SSL_CTX *ssl_ctx, QuicEndpointConfig config, ServeFn serve,
                  std::shared_ptr<SharedCidRegistry<Connection>> shared_cids = nullptr)
@@ -261,13 +263,14 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
         return ec ? 0 : endpoint.port();
     }
 
-    // Start reading. Returns immediately; the receive loop runs until close().
+    // Start reading. Returns immediately; the receive and send loops run until
+    // close().
     void start() {
         if (m_started)
             return;
         m_started = true;
-        asio::co_spawn(m_executor, receive_loop(), asio::detached);
-        asio::co_spawn(m_executor, send_loop(), asio::detached);
+        receive_loop();
+        send_loop();
     }
 
     // Stop admitting new connections while leaving the established ones
@@ -340,76 +343,93 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
 
     // --- datagram in -------------------------------------------------------
 
-    asio::awaitable<void> receive_loop() {
+    struct RecvState {
 #if defined(__linux__)
         // One large scratch the batch reads into (reused across calls: every
         // datagram is consumed synchronously and copied where it needs to live,
         // so nothing references it after the batch is processed).
-        std::vector<std::uint8_t> scratch(kRecvScratch);
+        std::vector<std::uint8_t> scratch = std::vector<std::uint8_t>(static_cast<std::size_t>(kRecvScratch));
         std::array<asio::ip::udp::endpoint, kRecvBatch> from{};
         std::array<iovec, kRecvBatch> iov{};
         std::array<mmsghdr, kRecvBatch> msgs{};
+#else
+        std::vector<std::uint8_t> buffer = std::vector<std::uint8_t>(static_cast<std::size_t>(kMaxDatagram));
+        asio::ip::udp::endpoint remote{};
+#endif
+    };
+
+    void receive_loop() {
+        auto state = std::make_shared<RecvState>();
+#if defined(__linux__)
         for (std::size_t i = 0; i < kRecvBatch; ++i) {
-            iov[i].iov_base = scratch.data() + i * kMaxDatagram;
-            iov[i].iov_len = kMaxDatagram;
-            msgs[i].msg_hdr.msg_iov = &iov[i];
-            msgs[i].msg_hdr.msg_iovlen = 1;
-            msgs[i].msg_hdr.msg_name = from[i].data();
-            msgs[i].msg_hdr.msg_namelen = from[i].capacity();
+            state->iov[i].iov_base = state->scratch.data() + i * kMaxDatagram;
+            state->iov[i].iov_len = kMaxDatagram;
+            state->msgs[i].msg_hdr.msg_iov = &state->iov[i];
+            state->msgs[i].msg_hdr.msg_iovlen = 1;
+            state->msgs[i].msg_hdr.msg_name = state->from[i].data();
+            state->msgs[i].msg_hdr.msg_namelen = state->from[i].capacity();
         }
-        for (;;) {
+#endif
+        receive_wait(std::move(state));
+    }
+
+    void receive_wait(std::shared_ptr<RecvState> state) {
+        auto self = this->shared_from_this();
+#if defined(__linux__)
+        m_socket.async_wait(asio::ip::udp::socket::wait_read, [self, state](error_code ec) {
+            if (ec) {
+                if (ec == asio::error::operation_aborted)
+                    return;
+                self->receive_wait(std::move(state));
+                return;
+            }
             // Readiness first, then drain with recvmmsg until the socket is
             // empty: one event-loop wake-up serves a whole batch of datagrams
             // instead of one syscall per packet.
-            auto [ec] =
-                co_await m_socket.async_wait(asio::ip::udp::socket::wait_read, asio::as_tuple(asio::use_awaitable));
-            if (ec) {
-                if (ec == asio::error::operation_aborted)
-                    co_return;
-                continue;
-            }
             for (;;) {
                 const int n =
-                    static_cast<int>(::recvmmsg(m_socket.native_handle(), msgs.data(), kRecvBatch, 0, nullptr));
+                    static_cast<int>(::recvmmsg(self->m_socket.native_handle(), state->msgs.data(), kRecvBatch, 0,
+                                                nullptr));
                 if (n <= 0) {
                     // EAGAIN/EWOULDBLOCK = drained; EINTR = try again next turn.
                     // A connection-refused here means a previous send drew an
-                    // ICMP port-unreachable — not fatal, nothing to reply to.
+                    // ICMP port-unreachable -- not fatal, nothing to reply to.
                     break;
                 }
                 for (int i = 0; i < n; ++i) {
-                    if (msgs[i].msg_len == 0)
+                    if (state->msgs[i].msg_len == 0)
                         continue;
-                    from[i].resize(msgs[i].msg_hdr.msg_namelen);
-                    handle_datagram(
-                        std::span<const std::uint8_t>{scratch.data() + static_cast<std::size_t>(i) * kMaxDatagram,
-                                                      static_cast<std::size_t>(msgs[i].msg_len)},
-                        from[i]);
+                    state->from[i].resize(state->msgs[i].msg_hdr.msg_namelen);
+                    self->handle_datagram(
+                        boost::span<const std::uint8_t>{
+                            state->scratch.data() + static_cast<std::size_t>(i) * kMaxDatagram,
+                            static_cast<std::size_t>(state->msgs[i].msg_len)},
+                        state->from[i]);
                 }
             }
-        }
+            self->receive_wait(std::move(state));
+        });
 #else
-        std::vector<std::uint8_t> buffer(kMaxDatagram);
-        for (;;) {
-            asio::ip::udp::endpoint remote;
-            auto [ec, n] =
-                co_await m_socket.async_receive_from(asio::buffer(buffer), remote, asio::as_tuple(asio::use_awaitable));
-            if (ec) {
-                if (ec == asio::error::operation_aborted)
-                    co_return;
-                // A connection-refused on a UDP socket means a previous send
-                // drew an ICMP port-unreachable. Not fatal, and there is nothing
-                // to reply to.
-                continue;
-            }
-            if (n == 0)
-                continue;
-            handle_datagram(std::span<const std::uint8_t>{buffer.data(), n}, remote);
-        }
+        m_socket.async_receive_from(
+            asio::buffer(state->buffer), state->remote, [self, state](error_code ec, std::size_t n) {
+                if (ec) {
+                    if (ec == asio::error::operation_aborted)
+                        return;
+                    // A connection-refused on a UDP socket means a previous send
+                    // drew an ICMP port-unreachable. Not fatal, and there is
+                    // nothing to reply to.
+                    self->receive_wait(std::move(state));
+                    return;
+                }
+                if (n != 0) {
+                    self->handle_datagram(boost::span<const std::uint8_t>{state->buffer.data(), n}, state->remote);
+                }
+                self->receive_wait(std::move(state));
+            });
 #endif
     }
 
-    void handle_datagram(std::span<const std::uint8_t> data, const asio::ip::udp::endpoint &remote) {
+    void handle_datagram(boost::span<const std::uint8_t> data, const asio::ip::udp::endpoint &remote) {
         ngtcp2_version_cid vc{};
         const std::size_t scid_len = m_config.connection.connection_id_length;
         switch (const int rv = ngtcp2_pkt_decode_version_cid(&vc, data.data(), data.size(), scid_len)) {
@@ -551,7 +571,7 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
 
         auto conn = std::make_shared<Connection>(m_executor, m_ssl_ctx, m_config.connection, bootstrap,
                                                  m_config.supported_versions, local, remote,
-                                                 std::span<const std::uint8_t>{m_secret.data(), m_secret.size()},
+                                                 boost::span<const std::uint8_t>{m_secret.data(), m_secret.size()},
                                                  [self](SendItem &&item) { self->queue_datagram(std::move(item)); });
         if (conn->init_failed()) {
             release_connection();
@@ -564,8 +584,8 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
         // that never existed.
         conn->set_cid_callbacks(
             [self, weak = std::weak_ptr<Connection>(conn)](
-                std::span<const std::uint8_t> cid, std::span<const std::uint8_t>) { self->associate_cid(cid, weak); },
-            [self](std::span<const std::uint8_t> cid) { self->dissociate_cid(cid); });
+                boost::span<const std::uint8_t> cid, boost::span<const std::uint8_t>) { self->associate_cid(cid, weak); },
+            [self](boost::span<const std::uint8_t> cid) { self->dissociate_cid(cid); });
 
         if (!conn->init()) {
             release_connection();
@@ -578,21 +598,25 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
         m_live.push_back(conn);
         conn->on_datagram(data, remote);
 
-        asio::co_spawn(m_executor, serve(conn), asio::detached);
+        serve(conn);
     }
 
-    asio::awaitable<void> serve(ConnectionPtr conn) {
+    void serve(ConnectionPtr conn) {
         // The engine's own run() drives the connection; this wrapper exists to
         // keep the connection alive until it is finished and to drop the
         // bookkeeping entry afterwards.
-        co_await m_serve(conn);
-        co_await conn->await_closed();
-        m_live.erase(std::remove(m_live.begin(), m_live.end(), conn), m_live.end());
-        // Its IDs are dead with it: nothing can route to this connection again,
-        // and the weak entries would otherwise outlive it by the process.
-        forget_cids(conn.get());
-        release_connection();
-        co_return;
+        auto self = this->shared_from_this();
+        m_serve(conn, [self, conn]() mutable {
+            conn->async_await_closed([self, conn]() mutable {
+                self->m_live.erase(std::remove(self->m_live.begin(), self->m_live.end(), conn),
+                                   self->m_live.end());
+                // Its IDs are dead with it: nothing can route to this connection
+                // again, and the weak entries would otherwise outlive it by the
+                // process.
+                self->forget_cids(conn.get());
+                self->release_connection();
+            });
+        });
     }
 
     // --- connection admission ---------------------------------------------
@@ -638,7 +662,7 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
         return key;
     }
 
-    void associate_cid(std::span<const std::uint8_t> cid, const std::weak_ptr<Connection> &conn) {
+    void associate_cid(boost::span<const std::uint8_t> cid, const std::weak_ptr<Connection> &conn) {
         if (cid.empty())
             return;
         const CidKey key = cid_key(cid.data(), cid.size());
@@ -655,7 +679,7 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
             m_cids_by_conn[live.get()].push_back(key);
     }
 
-    void dissociate_cid(std::span<const std::uint8_t> cid) {
+    void dissociate_cid(boost::span<const std::uint8_t> cid) {
         if (cid.empty())
             return;
         const CidKey key = cid_key(cid.data(), cid.size());
@@ -696,7 +720,7 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
     // These build their datagram in a stack buffer, so the payload is copied
     // into the queued item — the cheap move path below is for the connection's
     // persistent send buffers; these are one-per-connection events at most.
-    void queue_datagram_copy(std::span<const std::uint8_t> data, const asio::ip::udp::endpoint &to) {
+    void queue_datagram_copy(boost::span<const std::uint8_t> data, const asio::ip::udp::endpoint &to) {
         if (m_closed)
             return;
         SendItem item;
@@ -714,7 +738,7 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
             buf.data(), buf.size(), static_cast<std::uint8_t>(random_byte()), vc.scid, vc.scidlen, vc.dcid, vc.dcidlen,
             m_config.supported_versions.data(), m_config.supported_versions.size());
         if (n > 0)
-            queue_datagram_copy(std::span<const std::uint8_t>{buf.data(), static_cast<std::size_t>(n)}, remote);
+            queue_datagram_copy(boost::span<const std::uint8_t>{buf.data(), static_cast<std::size_t>(n)}, remote);
     }
 
     void send_retry(const ngtcp2_pkt_hd &hd, const ngtcp2_version_cid &vc, const asio::ip::udp::endpoint &remote) {
@@ -742,7 +766,7 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
         const ngtcp2_ssize n = ngtcp2_crypto_write_retry(buf.data(), buf.size(), hd.version, &hd.scid, &retry_scid,
                                                          &hd.dcid, token.data(), static_cast<std::size_t>(tokenlen));
         if (n > 0)
-            queue_datagram_copy(std::span<const std::uint8_t>{buf.data(), static_cast<std::size_t>(n)}, remote);
+            queue_datagram_copy(boost::span<const std::uint8_t>{buf.data(), static_cast<std::size_t>(n)}, remote);
     }
 
     void send_stateless_reset(std::size_t packet_len, const ngtcp2_version_cid &vc,
@@ -774,7 +798,7 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
         const ngtcp2_ssize n =
             ngtcp2_pkt_write_stateless_reset(buf.data(), buf.size(), token.data(), rand.data(), rand_len);
         if (n > 0)
-            queue_datagram_copy(std::span<const std::uint8_t>{buf.data(), static_cast<std::size_t>(n)}, remote);
+            queue_datagram_copy(boost::span<const std::uint8_t>{buf.data(), static_cast<std::size_t>(n)}, remote);
     }
 
     static std::uint8_t random_byte() {
@@ -852,35 +876,36 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
 #endif
     }
 
-    asio::awaitable<void> send_loop() {
-        while (!m_closed) {
-            auto [ec] = co_await m_send_wake.async_receive(asio::as_tuple(asio::use_awaitable));
-            (void)ec;
-            while (!m_send_queue.empty() && !m_closed) {
-                SendItem item = std::move(m_send_queue.front());
-                m_send_queue.pop_front();
-                const int r = raw_send(m_socket.native_handle(), item);
-                if (r < 0) {
-                    const int e = errno;
-                    if (e == EAGAIN || e == EWOULDBLOCK) {
-                        // Send buffer full. UDP never partially sends and asio
-                        // has no sendmsg path to park on, so wait for
-                        // writability and put the datagram back — this is the
-                        // only case where it is queueable again by QUIC's rules
-                        // (it was never committed to the wire).
-                        m_send_queue.push_front(std::move(item));
-                        co_await m_socket.async_wait(asio::ip::udp::socket::wait_write,
-                                                     asio::as_tuple(asio::use_awaitable));
-                        continue;
-                    }
-                    // Any other failure is a lost datagram, and QUIC is built
-                    // to tolerate loss. Retrying it would be worse:
-                    // retransmission belongs to ngtcp2, which knows the packet
-                    // number and the deadline.
+    void send_loop() {
+        auto self = this->shared_from_this();
+        m_send_wake.async_receive([self](error_code) {
+            if (self->m_closed)
+                return;
+            self->drain_send();
+        });
+    }
+
+    // Drain the queue without recursion. A datagram the kernel refuses with
+    // EAGAIN goes back to the front and waits for writability; every other
+    // error drops it (QUIC retransmits, and ngtcp2 owns the deadline).
+    void drain_send() {
+        while (!m_closed && !m_send_queue.empty()) {
+            SendItem item = std::move(m_send_queue.front());
+            m_send_queue.pop_front();
+            const int r = raw_send(m_socket.native_handle(), item);
+            if (r < 0) {
+                const int e = errno;
+                if (e == EAGAIN || e == EWOULDBLOCK) {
+                    m_send_queue.push_front(std::move(item));
+                    auto self = this->shared_from_this();
+                    m_socket.async_wait(asio::ip::udp::socket::wait_write,
+                                        [self](error_code) { self->drain_send(); });
+                    return;
                 }
             }
         }
-        co_return;
+        if (!m_closed)
+            send_loop();
     }
 
     Executor m_executor;

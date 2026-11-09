@@ -28,6 +28,17 @@ namespace {
 
 using json_types::Pet;
 
+// The port's read is token-based and reports parse failures as a completed
+// result; the test keeps the expected<T> shape.
+template <typename T> asio::awaitable<std::expected<T, error_code>> read_json(Request &req) {
+    auto [ec, parsed] = co_await async_read_json_body<T>(req, asio::as_tuple(asio::use_awaitable));
+    if (!parsed)
+        co_return std::unexpected{parsed.error()};
+    if (ec)
+        co_return std::unexpected{ec};
+    co_return std::move(*parsed);
+}
+
 } // namespace
 
 TEST_CASE("proto/json: read_json_body parses a struct from the body", "[json]") {
@@ -38,7 +49,7 @@ TEST_CASE("proto/json: read_json_body parses a struct from the body", "[json]") 
     (void)req->body().feed(R"({"id":7,"name":"rex"})");
     req->body().finish();
 
-    auto pet = run_on(ctx, read_json_body<Pet>(*req));
+    auto pet = run_on(ctx, read_json<Pet>(*req));
     REQUIRE(pet.has_value());
     REQUIRE(pet->has_value());
     CHECK((*pet)->id == 7);
@@ -54,7 +65,7 @@ TEST_CASE("proto/json: a malformed or type-mismatched body is std::unexpected", 
         (void)req->body().feed(bad);
         req->body().finish();
 
-        auto pet = run_on(ctx, read_json_body<Pet>(*req));
+        auto pet = run_on(ctx, read_json<Pet>(*req));
         REQUIRE(pet.has_value());      // the coroutine itself completed
         CHECK_FALSE(pet->has_value()); // the parse failed
     }
@@ -62,10 +73,10 @@ TEST_CASE("proto/json: a malformed or type-mismatched body is std::unexpected", 
 
 TEST_CASE("proto/json: write_json sends a one-shot JSON response", "[json]") {
     asio::io_context ctx;
-    auto writer = std::make_shared<FakeResponseSink>();
+    auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
     auto res = std::make_shared<ResponseWriter>(writer);
 
-    auto ec = run_on(ctx, write_json(res, Pet{3, "yuki"}, 201));
+    auto ec = run_on(ctx, as_ec(async_write_json(res, Pet{3, "yuki"}, 201, asio::as_tuple(asio::use_awaitable))));
     REQUIRE(ec.has_value());
     CHECK(*ec == error_code{});
     CHECK(writer->last_status == status::created);

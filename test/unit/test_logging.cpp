@@ -1,6 +1,7 @@
 // core/logging: the structured record path. Fields are typed attributes on the
-// record (Go log/slog / Rust tracing shape) and the sink decides the encoding —
-// here the JSON formatter and a capturing sink stand in for a log pipeline.
+// record (Go log/slog / Rust tracing shape); the sink owns the encoding, which
+// a capturing sink stands in for here. (The JSON sink module was dropped from
+// this port; test/cpp17 covers the remaining log surface.)
 
 #include <catch2/catch_test_macros.hpp>
 #include <cstdint>
@@ -55,34 +56,13 @@ TEST_CASE("core/logging: Attr overloads keep the value type", "[core][logging]")
     CHECK(std::get<std::string_view>(Attr{"s", std::string{"hi"}}.value) == "hi");
 }
 
-TEST_CASE("core/logging: the JSON formatter emits typed, escaped fields", "[core][logging]") {
-    const Attr attrs[] = {
-        {"method", "GET"},       {"status", std::int64_t{status::ok}}, {"duration_ms", 1.5}, {"ok", true},
-        {"path", "/a\"b\\c\nd"},
-    };
-    const LogRecord record{LogLevel::Warn, "access", std::source_location::current(), "request", attrs};
-
-    const std::string json = detail::format_json(record);
-    CHECK(json.front() == '{');
-    CHECK(json.back() == '\n');
-    CHECK(json.find("\"level\":\"warn\"") != std::string::npos);
-    CHECK(json.find("\"cat\":\"access\"") != std::string::npos);
-    CHECK(json.find("\"msg\":\"request\"") != std::string::npos);
-    CHECK(json.find("\"method\":\"GET\"") != std::string::npos);
-    CHECK(json.find("\"status\":200") != std::string::npos);
-    CHECK(json.find("\"duration_ms\":1.5") != std::string::npos);
-    CHECK(json.find("\"ok\":true") != std::string::npos);
-    // Quote, backslash and newline are escaped, not emitted raw.
-    CHECK(json.find("\"path\":\"/a\\\"b\\\\c\\nd\"") != std::string::npos);
-}
-
 TEST_CASE("core/logging: log_with_attrs reaches the sink with its fields", "[core][logging]") {
     auto sink = std::make_shared<CapturingSink>();
     CapturingSink *captured = sink.get();
     SinkScope scope{sink};
 
     const Attr attrs[] = {{"method", "POST"}, {"status", std::int64_t{status::created}}};
-    log_with_attrs(LogLevel::Info, "access", std::source_location::current(), "request", attrs);
+    log_with_attrs(LogLevel::Info, "access", source_location::current(), "request", attrs);
 
     REQUIRE(captured->recs.size() == 1);
     const auto &rec = captured->recs.front();

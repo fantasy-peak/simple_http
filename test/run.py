@@ -48,6 +48,16 @@ class Suite:
 
 SUITES = (
     Suite("unit", "fast", ("test_unit",), "binary", "test_unit", timeout=300),
+    Suite("cpp17", "fast", ("test_cpp17_smoke",), "binary", "test_cpp17_smoke", timeout=120),
+    Suite("cpp17-http", "standard", ("fixture_cpp17_server",), "python", "cpp17/run.py",
+          packages=("httpx", "websockets"), timeout=120),
+    Suite("cpp17-client", "standard", ("test_cpp17_client",), "python", "cpp17/client_interop.py",
+          timeout=120),
+    # Compiled as C++23: exercises the glaze-gated helpers in the same include
+    # root (typed params, JSON, OpenAPI, JWT/JWKS).
+    Suite("cpp17-glaze", "standard", ("test_cpp17_glaze",), "binary", "test_cpp17_glaze", timeout=120),
+    Suite("cpp17-h3", "standard", ("fixture_cpp17_server", "test_cpp17_h3_client"), "python",
+          "cpp17/h3_interop.py", timeout=120),
     Suite("openapi", "standard", ("diff_openapi_server",), "python",
           "diff/openapi/run.py", packages=("httpx", "jsonschema")),
     Suite("client-diff", "full",

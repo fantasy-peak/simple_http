@@ -1,56 +1,41 @@
 #pragma once
 
-// HTTP/1.1 client session.
+// HTTP/1.1 client session (C++17 token-only port).
 //
-// HTTP/1.x has no multiplexing, so one session serves one exchange at a time: a
-// second open_stream() while an exchange is in flight fails with
-// client_errc::session_busy (the facade opens another connection instead).
+// One exchange at a time per connection: the next open_stream() on a busy
+// session fails with client_errc::session_busy. Requests are framed with
+// Content-Length when the length is known up front and chunked when the body is
+// streamed; responses are decoded from Content-Length, chunked framing or
+// close-delimited bodies, with trailer sections published on the stream.
 //
-// Request framing follows the usual client rules: a body that is already known
-// goes out with Content-Length; a streamed one (Request::stream_body) is
-// sent chunked, one chunk per ClientStream::write(); a method that implies a
-// body gets Content-Length: 0 when the caller supplied none.
-//
-// The response head is parsed incrementally (H1ResponseParser) and the body is
-// framed from it:
-//   * Transfer-Encoding: chunked  -> chunked, trailers skipped;
-//   * Content-Length              -> fixed length;
-//   * neither, but a body is due  -> read until the peer closes (the close ends
-//                                    the body, RFC 9112 §6.3);
-//   * HEAD / 204 / 304            -> no body at all.
-// Framing decides reusability: only an explicitly ended body leaves the
-// connection at a request boundary. An EOF-delimited body ends the connection
-// by definition, and a body the caller stopped reading leaves the peer
-// mid-message, so neither session goes back to the pool.
-//
-// Idle reads are bounded by the client's idle_timeout: a peer that accepts the
-// request and then says nothing must not pin the coroutine (and the connection)
-// forever. A timeout closes the connection, since a half-read message leaves it
-// unusable.
+// The session is deliberately narrower than the C++23 original for this first
+// port: h2c upgrade and the automatic Expect: 100-continue dance are deferred,
+// and an interim 100 is read through to the final response.
 
-#include <array>
+#include <algorithm>
 #include <atomic>
 #include <boost/asio.hpp>
-#include <boost/asio/experimental/awaitable_operators.hpp>
-#include <charconv>
+#include <boost/asio/associated_cancellation_slot.hpp>
+#include <boost/asio/bind_cancellation_slot.hpp>
 #include <chrono>
-#include <cstddef>
 #include <cstdint>
-#include <expected>
+#include <cstdio>
+#include <cstring>
 #include <functional>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
 
+#include "../core/http_field.h"
 #include "../core/http_method.h"
-#include "../core/limits.h"
 #include "../core/logging.h"
 #include "../core/types.h"
-#include "../core/version.h"
-#include "../engine/h1/h1_parser.h"
+#include "../proto/body.h"
 #include "../proto/headers.h"
+#include "../proto/request.h"
 #include "../transport/transport.h"
 #include "client_config.h"
 #include "client_stream.h"
@@ -59,1189 +44,852 @@ namespace simple_http::detail {
 
 namespace asio = boost::asio;
 
-template <TransportLike Transport> class Http1ClientSession;
+template <typename Transport> class Http1ClientSession;
 
-// One HTTP/1.1 exchange, seen from the caller's side. All state lives in the
-// session (there is only ever one exchange in flight); this handle routes to it
-// and, being a strong owner, keeps the session alive for as long as the caller
-// holds the stream — nothing else would, since an idle HTTP/1.x session has no
-// loop of its own.
-template <TransportLike Transport> class Http1ClientStream final : public ClientStream {
+template <typename Transport> class Http1ClientStream final : public ClientStream {
   public:
     explicit Http1ClientStream(std::shared_ptr<Http1ClientSession<Transport>> session)
-        : m_session(std::move(session)) {}
+        : m_session(std::move(session)), m_executor(m_session->executor()) {}
 
-    asio::awaitable<error_code> write(std::string data) override {
-        co_return co_await m_session->exchange_write(std::move(data),
-                                                     /*last=*/false);
-    }
+    void write(std::string data, WriteCompletion done) override;
+    void finish(std::string data, WriteCompletion done) override;
+    void finish_trailers(Headers trailers, WriteCompletion done) override;
+    void read(ReadCompletion done) override;
+    void cancel(WriteCompletion done) override;
 
-    asio::awaitable<error_code> finish(std::string data) override {
-        co_return co_await m_session->exchange_write(std::move(data),
-                                                     /*last=*/true);
-    }
+    friend class Http1ClientSession<Transport>;
 
-    asio::awaitable<error_code> finish_trailers(Headers trailers) override {
-        co_return co_await m_session->exchange_write_trailers(std::move(trailers));
-    }
-
-    asio::awaitable<std::expected<ReadResult, error_code>> read() override {
-        // The exchange this stream belongs to has finished (the session marked
-        // it at finish_exchange): a caller that reads once more for the end-of-
-        // body signal gets it without touching session state. That matters
-        // because the session may already have been handed back to the pool and
-        // re-armed with the *next* exchange — probing the shared parser/buffer
-        // then would race it.
-        if (m_finished)
-            co_return ReadResult::end();
-        co_return co_await m_session->exchange_read();
-    }
-
-    bool finished() const override { return m_session->exchange_finished_state(); }
-
+    bool finished() const override { return m_finished.load(std::memory_order_acquire); }
     Version version() const override { return Version::Http11; }
-
     std::uint32_t id() const override { return 0; }
 
-    asio::awaitable<void> cancel() override {
-        co_await asio::dispatch(asio::bind_executor(m_session->get_executor(), asio::use_awaitable));
-        m_session->cancel_exchange();
-    }
-
-  private:
-    friend class Http1ClientSession<Transport>; // publishes the parsed head here
-
-    // Called by the session once this exchange's response has been fully
-    // consumed; the stream becomes inert from the caller's side.
     void mark_finished() { m_finished.store(true, std::memory_order_release); }
 
-    asio::awaitable<error_code> await_head() override { co_return co_await m_session->ensure_head(); }
+  protected:
+    void await_head(WriteCompletion done) override;
+    asio::any_io_executor head_executor() const override { return m_executor; }
 
+  private:
+    // The stream keeps the session alive (a caller may hold the stream after
+    // dropping the Client); the session only weakly references its current
+    // stream, which is what breaks the reference cycle. See release_exchange().
     std::shared_ptr<Http1ClientSession<Transport>> m_session;
-    // Atomic: read() consults it *before* hopping onto the session executor, so
-    // a caller driving the stream from another thread must not race the
-    // executor-side mark_finished(). (Ordered reads of finished()/read() remain
-    // safe; the flag is only a fast path for the end-of-body signal.)
+    asio::any_io_executor m_executor;
     std::atomic<bool> m_finished{false};
 };
 
-template <TransportLike Transport>
+template <typename Transport>
 class Http1ClientSession final : public ClientSession,
                                  public std::enable_shared_from_this<Http1ClientSession<Transport>> {
   public:
-    using Executor = decltype(std::declval<Transport &>().get_executor());
+    using Executor = asio::any_io_executor;
 
-    // Handing the connection to HTTP/2 after a successful h2c upgrade. Supplied
-    // by the facade (which owns the h2 session type) so this header needs no
-    // knowledge of it: it builds an HTTP/2 session over `transport`, replays
-    // `seed` as stream 1 and hands back both the session and that stream.
-    // `transport` is the connection, `seed` the request that carried the
-    // upgrade, and `initial` the bytes the peer sent right after its 101 (its h2
-    // preface/SETTINGS, possibly the response) — the successor must take them or
-    // they are lost.
-    using H2UpgradeFactory = std::function<asio::awaitable<
-        std::expected<std::pair<std::shared_ptr<ClientSession>, std::shared_ptr<ClientStream>>, error_code>>(
-        std::shared_ptr<Transport> transport, std::shared_ptr<Request> seed, std::string initial)>;
-
-    Http1ClientSession(std::shared_ptr<Transport> transport, std::string authority, EngineLimits limits,
-                       std::chrono::milliseconds idle_timeout)
+    Http1ClientSession(std::shared_ptr<Transport> transport, std::string authority, EngineLimits limits)
         : m_transport(std::move(transport)), m_executor(m_transport->get_executor()), m_authority(std::move(authority)),
-          m_limits(limits), m_idle_timeout(idle_timeout) {}
+          m_limits(limits) {}
 
-    // --- ClientSession ---
-
-    asio::awaitable<std::expected<std::shared_ptr<ClientStream>, error_code>>
-    open_stream(std::shared_ptr<Request> request) override {
-        co_await hop();
-        co_return co_await open_exchange(std::move(request), /*allow_upgrade=*/false, {});
+    void open_stream(std::shared_ptr<Request> request, OpenCompletion done) override {
+        auto self = this->shared_from_this();
+        hop([self, request = std::move(request), done = std::move(done)]() mutable {
+            self->open_exchange(std::move(request), std::move(done));
+        });
     }
 
-    // Like open_stream(), but in h2c Upgrade mode the request doubles as the
-    // protocol-switch request (`Upgrade: h2c` + `HTTP2-Settings`). When the peer
-    // answers 101 the connection becomes HTTP/2, this request is replayed there
-    // as stream 1, and the returned stream is the HTTP/2 one; otherwise the
-    // returned stream serves an ordinary HTTP/1.1 exchange (the peer ignored the
-    // upgrade, which is the common case for a server that does not speak h2c).
-    asio::awaitable<std::expected<std::shared_ptr<ClientStream>, error_code>>
-    open_stream_upgradeable(std::shared_ptr<Request> request, std::string http2_settings_b64) {
-        co_await hop();
-        co_return co_await open_exchange(std::move(request), /*allow_upgrade=*/true, std::move(http2_settings_b64));
-    }
-
-    // Whether the connection is worth an upgrade attempt: the facade installs a
-    // factory only when the target's policy asks for h2c, and a peer that already
-    // refused (or a request with a streamed body, which the upgrade cannot carry
-    // in one shot) is never asked again.
-    bool upgrade_available(bool streaming_body) const {
-        return !m_successor.load().lock() && !m_upgrade_failed.load() && static_cast<bool>(m_h2_factory) &&
-               !streaming_body;
-    }
-
-    bool alive() const override {
-        if (auto successor = m_successor.load().lock())
-            return successor->alive();
-        return m_alive;
-    }
-
+    bool alive() const override { return m_alive.load(std::memory_order_acquire); }
     bool reusable() const override {
-        if (auto successor = m_successor.load().lock())
-            return successor->reusable();
-        return m_alive && m_reusable && !m_busy;
+        return alive() && !m_busy && !m_close_after && m_body_complete && !m_connection_error;
     }
-
-    // Whether the connection can serve another request after the current one —
-    // alive, and neither side asked to close. Busy-ness is ignored on purpose:
-    // the single-connection engine queues the next HTTP/1.1 request on its gate
-    // instead of dialing, so a busy but keepable connection is a reuse. When the
-    // connection is *idle* it must also be at a request boundary (reusable()):
-    // an EOF-delimited or otherwise non-boundary idle connection is dead for
-    // reuse even though it is still "alive" — a busy one is fine, because the
-    // gate guarantees the in-flight exchange finishes (or closes the
-    // connection) before the queued request opens on it.
-    bool keepable() const override {
-        if (auto successor = m_successor.load().lock())
-            return successor->keepable();
-        return m_alive && m_keep_alive && !m_close_after && (m_busy || m_reusable);
-    }
-
-    // The in-flight exchange's completion flag (see the base declaration): the
-    // engine's stream-destruction hook reads it to tell an abandoned exchange
-    // from a completed one.
-    std::shared_ptr<std::atomic<bool>> exchange_done_flag() const override { return m_current_done; }
-
-    bool multiplexes() const override {
-        if (auto successor = m_successor.load().lock())
-            return successor->multiplexes();
-        return false;
-    }
-
-    Version version() const override {
-        if (auto successor = m_successor.load().lock())
-            return successor->version();
-        return Version::Http11;
-    }
-
+    bool keepable() const override { return alive() && !m_close_after; }
+    bool multiplexes() const override { return false; }
+    Version version() const override { return Version::Http11; }
     std::string_view authority() const override { return m_authority; }
     asio::any_io_executor executor() const override { return m_executor; }
 
     void close() override {
-        // Safe from any thread (and from a non-awaitable context): the teardown
-        // itself runs on the connection executor. The atomics are flipped
-        // *here*, synchronously, before the posted teardown: they are what the
-        // engine's reuse check (alive()/keepable()) reads, and a coroutine
-        // released onto the one-exchange gate must observe the closure before it
-        // opens an exchange — otherwise it could run open_stream on a session
-        // whose in-flight exchange was abandoned and see session_busy.
-        m_alive = false;
-        m_reusable = false;
-        asio::post(m_executor, [self = this->shared_from_this()] {
-            if (auto successor = self->m_successor.load().lock()) {
-                successor->close();
+        m_alive.store(false, std::memory_order_release);
+        m_transport->close();
+    }
+
+    void set_on_exchange_done(std::function<void()> cb) override { m_exchange_done = std::move(cb); }
+    std::shared_ptr<std::atomic<bool>> exchange_done_flag() const override { return m_current_done; }
+
+    // --- token operations used by the stream ---
+    //
+    // `caller` identifies the exchange that issued the operation. A stream may
+    // outlive its exchange (the session keeps only a weak reference after
+    // release_exchange, and Response holds the stream), so without this check a
+    // stale stream would write into — or read from — whatever exchange the
+    // connection is running now.
+    bool is_current(const Http1ClientStream<Transport> *caller) const {
+        return m_current.lock().get() == caller;
+    }
+
+    void exchange_write(std::string data, bool last, WriteCompletion done,
+                        const Http1ClientStream<Transport> *caller) {
+        auto self = this->shared_from_this();
+        hop([self, data = std::move(data), last, done = std::move(done), caller]() mutable {
+            if (!self->is_current(caller)) {
+                std::move(done)(make_error_code(client_errc::session_closed));
                 return;
             }
-            self->m_alive = false;
-            self->m_reusable = false;
-            if (self->m_transport)
-                self->m_transport->close();
+            self->do_exchange_write(std::move(data), last, std::move(done));
+        });
+    }
+    void exchange_write_trailers(Headers trailers, WriteCompletion done,
+                                 const Http1ClientStream<Transport> *caller) {
+        auto self = this->shared_from_this();
+        hop([self, trailers = std::move(trailers), done = std::move(done), caller]() mutable {
+            if (!self->is_current(caller)) {
+                std::move(done)(make_error_code(client_errc::session_closed));
+                return;
+            }
+            self->do_exchange_write_trailers(std::move(trailers), std::move(done));
+        });
+    }
+    void exchange_read(ReadCompletion done, const Http1ClientStream<Transport> *caller) {
+        auto self = this->shared_from_this();
+        hop([self, done = std::move(done), caller]() mutable {
+            if (!self->is_current(caller)) {
+                std::move(done)(make_error_code(client_errc::session_closed), ReadResult{});
+                return;
+            }
+            self->do_exchange_read(std::move(done));
+        });
+    }
+    void ensure_head(WriteCompletion done, const Http1ClientStream<Transport> *caller) {
+        auto self = this->shared_from_this();
+        hop([self, done = std::move(done), caller]() mutable {
+            if (!self->is_current(caller)) {
+                std::move(done)(make_error_code(client_errc::session_closed));
+                return;
+            }
+            self->do_ensure_head(std::move(done));
+        });
+    }
+    void cancel_exchange(WriteCompletion done, const Http1ClientStream<Transport> *caller) {
+        auto self = this->shared_from_this();
+        hop([self, done = std::move(done), caller]() mutable {
+            if (!self->is_current(caller)) {
+                // A stale handle must not tear down the exchange that owns the
+                // connection now.
+                std::move(done)(make_error_code(client_errc::session_closed));
+                return;
+            }
+            self->m_alive.store(false);
+            self->m_transport->close();
+            self->release_exchange();
+            std::move(done)(error_code{});
         });
     }
 
-    // --- wiring (facade only) ---
-    void set_h2_upgrade_factory(H2UpgradeFactory factory) { m_h2_factory = std::move(factory); }
-
-    // Fired once when an exchange completes (the connection is free again).
-    // The engine uses it to release its single-connection HTTP/1.1 gate —
-    // released on *exchange completion*, not on the caller dropping the stream
-    // handle, so a caller may keep the Stream object alive while the next
-    // request already proceeds.
-    void set_on_exchange_done(std::function<void()> cb) override { m_exchange_done = std::move(cb); }
-
-    std::shared_ptr<Transport> transport() { return m_transport; }
-
-    Executor get_executor() { return m_executor; }
+    Transport &transport() { return *m_transport; }
 
   private:
     friend class Http1ClientStream<Transport>;
 
-    // Outcome of the body framing decision.
     enum class BodyMode { None, Fixed, Chunked, EofDelimited };
-    enum class Fill { Ok, Eof, Error };
 
-    asio::awaitable<void> hop() { co_await asio::dispatch(asio::bind_executor(m_executor, asio::use_awaitable)); }
+    template <typename Fn> void hop(Fn &&fn) {
+        asio::dispatch(asio::bind_executor(asio::any_io_executor{m_executor}, std::forward<Fn>(fn)));
+    }
 
     static bool method_expects_body(Method method) {
-        return method == Method::Post || method == Method::Put || method == Method::Patch;
+        return method != Method::Get && method != Method::Head && method != Method::Options &&
+               method != Method::Trace && method != Method::Delete && method != Method::Connect;
     }
 
-    static error_code closed_error() { return make_error_code(client_errc::session_closed); }
-
-    // --- opening an exchange ---
-
-    asio::awaitable<std::expected<std::shared_ptr<ClientStream>, error_code>>
-    open_exchange(std::shared_ptr<Request> request, bool allow_upgrade, std::string settings_b64) {
-        if (auto successor = m_successor.load().lock()) {
-            co_return co_await successor->open_stream(std::move(request));
-        }
-        if (!m_alive)
-            co_return std::unexpected{closed_error()};
-        if (m_busy)
-            co_return std::unexpected{make_error_code(client_errc::session_busy)};
-        // A body supplied up front and a body to be streamed are two different
-        // things; asking for both is a contradiction, and the engines resolved it
-        // differently — HTTP/2 sent `body` as the first chunk, HTTP/1.1 dropped it
-        // without a word. Refusing is the only answer that cannot lose data.
-        if (request->stream_body() && request->content_length() >= 0)
-            co_return std::unexpected{make_error_code(client_errc::invalid_spec)};
-
-        auto stream = std::make_shared<Http1ClientStream<Transport>>(this->shared_from_this());
-        m_stream = stream;
-        m_busy = true;
-        m_reusable = false;
-        // A fresh per-exchange completion flag: the stream-destruction hook holds
-        // this exact object, so it stays "not done" unless *this* exchange
-        // finishes — a later exchange's flag is a different object and cannot
-        // mislead it.
-        m_current_done = std::make_shared<std::atomic<bool>>(false);
-        reset_exchange(std::move(request));
-
-        const bool want_upgrade = allow_upgrade && upgrade_available(m_spec->stream_body());
-        error_code ec;
-        if (want_upgrade) {
-            ec = co_await start_upgrade_exchange(std::move(settings_b64));
-        } else {
-            ec = co_await send_request_head();
-        }
-        if (ec) {
-            SIMPLE_HTTP_ERROR_LOG("h1 client: sending the request to {} failed: {}", m_authority, ec.message());
-            fail_session();
-            co_return std::unexpected{ec};
-        }
-
-        if (m_switched)
-            co_return co_await finish_upgrade(std::move(stream));
-        co_return stream;
-    }
-
-    // Completes an h2c upgrade: builds the HTTP/2 session over this transport and
-    // replays the request as stream 1. The caller gets the HTTP/2 stream, and
-    // this session becomes a facade over the successor (so the kept connection
-    // keeps working and reports version Http2).
-    asio::awaitable<std::expected<std::shared_ptr<ClientStream>, error_code>>
-    finish_upgrade(std::shared_ptr<ClientStream> h1_stream) {
-        (void)h1_stream; // the h1 side of the exchange is gone: its stream was
-                         // replayed as stream 1
-        auto transport = std::exchange(m_transport, nullptr);
-        std::string initial = std::exchange(m_buf, {});
-        auto result = co_await m_h2_factory(std::move(transport), std::move(m_spec), std::move(initial));
-        if (!result) {
-            m_alive = false;
-            m_busy = false;
-            co_return std::unexpected{result.error()};
-        }
-        m_successor.store(std::weak_ptr<ClientSession>{result->first});
-        // This session is now only a facade: its transport belongs to the
-        // successor. Mark it not-alive so the fallbacks used when the successor
-        // is *gone* (it self-holds through its loops and dies with the idle
-        // timeout) report the session as dead instead of "alive" — otherwise the
-        // engine would reuse it, open_exchange() would take the HTTP/1.1 path,
-        // and write_raw() would dereference the null m_transport. While the
-        // successor lives, alive()/keepable()/version() answer through the
-        // forward above.
-        m_alive = false;
+    void release_exchange() {
         m_busy = false;
-        SIMPLE_HTTP_ERROR_LOG("h1 client: {} switched to HTTP/2 (h2c upgrade)", m_authority);
-        co_return std::move(result->second);
+        if (m_current_done)
+            m_current_done->store(true, std::memory_order_release);
+        if (auto current = m_current.lock()) {
+            current->mark_finished();
+        }
+        m_current.reset();
+        auto hook = m_exchange_done;
+        if (hook)
+            hook();
     }
 
-    // Resets the per-exchange state for a new request.
-    void reset_exchange(std::shared_ptr<Request> request) {
+    void fail_exchange(error_code ec) {
+        m_connection_error = ec;
+        m_alive.store(false, std::memory_order_release);
+        m_transport->close();
+        m_body_complete = false;
+        release_exchange();
+    }
+
+    // --- request ---
+
+    void open_exchange(std::shared_ptr<Request> request, OpenCompletion done) {
+        if (!alive()) {
+            std::move(done)(make_error_code(client_errc::session_closed), nullptr);
+            return;
+        }
+        if (m_busy) {
+            std::move(done)(make_error_code(client_errc::session_busy), nullptr);
+            return;
+        }
+        std::string head;
+        if (auto ec = build_request_head(*request, head); ec) {
+            std::move(done)(ec, nullptr);
+            return;
+        }
+        m_busy = true;
         m_spec = std::move(request);
-        m_parser = H1ResponseParser{};
-        m_buf.clear();
-        m_head_parsed = false;
-        m_head_published = false;
-        m_head = ResponseHead{};
-        m_body_mode = BodyMode::None;
-        m_body_remaining = 0;
-        m_body_done = false;
-        m_close_after = false;
-        m_req_streaming = m_spec->stream_body();
-        m_req_finished = false;
-        m_resp_truncated = false;
-        m_switched = false;
-        m_cancelled = false;
-        m_awaiting_final = false;
-        m_keep_alive = !m_spec->close();
-        // Did this request ask for an interim 100-continue? If so the session
-        // hands the 100 back to the caller (as the head) instead of swallowing
-        // it, so the caller can send the body only once the peer agreed.
+        m_close_after = m_spec->close();
+        // Did this request ask for an interim 100-continue? If so the first 100
+        // is handed back to the caller as the head (instead of being swallowed)
+        // so Stream can send the body only after the peer agreed. A final
+        // response may also arrive instead -- a refusal -- and is surfaced too.
         m_expect_continue = false;
-        if (auto expect = m_spec->headers().get("expect")) {
+        if (auto expect = m_spec->headers().get(field::expect)) {
             m_expect_continue = icontains_ci(*expect, "100-continue");
         }
+        m_awaiting_final = false;
+        m_head_parsed = false;
+        m_body_complete = false;
+        m_connection_error = {};
+        m_in.clear();
+        m_trailers = Headers{};
+        m_current_done = std::make_shared<std::atomic<bool>>(false);
+        auto stream = std::make_shared<Http1ClientStream<Transport>>(this->shared_from_this());
+        m_current = stream;
+
+        const bool has_upfront_body = m_spec->stream_body() || m_spec->content_length() >= 0;
+        if (!m_spec->stream_body() && !has_upfront_body) {
+            auto bytes = std::make_shared<std::string>(std::move(head));
+            auto self = this->shared_from_this();
+            m_transport->async_write(ConstByteSpan{reinterpret_cast<const std::byte *>(bytes->data()), bytes->size()},
+                                     [self, stream, bytes, done = std::move(done)](error_code ec, std::size_t) mutable {
+                                         if (ec) {
+                                             self->fail_exchange(ec);
+                                             std::move(done)(ec, nullptr);
+                                             return;
+                                         }
+                                         std::move(done)(error_code{}, stream);
+                                     });
+            return;
+        }
+        if (!m_spec->stream_body()) {
+            auto self = this->shared_from_this();
+            m_spec->body().async_read_all([self, stream, head = std::move(head),
+                                           done = std::move(done)](error_code ec, std::string body) mutable {
+                if (ec) {
+                    self->release_exchange();
+                    std::move(done)(ec, nullptr);
+                    return;
+                }
+                std::string out = head;
+                if (!body.empty()) {
+                    if (self->m_request_chunked) {
+                        out += encode_chunk(body);
+                        out += "0\r\n\r\n";
+                    } else {
+                        out += body;
+                    }
+                }
+                auto bytes = std::make_shared<std::string>(std::move(out));
+                self->m_transport->async_write(
+                    ConstByteSpan{reinterpret_cast<const std::byte *>(bytes->data()), bytes->size()},
+                    [self, stream, bytes, done = std::move(done)](error_code wec, std::size_t) mutable {
+                        if (wec) {
+                            self->fail_exchange(wec);
+                            std::move(done)(wec, nullptr);
+                            return;
+                        }
+                        std::move(done)(error_code{}, stream);
+                    });
+            });
+            return;
+        }
+
+        auto bytes = std::make_shared<std::string>(std::move(head));
+        auto self = this->shared_from_this();
+        m_transport->async_write(ConstByteSpan{reinterpret_cast<const std::byte *>(bytes->data()), bytes->size()},
+                                 [self, stream, bytes, done = std::move(done)](error_code ec, std::size_t) mutable {
+                                     if (ec) {
+                                         self->fail_exchange(ec);
+                                         std::move(done)(ec, nullptr);
+                                         return;
+                                     }
+                                     std::move(done)(error_code{}, stream);
+                                 });
     }
 
-    // --- request side ---
-
-    // Serializes and sends the request head, plus the body when the caller
-    // supplied it up front.
-    asio::awaitable<error_code> send_request_head() {
-        std::string head;
-        if (auto ec = build_request_head(head); ec)
-            co_return ec;
-
-        if (!m_req_streaming && m_spec->content_length() >= 0) {
-            auto body = co_await m_spec->body().read_all();
-            if (!body)
-                co_return body.error();
-            if (!body->empty())
-                head.append(std::move(*body));
-            m_req_finished = true;
+    error_code build_request_head(const Request &request, std::string &out) {
+        if (contains_ctl(request.method_token()) || contains_ctl(request.target())) {
+            return make_error_code(client_errc::invalid_spec);
         }
-        if (!m_req_streaming && m_spec->content_length() < 0) {
-            m_req_finished = true; // no up-front body to send
-        }
-        auto ec = co_await write_raw(head);
-        if (!ec)
-            m_reusable = false; // only the response's framing can make it reusable
-        co_return ec;
-    }
-
-    // The h2c Upgrade form: the same request, plus the upgrade headers.
-    asio::awaitable<error_code> start_upgrade_exchange(std::string settings_b64) {
-        m_upgrade_settings = std::move(settings_b64);
-        m_upgrading = true; // build_request_head has to see it: it adds the upgrade headers
-        std::string head;
-        if (auto ec = build_request_head(head); ec) {
-            m_upgrading = false;
-            co_return ec;
-        }
-        if (m_req_streaming) {
-            m_upgrading = false;
-            co_return make_error_code(client_errc::invalid_spec); // an upgrade cannot stream
-        }
-        if (m_spec->content_length() >= 0) {
-            auto body = co_await m_spec->body().read_all();
-            if (!body) {
-                m_upgrading = false;
-                co_return body.error();
-            }
-            if (!body->empty())
-                head.append(std::move(*body));
-        }
-        m_req_finished = true;
-        auto ec = co_await write_raw(head);
-        if (ec) {
-            m_upgrading = false;
-            co_return ec;
-        }
-        // Read the response head: 101 means the peer switched (and this request
-        // is now stream 1 of the HTTP/2 connection).
-        if (auto pec = co_await read_response_head(/*allow_switching=*/true); pec) {
-            m_upgrading = false;
-            co_return pec;
-        }
-        if (m_head.status == status::switching_protocols) {
-            m_switched = true; // no head to deliver: the exchange becomes stream 1
-            m_body_mode = BodyMode::None;
-            m_body_done = true;
-        } else {
-            m_upgrade_failed.store(true); // do not ask this peer again
-        }
-        m_upgrading = false;
-        co_return error_code{};
-    }
-
-    // Builds the request head. Framing headers are ours: Host, Content-Length /
-    // Transfer-Encoding and Connection are (re)written here, and any field with a
-    // control byte is dropped rather than spliced into the message.
-    // The connection field — and the h2c upgrade preamble — hold fixed values, so
-    // they are written from constants rather than reassembled per request.
-    static constexpr std::string_view kKeepAliveConnection = "connection: keep-alive\r\n";
-    static constexpr std::string_view kCloseConnection = "connection: close\r\n";
-    static constexpr std::string_view kH2cUpgradeHeaders =
-        "connection: Upgrade, HTTP2-Settings\r\nupgrade: h2c\r\nhttp2-settings: ";
-
-    error_code build_request_head(std::string &out) {
-        // The raw token carries extension methods (PROPFIND, PURGE, …) that the
-        // enum cannot name; set_method() keeps it in sync for the common verbs.
-        std::string_view method = m_spec->method_token();
-        if (method.empty())
-            method = to_string(m_spec->method());
-        if (method.empty())
-            return make_error_code(client_errc::protocol_error);
-        const std::string_view target = m_spec->target();
-        if (contains_ctl(target) || contains_ctl(method))
-            return make_error_code(client_errc::protocol_error);
-
-        out.append(method);
+        out.reserve(256);
+        out.append(request.method_token());
         out.push_back(' ');
-        out.append(target.empty() ? "/" : target);
+        out.append(request.target());
         out.append(" HTTP/1.1\r\n");
-        // A `host` field on the Request is an explicit authority override (the
-        // reverse proxy's preserve_host mode); otherwise the connection target
-        // owns the authority.
-        const auto host_override = m_spec->header("host");
-        out.append("host: ");
-        out.append(host_override ? *host_override : std::string_view{m_authority});
-        out.append("\r\n");
 
-        bool saw_agent = false;
-        for (const auto &[name, value] : m_spec->headers()) {
-            if (name == "host" || name == "content-length" || name == "transfer-encoding" || name == "connection" ||
-                name == "upgrade" || name == "http2-settings" || name == "keep-alive") {
-                continue; // ours to set (and hop-by-hop fields are never forwarded
-                          // blindly)
+        bool has_host = false;
+        std::string host_value;
+        bool has_connection = false;
+        for (const auto &[name, value] : request.headers()) {
+            if (name == "host") {
+                has_host = true;
+                host_value = value;
             }
-            if (contains_ctl(name) || contains_ctl(value)) {
-                SIMPLE_HTTP_ERROR_LOG("h1 client: dropping header '{}' with CR/LF/NUL", name);
-                continue;
+            if (name == "connection")
+                has_connection = true;
+            if (name == "content-length" || name == "transfer-encoding" || is_connection_specific_field(name) ||
+                name == "host") {
+                continue; // framing and connection fields belong to the session
             }
-            if (name == "user-agent")
-                saw_agent = true;
             out.append(name);
             out.append(": ");
             out.append(value);
             out.append("\r\n");
         }
-        if (!saw_agent) {
-            out.append("user-agent: ");
-            out.append(client_product);
-            out.append("\r\n");
-        }
+        out.append("host: ");
+        out.append(has_host ? host_value : m_authority);
+        out.append("\r\n");
 
-        // Body framing first. An h2c upgrade request is still an HTTP/1.1
-        // request — RFC 9113 §3.2 requires the whole thing (body included) to be
-        // on the wire before the peer switches, so it must declare its length
-        // like any other request; without this the peer sees a body-less request
-        // and reads the body bytes as the start of the HTTP/2 connection.
-        if (m_req_streaming) {
-            out.append("transfer-encoding: chunked\r\n");
-        } else if (m_spec->content_length() >= 0) {
+        m_request_chunked = false;
+        if (request.stream_body()) {
+            if (request.content_length() >= 0) {
+                out.append("content-length: ");
+                out.append(std::to_string(request.content_length()));
+                out.append("\r\n");
+            } else {
+                m_request_chunked = true;
+                out.append("transfer-encoding: chunked\r\n");
+            }
+        } else if (request.content_length() >= 0) {
             out.append("content-length: ");
-            append_size(out, static_cast<std::size_t>(m_spec->content_length()));
+            out.append(std::to_string(request.content_length()));
             out.append("\r\n");
-        } else if (method_expects_body(m_spec->method())) {
+        } else if (method_expects_body(request.method())) {
             out.append("content-length: 0\r\n");
         }
 
-        if (m_upgrading) {
-            out.append(kH2cUpgradeHeaders);
-            out.append(m_upgrade_settings);
-            out.append("\r\n");
-        } else {
-            out.append(m_keep_alive ? kKeepAliveConnection : kCloseConnection);
+        if (request.close()) {
+            out.append("connection: close\r\n");
+        } else if (!has_connection) {
+            out.append("connection: keep-alive\r\n");
         }
         out.append("\r\n");
-        return error_code{};
-    }
-
-    // Body chunk for a streaming request.
-    asio::awaitable<error_code> exchange_write(std::string data, bool last) {
-        co_await hop();
-        if (!m_alive || m_switched)
-            co_return closed_error();
-        if (!m_req_streaming || m_req_finished)
-            co_return make_error_code(client_errc::body_not_streaming);
-
-        std::string out;
-        if (!data.empty())
-            out = encode_chunk(data);
-        if (last) {
-            out.append("0\r\n\r\n"); // last-chunk + trailer-less terminator
-            m_req_finished = true;
-        }
-        if (out.empty())
-            co_return error_code{};
-
-        auto ec = co_await write_raw(out);
-        if (ec) {
-            fail_session();
-            co_return ec;
-        }
-        co_return error_code{};
-    }
-
-    // Ends a chunked request body with a trailer section. The fields are written
-    // after the terminating chunk ("0\r\n<fields>\r\n"); framing fields are
-    // ignored. The peer must have been told to expect them via the request's
-    // `Trailer` header; that is the caller's contract.
-    asio::awaitable<error_code> exchange_write_trailers(Headers trailers) {
-        co_await hop();
-        if (!m_alive || m_switched)
-            co_return closed_error();
-        if (!m_req_streaming || m_req_finished)
-            co_return make_error_code(client_errc::body_not_streaming);
-
-        std::string out = "0\r\n";
-        for (const auto &[name, value] : trailers) {
-            if (name.empty() || name.front() == ':' || is_connection_specific_field(name) || contains_ctl(name) ||
-                contains_ctl(value)) {
-                continue;
-            }
-            out += name;
-            out += ": ";
-            out += value;
-            out += "\r\n";
-        }
-        out += "\r\n";
-        m_req_finished = true;
-
-        if (auto ec = co_await write_raw(out); ec) {
-            fail_session();
-            co_return ec;
-        }
-        co_return error_code{};
-    }
-
-    // Appends a size in lowercase hex (chunked framing) without the locale and
-    // formatted-output overhead of snprintf.
-    static void append_hex(std::string &out, std::size_t value) {
-        char buf[2 * sizeof(std::size_t)];
-        auto [end, ec] = std::to_chars(buf, buf + sizeof(buf), value, 16);
-        out.append(buf, static_cast<std::size_t>(end - buf));
-    }
-
-    // Appends a size in decimal without allocating.
-    static void append_size(std::string &out, std::size_t value) {
-        char buf[std::numeric_limits<std::size_t>::digits10 + 2];
-        auto [end, ec] = std::to_chars(buf, buf + sizeof(buf), value);
-        out.append(buf, static_cast<std::size_t>(end - buf));
+        return {};
     }
 
     static std::string encode_chunk(const std::string &data) {
-        std::string out;
-        out.reserve(2 * sizeof(std::size_t) + 4 + data.size()); // hex size, CRLF, CRLF
-        append_hex(out, data.size());
+        static constexpr char hex[] = "0123456789abcdef";
+        char size[2 * sizeof(std::size_t) + 2];
+        std::size_t i = sizeof(size);
+        std::size_t value = data.size();
+        do {
+            size[--i] = hex[value & 0xF];
+            value >>= 4;
+        } while (value != 0);
+        std::string out{size + i, sizeof(size) - i};
         out.append("\r\n");
         out.append(data);
         out.append("\r\n");
         return out;
     }
 
-    // --- response side ---
-
-    asio::awaitable<std::expected<ReadResult, error_code>> exchange_read() {
-        co_await hop();
-        // HTTP/1.1 is half-duplex: the response cannot begin until the request
-        // is complete (RFC 9112 §6.3). For a request *with* a body this means a
-        // caller that reads the body while the request body is still open would
-        // wait out its whole TTFB budget on a server that is (correctly)
-        // waiting for the rest of the request — fail fast instead of hanging.
-        // Body-less requests (GET/HEAD/…s) are unaffected: their "stream" never
-        // writes, and servers respond immediately without waiting.
-        // A final response to Expect: 100-continue is a legitimate exception:
-        // the peer refused the body, so the response is readable without
-        // finishing it. (A 100 alone leaves m_head_parsed false and keeps the
-        // fail-fast rule: the caller must send the body first.)
-        if (m_req_streaming && !m_req_finished && method_expects_body(m_spec->method()) &&
-            !(m_expect_continue && m_head_parsed))
-            co_return std::unexpected{make_error_code(client_errc::half_duplex)};
-        if (m_cancelled)
-            co_return std::unexpected{closed_error()};
-        if (!m_alive)
-            co_return std::unexpected{closed_error()};
-
-        // The caller may go straight to the body: parse (and publish) the head
-        // on the way, so status()/head() stay available either way. A 100-
-        // continue interim is not a body event: keep reading until the *final*
-        // head is in (a caller that drives the body through read() must have
-        // sent it; otherwise this waits on it, exactly as the peer does).
-        for (;;) {
-            if (auto ec = co_await ensure_head(); ec) {
-                fail_session();
-                co_return std::unexpected{ec};
-            }
-            if (m_head_parsed)
-                break;
-        }
-
-        if (m_body_done) {
-            // A bodyless response (HEAD, 204/304) ends here. Retiring the
-            // exchange is what hands the connection back to the pool, so it must
-            // happen even when the caller only reads the head.
-            if (m_busy)
-                finish_exchange();
-            co_return ReadResult::end();
-        }
-
-        switch (m_body_mode) {
-        case BodyMode::None:
-            m_body_done = true;
-            finish_exchange();
-            co_return ReadResult::end();
-        case BodyMode::Fixed:
-            co_return co_await read_fixed_body();
-        case BodyMode::Chunked:
-            co_return co_await read_chunked_body();
-        case BodyMode::EofDelimited:
-            co_return co_await read_to_eof_body();
-        }
-        co_return std::unexpected{make_error_code(client_errc::protocol_error)};
-    }
-
-    // Idempotent: parses the response head if that has not happened yet, and
-    // publishes it to the stream handle (once). Used by both read() and
-    // read_head().
-    asio::awaitable<error_code> ensure_head() {
-        // Same half-duplex rule as exchange_read: on HTTP/1.1 the head cannot
-        // arrive before a *bodied* request's body is complete, so reading it
-        // early hangs for the TTFB with nothing to show. Body-less requests
-        // (GET/HEAD/…) are unaffected. The one legitimate early read for a
-        // bodied request is `Expect: 100-continue` — the interim 100 is the
-        // "send your body now" signal and must be retrievable before the body
-        // goes out — so that path stays open.
-        if (m_req_streaming && !m_req_finished && method_expects_body(m_spec->method()) && !m_expect_continue)
-            co_return make_error_code(client_errc::half_duplex);
-        if (!m_head_parsed) {
-            if (auto ec = co_await read_response_head(); ec)
-                co_return ec;
-        }
-        if (!m_head_published) {
-            if (auto stream = m_stream.lock())
-                stream->set_head(m_head);
-            m_head_published = true;
-            if (!m_head_parsed) {
-                // An interim 100-continue was just handed back: the caller's
-                // handle must re-parse for the final response, so nothing is
-                // cached on it and the final republishes on the next call.
-                if (auto stream = m_stream.lock())
-                    stream->reset_head();
-                m_head_published = false;
-            }
-        }
-        // A response that ends at the head (HEAD, 204/304, an explicit
-        // Content-Length: 0) is already complete. Retire the exchange here so a
-        // caller that only reads the head — a proxy forwarding a 204, say —
-        // leaves the connection reusable and the one-exchange gate free,
-        // instead of holding both until some read() that never comes.
-        // (m_body_done stays false while a 100-continue final is still owed, so
-        // an interim head never retires the exchange.)
-        if (m_body_done && m_busy)
-            finish_exchange();
-        co_return error_code{};
-    }
-
-    // Reads and parses the response head, skipping the informational responses
-    // that may precede it (100 Continue, 103 Early Hints). A 101 here — outside
-    // the h2c upgrade path — is a protocol switch this session cannot honour, so
-    // it is rejected rather than mistaken for a final response.
-    // `allow_switching` accepts a 101 as a final answer: only the h2c upgrade
-    // path can act on one, and every other exchange must treat it as an error it
-    // cannot honour.
-    asio::awaitable<error_code> read_response_head(bool allow_switching = false) {
-        if (m_head_parsed)
-            co_return error_code{}; // already done (h2c upgrade path)
-        for (;;) {
-            auto state = m_parser.parse_head();
-            while (state == H1ResponseParser::State::NeedMore) {
-                if (m_parser.buffered() > m_limits.max_header_bytes) {
-                    SIMPLE_HTTP_ERROR_LOG("h1 client: response head from {} exceeds {} bytes", m_authority,
-                                          m_limits.max_header_bytes);
-                    co_return make_error_code(client_errc::header_too_large);
-                }
-                auto [fill, ec] = co_await fill_buf();
-                if (fill != Fill::Ok) {
-                    SIMPLE_HTTP_ERROR_LOG("h1 client: no response head from {}: {}", m_authority, ec.message());
-                    co_return ec;
-                }
-                // The parser owns the head buffer, so newly-read bytes go to it
-                // rather than to the body buffer.
-                m_parser.feed(std::string_view{m_buf});
-                m_buf.clear();
-                state = m_parser.parse_head();
-            }
-            if (state == H1ResponseParser::State::Error) {
-                SIMPLE_HTTP_ERROR_LOG("h1 client: malformed response head from {}", m_authority);
-                co_return make_error_code(client_errc::protocol_error);
-            }
-
-            const auto &parsed = m_parser.head();
-            if (parsed.status >= 200)
-                break;
-            if (parsed.status == status::switching_protocols && allow_switching)
-                break;
-            // A 100-continue *we asked for*: hand it to the caller as the head
-            // (the "send your body now" signal) instead of swallowing it, and
-            // leave the final response for the next read. m_head_parsed stays
-            // false, so the next read_head()/read() parses the final — and so
-            // read() knows to loop for it rather than treat a bodyless head as
-            // end-of-exchange. Once m_awaiting_final is set, any further 100 is
-            // just skipped like the other informational responses.
-            if (parsed.status == status::continue_ && m_expect_continue && !m_awaiting_final) {
-                m_head.status = status::continue_;
-                m_head.version = parsed.version;
-                m_head.headers = parsed.headers;
-                m_head.bodyless = true;
-                m_body_mode = BodyMode::None;
-                m_body_done = false;
-                m_awaiting_final = true;
-                m_buf.assign(m_parser.remainder());
-                m_parser.reset_after_head();
-                co_return error_code{};
-            }
-            if (parsed.status != status::continue_ && parsed.status != status::early_hints) {
-                SIMPLE_HTTP_ERROR_LOG("h1 client: unexpected {} from {}", parsed.status, m_authority);
-                co_return make_error_code(client_errc::protocol_error);
-            }
-            // Informational: drop it and parse whatever follows.
-            m_parser.reset_after_head();
-        }
-
-        const auto &parsed = m_parser.head();
-        m_head.status = parsed.status;
-        m_head.version = parsed.version;
-        m_head.headers = parsed.headers;
-        // The body framing, and with it the session's reusability.
-        decide_body_framing();
-        m_head.bodyless = m_body_mode == BodyMode::None;
-        // Bytes read past the head are the start of the body (or of the next
-        // response on a bodyless one).
-        m_buf.assign(m_parser.remainder());
-        m_parser.reset_after_head();
-        m_head_parsed = true;
-        co_return error_code{};
-    }
-
-    // Decides how the response body is delimited (RFC 9112 §6) and whether the
-    // connection may be reused afterwards.
-    void decide_body_framing() {
-        const auto &head = m_parser.head();
-        // What the response says about keep-alive, plus what we asked for.
-        auto conn = head.headers.get("connection");
-        if (conn && icontains_ci(*conn, "close"))
-            m_close_after = true;
-        if (head.version == Version::Http1) {
-            // HTTP/1.0 closes unless the peer opted in explicitly.
-            m_close_after = !(conn && icontains_ci(*conn, "keep-alive"));
-        }
-
-        // A response to HEAD, or to any request whose response carries no body
-        // by definition (RFC 9110 §6.4.1), ends at the head.
-        const bool method_head = m_spec->method() == Method::Head;
-        if (method_head || head.status == status::no_content || head.status == status::not_modified) {
-            m_body_mode = BodyMode::None;
-            m_body_done = true;
-            m_explicit_length = true; // nothing follows: the connection is at a boundary
-            m_reusable = !m_close_after;
+    void do_exchange_write(std::string data, bool last, WriteCompletion done) {
+        if (!m_busy) {
+            std::move(done)(make_error_code(client_errc::session_closed));
             return;
         }
-
-        auto te = head.headers.get("transfer-encoding");
-        if (te && icontains_ci(*te, "chunked")) {
-            m_body_mode = BodyMode::Chunked;
-            m_body_total = 0;
-            m_explicit_length = true;
+        if (!m_spec || !m_spec->stream_body()) {
+            std::move(done)(make_error_code(client_errc::body_not_streaming));
             return;
         }
-        if (auto cl = head.headers.get("content-length")) {
-            std::uint64_t len = 0;
-            if (!parse_uint(*cl, len)) {
-                SIMPLE_HTTP_ERROR_LOG("h1 client: bad Content-Length '{}' from {}", *cl, m_authority);
-                m_body_mode = BodyMode::EofDelimited; // treat as unframed; the
-                                                      // connection will not be reused
-                return;
-            }
-            m_body_mode = BodyMode::Fixed;
-            m_body_remaining = len;
-            m_explicit_length = true;
-            if (len == 0)
-                m_body_done = true;
+        std::string out;
+        if (m_request_chunked) {
+            if (!data.empty())
+                out = encode_chunk(data);
+            if (last)
+                out += "0\r\n\r\n";
+        } else {
+            out = std::move(data);
+        }
+        if (out.empty()) {
+            std::move(done)(error_code{});
             return;
         }
-        // No length, no chunked: the body runs until the peer closes.
-        m_body_mode = BodyMode::EofDelimited;
+        auto bytes = std::make_shared<std::string>(std::move(out));
+        auto self = this->shared_from_this();
+        m_transport->async_write(ConstByteSpan{reinterpret_cast<const std::byte *>(bytes->data()), bytes->size()},
+                                 [self, bytes, done = std::move(done)](error_code ec, std::size_t) mutable {
+                                     if (ec) {
+                                         self->fail_exchange(ec);
+                                     }
+                                     std::move(done)(ec);
+                                 });
     }
 
-    asio::awaitable<std::expected<ReadResult, error_code>> read_fixed_body() {
-        if (m_body_remaining == 0) {
-            m_body_done = true;
-            finish_exchange();
-            co_return ReadResult::end();
+    void do_exchange_write_trailers(Headers trailers, WriteCompletion done) {
+        if (!m_busy || !m_spec || !m_spec->stream_body()) {
+            std::move(done)(make_error_code(client_errc::body_not_streaming));
+            return;
         }
-        if (m_buf.empty()) {
-            switch (auto [fill, ec] = co_await fill_buf(); fill) {
-            case Fill::Ok:
-                break;
-            case Fill::Eof:
-                // The peer closed mid-body: the response is truncated.
-                SIMPLE_HTTP_ERROR_LOG("h1 client: {} closed after {}/{} body bytes", m_authority, m_body_remaining,
-                                      "?");
-                fail_session();
-                // The peer closed mid-body: what we have is a truncation,
-                // not a body.
-                co_return std::unexpected{make_error_code(asio::error::connection_reset)};
-            case Fill::Error:
-                fail_session();
-                co_return std::unexpected{ec};
-            }
+        if (!m_request_chunked) {
+            std::move(done)(make_error_code(client_errc::trailers_not_supported));
+            return;
         }
-        std::size_t take = static_cast<std::size_t>(std::min<std::uint64_t>(m_body_remaining, m_buf.size()));
-        std::string data = m_buf.substr(0, take);
-        m_buf.erase(0, take);
-        m_body_remaining -= take;
-        if (m_body_remaining == 0) {
-            m_body_done = true;
-            finish_exchange();
-        }
-        co_return ReadResult::chunk(std::move(data));
-    }
-
-    asio::awaitable<std::expected<ReadResult, error_code>> read_chunked_body() {
-        for (;;) {
-            // Chunk-size line.
-            std::size_t nl = m_buf.find('\n');
-            if (nl == std::string::npos) {
-                if (m_buf.size() > m_limits.max_header_bytes) {
-                    fail_session();
-                    co_return std::unexpected{make_error_code(client_errc::protocol_error)};
-                }
-                switch (auto [fill, ec] = co_await fill_buf(); fill) {
-                case Fill::Ok:
-                    continue;
-                case Fill::Eof:
-                    fail_session();
-                    // The peer closed mid-body: what we have is a truncation,
-                    // not a body.
-                    co_return std::unexpected{make_error_code(asio::error::connection_reset)};
-                case Fill::Error:
-                    fail_session();
-                    co_return std::unexpected{ec};
-                }
-            }
-            // Copy the size line out before consuming it: erasing m_buf shifts the
-            // bytes, so a view into it would then point at the chunk data.
-            std::string size_line{m_buf.data(), nl};
-            if (!size_line.empty() && size_line.back() == '\r')
-                size_line.pop_back();
-            m_buf.erase(0, nl + 1);
-            if (auto semi = size_line.find(';'); semi != std::string::npos) {
-                size_line.resize(semi); // chunk extensions are ignored
-            }
-            std::uint64_t chunk_len = 0;
-            // Bounded as it is parsed: `chunk_len + 2` below must not wrap, and a
-            // single chunk larger than the configured body cap is refused rather
-            // than buffered.
-            if (!parse_uint(size_line, chunk_len, 16) || chunk_len > m_limits.max_body_bytes) {
-                SIMPLE_HTTP_ERROR_LOG("h1 client: malformed or oversized chunk size from {}", m_authority);
-                fail_session();
-                co_return std::unexpected{make_error_code(client_errc::protocol_error)};
-            }
-
-            if (chunk_len == 0) {
-                // Last chunk: the trailer fields follow, up to the terminating
-                // blank line. They are surfaced through response_trailers()
-                // (the reverse proxy forwards them; a plain caller may ignore
-                // them). The whole section is bounded like the response head: a
-                // peer that never terminates it must not grow memory.
-                Headers trailers;
-                std::size_t trailer_bytes = 0;
-                for (;;) {
-                    std::size_t tnl = m_buf.find('\n');
-                    if (tnl == std::string::npos) {
-                        if (m_buf.size() > m_limits.max_header_bytes) {
-                            fail_session();
-                            co_return std::unexpected{make_error_code(client_errc::header_too_large)};
-                        }
-                        switch (auto [fill, ec] = co_await fill_buf(); fill) {
-                        case Fill::Ok:
-                            continue;
-                        case Fill::Eof:
-                            fail_session();
-                            // The peer closed mid-body: what we have is a truncation,
-                            // not a body.
-                            co_return std::unexpected{make_error_code(asio::error::connection_reset)};
-                        case Fill::Error:
-                            fail_session();
-                            co_return std::unexpected{ec};
-                        }
-                    }
-                    std::string line{m_buf.data(), tnl};
-                    m_buf.erase(0, tnl + 1);
-                    if (!line.empty() && line.back() == '\r')
-                        line.pop_back();
-                    if (line.empty())
-                        break; // end of trailers: the body is complete
-                    trailer_bytes += line.size() + 2;
-                    if (trailer_bytes > m_limits.max_header_bytes) {
-                        fail_session();
-                        co_return std::unexpected{make_error_code(client_errc::header_too_large)};
-                    }
-                    switch (h1_detail::parse_field_line(line, trailers)) {
-                    case h1_detail::FieldLine::Ok:
-                        break;
-                    case h1_detail::FieldLine::NameTooLong:
-                        fail_session();
-                        co_return std::unexpected{make_error_code(client_errc::header_too_large)};
-                    case h1_detail::FieldLine::Malformed:
-                        SIMPLE_HTTP_ERROR_LOG("h1 client: malformed trailer field from {}", m_authority);
-                        fail_session();
-                        co_return std::unexpected{make_error_code(client_errc::protocol_error)};
-                    }
-                }
-                if (auto stream = m_stream.lock())
-                    stream->set_trailers(std::move(trailers));
-                m_body_done = true;
-                finish_exchange();
-                co_return ReadResult::end();
-            }
-
-            // Chunk data (+ its trailing CRLF) must be buffered whole.
-            while (m_buf.size() < chunk_len + 2) {
-                switch (auto [fill, ec] = co_await fill_buf(); fill) {
-                case Fill::Ok:
-                    break;
-                case Fill::Eof:
-                    fail_session();
-                    // The peer closed mid-body: what we have is a truncation,
-                    // not a body.
-                    co_return std::unexpected{make_error_code(asio::error::connection_reset)};
-                case Fill::Error:
-                    fail_session();
-                    co_return std::unexpected{ec};
-                }
-            }
-            std::string data = m_buf.substr(0, static_cast<std::size_t>(chunk_len));
-            m_buf.erase(0, static_cast<std::size_t>(chunk_len));
-            if (m_buf.size() >= 2 && m_buf[0] == '\r' && m_buf[1] == '\n')
-                m_buf.erase(0, 2);
-            co_return ReadResult::chunk(std::move(data));
-        }
-    }
-
-    asio::awaitable<std::expected<ReadResult, error_code>> read_to_eof_body() {
-        for (;;) {
-            if (!m_buf.empty()) {
-                std::string data = std::move(m_buf);
-                m_buf.clear();
-                co_return ReadResult::chunk(std::move(data));
-            }
-            switch (auto [fill, ec] = co_await fill_buf(); fill) {
-            case Fill::Ok:
+        std::string out = "0\r\n";
+        for (const auto &[name, value] : trailers) {
+            if (is_forbidden_trailer_field(name))
                 continue;
-            case Fill::Eof:
-                // The close *is* the end of the body (RFC 9112 §6.3), but it
-                // also ends the connection: never reusable.
-                m_body_done = true;
-                m_explicit_length = false;
-                finish_exchange();
-                co_return ReadResult::end();
-            case Fill::Error:
-                fail_session();
-                co_return std::unexpected{ec};
-            }
+            out.append(name);
+            out.append(": ");
+            out.append(value);
+            out.append("\r\n");
+        }
+        out.append("\r\n");
+        auto bytes = std::make_shared<std::string>(std::move(out));
+        auto self = this->shared_from_this();
+        m_transport->async_write(ConstByteSpan{reinterpret_cast<const std::byte *>(bytes->data()), bytes->size()},
+                                 [self, bytes, done = std::move(done)](error_code ec, std::size_t) mutable {
+                                     if (ec) {
+                                         self->fail_exchange(ec);
+                                     }
+                                     std::move(done)(ec);
+                                 });
+    }
+
+    // --- reading ---
+
+    template <typename Handler> void read_more(Handler &&handler) {
+        auto self = this->shared_from_this();
+        // The wrapping lambda below carries no associators of its own. Forward
+        // the caller's cancellation slot explicitly, or a per-operation deadline
+        // (Stream::read_head_with / read_with) can never abort the socket read:
+        // the slot would stop here and the read would hang until the peer moved.
+        auto slot = m_read_slot.is_connected() ? m_read_slot : asio::get_associated_cancellation_slot(handler);
+        auto on_read = [self, done = std::forward<Handler>(handler)](error_code ec, std::size_t n) mutable {
+            if (!ec && n != 0)
+                self->m_in.append(reinterpret_cast<const char *>(self->m_scratch.data()), n);
+            done(ec, n);
+        };
+        if (slot.is_connected()) {
+            m_transport->async_read_some(ByteSpan{m_scratch.data(), m_scratch.size()},
+                                         asio::bind_cancellation_slot(slot, std::move(on_read)));
+        } else {
+            m_transport->async_read_some(ByteSpan{m_scratch.data(), m_scratch.size()}, std::move(on_read));
         }
     }
 
-    // The exchange reached its end: the connection is at a request boundary
-    // exactly when the body's length was explicit and neither side asked to
-    // close.
-    void finish_exchange() {
-        m_busy = false;
-        // Mark *this* exchange done before anything else: the stream-destruction
-        // hook (which may run the instant the caller drops its handle) must see
-        // "completed", not "abandoned".
-        if (m_current_done)
-            m_current_done->store(true, std::memory_order_release);
-        if (auto stream = m_stream.lock())
-            stream->mark_finished();
-        // An explicit body length is what leaves the connection at a request
-        // boundary; anything else (EOF-delimited body, a `Connection: close` from
-        // either side, stray bytes the peer already sent) means it must be closed.
-        // `m_keep_alive` is the *request's* intent, `m_close_after` only the
-        // response's. A spec that asked to close must not be left reusable just
-        // because the peer did not echo `Connection: close` back — the next
-        // request would then fail on a connection this side is done with.
-        m_reusable = m_alive && m_explicit_length && !m_close_after && m_keep_alive && m_buf.empty();
-        // A connection this exchange leaves unusable (EOF-delimited, either side
-        // asked to close, stray bytes) is closed *here*, on the session
-        // executor, where the decision is serialized with every other exchange.
-        // Deferring it to the stream-destruction hook is what let a completed
-        // exchange close a connection a later, already-running exchange had
-        // taken over (its "not reusable" check could not tell the two apart).
-        if (!m_reusable) {
-            m_alive = false;
-            if (m_transport)
-                m_transport->close();
+    void do_ensure_head(WriteCompletion done) {
+        // Remember the caller's cancellation slot for the whole read chain.
+        // The intermediate lambdas that append to m_in and re-enter read_head
+        // do not carry associators, so a per-operation deadline must be applied
+        // to the socket read from here rather than from the wrapped handler.
+        m_read_slot = asio::get_associated_cancellation_slot(done);
+        if (m_head_parsed) {
+            std::move(done)(error_code{});
+            return;
         }
-        if (m_exchange_done)
-            m_exchange_done();
-    }
-
-    bool exchange_finished_state() const { return !m_busy; }
-
-    void cancel_exchange() {
-        // dispatch, not post: a caller that abandons an exchange and immediately
-        // starts another must not race the teardown (it would open a second
-        // connection instead of reusing this one).
-        asio::dispatch(m_executor, [self = this->shared_from_this()] {
-            if (self->m_cancelled)
+        auto self = this->shared_from_this();
+        read_head([self, done = std::move(done)](error_code ec) mutable {
+            if (ec) {
+                // A per-operation deadline cancels this read only. The
+                // automatic 100-continue probe relies on that: on timeout the
+                // caller sends the body anyway. Poisoning the exchange here
+                // (closing the transport) made the fallback impossible.
+                // Protocol/transport errors remain fatal.
+                if (ec != asio::error::operation_aborted)
+                    self->fail_exchange(ec);
+                std::move(done)(ec);
                 return;
-            self->m_cancelled = true;
-            self->m_body_done = true;
-            // A half-written request (or a half-read response) leaves the peer at
-            // an unknown position, so HTTP/1.x has to close the connection.
-            self->fail_session();
+            }
+            std::move(done)(error_code{});
         });
     }
 
-    void fail_session() {
-        m_alive = false;
-        m_reusable = false;
-        m_busy = false;
-        if (m_transport)
-            m_transport->close();
-        // Note: no exchange-done here. The single-connection gate is handed
-        // back by the exchange's *owner* — the engine's open-failure branch
-        // (when the open itself failed) or the convenience layer when a read
-        // fails here (http.h exchange_once), plus the stream-destruction safety
-        // net — never at the session's own failure point, which would race the
-        // owner's retry/redial decision and wake a queued request onto a dying
-        // connection.
-    }
-
-    // --- byte helpers ---
-
-    // Reads more bytes into m_buf, bounded by the idle timeout: a peer that goes
-    // quiet mid-message must not pin the coroutine forever.
-    asio::awaitable<std::pair<Fill, error_code>> fill_buf() {
-        using namespace asio::experimental::awaitable_operators;
-        std::array<std::byte, 16 * 1024> tmp; // no init: read_some fills [0,n)
-        auto read_op = [this, &tmp]() -> asio::awaitable<IoResult> {
-            co_return co_await m_transport->async_read_some(std::span<std::byte>{tmp});
-        };
-
-        if (m_idle_timeout.count() <= 0) { // no idle deadline: a plain read
-            auto [ec, n] = co_await read_op();
-            if (ec) {
-                if (ec == asio::error::eof)
-                    co_return std::pair{Fill::Eof, ec};
-                co_return std::pair{Fill::Error, ec};
+    // Reads status line + fields (and any body bytes already buffered),
+    // transparently skipping interim 1xx responses other than a final one.
+    template <typename Handler> void read_head(Handler &&handler) {
+        auto done = std::forward<Handler>(handler);
+        const auto marker = m_in.find("\r\n\r\n");
+        if (marker == std::string::npos) {
+            if (m_in.size() > m_limits.max_header_bytes) {
+                done(make_error_code(client_errc::protocol_error));
+                return;
             }
-            if (n == 0)
-                co_return std::pair{Fill::Eof, make_error_code(asio::error::eof)};
-            m_buf.append(reinterpret_cast<const char *>(tmp.data()), n);
-            co_return std::pair{Fill::Ok, error_code{}};
+            read_more([this, done = std::move(done)](error_code ec, std::size_t) mutable {
+                if (ec) {
+                    done(ec);
+                    return;
+                }
+                read_head(std::move(done));
+            });
+            return;
+        }
+        const std::string block = m_in.substr(0, marker + 4);
+        m_in.erase(0, marker + 4);
+        const auto line_end = block.find("\r\n");
+        if (line_end == std::string::npos) {
+            done(make_error_code(client_errc::protocol_error));
+            return;
+        }
+        const std::string_view status_line{block.data(), line_end};
+        // "HTTP/1.1 200 OK"
+        const auto sp1 = status_line.find(' ');
+        if (sp1 == std::string_view::npos || status_line.substr(0, sp1) != "HTTP/1.1") {
+            done(make_error_code(client_errc::protocol_error));
+            return;
+        }
+        const auto sp2 = status_line.find(' ', sp1 + 1);
+        int status = 0;
+        for (std::size_t i = sp1 + 1; i < (sp2 == std::string_view::npos ? status_line.size() : sp2); ++i) {
+            if (status_line[i] < '0' || status_line[i] > '9') {
+                done(make_error_code(client_errc::protocol_error));
+                return;
+            }
+            status = status * 10 + (status_line[i] - '0');
+        }
+        ResponseHead head;
+        head.status = status;
+        head.version = Version::Http11;
+        std::size_t pos = line_end + 2;
+        while (pos + 1 < block.size()) {
+            const auto end = block.find("\r\n", pos);
+            if (end == std::string::npos || end == pos)
+                break;
+            const std::string_view line{block.data() + pos, end - pos};
+            const auto colon = line.find(':');
+            if (colon != std::string_view::npos) {
+                head.headers.add_lower(ascii_lower_copy(trim_ows(line.substr(0, colon))),
+                                       std::string{trim_ows(line.substr(colon + 1))});
+            }
+            pos = end + 2;
         }
 
-        auto deadline_op = [this]() -> asio::awaitable<void> {
-            asio::steady_timer timer{m_executor};
-            timer.expires_after(m_idle_timeout);
-            co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
-        };
-
-        auto outcome = co_await (read_op() || deadline_op());
-        if (auto *result = std::get_if<IoResult>(&outcome)) {
-            auto [ec, n] = *result;
-            if (ec) {
-                if (ec == asio::error::eof)
-                    co_return std::pair{Fill::Eof, ec};
-                co_return std::pair{Fill::Error, ec};
+        // Interim responses: a 100 that answers our own Expect: 100-continue is
+        // surfaced as the head so the caller can send the body; the final
+        // response is then parsed on the next read_head. Every other 1xx is not
+        // a final response and is skipped.
+        if (status >= 100 && status < 200 && status != 101) {
+            if (status == 100 && m_expect_continue && !m_awaiting_final) {
+                m_awaiting_final = true;
+                // m_head_parsed stays false: this is not the final head, and the
+                // caller resets the published head before asking again.
+                if (auto current = m_current.lock()) {
+                    current->set_head(std::move(head));
+                }
+                done(error_code{});
+                return;
             }
-            if (n == 0)
-                co_return std::pair{Fill::Eof, make_error_code(asio::error::eof)};
-            m_buf.append(reinterpret_cast<const char *>(tmp.data()), n);
-            co_return std::pair{Fill::Ok, error_code{}};
+            read_head(std::move(done));
+            return;
         }
-        // Idle timeout: the message is abandoned mid-way, so the connection goes.
-        SIMPLE_HTTP_ERROR_LOG("h1 client: {} went idle for {}ms", m_authority, m_idle_timeout.count());
-        fail_session();
-        auto ec = make_error_code(client_errc::request_timeout);
-        if (m_transport)
-            m_transport->close();
-        co_return std::pair{Fill::Error, ec};
+
+        m_status = status;
+        m_head_parsed = true;
+        m_close_after = m_close_after || header_has_token(head.headers, "connection", "close");
+        ResponseHead parsed_head = std::move(head);
+        if (auto current = m_current.lock()) {
+            current->set_head(parsed_head);
+        }
+
+        const bool head_request = m_spec && m_spec->method() == Method::Head;
+        const bool bodyless = head_request || status == 204 || status == 304;
+        m_body_complete = false;
+        if (bodyless) {
+            m_body_mode = BodyMode::None;
+            m_body_complete = true;
+            done(error_code{});
+            return;
+        }
+        if (header_has_token(parsed_head.headers, "transfer-encoding", "chunked")) {
+            m_body_mode = BodyMode::Chunked;
+        } else if (const auto cl = parsed_head.header("content-length")) {
+            std::uint64_t value = 0;
+            for (char c : *cl) {
+                if (c < '0' || c > '9') {
+                    done(make_error_code(client_errc::protocol_error));
+                    return;
+                }
+                value = value * 10 + static_cast<std::uint64_t>(c - '0');
+            }
+            m_body_remaining = value;
+            m_body_mode = value == 0 ? BodyMode::None : BodyMode::Fixed;
+            m_body_complete = value == 0;
+        } else {
+            m_body_mode = BodyMode::EofDelimited;
+        }
+        done(error_code{});
     }
 
-    asio::awaitable<error_code> write_raw(const std::string &out) {
-        auto [ec, n] = co_await m_transport->async_write(std::as_bytes(std::span<const char>{out.data(), out.size()}));
-        (void)n;
-        co_return ec;
+    void do_exchange_read(ReadCompletion done) {
+        // Same as do_ensure_head: the slot must survive the read_head/read_body
+        // wrappers so a body-idle deadline can abort the socket read.
+        m_read_slot = asio::get_associated_cancellation_slot(done);
+        if (!m_busy) {
+            std::move(done)(make_error_code(client_errc::session_closed), ReadResult{});
+            return;
+        }
+        if (!m_head_parsed) {
+            auto self = this->shared_from_this();
+            read_head([self, done = std::move(done)](error_code ec) mutable {
+                if (ec) {
+                    self->fail_exchange(ec);
+                    std::move(done)(ec, ReadResult{});
+                    return;
+                }
+                self->read_body(std::move(done));
+            });
+            return;
+        }
+        read_body(std::move(done));
     }
 
-    // Parses an unsigned integer in `base` with overflow protection.
-    static bool parse_uint(std::string_view s, std::uint64_t &out, unsigned base = 10) {
-        if (s.empty())
-            return false;
-        std::uint64_t v = 0;
-        for (char c : s) {
+    void read_body(ReadCompletion done) {
+        switch (m_body_mode) {
+        case BodyMode::None:
+            finish_body(std::move(done));
+            return;
+        case BodyMode::Fixed:
+            read_fixed(std::move(done));
+            return;
+        case BodyMode::Chunked:
+            read_chunked(std::move(done));
+            return;
+        case BodyMode::EofDelimited:
+            read_eof_delimited(std::move(done));
+            return;
+        }
+    }
+
+    void finish_body(ReadCompletion done) {
+        m_body_complete = true;
+        release_exchange();
+        std::move(done)(error_code{}, ReadResult::end());
+    }
+
+    void fail_read(ReadCompletion done, error_code ec) {
+        fail_exchange(ec);
+        std::move(done)(ec, ReadResult{});
+    }
+
+    void read_fixed(ReadCompletion done) {
+        if (m_body_remaining == 0) {
+            finish_body(std::move(done));
+            return;
+        }
+        if (!m_in.empty()) {
+            const std::size_t take = static_cast<std::size_t>(std::min<std::uint64_t>(m_body_remaining, m_in.size()));
+            std::string chunk = m_in.substr(0, take);
+            m_in.erase(0, take);
+            m_body_remaining -= take;
+            std::move(done)(error_code{}, ReadResult::chunk(std::move(chunk)));
+            return;
+        }
+        auto self = this->shared_from_this();
+        read_more([self, done = std::move(done)](error_code ec, std::size_t) mutable {
+            if (ec) {
+                self->fail_read(std::move(done), ec);
+                return;
+            }
+            self->read_fixed(std::move(done));
+        });
+    }
+
+    void read_chunked(ReadCompletion done) {
+        const auto nl = m_in.find("\r\n");
+        if (nl == std::string::npos) {
+            if (m_in.size() > m_limits.max_header_bytes) {
+                fail_read(std::move(done), make_error_code(client_errc::protocol_error));
+                return;
+            }
+            auto self = this->shared_from_this();
+            read_more([self, done = std::move(done)](error_code ec, std::size_t) mutable {
+                if (ec) {
+                    self->fail_read(std::move(done), ec);
+                    return;
+                }
+                self->read_chunked(std::move(done));
+            });
+            return;
+        }
+        std::string_view size_line{m_in.data(), nl};
+        if (auto semi = size_line.find(';'); semi != std::string_view::npos)
+            size_line = size_line.substr(0, semi);
+        std::uint64_t size = 0;
+        bool any = false;
+        for (char c : size_line) {
             unsigned d;
-            if (c >= '0' && c <= '9') {
+            if (c >= '0' && c <= '9')
                 d = static_cast<unsigned>(c - '0');
-            } else if (base == 16 && c >= 'a' && c <= 'f') {
+            else if (c >= 'a' && c <= 'f')
                 d = 10u + static_cast<unsigned>(c - 'a');
-            } else if (base == 16 && c >= 'A' && c <= 'F') {
+            else if (c >= 'A' && c <= 'F')
                 d = 10u + static_cast<unsigned>(c - 'A');
-            } else {
-                return false;
+            else {
+                fail_read(std::move(done), make_error_code(client_errc::protocol_error));
+                return;
             }
-            if (d >= base)
-                return false;
-            if (v > (UINT64_MAX - d) / base)
-                return false;
-            v = v * base + d;
+            size = size * 16 + d;
+            any = true;
         }
-        out = v;
-        return true;
+        if (!any) {
+            fail_read(std::move(done), make_error_code(client_errc::protocol_error));
+            return;
+        }
+        m_in.erase(0, nl + 2);
+        if (size == 0) {
+            // Consume the trailer section up to the blank line.
+            read_trailers(std::move(done));
+            return;
+        }
+        if (m_in.size() < size + 2) {
+            auto self = this->shared_from_this();
+            read_more([self, done = std::move(done), size](error_code ec, std::size_t) mutable {
+                if (ec) {
+                    self->fail_read(std::move(done), ec);
+                    return;
+                }
+                self->read_chunked_data(std::move(done), size);
+            });
+            return;
+        }
+        read_chunked_data(std::move(done), size);
     }
 
-    // --- members ---
+    void read_chunked_data(ReadCompletion done, std::uint64_t size) {
+        if (m_in.size() < size + 2) {
+            auto self = this->shared_from_this();
+            read_more([self, done = std::move(done), size](error_code ec, std::size_t) mutable {
+                if (ec) {
+                    self->fail_read(std::move(done), ec);
+                    return;
+                }
+                self->read_chunked_data(std::move(done), size);
+            });
+            return;
+        }
+        if (static_cast<std::size_t>(size) + 2 > m_in.size() ||
+            m_in.compare(static_cast<std::size_t>(size), 2, "\r\n") != 0) {
+            fail_read(std::move(done), make_error_code(client_errc::protocol_error));
+            return;
+        }
+        std::string chunk = m_in.substr(0, static_cast<std::size_t>(size));
+        m_in.erase(0, static_cast<std::size_t>(size) + 2);
+        std::move(done)(error_code{}, ReadResult::chunk(std::move(chunk)));
+    }
+
+    void read_trailers(ReadCompletion done) {
+        const auto nl = m_in.find("\r\n");
+        if (nl == std::string::npos) {
+            auto self = this->shared_from_this();
+            read_more([self, done = std::move(done)](error_code ec, std::size_t) mutable {
+                if (ec) {
+                    self->fail_read(std::move(done), ec);
+                    return;
+                }
+                self->read_trailers(std::move(done));
+            });
+            return;
+        }
+        if (nl == 0) {
+            m_in.erase(0, 2);
+            if (auto current = m_current.lock()) {
+                current->set_trailers(m_trailers);
+            }
+            finish_body(std::move(done));
+            return;
+        }
+        const std::string_view line{m_in.data(), nl};
+        const auto colon = line.find(':');
+        if (colon != std::string_view::npos) {
+            const std::string name = ascii_lower_copy(trim_ows(line.substr(0, colon)));
+            const std::string_view value = trim_ows(line.substr(colon + 1));
+            if (!is_forbidden_trailer_field(name))
+                m_trailers.add_lower(name, std::string{value});
+        }
+        m_in.erase(0, nl + 2);
+        read_trailers(std::move(done));
+    }
+
+    void read_eof_delimited(ReadCompletion done) {
+        if (!m_in.empty()) {
+            std::string chunk = std::move(m_in);
+            m_in.clear();
+            std::move(done)(error_code{}, ReadResult::chunk(std::move(chunk)));
+            return;
+        }
+        auto self = this->shared_from_this();
+        read_more([self, done = std::move(done)](error_code ec, std::size_t) mutable {
+            if (ec == asio::error::eof || ec == asio::error::connection_reset) {
+                self->m_close_after = true;
+                self->finish_body(std::move(done));
+                return;
+            }
+            if (ec) {
+                self->fail_read(std::move(done), ec);
+                return;
+            }
+            self->read_eof_delimited(std::move(done));
+        });
+    }
+
     std::shared_ptr<Transport> m_transport;
-    Executor m_executor;
+    asio::any_io_executor m_executor;
     std::string m_authority;
     EngineLimits m_limits;
-    std::chrono::milliseconds m_idle_timeout;
 
-    // The engine's reuse check reads alive()/reusable() from whatever thread
-    // drives the next request (a Client may be shared across threads), so these
-    // are atomics rather than plain bools — the session executor writes them,
-    // a foreign thread reads them without a data race.
-    std::atomic<bool> m_alive{true};
-    std::atomic<bool> m_busy{false};     // an exchange is in flight
-    std::atomic<bool> m_reusable{false}; // idle and positioned at a request boundary
-    // Set once an upgrade was refused (so the peer is not asked again).
-    // Atomic: written on the session executor, read by upgrade_available() from
-    // the requesting thread.
-    std::atomic<bool> m_upgrade_failed{false};
-    H2UpgradeFactory m_h2_factory;
-    std::function<void()> m_exchange_done; // gate release on exchange completion
-    // The in-flight exchange's completion flag (see exchange_done_flag()). The
-    // engine captures the same object in the stream's destruction hook.
-    std::shared_ptr<std::atomic<bool>> m_current_done;
-    // Set once an h2c upgrade succeeded. Weak on purpose: the successor (an
-    // HTTP/2 session) self-holds through its resident loops, and this session —
-    // the engine's single kept connection — forwards open_stream/close/version
-    // to it. Atomic: finish_upgrade() stores it on the session executor while
-    // alive()/reusable()/keepable()/version()/upgrade_available() read it from
-    // whatever thread drives the next request — a plain weak_ptr there would be
-    // a data race on its control block (the two words are not torn-safe).
-    std::atomic<std::weak_ptr<ClientSession>> m_successor;
-
-    // Current exchange (HTTP/1.x serves one at a time). The stream handle is
-    // weak: it owns this session, so a strong link here would be a cycle.
-    std::weak_ptr<Http1ClientStream<Transport>> m_stream;
     std::shared_ptr<Request> m_spec;
-    H1ResponseParser m_parser;
-    std::string m_buf; // bytes read from the transport, not yet consumed
-    ResponseHead m_head;
+    // Weak: the stream owns a strong reference to this session, so the session
+    // must not own the stream back. A caller may keep the Stream handle after
+    // dropping the Client; that handle keeps the session and transport alive.
+    std::weak_ptr<Http1ClientStream<Transport>> m_current;
+    std::shared_ptr<std::atomic<bool>> m_current_done;
+    std::function<void()> m_exchange_done;
+
+    std::atomic<bool> m_alive{true};
+    bool m_busy{false};
+    bool m_close_after{false};
+    error_code m_connection_error;
+    bool m_request_chunked{false};
+
+    std::string m_in;
+    std::array<std::byte, 16 * 1024> m_scratch{};
+
+    bool m_head_parsed{false};
+    bool m_expect_continue{false}; // the request asked for an interim 100
+    bool m_awaiting_final{false};  // a 100 was surfaced; the final still follows
+    // Cancellation slot of the pending head/body read, captured at the entry
+    // points so per-operation deadlines survive the intermediate wrappers.
+    asio::cancellation_slot m_read_slot;
+    int m_status{0};
     BodyMode m_body_mode{BodyMode::None};
     std::uint64_t m_body_remaining{0};
-    std::uint64_t m_body_total{0};
-    bool m_body_done{false};
-    bool m_head_parsed{false};
-    bool m_head_published{false};
-    bool m_req_streaming{false};
-    bool m_req_finished{false};
-    std::atomic<bool> m_keep_alive{true};
-    std::atomic<bool> m_close_after{false};
-    bool m_explicit_length{false};
-    bool m_upgrading{false};
-    bool m_switched{false};
-    bool m_cancelled{false};
-    bool m_resp_truncated{false};
-    // Expect: 100-continue bookkeeping (see read_response_head / ensure_head).
-    bool m_expect_continue{false}; // the request asked for an interim 100
-    bool m_awaiting_final{false};  // a 100 was delivered; the final still follows
-    std::string m_upgrade_settings;
+    bool m_body_complete{false};
+    Headers m_trailers;
 };
+
+template <typename Transport> void Http1ClientStream<Transport>::write(std::string data, WriteCompletion done) {
+    m_session->exchange_write(std::move(data), /*last=*/false, std::move(done), this);
+}
+
+template <typename Transport> void Http1ClientStream<Transport>::finish(std::string data, WriteCompletion done) {
+    m_session->exchange_write(std::move(data), /*last=*/true, std::move(done), this);
+}
+
+template <typename Transport>
+void Http1ClientStream<Transport>::finish_trailers(Headers trailers, WriteCompletion done) {
+    m_session->exchange_write_trailers(std::move(trailers), std::move(done), this);
+}
+
+template <typename Transport> void Http1ClientStream<Transport>::read(ReadCompletion done) {
+    m_session->exchange_read(std::move(done), this);
+}
+
+template <typename Transport> void Http1ClientStream<Transport>::cancel(WriteCompletion done) {
+    m_session->cancel_exchange(std::move(done), this);
+}
+
+template <typename Transport> void Http1ClientStream<Transport>::await_head(WriteCompletion done) {
+    m_session->ensure_head(std::move(done), this);
+}
 
 } // namespace simple_http::detail

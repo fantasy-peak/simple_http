@@ -58,6 +58,20 @@ target("simple_http")
     )
 target_end()
 
+-- C++17 token-only port -----------------------------------------------------
+-- Header-only shell like simple_http, but a separate include root and language
+-- standard. It does not depend on glaze (JSON/OpenAPI are outside the first
+-- porting phases); ngtcp2/nghttp3 arrive with the HTTP/3 phase.
+target("simple_http_cpp17")
+    set_kind("static")
+    set_languages("c++17")
+    add_includedirs("cpp17/include", { public = true })
+    -- ngtcp2/nghttp3 are only needed by a TU that defines
+    -- SIMPLE_HTTP_ENABLE_HTTP3, but the headers are available to every
+    -- consumer of this include root.
+    add_packages("ngtcp2", "nghttp3", "boost", "openssl4", "zlib", "brotli", { public = true })
+target_end()
+
 -- TEST TARGETS --
 -- Three roles:
 --   test_*      assertion programs (Catch2 unit suite)
@@ -215,3 +229,102 @@ add_test_binary("diff_openapi_server", "test/diff/openapi/demo_server.cpp", {
     group = "test/diff/openapi",
     packages = {"glaze"},
 })
+
+-- C++17 port smoke ----------------------------------------------------------
+-- Hand-written rather than add_test_binary: it must depend on
+-- simple_http_cpp17 and force c++17, and neither is the helper's default.
+target("test_cpp17_smoke")
+    set_kind("binary")
+    set_default(false)
+    set_group("test/cpp17")
+    set_languages("c++17")
+    add_deps("simple_http_cpp17")
+    add_files("test/cpp17/smoke.cpp")
+    -- The logging macro's compile-time level gate is an always-true comparison
+    -- for the default SIMPLE_HTTP_LOG_ACTIVE_LEVEL=0; the root test targets
+    -- suppress the same warning.
+    add_cxflags("-Wno-type-limits")
+    set_rundir(".")
+target_end()
+
+-- C++17 port interop fixture ------------------------------------------------
+-- Driven by test/cpp17/run.py with httpx + websockets (independent clients).
+-- The shared conformance fixture, built against the C++17 include root. The
+-- file selects its callback handlers under SIMPLE_HTTP_CPP17, so the same
+-- source serves both implementations.
+target("fixture_conformance_server_cpp17")
+    set_kind("binary")
+    set_default(false)
+    set_group("test/cpp17")
+    set_languages("c++17")
+    add_deps("simple_http_cpp17")
+    add_files("test/fixtures/conformance_server.cpp")
+    add_defines("SIMPLE_HTTP_CPP17", "SIMPLE_HTTP_ENABLE_HTTP3")
+    add_cxflags("-Wno-type-limits")
+    set_rundir(".")
+target_end()
+
+target("test_cpp17_client")
+    set_kind("binary")
+    set_default(false)
+    set_group("test/cpp17")
+    set_languages("c++17")
+    add_deps("simple_http_cpp17")
+    add_files("test/cpp17/client_interop.cpp")
+    add_cxflags("-Wno-type-limits")
+    set_rundir(".")
+target_end()
+
+-- C++23 build of the C++17 include root: the glaze-gated surface -------------
+-- Same headers as simple_http_cpp17, compiled as C++23 with glaze linked in so
+-- the typed params / JSON / OpenAPI / JWT helpers are enabled.
+target("test_cpp17_glaze")
+    set_kind("binary")
+    set_default(false)
+    set_group("test/cpp17")
+    set_languages("c++23")
+    add_deps("simple_http_cpp17")
+    add_packages("glaze")
+    add_files("test/cpp17/glaze_smoke.cpp")
+    add_cxflags("-Wno-type-limits")
+    set_rundir(".")
+target_end()
+
+target("test_cpp17_h3_client")
+    set_kind("binary")
+    set_default(false)
+    set_group("test/cpp17")
+    set_languages("c++17")
+    add_deps("simple_http_cpp17")
+    add_files("test/cpp17/h3_interop.cpp")
+    add_defines("SIMPLE_HTTP_ENABLE_HTTP3")
+    add_cxflags("-Wno-type-limits")
+    set_rundir(".")
+target_end()
+
+-- Same conformance fixture, but handlers are full C++23 coroutines written on
+-- top of the port's token API (co_await ...(use_awaitable)). This exercises the
+-- dispatcher coroutine adapter end to end.
+target("fixture_conformance_server_cpp17_coro")
+    set_kind("binary")
+    set_default(false)
+    set_group("test/cpp17")
+    set_languages("c++23")
+    add_deps("simple_http_cpp17")
+    add_files("test/fixtures/conformance_server_coro.cpp")
+    add_defines("SIMPLE_HTTP_ENABLE_HTTP3")
+    add_cxflags("-Wno-type-limits")
+    set_rundir(".")
+target_end()
+
+target("fixture_cpp17_server")
+    set_kind("binary")
+    set_default(false)
+    set_group("test/cpp17")
+    set_languages("c++17")
+    add_deps("simple_http_cpp17")
+    add_files("test/cpp17/fixture_server.cpp")
+    add_defines("SIMPLE_HTTP_ENABLE_HTTP3")
+    add_cxflags("-Wno-type-limits")
+    set_rundir(".")
+target_end()

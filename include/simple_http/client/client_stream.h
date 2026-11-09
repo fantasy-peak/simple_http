@@ -1,88 +1,60 @@
 #pragma once
 
-// The client's request/response model: what to send (Request), what came
-// back (ResponseHead) and the two handles the caller drives — ClientStream for
-// one exchange, ClientSession for the connection under it.
+// The client's request/response model (C++17 token-only port).
 //
-// The response side is deliberately shaped like the server's: read_head() gives
-// the status and headers, then read() yields body chunks until one reports
-// end-of-body (the same ReadResult the server's Body uses). Whichever of the
-// two runs first parses and caches the head, so a caller may ask for the head
-// explicitly or go straight to the body and consult head()/status() afterwards
-// — nothing is silently dropped either way. Failures are error codes on the
-// expected: a truncated body, a reset stream, a stalled peer.
+// The response side mirrors the server's: async_read_head() gives the status
+// and headers, then async_read() yields body chunks until one reports
+// end-of-body (the same ReadResult the server's Body uses). Whichever runs
+// first parses and caches the head. Failures are error codes on the completion,
+// so the caller's token decides whether they become values or exceptions.
 //
-// The request side mirrors Response as well: write() sends a body chunk and
-// finish() ends the body (chunked on HTTP/1.1, DATA frames on HTTP/2).
-//
-// Version collapsing works exactly as it does on the server: the caller never
-// branches on HTTP/1.1 vs HTTP/2. HTTP/1.1 sessions serve one exchange at a
-// time, HTTP/2 sessions multiplex — a second open_stream() on an h1 session
-// fails with client_errc::session_busy, while an h2 session happily returns
-// more streams.
-//
-// Every operation that touches the transport or the session - the reads, the
-// writes and cancel() - is an awaitable that hops onto the session's executor
-// first (concurrency model A), so a stream may be driven from another thread
-// just like a server-side Response. The remaining accessors (head(), status(),
-// finished(), id(), version()) are synchronous snapshots of the last value
-// published on that executor: safe to read, but not to call concurrently with
-// an operation on the same stream.
+// Version collapsing works as on the server: the caller never branches on
+// HTTP/1.1 vs HTTP/2. HTTP/1.1 sessions serve one exchange at a time; HTTP/2
+// sessions multiplex.
 
 #include <atomic>
 #include <boost/asio.hpp>
+#include <boost/asio/any_completion_handler.hpp>
+#include <boost/asio/async_result.hpp>
 #include <cstdint>
-#include <expected>
-#include <functional> // set_on_destroy / session hooks
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
 
-#include "../core/base64.h" // ClientStream::write path (Request carries basic_auth)
+#include "../core/base64.h"
 #include "../core/http_field.h"
 #include "../core/http_method.h"
+#include "../core/result.h"
 #include "../core/types.h"
-#include "../proto/body.h" // ReadResult
+#include "../proto/body.h"
 #include "../proto/headers.h"
-#include "../proto/request.h" // Request — the shared request message type
+#include "../proto/request.h"
+#include "../proto/response_writer.h" // WriteCompletion
 #include "client_config.h"
 
 namespace simple_http::detail {
 
 namespace asio = boost::asio;
 
-// The request message type is `simple_http::Request` (proto/request.h), shared
-// with the server: a caller builds one (method/target/headers/body/close) and a
-// session sends it. Framing headers (Host, Content-Length, Transfer-Encoding,
-// connection-specific fields) are the session's business — anything set on the
-// Request that the protocol forbids is dropped at send time.
-
-// The response head, as read_head() returns it.
+// The response head, as async_read_head() returns it.
 struct ResponseHead {
     int status{0};
     Version version{Version::Http11};
     Headers headers;
-    // True when nothing follows the head: a response to HEAD, or 204/304.
     bool bodyless{false};
-    // True when the client transparently decoded this body (Go's
-    // Response.Uncompressed). Content-Encoding/Content-Length are then absent.
     bool uncompressed{false};
 
     std::optional<std::string_view> header(std::string_view name) const { return headers.get(name); }
 };
 
-// How a stream ended, shared between a multiplexed session (which sets it) and
-// the stream handle (which reports it). It lives on the handle, not in the
-// session's stream table: the session erases that entry as soon as the stream is
-// over, so a handle kept a little longer still answers truthfully instead of
-// reporting a closed session. Shared by the HTTP/2 and HTTP/3 sessions.
 enum class StreamState : int {
     Open = 0,
-    Eof,        // the response body ended normally
-    Reset,      // the peer reset the stream (RST_STREAM / RESET_STREAM)
-    Disconnect, // the connection went away mid-stream
-    Failed,     // a specific error_code (in StreamOutcome::ec)
+    Eof,
+    Reset,
+    Disconnect,
+    Failed,
 };
 
 struct StreamOutcome {
@@ -91,15 +63,6 @@ struct StreamOutcome {
 
     StreamState get() const { return static_cast<StreamState>(state.load(std::memory_order_acquire)); }
 
-    // The first terminal transition wins; a later one is ignored. A terminal
-    // outcome must be stable: close() marks every stream Failed(session_closed)
-    // and the subsequent teardown used to overwrite each one with
-    // Disconnect(eof), so a caller could observe two different reasons for one
-    // stream. It also means `ec` is written exactly once, before the release
-    // store that publishes it — a foreign thread that observed the terminal
-    // state with acquire (finished()/read()'s pre-hop check) then reads a stable
-    // `ec`, with no concurrent write to race. Writers all run on the session
-    // executor (model A), so the relaxed guard needs no compare-exchange.
     void set(StreamState s, error_code e = {}) {
         if (state.load(std::memory_order_relaxed) != static_cast<int>(StreamState::Open))
             return;
@@ -107,33 +70,25 @@ struct StreamOutcome {
         state.store(static_cast<int>(s), std::memory_order_release);
     }
 
-    // The error a failed stream reports; Open/Eof/Rst/Disconnect have their own
-    // event or error at the call site.
     error_code to_error() const { return ec ? ec : make_error_code(client_errc::session_closed); }
 };
 
-// Maps a terminal stream state to what the caller sees: a clean end-of-body, or
-// the error that ended it. A reset and a vanished connection are failures — the
-// body the caller got is a truncation, not a body.
-inline std::expected<ReadResult, error_code> outcome_result(const StreamOutcome &outcome) {
+inline result<ReadResult> outcome_result(const StreamOutcome &outcome) {
     switch (outcome.get()) {
     case StreamState::Eof:
         return ReadResult::end();
     case StreamState::Reset:
-        return std::unexpected{make_error_code(client_errc::stream_reset)};
+        return make_error_code(client_errc::stream_reset);
     case StreamState::Disconnect:
-        return std::unexpected{make_error_code(asio::error::connection_reset)};
+        return make_error_code(asio::error::connection_reset);
     case StreamState::Failed:
-        return std::unexpected{outcome.to_error()};
+        return outcome.to_error();
     case StreamState::Open:
     default:
-        return std::unexpected{make_error_code(client_errc::session_closed)};
+        return make_error_code(client_errc::session_closed);
     }
 }
 
-// The error form, for the paths that only need to know why a stream ended (a
-// clean end-of-body is then reported as a protocol error: no head ever
-// arrived).
 inline error_code outcome_error(const StreamOutcome &outcome) {
     switch (outcome.get()) {
     case StreamState::Reset:
@@ -150,24 +105,17 @@ inline error_code outcome_error(const StreamOutcome &outcome) {
     }
 }
 
-// One request/response exchange. Lifetime: keep it alive until the exchange is
-// done; the session stays alive while any of its streams does.
+using ReadCompletion = asio::any_completion_handler<void(error_code, ReadResult)>;
+using OpenCompletion = asio::any_completion_handler<void(error_code, std::shared_ptr<class ClientStream>)>;
+
+// One request/response exchange. Completion signatures:
+//   async_write / async_finish / async_finish_trailers / async_cancel -> void(error_code)
+//   async_read -> void(error_code, ReadResult)
+//   async_read_head -> void(error_code, ResponseHead)
 class ClientStream {
   public:
-    virtual ~ClientStream() {
-        // One-shot lifecycle hook fired when the caller drops the stream: the
-        // engine uses it to release its single HTTP/1.1 connection's one-
-        // exchange gate (so the next request can proceed) and to close a
-        // throwaway connection for a different origin. Must not touch the
-        // stream — the derived members are already gone when this runs.
-        run_destroy_hook();
-    }
+    virtual ~ClientStream() { run_destroy_hook(); }
 
-    // Fires the destruction hook now instead of waiting for the destructor.
-    // Client::Stream::abort() uses this: an aborted exchange no longer needs
-    // the connection, and a caller that keeps the Stream handle alive must not
-    // keep the engine's HTTP/1.1 one-exchange gate with it. The hook is
-    // one-shot, so the destructor will not run it a second time.
     void run_destroy_hook() {
         if (m_destroy_hook_fired.exchange(true, std::memory_order_acq_rel))
             return;
@@ -175,189 +123,181 @@ class ClientStream {
             m_on_destroy();
     }
 
-    // Installs the destruction hook (see the destructor). The engine sets it on
-    // every stream it hands out.
     void set_on_destroy(std::function<void()> cb) { m_on_destroy = std::move(cb); }
 
-    // The engine's single-connection h1 gate holder for this exchange: the
-    // on-destroy hook uses it to hand the gate back (idempotently — see
-    // ExchangeGate::release) when the caller drops the stream.
     void set_gate_token(std::shared_ptr<void> tok) { m_gate_token = std::move(tok); }
     const std::shared_ptr<void> &gate_token() const { return m_gate_token; }
 
     // --- request side ---
-    // Sends a body chunk / finishes the body. Only valid for a request opened
-    // with Request::stream_body; otherwise body_not_streaming.
-    [[nodiscard]] virtual asio::awaitable<error_code> write(std::string data) = 0;
-    [[nodiscard]] virtual asio::awaitable<error_code> finish(std::string data) = 0;
-    // Ends a streamed body with a trailer section. Implementations that cannot
-    // carry request trailers return client_errc::trailers_not_supported rather
-    // than silently dropping the fields.
-    [[nodiscard]] virtual asio::awaitable<error_code> finish_trailers(Headers trailers) {
-        (void)trailers;
-        co_return make_error_code(client_errc::trailers_not_supported);
+    template <typename Token> auto async_write(std::string data, Token &&token) {
+        auto initiation = [this, data = std::move(data)](auto handler) mutable {
+            write(std::move(data), std::move(handler));
+        };
+        return asio::async_initiate<Token, void(error_code)>(
+            detail::make_executor_initiation(std::move(initiation), head_executor()), token);
+    }
+    template <typename Token> auto async_finish(std::string data, Token &&token) {
+        auto initiation = [this, data = std::move(data)](auto handler) mutable {
+            finish(std::move(data), std::move(handler));
+        };
+        return asio::async_initiate<Token, void(error_code)>(
+            detail::make_executor_initiation(std::move(initiation), head_executor()), token);
+    }
+    template <typename Token> auto async_finish_trailers(Headers trailers, Token &&token) {
+        auto initiation = [this, trailers = std::move(trailers)](auto handler) mutable {
+            finish_trailers(std::move(trailers), std::move(handler));
+        };
+        return asio::async_initiate<Token, void(error_code)>(
+            detail::make_executor_initiation(std::move(initiation), head_executor()), token);
     }
 
     // --- response side ---
-    // The response head: waits for it (and parses it) if that has not happened
-    // yet. Idempotent — the head is cached, so calling it after read() has
-    // already delivered body bytes works too.
-    [[nodiscard]] asio::awaitable<std::expected<ResponseHead, error_code>> read_head() {
-        if (!m_head_ready) {
-            if (auto ec = co_await await_head(); ec)
-                co_return std::unexpected{ec};
-        }
-        co_return *m_head;
+    template <typename Token> auto async_read_head(Token &&token) {
+        return asio::async_compose<Token, void(error_code, ResponseHead)>(ReadHeadOp{*this}, token, head_executor());
     }
 
-    // The head, once read_head() (or read()) has completed. Before that it is a
-    // default-constructed head (status 0).
     const ResponseHead &head() const { return m_head ? *m_head : m_no_head; }
     int status() const { return head().status; }
 
-    // Trailer fields received after the response body (RFC 9110 §6.5): the
-    // chunked trailer section on HTTP/1.1, the trailing HEADERS block on
-    // HTTP/2. Empty when the peer sent none. The engine publishes them while
-    // reading the body, so they are complete once read() reported end-of-body
-    // (a caller that only ever reads the head sees an empty set). Like head(),
-    // this is written on the session's executor and safe to read once the
-    // exchange has delivered the values.
     [[nodiscard]] virtual const Headers &response_trailers() const noexcept { return m_trailers; }
 
-    // The next body event: a chunk, or end-of-body. The head is parsed on the
-    // way if the caller never asked for it.
-    [[nodiscard]] virtual asio::awaitable<std::expected<ReadResult, error_code>> read() = 0;
+    template <typename Token> auto async_read(Token &&token) {
+        auto initiation = [this](auto handler) { read(std::move(handler)); };
+        return asio::async_initiate<Token, void(error_code, ReadResult)>(
+            detail::make_executor_initiation(std::move(initiation), head_executor()), token);
+    }
 
-    // Reads the whole remaining body. `max_bytes` (0 = unlimited) bounds how much
-    // is accumulated, so a peer cannot exhaust memory with an endless body; the
-    // convenience layer always passes a cap.
-    [[nodiscard]] asio::awaitable<std::expected<std::string, error_code>> read_all(std::size_t max_bytes = 0) {
-        std::string out;
-        for (;;) {
-            auto chunk = co_await read();
-            if (!chunk)
-                co_return std::unexpected{chunk.error()};
-            if (chunk->eof)
-                co_return out;
-            if (max_bytes != 0 && out.size() + chunk->data.size() > max_bytes) {
-                co_return std::unexpected{make_error_code(client_errc::body_too_large)};
-            }
-            out.append(chunk->data);
-        }
+    template <typename Token> auto async_read_all(std::size_t max_bytes, Token &&token) {
+        return asio::async_compose<Token, void(error_code, std::string)>(ReadAllOp{*this, max_bytes}, token,
+                                                                         head_executor());
     }
 
     // --- state ---
-    // Both directions complete. The session may then be reused (see
-    // ClientSession::reusable()).
     virtual bool finished() const = 0;
     virtual Version version() const = 0;
-    // HTTP/2 stream id; 0 on HTTP/1.x.
     virtual std::uint32_t id() const = 0;
-    // Abandons the exchange: RST_STREAM on HTTP/2 (the connection survives),
-    // connection close on HTTP/1.x (a half-written request leaves the peer at an
-    // unknown position). Hops like the operations above, because it changes
-    // session state the driving coroutine also touches.
-    [[nodiscard]] virtual asio::awaitable<void> cancel() = 0;
 
-    // Drops the cached head so the next read_head() parses the final response.
-    // Used after an interim 100-continue was delivered to an automatic caller.
-    // Virtual so a decorator can also clear the wrapped stream's cache; the
-    // inner session caches the interim head independently.
+    template <typename Token> auto async_cancel(Token &&token) {
+        auto initiation = [this](auto handler) { cancel(std::move(handler)); };
+        return asio::async_initiate<Token, void()>(
+            detail::make_executor_initiation(std::move(initiation), head_executor()), token);
+    }
+
     virtual void clear_head_cache() { reset_head(); }
 
+    // Token-level virtuals implemented by the session-specific stream.
+    virtual void write(std::string data, WriteCompletion done) = 0;
+    virtual void finish(std::string data, WriteCompletion done) = 0;
+    virtual void finish_trailers(Headers trailers, WriteCompletion done) {
+        (void)trailers;
+        std::move(done)(make_error_code(client_errc::trailers_not_supported));
+    }
+    virtual void read(ReadCompletion done) = 0;
+    virtual void cancel(WriteCompletion done) = 0;
+
+    // Awaits and publishes the response head; runs on the session executor.
+    // Public because decorators forward it through a ClientStream pointer.
+    virtual void await_head(WriteCompletion done) = 0;
+    virtual asio::any_io_executor head_executor() const = 0;
+
   protected:
-    // Called by the session once the response head is parsed; `await_head()` must
-    // have done so before reporting success.
     void set_head(ResponseHead head) {
         if (!m_head)
             m_head = std::make_shared<ResponseHead>();
         *m_head = std::move(head);
         m_head_ready = true;
     }
-
-    // Invalidates the cached head so the next read_head() re-parses. Used by the
-    // HTTP/1.1 session after it publishes an interim 100-continue: that head is
-    // handed to the caller (so it can send the body), but the *real* response
-    // head still follows and must not be masked by the cached interim.
     void reset_head() { m_head_ready = false; }
-
-    // Called by the engine once the body's trailing field section has been
-    // parsed; see response_trailers().
     void set_trailers(Headers trailers) { m_trailers = std::move(trailers); }
 
-    // Waits until the response head is available (and publishes it via
-    // set_head()), or fails. Implemented by the session: only it knows how the
-    // head arrives on its wire.
-    [[nodiscard]] virtual asio::awaitable<error_code> await_head() = 0;
+    bool head_ready() const { return m_head_ready; }
+    const std::shared_ptr<ResponseHead> &head_ptr() const { return m_head; }
 
   private:
+    struct ReadHeadOp {
+        ClientStream &stream;
+
+        asio::any_io_executor get_executor() const noexcept { return stream.head_executor(); }
+
+        template <typename Self> void operator()(Self &self, error_code ec = {}) {
+            if (!started) {
+                started = true;
+                if (stream.head_ready()) {
+                    self.complete(error_code{}, *stream.head_ptr());
+                    return;
+                }
+                stream.await_head(WriteCompletion(std::move(self)));
+                return;
+            }
+            if (ec) {
+                self.complete(ec, ResponseHead{});
+                return;
+            }
+            if (!stream.head_ptr()) {
+                self.complete(make_error_code(client_errc::protocol_error), ResponseHead{});
+                return;
+            }
+            self.complete(error_code{}, *stream.head_ptr());
+        }
+        bool started{false};
+    };
+
+    struct ReadAllOp {
+        ClientStream &stream;
+        std::size_t max_bytes;
+        std::string out;
+        bool started{false};
+
+        asio::any_io_executor get_executor() const noexcept { return stream.head_executor(); }
+
+        template <typename Self> void operator()(Self &self, error_code ec = {}, ReadResult chunk = {}) {
+            if (!started) {
+                started = true;
+                stream.read(ReadCompletion(std::move(self)));
+                return;
+            }
+            if (ec) {
+                self.complete(ec, std::string{});
+                return;
+            }
+            if (chunk.eof) {
+                self.complete(error_code{}, std::move(out));
+                return;
+            }
+            if (max_bytes != 0 && out.size() + chunk.data.size() > max_bytes) {
+                self.complete(make_error_code(client_errc::body_too_large), std::string{});
+                return;
+            }
+            out.append(chunk.data);
+            stream.read(ReadCompletion(std::move(self)));
+        }
+    };
+
     std::shared_ptr<ResponseHead> m_head;
     bool m_head_ready{false};
     ResponseHead m_no_head{};
     Headers m_trailers;
     std::function<void()> m_on_destroy;
-    // Atomic: the hook may be fired early from abort() on a caller thread and
-    // again from the destructor (which can run anywhere), exactly once.
     std::atomic<bool> m_destroy_hook_fired{false};
     std::shared_ptr<void> m_gate_token;
 };
 
-// A connection to one target, serving h1 or h2 exchanges.
 class ClientSession {
   public:
     virtual ~ClientSession() = default;
 
-    // Starts an exchange. HTTP/1.1: one at a time. HTTP/2: any number, each
-    // multiplexed on the same connection. The request to send is a shared_ptr
-    // to a `Request`, the same type the server hands its handlers — built the
-    // same way (method, target, headers, body) and read back by the engine at
-    // send time.
-    [[nodiscard]] virtual asio::awaitable<std::expected<std::shared_ptr<ClientStream>, error_code>>
-    open_stream(std::shared_ptr<Request> request) = 0;
+    virtual void open_stream(std::shared_ptr<Request> request, OpenCompletion done) = 0;
 
-    // The transport is usable and no fatal error has been seen.
     virtual bool alive() const = 0;
-    // True when the session is positioned at a request boundary (HTTP/1.x: the
-    // last exchange ended with an explicit body length and no `Connection:
-    // close`; HTTP/2: no in-flight streams).
     virtual bool reusable() const = 0;
-    // True when the session can serve another request after the current one —
-    // alive and neither side asked to close. Unlike reusable() this ignores
-    // whether an exchange is currently in flight, which is exactly what the
-    // single-connection engine's reuse check needs: a busy-but-keepable HTTP/1.1
-    // connection is a *reuse* (the next request queues on the gate), while a
-    // close-requested one must be dropped and re-dialed. Read from foreign
-    // threads (shared Client), so its inputs are atomics.
     virtual bool keepable() const = 0;
-    // True when one connection can serve several exchanges at the same time.
-    // The engine uses this capability — not `version() == …` — to decide
-    // whether an exchange must take the HTTP/1.1 one-exchange gate. An
-    // HTTP/1.1 session that completed an h2c upgrade reports the successor's
-    // capability (true) here.
     virtual bool multiplexes() const = 0;
     virtual Version version() const = 0;
-    // "host:port" this session is connected to, for diagnostics.
     virtual std::string_view authority() const = 0;
-    // The executor every operation of this session runs on (model A). The
-    // engine uses it to release its kept connection: dropping the last
-    // reference to a session frees an object graph (Body channels, timers)
-    // that was created on this executor, so the destructor must run on it even
-    // when the drop happens on another thread.
     virtual asio::any_io_executor executor() const = 0;
     virtual void close() = 0;
 
-    // One-shot hook fired when an exchange completes and the connection can
-    // serve another. The engine uses it on its single HTTP/1.1 connection to
-    // release the one-exchange gate on *completion*, independent of how long
-    // the caller keeps the stream handle. No-op except on HTTP/1.1 sessions.
     virtual void set_on_exchange_done(std::function<void()> cb) { (void)cb; }
-
-    // The completion flag of the exchange currently in flight, shared with the
-    // engine's stream-destruction hook so it can tell an *abandoned* exchange
-    // (dropped before it ever reached its end — a half-read message, which must
-    // close the connection) from one that completed and merely left a stream
-    // handle alive (whose connection the session itself decides to keep or
-    // close). HTTP/1.1 only; a null shared_ptr elsewhere.
     virtual std::shared_ptr<std::atomic<bool>> exchange_done_flag() const { return nullptr; }
 };
 

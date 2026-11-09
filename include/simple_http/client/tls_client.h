@@ -17,9 +17,9 @@
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 
+#include "../core/format.h"
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
-#include <format>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -72,7 +72,7 @@ inline std::vector<unsigned char> alpn_wire_list(const ClientTarget &target, con
     std::vector<unsigned char> wire;
     for (const auto &proto : protos) {
         if (proto.empty() || proto.size() > 255) {
-            throw std::runtime_error(std::format("TLS ALPN protocol name out of range: '{}'", proto));
+            throw std::runtime_error(simple_http::format("TLS ALPN protocol name out of range: '{}'", proto));
         }
         wire.push_back(static_cast<unsigned char>(proto.size()));
         wire.insert(wire.end(), proto.begin(), proto.end());
@@ -109,7 +109,7 @@ inline std::shared_ptr<asio::ssl::context> make_client_ssl_context(const TlsClie
             error_code ec;
             ctx->load_verify_file(cfg.ca_file, ec);
             if (ec) {
-                throw std::runtime_error(std::format("client CA file '{}': {}", cfg.ca_file, ec.message()));
+                throw std::runtime_error(simple_http::format("client CA file '{}': {}", cfg.ca_file, ec.message()));
             }
         } else {
             error_code ec;
@@ -127,14 +127,42 @@ inline std::shared_ptr<asio::ssl::context> make_client_ssl_context(const TlsClie
         error_code ec;
         ctx->use_certificate_chain_file(cfg.cert_chain_file, ec);
         if (ec) {
-            throw std::runtime_error(std::format("client certificate '{}': {}", cfg.cert_chain_file, ec.message()));
+            throw std::runtime_error(
+                simple_http::format("client certificate '{}': {}", cfg.cert_chain_file, ec.message()));
         }
         ctx->use_private_key_file(cfg.private_key_file, asio::ssl::context::pem, ec);
         if (ec) {
-            throw std::runtime_error(std::format("client private key '{}': {}", cfg.private_key_file, ec.message()));
+            throw std::runtime_error(
+                simple_http::format("client private key '{}': {}", cfg.private_key_file, ec.message()));
         }
     }
 
+    return ctx;
+}
+
+// The TLS policy for an HTTPS proxy leg. Deliberately separate from the origin
+// context: the client certificate must not be presented to a proxy, and the
+// proxy's CA/verification settings are its own. `base` supplies the fallback CA
+// file (ProxyConfig::ca_file empty = ClientConfig::tls.ca_file).
+inline std::shared_ptr<asio::ssl::context> make_proxy_ssl_context(const ProxyConfig &proxy,
+                                                                  const TlsClientConfig &base) {
+    ensure_openssl_initialized();
+    auto ctx = std::make_shared<asio::ssl::context>(asio::ssl::context::tls_client);
+    ctx->set_options(asio::ssl::context::default_workarounds | asio::ssl::context::no_tlsv1 |
+                     asio::ssl::context::no_tlsv1_1);
+    ctx->set_verify_mode(proxy.verify_peer ? asio::ssl::verify_peer : asio::ssl::verify_none);
+    if (proxy.verify_peer) {
+        const std::string &ca = proxy.ca_file.empty() ? base.ca_file : proxy.ca_file;
+        error_code ec;
+        if (!ca.empty()) {
+            ctx->load_verify_file(ca, ec);
+        } else {
+            ctx->set_default_verify_paths(ec); // best effort: no store means the handshake fails later
+        }
+        if (ec) {
+            throw std::runtime_error(simple_http::format("client proxy CA '{}': {}", ca, ec.message()));
+        }
+    }
     return ctx;
 }
 
@@ -188,16 +216,13 @@ inline error_code apply_client_ssl_settings(SSL *ssl, const ClientTlsHandshake &
 // Templated on the transport, not hard-coded to TlsStreamTransport: an HTTPS
 // proxy needs a second TLS layer for the origin (NestedTlsTransport), and the
 // handshake is identical there.
-template <typename Transport>
-asio::awaitable<error_code> tls_client_handshake(Transport &transport, const ClientTlsHandshake &hs) {
+template <typename Transport, typename Token>
+auto async_tls_client_handshake(Transport &transport, const ClientTlsHandshake &hs, Token &&token) {
     SSL *ssl = transport.stream().native_handle();
-
-    if (error_code ec = apply_client_ssl_settings(ssl, hs))
-        co_return ec;
-
-    auto [ec] = co_await transport.stream().async_handshake(asio::ssl::stream_base::client,
-                                                            asio::as_tuple(asio::use_awaitable));
-    co_return ec;
+    if (error_code ec = apply_client_ssl_settings(ssl, hs)) {
+        return asio::async_initiate<Token, void(error_code)>([ec](auto handler) { std::move(handler)(ec); }, token);
+    }
+    return transport.stream().async_handshake(asio::ssl::stream_base::client, std::forward<Token>(token));
 }
 
 } // namespace simple_http::detail

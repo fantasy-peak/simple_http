@@ -939,6 +939,73 @@ test/run.sh server-diff
     用 `ngtcp2_ccerr_set_tls_alert(SSL_AD_MISSING_EXTENSION)` 关闭
     （线上是 `CONNECTION_CLOSE 0x016d`）。判断要在 TLS 状态已离开
     `TLS_ST_SR_CLNT_HELLO` 之后做，否则会把分片到达的 ClientHello 误杀。
+31. **请求取消 signal 必须 fan-out**：`Request::cancellation_slot()` 每次返回
+    独立 `cancellation_signal`，`cancel()` 向全部 signal 广播。asio 把
+    `cancellation_state` 的 impl 存放在父 slot 的 handler 存储里，若同一
+    `Request` slot 同时被外层协程（`co_spawn` 的 bind）和内层操作（如
+    detached 协程的定时器）绑定，后者会覆盖前者；外层协程随后
+    `clear_cancellation_slot()` 会写到已释放的 impl（SIGSEGV）。
+32. **h1 读超时必须传到 socket**：`read_more` 一类包装 lambda 不携带
+    associators，会把 cancellation slot 丢掉，导致
+    `Stream::read_head_with/read_with` 的 deadline 无法中止挂起的读。
+    在 `do_ensure_head`/`do_exchange_read` 入口记录 `m_read_slot`，并由
+    `read_more` 显式 `bind_cancellation_slot` 到 socket 操作。
+33. **h1 `Expect: 100-continue` 上抛**：interim 100 必须作为 head 交给调用方
+    （`m_expect_continue` / `m_awaiting_final`），由 `Stream` 的自动流清缓存后
+    再发请求体；在 h1 内部吞掉 100 并直接等最终响应会与等待请求体的服务端
+    互锁。最终响应（拒绝）也要原样上抛为 `expectation_failed`。
+34. **客户端拨号必须实现 `ResolveFn` + `connect_timeout`**：直接路径和代理
+    路径都要接线；连接失败/超时映射为 `client_errc::connect_timeout`。部分
+    环境（WSL2）对 `127.0.0.1:1` 会 drop 而不是 refuse，没有超时会挂死。
+35. **h3 客户端 SSL_CTX 生命周期**：`ConnectState` 只保存裸 `SSL_CTX*`。
+    当 `Client` 自己没缓存 context 时，`dial_h3` 里的局部 shared_ptr 必须被
+    完成回调捕获，活到连接建立（`SSL_new`）之后，否则连接层拿到悬空指针，
+    表现为 `SSL_new failed` 并误报 protocol_error。
+36. **错误码类别统一**：库内比较/映射一律用
+    `make_error_code(asio::error::X)`（system 类别）。`boost::system::errc::`
+    `make_error_code`（generic 类别）与 `asio::error::X` 不相等，曾导致请求
+    解压超限映射成 400 而不是 413、trailer 校验错误比较失败。
+37. **h2c Upgrade 服务端**：h1 检测 `Upgrade: h2c` + `Connection: Upgrade` +
+    `HTTP2-Settings`，排空升级请求体、回 101，把已读到的剩余字节（客户端
+    preface）交给 `Http2Engine::run_h2c`，并把原请求重放为 stream 1，同时置
+    `half_closed_remote`（否则 stream 1 永不 retire，泄漏并发槽位）。TLS 监听
+    必须禁用 h2c（协议由 ALPN 决定）。
+38. **重定向降级为 GET**：303/301/302 丢弃实体时同时
+    `set_stream_body(false)` + `set_content_length(-1)`，否则 h1 会写出
+    `content-length: 0`，与 Go 的跟随行为不一致。
+39. **状态码重试**：`retry_statuses` 默认空；显式开启后按 `Retry-After` 或
+    退避重放，重放前响应体必须已经消费。`send_hop` 的重试计数与重定向计数
+    相互独立，重试时重定向计数归零。
+40. **请求解压超限是 413**：`Body` 解码超限返回
+    `asio::error::message_size`（`extract.h` 据此映射
+    `payload_too_large`）；畸形/截断仍是 400。
+41. **错误体省略空 details**：`JsonError::details` 为空时不输出
+    `"details":null`，而是整个字段省略（与 Go 的 `omitempty` 参考实现一致），
+    否则差分端口径不一致。
+42. **`Client` 异步回调不能持裸 `this`**：`Client` 继承
+    `enable_shared_from_this`，异步入口用 `keep_alive()` 捕获。堆上的
+    `Client`（如 HTTP 反代里的 `make_shared<Client>`）由回调保活；栈上对象
+    返回不拥有控制块的别名 `shared_ptr`，依赖 awaitable 契约。此前
+    `dial_via_proxy` 的 DNS 完成回调在 `Client` 析构后访问 `m_executor`，
+    ASan 报 heap-use-after-free。
+43. **h1 客户端 session ↔ stream 方向**：session 用 `weak_ptr` 持有当前
+    stream（`m_current`），stream 强引用 session 并缓存 executor。反过来
+    （session 强持 stream、stream 强持 session）是每次 exchange 一个环；
+    LeakSanitizer 会报 `Request`/`Http1ClientSession` 间接泄漏。
+44. **自递归 `shared_ptr<std::function>` 必须弱自引用**：
+    `middleware::timeout` 的 `poll` 与 `client/ws_client.h` 的 `step` 都靠
+    挂起的 timer/read handler 持有强引用保活，函数对象自身只捕获
+    `weak_ptr`。直接捕获自身会让每次安装都永久泄漏 request/response/
+    completion/timer（曾在 ASan unit 中报 10 KB / 99 allocations）。
+45. **`Server::Core::dispatch` 不能强捕获 `core`**：`dispatch` 是 `Core`
+    的成员，强捕获形成 `Core → dispatch → Core` 自环，`stop()` 后整个
+    `Core → IoCtxPool → io_context → pending handlers` 链都泄漏。dispatch
+    捕获 `weak_ptr<Core>`（过期后直接完成）和 router。
+46. **accept/serve/sniff 回调弱引用 listener/core**：挂起的 accept、
+    TLS 握手、嗅探读取和 posted serve 不能强持 `ListenerState`/`Core`，
+    否则 `listener → acceptor → handler → listener` 或
+    `core → pool → io_context → handler → core` 在 teardown 时成环。
+    连接计数在弱引用过期时跳过（此时 Server 已销毁，计数无意义）。
 
 ---
 
@@ -970,6 +1037,10 @@ test/run.sh server-diff
 - CMake 接口未接入 ngtcp2/nghttp3；HTTP/3 目前只由 xmake 构建提供。
 - `simple_httpConfig.cmake.in` 缺 `find_dependency(glaze)`。
 - 根目录 `compile_commands.json` 可能过期；以 `build/` 下的为准。
+- 客户端 `ClientConfig::request_timeout` 到点只会让调用方拿到
+  `client_errc::request_timeout`；被包装的底层交换可能继续跑到对端响应或连接
+  空闲超时。逐阶段预算（`response_head_timeout` / `body_idle_timeout`）会真正
+  取消挂起读，整体预算目前不做跨层取消。
 
 ---
 

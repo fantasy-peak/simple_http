@@ -1,13 +1,17 @@
 #pragma once
 
-// Streaming file responses: the file is read in bounded chunks and written as
-// the response body, so a large file never sits in user-space memory. This is
-// the serving primitive; Range/conditional-request policy (ETag, Last-Modified,
-// If-Range) stays in static_files.h, which also decides what happens for a
-// missing path.
+// Streaming file responses (C++17 token-only port): the file is read in
+// bounded chunks and written as the response body, so a large file never sits
+// in user-space memory. This is the serving primitive; Range/conditional
+// request policy (ETag, Last-Modified, If-Range) stays in static_files.h, which
+// also decides what happens for a missing path.
 //
-//   co_await simple_http::send_file(*res, "assets/app.js");
-//   co_await simple_http::send_file(*res, path, {.content_type = "text/plain"});
+//   simple_http::async_send_file(*res, "assets/app.js", simple_http::finish_with(std::move(done)));
+//   simple_http::async_send_file(*res, path, {.content_type = "text/plain"}, token);
+//
+// Completion signature: void(error_code). The caller maps the error onto a
+// status (typically 404 or 500); headers are only applied after the file was
+// successfully stat'ed, so a failed call leaves the response untouched.
 //
 // The file I/O is synchronous (std::ifstream). Boost 1.92's asio::stream_file
 // only has a backend under io_uring/IOCP, so it cannot be used on a plain epoll
@@ -17,12 +21,15 @@
 // usually a different executor in the pool).
 
 #include <array>
+#include <boost/asio/any_io_executor.hpp>
+#include <boost/asio/compose.hpp>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 
 #include "../core/http_field.h"
 #include "../core/mime.h"
@@ -30,6 +37,8 @@
 #include "../proto/response.h"
 
 namespace simple_http {
+
+namespace asio = boost::asio;
 
 struct SendFileOptions {
     // Empty = derive from the file extension via mime::by_extension().
@@ -42,53 +51,112 @@ struct SendFileOptions {
     bool set_content_length{true};
 };
 
-// Streams `path` as the response body. Returns an error_code for the caller to
-// map onto a status (typically 404 or 500); headers are only applied after the
-// file was successfully stat'ed, so a failed call leaves the response untouched.
-inline asio::awaitable<error_code> send_file(ResponseWriter &res, std::string path, SendFileOptions opts = {}) {
-    std::error_code stat_ec;
-    const auto size = std::filesystem::file_size(path, stat_ec);
-    if (stat_ec) {
-        co_return boost::system::errc::make_error_code(boost::system::errc::no_such_file_or_directory);
-    }
-    if (opts.max_bytes != 0 && size > opts.max_bytes) {
-        co_return boost::system::errc::make_error_code(boost::system::errc::file_too_large);
+namespace detail {
+
+struct SendFileOp {
+    ResponseWriter &response;
+    std::string path;
+    SendFileOptions options;
+
+    std::ifstream file;
+    std::array<char, 64 * 1024> buffer{};
+    error_code pre;
+    int stage{0};
+
+    asio::any_io_executor get_executor() const noexcept { return response.writer().get_executor(); }
+
+    error_code prepare() {
+        std::error_code stat_ec;
+        const auto size = std::filesystem::file_size(path, stat_ec);
+        if (stat_ec) {
+            return boost::system::errc::make_error_code(boost::system::errc::no_such_file_or_directory);
+        }
+        if (options.max_bytes != 0 && size > options.max_bytes) {
+            return boost::system::errc::make_error_code(boost::system::errc::file_too_large);
+        }
+        const auto content_type =
+            options.content_type.empty() ? std::string{mime::by_extension(path)} : options.content_type;
+        response.content_type(content_type);
+        if (options.set_content_length) {
+            response.header(field::content_length, std::to_string(size));
+        }
+        return {};
     }
 
-    const auto content_type = opts.content_type.empty() ? std::string{mime::by_extension(path)} : opts.content_type;
-    res.content_type(content_type);
-    if (opts.set_content_length) {
-        res.header(field::content_length, std::to_string(size));
-    }
-
-    if (res.writer().head_request()) {
-        co_return co_await res.send_bodyless();
-    }
-
-    std::ifstream file{path, std::ios::binary};
-    if (!file) {
-        co_return boost::system::errc::make_error_code(boost::system::errc::no_such_file_or_directory);
-    }
-
-    if (auto ec = co_await res.begin(); ec) {
-        co_return ec;
-    }
-
-    std::array<char, 64 * 1024> buffer;
-    for (;;) {
+    template <typename Self> void read_and_write(Self &self) {
         file.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
         const auto n = file.gcount();
         if (n <= 0) {
-            break;
+            if (file.bad()) {
+                self.complete(boost::system::errc::make_error_code(boost::system::errc::io_error));
+                return;
+            }
+            stage = 3;
+            response.async_finish(std::move(self));
+            return;
         }
-        if (auto ec = co_await res.write(std::string(buffer.data(), static_cast<std::size_t>(n))); ec) {
-            co_return ec;
+        stage = 2;
+        response.async_write(std::string(buffer.data(), static_cast<std::size_t>(n)), std::move(self));
+    }
+
+    template <typename Self> void operator()(Self &self, error_code ec = {}) {
+        switch (stage) {
+        case 0:
+            pre = prepare();
+            if (pre) {
+                self.complete(pre);
+                return;
+            }
+            if (response.writer().head_request()) {
+                stage = 4;
+                response.async_send_bodyless(std::move(self));
+                return;
+            }
+            file.open(path, std::ios::binary);
+            if (!file) {
+                self.complete(boost::system::errc::make_error_code(boost::system::errc::no_such_file_or_directory));
+                return;
+            }
+            stage = 1;
+            response.async_begin(std::move(self));
+            return;
+        case 1:
+            if (ec) {
+                self.complete(ec);
+                return;
+            }
+            read_and_write(self);
+            return;
+        case 2:
+            if (ec) {
+                self.complete(ec);
+                return;
+            }
+            read_and_write(self);
+            return;
+        case 3:
+        case 4:
+            self.complete(ec);
+            return;
+        default:
+            self.complete(boost::system::errc::make_error_code(boost::system::errc::operation_canceled));
+            return;
         }
     }
-    if (file.bad()) {
-        co_return boost::system::errc::make_error_code(boost::system::errc::io_error);
-    }
-    co_return co_await res.finish();
+};
+
+} // namespace detail
+
+// Streams `path` as the response body. Completion signature: void(error_code).
+template <typename Token>
+auto async_send_file(ResponseWriter &response, std::string path, SendFileOptions options, Token &&token) {
+    auto executor = response.writer().get_executor();
+    return asio::async_compose<Token, void(error_code)>(
+        detail::SendFileOp{response, std::move(path), std::move(options)}, token, executor);
+}
+
+template <typename Token> auto async_send_file(ResponseWriter &response, std::string path, Token &&token) {
+    return async_send_file(response, std::move(path), SendFileOptions{}, std::forward<Token>(token));
 }
 
 } // namespace simple_http

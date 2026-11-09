@@ -58,6 +58,10 @@ EXPECT_H3SPEC_PASSED=47
 # 按名字查而不是猜路径。
 H3SPEC_BIN=h3spec-linux-x86_64
 
+# 服务端是否提供 HTTP/3 (UDP :7792)。C++23 版默认提供；C++17 移植版没有
+# QUIC，用 CONFORMANCE_HTTP3=0 运行本脚本时不再等待 :7792，也不跑 h3spec。
+HTTP3="${CONFORMANCE_HTTP3:-1}"
+
 SERVER_PID=""
 FAILURES=0
 SUITES=()
@@ -133,7 +137,11 @@ start_server() {
         head_ "构建 server"
         ( cd "$ROOT" && xmake build fixture_conformance_server ) || { bad "xmake build fixture_conformance_server 失败"; return 1; }
     fi
-    head_ "启动 conformance 夹具（:7788 嗅探+ws / :7790 h2c / :7791 h1 / :7792 tcp+udp h3）"
+    if [[ "$HTTP3" == "1" ]]; then
+        head_ "启动 conformance 夹具（:7788 嗅探+ws / :7790 h2c / :7791 h1 / :7792 tcp+udp h3）"
+    else
+        head_ "启动 conformance 夹具（:7788 嗅探+ws / :7790 h2c / :7791 h1；无 h3）"
+    fi
     # 必须在仓库根目录起：证书路径是相对路径。
     # exec 让子 shell 被 server 自己替换掉，$! 才是 server 的 PID —— 否则 kill
     # 落在中间那层 shell 上，server 会变成孤儿继续占着端口。
@@ -143,8 +151,10 @@ start_server() {
     local port ready i
     # 7792 是双传输端点：TCP 与 UDP 同号，所以这里的 TCP 探活对它同样有效。
     # 纯 QUIC 端点是探不到的 —— /dev/tcp 看不见 UDP —— 需要另起一个端点时，
-    # 这里的探活也要一起改。
-    for port in "$PORT_SNIFF" "$PORT_H2C" "$PORT_H1" "$PORT_H3"; do
+    # 这里的探活也要一起改。CONFORMANCE_HTTP3=0 的服务端不监听它。
+    local ports=("$PORT_SNIFF" "$PORT_H2C" "$PORT_H1")
+    [[ "$HTTP3" == "1" ]] && ports+=("$PORT_H3")
+    for port in "${ports[@]}"; do
         ready=0
         for i in $(seq 1 50); do
             # 只探 TCP 可连：h2c 端点会拒掉普通 GET（那本来就是无效前导），
@@ -353,7 +363,13 @@ head_ "环境自检"
 ENV_OK=1
 want h2spec   && { require_h2spec   || ENV_OK=0; }
 want h1spec   && { require_h1spec >/dev/null || ENV_OK=0; }
-want h3spec   && { require_h3spec   || ENV_OK=0; }
+if want h3spec; then
+    if [[ "$HTTP3" == "1" ]]; then
+        require_h3spec || ENV_OK=0
+    else
+        warn "跳过 h3spec：该服务端没有 HTTP/3（CONFORMANCE_HTTP3=0）"
+    fi
+fi
 want autobahn && {
     require_docker_image "$AUTOBAHN_IMAGE" || ENV_OK=0
 }
@@ -365,11 +381,16 @@ if [[ "$ENV_OK" != "1" ]]; then
     exit 1
 fi
 
+if [[ "$HTTP3" == "0" ]] && want h3spec && [[ ${#SUITES[@]} -ne 0 ]]; then
+    say "h3spec 需要 HTTP/3 构建，而 CONFORMANCE_HTTP3=0；请去掉该参数或改用支持 h3 的服务端。"
+    exit 2
+fi
+
 start_server || exit 1
 
 want h2spec   && run_h2spec
 want h1spec   && run_h1spec
-want h3spec   && run_h3spec
+[[ "$HTTP3" == "1" ]] && want h3spec && run_h3spec
 want autobahn && run_autobahn
 
 stop_server

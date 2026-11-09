@@ -24,16 +24,16 @@ std::string packed(std::string_view encoding, std::string_view body) {
 // A pull-mode Body that yields `wire` in the given chunk sizes.
 Body make_pull_body(asio::io_context &ctx, const std::string &wire, std::size_t chunk) {
     Body body{ctx.get_executor()};
-    body.set_pull_provider(
-        [&wire, chunk, offset = std::size_t{0}]() mutable -> asio::awaitable<std::expected<ReadResult, error_code>> {
-            if (offset >= wire.size()) {
-                co_return ReadResult::end();
-            }
-            const std::size_t n = std::min(chunk, wire.size() - offset);
-            std::string out = wire.substr(offset, n);
-            offset += n;
-            co_return ReadResult::chunk(std::move(out));
-        });
+    body.set_pull_provider([&wire, chunk, offset = std::size_t{0}](Body::ReadCompletion done) mutable {
+        if (offset >= wire.size()) {
+            std::move(done)(error_code{}, ReadResult::end());
+            return;
+        }
+        const std::size_t n = std::min(chunk, wire.size() - offset);
+        std::string out = wire.substr(offset, n);
+        offset += n;
+        std::move(done)(error_code{}, ReadResult::chunk(std::move(out)));
+    });
     return body;
 }
 
@@ -64,7 +64,7 @@ TEST_CASE("request decoding: pull-mode Body decodes streaming chunks", "[request
     for (std::size_t chunk : {std::size_t{1}, std::size_t{3}, std::size_t{7}, std::size_t{1024}}) {
         Body body = make_pull_body(ctx, wire, chunk);
         REQUIRE(body.enable_decoding(make_decoder("gzip"), 0));
-        auto result = run_on(ctx, body.read_all());
+        auto result = run_on(ctx, body_read_all(body));
         REQUIRE(result.has_value());
         REQUIRE(result->has_value());
         CHECK(**result == text);
@@ -87,7 +87,7 @@ TEST_CASE("request decoding: pushed Body decodes and credits wire bytes", "[requ
     }
     body.finish();
 
-    auto result = run_on(ctx, body.read_all());
+    auto result = run_on(ctx, body_read_all(body));
     REQUIRE(result.has_value());
     REQUIRE(result->has_value());
     CHECK(**result == text);
@@ -110,7 +110,7 @@ TEST_CASE("request decoding: enabled after frames are already queued", "[request
     // still decode the queued frames.
     REQUIRE(body.enable_decoding(make_decoder("gzip"), 0));
 
-    auto result = run_on(ctx, body.read_all());
+    auto result = run_on(ctx, body_read_all(body));
     REQUIRE(result.has_value());
     REQUIRE(result->has_value());
     CHECK(**result == text);
@@ -124,10 +124,10 @@ TEST_CASE("request decoding: malformed and truncated streams fail", "[request-de
         std::string bad = "definitely not gzip";
         REQUIRE(body.feed(std::move(bad)));
         body.finish();
-        auto result = run_on(ctx, body.read_all());
+        auto result = run_on(ctx, body_read_all(body));
         REQUIRE(result.has_value());
         REQUIRE_FALSE(result->has_value());
-        CHECK(result->error() == asio::error::invalid_argument);
+        CHECK(result->error().value() == asio::error::invalid_argument);
     }
     SECTION("truncated member") {
         const std::string wire = packed("gzip", "a body that will be truncated");
@@ -136,10 +136,10 @@ TEST_CASE("request decoding: malformed and truncated streams fail", "[request-de
         std::string bad = wire.substr(0, wire.size() - 4);
         REQUIRE(body.feed(std::move(bad)));
         body.finish();
-        auto result = run_on(ctx, body.read_all());
+        auto result = run_on(ctx, body_read_all(body));
         REQUIRE(result.has_value());
         REQUIRE_FALSE(result->has_value());
-        CHECK(result->error() == asio::error::invalid_argument);
+        CHECK(result->error().value() == asio::error::invalid_argument);
     }
 }
 
@@ -154,17 +154,17 @@ TEST_CASE("request decoding: decoded size budget is enforced", "[request-decodin
     REQUIRE(body.feed(std::move(chunk)));
     body.finish();
 
-    auto result = run_on(ctx, body.read_all());
+    auto result = run_on(ctx, body_read_all(body));
     REQUIRE(result.has_value());
     REQUIRE_FALSE(result->has_value());
-    CHECK(result->error() == asio::error::message_size);
+    CHECK(result->error().value() == asio::error::message_size);
 }
 
 TEST_CASE("request decoding: enable_decoding refuses after a read", "[request-decoding]") {
     asio::io_context ctx;
     Body body{ctx.get_executor()};
     body.finish();
-    auto eof = run_on(ctx, body.read());
+    auto eof = run_on(ctx, body_read(body));
     REQUIRE(eof.has_value());
     REQUIRE(eof->has_value());
     CHECK((*eof)->eof);
@@ -183,22 +183,23 @@ TEST_CASE("decompress_request: gzip body is decoded and headers are rewritten", 
     REQUIRE(req->body().feed(std::move(chunk)));
     req->body().finish();
 
-    auto sink = std::make_shared<FakeResponseSink>();
+    auto sink = std::make_shared<FakeResponseSink>(ctx.get_executor());
     auto res = std::make_shared<ResponseWriter>(sink);
 
     std::string seen;
     bool called = false;
-    Next next = [&](RequestPtr r, ResponsePtr, SslHandle) -> asio::awaitable<void> {
+    Next next = [&](RequestPtr r, ResponsePtr, SslHandle, HandlerCompletion done) {
         called = true;
-        auto all = co_await r->body().read_all();
-        if (all) {
-            seen = *all;
-        }
-        co_return;
+        auto completion = std::make_shared<HandlerCompletion>(std::move(done));
+        r->body().async_read_all([&, r, completion](error_code ec, std::string all) {
+            if (!ec)
+                seen = std::move(all);
+            std::move(*completion)();
+        });
     };
 
     auto mw = middleware::decompress_request();
-    REQUIRE(run_on(ctx, mw(req, res, SslHandle{}, next)));
+    REQUIRE(run_on(ctx, await_void([&](auto done) { mw(req, res, SslHandle{}, next, std::move(done)); })));
     CHECK(called);
     CHECK(seen == text);
     CHECK_FALSE(req->header("content-encoding").has_value());
@@ -210,17 +211,17 @@ TEST_CASE("decompress_request: unsupported coding is 415 before the handler", "[
     asio::io_context ctx;
     auto req = make_request(ctx);
     req->mutable_headers().add("content-encoding", "deflate");
-    auto sink = std::make_shared<FakeResponseSink>();
+    auto sink = std::make_shared<FakeResponseSink>(ctx.get_executor());
     auto res = std::make_shared<ResponseWriter>(sink);
 
     bool called = false;
-    Next next = [&](RequestPtr, ResponsePtr, SslHandle) -> asio::awaitable<void> {
+    Next next = [&](RequestPtr, ResponsePtr, SslHandle, HandlerCompletion done) {
         called = true;
-        co_return;
+        std::move(done)();
     };
 
     auto mw = middleware::decompress_request();
-    REQUIRE(run_on(ctx, mw(req, res, SslHandle{}, next)));
+    REQUIRE(run_on(ctx, await_void([&](auto done) { mw(req, res, SslHandle{}, next, std::move(done)); })));
     CHECK_FALSE(called);
     CHECK(sink->last_status == status::unsupported_media_type);
     CHECK(sink->header("accept-encoding") == "gzip, br");
@@ -237,20 +238,21 @@ TEST_CASE("decompress_request: excluded paths stay on the raw representation", "
     REQUIRE(req->body().feed(std::move(chunk)));
     req->body().finish();
 
-    auto sink = std::make_shared<FakeResponseSink>();
+    auto sink = std::make_shared<FakeResponseSink>(ctx.get_executor());
     auto res = std::make_shared<ResponseWriter>(sink);
 
     std::string seen;
-    Next next = [&](RequestPtr r, ResponsePtr, SslHandle) -> asio::awaitable<void> {
-        auto all = co_await r->body().read_all();
-        if (all) {
-            seen = *all;
-        }
-        co_return;
+    Next next = [&](RequestPtr r, ResponsePtr, SslHandle, HandlerCompletion done) {
+        auto completion = std::make_shared<HandlerCompletion>(std::move(done));
+        r->body().async_read_all([&, r, completion](error_code ec, std::string all) {
+            if (!ec)
+                seen = std::move(all);
+            std::move(*completion)();
+        });
     };
 
     auto mw = middleware::decompress_request(RequestDecompressionConfig{.excluded_paths = {"/proxy/"}});
-    REQUIRE(run_on(ctx, mw(req, res, SslHandle{}, next)));
+    REQUIRE(run_on(ctx, await_void([&](auto done) { mw(req, res, SslHandle{}, next, std::move(done)); })));
     CHECK(seen == wire);
     CHECK(req->header("content-encoding").value_or("") == "gzip");
 }
@@ -264,15 +266,15 @@ TEST_CASE("decompress_request: a body already read cannot be decoded", "[request
     REQUIRE(req->body().feed(std::move(chunk)));
     req->body().finish();
 
-    auto consumed = run_on(ctx, req->body().read_all());
+    auto consumed = run_on(ctx, body_read_all(req->body()));
     REQUIRE(consumed.has_value());
 
-    auto sink = std::make_shared<FakeResponseSink>();
+    auto sink = std::make_shared<FakeResponseSink>(ctx.get_executor());
     auto res = std::make_shared<ResponseWriter>(sink);
-    Next next = [](RequestPtr, ResponsePtr, SslHandle) -> asio::awaitable<void> { co_return; };
+    Next next = [](RequestPtr, ResponsePtr, SslHandle, HandlerCompletion done) { std::move(done)(); };
 
     auto mw = middleware::decompress_request();
-    REQUIRE(run_on(ctx, mw(req, res, SslHandle{}, next)));
+    REQUIRE(run_on(ctx, await_void([&](auto done) { mw(req, res, SslHandle{}, next, std::move(done)); })));
     CHECK(sink->last_status == status::internal_server_error);
 }
 

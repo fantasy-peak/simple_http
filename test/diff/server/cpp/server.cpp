@@ -43,6 +43,34 @@ using namespace simple_http;
 namespace {
 
 volatile std::sig_atomic_t g_stop = 0;
+
+// The token port reports results as completion arguments; these coroutine
+// adapters keep the reference server's value-or-error style.
+template <typename T>
+asio::awaitable<std::expected<T, error_code>> as_expected(asio::awaitable<std::tuple<error_code, T>> op) {
+    auto [ec, value] = co_await std::move(op);
+    if (ec)
+        co_return std::unexpected{ec};
+    co_return std::move(value);
+}
+
+inline asio::awaitable<error_code> as_ec(asio::awaitable<std::tuple<error_code>> op) {
+    auto [ec] = co_await std::move(op);
+    co_return ec;
+}
+
+inline asio::awaitable<std::expected<std::string, error_code>> body_read_all(Body &body) {
+    return as_expected(body.async_read_all(asio::as_tuple(asio::use_awaitable)));
+}
+
+inline asio::awaitable<std::expected<WsMessage, error_code>> ws_read(WebSocket &ws) {
+    return as_expected(ws.async_read(asio::as_tuple(asio::use_awaitable)));
+}
+
+inline asio::awaitable<error_code> ws_write(WebSocket &ws, std::string data, bool text) {
+    return as_ec(ws.async_write(std::move(data), text, asio::as_tuple(asio::use_awaitable)));
+}
+
 void request_stop(int) { g_stop = 1; }
 
 std::string read_file(const std::string &path) {
@@ -136,7 +164,7 @@ std::string proto_name(Version version) {
 }
 
 asio::awaitable<std::string> echo_body(Request &req) {
-    auto body = co_await req.body().read_all();
+    auto body = co_await body_read_all(req.body());
     if (!body) {
         co_return std::string{};
     }
@@ -163,15 +191,15 @@ asio::awaitable<std::string> echo_body(Request &req) {
 }
 
 asio::awaitable<void> echo_handler(std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) {
-    co_await res->status(status::ok).content_type("application/json").send(co_await echo_body(*req));
+    co_await res->status(status::ok).content_type("application/json").async_send(co_await echo_body(*req), asio::use_awaitable);
 }
 
 asio::awaitable<void> multipart_handler(std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) {
-    auto parts = co_await read_multipart_body(*req);
+    auto parts = co_await as_expected(read_multipart_body(*req, asio::as_tuple(asio::use_awaitable)));
     if (!parts) {
         co_await res->status(status::bad_request)
             .content_type("application/json")
-            .send("{\"error\":\"not multipart\"}");
+            .async_send("{\"error\":\"not multipart\"}", asio::use_awaitable);
         co_return;
     }
     std::vector<MultipartEchoPart> out;
@@ -180,7 +208,7 @@ asio::awaitable<void> multipart_handler(std::shared_ptr<Request> req, std::share
             MultipartEchoPart{part.name, part.filename, part.content_type, part.data.size(), base64_encode(part.data)});
     }
     auto encoded = glz::write_json(out);
-    co_await res->status(status::ok).content_type("application/json").send(encoded ? *encoded : "[]");
+    co_await res->status(status::ok).content_type("application/json").async_send(encoded ? *encoded : "[]", asio::use_awaitable);
 }
 
 // The client certificate's Common Name, or "none" when the connection is not
@@ -221,7 +249,7 @@ template <typename ServerT> void register_routes(ServerT &server, const std::sha
     server.state(std::make_shared<AppState>());
 
     server.route(any_methods, "/plain", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(status::ok).send("hello");
+        co_await res->status(status::ok).async_send("hello", asio::use_awaitable);
     });
     server.route(any_methods, "/echo", echo_handler);
     server.route(any_methods, "/multipart", multipart_handler);
@@ -229,7 +257,7 @@ template <typename ServerT> void register_routes(ServerT &server, const std::sha
     // the rest report "none".
     server.route({Method::Get}, "/client-cert",
                  [](RequestPtr, ResponsePtr res, SslHandle ssl) -> asio::awaitable<void> {
-                     co_await res->status(status::ok).send(peer_common_name(ssl));
+                     co_await res->status(status::ok).async_send(peer_common_name(ssl), asio::use_awaitable);
                  });
 
     // The status template needs a numeric path capture.
@@ -240,7 +268,7 @@ template <typename ServerT> void register_routes(ServerT &server, const std::sha
                      if (value) {
                          std::from_chars(value->data(), value->data() + value->size(), code);
                      }
-                     co_await res->status(code).send("status");
+                     co_await res->status(code).async_send("status", asio::use_awaitable);
                  });
 
     server.route({Method::Get}, "/redirect/{code}",
@@ -249,69 +277,69 @@ template <typename ServerT> void register_routes(ServerT &server, const std::sha
                      if (const auto value = req->param("code")) {
                          std::from_chars(value->data(), value->data() + value->size(), code);
                      }
-                     co_await res->status(code).header("location", "/echo").send("");
+                     co_await res->status(code).header("location", "/echo").async_send("", asio::use_awaitable);
                  });
 
     // Routing precedence: exact beats template beats catch-all.
     server.route({Method::Get}, "/files/static", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(status::ok).send("static");
+        co_await res->status(status::ok).async_send("static", asio::use_awaitable);
     });
     server.route({Method::Get}, "/files/{id}",
                  [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
-                     co_await res->status(status::ok).send("id=" + std::string{req->param("id").value_or("")});
+                     co_await res->status(status::ok).async_send("id=" + std::string{req->param("id").value_or("")}, asio::use_awaitable);
                  });
     server.route({Method::Get}, "/files/{*rest}",
                  [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
-                     co_await res->status(status::ok).send("rest=" + std::string{req->param("rest").value_or("")});
+                     co_await res->status(status::ok).async_send("rest=" + std::string{req->param("rest").value_or("")}, asio::use_awaitable);
                  });
     server.route_regex({Method::Get}, "/api/.*",
                        [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
-                           co_await res->status(status::ok).send("api path: " + std::string{req->path()});
+                           co_await res->status(status::ok).async_send("api path: " + std::string{req->path()}, asio::use_awaitable);
                        });
 
     server.route({Method::Get, Method::Post}, "/method",
                  [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
-                     co_await res->status(status::ok).send(std::string{"method:"} + std::string{req->method_token()});
+                     co_await res->status(status::ok).async_send(std::string{"method:"} + std::string{req->method_token()}, asio::use_awaitable);
                  });
 
     server.route(
         {Method::Get}, "/users/{id}",
         extract<Path<UserParams>>([](const UserParams &params, RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-            co_await res->status(status::ok).send("id=" + std::to_string(params.id));
+            co_await res->status(status::ok).async_send("id=" + std::to_string(params.id), asio::use_awaitable);
         }));
 
     server.route({Method::Get}, "/state", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
         const AppState *state = req->app_state<AppState>();
-        co_await res->status(status::ok).send(state ? state->name : "missing");
+        co_await res->status(status::ok).async_send(state ? state->name : "missing", asio::use_awaitable);
     });
     server.route(
         {Method::Get}, "/list",
         extract<Query<ListQuery>>([](const ListQuery &query, RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-            co_await res->status(status::ok).send(query.q + ":" + std::to_string(query.page));
+            co_await res->status(status::ok).async_send(query.q + ":" + std::to_string(query.page), asio::use_awaitable);
         }));
     server.route({Method::Post}, "/json",
                  extract<Json<CreateUser>>([](CreateUser value, RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-                     co_await res->status(status::created).send(value.name + ":" + std::to_string(value.age));
+                     co_await res->status(status::created).async_send(value.name + ":" + std::to_string(value.age), asio::use_awaitable);
                  }));
     server.route(
         {Method::Post}, "/valid",
         extract<Valid<Json<CreateUser>>>([](CreateUser value, RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-            co_await res->status(status::created).send(value.name);
+            co_await res->status(status::created).async_send(value.name, asio::use_awaitable);
         }));
     server.route({Method::Post}, "/form",
                  extract<Form<CreateUser>>([](CreateUser value, RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-                     co_await res->status(status::created).send(value.name + ":" + std::to_string(value.age));
+                     co_await res->status(status::created).async_send(value.name + ":" + std::to_string(value.age), asio::use_awaitable);
                  }));
     server.route({Method::Get}, "/header",
                  extract<Header<int, "x-page">, Cookie<std::string, "sid">>(
                      [](int page, std::string sid, RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-                         co_await res->status(status::ok).send(std::to_string(page) + ":" + sid);
+                         co_await res->status(status::ok).async_send(std::to_string(page) + ":" + sid, asio::use_awaitable);
                      }));
 
     // Reverse proxy to this same server's /backend. Go's reference server uses
     // httputil.ReverseProxy, so the observable part is the backend body.
     server.route(any_methods, "/backend", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(status::ok).send("backend");
+        co_await res->status(status::ok).async_send("backend", asio::use_awaitable);
     });
     server.http_proxy("/proxy", HttpProxyTarget{.host = "127.0.0.1", .port = 7820, .rewrite_path = "/backend"});
 
@@ -320,16 +348,16 @@ template <typename ServerT> void register_routes(ServerT &server, const std::sha
     server.route({Method::Post}, "/decode",
                  {middleware::decompress_request(RequestDecompressionConfig{.max_decoded_bytes = 1 << 20})},
                  [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
-                     auto body = co_await req->body().read_all();
+                     auto body = co_await body_read_all(req->body());
                      if (!body) {
                          const int code = body.error() == asio::error::message_size ? status::payload_too_large
                                                                                     : status::bad_request;
-                         co_await res->status(code).send("decode error");
+                         co_await res->status(code).async_send("decode error", asio::use_awaitable);
                          co_return;
                      }
                      const std::string ce{req->header(field::content_encoding).value_or("none")};
                      const std::string cl{req->header(field::content_length).value_or("none")};
-                     co_await res->status(status::ok).send(std::format("ce={};cl={};", ce, cl) + *body);
+                     co_await res->status(status::ok).async_send(std::format("ce={};cl={};", ce, cl) + *body, asio::use_awaitable);
                  });
 
     // Slow handler for the raw Rapid Reset probe: enough concurrent streams
@@ -340,101 +368,101 @@ template <typename ServerT> void register_routes(ServerT &server, const std::sha
                      asio::steady_timer timer{co_await asio::this_coro::executor};
                      timer.expires_after(std::chrono::milliseconds(ms));
                      co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
-                     co_await res->status(status::ok).send("delayed");
+                     co_await res->status(status::ok).async_send("delayed", asio::use_awaitable);
                  });
 
     server.route(
         any_methods, "/drain",
         [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
-            auto body = co_await req->body().read_all();
-            co_await res->status(status::ok).send("received " + std::to_string(body ? body->size() : 0) + " bytes");
+            auto body = co_await body_read_all(req->body());
+            co_await res->status(status::ok).async_send("received " + std::to_string(body ? body->size() : 0) + " bytes", asio::use_awaitable);
         });
     server.route(any_methods, "/stream",
                  [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
-                     co_await res->status(status::ok).content_type("text/plain").begin();
+                     co_await res->status(status::ok).content_type("text/plain").async_begin(asio::use_awaitable);
                      for (int i = 0; i < 3; ++i) {
-                         co_await res->write("part" + std::to_string(i) + " ");
+                         co_await res->async_write("part" + std::to_string(i) + " ", asio::use_awaitable);
                      }
-                     co_await res->finish("end\n");
+                     co_await res->async_finish("end\n", asio::use_awaitable);
                  });
     server.route(any_methods, "/trailers",
                  [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
-                     co_await res->status(status::ok).content_type("text/plain").begin();
-                     co_await res->write("body");
+                     co_await res->status(status::ok).content_type("text/plain").async_begin(asio::use_awaitable);
+                     co_await res->async_write("body", asio::use_awaitable);
                      res->trailer("x-checksum", "abc123");
-                     co_await res->finish();
+                     co_await res->async_finish(asio::use_awaitable);
                  });
     server.route(any_methods, "/sse",
                  [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
-                     co_await res->sse_begin();
+                     co_await res->async_sse_begin(asio::use_awaitable);
                      for (int i = 1; i <= 3; ++i) {
-                         co_await res->sse_event("value-" + std::to_string(i), "tick", std::to_string(i));
+                         co_await res->async_sse_event("value-" + std::to_string(i), "tick", std::to_string(i), "", asio::use_awaitable);
                      }
-                     co_await res->finish();
+                     co_await res->async_finish(asio::use_awaitable);
                  });
 
     server.route(any_methods, "/trailer-echo",
                  [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
-                     (void)co_await req->body().read_all();
+                     (void)co_await body_read_all(req->body());
                      const auto check = req->trailers().get("x-check");
-                     co_await res->status(status::ok).send(check ? std::string{*check} : std::string{"missing"});
+                     co_await res->status(status::ok).async_send(check ? std::string{*check} : std::string{"missing"}, asio::use_awaitable);
                  });
     server.route(any_methods, "/expect-ok",
                  [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
-                     co_await res->send_continue();
-                     auto body = co_await req->body().read_all();
-                     co_await res->status(status::ok).send("got " + std::to_string(body ? body->size() : 0));
+                     co_await res->async_send_continue(asio::use_awaitable);
+                     auto body = co_await body_read_all(req->body());
+                     co_await res->status(status::ok).async_send("got " + std::to_string(body ? body->size() : 0), asio::use_awaitable);
                  });
     server.route(any_methods, "/expect-reject", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(status::expectation_failed).send("no");
+        co_await res->status(status::expectation_failed).async_send("no", asio::use_awaitable);
     });
 
     // Host routing.
     server.route({Method::Get}, "/who", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(status::ok).send("root");
+        co_await res->status(status::ok).async_send("root", asio::use_awaitable);
     });
     server.host("api.example.com", [](Router &api) {
         api.route({Method::Get}, "/who", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-            co_await res->status(status::ok).send("api");
+            co_await res->status(status::ok).async_send("api", asio::use_awaitable);
         });
     });
     server.host("*.example.com", [](Router &sub) {
         sub.route({Method::Get}, "/who", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-            co_await res->status(status::ok).send("sub");
+            co_await res->status(status::ok).async_send("sub", asio::use_awaitable);
         });
     });
     server.host("api.example.com:8080", [](Router &port_router) {
         port_router.route({Method::Get}, "/who", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-            co_await res->status(status::ok).send("port");
+            co_await res->status(status::ok).async_send("port", asio::use_awaitable);
         });
     });
 
     // Middleware surfaces.
     server.route(any_methods, "/gzip", {middleware::compress(CompressionConfig{.min_bytes = 1})},
                  [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-                     co_await res->status(status::ok).content_type("text/plain").send(std::string(2048, 'c'));
+                     co_await res->status(status::ok).content_type("text/plain").async_send(std::string(2048, 'c'), asio::use_awaitable);
                  });
     server.route(
         any_methods, "/cors",
         {make_cors_middleware(CorsConfig{.allow_origins = {"https://*.example.com"}, .allow_credentials = true})},
-        [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(status::ok).send("cors"); });
+        [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(status::ok).async_send("cors", asio::use_awaitable); });
     server.route(
         any_methods, "/secure",
         {middleware::secure_headers(middleware::SecureHeadersConfig{.content_security_policy = "default-src 'self'",
                                                                     .hsts_max_age = std::chrono::seconds{60}})},
-        [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(status::ok).send("secure"); });
+        [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(status::ok).async_send("secure", asio::use_awaitable); });
     server.route(
         any_methods, "/basic", {middleware::basic_auth("user", "pass")},
-        [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(status::ok).send("ok"); });
+        [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(status::ok).async_send("ok", asio::use_awaitable); });
     server.route(
         any_methods, "/request-id", {middleware::request_id()},
         [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
-            co_await res->status(status::ok).send(std::string{req->header("x-request-id").value_or("missing")});
+            co_await res->status(status::ok).async_send(std::string{req->header("x-request-id").value_or("missing")}, asio::use_awaitable);
         });
     auto limiter = std::make_shared<middleware::RateLimiter>(/*rate=*/0.001, /*burst=*/1, /*max_keys=*/16);
     server.route(
         any_methods, "/rate", {middleware::rate_limit(limiter)},
-        [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(status::ok).send("ok"); });
+        [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(status::ok).async_send("ok", asio::use_awaitable); });
 
     // Session / CSRF / JWT.
     auto sessions = std::make_shared<MemorySessionStore>();
@@ -445,31 +473,31 @@ template <typename ServerT> void register_routes(ServerT &server, const std::sha
                      if (auto *s = session(*req)) {
                          s->set("uid", "42");
                      }
-                     co_await res->status(status::no_content).send("");
+                     co_await res->status(status::no_content).async_send("", asio::use_awaitable);
                  });
     server.route({Method::Get}, "/session/get", {session_mw},
                  [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
                      auto *s = session(*req);
                      const auto uid = s ? s->get("uid") : std::nullopt;
-                     co_await res->status(status::ok).send(uid ? std::string{*uid} : "none");
+                     co_await res->status(status::ok).async_send(uid ? std::string{*uid} : "none", asio::use_awaitable);
                  });
     auto csrf_mw = middleware::csrf(CsrfConfig{
         .cookie_name = "csrf", .header_name = "x-csrf-token", .secure = false, .exempt_paths = {"/csrf/exempt"}});
     server.route({Method::Get}, "/csrf/token", {csrf_mw}, [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(status::ok).send(std::string{csrf_token(*req)});
+        co_await res->status(status::ok).async_send(std::string{csrf_token(*req)}, asio::use_awaitable);
     });
     server.route({Method::Post}, "/csrf/submit", {csrf_mw}, [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(status::no_content).send("");
+        co_await res->status(status::no_content).async_send("", asio::use_awaitable);
     });
     server.route({Method::Post}, "/csrf/exempt", {csrf_mw}, [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(status::no_content).send("");
+        co_await res->status(status::no_content).async_send("", asio::use_awaitable);
     });
     server.route(
         {Method::Get}, "/jwt/me",
         {middleware::jwt(JwtConfig{.algorithms = {"HS256"}, .secret = "secret", .issuer = "iss", .audience = "aud"})},
         [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
             const Principal *principal_value = principal(*req);
-            co_await res->status(status::ok).send(principal_value ? principal_value->subject : std::string{"missing"});
+            co_await res->status(status::ok).async_send(principal_value ? principal_value->subject : std::string{"missing"}, asio::use_awaitable);
         });
 
     // WebSocket.
@@ -478,22 +506,22 @@ template <typename ServerT> void register_routes(ServerT &server, const std::sha
     server.ws_route("/ws/guarded", {middleware::ws_origin({"https://app.example.com"})},
                     [](std::shared_ptr<Request>, std::shared_ptr<WebSocket> ws) -> asio::awaitable<void> {
                         for (;;) {
-                            auto msg = co_await ws->read();
+                            auto msg = co_await ws_read(*ws);
                             if (!msg) {
                                 break;
                             }
-                            if (co_await ws->write(msg->data, msg->text)) {
+                            if (co_await ws_write(*ws, msg->data, msg->text)) {
                                 break;
                             }
                         }
                     });
     server.ws_route("/ws/echo", [](std::shared_ptr<Request>, std::shared_ptr<WebSocket> ws) -> asio::awaitable<void> {
         for (;;) {
-            auto msg = co_await ws->read();
+            auto msg = co_await ws_read(*ws);
             if (!msg) {
                 break;
             }
-            if (auto ec = co_await ws->write(msg->data, msg->text)) {
+            if (auto ec = co_await ws_write(*ws, msg->data, msg->text)) {
                 break;
             }
         }
@@ -503,7 +531,7 @@ template <typename ServerT> void register_routes(ServerT &server, const std::sha
         server.static_files(site);
     }
     server.fallback([](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(status::not_found).send("not found");
+        co_await res->status(status::not_found).async_send("not found", asio::use_awaitable);
     });
 }
 
@@ -588,7 +616,7 @@ int main(int argc, char **argv) {
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
     ServerConfig h3_cfg;
     h3_cfg.listen = InetAddress{"0.0.0.0", 7823, false};
-    h3_cfg.quic = QuicAddress{"0.0.0.0", 7823, false};
+    h3_cfg.quic = InetAddress{"0.0.0.0", 7823, false};
     h3_cfg.worker_threads = 2;
     h3_cfg.reuse_port = true;
     h3_cfg.limits.max_body_bytes = 1024 * 1024;

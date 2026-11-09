@@ -1,43 +1,40 @@
 #pragma once
 
-// HTTP/1.x engine — beast-free.
+// HTTP/1.x engine (C++17 token-only port).
 //
-// Http1Engine::run drives one connection: read bytes off the Transport into an
-// H1Parser (engine/h1/h1_parser.h) until a full head is parsed, frame the
-// request body (chunked / Content-Length / none) and feed it into
-// Request::body(), then hand the request to the dispatcher (Router) with the
-// transport's TLS handle. The loop repeats while the connection is keep-alive.
-// Responses go through Http1ResponseSink, which hand-serializes either a
-// Content-Length reply (one-shot) or a chunked stream directly onto the
-// transport.
+// Http1Engine drives one connection: it reads bytes into an H1Parser until a
+// full head is parsed, frames the request body (chunked / Content-Length /
+// none), hands the request to the dispatcher, and repeats while the connection
+// is keep-alive. Responses go through Http1ResponseSink, which hand-serializes
+// either a Content-Length reply or a chunked stream onto the transport.
 //
-// Upgrades: an Upgrade: websocket request (matched by a registered ws route) is
-// handed to the WebSocket layer; an Upgrade: h2c request carrying an
-// HTTP2-Settings header is answered with 101 and handed to
-// Http2Engine::run_h2c, which replays the original request as HTTP/2 stream 1
-// and continues as h2.
+// This first port supports HTTP/1.x and local WebSocket upgrades. The h2c
+// upgrade and the byte-level WebSocket reverse proxy are deferred with the
+// HTTP/2 phase and the proxy phase respectively.
 //
-// Thread safety (model A): every write first hops onto the connection executor
-// before touching the transport, so a Response captured by the handler is safe
-// to use from any thread.
+// Thread safety (model A): every sink write hops onto the connection executor
+// before touching the transport, so a Response captured by a handler is safe
+// from any thread.
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <boost/asio.hpp>
-#include <boost/asio/experimental/awaitable_operators.hpp>
+#include <boost/asio/any_completion_handler.hpp>
 #include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
-#include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
+#include "../../core/http_field.h"
 #include "../../core/http_method.h"
 #include "../../core/http_status.h"
 #include "../../core/limits.h"
@@ -52,6 +49,7 @@
 #include "../../transport/transport.h"
 #include "../dispatcher.h"
 #include "../h2/h2_engine.h"
+#include "../ws_proxy_common.h"
 #include "h1_parser.h"
 #include "ws_proxy.h"
 
@@ -60,22 +58,13 @@ namespace simple_http {
 namespace asio = boost::asio;
 
 // A connection-level idle deadline shared between the engine and the response
-// writer(s) it creates, so that both reads and writes can refresh it and the
-// watchdog reaps a connection only when it is genuinely idle in both
-// directions.
+// writer(s) it creates.
 using SharedDeadline = std::shared_ptr<std::chrono::steady_clock::time_point>;
 
 // ResponseSink for HTTP/1.x. Hand-serializes directly onto the transport.
-template <TransportLike Transport> class Http1ResponseSink : public ResponseSink {
+template <typename Transport>
+class Http1ResponseSink final : public ResponseSink, public std::enable_shared_from_this<Http1ResponseSink<Transport>> {
   public:
-    // `deadline` and `idle_timeout` let a write refresh the connection's idle
-    // deadline (shared with the engine's read path and watchdog). `alt_svc` is
-    // the already-rendered value of the Alt-Svc field, or empty for none: the
-    // writer has no business knowing about ports or cache lifetimes, only about
-    // where the octets go.
-    // `continue_sent` is shared with the engine so an interim 100 is written at
-    // most once, whether the engine emits it lazily on the first body read or a
-    // handler asks for it explicitly via Response::send_continue().
     Http1ResponseSink(std::shared_ptr<Transport> transport, Version version, SharedDeadline deadline,
                       std::chrono::steady_clock::duration idle_timeout, std::string alt_svc = {},
                       std::shared_ptr<std::atomic<bool>> continue_sent = {})
@@ -83,185 +72,372 @@ template <TransportLike Transport> class Http1ResponseSink : public ResponseSink
           m_deadline(std::move(deadline)), m_idle_timeout(idle_timeout), m_alt_svc(std::move(alt_svc)),
           m_continue_sent(std::move(continue_sent)) {}
 
-    // Set by the engine when the request method was HEAD: the response keeps its
-    // headers (so the client learns the entity length) but carries no body
-    // (RFC 9110 §9.3.2).
     void set_head_request(bool head) { m_head_request = head; }
+    void set_keep_alive(bool ka) { m_keep_alive_out = ka; }
+    bool keep_alive_out() const { return m_keep_alive_out; }
 
-    asio::awaitable<error_code> send(int status, Headers headers, std::string body) override {
-        co_await hop();
-        if (!m_open)
-            co_return make_error_code(asio::error::not_connected);
+    void send(int status, Headers headers, std::string body, WriteCompletion done) override {
+        on_executor([self = this->shared_from_this(), status, headers = std::move(headers), body = std::move(body),
+                     done = std::move(done)]() mutable {
+            self->do_send(status, std::move(headers), std::move(body), std::move(done));
+        });
+    }
 
+    void send_bodyless(int status, Headers headers, WriteCompletion done) override {
+        on_executor(
+            [self = this->shared_from_this(), status, headers = std::move(headers), done = std::move(done)]() mutable {
+                self->do_send_bodyless(status, std::move(headers), std::move(done));
+            });
+    }
+
+    void send_continue(WriteCompletion done) override {
+        on_executor([self = this->shared_from_this(), done = std::move(done)]() mutable {
+            if (!self->m_open) {
+                std::move(done)(make_error_code(asio::error::not_connected));
+                return;
+            }
+            if (self->m_continue_sent && self->m_continue_sent->exchange(true, std::memory_order_relaxed)) {
+                std::move(done)(error_code{});
+                return;
+            }
+            self->write_raw("HTTP/1.1 100 Continue\r\n\r\n", std::move(done));
+        });
+    }
+
+    void send_headers(int status, Headers headers, WriteCompletion done) override {
+        on_executor(
+            [self = this->shared_from_this(), status, headers = std::move(headers), done = std::move(done)]() mutable {
+                self->do_send_headers(status, std::move(headers), std::move(done));
+            });
+    }
+
+    void send_chunk(std::string data, WriteCompletion done) override {
+        on_executor([self = this->shared_from_this(), data = std::move(data), done = std::move(done)]() mutable {
+            self->do_send_chunk(std::move(data), std::move(done));
+        });
+    }
+
+    void send_last(std::string data, WriteCompletion done) override {
+        on_executor([self = this->shared_from_this(), data = std::move(data), done = std::move(done)]() mutable {
+            self->do_send_last(std::move(data), std::move(done));
+        });
+    }
+
+    void send_trailers(Headers trailers, WriteCompletion done) override {
+        on_executor(
+            [self = this->shared_from_this(), trailers = std::move(trailers), done = std::move(done)]() mutable {
+                self->do_send_trailers(std::move(trailers), std::move(done));
+            });
+    }
+
+    void connected(ConnectedCompletion done) const override {
+        on_executor([self = this->shared_from_this(), done = std::move(done)]() mutable {
+            std::move(done)(error_code{}, self->m_open);
+        });
+    }
+
+    void close(WriteCompletion done) override {
+        on_executor([self = this->shared_from_this(), done = std::move(done)]() mutable {
+            self->m_open = false;
+            self->m_transport->close();
+            std::move(done)(error_code{});
+        });
+    }
+
+    Version version() const override { return m_version; }
+    asio::any_io_executor get_executor() const override { return m_executor; }
+    bool head_request() const noexcept override { return m_head_request; }
+
+  private:
+    template <typename Fn> void on_executor(Fn &&fn) const {
+        asio::dispatch(asio::bind_executor(asio::any_io_executor{m_executor}, std::forward<Fn>(fn)));
+    }
+
+    static constexpr std::size_t kResponseOverhead = 96;
+    static constexpr std::string_view kCrLf = "\r\n";
+    static constexpr std::string_view kLastChunk = "0\r\n\r\n";
+    static constexpr std::string_view kAltSvcPrefix = "alt-svc: ";
+    static constexpr std::string_view kKeepAliveConnection = "connection: keep-alive\r\n";
+    static constexpr std::string_view kCloseConnection = "connection: close\r\n";
+
+    static ConstByteSpan as_bytes(std::string_view bytes) {
+        return ConstByteSpan{reinterpret_cast<const std::byte *>(bytes.data()), bytes.size()};
+    }
+
+    static std::size_t headers_bytes(const Headers &headers) {
+        std::size_t total = 0;
+        for (const auto &[name, value] : headers) {
+            total += name.size() + value.size() + 4;
+        }
+        return total;
+    }
+
+    [[nodiscard]] std::size_t headers_bytes_with_alt_svc(const Headers &headers) const {
+        std::size_t total = headers_bytes(headers);
+        if (!m_alt_svc.empty())
+            total += kAltSvcPrefix.size() + m_alt_svc.size() + 2;
+        return total;
+    }
+
+    void append_status_line(std::string &out, int status) const {
+        out.append(m_version == Version::Http1 ? "HTTP/1.0 " : "HTTP/1.1 ");
+        append_int(out, status);
+        out.push_back(' ');
+        out.append(reason_phrase(status));
+        out.append("\r\n");
+    }
+
+    static void append_int(std::string &out, int value) {
+        char buf[std::numeric_limits<int>::digits10 + 2];
+        auto [end, ec] = std::to_chars(buf, buf + sizeof(buf), value);
+        (void)ec;
+        out.append(buf, static_cast<std::size_t>(end - buf));
+    }
+
+    void append_headers(std::string &out, const Headers &headers) const {
+        bool saw_connection = false;
+        for (const auto &[name, value] : headers) {
+            if (name == "connection")
+                saw_connection = true;
+            out.append(name);
+            out.append(": ");
+            out.append(value);
+            out.append("\r\n");
+        }
+        if (!m_alt_svc.empty()) {
+            out.append(kAltSvcPrefix);
+            out.append(m_alt_svc);
+            out.append("\r\n");
+        }
+        if (!saw_connection) {
+            out.append(m_keep_alive_out ? kKeepAliveConnection : kCloseConnection);
+        }
+    }
+
+    void build_head(std::string &out, int status, const Headers &headers) const {
+        out.reserve(kResponseOverhead + headers_bytes_with_alt_svc(headers));
+        append_status_line(out, status);
+        append_headers(out, headers);
+        out.append("\r\n");
+    }
+
+    static void strip_hop_by_hop(Headers &headers) {
+        for (const std::string_view name :
+             {"connection", "keep-alive", "transfer-encoding", "proxy-connection", "upgrade"}) {
+            headers.erase(name);
+        }
+    }
+
+    void touch_deadline() {
+        if (m_deadline)
+            *m_deadline = std::chrono::steady_clock::now() + m_idle_timeout;
+    }
+
+    // Writes a buffer sequence with the "error only" completion the sink uses.
+    // The buffers live in a shared string held by the operation.
+    void write_buffers(std::shared_ptr<std::string> bytes, WriteCompletion done) {
+        auto self = this->shared_from_this();
+        auto transport = m_transport;
+        touch_deadline();
+        detail::async_error_only(
+            m_executor, std::move(done),
+            [self, transport, bytes](asio::any_completion_handler<void(error_code, std::size_t)> handler) {
+                const std::array<ConstByteSpan, 1> buffers{as_bytes(*bytes)};
+                transport->async_write_seq(boost::span<const ConstByteSpan>{buffers.data(), buffers.size()},
+                                           std::move(handler));
+            });
+    }
+
+    void write_raw(std::string_view out, WriteCompletion done) {
+        write_buffers(std::make_shared<std::string>(out), std::move(done));
+    }
+
+    void write_pair(std::string head, std::string body, WriteCompletion done) {
+        auto self = this->shared_from_this();
+        auto transport = m_transport;
+        touch_deadline();
+        auto head_keep = std::make_shared<std::string>(std::move(head));
+        auto body_keep = std::make_shared<std::string>(std::move(body));
+        detail::async_error_only(
+            m_executor, std::move(done),
+            [self, transport, head_keep,
+             body_keep](asio::any_completion_handler<void(error_code, std::size_t)> handler) {
+                const std::array<ConstByteSpan, 2> buffers{as_bytes(*head_keep), as_bytes(*body_keep)};
+                transport->async_write_seq(boost::span<const ConstByteSpan>{buffers.data(), buffers.size()},
+                                           std::move(handler));
+            });
+    }
+
+    void complete_write(error_code ec, WriteCompletion done) {
+        if (ec)
+            m_open = false;
+        std::move(done)(ec);
+    }
+
+    void do_send(int status, Headers headers, std::string body, WriteCompletion done) {
+        if (!m_open) {
+            std::move(done)(make_error_code(asio::error::not_connected));
+            return;
+        }
         if (status == status::no_content || status == status::not_modified) {
-            // Neither a body nor a Content-Length (RFC 9110 §15.3.5/§15.4.5).
-            // A 304 may legally repeat the selected representation's length, so
-            // only the 204 (and any 1xx) drops a handler-set field here.
             if (status == status::no_content) {
                 headers.erase("content-length");
             }
-            co_return co_await send_bodyless(status, std::move(headers));
+            do_send_bodyless(status, std::move(headers), std::move(done));
+            return;
         }
-        // A handler must not choose the connection framing: a Transfer-Encoding
-        // set alongside the Content-Length added below is two framings on one
-        // message (RFC 9112 §6.1), the classic response-splitting shape. The
-        // engine owns framing; connection management likewise stays here.
         strip_hop_by_hop(headers);
         ensure_date(headers);
-
-        // Erase first: add_lower appends, so a handler that set its own
-        // content-length would otherwise put two conflicting ones on the wire —
-        // a response-splitting vector for any intermediary, and this library is
-        // one. compressing_writer.h already does exactly this.
         headers.erase("content-length");
         headers.add_lower("content-length", std::to_string(body.size()));
-        // The head gets its own buffer, and the body is streamed from wherever the
-        // caller handed it to us. Concatenating the two first would copy the whole
-        // body — plus a second allocation and its page faults — which is what made
-        // a large response expensive.
         std::string head;
         build_head(head, status, headers);
-        if (m_head_request) { // headers only
-            auto ec = co_await write_raw(head);
-            if (ec)
-                m_open = false;
-            co_return ec;
+        if (m_head_request) {
+            write_raw(head, [self = this->shared_from_this(), done = std::move(done)](error_code ec) mutable {
+                self->complete_write(ec, std::move(done));
+            });
+            return;
         }
-
-        const std::array<ConstByteSpan, 2> buffers{as_bytes(head), as_bytes(body)};
-        auto ec = co_await write_raw_seq(buffers);
-        if (ec)
-            m_open = false;
-        co_return ec;
+        write_pair(std::move(head), std::move(body),
+                   [self = this->shared_from_this(), done = std::move(done)](error_code ec) mutable {
+                       self->complete_write(ec, std::move(done));
+                   });
     }
 
-    asio::awaitable<error_code> send_bodyless(int status, Headers headers) override {
-        co_await hop();
-        if (!m_open)
-            co_return make_error_code(asio::error::not_connected);
+    void do_send_bodyless(int status, Headers headers, WriteCompletion done) {
+        if (!m_open) {
+            std::move(done)(make_error_code(asio::error::not_connected));
+            return;
+        }
         strip_hop_by_hop(headers);
-        // 204 (and 1xx) must not carry Content-Length (RFC 9110 §15.3.5). A
-        // HEAD response and a 304 are the two bodyless shapes allowed to keep
-        // it — HEAD describes the GET's entity, and a 304 may repeat the
-        // selected representation's length.
         if (status == status::no_content || (status >= 100 && status < 200)) {
             headers.erase("content-length");
         }
         ensure_date(headers);
         std::string out;
         build_head(out, status, headers);
-        auto ec = co_await write_raw(out);
-        if (ec)
-            m_open = false;
-        co_return ec;
+        write_raw(out, [self = this->shared_from_this(), done = std::move(done)](error_code ec) mutable {
+            self->complete_write(ec, std::move(done));
+        });
     }
 
-    asio::awaitable<error_code> send_continue() override {
-        co_await hop();
-        if (!m_open)
-            co_return make_error_code(asio::error::not_connected);
-        // The engine may already have sent the interim response when the
-        // handler read the body; a second one is legal but pointless.
-        if (m_continue_sent && m_continue_sent->exchange(true, std::memory_order_relaxed))
-            co_return error_code{};
-        auto ec = co_await write_raw("HTTP/1.1 100 Continue\r\n\r\n");
-        if (ec)
-            m_open = false;
-        co_return ec;
-    }
-
-    asio::awaitable<error_code> send_headers(int status, Headers headers) override {
-        co_await hop();
-        if (!m_open)
-            co_return make_error_code(asio::error::not_connected);
+    void do_send_headers(int status, Headers headers, WriteCompletion done) {
+        if (!m_open) {
+            std::move(done)(make_error_code(asio::error::not_connected));
+            return;
+        }
         strip_hop_by_hop(headers);
         ensure_date(headers);
-
-        // A streamed response is chunked (HTTP/1.1) or close-delimited
-        // (HTTP/1.0 / HEAD): a handler-supplied Content-Length must not survive
-        // alongside it, or the response carries two conflicting framings — a
-        // response-splitting vector for any intermediary (RFC 9112 §6.1). send()
-        // already erases it; the streaming path used to miss it.
         headers.erase("content-length");
-        // HTTP/1.0 has no chunked framing: such a response is delimited by the
-        // connection close, so refuse keep-alive here (append_headers then writes
-        // `connection: close` and the engine closes, since keep_alive_out() is
-        // false). A response to HEAD is delimited by its headers alone.
         if (m_version == Version::Http1 || m_head_request) {
             m_keep_alive_out = false;
         } else {
             headers.add_lower("transfer-encoding", "chunked");
-            // Remembered so send_trailers() knows there is a chunked framing to
-            // hang a trailer section on; a close-delimited response has none.
             m_chunked = true;
         }
         std::string out;
         build_head(out, status, headers);
-
-        auto ec = co_await write_raw(out);
-        if (ec)
-            m_open = false;
-        co_return ec;
+        write_raw(out, [self = this->shared_from_this(), done = std::move(done)](error_code ec) mutable {
+            self->complete_write(ec, std::move(done));
+        });
     }
 
-    asio::awaitable<error_code> send_chunk(std::string data) override {
-        if (m_head_request)
-            co_return error_code{}; // HEAD: headers only
-        co_await hop();
-        if (!m_open)
-            co_return make_error_code(asio::error::not_connected);
-        // A close-delimited body (HTTP/1.0) has no chunked framing to hang the
-        // bytes on: writing "size\r\n<data>\r\n" there would put the framing
-        // itself in the client's body. The connection close delimits it instead.
-        error_code ec;
-        if (!m_chunked) {
-            if (!data.empty())
-                ec = co_await write_raw(data);
-        } else {
-            ec = co_await write_chunked(data, /*last=*/false);
+    void do_send_chunk(std::string data, WriteCompletion done) {
+        if (m_head_request) {
+            std::move(done)(error_code{});
+            return;
         }
-        if (ec)
-            m_open = false;
-        co_return ec;
-    }
-
-    asio::awaitable<error_code> send_last(std::string data) override {
-        if (m_head_request)
-            co_return error_code{}; // HEAD: headers only
-        co_await hop();
-        if (!m_open)
-            co_return make_error_code(asio::error::not_connected);
-        error_code ec;
-        if (!m_chunked) {
-            // Close-delimited: the final bytes, with no terminator to write -
-            // the engine closes the connection to end the body.
-            if (!data.empty())
-                ec = co_await write_raw(data);
-        } else if (data.empty()) {
-            // An empty final chunk is nothing but the terminator; otherwise the
-            // data chunk and the terminator go out together.
-            ec = co_await write_raw(kLastChunk);
-        } else {
-            ec = co_await write_chunked(data, /*last=*/true);
+        if (!m_open) {
+            std::move(done)(make_error_code(asio::error::not_connected));
+            return;
         }
-        if (ec)
-            m_open = false;
-        co_return ec;
+        auto self = this->shared_from_this();
+        auto finish = [self, done = std::move(done)](error_code ec) mutable {
+            self->complete_write(ec, std::move(done));
+        };
+        if (!m_chunked) {
+            if (data.empty()) {
+                std::move(finish)(error_code{});
+                return;
+            }
+            write_raw(data, std::move(finish));
+            return;
+        }
+        // "<hex size>\r\n<data>\r\n" as one write, without concatenating.
+        auto transport = m_transport;
+        touch_deadline();
+        auto payload = std::make_shared<std::string>(std::move(data));
+        detail::async_error_only(
+            m_executor, std::move(finish),
+            [transport, payload](asio::any_completion_handler<void(error_code, std::size_t)> handler) {
+                char hex[2 * sizeof(std::size_t) + 2];
+                auto [end, ec] = std::to_chars(hex, hex + sizeof(hex) - 2, payload->size(), 16);
+                (void)ec;
+                *end++ = '\r';
+                *end++ = '\n';
+                const std::string_view size{hex, static_cast<std::size_t>(end - hex)};
+                const std::array<ConstByteSpan, 3> buffers{as_bytes(size), as_bytes(*payload), as_bytes(kCrLf)};
+                transport->async_write_seq(boost::span<const ConstByteSpan>{buffers.data(), buffers.size()},
+                                           std::move(handler));
+            });
     }
 
-    // Ends a chunked response with a trailer section: the terminating chunk is
-    // "0\r\n<fields>\r\n" instead of the trailer-less "0\r\n\r\n". A response to
-    // HEAD, or one that is close-delimited (HTTP/1.0, and any response whose
-    // framing never became chunked), has nowhere to carry trailers, so they are
-    // dropped there - the connection close already delimits those bodies.
-    asio::awaitable<error_code> send_trailers(Headers trailers) override {
-        if (m_head_request)
-            co_return error_code{}; // HEAD: headers only, no body and no trailers
-        co_await hop();
-        if (!m_open)
-            co_return make_error_code(asio::error::not_connected);
+    void do_send_last(std::string data, WriteCompletion done) {
+        if (m_head_request) {
+            std::move(done)(error_code{});
+            return;
+        }
+        if (!m_open) {
+            std::move(done)(make_error_code(asio::error::not_connected));
+            return;
+        }
+        auto self = this->shared_from_this();
+        auto finish = [self, done = std::move(done)](error_code ec) mutable {
+            self->complete_write(ec, std::move(done));
+        };
         if (!m_chunked) {
-            co_return error_code{}; // close-delimited: nothing to terminate
+            if (data.empty()) {
+                std::move(finish)(error_code{});
+                return;
+            }
+            write_raw(data, std::move(finish));
+            return;
+        }
+        if (data.empty()) {
+            write_raw(kLastChunk, std::move(finish));
+            return;
+        }
+        auto transport = m_transport;
+        touch_deadline();
+        auto payload = std::make_shared<std::string>(std::move(data));
+        detail::async_error_only(
+            m_executor, std::move(finish),
+            [transport, payload](asio::any_completion_handler<void(error_code, std::size_t)> handler) {
+                char hex[2 * sizeof(std::size_t) + 2];
+                auto [end, ec] = std::to_chars(hex, hex + sizeof(hex) - 2, payload->size(), 16);
+                (void)ec;
+                *end++ = '\r';
+                *end++ = '\n';
+                const std::string_view size{hex, static_cast<std::size_t>(end - hex)};
+                const std::array<ConstByteSpan, 4> buffers{as_bytes(size), as_bytes(*payload), as_bytes(kCrLf),
+                                                           as_bytes(kLastChunk)};
+                transport->async_write_seq(boost::span<const ConstByteSpan>{buffers.data(), buffers.size()},
+                                           std::move(handler));
+            });
+    }
+
+    void do_send_trailers(Headers trailers, WriteCompletion done) {
+        if (m_head_request) {
+            std::move(done)(error_code{});
+            return;
+        }
+        if (!m_open) {
+            std::move(done)(make_error_code(asio::error::not_connected));
+            return;
+        }
+        if (!m_chunked) {
+            std::move(done)(error_code{});
+            return;
         }
         std::string out;
         out.reserve(3 + headers_bytes(trailers) + 2);
@@ -275,531 +451,257 @@ template <TransportLike Transport> class Http1ResponseSink : public ResponseSink
             out.append("\r\n");
         }
         out.append("\r\n");
-        auto ec = co_await write_raw(out);
-        if (ec)
-            m_open = false;
-        co_return ec;
+        write_raw(out, [self = this->shared_from_this(), done = std::move(done)](error_code ec) mutable {
+            self->complete_write(ec, std::move(done));
+        });
     }
-
-    asio::awaitable<bool> connected() const override {
-        co_await hop();
-        co_return m_open;
-    }
-    asio::awaitable<void> close() override {
-        co_await hop();
-        m_open = false;
-        m_transport->close();
-    }
-    Version version() const override { return m_version; }
-    bool head_request() const noexcept override { return m_head_request; }
-
-    // Set by the engine from the parsed request's Connection header so the
-    // response line matches what the engine decided about keep-alive.
-    void set_keep_alive(bool ka) { m_keep_alive_out = ka; }
-    bool keep_alive_out() const { return m_keep_alive_out; }
-
-  private:
-    // Headroom for what every response writes and headers_bytes() does not
-    // count: the status line, the connection line append_headers() may add, and
-    // the blank line closing the head. Sized for the longest of each.
-    static constexpr std::size_t kResponseOverhead = 96;
-
-    // Appends the status line ("HTTP/1.1 200 OK\r\n") straight onto `out`.
-    // Hand-appended rather than std::format: this runs once per response, and
-    // the format-string machinery costs more than the copies it saves.
-    void append_status_line(std::string &out, int status) const {
-        out.append(m_version == Version::Http1 ? "HTTP/1.0 " : "HTTP/1.1 ");
-        append_int(out, status);
-        out.push_back(' ');
-        out.append(reason_phrase(status));
-        out.append("\r\n");
-    }
-
-    // Appends a non-negative integer without allocating.
-    static void append_int(std::string &out, int value) {
-        char buf[std::numeric_limits<int>::digits10 + 2];
-        auto [end, ec] = std::to_chars(buf, buf + sizeof(buf), value);
-        out.append(buf, static_cast<std::size_t>(end - buf));
-    }
-
-    // Framing pieces the scatter-gather writes below share.
-    static constexpr std::string_view kCrLf = "\r\n";
-    static constexpr std::string_view kLastChunk = "0\r\n\r\n"; // trailer-less terminator
-
-    // The same bytes, as the transport's buffer type.
-    static ConstByteSpan as_bytes(std::string_view bytes) {
-        return std::as_bytes(std::span<const char>{bytes.data(), bytes.size()});
-    }
-
-    // Wire size of the fields as append_headers() writes them, so a response
-    // buffer can be sized once instead of growing and recopying.
-    static std::size_t headers_bytes(const Headers &headers) {
-        std::size_t total = 0;
-        for (const auto &[name, value] : headers) {
-            total += name.size() + value.size() + 4; // ": " + CRLF
-        }
-        return total;
-    }
-
-    // The same, plus the Alt-Svc line append_headers() adds on its own, so the
-    // reserve stays an upper bound rather than an estimate that reallocates once.
-    [[nodiscard]] std::size_t headers_bytes_with_alt_svc(const Headers &headers) const {
-        std::size_t total = headers_bytes(headers);
-        if (!m_alt_svc.empty())
-            total += kAltSvcPrefix.size() + m_alt_svc.size() + 2;
-        return total;
-    }
-
-    static constexpr std::string_view kAltSvcPrefix = "alt-svc: ";
-
-    // The connection field holds one of exactly two values, so the whole line
-    // is a compile-time constant rather than three appends per response.
-    static constexpr std::string_view kKeepAliveConnection = "connection: keep-alive\r\n";
-    static constexpr std::string_view kCloseConnection = "connection: close\r\n";
-
-    void append_headers(std::string &out, const Headers &headers) const {
-        bool saw_connection = false;
-        for (const auto &[name, value] : headers) {
-            if (name == "connection")
-                saw_connection = true;
-            out.append(name);
-            out.append(": ");
-            out.append(value);
-            out.append("\r\n");
-        }
-        // Alt-Svc: how a browser learns this origin also speaks HTTP/3
-        // (RFC 7838). Sent on every response rather than once — it is a cache
-        // entry with an expiry, and a client that arrives on a fresh profile has
-        // seen none of the earlier ones.
-        if (!m_alt_svc.empty()) {
-            out.append(kAltSvcPrefix);
-            out.append(m_alt_svc);
-            out.append("\r\n");
-        }
-        if (!saw_connection) {
-            out.append(m_keep_alive_out ? kKeepAliveConnection : kCloseConnection);
-        }
-    }
-
-    // Serializes the status line, the fields and the blank line. The one-shot,
-    // bodyless and streamed paths differ only in the framing fields they set on
-    // `headers` beforehand (and in what follows the head); sharing this keeps
-    // those differences visible and stops the three copies from drifting - the
-    // streamed path once forgot to erase content-length, which only a shared
-    // serializer makes obvious.
-    void build_head(std::string &out, int status, const Headers &headers) const {
-        out.reserve(kResponseOverhead + headers_bytes_with_alt_svc(headers));
-        append_status_line(out, status);
-        append_headers(out, headers);
-        out.append("\r\n");
-    }
-
-    // Writes one chunked frame — "<hex size>\r\n<data>\r\n" — straight from its
-    // pieces as a single operation, so a chunk payload is never copied into a
-    // framing buffer. With `last` the terminator rides along in the same write.
-    asio::awaitable<error_code> write_chunked(std::string_view data, bool last) {
-        char hex[2 * sizeof(std::size_t) + 2];
-        auto [end, ec] = std::to_chars(hex, hex + sizeof(hex) - 2, data.size(), 16);
-        *end++ = '\r';
-        *end++ = '\n';
-        const std::string_view size{hex, static_cast<std::size_t>(end - hex)};
-
-        const std::array<ConstByteSpan, 4> buffers{as_bytes(size), as_bytes(data), as_bytes(kCrLf),
-                                                   as_bytes(last ? kLastChunk : std::string_view{})};
-        co_return co_await write_raw_seq(std::span<const ConstByteSpan>{buffers.data(), last ? 4u : 3u});
-    }
-
-    // Writes several buffers as one operation (a single writev where the platform
-    // has one). Concatenating them first would cost a scratch allocation plus a
-    // copy of everything in it — which is exactly what made large responses
-    // expensive, since the body is usually the bulk of the bytes.
-    asio::awaitable<error_code> write_raw_seq(std::span<const ConstByteSpan> buffers) {
-        // Writing is connection activity: refresh the shared idle deadline so the
-        // watchdog does not reap a connection busy streaming a response.
-        if (m_deadline)
-            *m_deadline = std::chrono::steady_clock::now() + m_idle_timeout;
-        auto [ec, n] = co_await m_transport->async_write_seq(buffers);
-        (void)n;
-        co_return ec;
-    }
-
-    asio::awaitable<error_code> write_raw(std::string_view out) {
-        // Transport::async_write is a composed operation (asio::async_write): it
-        // writes the whole buffer or returns an error, so no partial-write loop
-        // is needed here.
-        const std::array<ConstByteSpan, 1> buffers{as_bytes(out)};
-        co_return co_await write_raw_seq(buffers);
-    }
-
-    // Handler-set connection-level fields are never the handler's to choose:
-    // the engine decides both framing (Content-Length vs chunked) and the
-    // connection disposition. Leaving them in can put two framings on one
-    // message (RFC 9112 §6.1) or override keep-alive.
-    static void strip_hop_by_hop(Headers &headers) {
-        for (const std::string_view name :
-             {"connection", "keep-alive", "transfer-encoding", "proxy-connection", "upgrade"}) {
-            headers.erase(name);
-        }
-    }
-
-    asio::awaitable<void> hop() const { co_await asio::dispatch(asio::bind_executor(m_executor, asio::use_awaitable)); }
 
     std::shared_ptr<Transport> m_transport;
-    decltype(std::declval<Transport &>().get_executor()) m_executor;
+    asio::any_io_executor m_executor;
     Version m_version;
     bool m_open{true};
     bool m_keep_alive_out{true};
-    bool m_head_request{false}; // response to HEAD: no body (RFC 9110 §9.3.2)
-    bool m_chunked{false};      // send_headers chose chunked framing (trailers possible)
-    SharedDeadline m_deadline;  // shared with the engine (read path + watchdog)
+    bool m_head_request{false};
+    bool m_chunked{false};
+    SharedDeadline m_deadline;
     std::chrono::steady_clock::duration m_idle_timeout{};
-    std::string m_alt_svc; // rendered Alt-Svc value; empty for none
-    // Shared with the engine: exactly one interim 100 Continue per request.
+    std::string m_alt_svc;
     std::shared_ptr<std::atomic<bool>> m_continue_sent;
 };
 
-template <TransportLike Transport> class Http1Engine : public std::enable_shared_from_this<Http1Engine<Transport>> {
+template <typename Transport> class Http1Engine : public std::enable_shared_from_this<Http1Engine<Transport>> {
   public:
     explicit Http1Engine(std::shared_ptr<Transport> transport, EngineLimits limits = {})
-        : m_transport(std::move(transport)), m_executor(m_transport->get_executor()), m_limits(limits) {}
+        : m_transport(std::move(transport)), m_executor(m_transport->get_executor()), m_limits(limits),
+          m_watchdog(std::make_shared<asio::steady_timer>(m_executor)) {}
 
-    // Whether an `Upgrade: h2c` request may switch this connection to HTTP/2.
-    // A listener declared PlaintextHttp::Http1Only turns this off so the
-    // upgrade is not silently honoured.
+    // Whether an Upgrade: h2c request may switch this connection to HTTP/2.
+    // TLS listeners must leave this off: on TLS the protocol is chosen by ALPN,
+    // so honouring a cleartext upgrade there would let a client switch to h2
+    // without negotiating it.
     void allow_h2c_upgrade(bool allow) { m_allow_h2c = allow; }
 
-    // Serve requests on this connection until it closes or a request is not
-    // keep-alive. `dispatch` runs the handler for each request. `initial` may
-    // contain bytes already read from the transport during protocol detection
-    // (e.g. by a preceding peek); they are consumed before reading more.
-    asio::awaitable<void> run(const Dispatcher &dispatch, std::string initial = {}, WsLookup ws_lookup = {},
-                              WsProxyLookup ws_proxy_lookup = {}, WsLookup ws_regex_lookup = {}) {
-        using namespace asio::experimental::awaitable_operators;
+    // Serves requests until the connection closes or a request is not
+    // keep-alive. `on_done` runs exactly once, after the transport has been
+    // shut down and closed.
+    void run(Dispatcher dispatch, std::string initial, WsLookup ws_lookup, WsProxyLookup ws_proxy_lookup,
+             WsLookup ws_regex_lookup, std::function<void()> on_done) {
+        m_dispatch = std::move(dispatch);
         m_ws_lookup = std::move(ws_lookup);
         m_ws_proxy_lookup = std::move(ws_proxy_lookup);
         m_ws_regex_lookup = std::move(ws_regex_lookup);
+        m_on_done = std::move(on_done);
+        m_in.assign(initial);
         *m_deadline = std::chrono::steady_clock::now() + m_limits.idle_timeout;
         if (m_limits.idle_timeout.count() > 0) {
-            co_await (serve_loop(dispatch, std::move(initial)) || watchdog());
-        } else {
-            // net/connection.h treats <= 0 as "no deadline" while detecting and
-            // handshaking; the engine must agree. Racing the zero-length
-            // watchdog here would complete it immediately and close every
-            // connection the moment the engine starts.
-            co_await serve_loop(dispatch, std::move(initial));
+            arm_watchdog();
         }
-        if (!handed_off()) {
-            // TLS gets a close_notify before the socket goes; plaintext's
-            // shutdown() is a no-op.
-            co_await m_transport->shutdown();
-            m_transport->close();
-        }
-        co_return;
+        parse_head();
     }
 
   private:
-    // Idle watchdog: closes the transport once no bytes have arrived within the
-    // idle timeout, which unblocks any pending read in serve_loop and ends the
-    // connection. Mirrors the HTTP/2 engine's watchdog (Slowloris defense).
-    asio::awaitable<void> watchdog() {
-        asio::steady_timer timer{m_executor};
-        for (;;) {
-            timer.expires_at(*m_deadline);
-            co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
-            if (handed_off()) {
-                // The connection was handed to the WebSocket layer, which manages
-                // its own lifetime; stop watching without closing the transport.
-                for (;;) {
-                    timer.expires_after(std::chrono::hours(24));
-                    co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
-                }
-            }
-            if (std::chrono::steady_clock::now() >= *m_deadline)
-                break; // idle timeout elapsed
+    using LineCompletion = asio::any_completion_handler<void(error_code, std::string)>;
+    using PullCompletion = Body::ReadCompletion;
+    using PullAttention = std::function<void(bool)>;
+
+    // --- connection lifetime -------------------------------------------------
+
+    void finish() {
+        if (m_finished)
+            return;
+        m_finished = true;
+        m_watchdog->cancel();
+        auto self = this->shared_from_this();
+        if (m_owner != TransportOwner::Engine) {
+            complete_done();
+            return;
         }
-        co_return;
+        m_transport->async_shutdown([self](error_code) {
+            self->m_transport->close();
+            self->complete_done();
+        });
     }
 
-    // A read that refreshes the idle deadline on every attempt; all transport
-    // reads in the engine go through this so the watchdog covers header reads,
-    // body reads and pipelined-request reads alike. Writes refresh the same
-    // shared deadline from Http1ResponseSink::write_raw.
-    asio::awaitable<std::pair<error_code, std::size_t>> read_some(std::span<std::byte> buf) {
-        *m_deadline = std::chrono::steady_clock::now() + m_limits.idle_timeout;
-        co_return co_await m_transport->async_read_some(buf);
+    void complete_done() {
+        if (m_done_called)
+            return;
+        m_done_called = true;
+        auto on_done = std::move(m_on_done);
+        if (on_done) {
+            on_done();
+        }
     }
 
-    asio::awaitable<void> serve_loop(const Dispatcher &dispatch, std::string initial) {
-        m_in.assign(initial);
-        auto exec = m_transport->get_executor();
-        // Reused across requests and parsing straight out of m_in: the parser
-        // owns no bytes here, so neither the head nor the pipelined bytes after
-        // it are copied (the client keeps using feed()/parse_head() on its own
-        // internal buffer).
-        H1Parser parser;
+    void arm_watchdog() {
+        if (m_limits.idle_timeout.count() <= 0)
+            return;
+        auto self = this->shared_from_this();
+        m_watchdog->expires_at(*m_deadline);
+        m_watchdog->async_wait([self](error_code ec) {
+            if (ec == asio::error::operation_aborted)
+                return;
+            if (self->m_owner != TransportOwner::Engine)
+                return;
+            if (std::chrono::steady_clock::now() >= *self->m_deadline) {
+                self->m_transport->close(); // unblocks any pending read; finish() follows
+                return;
+            }
+            self->arm_watchdog();
+        });
+    }
 
-        for (;;) {
-            parser.reset_for_next_head();
-            auto state = parser.parse_head(m_in.view());
-            while (state == H1Parser::State::NeedMore) {
-                if (m_in.size() > m_limits.max_header_bytes) {
-                    co_await send_error_response(
-                        status::request_header_fields_too_large); // Request Header Fields Too Large
-                    co_return;
-                }
-                std::array<std::byte, 8192> tmp; // no init: read_some fills [0,n)
-                auto [ec, n] = co_await read_some(std::span<std::byte>{tmp});
+    void touch_deadline() { *m_deadline = std::chrono::steady_clock::now() + m_limits.idle_timeout; }
+
+    // One transport read into the scan buffer, refreshing the shared deadline.
+    template <typename Handler> void read_scan(Handler &&handler) {
+        touch_deadline();
+        m_transport->async_read_some(ByteSpan{m_scan.data(), m_scan.size()}, std::forward<Handler>(handler));
+    }
+
+    // --- head parsing --------------------------------------------------------
+
+    void parse_head() {
+        m_parser.reset_for_next_head();
+        parse_head_step();
+    }
+
+    void parse_head_step() {
+        auto state = m_parser.parse_head(m_in.view());
+        if (state == H1Parser::State::NeedMore) {
+            if (m_in.size() > m_limits.max_header_bytes) {
+                send_error_response(status::request_header_fields_too_large);
+                return;
+            }
+            auto self = this->shared_from_this();
+            read_scan([self](error_code ec, std::size_t n) {
                 if (ec) {
-                    co_return; // EOF or error before a full head — nothing more to do
+                    self->finish();
+                    return;
                 }
-                m_in.append(tmp.data(), n);
-                state = parser.parse_head(m_in.view());
-            }
-            if (state == H1Parser::State::Error) {
-                co_await send_error_response(status::bad_request);
-                co_return;
-            }
-            // The loop above checks the limit only while the head is
-            // incomplete. A head larger than max_header_bytes that arrives
-            // complete in the final read would otherwise be parsed and served:
-            // the size test must also run once the parser says Done.
-            if (parser.consumed() > m_limits.max_header_bytes) {
-                co_await send_error_response(status::request_header_fields_too_large);
-                co_return;
-            }
+                self->m_in.append(self->m_scan.data(), n);
+                self->parse_head_step();
+            });
+            return;
+        }
+        if (state == H1Parser::State::Error) {
+            send_error_response(status::bad_request);
+            return;
+        }
+        if (m_parser.consumed() > m_limits.max_header_bytes) {
+            send_error_response(status::request_header_fields_too_large);
+            return;
+        }
+        m_in.consume(m_parser.consumed());
 
-            // The parsed head is a set of owned strings, so everything left in
-            // m_in is the body (or the peer's first frames after an upgrade).
-            // Consume the head once here; the branches below read m_in directly
-            // instead of copying the remainder out of the parser.
-            m_in.consume(parser.consumed());
-
-            auto &head = parser.head();
-            Version version = head.version;
-            // RFC 9112 §3.2.2: for an absolute-form request-target the
-            // authority from the request line overrides the Host field (an
-            // origin server uses the target's host and ignores Host). The
-            // parser keeps the authority separately because the target was
-            // reduced to origin-form; fold it back in here so routing, vhost
-            // selection, logging and the reverse proxy all see one host. Go's
-            // net/http does the same (r.Host comes from the URL).
-            if (head.absolute_form && !head.authority.empty()) {
-                head.headers.erase("host");
-                head.headers.add_lower("host", head.authority);
-            }
-            // RFC 9112 §3.2: a request carries exactly one Host. Zero leaves no
-            // authority to route on; more than one is ambiguous, and two hops
-            // reading different copies is the classic smuggling shape. HTTP/1.0
-            // made Host optional, so only the "more than one" half applies there.
-            //
-            // Checked here rather than in H1Parser: "name: value" lines are the
-            // parser's business, but which fields must be *present* is HTTP
-            // semantics — and the parser's own unit tests are syntax tests that
-            // build minimal requests.
-            {
-                const std::size_t hosts = head.headers.count("host");
-                if (hosts > 1 || (hosts == 0 && version == Version::Http11)) {
-                    co_await send_error_response(status::bad_request, {}, version);
-                    co_return;
-                }
-            }
-            const auto framing = parse_body_framing(head);
-            if (framing.error_status != 0) {
-                co_await send_error_response(framing.error_status, {}, version);
-                co_return;
-            }
-            const bool request_keep_alive = connection_keep_alive(head, version);
-
-            // WebSocket upgrade: an Upgrade: websocket request with a
-            // Sec-WebSocket-Key. A path registered as a proxy route is spliced
-            // byte-for-byte to its backend (transparent reverse proxy); otherwise
-            // a matched local ws route hands the connection to the WebSocket
-            // layer, through the middleware chain. On success serve_loop returns
-            // (the transport is no longer owned by this engine).
-            if (is_websocket_upgrade(head)) {
-                // RFC 6455 §4.1: the handshake is a GET with no body. Any body
-                // bytes would otherwise be read as the peer's first frames.
-                if (framing.has_body) {
-                    co_await send_error_response(status::bad_request, {}, version);
-                    co_return;
-                }
-                std::string_view ws_path = request_path(head.target);
-
-                // RFC 6455 §4.2.1: the handshake demands Sec-WebSocket-Version:
-                // 13. A wrong version is answered 426 naming the supported one; a
-                // missing version is a malformed handshake (the RFC's reject and
-                // accept paths both key off the version). Checked before routing
-                // or middleware: a handshake that cannot proceed must not run
-                // user code for it.
-                if (!co_await check_ws_version(head)) {
-                    co_return;
-                }
-
-                // The Request the middleware chain sees, and the ResponseWriter
-                // it can short-circuit with — or load headers into, which the
-                // terminal then folds into the 101 handshake (request_id's
-                // X-Request-Id lands on the wire instead of vanishing).
-                auto request = std::make_shared<Request>(version, exec, m_transport->peer());
-                request->set_method_token(head.method_token);
-                request->set_target(head.target);
-                request->mutable_headers() = head.headers;
-                auto writer = std::make_shared<Http1ResponseSink<Transport>>(
-                    m_transport, head.version, m_deadline, m_limits.idle_timeout, m_limits.alt_svc_value());
-                auto response = std::make_shared<ResponseWriter>(writer);
-                auto upgrade_fn = [this](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res,
-                                         WsHandler handler) -> asio::awaitable<bool> {
-                    co_return co_await try_websocket_upgrade(std::move(req), std::move(res), std::move(handler));
-                };
-
-                // Nginx-style precedence: a local exact ws route wins over a
-                // byte-level proxy route for the same path; the proxy still
-                // beats a local regex ws route. An exact route's middleware
-                // chain runs through the terminal; if it short-circuits (or the
-                // upgrade fails) the connection closes — a failed handshake
-                // leaves it unusable.
-                if (m_ws_lookup) {
-                    if (auto run = m_ws_lookup(ws_path)) {
-                        // The bool is deliberately ignored: the transport owner already
-                        // records whether the 101 went out, and this engine is done either way
-                        // (upgraded, or answered by a short-circuiting middleware).
-                        (void)co_await (*run)(request, response, m_transport->tls_handle(), upgrade_fn);
-                        co_return; // upgraded, or answered by middleware — either way the engine is done
-                    }
-                }
-
-                // Byte-level proxy pass-through, between the exact and the regex
-                // local ws routes.
-                if (m_ws_proxy_lookup) {
-                    if (auto target = m_ws_proxy_lookup(ws_path)) {
-                        m_owner = TransportOwner::WebSocket; // stop the watchdog from closing the transport
-                        std::string peer_address = address_string_if_specified(m_transport->peer().address());
-                        co_await run_ws_proxy(m_transport, head, std::string{m_in.view()}, std::move(*target),
-                                              m_limits.idle_timeout, m_limits.max_header_bytes, std::move(peer_address),
-                                              m_transport->tls_handle().has_value());
-                        co_return; // tunnel finished; run() must not touch the transport
-                    }
-                }
-
-                // Local regex WebSocket handlers, consulted last.
-                if (m_ws_regex_lookup) {
-                    if (auto run = m_ws_regex_lookup(ws_path)) {
-                        // Same as the exact-route branch above: the bool is ignored;
-                        // the transport owner records whether the 101 went out.
-                        (void)co_await (*run)(request, response, m_transport->tls_handle(), upgrade_fn);
-                        co_return;
-                    }
-                }
-
-                // Upgrade requested but no proxy/route matched: reply 404 and
-                // close.
-                co_await send_error_response(status::not_found, {}, version);
-                co_return;
-            }
-
-            // h2c cleartext upgrade: Upgrade: h2c + HTTP2-Settings. Answer 101 and
-            // continue the connection as HTTP/2, replaying this request as
-            // stream 1 (RFC 7540 §3.2). The transport is then owned by the h2
-            // engine, so serve_loop returns.
-            if (m_allow_h2c && is_h2c_upgrade(head)) {
-                co_await do_h2c_upgrade(dispatch, head, framing);
-                co_return;
-            }
-
-            auto request = std::make_shared<Request>(version, exec, m_transport->peer());
-            request->set_method_token(std::move(head.method_token));
-            request->set_target(std::move(head.target));
-
-            // Bytes already read past the head (still in m_in) are the start of
-            // the body.
-            //
-            // Install pull-mode body framing: the handler reads the body on demand
-            // (req.body().read()), which pulls/frames bytes off the socket only
-            // when asked. A handler that ignores the body triggers no body reads.
-            //
-            // The provider must NOT capture `this`: the engine dies with the
-            // connection, while the Request may live on — a handler that stashes
-            // the Request for a deferred coroutine (delayed processing, a worker
-            // pool) and returns would have its later body read call into a freed
-            // engine (heap-use-after-free, reproduced under ASan). The weak_ptr
-            // is the same pattern Http2ResponseSink uses for the h2 engine: the
-            // read succeeds while the engine (and hence the connection) is alive,
-            // and reports a clean end-of-life error once it is gone.
-            // Read before the header map is moved into the Request below.
-            const bool expect_continue = framing.has_body && header_has_token(head.headers, "expect", "100-continue");
-            setup_body_framing(framing.chunked, framing.content_length);
-            m_body_state.expect_continue = expect_continue;
-            m_continue_sent->store(false, std::memory_order_relaxed);
-            // Move the parsed header fields into the request: setup_body_framing
-            // above was the last thing that read `head.headers`, so from here the
-            // per-request copy of every field (name + value string each) is gone.
-            request->mutable_headers() = std::move(head.headers);
-            m_body_request = request;
-            std::weak_ptr<Http1Engine> weak = this->weak_from_this();
-            request->body().set_pull_provider(
-                [weak = std::move(weak)]() mutable -> asio::awaitable<std::expected<ReadResult, error_code>> {
-                    auto eng = weak.lock();
-                    if (!eng)
-                        co_return std::unexpected{make_error_code(asio::error::not_connected)};
-                    co_return co_await eng->pull_body_chunk();
-                });
-
-            // A request that asked for 100-continue is waiting for an interim
-            // response before it sends its body. The engine writes that 100
-            // lazily on the handler's first body read (RFC 9110 §10.1.1); if
-            // the handler answers without reading the body, no 100 is sent and
-            // draining would block until the client gives up — and bytes of the
-            // *next* pipelined request would be consumed as this body. Announce
-            // Connection: close up front and skip the drain below; the exchange
-            // ends at the response.
-            auto writer = std::make_shared<Http1ResponseSink<Transport>>(
-                m_transport, version, m_deadline, m_limits.idle_timeout, m_limits.alt_svc_value(), m_continue_sent);
-            writer->set_keep_alive(request_keep_alive && !expect_continue);
-            const bool head_request = head.method == Method::Head;
-            writer->set_head_request(head_request);
-            // Compression wraps the writer, not the Response, so that every
-            // handler - the reverse proxy included - passes through it without
-            // knowing. maybe_compress_writer returns `writer` unchanged when the
-            // client accepts none of what we produce; otherwise the per-request
-            // policy (a mounted middleware::compress) decides per response.
-            auto response = std::make_shared<ResponseWriter>(
-                maybe_compress_writer(writer, m_transport->get_executor(), request, head_request));
-
-            // Run the handler to completion (h1 is half-duplex: the reader and the
-            // response writer are the same coroutine, no concurrent read/write).
-            bool handler_failed = false;
-            co_await run_handler(dispatch, request, response, handler_failed);
-
-            // Drain any request body the handler did not read, so the connection
-            // is positioned at the next pipelined request. If draining fails or
-            // the body was oversized/malformed, we cannot safely reuse the
-            // connection. An Expect: 100-continue body the handler never read is
-            // the exception: no interim response was sent, so the peer never
-            // uploaded it and there is nothing to drain; the connection is
-            // closing anyway.
-            const bool drained = (expect_continue && !m_body_state.done) ? false : co_await drain_body();
-
-            const bool still_open = co_await writer->connected();
-            // `keep_alive_out` is what the *response* announced: a streamed
-            // HTTP/1.0 body (or a streamed HEAD) is close-delimited, so the
-            // engine must actually close even when the request asked to keep
-            // the connection alive - otherwise the client waits for an EOF that
-            // never comes. may_reuse() lists every veto in one place.
-            if (!may_reuse(!handler_failed, request_keep_alive, writer->keep_alive_out(), still_open, drained)) {
-                break;
+        auto &head = m_parser.head();
+        Version version = head.version;
+        if (head.absolute_form && !head.authority.empty()) {
+            head.headers.erase("host");
+            head.headers.add_lower("host", head.authority);
+        }
+        {
+            const std::size_t hosts = head.headers.count("host");
+            if (hosts > 1 || (hosts == 0 && version == Version::Http11)) {
+                send_error_response(status::bad_request, {}, version);
+                return;
             }
         }
-        co_return; // run() closes the transport when serve_loop returns
+        const auto framing = parse_body_framing(head);
+        if (framing.error_status != 0) {
+            send_error_response(framing.error_status, {}, version);
+            return;
+        }
+        const bool request_keep_alive = connection_keep_alive(head, version);
+
+        if (is_websocket_upgrade(head)) {
+            if (framing.has_body) {
+                send_error_response(status::bad_request, {}, version);
+                return;
+            }
+            handle_websocket(head, version);
+            return;
+        }
+
+        // h2c cleartext upgrade (RFC 9113 §3.2): answer 101 and continue the
+        // connection as HTTP/2, replaying this request as stream 1.
+        if (m_allow_h2c && is_h2c_upgrade(head)) {
+            do_h2c_upgrade(head, framing);
+            return;
+        }
+
+        auto request = std::make_shared<Request>(version, m_executor, m_transport->peer());
+        request->set_method_token(std::move(head.method_token));
+        request->set_target(std::move(head.target));
+
+        const bool expect_continue = framing.has_body && header_has_token(head.headers, "expect", "100-continue");
+        setup_body_framing(framing.chunked, framing.content_length);
+        m_body_state.expect_continue = expect_continue;
+        m_continue_sent->store(false, std::memory_order_relaxed);
+        request->mutable_headers() = std::move(head.headers);
+        m_body_request = request;
+
+        auto self = this->shared_from_this();
+        request->body().set_pull_provider([self](PullCompletion done) { self->pull_body_chunk(std::move(done)); });
+
+        auto writer = std::make_shared<Http1ResponseSink<Transport>>(
+            m_transport, version, m_deadline, m_limits.idle_timeout, m_limits.alt_svc_value(), m_continue_sent);
+        writer->set_keep_alive(request_keep_alive && !expect_continue);
+        const bool head_request = m_parser.head().method == Method::Head;
+        writer->set_head_request(head_request);
+        auto response =
+            std::make_shared<ResponseWriter>(maybe_compress_writer(writer, m_executor, request, head_request));
+
+        // A handler that signals completion twice must not drive after_handler
+        // twice: the second pass would start a competing head read on the same
+        // parser. h2 already guards this; h1 previously did not.
+        auto handler_failed = std::make_shared<bool>(false);
+        auto completed = std::make_shared<bool>(false);
+        auto finish = [self, request, response, writer, request_keep_alive, expect_continue, head_request,
+                       handler_failed, completed]() mutable {
+            if (*completed)
+                return;
+            *completed = true;
+            self->after_handler(request, writer, request_keep_alive, expect_continue, head_request, *handler_failed);
+        };
+        try {
+            m_dispatch(request, response, m_transport->tls_handle(), finish);
+        } catch (const std::exception &e) {
+            SIMPLE_HTTP_ERROR_LOG("h1 handler threw: {}", e.what());
+            *handler_failed = true;
+            finish();
+        } catch (...) {
+            SIMPLE_HTTP_ERROR_LOG("h1 handler threw unknown exception");
+            *handler_failed = true;
+            finish();
+        }
     }
 
-    // Configures body framing for the current request (called once per request,
-    // before dispatch). `chunked` and `content_length` are the already-parsed
-    // Transfer-Encoding/Content-Length fields: serve_loop read them for its
-    // validation and hands them over instead of making this function look them
-    // up a second time. Chunked takes precedence over Content-Length (RFC 7230
-    // §3.3.3); a request with neither has no body.
+    void after_handler(const std::shared_ptr<Request> &request,
+                       const std::shared_ptr<Http1ResponseSink<Transport>> &writer, bool request_keep_alive,
+                       bool expect_continue, bool head_request, bool handler_failed) {
+        const bool skip_drain = expect_continue && !m_body_state.done;
+        auto self = this->shared_from_this();
+        auto proceed = [self, writer, request_keep_alive, handler_failed](bool drained) {
+            writer->connected([self, writer, request_keep_alive, handler_failed, drained](error_code, bool still_open) {
+                if (!may_reuse(!handler_failed, request_keep_alive, writer->keep_alive_out(), still_open, drained)) {
+                    self->finish();
+                    return;
+                }
+                self->parse_head();
+            });
+        };
+        (void)request;
+        (void)head_request;
+        if (skip_drain) {
+            proceed(false);
+            return;
+        }
+        drain_body(std::move(proceed));
+    }
+
+    // --- body framing --------------------------------------------------------
+
     void setup_body_framing(bool chunked, std::optional<std::string_view> content_length) {
-        // One reset, not five field assignments: a request never inherits a
-        // flag from the previous one.
         m_body_state.reset();
         if (chunked) {
             m_body_state.mode = BodyState::Mode::Chunked;
@@ -807,7 +709,6 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
         }
         if (content_length) {
             std::uint64_t len = 0;
-            // serve_loop already validated this; Ok is guaranteed here.
             (void)parse_uint(*content_length, 10, m_limits.max_body_bytes, len);
             m_body_state.mode = BodyState::Mode::Fixed;
             m_body_state.remaining = len;
@@ -816,432 +717,266 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
             return;
         }
         m_body_state.mode = BodyState::Mode::None;
-        m_body_state.done = true; // no body
+        m_body_state.done = true;
     }
 
-    // Pull one body chunk on demand (Body::read calls this via the provider).
-    // Returns a data chunk, end-of-body, or an error_code.
-    asio::awaitable<std::expected<ReadResult, error_code>> pull_body_chunk() {
-        auto result = co_await pull_body_chunk_impl();
-        if (!result)
-            m_body_state.error = true; // see drain_body(): a consumed error still poisons the connection
-        co_return result;
-    }
-
-    asio::awaitable<std::expected<ReadResult, error_code>> pull_body_chunk_impl() {
-        if (m_body_state.done)
-            co_return ReadResult::end();
-        // RFC 9110 §10.1.1: a client that sent Expect: 100-continue waits for
-        // the interim response before sending the body, and the server must not
-        // wait for the body first. Emit it on the first read rather than at the
-        // head, so a handler that rejects the upload can still answer with a
-        // final status. The latch makes this exactly once per request, whether
-        // the engine or a handler's send_continue() gets here first.
-        if (m_body_state.expect_continue && !m_continue_sent->exchange(true, std::memory_order_relaxed)) {
-            if (auto ec = co_await write_all(kContinueResponse); ec)
-                co_return std::unexpected{ec};
+    void pull_body_chunk(PullCompletion done) {
+        if (m_body_state.done) {
+            std::move(done)(error_code{}, ReadResult::end());
+            return;
         }
+        auto self = this->shared_from_this();
+        if (m_body_state.expect_continue && !m_continue_sent->exchange(true, std::memory_order_relaxed)) {
+            auto keep = std::make_shared<std::string>(kContinueResponse);
+            const std::array<ConstByteSpan, 1> buffers{
+                ConstByteSpan{reinterpret_cast<const std::byte *>(keep->data()), keep->size()}};
+            touch_deadline();
+            m_transport->async_write_seq(boost::span<const ConstByteSpan>{buffers.data(), buffers.size()},
+                                         [self, keep, done = std::move(done)](error_code ec, std::size_t) mutable {
+                                             if (ec) {
+                                                 self->body_failed(ec, std::move(done));
+                                                 return;
+                                             }
+                                             self->pull_mode(std::move(done));
+                                         });
+            return;
+        }
+        pull_mode(std::move(done));
+    }
+
+    void pull_mode(PullCompletion done) {
         switch (m_body_state.mode) {
         case BodyState::Mode::None:
             m_body_state.done = true;
-            co_return ReadResult::end();
+            std::move(done)(error_code{}, ReadResult::end());
+            return;
         case BodyState::Mode::Fixed:
-            co_return co_await pull_fixed_chunk();
+            pull_fixed(std::move(done));
+            return;
         case BodyState::Mode::Chunked:
-            co_return co_await pull_chunked_chunk();
+            pull_chunked(std::move(done));
+            return;
         }
-        co_return ReadResult::end();
+        std::move(done)(error_code{}, ReadResult::end());
     }
 
-    // Fixed-length body: hand back up to one buffer's worth per call.
-    asio::awaitable<std::expected<ReadResult, error_code>> pull_fixed_chunk() {
+    void body_failed(error_code ec, PullCompletion done) {
+        m_body_state.error = true;
+        m_body_state.done = true;
+        std::move(done)(ec, ReadResult{});
+    }
+
+    void pull_fixed(PullCompletion done) {
         if (m_body_state.remaining == 0) {
             m_body_state.done = true;
-            co_return ReadResult::end();
+            std::move(done)(error_code{}, ReadResult::end());
+            return;
         }
-        if (m_in.empty()) {
-            // Nothing buffered (the normal case once the head read-ahead runs
-            // out): read straight into the chunk that is about to be handed to
-            // the handler, so a byte moves socket -> chunk instead of
-            // socket -> scratch -> buffer -> chunk. The engine's read_some also
-            // refreshes the shared idle deadline, like every other transport
-            // read here.
-            const std::size_t want =
-                static_cast<std::size_t>(std::min<std::uint64_t>(m_body_state.remaining, kReadChunkBytes));
-            // resize_and_overwrite sizes the string without value-initializing
-            // it: the read overwrites every byte, so zero-filling first only
-            // doubled the memory traffic for the whole body.
-            std::string chunk;
-            chunk.resize_and_overwrite(want, [](char *, std::size_t n) noexcept { return n; });
-            auto [ec, n] =
-                co_await read_some(std::span<std::byte>{reinterpret_cast<std::byte *>(chunk.data()), chunk.size()});
-            if (ec) {
-                m_body_state.done = true;
-                co_return std::unexpected(ec);
-            }
-            chunk.resize(n);
-            m_body_state.remaining -= n;
+        if (!m_in.empty()) {
+            const std::size_t take =
+                static_cast<std::size_t>(std::min<std::uint64_t>(m_body_state.remaining, m_in.size()));
+            std::string chunk{m_in.view().substr(0, take)};
+            m_in.consume(take);
+            m_body_state.remaining -= take;
             if (m_body_state.remaining == 0)
                 m_body_state.done = true;
-            co_return ReadResult::chunk(std::move(chunk));
+            std::move(done)(error_code{}, ReadResult::chunk(std::move(chunk)));
+            return;
         }
-        const std::size_t take = static_cast<std::size_t>(std::min<std::uint64_t>(m_body_state.remaining, m_in.size()));
-        std::string chunk{m_in.view().substr(0, take)};
-        m_in.consume(take);
-        m_body_state.remaining -= take;
-        if (m_body_state.remaining == 0)
-            m_body_state.done = true;
-        co_return ReadResult::chunk(std::move(chunk));
+        const std::size_t want =
+            static_cast<std::size_t>(std::min<std::uint64_t>(m_body_state.remaining, kReadChunkBytes));
+        auto chunk = std::make_shared<std::string>(want, '\0');
+        touch_deadline();
+        auto self = this->shared_from_this();
+        m_transport->async_read_some(ByteSpan{reinterpret_cast<std::byte *>(chunk->data()), chunk->size()},
+                                     [self, chunk, done = std::move(done)](error_code ec, std::size_t n) mutable {
+                                         if (ec) {
+                                             self->body_failed(ec, std::move(done));
+                                             return;
+                                         }
+                                         chunk->resize(n);
+                                         self->m_body_state.remaining -= n;
+                                         if (self->m_body_state.remaining == 0)
+                                             self->m_body_state.done = true;
+                                         std::move(done)(error_code{}, ReadResult::chunk(std::move(*chunk)));
+                                     });
     }
 
-    // Chunked body: decode and return the next chunk's data (RFC 7230 §4.1).
-    asio::awaitable<std::expected<ReadResult, error_code>> pull_chunked_chunk() {
-        std::string size_line;
-        if (!co_await read_line(size_line)) {
-            m_body_state.done = true;
-            co_return std::unexpected(make_error_code(asio::error::eof));
-        }
-        std::string_view size_tok{size_line};
-        if (auto semi = size_tok.find(';'); semi != std::string_view::npos) {
-            size_tok = size_tok.substr(0, semi);
-        }
-        std::uint64_t chunk_len = 0;
-        if (parse_uint(size_tok, 16, m_limits.max_body_bytes, chunk_len) != NumParse::Ok) {
-            m_body_state.done = true;
-            co_return std::unexpected(make_error_code(asio::error::invalid_argument));
-        }
-        if (chunk_len == 0) {
-            // Last chunk: consume trailers up to the blank line, then EOF.
-            // The section is a header block, so it is bounded like one: a peer
-            // that streams unbounded trailer fields must not be able to turn a
-            // modest chunked body into a multi-gigabyte vector of pairs (a
-            // 4-byte line is one entry). max_header_bytes is the same bound the
-            // client applies to response trailers.
-            std::size_t trailer_bytes = 0;
-            std::string trailer;
-            for (;;) {
-                if (!co_await read_line(trailer)) {
-                    // An EOF or an over-long trailer line is not a well-formed end
-                    // of body: the remaining bytes are not a request boundary, so
-                    // the handler must see the error and the connection must close.
-                    m_body_state.done = true;
-                    if (m_body_state.line_overflow)
-                        co_return std::unexpected(make_error_code(asio::error::message_size));
-                    co_return std::unexpected(make_error_code(asio::error::eof));
-                }
-                if (trailer.empty())
-                    break; // the blank line that terminates the trailer section
-                // Each line is already bounded by read_line; bound the section
-                // as a whole too, so the number of stored fields is bounded.
-                trailer_bytes += trailer.size() + 2;
-                if (trailer_bytes > m_limits.max_header_bytes) {
-                    m_body_state.done = true;
-                    co_return std::unexpected(make_error_code(asio::error::message_size));
-                }
-                // Expose the field once the body ends. Framing and hop-by-hop
-                // fields are not valid trailers (RFC 9110 §6.5.1) and are
-                // ignored: trailers must not be able to inject a second
-                // Content-Length/Host/TE into whatever consumes them.
-                if (auto request = m_body_request.lock()) {
-                    const auto colon = trailer.find(':');
-                    if (colon != std::string::npos) {
-                        const std::string_view name = trim_ows(std::string_view{trailer}.substr(0, colon));
-                        const std::string_view value = trim_ows(std::string_view{trailer}.substr(colon + 1));
-                        // The forbidden set is lowercase; the wire name is not.
-                        const std::string lower_name = ascii_lower_copy(name);
-                        if (!name.empty() && !contains_ctl(name) && !contains_ctl(value) &&
-                            !is_forbidden_trailer_field(lower_name)) {
-                            request->mutable_trailers().add_lower(lower_name, std::string{value});
-                        }
-                    }
-                }
-            }
-            m_body_state.done = true;
-            co_return ReadResult::end();
-        }
-        m_body_state.total += chunk_len;
-        if (m_body_state.total > m_limits.max_body_bytes) {
-            m_body_state.done = true;
-            co_return std::unexpected(make_error_code(asio::error::message_size));
-        }
-        std::string chunk;
-        if (!co_await read_exact_into(chunk, static_cast<std::size_t>(chunk_len))) {
-            m_body_state.done = true;
-            co_return std::unexpected(make_error_code(asio::error::eof));
-        }
-        std::string crlf;
-        if (!co_await read_exact_into(crlf, 2)) { // trailing CRLF after chunk data
-            m_body_state.done = true;
-            co_return std::unexpected(make_error_code(asio::error::eof));
-        }
-        // The trailer is framing, not padding. Accepting any two bytes here is
-        // the lenient half of a request-smuggling split with a CRLF-strict
-        // front-end — RFC 9112 §7.1 requires the CRLF, and a proxy is exactly
-        // where the disagreement gets exploited.
-        if (crlf != "\r\n") {
-            m_body_state.done = true;
-            co_return std::unexpected(make_error_code(asio::error::invalid_argument));
-        }
-        co_return ReadResult::chunk(std::move(chunk));
-    }
-
-    // Reads and discards any unread request body so the connection is aligned to
-    // the next request. Returns false if the body could not be fully drained
-    // (error/EOF) — the caller then closes the connection instead of reusing it.
-    asio::awaitable<bool> drain_body() {
-        while (!m_body_state.done) {
-            auto r = co_await pull_body_chunk();
-            if (!r)
-                co_return false; // error mid-body: cannot reuse the connection
-        }
-        // A handler that reads the body can consume the error itself (read_all
-        // then answers 400). m_body_state.done is already set by the failing pull, so
-        // the loop above never sees it — but the connection is just as poisoned:
-        // the byte stream is no longer at a request boundary, and parsing the
-        // next request from the residual bytes is the smuggling shape.
-        co_return !m_body_state.error;
-    }
-
-    // Parses an unsigned integer (base 10 or 16) with explicit overflow and
-    // upper-bound checks. `max` is the largest accepted value; anything larger
-    // (or that would overflow) is reported as Overflow rather than wrapping.
-    enum class NumParse { Ok, Invalid, Overflow };
-    static NumParse parse_uint(std::string_view s, unsigned base, std::uint64_t max, std::uint64_t &out) {
-        if (s.empty())
-            return NumParse::Invalid;
-        std::uint64_t v = 0;
-        bool any = false;
-        for (char c : s) {
-            unsigned d;
-            if (c >= '0' && c <= '9') {
-                d = static_cast<unsigned>(c - '0');
-            } else if (base == 16 && c >= 'a' && c <= 'f') {
-                d = 10u + static_cast<unsigned>(c - 'a');
-            } else if (base == 16 && c >= 'A' && c <= 'F') {
-                d = 10u + static_cast<unsigned>(c - 'A');
-            } else {
-                return NumParse::Invalid;
-            }
-            if (v > (max - d) / base)
-                return NumParse::Overflow; // would exceed max
-            v = v * base + d;
-            any = true;
-        }
-        if (!any)
-            return NumParse::Invalid;
-        out = v;
-        return NumParse::Ok;
-    }
-
-    static bool connection_keep_alive(const ParsedHead &head, Version version) {
-        if (header_has_token(head.headers, "connection", "close")) {
-            return false;
-        }
-        if (header_has_token(head.headers, "connection", "keep-alive")) {
-            return true;
-        }
-        return version != Version::Http1; // HTTP/1.1 defaults to keep-alive, 1.0 to close
-    }
-
-    // Every reason the same connection may serve another request, in one place.
-    // Each argument is a distinct veto; keeping them separate makes "which side
-    // said no" visible instead of hiding it in one long condition:
-    //   handler_ok          - a throwing handler leaves the response state unknown;
-    //   request_keep_alive  - the request's Connection field / HTTP version;
-    //   response_keep_alive - what the writer actually announced (an HTTP/1.0 or
-    //                         HEAD streamed body is close-delimited, so the writer
-    //                         flips it to false);
-    //   transport_open      - the write path did not observe a dead transport;
-    //   body_drained        - the request body reached a request boundary.
-    static bool may_reuse(bool handler_ok, bool request_keep_alive, bool response_keep_alive, bool transport_open,
-                          bool body_drained) {
-        return handler_ok && request_keep_alive && response_keep_alive && transport_open && body_drained;
-    }
-
-    // The validated framing of this request. `error_status` is 0 when the
-    // fields are usable; otherwise it is the status to answer with before any
-    // handler (or upgrade) runs.
-    struct BodyFraming {
-        int error_status{0};
-        bool chunked{false};
-        bool has_body{false};
-        std::optional<std::string_view> content_length;
-    };
-
-    // RFC 9112 §6: Transfer-Encoding is a list of transfer codings, and only
-    // chunked is implemented here. Rejecting unknown codings (501) is the only
-    // safe answer: silently passing the body through would hand gzip/… bytes to
-    // the handler, and a front-end that framed the request differently would
-    // desync. `chunked` has to be the last coding. A request carrying both TE
-    // and CL is refused (400): TE-wins is legal but is exactly the CL.TE split
-    // nginx and others reject outright.
-    BodyFraming parse_body_framing(const ParsedHead &head) const {
-        BodyFraming out;
-        if (head.headers.count("content-length") > 1) {
-            out.error_status = status::bad_request;
-            return out;
-        }
-        out.content_length = head.headers.get("content-length");
-
-        const auto te_values = head.headers.get_all("transfer-encoding");
-        if (!te_values.empty()) {
-            // RFC 9112 §6.1: Transfer-Encoding is an HTTP/1.1 framing mechanism.
-            // An HTTP/1.0 peer (or the front end that let one through) does not
-            // frame by chunked, so accepting it here creates a TE.CL split:
-            // this server consumes the chunked body while the front end treats
-            // the same bytes as the next request. Go's net/http ignores TE on
-            // 1.0; refusing is the fail-closed equivalent.
-            if (head.version == Version::Http1) {
-                out.error_status = status::bad_request;
-                return out;
-            }
-            std::vector<std::string_view> codings;
-            for (auto value : te_values) {
-                while (true) {
-                    const std::size_t comma = value.find(',');
-                    const std::string_view token = trim_ows(value.substr(0, comma));
-                    if (token.empty()) {
-                        out.error_status = status::bad_request;
-                        return out;
-                    }
-                    codings.push_back(token);
-                    if (comma == std::string_view::npos) {
-                        break;
-                    }
-                    value.remove_prefix(comma + 1);
-                }
-            }
-            for (std::size_t i = 0; i < codings.size(); ++i) {
-                if (!iequals_ci(codings[i], "chunked")) {
-                    continue;
-                }
-                if (i + 1 != codings.size()) {
-                    out.error_status = status::bad_request; // chunked must be the final coding
-                    return out;
-                }
-                if (codings.size() != 1) {
-                    out.error_status = status::not_implemented; // another coding we do not decode
-                    return out;
-                }
-                out.chunked = true;
-            }
-            if (!out.chunked) {
-                out.error_status = status::not_implemented;
-                return out;
-            }
-            if (out.content_length) {
-                out.error_status = status::bad_request; // TE + CL: refuse the ambiguity
-                return out;
-            }
-            out.has_body = true;
-            return out;
-        }
-
-        if (out.content_length) {
-            std::uint64_t len = 0;
-            switch (parse_uint(*out.content_length, 10, m_limits.max_body_bytes, len)) {
-            case NumParse::Invalid:
-                out.error_status = status::bad_request;
-                return out;
-            case NumParse::Overflow:
-                out.error_status = status::payload_too_large;
-                return out;
-            case NumParse::Ok:
-                break;
-            }
-            out.has_body = len > 0;
-        }
-        return out;
-    }
-
-    // Reads one CRLF- or LF-terminated line from the read buffer (topping up
-    // from the transport as needed), stripping the terminator. Returns false on
-    // EOF or an over-long line.
-    asio::awaitable<bool> read_line(std::string &out) {
-        m_body_state.line_overflow = false;
-        for (;;) {
-            const std::string_view buffered = m_in.view();
-            const std::size_t nl = buffered.find('\n');
-            if (nl != std::string_view::npos) {
-                const std::size_t end = (nl > 0 && buffered[nl - 1] == '\r') ? nl - 1 : nl;
-                out.assign(buffered, 0, end);
-                m_in.consume(nl + 1);
-                co_return true;
-            }
-            // No line ending yet, so everything buffered belongs to this line (a
-            // chunk-size line or a trailer line). Bound it: read_some refreshes the
-            // idle deadline on every call, so an endless line (never a newline)
-            // would otherwise grow the buffer until the process runs out of memory.
-            if (m_in.size() >= m_limits.max_header_bytes) {
-                SIMPLE_HTTP_ERROR_LOG("h1 line longer than {} bytes; closing", m_limits.max_header_bytes);
-                m_body_state.line_overflow = true; // distinguish from EOF for the trailer section
-                co_return false;
-            }
-            auto [ec, n] = co_await read_some(std::span<std::byte>{m_read_scratch});
-            if (ec)
-                co_return false;
-            m_in.append(m_read_scratch.data(), n);
-        }
-    }
-
-    // Reads exactly `len` bytes into `out`: whatever is already buffered is
-    // copied out first, and the rest is read straight from the transport into
-    // the output string. A chunked body used to be staged through the read
-    // buffer (top up `len` bytes, copy out, erase), so one large chunk cost two
-    // chunk-sized buffers plus a memmove; this keeps it at one.
-    asio::awaitable<bool> read_exact_into(std::string &out, std::size_t len) {
-        std::size_t have = 0;
-        // resize_and_overwrite sizes without value-initializing the tail; the
-        // read below overwrites every byte this leaves uninitialized.
-        out.resize_and_overwrite(len, [&](char *buf, std::size_t n) noexcept {
-            have = std::min<std::size_t>(n, m_in.size());
-            if (have != 0) {
-                std::memcpy(buf, m_in.view().data(), have);
-                m_in.consume(have);
-            }
-            return n;
-        });
-        while (have < len) {
-            auto [ec, n] =
-                co_await read_some(std::span<std::byte>{reinterpret_cast<std::byte *>(out.data() + have), len - have});
+    void pull_chunked(PullCompletion done) {
+        auto self = this->shared_from_this();
+        read_line([self, done = std::move(done)](error_code ec, std::string size_line) mutable {
             if (ec) {
-                out.resize(have);
-                co_return false;
+                self->body_failed(ec, std::move(done));
+                return;
             }
-            have += n;
-        }
-        co_return true;
+            std::string_view size_tok{size_line};
+            if (auto semi = size_tok.find(';'); semi != std::string_view::npos) {
+                size_tok = size_tok.substr(0, semi);
+            }
+            std::uint64_t chunk_len = 0;
+            if (parse_uint(size_tok, 16, self->m_limits.max_body_bytes, chunk_len) != NumParse::Ok) {
+                self->body_failed(make_error_code(asio::error::invalid_argument), std::move(done));
+                return;
+            }
+            if (chunk_len == 0) {
+                self->read_trailers(std::move(done));
+                return;
+            }
+            self->m_body_state.total += chunk_len;
+            if (self->m_body_state.total > self->m_limits.max_body_bytes) {
+                self->body_failed(make_error_code(asio::error::message_size), std::move(done));
+                return;
+            }
+            self->read_exact(static_cast<std::size_t>(chunk_len), [self, done = std::move(done)](
+                                                                      error_code ec2, std::string chunk) mutable {
+                if (ec2) {
+                    self->body_failed(ec2, std::move(done));
+                    return;
+                }
+                self->read_exact(2, [self, chunk = std::move(chunk), done = std::move(done)](error_code ec3,
+                                                                                             std::string crlf) mutable {
+                    if (ec3) {
+                        self->body_failed(ec3, std::move(done));
+                        return;
+                    }
+                    if (crlf != "\r\n") {
+                        self->body_failed(make_error_code(asio::error::invalid_argument), std::move(done));
+                        return;
+                    }
+                    std::move(done)(error_code{}, ReadResult::chunk(std::move(chunk)));
+                });
+            });
+        });
     }
 
-    // Runs the handler; captures failure so run() can close the connection.
-    asio::awaitable<void> run_handler(const Dispatcher &dispatch, std::shared_ptr<Request> request,
-                                      std::shared_ptr<ResponseWriter> response, bool &failed) {
-        try {
-            co_await dispatch(std::move(request), std::move(response), m_transport->tls_handle());
-        } catch (const std::exception &e) {
-            SIMPLE_HTTP_ERROR_LOG("h1 handler threw: {}", e.what());
-            failed = true;
-        } catch (...) {
-            SIMPLE_HTTP_ERROR_LOG("h1 handler threw unknown exception");
-            failed = true;
-        }
-        co_return;
+    void read_trailers(PullCompletion done) {
+        auto self = this->shared_from_this();
+        read_line([self, done = std::move(done)](error_code ec, std::string trailer) mutable {
+            if (ec) {
+                self->body_failed(ec, std::move(done));
+                return;
+            }
+            if (trailer.empty()) {
+                self->m_body_state.done = true;
+                std::move(done)(error_code{}, ReadResult::end());
+                return;
+            }
+            self->m_trailer_bytes += trailer.size() + 2;
+            if (self->m_trailer_bytes > self->m_limits.max_header_bytes) {
+                self->body_failed(make_error_code(asio::error::message_size), std::move(done));
+                return;
+            }
+            if (auto request = self->m_body_request.lock()) {
+                const auto colon = trailer.find(':');
+                if (colon != std::string::npos) {
+                    const std::string_view name = trim_ows(std::string_view{trailer}.substr(0, colon));
+                    const std::string_view value = trim_ows(std::string_view{trailer}.substr(colon + 1));
+                    const std::string lower_name = ascii_lower_copy(name);
+                    if (!name.empty() && !contains_ctl(name) && !contains_ctl(value) &&
+                        !is_forbidden_trailer_field(lower_name)) {
+                        request->mutable_trailers().add_lower(lower_name, std::string{value});
+                    }
+                }
+            }
+            self->read_trailers(std::move(done));
+        });
     }
 
-    // Answers an error and closes. `version` is the parsed request's version when
-    // it is already known (the status line then matches the request); errors
-    // before the version is parsed fall back to HTTP/1.1.
-    asio::awaitable<void> send_error_response(int status, Headers extra = {}, Version version = Version::Http11) {
+    void drain_body(std::function<void(bool)> done) {
+        if (m_body_state.done) {
+            done(!m_body_state.error);
+            return;
+        }
+        auto self = this->shared_from_this();
+        pull_body_chunk([self, done = std::move(done)](error_code ec, ReadResult r) mutable {
+            if (ec) {
+                done(false);
+                return;
+            }
+            if (r.eof) {
+                done(!self->m_body_state.error);
+                return;
+            }
+            self->drain_body(std::move(done));
+        });
+    }
+
+    // --- framed reads --------------------------------------------------------
+
+    // Reads one CRLF- or LF-terminated line, topping up from the transport.
+    void read_line(LineCompletion done) {
+        auto state = std::make_shared<std::string>();
+        m_body_state.line_overflow = false;
+        loop_read_line(std::move(state), std::move(done));
+    }
+
+    void loop_read_line(std::shared_ptr<std::string> out, LineCompletion done) {
+        const std::string_view buffered = m_in.view();
+        const std::size_t nl = buffered.find('\n');
+        if (nl != std::string_view::npos) {
+            const std::size_t end = (nl > 0 && buffered[nl - 1] == '\r') ? nl - 1 : nl;
+            out->assign(buffered.data(), end);
+            m_in.consume(nl + 1);
+            std::move(done)(error_code{}, std::move(*out));
+            return;
+        }
+        if (m_in.size() >= m_limits.max_header_bytes) {
+            m_body_state.line_overflow = true;
+            std::move(done)(make_error_code(asio::error::message_size), std::string{});
+            return;
+        }
+        auto self = this->shared_from_this();
+        read_scan([self, out, done = std::move(done)](error_code ec, std::size_t n) mutable {
+            if (ec) {
+                std::move(done)(ec, std::string{});
+                return;
+            }
+            self->m_in.append(self->m_scan.data(), n);
+            self->loop_read_line(std::move(out), std::move(done));
+        });
+    }
+
+    // Reads exactly `len` bytes, copying whatever is buffered first and then
+    // reading the rest straight into the output string.
+    void read_exact(std::size_t len, LineCompletion done) {
+        auto out = std::make_shared<std::string>(len, '\0');
+        const std::size_t have = std::min<std::size_t>(len, m_in.size());
+        if (have != 0) {
+            std::memcpy(out->data(), m_in.view().data(), have);
+            m_in.consume(have);
+        }
+        loop_read_exact(std::move(out), have, len, std::move(done));
+    }
+
+    void loop_read_exact(std::shared_ptr<std::string> out, std::size_t have, std::size_t len, LineCompletion done) {
+        if (have == len) {
+            std::move(done)(error_code{}, std::move(*out));
+            return;
+        }
+        auto self = this->shared_from_this();
+        touch_deadline();
+        m_transport->async_read_some(
+            ByteSpan{reinterpret_cast<std::byte *>(out->data() + have), len - have},
+            [self, out, have, len, done = std::move(done)](error_code ec, std::size_t n) mutable {
+                if (ec) {
+                    std::move(done)(ec, std::string{});
+                    return;
+                }
+                self->loop_read_exact(std::move(out), have + n, len, std::move(done));
+            });
+    }
+
+    // --- errors and upgrades -------------------------------------------------
+
+    void send_error_response(int status, Headers extra = {}, Version version = Version::Http11) {
         auto writer = std::make_shared<Http1ResponseSink<Transport>>(m_transport, version, m_deadline,
                                                                      m_limits.idle_timeout, m_limits.alt_svc_value());
         writer->set_keep_alive(false);
         std::string body{reason_phrase(status)};
-        (void)co_await writer->send(status, std::move(extra), std::move(body));
+        auto self = this->shared_from_this();
+        writer->send(status, std::move(extra), std::move(body), [self](error_code) { self->finish(); });
     }
 
-    // Detects a WebSocket upgrade handshake: a GET carrying
-    // `Upgrade: websocket`, `Connection: Upgrade` and a Sec-WebSocket-Key.
-    // Both fields are token lists, so they are matched exactly.
     static bool is_websocket_upgrade(const ParsedHead &head) {
         if (!header_has_token(head.headers, "upgrade", "websocket")) {
             return false;
@@ -1252,15 +987,6 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
         return head.headers.get("sec-websocket-key").has_value();
     }
 
-    // Performs the WebSocket handshake for a matched route: sends the 101
-    // response, builds a WebSocket over this transport, then runs the ws handler
-    // and its write pump concurrently. Returns true if the connection was
-    // upgraded (the caller must not close it), false if no route matched.
-    // Strips the query string from a request target, yielding the path used for
-    // route/proxy lookup.
-    // The path part of a request target, query string stripped. A view into
-    // `target` — every caller only reads it, so building a string here would be
-    // a copy per request.
     static std::string_view request_path(std::string_view target) {
         if (auto q = target.find('?'); q != std::string_view::npos) {
             return target.substr(0, q);
@@ -1268,10 +994,69 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
         return target;
     }
 
-    asio::awaitable<bool> try_websocket_upgrade(std::shared_ptr<Request> request, std::shared_ptr<ResponseWriter> res,
-                                                WsHandler handler) {
-        // permessage-deflate (RFC 7692): only when the server enabled it and the
-        // client offered it. A declined offer simply continues uncompressed.
+    void handle_websocket(const ParsedHead &head, Version version) {
+        // RFC 6455 §4.2.1 version gate.
+        const auto ws_version = head.headers.get("sec-websocket-version");
+        if (!ws_version) {
+            send_error_response(status::bad_request, {}, version);
+            return;
+        }
+        if (*ws_version != "13") {
+            Headers extra;
+            extra.add_lower("sec-websocket-version", "13");
+            send_error_response(status::upgrade_required, std::move(extra), version);
+            return;
+        }
+
+        auto request = std::make_shared<Request>(version, m_executor, m_transport->peer());
+        request->set_method_token(head.method_token);
+        request->set_target(head.target);
+        request->mutable_headers() = head.headers;
+        auto writer = std::make_shared<Http1ResponseSink<Transport>>(m_transport, head.version, m_deadline,
+                                                                     m_limits.idle_timeout, m_limits.alt_svc_value());
+        auto response = std::make_shared<ResponseWriter>(writer);
+
+        auto self = this->shared_from_this();
+        WsUpgrade upgrade = [self](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res,
+                                   CallbackWsHandler handler, WsUpgradeCompletion done) mutable {
+            self->try_websocket_upgrade(std::move(req), std::move(res), std::move(handler), std::move(done));
+        };
+
+        const std::string_view path = request_path(head.target);
+        if (m_ws_lookup) {
+            if (auto run = m_ws_lookup(path)) {
+                (*run)(request, response, m_transport->tls_handle(), std::move(upgrade),
+                       [self](error_code, bool) { self->finish(); });
+                return;
+            }
+        }
+
+        // Byte-level proxy pass-through, between the exact and the regex local
+        // ws routes (nginx-style precedence).
+        if (m_ws_proxy_lookup) {
+            if (auto target = m_ws_proxy_lookup(path)) {
+                m_owner = TransportOwner::WebSocket; // stop the watchdog from closing the transport
+                std::string peer_address = address_string_if_specified(m_transport->peer().address());
+                std::string initial{m_in.view()};
+                async_run_ws_proxy(m_transport, head, std::move(initial), std::move(*target), m_limits.idle_timeout,
+                                   m_limits.max_header_bytes, std::move(peer_address),
+                                   m_transport->tls_handle().has_value(), [self](bool) { self->finish(); });
+                return;
+            }
+        }
+
+        if (m_ws_regex_lookup) {
+            if (auto run = m_ws_regex_lookup(path)) {
+                (*run)(request, response, m_transport->tls_handle(), std::move(upgrade),
+                       [self](error_code, bool) { self->finish(); });
+                return;
+            }
+        }
+        send_error_response(status::not_found, {}, version);
+    }
+
+    void try_websocket_upgrade(std::shared_ptr<Request> request, std::shared_ptr<ResponseWriter> res,
+                               CallbackWsHandler handler, WsUpgradeCompletion done) {
         WsDeflateConfig deflate;
         if (m_limits.ws_compression) {
             const auto offered = request->header("sec-websocket-extensions").value_or(std::string_view{});
@@ -1280,15 +1065,10 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
             }
         }
 
-        // Build and send the 101 Switching Protocols handshake response: the
-        // fixed handshake fields, the accept key, the negotiated extension, and
-        // any fields the middleware chain set on `res` before reaching this
-        // terminal (request_id's X-Request-Id, a middleware's Set-Cookie, ...).
         auto key = request->header("sec-websocket-key");
         if (!key) {
-            // is_websocket_upgrade() guarantees the key; defensive only.
-            co_await send_error_response(status::bad_request, {}, request->version());
-            co_return false;
+            std::move(done)(make_error_code(asio::error::invalid_argument), false);
+            return;
         }
         std::string resp = "HTTP/1.1 101 Switching Protocols\r\n"
                            "Upgrade: websocket\r\n"
@@ -1301,11 +1081,6 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
             resp += ws_deflate_response_value(deflate);
             resp += "\r\n";
         }
-        // Identify the server, as every other response does (ResponseWriter's
-        // apply_defaults). This head is assembled here rather than through
-        // send(), so that default never ran. Only Server belongs on a 101:
-        // Content-Type is meaningless without a body, and Date is not required
-        // for 1xx (RFC 9110 §6.6.1). A middleware that set its own Server wins.
         const auto &fields = res->headers();
         if (!fields.contains("server")) {
             resp += "Server: ";
@@ -1319,77 +1094,120 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
             resp += "\r\n";
         }
         resp += "\r\n";
-        if (auto ec = co_await write_all(resp); ec) {
-            co_return false; // could not send handshake; connection is unusable
-        }
 
-        m_owner = TransportOwner::WebSocket;
-
-        // The backend is shared-owned: the detached write pump keeps a reference
-        // to it (and hence to the transport) while a write is in flight, even
-        // after this WebSocket handle is gone.
-        auto backend =
-            std::make_shared<WsBackendImpl<Transport>>(m_transport, m_limits.max_body_bytes, m_limits.idle_timeout,
-                                                       /*expect_masked=*/true, m_limits.ws_read_ahead_bytes, deflate);
-
-        // Bytes the parser read past the request head are the start of the
-        // WebSocket stream - typically the client's first frame, which many clients
-        // pipeline behind the upgrade request. Hand them to the frame parser
-        // instead of dropping them.
-        backend->feed(m_in.view());
-        m_in.clear();
-
-        auto ws = std::make_shared<WebSocket>(std::move(backend));
-
-        // Start the write pump as an independent coroutine on this executor so it
-        // outlives the handler: after the handler returns we still need the pump
-        // running to flush a graceful Close frame (ws->close()).
-        asio::co_spawn(m_executor, ws->run_writer(), asio::detached);
-
-        // Run the handler to completion.
-        try {
-            co_await run_ws_handler(handler, request, ws);
-        } catch (const std::exception &e) {
-            SIMPLE_HTTP_ERROR_LOG("ws handler threw: {}", e.what());
-        } catch (...) {
-            SIMPLE_HTTP_ERROR_LOG("ws handler threw unknown exception");
-        }
-
-        // Graceful shutdown: close() enqueues a Close frame, waits for the pump to
-        // write it (if the handler did not already close), then stops the pump and
-        // tears down the transport.
-        (void)co_await ws->close();
-        co_return true;
+        auto self = this->shared_from_this();
+        auto keep = std::make_shared<std::string>(std::move(resp));
+        touch_deadline();
+        m_transport->async_write(
+            ConstByteSpan{reinterpret_cast<const std::byte *>(keep->data()), keep->size()},
+            [self, keep, request, handler, deflate, done = std::move(done)](error_code ec, std::size_t) mutable {
+                if (ec) {
+                    std::move(done)(ec, false);
+                    return;
+                }
+                self->m_owner = TransportOwner::WebSocket;
+                auto backend = std::make_shared<WsBackendImpl<Transport>>(
+                    self->m_transport, self->m_limits.max_body_bytes, self->m_limits.idle_timeout,
+                    /*expect_masked=*/true, self->m_limits.ws_read_ahead_bytes, deflate);
+                backend->feed(self->m_in.view());
+                self->m_in.clear();
+                auto ws = std::make_shared<WebSocket>(std::move(backend));
+                ws->run_writer();
+                // Run the ws handler; when it finishes, close gracefully.
+                invoke_ws_handler(simple_http::WsHandler(handler), request, ws, [ws, done = std::move(done)]() mutable {
+                    ws->async_close(
+                        [done = std::move(done)](error_code) mutable { std::move(done)(error_code{}, true); });
+                });
+            });
     }
 
-    asio::awaitable<void> run_ws_handler(const WsHandler &handler, std::shared_ptr<Request> request,
-                                         std::shared_ptr<WebSocket> ws) {
-        co_await handler(std::move(request), std::move(ws));
-        co_return;
+    // --- helpers -------------------------------------------------------------
+
+    enum class NumParse { Ok, Invalid, Overflow };
+    static NumParse parse_uint(std::string_view s, unsigned base, std::uint64_t max, std::uint64_t &out) {
+        if (s.empty())
+            return NumParse::Invalid;
+        std::uint64_t v = 0;
+        for (char c : s) {
+            unsigned d;
+            if (c >= '0' && c <= '9') {
+                d = static_cast<unsigned>(c - '0');
+            } else if (base == 16 && c >= 'a' && c <= 'f') {
+                d = 10u + static_cast<unsigned>(c - 'a');
+            } else if (base == 16 && c >= 'A' && c <= 'F') {
+                d = 10u + static_cast<unsigned>(c - 'A');
+            } else {
+                return NumParse::Invalid;
+            }
+            if (v > (max - d) / base)
+                return NumParse::Overflow;
+            v = v * base + d;
+        }
+        out = v;
+        return NumParse::Ok;
     }
 
-    // RFC 6455 §4.2.1 version gate, checked after an Upgrade: websocket head
-    // parses: a missing Sec-WebSocket-Version is answered 400, a value other than
-    // 13 with 426 + Sec-WebSocket-Version: 13, closing the connection either way.
-    // (Previously a handshake with the wrong version got a 101 like a valid one.)
-    asio::awaitable<bool> check_ws_version(const ParsedHead &head) {
-        const auto version = head.headers.get("sec-websocket-version");
-        if (!version) {
-            co_await send_error_response(status::bad_request, {},
-                                         head.version); // a handshake without a version is malformed
-            co_return false;
+    static bool connection_keep_alive(const ParsedHead &head, Version version) {
+        if (header_has_token(head.headers, "connection", "close")) {
+            return false;
         }
-        if (*version != "13") {
-            Headers extra;
-            extra.add_lower("sec-websocket-version", "13");
-            co_await send_error_response(status::upgrade_required, std::move(extra), head.version);
-            co_return false;
+        if (header_has_token(head.headers, "connection", "keep-alive")) {
+            return true;
         }
-        co_return true;
+        return version != Version::Http1;
     }
 
+    static bool may_reuse(bool handler_ok, bool request_keep_alive, bool response_keep_alive, bool transport_open,
+                          bool body_drained) {
+        return handler_ok && request_keep_alive && response_keep_alive && transport_open && body_drained;
+    }
+
+    struct BodyFraming {
+        int error_status{0};
+        bool chunked{false};
+        bool has_body{false};
+        std::optional<std::string_view> content_length;
+    };
+
+    BodyFraming parse_body_framing(const ParsedHead &head) const {
+        BodyFraming out;
+        const auto te = head.headers.get("transfer-encoding");
+        const auto cl = head.headers.get("content-length");
+        if (te) {
+            if (!value_has_token(*te, "chunked")) {
+                out.error_status = status::not_implemented;
+                return out;
+            }
+            if (cl) {
+                out.error_status = status::bad_request; // CL + TE: smuggling shape
+                return out;
+            }
+            out.chunked = true;
+            out.has_body = true;
+            return out;
+        }
+        if (cl) {
+            if (head.headers.count("content-length") > 1) {
+                out.error_status = status::bad_request;
+                return out;
+            }
+            std::uint64_t len = 0;
+            const auto parsed = parse_uint(*cl, 10, m_limits.max_body_bytes, len);
+            if (parsed == NumParse::Invalid) {
+                out.error_status = status::bad_request;
+                return out;
+            }
+            if (parsed == NumParse::Overflow) {
+                out.error_status = status::payload_too_large;
+                return out;
+            }
+            out.content_length = *cl;
+            out.has_body = len > 0;
+        }
+        return out;
+    }
     // Detects an h2c cleartext upgrade: Upgrade: h2c, Connection: Upgrade, and
-    // the HTTP2-Settings header itself (RFC 7540 §3.2).
+    // the HTTP2-Settings header itself (RFC 9113 §3.2).
     static bool is_h2c_upgrade(const ParsedHead &head) {
         if (!header_has_token(head.headers, "upgrade", "h2c")) {
             return false;
@@ -1400,72 +1218,85 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
         return head.headers.get("http2-settings").has_value();
     }
 
-    // Performs the h2c upgrade: reads any request body, sends 101, then hands the
-    // connection to an Http2Engine that replays this request as stream 1.
-    asio::awaitable<void> do_h2c_upgrade(const Dispatcher &dispatch, const ParsedHead &head,
-                                         const BodyFraming &framing) {
-        // Drain the (small) upgrade-request body so it can be replayed on stream 1.
-        setup_body_framing(framing.chunked, framing.content_length);
-        std::string body;
-        while (!m_body_state.done) {
-            auto r = co_await pull_body_chunk();
-            if (!r)
-                break; // body error: proceed with whatever we have
-            if (!r->eof)
-                body.append(r->data);
-        }
-
-        // 101 Switching Protocols handshake response — entirely constant.
-        if (auto ec = co_await write_all(kH2cUpgradeResponse); ec) {
-            m_transport->close();
-            co_return;
-        }
-
-        // Bytes buffered past the request body are the client's HTTP/2 connection
-        // preface and whatever it sent right after (RFC 9113 §3.2 allows the
-        // preface immediately). They must travel into the h2 engine's receive
-        // buffer, or the engine reads the client's next real frame as the preface
-        // and answers GOAWAY(PROTOCOL_ERROR).
-        std::string buffered = m_in.take_all();
-        m_owner = TransportOwner::Http2;
-        std::string settings_b64{*head.headers.get("http2-settings")};
-
-        auto engine = std::make_shared<Http2Engine<Transport>>(m_transport, m_limits);
-        co_await engine->run_h2c(dispatch, settings_b64, head.method, std::string{head.target}, head.headers,
-                                 std::move(body), std::move(buffered), m_ws_lookup, m_ws_regex_lookup,
-                                 m_ws_proxy_lookup);
-        co_return;
-    }
-
-    // Writes all of `out` to the transport (partial-write loop).
-    // The 101 h2c handshake is fixed, so its constant part lives here; the
-    // WebSocket 101 is assembled per upgrade in try_websocket_upgrade (its head
-    // varies: negotiated extensions, middleware fields).
     static constexpr std::string_view kH2cUpgradeResponse = "HTTP/1.1 101 Switching Protocols\r\n"
                                                             "Connection: Upgrade\r\n"
                                                             "Upgrade: h2c\r\n\r\n";
-    // Sent lazily from the body-read path when the request asked for it.
-    static constexpr std::string_view kContinueResponse = "HTTP/1.1 100 Continue\r\n\r\n";
-    // How many bytes one transport read grabs (the head-read buffers and the
-    // engine's body-framing scratch).
-    static constexpr std::size_t kReadChunkBytes = 8192;
 
-    // Writes all of `out` to the transport. `out` must outlive the await, so
-    // callers pass either a local buffer or a string constant.
-    asio::awaitable<error_code> write_all(std::string_view out) {
-        // Composed async_write: whole buffer or error, no partial-write loop.
-        auto [ec, n] = co_await m_transport->async_write(std::as_bytes(std::span<const char>{out.data(), out.size()}));
-        (void)n;
-        co_return ec;
+    // Performs the h2c upgrade: reads the upgrade request's body, sends 101, and
+    // hands the transport (plus any bytes read past the request) to an
+    // Http2Engine that replays this request as stream 1.
+    void do_h2c_upgrade(const ParsedHead &head, const BodyFraming &framing) {
+        setup_body_framing(framing.chunked, framing.content_length);
+        m_body_state.expect_continue = framing.has_body && header_has_token(head.headers, "expect", "100-continue");
+        m_continue_sent->store(false, std::memory_order_relaxed);
+        auto body = std::make_shared<std::string>();
+        auto self = this->shared_from_this();
+        drain_h2c_body(head, std::move(body));
     }
 
-    // Bytes read past the request head (and, for chunked bodies, framing bytes
-    // read ahead of the chunk data): a string plus a read cursor. Consuming
-    // advances the cursor; the dead prefix is compacted only once it dominates
-    // the buffer, so framing a chunked body no longer memmoves the buffer for
-    // every size line and CRLF. The chunk data itself never lands here: the
-    // chunked path reads it straight into the handler's chunk (see
-    // read_exact_into), which is why this buffer stays small.
+    void drain_h2c_body(ParsedHead head, std::shared_ptr<std::string> body) {
+        if (m_body_state.done) {
+            start_h2c(std::move(head), std::move(*body));
+            return;
+        }
+        auto self = this->shared_from_this();
+        pull_body_chunk([self, head = std::move(head), body](error_code ec, ReadResult r) mutable {
+            if (ec) {
+                self->m_transport->close();
+                self->finish();
+                return;
+            }
+            if (r.eof) {
+                self->start_h2c(std::move(head), std::move(*body));
+                return;
+            }
+            if (body->size() + r.data.size() > self->m_limits.max_body_bytes) {
+                self->send_error_response(status::payload_too_large, {}, head.version);
+                return;
+            }
+            body->append(r.data);
+            self->drain_h2c_body(std::move(head), std::move(body));
+        });
+    }
+
+    void start_h2c(ParsedHead head, std::string body) {
+        auto self = this->shared_from_this();
+        // The transport now belongs to the h2 engine. Stop the h1 idle watchdog
+        // and keep finish() from shutting the transport down: ownership only
+        // moves after the 101 has been written.
+        m_finished = true;
+        m_watchdog->cancel();
+        auto response = std::make_shared<std::string>(kH2cUpgradeResponse);
+        auto transport = m_transport;
+        detail::async_error_only(
+            m_executor,
+            [self, head = std::move(head), body = std::move(body)](error_code ec) mutable {
+                if (ec) {
+                    self->m_transport->close();
+                    self->complete_done();
+                    return;
+                }
+                // Bytes already read past the request are the client's
+                // connection preface and whatever followed it.
+                std::string buffered{self->m_in.view()};
+                self->m_in.consume(self->m_in.size());
+                std::string settings_b64{*head.headers.get("http2-settings")};
+                self->m_owner = TransportOwner::Http2;
+                auto engine = std::make_shared<Http2Engine<Transport>>(self->m_transport, self->m_limits);
+                engine->run_h2c(self->m_dispatch, std::move(settings_b64), head.method, head.method_token,
+                                std::string{head.target}, std::move(head.headers), std::move(body), std::move(buffered),
+                                self->m_ws_lookup, self->m_ws_proxy_lookup, self->m_ws_regex_lookup,
+                                [self]() { self->complete_done(); });
+            },
+            [transport, response](asio::any_completion_handler<void(error_code, std::size_t)> handler) {
+                const std::array<ConstByteSpan, 1> buffers{
+                    ConstByteSpan{reinterpret_cast<const std::byte *>(response->data()), response->size()}};
+                transport->async_write_seq(boost::span<const ConstByteSpan>{buffers.data(), buffers.size()},
+                                           std::move(handler));
+            });
+    }
+
+    // Bytes read past the request head (and chunked framing bytes).
     class ReadBuf {
       public:
         void assign(std::string_view bytes) {
@@ -1478,36 +1309,20 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
         }
         [[nodiscard]] bool empty() const { return m_pos >= m_data.size(); }
         [[nodiscard]] std::size_t size() const { return m_data.size() - m_pos; }
-        // Valid until the next append/consume/clear on this buffer.
         [[nodiscard]] std::string_view view() const { return std::string_view{m_data}.substr(m_pos); }
-
         void append(const std::byte *data, std::size_t n) {
             if (n == 0)
                 return;
-            // Amortized O(1): drop the consumed prefix only when at least half
-            // the buffer is dead and enough of it has accumulated to matter.
             if (m_pos >= 4096 && m_pos * 2 >= m_data.size()) {
                 m_data.erase(0, m_pos);
                 m_pos = 0;
             }
             m_data.append(reinterpret_cast<const char *>(data), n);
         }
-
         void consume(std::size_t n) {
             m_pos += std::min(n, size());
             if (m_pos >= m_data.size())
                 clear();
-        }
-
-        // Moves everything out; the h2c upgrade hands the leftover to the h2
-        // engine's receive buffer this way. The common case has nothing
-        // consumed, so the whole string can be moved rather than copied.
-        std::string take_all() {
-            if (m_pos == 0)
-                return std::exchange(m_data, {});
-            std::string out{view()};
-            clear();
-            return out;
         }
 
       private:
@@ -1515,54 +1330,45 @@ template <TransportLike Transport> class Http1Engine : public std::enable_shared
         std::size_t m_pos{0};
     };
 
-    // --- pull-mode request-body state (one request at a time; h1 is serial) ---
-    // Framing state for the request currently being served. h1 is serial, so
-    // one instance suffices, but grouping the fields makes that invariant
-    // explicit and gives setup_body_framing() a single reset point.
     struct BodyState {
         enum class Mode { None, Fixed, Chunked };
         Mode mode{Mode::None};
-        std::uint64_t remaining{0};  // Fixed: bytes left to read
-        std::uint64_t total{0};      // Chunked: running total (bounded by max_body_bytes)
-        bool done{false};            // body fully delivered (EOF reached) / no body
-        bool error{false};           // a pull failed: the connection is not at a request boundary
-        bool line_overflow{false};   // the last read_line() stopped at the size bound (not EOF)
-        bool expect_continue{false}; // the request asked for an interim 100 before its body
-
+        std::uint64_t remaining{0};
+        std::uint64_t total{0};
+        bool done{false};
+        bool error{false};
+        bool line_overflow{false};
+        bool expect_continue{false};
         void reset() { *this = BodyState{}; }
     };
-    BodyState m_body_state;
-    // Set while a request body is being pulled, so chunked trailers can be
-    // published onto the Request. Weak: the Request may outlive the engine.
-    std::weak_ptr<Request> m_body_request;
-    // Exactly-once latch for the interim 100 Continue, shared with the response
-    // writer and reset at the start of every request.
-    std::shared_ptr<std::atomic<bool>> m_continue_sent{std::make_shared<std::atomic<bool>>(false)};
+
+    static constexpr std::string_view kContinueResponse = "HTTP/1.1 100 Continue\r\n\r\n";
+    static constexpr std::size_t kReadChunkBytes = 8192;
+
+    enum class TransportOwner { Engine, WebSocket, Http2 };
+    [[nodiscard]] bool handed_off() const { return m_owner != TransportOwner::Engine; }
 
     std::shared_ptr<Transport> m_transport;
-    decltype(std::declval<Transport &>().get_executor()) m_executor;
+    asio::any_io_executor m_executor;
     EngineLimits m_limits;
-    // Shared so response writers can refresh it on writes too (see
-    // SharedDeadline).
     SharedDeadline m_deadline{std::make_shared<std::chrono::steady_clock::time_point>()};
-    ReadBuf m_in; // bytes read past the most recently parsed head
-    // Reused transport-read scratch for the body-framing helpers (read_line and
-    // the buffered starts of read_exact_into). Pull mode reads sequentially, so
-    // there is only ever one reader; hoisting the 8 KiB out of their coroutine
-    // frames stops every chunk-size line from allocating a fresh scratch.
-    std::array<std::byte, kReadChunkBytes> m_read_scratch{};
-    WsLookup m_ws_lookup;            // local WebSocket route lookup, exact only (empty if
-                                     // ws disabled)
+    ReadBuf m_in;
+    std::array<std::byte, kReadChunkBytes> m_scan{};
+    H1Parser m_parser;
+    BodyState m_body_state;
+    std::weak_ptr<Request> m_body_request;
+    std::shared_ptr<std::atomic<bool>> m_continue_sent{std::make_shared<std::atomic<bool>>(false)};
+    std::size_t m_trailer_bytes{0};
+    Dispatcher m_dispatch;
+    WsLookup m_ws_lookup;
     WsProxyLookup m_ws_proxy_lookup; // WebSocket proxy-route lookup (empty if none)
-    WsLookup m_ws_regex_lookup;      // local WebSocket route lookup, regex only
-                                     // (empty if none)
-    // Who owns the transport once serve_loop returns. Engine means run() still
-    // has to shut it down; the upgrade paths hand it to another layer, which is
-    // also what tells the watchdog to stop reaping it.
-    enum class TransportOwner { Engine, WebSocket, Http2 };
+    WsLookup m_ws_regex_lookup;
+    std::function<void()> m_on_done;
+    std::shared_ptr<asio::steady_timer> m_watchdog;
     TransportOwner m_owner{TransportOwner::Engine};
-    [[nodiscard]] bool handed_off() const { return m_owner != TransportOwner::Engine; }
-    bool m_allow_h2c{true}; // PlaintextHttp::Http1Only turns this off
+    bool m_allow_h2c{true};
+    bool m_finished{false};
+    bool m_done_called{false};
 };
 
 } // namespace simple_http

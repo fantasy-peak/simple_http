@@ -1,6 +1,6 @@
 #pragma once
 
-// Logging facade.
+// Logging facade (C++17 port).
 //
 // The library never writes to a stream itself. It formats a record and hands it
 // to whatever LogSink is installed, so a deployment can route records into
@@ -9,55 +9,37 @@
 //
 // A record carries two things a sink may format: a human-readable `message`, and
 // a set of typed `attrs` (key + value), the shape Go's `log/slog` and Rust's
-// `tracing` settled on. That split is deliberate:
+// `tracing` settled on.
 //
-//   * fields are first-class at the call site (typed, not flattened into the
-//     message), so a sink can emit them as structured data;
-//   * the *format* is the sink's decision (JSON lines, key=value text, an
-//     spdlog record, ECS/OTEL schema), not the call site's. `make_json_sink`
-//     is the ready-made line-delimited-JSON sink; a text sink renders the same
-//     attrs as `key=value`.
-//
-// An adapter for an existing logging library is a small LogSink subclass written
-// on the consumer side. That is deliberate: shipping adapters in the library
-// would put the third-party headers on every consumer's include path and imply a
-// dependency the library does not have. The interface therefore contains no
-// third-party types.
-//
-// Three properties the design is built around:
-//
-//   * The sink decides the level. `enabled()` is asked before the message is
-//     built, so a sink configured to drop a level costs nothing for records at
-//     that level — and a logger that already knows its own threshold does not
-//     need it configured twice.
-//
-//   * Installing a sink is safe while other threads log: the swap is atomic, and
-//     a thread already inside a sink keeps that sink alive until it returns.
-//
-//   * Nothing is allocated to log the common case. Messages up to
-//     kInlineMessageBytes are formatted onto the stack.
+// C++17 substitutions relative to the C++23 implementation:
+//   * std::format / std::format_string -> core/format.h's `{}` subset;
+//   * std::source_location              -> core/source_location.h;
+//   * std::span<const Attr>             -> boost::span<const Attr>;
+//   * std::atomic<std::shared_ptr<>>    -> atomic_load/atomic_store free
+//     functions on a shared_ptr (the C++17 spelling of the same guarantee:
+//     a reader inside a sink keeps that sink alive across a swap).
 //
 // Logging can be compiled out entirely with SIMPLE_HTTP_ENABLE_LOG=0, or
 // compiled down to a minimum level with SIMPLE_HTTP_LOG_ACTIVE_LEVEL.
 
 #include <array>
 #include <atomic>
+#include <boost/core/span.hpp>
 #include <chrono>
-#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
-#include <format>
 #include <memory>
 #include <mutex>
-#include <source_location>
-#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
+
+#include "format.h"
+#include "source_location.h"
 
 namespace simple_http {
 
@@ -113,8 +95,7 @@ struct Attr {
     // Any other arithmetic type (int, unsigned, long, size_t, float, ...)
     // narrows to a signed/unsigned 64-bit or a double, so there is one overload
     // rather than a ladder that can be ambiguous across platforms.
-    template <typename T>
-        requires(std::is_arithmetic_v<T> && !std::is_same_v<T, bool>)
+    template <typename T, typename = std::enable_if_t<std::is_arithmetic_v<T> && !std::is_same_v<T, bool>>>
     Attr(std::string_view k, T v) : key(k) {
         if constexpr (std::is_floating_point_v<T>) {
             value = static_cast<double>(v);
@@ -138,17 +119,12 @@ struct LogFields {
 };
 
 // One record, handed to a sink.
-//
-// `message` and `category` point at storage that is only guaranteed to live for
-// the duration of the sink call; a sink that needs either beyond that must copy
-// it. `attrs` (empty when the record carries no structured fields) has the same
-// contract; this is what keeps the facade allocation-free for the common case.
 struct LogRecord {
     LogLevel level;
     std::string_view category; // module tag; empty when the caller has none
-    std::source_location where;
+    source_location where;
     std::string_view message;
-    std::span<const Attr> attrs{};
+    boost::span<const Attr> attrs{};
 };
 
 class LogSink {
@@ -166,18 +142,14 @@ class LogSink {
 
 namespace detail {
 
-// The installed sink. std::atomic<std::shared_ptr<>> gives readers a single
-// atomic load and writers a safe swap, with no lock on the logging path; a
-// thread inside a sink holds its own shared_ptr, so a swap cannot pull the sink
-// out from under it.
-inline std::atomic<std::shared_ptr<LogSink>> &sink_slot() noexcept {
-    static std::atomic<std::shared_ptr<LogSink>> slot;
+// The installed sink. The C++17 spelling of std::atomic<std::shared_ptr<>>:
+// a reader gets a single atomic load, a writer a safe swap, and a thread inside
+// a sink holds its own shared_ptr, so a swap cannot pull the sink out from
+// under it.
+inline std::shared_ptr<LogSink> &sink_slot() noexcept {
+    static std::shared_ptr<LogSink> slot;
     return slot;
 }
-
-// Messages up to this length are formatted onto the stack; longer ones fall
-// back to a heap buffer. Sized for the usual case of an error plus its context.
-inline constexpr std::size_t kInlineMessageBytes = 512;
 
 // The value of an attr rendered for the text sink.
 inline std::string attr_text(const Attr &attr) {
@@ -186,11 +158,11 @@ inline std::string attr_text(const Attr &attr) {
         [&out](const auto &arg) {
             using T = std::decay_t<decltype(arg)>;
             if constexpr (std::is_same_v<T, std::string_view>) {
-                out.assign(arg);
+                out.assign(arg.data(), arg.size());
             } else if constexpr (std::is_same_v<T, bool>) {
                 out = arg ? "true" : "false";
             } else {
-                out = std::format("{}", arg);
+                out = simple_http::format("{}", arg);
             }
         },
         attr.value);
@@ -209,7 +181,7 @@ class FileSinkBase : public LogSink {
 
   protected:
     void write_line(std::string_view line) {
-        const std::lock_guard lock{m_mutex};
+        const std::lock_guard<std::mutex> lock{m_mutex};
         std::fwrite(line.data(), 1, line.size(), m_stream);
         std::fflush(m_stream);
     }
@@ -220,9 +192,8 @@ class FileSinkBase : public LogSink {
     std::mutex m_mutex;
 };
 
-// A one-line-per-record text sink on a stdio stream. Enough for examples, tests
-// and small tools; a deployment usually installs its own. Attributes are
-// appended as ` key=value`.
+// A one-line-per-record text sink on a stdio stream. Attributes are appended as
+// ` key=value`.
 class StreamSink final : public FileSinkBase {
   public:
     using FileSinkBase::FileSinkBase;
@@ -230,8 +201,16 @@ class StreamSink final : public FileSinkBase {
     void log(const LogRecord &record) override {
         // One string, one fwrite, under a lock: concurrent records must not
         // interleave halfway through a line.
-        std::string line = std::format("[{}] {}:{}: {}", to_string(record.level), basename(record.where.file_name()),
-                                       record.where.line(), record.message);
+        std::string line;
+        line.reserve(record.message.size() + 64);
+        line += '[';
+        line += to_string(record.level);
+        line += "] ";
+        line += basename(record.where.file_name());
+        line += ':';
+        line += std::to_string(record.where.line());
+        line += ": ";
+        line += record.message;
         for (const Attr &attr : record.attrs) {
             line += ' ';
             line += attr.key;
@@ -243,40 +222,22 @@ class StreamSink final : public FileSinkBase {
     }
 };
 
-// Line-delimited JSON, one object per record. The production sink for log
-// pipelines (Loki/ELK/Datadog/CloudWatch): fields stay typed and queryable.
-// Defined in logging_json.h (glaze-backed) so this header stays third-party
-// free; make_json_sink() is declared there.
-
 // Message-only entry point (used by the per-level macros). Formats `fmt` and
-// its args onto the stack and emits a record with no attrs.
+// its args and emits a record with no attrs.
 template <typename... Args>
-void dispatch(LogLevel level, std::string_view category, std::source_location where, std::format_string<Args...> fmt,
-              Args &&...args) {
-    auto sink = sink_slot().load(std::memory_order_acquire);
+void dispatch(LogLevel level, std::string_view category, source_location where, std::string_view fmt, Args &&...args) {
+    auto sink = std::atomic_load(&sink_slot());
     if (!sink || !sink->enabled(level)) {
         return; // nothing is formatted for a record the sink would drop
     }
-
-    std::array<char, kInlineMessageBytes> inline_buffer{};
-    const auto written = std::format_to_n(inline_buffer.data(), inline_buffer.size(), fmt, std::forward<Args>(args)...);
-    // format_to_n reports the length it would have produced, as a signed
-    // difference type, whether or not it was truncated.
-    if (std::cmp_less_equal(written.size, inline_buffer.size())) {
-        const auto length = static_cast<std::size_t>(written.size);
-        sink->log(LogRecord{level, category, where, std::string_view{inline_buffer.data(), length}});
-        return;
-    }
-    // Rare: the message outgrew the stack buffer. Format it again, this time into
-    // a heap buffer that is freed when the sink returns.
-    const std::string oversized = std::format(fmt, std::forward<Args>(args)...);
-    sink->log(LogRecord{level, category, where, oversized});
+    const std::string message = simple_http::format(fmt, std::forward<Args>(args)...);
+    sink->log(LogRecord{level, category, where, message});
 }
 
 // Structured entry point: a ready message plus typed attributes.
-inline void emit_attrs(LogLevel level, std::string_view category, std::source_location where, std::string_view message,
-                       std::span<const Attr> attrs) {
-    auto sink = sink_slot().load(std::memory_order_acquire);
+inline void emit_attrs(LogLevel level, std::string_view category, source_location where, std::string_view message,
+                       boost::span<const Attr> attrs) {
+    auto sink = std::atomic_load(&sink_slot());
     if (!sink || !sink->enabled(level)) {
         return;
     }
@@ -287,11 +248,9 @@ inline void emit_attrs(LogLevel level, std::string_view category, std::source_lo
 
 // Installs `sink` (nullptr drops every record). Safe to call at any time, from
 // any thread, while other threads are logging.
-inline void set_log_sink(std::shared_ptr<LogSink> sink) {
-    detail::sink_slot().store(std::move(sink), std::memory_order_release);
-}
+inline void set_log_sink(std::shared_ptr<LogSink> sink) { std::atomic_store(&detail::sink_slot(), std::move(sink)); }
 
-inline std::shared_ptr<LogSink> log_sink() noexcept { return detail::sink_slot().load(std::memory_order_acquire); }
+inline std::shared_ptr<LogSink> log_sink() noexcept { return std::atomic_load(&detail::sink_slot()); }
 
 // Writes to stderr: "<level> <file>:<line>: <message> [key=value ...]".
 inline std::shared_ptr<LogSink> make_stderr_sink(LogLevel minimum = LogLevel::Info) {
@@ -304,25 +263,19 @@ inline std::shared_ptr<LogSink> make_stdout_sink(LogLevel minimum = LogLevel::In
     return std::make_shared<detail::StreamSink>(minimum, stdout);
 }
 
-// Writes line-delimited JSON to stderr (glaze-backed, see logging_json.h). The
-// structured counterpart of make_stderr_sink, for a log pipeline.
-
 // What the macros expand to. Call it directly to name the category, or to
 // supply a location other than the call site. `where` must be
-// std::source_location::current() evaluated at the call site — the type has no
-// public constructor, so a wrapper function cannot capture the caller's
-// position for you, which is the whole reason the macros exist.
+// source_location::current() evaluated at the call site — its default arguments
+// capture the caller's position, which is the whole reason the macros exist.
 template <typename... Args>
-inline void log(LogLevel level, std::string_view category, std::source_location where, std::format_string<Args...> fmt,
+inline void log(LogLevel level, std::string_view category, source_location where, std::string_view fmt,
                 Args &&...args) {
     detail::dispatch(level, category, where, fmt, std::forward<Args>(args)...);
 }
 
-// The structured entry point: a ready message plus typed attributes. Call it
-// directly (it has no format string, so it needs no macro); see access_log() for
-// the library's own use.
-inline void log_with_attrs(LogLevel level, std::string_view category, std::source_location where,
-                           std::string_view message, std::span<const Attr> attrs) {
+// The structured entry point: a ready message plus typed attributes.
+inline void log_with_attrs(LogLevel level, std::string_view category, source_location where, std::string_view message,
+                           boost::span<const Attr> attrs) {
     detail::emit_attrs(level, category, where, message, attrs);
 }
 
@@ -343,8 +296,10 @@ inline void log_with_attrs(LogLevel level, std::string_view category, std::sourc
 // `category` is a string_view; use "" when the call site has no module tag.
 #define SIMPLE_HTTP_LOG_AT(level, category, ...)                                                                       \
     do {                                                                                                               \
-        if constexpr (static_cast<int>(level) >= SIMPLE_HTTP_LOG_ACTIVE_LEVEL) {                                       \
-            ::simple_http::log(level, category, std::source_location::current(), __VA_ARGS__);                         \
+        if constexpr (SIMPLE_HTTP_LOG_ACTIVE_LEVEL <= 0) {                                                             \
+            ::simple_http::log(level, category, ::simple_http::source_location::current(), __VA_ARGS__);               \
+        } else if constexpr (static_cast<int>(level) >= SIMPLE_HTTP_LOG_ACTIVE_LEVEL) {                                \
+            ::simple_http::log(level, category, ::simple_http::source_location::current(), __VA_ARGS__);               \
         }                                                                                                              \
     } while (false)
 #else

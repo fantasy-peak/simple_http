@@ -359,29 +359,28 @@ TEST_CASE("client/resolve: the hook wins, an empty hook falls back to asio", "[c
     asio::io_context ctx;
     auto ex = ctx.get_executor();
 
-    ResolveFn hook =
-        [](std::string,
-           std::string port) -> asio::awaitable<std::pair<error_code, std::vector<asio::ip::tcp::endpoint>>> {
+    ResolveFn hook = [](std::string, std::string port, ResolveCompletion done) {
         const auto p = static_cast<std::uint16_t>(std::stoul(port));
-        co_return std::pair<error_code, std::vector<asio::ip::tcp::endpoint>>{
-            {}, {asio::ip::tcp::endpoint{asio::ip::make_address("192.0.2.1"), p}}};
+        std::vector<asio::ip::tcp::endpoint> endpoints{
+            asio::ip::tcp::endpoint{asio::ip::make_address("192.0.2.1"), p}};
+        std::move(done)(error_code{}, std::move(endpoints));
     };
 
-    auto hooked = run_on(ctx, resolve_endpoints(hook, "example.com", 443, ex));
+    auto hooked = run_on(ctx, as_expected(async_resolve_endpoints(hook, "example.com", 443, ex,
+                                                                 asio::as_tuple(asio::use_awaitable))));
     REQUIRE(hooked);
-    CHECK(hooked->first == error_code{});
-    REQUIRE(hooked->second.size() == 1);
-    CHECK(hooked->second[0].address() == asio::ip::make_address("192.0.2.1"));
-    CHECK(hooked->second[0].port() == 443);
+    REQUIRE(hooked->has_value());
+    REQUIRE((*hooked)->size() == 1);
+    CHECK((*hooked)->at(0).address() == asio::ip::make_address("192.0.2.1"));
+    CHECK((*hooked)->at(0).port() == 443);
 
     // No hook: the same call still resolves through asio (a numeric host needs
     // no network, which keeps this test hermetic).
-    auto fallback = run_on(ctx, resolve_endpoints(ResolveFn{}, "127.0.0.1", 80, ex));
+    auto fallback = run_on(ctx, async_resolve_endpoints(ResolveFn{}, "127.0.0.1", 80, ex, asio::use_awaitable));
     REQUIRE(fallback);
-    CHECK(fallback->first == error_code{});
-    REQUIRE_FALSE(fallback->second.empty());
-    CHECK(fallback->second[0].address() == asio::ip::make_address("127.0.0.1"));
-    CHECK(fallback->second[0].port() == 80);
+    REQUIRE_FALSE(fallback->empty());
+    CHECK(fallback->at(0).address() == asio::ip::make_address("127.0.0.1"));
+    CHECK(fallback->at(0).port() == 80);
 }
 
 TEST_CASE("client/retry: Retry-After parses seconds and HTTP dates", "[client][retry]") {

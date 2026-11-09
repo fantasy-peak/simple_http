@@ -30,6 +30,7 @@
 // handler/static_files.h, which is the half that needs them.
 
 #include <algorithm>
+#include <boost/unordered_map.hpp>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -37,10 +38,10 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <vector>
 
 #include "accept_encoding.h" // AcceptEncoding, coding_q, identity_q
+#include "compat.h"          // starts_with / ends_with
 #include "logging.h"
 #include "mime.h"     // by_extension
 #include "types.h"    // StringHash (the lookup's transparent hash)
@@ -140,7 +141,19 @@ inline bool path_is_under(const std::string &root, const std::string &candidate)
 // number (observed: a plausible-looking but wildly wrong year, which then also
 // poisons the ETag). clock_cast is the portable conversion between clocks.
 inline std::int64_t file_time_to_unix(const std::filesystem::file_time_type &t) {
-    const auto sys = std::chrono::clock_cast<std::chrono::system_clock>(t);
+    // C++17 has no std::chrono::clock_cast. The portable substitute samples the
+    // offset between the file clock and the system clock "now" and applies it
+    // to `t`; the file clock's epoch is unspecified but the tick period is the
+    // same, so a duration_cast keeps the arithmetic well-formed. A few
+    // nanoseconds of sampling skew are irrelevant for a seconds-granularity
+    // timestamp.
+    const auto file_offset = std::chrono::duration_cast<std::chrono::system_clock::duration>(
+        std::filesystem::file_time_type::clock::now().time_since_epoch());
+    const auto sys_offset = std::chrono::duration_cast<std::chrono::system_clock::duration>(
+        std::chrono::system_clock::now().time_since_epoch());
+    const auto delta = file_offset - sys_offset;
+    const auto sys = std::chrono::system_clock::time_point{
+        std::chrono::duration_cast<std::chrono::system_clock::duration>(t.time_since_epoch()) - delta};
     return static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::seconds>(sys.time_since_epoch()).count());
 }
 
@@ -257,8 +270,8 @@ class StaticTable {
     // Built once by load(), then read-only for the life of the process. Every
     // worker thread reads it concurrently; nothing mutates it, so no lock is
     // needed — and none may be added without also revisiting the serving half,
-    // which deliberately holds no lock across any co_await.
-    std::unordered_map<std::string, EntryPtr, StringHash, std::equal_to<>> m_table;
+    // which deliberately holds no lock across any await point.
+    boost::unordered_map<std::string, EntryPtr, StringHash, std::equal_to<>> m_table;
 
     EntryPtr m_not_found;
 
@@ -332,7 +345,7 @@ inline bool StaticTable::load(std::string &error) {
     }
     std::sort(rels.begin(), rels.end()); // deterministic keys and preload order
 
-    auto is_precompressed = [](std::string_view rel) { return rel.ends_with(".br") || rel.ends_with(".gz"); };
+    auto is_precompressed = [](std::string_view rel) { return ends_with(rel, ".br") || ends_with(rel, ".gz"); };
 
     auto make_representation = [&](const std::string &rel, std::uint64_t &budget) -> StaticRepresentation {
         StaticRepresentation rep;
@@ -345,9 +358,9 @@ inline bool StaticTable::load(std::string &error) {
         const std::int64_t mtime_s = se ? 0 : detail::file_time_to_unix(mtime);
 
         std::string suffix;
-        if (rel.ends_with(".br")) {
+        if (ends_with(rel, ".br")) {
             suffix = "br";
-        } else if (rel.ends_with(".gz")) {
+        } else if (ends_with(rel, ".gz")) {
             suffix = "gz";
         }
         rep.etag = make_etag(mtime_s, rep.size, suffix);
@@ -369,7 +382,7 @@ inline bool StaticTable::load(std::string &error) {
     // Looking the base up in m_table would also match an alias key (a directory
     // index or the extensionless .html spelling), which is how blog.gz used to
     // become the gzip representation of /blog's index.html.
-    std::unordered_map<std::string, std::shared_ptr<StaticEntry>> direct;
+    boost::unordered_map<std::string, std::shared_ptr<StaticEntry>> direct;
 
     // Pass 1: the base files.
     for (const auto &rel : rels) {
@@ -421,7 +434,7 @@ inline bool StaticTable::load(std::string &error) {
             while (!dir.empty() && dir.back() == '/')
                 dir.pop_back();
             insert_keys(dir.empty() ? "/" : "/" + dir);
-        } else if (rel.ends_with(".html")) {
+        } else if (ends_with(rel, ".html")) {
             // No 301 from /blog/foo to /blog/foo.html: a redirect is an
             // open-redirect surface for no benefit, and answering both is what a
             // `try_files $uri $uri.html $uri/index.html` config does anyway.
@@ -439,10 +452,10 @@ inline bool StaticTable::load(std::string &error) {
     for (const auto &rel : rels) {
         std::string base;
         bool is_br = false;
-        if (rel.ends_with(".br")) {
+        if (ends_with(rel, ".br")) {
             base = rel.substr(0, rel.size() - 3);
             is_br = true;
-        } else if (rel.ends_with(".gz")) {
+        } else if (ends_with(rel, ".gz")) {
             base = rel.substr(0, rel.size() - 3);
         } else {
             continue;
@@ -486,14 +499,14 @@ inline std::string StaticTable::cache_control_for(const StaticEntry &entry) cons
         // Content-hashed: the bytes behind this URL can never change.
         return "public, max-age=31536000, immutable";
     }
-    if (entry.content_type.starts_with("text/html")) {
+    if (starts_with(entry.content_type, "text/html")) {
         // Revalidate every time. This is also what keeps conditional requests
         // exercised in a normal browsing session: a cache that never revalidates
         // hides the whole ETag path behind a browser's private cache.
         return "no-cache";
     }
-    if (entry.content_type.starts_with("application/json") || entry.content_type.starts_with("application/xml") ||
-        entry.content_type.starts_with("application/manifest")) {
+    if (starts_with(entry.content_type, "application/json") || starts_with(entry.content_type, "application/xml") ||
+        starts_with(entry.content_type, "application/manifest")) {
         return "public, max-age=3600";
     }
     return "public, max-age=86400";

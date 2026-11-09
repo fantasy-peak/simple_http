@@ -31,7 +31,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
-#include <span>
+#include "../core/compat.h"
 #include <vector>
 
 namespace simple_http::quic {
@@ -56,7 +56,7 @@ struct StreamData {
     // Non-zero when this slice ends the stream (the FIN rides with it).
     int fin{0};
     // The bytes. Empty with a negative `stream_id` is the common case.
-    std::span<const ByteVec> vec{};
+    boost::span<const ByteVec> vec{};
     // Non-zero: the engine hit a connection-level error and the connection must
     // be closed with this HTTP/3 error code. Returning the code here rather
     // than throwing keeps the pull path allocation- and exception-free, which
@@ -96,7 +96,7 @@ class Protocol {
     // STREAM frame payload. `fin` is carried in `flags` as `kStreamDataFin`,
     // which the engine masks itself.
     virtual void on_stream_data(std::uint32_t flags, std::int64_t stream_id,
-                                std::span<const std::uint8_t> data) noexcept = 0;
+                                boost::span<const std::uint8_t> data) noexcept = 0;
 
     // The peer acknowledged `datalen` bytes of this stream's send half. This is
     // what lets the engine release the buffer it lent to the connection, and

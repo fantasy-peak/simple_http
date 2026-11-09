@@ -18,6 +18,7 @@
 #include <string>
 #include <string_view>
 
+#include "compat.h"     // starts_with
 #include "http_field.h" // trim_ows
 
 namespace simple_http {
@@ -54,7 +55,7 @@ inline std::string make_etag(std::int64_t mtime_unix, std::uint64_t size, std::s
 inline bool etag_matches(std::string_view header_value, std::string_view etag) {
     auto strip = [](std::string_view v) {
         v = trim_ows(v);
-        if (v.starts_with("W/"))
+        if (starts_with(v, "W/"))
             v.remove_prefix(2);
         return v;
     };
@@ -82,7 +83,7 @@ inline bool etag_matches(std::string_view header_value, std::string_view etag) {
 inline bool etag_strong_match(std::string_view header_value, std::string_view etag) {
     auto strong = [](std::string_view v) {
         v = trim_ows(v);
-        return !v.starts_with("W/") ? v : std::string_view{};
+        return !starts_with(v, "W/") ? v : std::string_view{};
     };
     const auto expected = strong(etag);
     const auto supplied = strong(header_value);
@@ -108,7 +109,7 @@ struct ByteRange {
 inline std::optional<ByteRange> parse_range(std::string_view header, std::uint64_t size, bool &unsatisfiable) {
     unsatisfiable = false;
     constexpr std::string_view kPrefix = "bytes=";
-    if (!header.starts_with(kPrefix))
+    if (!starts_with(header, kPrefix))
         return std::nullopt;
     std::string_view spec = header.substr(kPrefix.size());
 

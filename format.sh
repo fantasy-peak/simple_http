@@ -39,7 +39,7 @@ case "${1:-}" in
 esac
 
 # include/ 与 test/ 下的 C/C++ 源文件。
-mapfile -t files < <(find "$ROOT/include" "$ROOT/test" -type f \
+mapfile -t files < <(find "$ROOT/include" "$ROOT/cpp17" "$ROOT/test" -type f \
     \( -name '*.h' -o -name '*.hpp' -o -name '*.hh' -o -name '*.cpp' -o -name '*.cc' -o -name '*.cxx' \) \
     -not -path '*/build/*' -not -path '*/.venv/*' | sort)
 

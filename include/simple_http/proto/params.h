@@ -1,23 +1,27 @@
 #pragma once
 
-// Typed request-parameter extraction — the axum `Path<T>` / `Query<T>`
+// Typed request-parameter extraction -- the axum `Path<T>` / `Query<T>`
 // extractors (and Go 1.22's typed `r.PathValue`): a struct's field names are
 // matched against the route template's `{name}`s (path) or the query-string
 // keys (query), and each value is parsed into its field's type by glaze
 // reflection:
 //
 //   struct Params { std::string id; std::int64_t page; };
-//   server.route({Method::Get}, "/orders/{id}?page={page}"… // actually path:
 //   server.route({Method::Get}, "/orders/{id}", handler);       // template
 //   const auto p = simple_http::path_params<Params>(*req);      // captures
-//   const auto q = simple_http::query_params<Params>(*req);     // ?page=…
+//   const auto q = simple_http::query_params<Params>(*req);     // ?page=...
 //
-// A missing or unparsable value yields nullopt — the handler decides the 404
-// /400 — matching openapi::path_params (which now aliases here). Values are
+// A missing or unparsable value yields nullopt -- the handler decides the 404
+// /400 -- matching openapi::path_params (which now aliases here). Values are
 // read as JSON scalars, so numeric and boolean fields parse exactly like their
 // JSON spellings; std::string fields take the raw text.
+//
+// This is part of the glaze-gated surface: see core/glaze_support.h. A real
+// C++17 build does not see this header's contents.
 
-#include <glaze/glaze.hpp>
+#include "../core/glaze_support.h"
+
+#if SIMPLE_HTTP_CPP17_ENABLE_GLAZE
 
 #include <optional>
 #include <string>
@@ -34,7 +38,7 @@ namespace params_detail {
 // Fills `out` field by field from `get(name)`: glaze reflection names the
 // fields, the getter supplies the values. Any missing or unparsable field
 // marks the parse incomplete (nullopt upstream).
-template <typename T, typename Getter> bool params_from(T &out, Getter &&get) {
+template <typename T, typename Getter> bool params_from(T &out, const Getter &get) {
     bool complete = true;
     std::size_t i = 0;
     glz::for_each_field(out, [&](auto &field) {
@@ -81,7 +85,7 @@ template <typename T> std::optional<T> query_params(const Request &req) {
     return out;
 }
 
-// Parses any QueryParams into T — the shared engine behind query_params, so a
+// Parses any QueryParams into T -- the shared engine behind query_params, so a
 // parsed urlencoded form body parses the same way. The returned T owns its
 // strings; `q` only needs to outlive the call.
 template <typename T> std::optional<T> parse_params(const QueryParams &q) {
@@ -93,3 +97,5 @@ template <typename T> std::optional<T> parse_params(const QueryParams &q) {
 }
 
 } // namespace simple_http
+
+#endif // SIMPLE_HTTP_CPP17_ENABLE_GLAZE

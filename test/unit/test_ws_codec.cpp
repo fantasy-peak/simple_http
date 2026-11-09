@@ -274,13 +274,12 @@ TEST_CASE("ws/backend: messages, fragmentation, Ping and Close", "[ws]") {
     auto backend =
         std::make_shared<WsBackendImpl<MockTransport>>(transport, /*max_payload=*/4096, std::chrono::seconds(5));
     auto ws = std::make_shared<WebSocket>(backend);
-    asio::co_spawn(ctx, ws->run_writer(),
-                   asio::detached); // the pump the handle writes through
+    ws->run_writer(); // the pump the handle writes through
     drain(ctx);
 
     SECTION("a single masked text frame is delivered as one message") {
         transport->push(ws_client_frame(WsOpcode::Text, "hello"));
-        auto message = run_until(ctx, ws->read());
+        auto message = run_until(ctx, ws_read(*ws));
         REQUIRE(message.has_value());
         REQUIRE(message->has_value());
         CHECK((*message)->data == "hello");
@@ -289,7 +288,7 @@ TEST_CASE("ws/backend: messages, fragmentation, Ping and Close", "[ws]") {
 
     SECTION("a binary frame keeps its type") {
         transport->push(ws_client_frame(WsOpcode::Binary, "raw"));
-        auto message = run_until(ctx, ws->read());
+        auto message = run_until(ctx, ws_read(*ws));
         REQUIRE(message.has_value());
         REQUIRE(message->has_value());
         CHECK((*message)->data == "raw");
@@ -300,7 +299,7 @@ TEST_CASE("ws/backend: messages, fragmentation, Ping and Close", "[ws]") {
         transport->push(ws_client_frame(WsOpcode::Text, "frag1-", /*fin=*/false));
         transport->push(ws_client_frame(WsOpcode::Continuation, "frag2-", /*fin=*/false));
         transport->push(ws_client_frame(WsOpcode::Continuation, "frag3", /*fin=*/true));
-        auto message = run_until(ctx, ws->read());
+        auto message = run_until(ctx, ws_read(*ws));
         REQUIRE(message.has_value());
         REQUIRE(message->has_value());
         CHECK((*message)->data == "frag1-frag2-frag3");
@@ -309,7 +308,7 @@ TEST_CASE("ws/backend: messages, fragmentation, Ping and Close", "[ws]") {
     SECTION("a Ping is answered with a Pong and reading continues") {
         transport->push(ws_client_frame(WsOpcode::Ping, "ping-payload"));
         transport->push(ws_client_frame(WsOpcode::Text, "after ping"));
-        auto message = run_until(ctx, ws->read());
+        auto message = run_until(ctx, ws_read(*ws));
         REQUIRE(message.has_value());
         REQUIRE(message->has_value());
         CHECK((*message)->data == "after ping");
@@ -323,7 +322,7 @@ TEST_CASE("ws/backend: messages, fragmentation, Ping and Close", "[ws]") {
 
     SECTION("a Close is answered with a Close and ends the read") {
         transport->push(ws_client_frame(WsOpcode::Close, ws_close_payload(1000)));
-        auto message = run_until(ctx, ws->read());
+        auto message = run_until(ctx, ws_read(*ws));
         REQUIRE(message.has_value());
         REQUIRE_FALSE(message->has_value());
         CHECK(message->error() == asio::error::eof);
@@ -337,7 +336,7 @@ TEST_CASE("ws/backend: messages, fragmentation, Ping and Close", "[ws]") {
     SECTION("a data frame before the previous message finished is an error") {
         transport->push(ws_client_frame(WsOpcode::Text, "unfinished", /*fin=*/false));
         transport->push(ws_client_frame(WsOpcode::Text, "interrupting", /*fin=*/true));
-        auto message = run_until(ctx, ws->read());
+        auto message = run_until(ctx, ws_read(*ws));
         REQUIRE(message.has_value());
         REQUIRE_FALSE(message->has_value());
         CHECK(message->error() == asio::error::invalid_argument);
@@ -345,7 +344,7 @@ TEST_CASE("ws/backend: messages, fragmentation, Ping and Close", "[ws]") {
 
     SECTION("a continuation without a started message is an error") {
         transport->push(ws_client_frame(WsOpcode::Continuation, "orphan", /*fin=*/true));
-        auto message = run_until(ctx, ws->read());
+        auto message = run_until(ctx, ws_read(*ws));
         REQUIRE(message.has_value());
         REQUIRE_FALSE(message->has_value());
         CHECK(message->error() == asio::error::invalid_argument);
@@ -354,14 +353,14 @@ TEST_CASE("ws/backend: messages, fragmentation, Ping and Close", "[ws]") {
     SECTION("reassembling past max_payload is refused") {
         transport->push(ws_client_frame(WsOpcode::Text, std::string(3000, 'a'), /*fin=*/false));
         transport->push(ws_client_frame(WsOpcode::Continuation, std::string(3000, 'b'), /*fin=*/true));
-        auto message = run_until(ctx, ws->read());
+        auto message = run_until(ctx, ws_read(*ws));
         REQUIRE(message.has_value());
         REQUIRE_FALSE(message->has_value());
         CHECK(message->error() == asio::error::message_size);
     }
 
     SECTION("a small payload is written as a single unmasked frame") {
-        REQUIRE(run_until(ctx, ws->write("out", /*text=*/true)));
+        REQUIRE(run_until(ctx, ws_write(*ws, "out", /*text=*/true)));
         drain(ctx);
         const std::string written = transport->written();
         REQUIRE(written.size() >= 5);
@@ -440,11 +439,11 @@ TEST_CASE("ws/backend: ping and close-with-code", "[ws]") {
     auto backend =
         std::make_shared<WsBackendImpl<MockTransport>>(transport, /*max_payload=*/4096, std::chrono::seconds(5));
     auto ws = std::make_shared<WebSocket>(backend);
-    asio::co_spawn(ctx, ws->run_writer(), asio::detached); // the pump writes through
+    ws->run_writer(); // the pump writes through
     drain(ctx);
 
     SECTION("ping writes a Ping frame once") {
-        REQUIRE(run_until(ctx, ws->ping("probe")));
+        REQUIRE(run_until(ctx, as_ec(ws->async_ping("probe", asio::as_tuple(asio::use_awaitable)))));
         drain(ctx);
         const std::string written = transport->written();
         REQUIRE(written.size() >= 5);
@@ -454,7 +453,7 @@ TEST_CASE("ws/backend: ping and close-with-code", "[ws]") {
     }
 
     SECTION("a Ping payload over 125 octets is refused (control-frame cap)") {
-        const auto ec = run_until(ctx, ws->ping(std::string(126, 'a')));
+        const auto ec = run_until(ctx, ws_ping(*ws, std::string(126, 'a')));
         REQUIRE(ec.has_value());
         CHECK(*ec == asio::error::invalid_argument);
         drain(ctx);
@@ -462,7 +461,7 @@ TEST_CASE("ws/backend: ping and close-with-code", "[ws]") {
     }
 
     SECTION("close() with a code and reason serializes both") {
-        REQUIRE(run_until(ctx, ws->close(1001, "going away")));
+        REQUIRE(run_until(ctx, ws_close(*ws, 1001, "going away")));
         drain(ctx);
         const std::string written = transport->written();
         REQUIRE(written.size() >= 4);
@@ -474,20 +473,20 @@ TEST_CASE("ws/backend: ping and close-with-code", "[ws]") {
 
     SECTION("a code the peer may never receive is refused") {
         for (std::uint16_t bad : {1004u, 1005u, 1006u, 1015u, 2000u, 5000u}) {
-            const auto ec = run_until(ctx, ws->close(bad, ""));
+            const auto ec = run_until(ctx, ws_close(*ws, bad, ""));
             REQUIRE(ec.has_value());
             CHECK(*ec == asio::error::invalid_argument);
         }
     }
 
     SECTION("a reason that is not UTF-8 is refused") {
-        const auto ec = run_until(ctx, ws->close(1000, std::string{"\xFF\xFE"}));
+        const auto ec = run_until(ctx, ws_close(*ws, 1000, std::string{"\xFF\xFE"}));
         REQUIRE(ec.has_value());
         CHECK(*ec == asio::error::invalid_argument);
     }
 
     SECTION("a reason over 123 octets is refused") {
-        const auto ec = run_until(ctx, ws->close(1000, std::string(124, 'x')));
+        const auto ec = run_until(ctx, ws_close(*ws, 1000, std::string(124, 'x')));
         REQUIRE(ec.has_value());
         CHECK(*ec == asio::error::invalid_argument);
     }
@@ -710,7 +709,7 @@ TEST_CASE("ws/deflate: the backend round-trips compressed messages", "[ws][ws-de
                                                                   std::chrono::seconds(5), /*expect_masked=*/true,
                                                                   /*inbox_limit=*/4u * 1024 * 1024, deflate);
     auto ws = std::make_shared<WebSocket>(backend);
-    asio::co_spawn(ctx, ws->run_writer(), asio::detached);
+    ws->run_writer();
     drain(ctx);
 
     const unsigned char mask[4] = {0x37, 0xfa, 0x21, 0x3d};
@@ -720,7 +719,7 @@ TEST_CASE("ws/deflate: the backend round-trips compressed messages", "[ws][ws-de
         std::string compressed;
         REQUIRE(d.compress("hello compressed world", compressed, false));
         transport->push(ws_client_frame(WsOpcode::Text, compressed, /*fin=*/true, mask, /*rsv1=*/true));
-        auto message = run_until(ctx, ws->read());
+        auto message = run_until(ctx, ws_read(*ws));
         REQUIRE(message.has_value());
         REQUIRE(message->has_value());
         CHECK((*message)->data == "hello compressed world");
@@ -735,7 +734,7 @@ TEST_CASE("ws/deflate: the backend round-trips compressed messages", "[ws][ws-de
         transport->push(
             ws_client_frame(WsOpcode::Text, compressed.substr(0, half), /*fin=*/false, mask, /*rsv1=*/true));
         transport->push(ws_client_frame(WsOpcode::Continuation, compressed.substr(half), /*fin=*/true, mask));
-        auto message = run_until(ctx, ws->read());
+        auto message = run_until(ctx, ws_read(*ws));
         REQUIRE(message.has_value());
         REQUIRE(message->has_value());
         CHECK((*message)->data == std::string(1024, 'q') + "tail");
@@ -743,14 +742,14 @@ TEST_CASE("ws/deflate: the backend round-trips compressed messages", "[ws][ws-de
 
     SECTION("uncompressed messages still pass through once compression is on") {
         transport->push(ws_client_frame(WsOpcode::Text, "plain", /*fin=*/true, mask, /*rsv1=*/false));
-        auto message = run_until(ctx, ws->read());
+        auto message = run_until(ctx, ws_read(*ws));
         REQUIRE(message.has_value());
         REQUIRE(message->has_value());
         CHECK((*message)->data == "plain");
     }
 
     SECTION("a compressed write hits the wire with RSV1 and decodes back") {
-        REQUIRE(run_until(ctx, ws->write("outbound compressed", /*text=*/true)));
+        REQUIRE(run_until(ctx, ws_write(*ws, "outbound compressed", /*text=*/true)));
         drain(ctx);
         const std::string written = transport->written();
         REQUIRE(written.size() >= 3);
@@ -772,7 +771,7 @@ TEST_CASE("ws/deflate: the backend round-trips compressed messages", "[ws][ws-de
         REQUIRE(d.compress("two", compressed, false));
         transport->push(ws_client_frame(WsOpcode::Text, "one", /*fin=*/false, mask, /*rsv1=*/false));
         transport->push(ws_client_frame(WsOpcode::Continuation, compressed, /*fin=*/true, mask, /*rsv1=*/true));
-        auto message = run_until(ctx, ws->read());
+        auto message = run_until(ctx, ws_read(*ws));
         REQUIRE(message.has_value());
         REQUIRE_FALSE(message->has_value());
         CHECK(message->error() == asio::error::invalid_argument);
@@ -791,7 +790,7 @@ TEST_CASE("ws/deflate: the backend round-trips compressed messages", "[ws][ws-de
         transport->push(frame.substr(0, mid));
         drain(ctx); // the reader must see the partial frame
         transport->push(frame.substr(mid));
-        auto message = run_until(ctx, ws->read());
+        auto message = run_until(ctx, ws_read(*ws));
         REQUIRE(message.has_value());
         REQUIRE(message->has_value());
         CHECK((*message)->data == "split-in-flights");
@@ -800,7 +799,7 @@ TEST_CASE("ws/deflate: the backend round-trips compressed messages", "[ws][ws-de
     SECTION("corrupt deflate data is a protocol error, not a crash") {
         transport->push(ws_client_frame(WsOpcode::Text, std::string{"\xDE\xAD\xBE\xEF\x00\x01\x02\x03"}, /*fin=*/true,
                                         mask, /*rsv1=*/true));
-        auto message = run_until(ctx, ws->read());
+        auto message = run_until(ctx, ws_read(*ws));
         REQUIRE(message.has_value());
         REQUIRE_FALSE(message->has_value());
         CHECK(message->error() == asio::error::invalid_argument);
@@ -811,7 +810,7 @@ TEST_CASE("ws/deflate: the backend round-trips compressed messages", "[ws][ws-de
         std::string compressed;
         REQUIRE(d.compress(std::string{"\x80\x81"}, compressed, false));
         transport->push(ws_client_frame(WsOpcode::Text, compressed, /*fin=*/true, mask, /*rsv1=*/true));
-        auto message = run_until(ctx, ws->read());
+        auto message = run_until(ctx, ws_read(*ws));
         REQUIRE(message.has_value());
         REQUIRE_FALSE(message->has_value());
         CHECK(message->error() == asio::error::invalid_argument);
@@ -828,11 +827,11 @@ TEST_CASE("ws/deflate: per-connection compression controls", "[ws][ws-deflate]")
                                                                       std::chrono::seconds(5), /*expect_masked=*/true,
                                                                       /*inbox_limit=*/4u * 1024 * 1024, deflate);
         auto ws = std::make_shared<WebSocket>(backend);
-        asio::co_spawn(ctx, ws->run_writer(), asio::detached);
+        ws->run_writer();
         drain(ctx);
 
         CHECK(ws->compression_negotiated());
-        REQUIRE(run_until(ctx, ws->write("compressed by default", /*text=*/true)));
+        REQUIRE(run_until(ctx, ws_write(*ws, "compressed by default", /*text=*/true)));
         drain(ctx);
         const std::string written = transport->written();
         REQUIRE(!written.empty());
@@ -846,14 +845,14 @@ TEST_CASE("ws/deflate: per-connection compression controls", "[ws][ws-deflate]")
                                                                       std::chrono::seconds(5), /*expect_masked=*/true,
                                                                       /*inbox_limit=*/4u * 1024 * 1024, deflate);
         auto ws = std::make_shared<WebSocket>(backend);
-        asio::co_spawn(ctx, ws->run_writer(), asio::detached);
+        ws->run_writer();
         drain(ctx);
 
-        REQUIRE(run_until(ctx, ws->write("first compressed", /*text=*/true)));
-        REQUIRE(run_until(ctx, ws->enable_write_compression(false)));
-        REQUIRE(run_until(ctx, ws->write("then plain", /*text=*/true)));
-        REQUIRE(run_until(ctx, ws->enable_write_compression(true)));
-        REQUIRE(run_until(ctx, ws->write("compressed again", /*text=*/true)));
+        REQUIRE(run_until(ctx, ws_write(*ws, "first compressed", /*text=*/true)));
+        REQUIRE(run_until(ctx, ws_enable_compression(*ws, false)));
+        REQUIRE(run_until(ctx, ws_write(*ws, "then plain", /*text=*/true)));
+        REQUIRE(run_until(ctx, ws_enable_compression(*ws, true)));
+        REQUIRE(run_until(ctx, ws_write(*ws, "compressed again", /*text=*/true)));
         drain(ctx);
 
         // Each write is one queued frame: walk them and check the RSV1 bit.
@@ -871,22 +870,22 @@ TEST_CASE("ws/deflate: per-connection compression controls", "[ws][ws-deflate]")
                                                                       std::chrono::seconds(5), /*expect_masked=*/true,
                                                                       /*inbox_limit=*/4u * 1024 * 1024, deflate);
         auto ws = std::make_shared<WebSocket>(backend);
-        asio::co_spawn(ctx, ws->run_writer(), asio::detached);
+        ws->run_writer();
         drain(ctx);
 
         for (int good : {0, 1, 6, 9}) {
-            const auto ec = run_until(ctx, ws->set_compression_level(good));
+            const auto ec = run_until(ctx, ws_set_compression_level(*ws, good));
             REQUIRE(ec.has_value());
             CHECK_FALSE(*ec);
         }
         for (int bad : {-1, 10, 100}) {
-            const auto ec = run_until(ctx, ws->set_compression_level(bad));
+            const auto ec = run_until(ctx, ws_set_compression_level(*ws, bad));
             REQUIRE(ec.has_value());
             CHECK(*ec == asio::error::invalid_argument);
         }
         // The level change takes effect: compressed output still round-trips.
-        REQUIRE(run_until(ctx, ws->set_compression_level(1)));
-        REQUIRE(run_until(ctx, ws->write("level one", /*text=*/true)));
+        REQUIRE(run_until(ctx, ws_set_compression_level(*ws, 1)));
+        REQUIRE(run_until(ctx, ws_write(*ws, "level one", /*text=*/true)));
         drain(ctx);
         const std::string written = transport->written();
         REQUIRE(written.size() >= 3);
@@ -898,12 +897,12 @@ TEST_CASE("ws/deflate: per-connection compression controls", "[ws][ws-deflate]")
         auto backend =
             std::make_shared<WsBackendImpl<MockTransport>>(transport, /*max_payload=*/65536, std::chrono::seconds(5));
         auto ws = std::make_shared<WebSocket>(backend);
-        asio::co_spawn(ctx, ws->run_writer(), asio::detached);
+        ws->run_writer();
         drain(ctx);
 
         CHECK_FALSE(ws->compression_negotiated());
-        REQUIRE(run_until(ctx, ws->enable_write_compression(true))); // accepted, no effect
-        REQUIRE(run_until(ctx, ws->write("plain", /*text=*/true)));
+        REQUIRE(run_until(ctx, ws_enable_compression(*ws, true))); // accepted, no effect
+        REQUIRE(run_until(ctx, ws_write(*ws, "plain", /*text=*/true)));
         drain(ctx);
         const std::string written = transport->written();
         REQUIRE(!written.empty());
@@ -921,7 +920,7 @@ TEST_CASE("ws/inbox: a flooding peer is bounded by inbox_limit", "[ws]") {
                                                                   std::chrono::seconds(5), /*expect_masked=*/true,
                                                                   /*inbox_limit=*/kLimit);
     auto ws = std::make_shared<WebSocket>(backend);
-    asio::co_spawn(ctx, ws->run_writer(), asio::detached);
+    ws->run_writer();
 
     const unsigned char mask[4] = {0x37, 0xfa, 0x21, 0x3d};
     std::string expected;
@@ -933,7 +932,7 @@ TEST_CASE("ws/inbox: a flooding peer is bounded by inbox_limit", "[ws]") {
 
     // Touch read() once so the reader pump starts, then let it run ahead. If
     // the inbox were unbounded it would swallow the whole flood here.
-    auto first = run_until(ctx, ws->read());
+    auto first = run_until(ctx, ws_read(*ws));
     REQUIRE(first.has_value());
     REQUIRE(first->has_value());
     drain(ctx);
@@ -942,7 +941,7 @@ TEST_CASE("ws/inbox: a flooding peer is bounded by inbox_limit", "[ws]") {
     // Draining makes room; the reader resumes and delivers everything in order.
     std::string got = (*first)->data;
     for (int i = 1; i < 10; ++i) {
-        auto message = run_until(ctx, ws->read());
+        auto message = run_until(ctx, ws_read(*ws));
         REQUIRE(message.has_value());
         REQUIRE(message->has_value());
         got += (*message)->data;

@@ -1,22 +1,61 @@
 #pragma once
 
-// Dispatcher: the callback an engine invokes once a request is ready.
+// Dispatcher: the seam between an engine and the handler layer (C++17 port).
 //
-// It is the seam between the engine layer (which produces Request/Response) and
-// the handler layer (Router, which implements a Dispatcher). Defined here so
-// the engines depend only on this narrow type, not on the whole handler layer.
+// This is the one header in the port allowed to mention coroutine types. The
+// C++17 build compiles the coroutine branch out entirely
+// (SIMPLE_HTTP_CPP17_CORO_HANDLERS == 0); a downstream build compiled as C++20
+// gets automatic adaptation of coroutine handlers, so the same registration
+// call works with either style:
+//
+//   server.route({Method::Get}, "/hello",
+//       [](RequestPtr, ResponsePtr res, HandlerCompletion done) {   // callback
+//           res->status(200);
+//           // finish_with adapts an "I am done" handler to the error_code
+//           // signature an I/O operation completes with.
+//           res->async_send("hello", finish_with(std::move(done)));
+//       });
+//
+//   server.route({Method::Get}, "/hello",
+//       [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {  // C++20
+//           res->status(200);
+//           co_await res->async_send("hello", asio::use_awaitable);
+//       });
+//
+// Both forms are normalized to CallbackHandler. The coroutine adapter spawns
+// the handler on the request's owner executor with the request's cancellation
+// slot bound, and turns an exception into the same 500/close behaviour the
+// C++23 implementation had.
 
+#include <boost/asio/any_completion_handler.hpp>
+#include <boost/asio/any_io_executor.hpp>
+#include <boost/asio/detail/config.hpp>
+
+#if defined(BOOST_ASIO_HAS_CO_AWAIT)
 #include <boost/asio/awaitable.hpp>
+#include <boost/asio/bind_cancellation_slot.hpp>
+#include <boost/asio/co_spawn.hpp>
+#define SIMPLE_HTTP_CPP17_CORO_HANDLERS 1
+#else
+#define SIMPLE_HTTP_CPP17_CORO_HANDLERS 0
+#endif
+
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
+#include <utility>
+#include <variant>
 
-#include "../core/resolve.h" // ResolveFn (optional external DNS)
+#include "../core/http_status.h"
+#include "../core/logging.h"
+#include "../core/resolve.h"
 #include "../proto/request.h"
 #include "../proto/response.h"
 #include "../proto/websocket.h"
@@ -26,168 +65,425 @@ namespace simple_http {
 
 namespace asio = boost::asio;
 
-using Dispatcher =
-    std::function<asio::awaitable<void>(std::shared_ptr<Request>, std::shared_ptr<ResponseWriter>, SslHandle)>;
+using RequestPtr = std::shared_ptr<Request>;
+using ResponsePtr = std::shared_ptr<ResponseWriter>;
 
-// The raw WebSocket route handler — the shape a ws_route() registration has.
-// (handler.h spells the identical alias as `WsHandler`; both are the same
-// function type, and this header stands alone per the layering rule, so the
-// alias is repeated here and converting between the two spellings is free.)
-using WsHandler = std::function<asio::awaitable<void>(std::shared_ptr<Request>, std::shared_ptr<WebSocket>)>;
+// Handler completion: what a handler calls once it has finished (successfully
+// or not). It carries no error; a handler reports failures through the
+// response, and exceptions are turned into 500s by the adapter below.
+using HandlerCompletion = asio::any_completion_handler<void()>;
 
-// The engine's terminal step of a WebSocket upgrade: called by the handler
-// layer once its middleware chain has reached it (i.e. no middleware
-// short-circuited the handshake). It negotiates extensions, writes the 101
-// handshake (folding in any fields middleware set on `res`), builds the
-// WebSocket, runs `handler`, and closes the connection. Returns true when the
-// connection was upgraded.
-using WsUpgrade =
-    std::function<asio::awaitable<bool>(std::shared_ptr<Request>, std::shared_ptr<ResponseWriter>, WsHandler handler)>;
+// The normalized callback shape. SslHandle is nullopt for a plaintext
+// connection.
+using CallbackHandler = std::function<void(RequestPtr, ResponsePtr, SslHandle, HandlerCompletion)>;
 
-// The WebSocket handler shape (mirrors handler layer's WsHandler). Rather than
-// running the raw ws handler directly, the handler layer runs it through the
-// middleware chain: global + group + per-route middleware (the same ones as
-// HTTP routes), ending at the engine's WsUpgrade terminal. Returns true if the
-// connection was upgraded; a middleware that short-circuits answers the
-// handshake with a plain HTTP response via `res` and returns false. Before this
-// seam, WebSocket upgrades bypassed the middleware chain entirely.
-using WsHandlerFn = std::function<asio::awaitable<bool>(std::shared_ptr<Request>, std::shared_ptr<ResponseWriter>,
-                                                        SslHandle, WsUpgrade up)>;
+#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+// The coroutine shape, available only when the translation unit is compiled
+// with coroutine support.
+using CoroHandler = std::function<asio::awaitable<void>(RequestPtr, ResponsePtr, SslHandle)>;
+using Handler = std::variant<CallbackHandler, CoroHandler>;
+#else
+using Handler = CallbackHandler;
+#endif
 
-// Looks up a WebSocket handler for a request path; empty if none matches. The
-// engine calls this after a websocket upgrade is requested.
+// The engine invokes the dispatcher with the request's completion handler.
+using Dispatcher = CallbackHandler;
+
+// Raw WebSocket route handlers and the upgrade seam.
+using CallbackWsHandler = std::function<void(RequestPtr, std::shared_ptr<WebSocket>, HandlerCompletion)>;
+using WsUpgradeCompletion = asio::any_completion_handler<void(error_code, bool)>;
+using WsUpgrade = std::function<void(RequestPtr, ResponsePtr, CallbackWsHandler, WsUpgradeCompletion)>;
+using WsHandlerFn = std::function<void(RequestPtr, ResponsePtr, SslHandle, WsUpgrade, WsUpgradeCompletion)>;
 using WsLookup = std::function<std::optional<WsHandlerFn>(std::string_view path)>;
 
-// A backend a WebSocket upgrade should be transparently proxied to (byte-level
-// pass-through reverse proxy). host/port name a plain TCP endpoint; the engine
-// opens a TCP connection, replays the client's raw upgrade request to it, then
-// copies bytes both ways verbatim (frames, fragmentation, masking and control
-// frames all pass through untouched).
+#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+using CoroWsHandler = std::function<asio::awaitable<void>(RequestPtr, std::shared_ptr<WebSocket>)>;
+using WsHandler = std::variant<CallbackWsHandler, CoroWsHandler>;
+#else
+using WsHandler = CallbackWsHandler;
+#endif
+
+namespace detail {
+
+// Detection idiom instead of std::invoke_result_t: the latter is a hard error
+// for a callable that is not invocable with the probed arguments, and
+// make_handler probes every shape.
+template <typename F, typename = void> struct result_ssl {
+    static constexpr bool valid = false;
+    static constexpr bool is_void = false;
+    static constexpr bool is_coro = false;
+};
+template <typename F> struct result_ssl<F, std::void_t<std::invoke_result_t<F &, RequestPtr, ResponsePtr, SslHandle>>> {
+    using type = std::invoke_result_t<F &, RequestPtr, ResponsePtr, SslHandle>;
+    static constexpr bool valid = true;
+    static constexpr bool is_void = std::is_same_v<type, void>;
+#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+    static constexpr bool is_coro = std::is_same_v<type, asio::awaitable<void>>;
+#else
+    static constexpr bool is_coro = false;
+#endif
+};
+
+template <typename F, typename = void> struct result_two {
+    static constexpr bool valid = false;
+    static constexpr bool is_void = false;
+    static constexpr bool is_coro = false;
+};
+template <typename F> struct result_two<F, std::void_t<std::invoke_result_t<F &, RequestPtr, ResponsePtr>>> {
+    using type = std::invoke_result_t<F &, RequestPtr, ResponsePtr>;
+    static constexpr bool valid = true;
+    static constexpr bool is_void = std::is_same_v<type, void>;
+#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+    static constexpr bool is_coro = std::is_same_v<type, asio::awaitable<void>>;
+#else
+    static constexpr bool is_coro = false;
+#endif
+};
+
+template <typename F>
+constexpr bool is_callback_handler_ssl =
+    std::is_invocable_v<F &, RequestPtr, ResponsePtr, SslHandle, HandlerCompletion>;
+template <typename F>
+constexpr bool is_callback_handler = std::is_invocable_v<F &, RequestPtr, ResponsePtr, HandlerCompletion>;
+
+template <typename F> constexpr bool is_sync_handler_ssl = result_ssl<F>::valid && result_ssl<F>::is_void;
+template <typename F> constexpr bool is_sync_handler = result_two<F>::valid && result_two<F>::is_void;
+#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+template <typename F> constexpr bool is_coro_handler_ssl = result_ssl<F>::valid && result_ssl<F>::is_coro;
+template <typename F> constexpr bool is_coro_handler = result_two<F>::valid && result_two<F>::is_coro;
+#endif
+
+template <typename F, typename = void> struct ws_result {
+    static constexpr bool valid = false;
+    static constexpr bool is_coro = false;
+};
+#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+template <typename F>
+struct ws_result<F, std::void_t<std::invoke_result_t<F &, RequestPtr, std::shared_ptr<WebSocket>>>> {
+    using type = std::invoke_result_t<F &, RequestPtr, std::shared_ptr<WebSocket>>;
+    static constexpr bool valid = true;
+    static constexpr bool is_coro = std::is_same_v<type, asio::awaitable<void>>;
+};
+#endif
+
+// Wraps any accepted handler shape into the callback form.
+template <typename F> CallbackHandler make_callback_handler(F &&fn) {
+    using D = std::decay_t<F>;
+    if constexpr (is_callback_handler_ssl<D>) {
+        return CallbackHandler(std::forward<F>(fn));
+    } else if constexpr (is_callback_handler<D>) {
+        return CallbackHandler(
+            [fn = std::forward<F>(fn)](RequestPtr req, ResponsePtr res, SslHandle, HandlerCompletion done) mutable {
+                fn(std::move(req), std::move(res), std::move(done));
+            });
+    } else if constexpr (is_sync_handler_ssl<D>) {
+        return CallbackHandler(
+            [fn = std::forward<F>(fn)](RequestPtr req, ResponsePtr res, SslHandle ssl, HandlerCompletion done) mutable {
+                fn(std::move(req), std::move(res), ssl);
+                std::move(done)();
+            });
+    } else if constexpr (is_sync_handler<D>) {
+        return CallbackHandler(
+            [fn = std::forward<F>(fn)](RequestPtr req, ResponsePtr res, SslHandle, HandlerCompletion done) mutable {
+                fn(std::move(req), std::move(res));
+                std::move(done)();
+            });
+#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+    } else if constexpr (is_coro_handler_ssl<D>) {
+        return CallbackHandler(
+            [fn = std::forward<F>(fn)](RequestPtr req, ResponsePtr res, SslHandle ssl, HandlerCompletion done) mutable {
+                execute_coroutine(req, res, std::move(done), [fn, req, res, ssl]() mutable {
+                    return fn(std::move(req), std::move(res), ssl);
+                });
+            });
+    } else if constexpr (is_coro_handler<D>) {
+        return CallbackHandler([fn = std::forward<F>(fn)](RequestPtr req, ResponsePtr res, SslHandle ssl,
+                                                          HandlerCompletion done) mutable {
+            (void)ssl;
+            execute_coroutine(req, res, std::move(done),
+                              [fn, req, res]() mutable { return fn(std::move(req), std::move(res)); });
+        });
+#endif
+    } else {
+        static_assert(sizeof(F) == 0,
+                      "handler must be callable as (RequestPtr, ResponsePtr[, SslHandle], HandlerCompletion) "
+                      "or return void / asio::awaitable<void> from (RequestPtr, ResponsePtr[, SslHandle])");
+    }
+}
+
+#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+// Detection traits and execution helper for handlers whose extracted values are
+// prepended to (RequestPtr, ResponsePtr[, SslHandle]). They live here, next to
+// the rest of the coroutine adapter, so that extract.h -- like every other
+// header -- never has to name a coroutine type.
+template <typename F, typename Tuple, typename = void> struct extracted_coro_ssl : std::false_type {};
+template <typename F, typename... Vs>
+struct extracted_coro_ssl<
+    F, std::tuple<Vs...>,
+    std::enable_if_t<
+        std::is_same_v<std::invoke_result_t<F &, Vs..., RequestPtr, ResponsePtr, SslHandle>, asio::awaitable<void>>>>
+    : std::true_type {};
+
+template <typename F, typename Tuple, typename = void> struct extracted_coro : std::false_type {};
+template <typename F, typename... Vs>
+struct extracted_coro<
+    F, std::tuple<Vs...>,
+    std::enable_if_t<std::is_same_v<std::invoke_result_t<F &, Vs..., RequestPtr, ResponsePtr>, asio::awaitable<void>>>>
+    : std::true_type {};
+
+// Spawns a coroutine handler on the request's owner executor with the request's
+// cancellation slot bound, and applies the historical exception policy: a
+// cancelled request is left alone; an unsent response becomes a 500; a started
+// response is closed instead of splicing a second status line onto the wire.
+template <typename F>
+void execute_coroutine(const RequestPtr &req, const ResponsePtr &res, HandlerCompletion done, F &&fn) {
+    const RequestPtr req_keep = req;
+    const ResponsePtr fallback = res;
+    auto executor = req_keep ? req_keep->executor() : asio::any_io_executor{};
+    auto token = asio::bind_cancellation_slot(
+        req_keep ? req_keep->cancellation_slot() : asio::cancellation_slot{},
+        [done = std::move(done), req_keep, fallback](std::exception_ptr ep) mutable {
+            if (!ep) {
+                std::move(done)();
+                return;
+            }
+            if (req_keep && req_keep->cancelled()) {
+                std::move(done)();
+                return;
+            }
+            SIMPLE_HTTP_ERROR_LOG("handler threw: {}", "exception");
+            if (!fallback) {
+                std::move(done)();
+                return;
+            }
+            if (fallback->started()) {
+                fallback->async_close([done = std::move(done)](error_code) mutable { std::move(done)(); });
+            } else {
+                fallback->status(status::internal_server_error);
+                fallback->async_send("", [done = std::move(done)](error_code) mutable { std::move(done)(); });
+            }
+        });
+    asio::co_spawn(executor, std::forward<F>(fn), std::move(token));
+}
+
+template <typename F, typename Tuple>
+void execute_extracted_coroutine(const RequestPtr &req, const ResponsePtr &res, HandlerCompletion done,
+                                 std::shared_ptr<F> fn, Tuple args) {
+    execute_coroutine(req, res, std::move(done),
+                      [fn, args = std::move(args)]() mutable { return std::apply(*fn, std::move(args)); });
+}
+
+#endif
+
+} // namespace detail
+
+// Normalizes any accepted handler callable (already-built Handler, callback,
+// synchronous function, or -- in a C++20 build -- a coroutine) into a Handler.
+template <typename F> Handler make_handler(F &&fn) {
+    using D = std::decay_t<F>;
+#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+    if constexpr (std::is_same_v<D, Handler>) {
+        return std::forward<F>(fn);
+    } else if constexpr (std::is_same_v<D, CoroHandler>) {
+        return Handler{std::forward<F>(fn)};
+    } else {
+        return Handler{detail::make_callback_handler(std::forward<F>(fn))};
+    }
+#else
+    if constexpr (std::is_same_v<D, Handler>) {
+        return std::forward<F>(fn);
+    } else {
+        return detail::make_callback_handler(std::forward<F>(fn));
+    }
+#endif
+}
+
+// Runs a Handler and always completes `done` (including on exceptions from a
+// callback handler).
+inline void invoke_handler(const Handler &handler, RequestPtr req, ResponsePtr res, SslHandle ssl,
+                           HandlerCompletion done) {
+    const RequestPtr req_keep = req;
+    const ResponsePtr fallback = res;
+#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+    if (std::holds_alternative<CoroHandler>(handler)) {
+        const CoroHandler &fn = std::get<CoroHandler>(handler);
+        detail::execute_coroutine(req, res, std::move(done),
+                                  [fn, req, res, ssl]() mutable { return fn(std::move(req), std::move(res), ssl); });
+        return;
+    }
+#endif
+#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+    const CallbackHandler &fn = std::get<0>(handler);
+#else
+    const CallbackHandler &fn = handler;
+#endif
+    // HandlerCompletion is move-only, and it is moved into the handler below.
+    // Keep the owner here behind a one-shot wrapper so the exception path can
+    // still complete: otherwise a synchronous throw destroys the only copy and
+    // the engine never runs after_handler/handler_finished (h1 stalls, h2/h3
+    // leak a concurrency slot).
+    auto completion = std::make_shared<HandlerCompletion>(std::move(done));
+    auto completed = std::make_shared<bool>(false);
+    auto finish = [completion, completed]() {
+        if (*completed) {
+            return;
+        }
+        *completed = true;
+        auto callback = std::move(*completion);
+        if (callback) {
+            std::move(callback)();
+        }
+    };
+    HandlerCompletion handed([finish]() mutable { finish(); });
+    try {
+        fn(std::move(req), std::move(res), ssl, std::move(handed));
+    } catch (...) {
+        if (req_keep && req_keep->cancelled()) {
+            finish();
+            return;
+        }
+        SIMPLE_HTTP_ERROR_LOG("handler threw synchronously");
+        if (!fallback) {
+            finish();
+            return;
+        }
+        if (fallback->started()) {
+            fallback->async_close([finish](error_code) mutable { finish(); });
+        } else {
+            fallback->status(status::internal_server_error);
+            fallback->async_send("", [finish](error_code) mutable { finish(); });
+        }
+    }
+}
+
+// --- WebSocket handler normalization ---
+
+template <typename F> WsHandler make_ws_handler(F &&fn) {
+    using D = std::decay_t<F>;
+#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+    if constexpr (std::is_same_v<D, WsHandler>) {
+        return std::forward<F>(fn);
+    } else if constexpr (detail::ws_result<D>::valid && detail::ws_result<D>::is_coro) {
+        return WsHandler(CoroWsHandler(std::forward<F>(fn)));
+    } else {
+        return WsHandler(CallbackWsHandler(std::forward<F>(fn)));
+    }
+#else
+    if constexpr (std::is_same_v<D, WsHandler>) {
+        return std::forward<F>(fn);
+    } else {
+        return WsHandler(std::forward<F>(fn));
+    }
+#endif
+}
+
+// Runs a raw WebSocket handler and completes `done` when it finishes.
+inline void invoke_ws_handler(const WsHandler &handler, RequestPtr req, std::shared_ptr<WebSocket> ws,
+                              HandlerCompletion done) {
+#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+    if (std::holds_alternative<CoroWsHandler>(handler)) {
+        const CoroWsHandler &fn = std::get<CoroWsHandler>(handler);
+        auto executor = req ? req->executor() : asio::any_io_executor{};
+        asio::co_spawn(
+            executor, [fn, req, ws]() mutable { return fn(std::move(req), std::move(ws)); },
+            asio::bind_cancellation_slot(req ? req->cancellation_slot() : asio::cancellation_slot{},
+                                         [done = std::move(done)](std::exception_ptr) mutable { std::move(done)(); }));
+        return;
+    }
+#endif
+#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+    const CallbackWsHandler &fn = std::get<0>(handler);
+#else
+    const CallbackWsHandler &fn = handler;
+#endif
+    // Same one-shot wrapper as invoke_handler: a synchronous throw must still
+    // complete the upgrade/request, or the engine waits forever.
+    auto completion = std::make_shared<HandlerCompletion>(std::move(done));
+    auto completed = std::make_shared<bool>(false);
+    auto finish = [completion, completed]() {
+        if (*completed) {
+            return;
+        }
+        *completed = true;
+        auto callback = std::move(*completion);
+        if (callback) {
+            std::move(callback)();
+        }
+    };
+    HandlerCompletion handed([finish]() mutable { finish(); });
+    try {
+        fn(std::move(req), std::move(ws), std::move(handed));
+    } catch (...) {
+        SIMPLE_HTTP_ERROR_LOG("websocket handler threw synchronously");
+        finish();
+    }
+}
+
+// Adapts a HandlerCompletion (void()) to the void(error_code) completion an I/O
+// operation produces. The error is ignored deliberately: the handler's contract
+// is "I am done"; a write failure already closed the connection.
+inline WriteCompletion finish_with(HandlerCompletion done) {
+    return WriteCompletion([done = std::move(done)](error_code) mutable { std::move(done)(); });
+}
+
+// Adapts the stored WsHandler variant to the callback form the engine's upgrade
+// terminal invokes after the handshake.
+inline CallbackWsHandler to_callback_ws_handler(WsHandler handler) {
+#if SIMPLE_HTTP_CPP17_CORO_HANDLERS
+    if (std::holds_alternative<CoroWsHandler>(handler)) {
+        CoroWsHandler fn = std::get<CoroWsHandler>(std::move(handler));
+        return [fn = std::move(fn)](RequestPtr req, std::shared_ptr<WebSocket> ws, HandlerCompletion done) mutable {
+            auto executor = req ? req->executor() : asio::any_io_executor{};
+            asio::co_spawn(
+                executor, [fn, req, ws]() mutable { return fn(std::move(req), std::move(ws)); },
+                asio::bind_cancellation_slot(
+                    req ? req->cancellation_slot() : asio::cancellation_slot{},
+                    [done = std::move(done)](std::exception_ptr) mutable { std::move(done)(); }));
+        };
+    }
+    return std::get<0>(handler);
+#else
+    return handler;
+#endif
+}
+
+// --- proxy lookup seams (unchanged in shape from the C++23 version) ---
+
 struct WsProxyTarget {
     std::string host;
     std::uint16_t port{0};
-    // Optional request-target rewrite template. When non-empty, the upgrade
-    // request line sent to the backend uses this instead of the client's
-    // original target. For a regex proxy route it is a substitution template
-    // that may reference capture groups: $0 = whole match, $1..$9 = groups,
-    // $$ = a literal '$'. For an exact route (no groups) it is used verbatim.
-    // Everything after the handshake is still spliced byte-for-byte.
     std::string rewrite_path;
-
-    // Host policy for the backend handshake. preserve_host (the default) keeps
-    // the frontend's Host, which is what Go's NewSingleHostReverseProxy does
-    // and what backends validating Origin against Host expect. host_header is
-    // an explicit override and wins over preserve_host.
     bool preserve_host{true};
     std::string host_header;
-
-    // Go Rewrite mode strips inbound Forwarded/X-Forwarded-* and authors the
-    // three standard fields. Set this to append the inbound X-Forwarded-For
-    // chain instead of replacing it with the real peer.
     bool preserve_inbound_forwarding{false};
-
-    // Budget for establishing the backend leg: name resolution, TCP connect, and
-    // the Upgrade handshake (a backend that accepts and then never answers is
-    // bounded by this, not left to the idle watchdog). 0 disables the timer.
     std::chrono::milliseconds connect_timeout{10000};
-
-    // Optional name-resolution override for the backend leg. Empty = asio's
-    // system resolver. Same contract as ClientConfig::resolve: return the
-    // endpoints to try, in order, from the connection executor.
     ResolveFn resolve;
-
-    // Disable Nagle's algorithm on the backend leg, with the same default and
-    // meaning as ClientConfig::tcp_nodelay (which the HTTP proxy route uses).
-    // The byte tunnel is latency-sensitive and writes small frames, so leaving
-    // it on would add up to a delayed-ACK worth of latency per message.
     bool tcp_nodelay{true};
 };
 
-// Looks up a proxy backend for a request path; empty if the path is not a proxy
-// route. The h1 engine consults this between the local exact and the local
-// regex ws handler (nginx order): a proxied path beats a local regex ws
-// handler, but loses to a local exact one.
 using WsProxyLookup = std::function<std::optional<WsProxyTarget>(std::string_view path)>;
 
-// Go httputil.ReverseProxy-shaped policy hooks. They run on the connection
-// executor (model A), so they may touch the outbound Request/Headers directly
-// without locking.
 struct HttpProxyHooks {
-    // Rewrite: after the standard outbound request has been built (hop-by-hop
-    // fields removed, forwarding fields stripped), before it is sent. `out` is
-    // a client-side Request: it may change the target, method, headers or body
-    // framing. This is Go's ReverseProxy.Rewrite / ProxyRequest.Out.
     std::function<void(const Request &in, Request &out)> rewrite;
-
-    // ModifyResponse: after the backend response head arrived and hop-by-hop
-    // fields were removed, before it is relayed. May change the status and the
-    // header section (Location, Set-Cookie, extra fields, …). Returning an
-    // error invokes the error handler and aborts the exchange. This is Go's
-    // ReverseProxy.ModifyResponse.
     std::function<error_code(int &status, Headers &headers, const Request &in)> modify_response;
-
-    // ErrorHandler: an upstream exchange failed before the response started.
-    // It may send its own response through `res`; if it returns without
-    // starting one, the proxy falls back to 502. Mid-body failures are not
-    // routed here: once bytes are flowing the only honest action is aborting
-    // the frontend response (Go's ErrAbortHandler behaviour).
-    std::function<asio::awaitable<void>(std::shared_ptr<ResponseWriter>, const Request &, error_code)> error_handler;
+    std::function<void(std::shared_ptr<ResponseWriter>, const Request &, error_code, HandlerCompletion)> error_handler;
 };
 
-// A backend a plain HTTP request should be reverse-proxied to (request-level
-// proxy). Unlike WsProxyTarget this is per-request: for each matching request
-// the proxy takes an upstream connection to host:port (a fresh client each
-// time), forwards the request (with the standard X-Forwarded-* headers added
-// and hop-by-hop headers stripped), then streams the backend's response back to
-// the client. rewrite_path works like WsProxyTarget's: a substitution template
-// ($0/$1..$9/$$) for regex routes, or a verbatim replacement for exact routes;
-// empty keeps the original target.
 struct HttpProxyTarget {
     std::string host;
     std::uint16_t port{0};
     std::string rewrite_path;
-    // Backend over TLS. ALPN then decides h2 vs HTTP/1.1, so an https backend
-    // gets HTTP/2 for free when it offers it.
     bool tls{false};
-    // Plaintext backend that speaks HTTP/2: the first request on a connection
-    // carries `Upgrade: h2c` (one extra round trip); a backend that ignores it
-    // answers over HTTP/1.1 as usual. Ignored when `tls` is set.
     bool h2c{false};
-    // Prior-knowledge h2c: send the HTTP/2 preface directly instead of the
-    // Upgrade round trip. Only for backends known to speak h2c.
     bool h2c_prior_knowledge{false};
-
-    // Host policy. By default the client layer writes the backend's authority
-    // (nginx's proxy_set_header Host $proxy_host). preserve_host keeps the
-    // frontend's Host (Go's NewSingleHostReverseProxy default); host_header is
-    // an explicit override and wins over preserve_host.
     bool preserve_host{false};
     std::string host_header;
-
-    // Go's Rewrite mode strips client-supplied forwarding headers by default
-    // (Forwarded and X-Forwarded-*). Set this to append the inbound
-    // X-Forwarded-For chain instead of replacing it with the real peer; the
-    // other X-Forwarded-* fields are always authored by the proxy.
     bool preserve_inbound_forwarding{false};
-
-    // Upper bound on attempts for a request that is safe to replay (no body and
-    // an idempotent method). 0/1 disables the proxy's own retry; the client
-    // layer's RetryPolicy still applies independently.
     std::size_t max_attempts{3};
-
     HttpProxyHooks hooks;
-
-    // Let the upstream Client honor HTTP_PROXY / HTTPS_PROXY / ALL_PROXY. Off by
-    // default: a server's ambient proxy environment must not reroute its
-    // backends (usually loopback or private addresses). A ClientConfig::proxy
-    // set on the route applies regardless of this flag.
     bool use_env_proxy{false};
 };
 
-// Looks up an HTTP proxy backend for a request path; empty if the path is not a
-// proxy route. The Router consults this in dispatch after the exact local match
-// misses, so a proxied path beats a local regex handler but loses to an exact
-// one (nginx order).
 using HttpProxyLookup = std::function<std::optional<HttpProxyTarget>(std::string_view path)>;
 
 } // namespace simple_http

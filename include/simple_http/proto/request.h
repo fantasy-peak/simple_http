@@ -4,16 +4,19 @@
 //
 // Server-side: an engine populates the request line and headers, feeds the body
 // into the owned Body stream, and the handler reads it back with
-// `co_await req.body().read()`. Client-side: the caller sets method/target/
+// `req.body().async_read(token)`. Client-side: the caller sets method/target/
 // headers/body (or streams the body via body().feed()), and the engine reads it
 // to send. Go's http.Request is the same single type for both roles; so is this.
 
 #include <any>
-#include <boost/asio.hpp>
-#include <boost/asio/experimental/channel.hpp>
+#include <atomic>
+#include <boost/asio/any_io_executor.hpp>
+#include <boost/asio/cancellation_signal.hpp>
+#include <boost/asio/dispatch.hpp>
+#include <boost/asio/ip/tcp.hpp>
 #include <memory>
+#include <mutex>
 #include <optional>
-#include <stop_token>
 #include <string>
 #include <string_view>
 #include <typeindex>
@@ -50,14 +53,14 @@ class Request {
     // once owned by a Request the body has already begun flowing. The path/query
     // views are rebound to the moved-to target.
     Request(Request &&other) noexcept
-        : m_version(other.m_version), m_peer(std::move(other.m_peer)), m_body(std::move(other.m_body)),
-          m_method(other.m_method), m_method_token(std::move(other.m_method_token)),
-          m_target(std::move(other.m_target)), m_headers(std::move(other.m_headers)),
-          m_trailers(std::move(other.m_trailers)), m_params(std::move(other.m_params)),
-          m_query_params(std::move(other.m_query_params)), m_query_parsed(other.m_query_parsed), m_close(other.m_close),
-          m_stream_body(other.m_stream_body), m_content_length(other.m_content_length), m_url(std::move(other.m_url)),
-          m_body_source(std::move(other.m_body_source)), m_state(std::move(other.m_state)),
-          m_stop(std::move(other.m_stop)) {
+        : m_version(other.m_version), m_peer(std::move(other.m_peer)), m_exec(std::move(other.m_exec)),
+          m_body(std::move(other.m_body)), m_close(other.m_close), m_stream_body(other.m_stream_body),
+          m_content_length(other.m_content_length), m_url(std::move(other.m_url)),
+          m_body_source(std::move(other.m_body_source)), m_method(other.m_method),
+          m_method_token(std::move(other.m_method_token)), m_target(std::move(other.m_target)),
+          m_headers(std::move(other.m_headers)), m_trailers(std::move(other.m_trailers)),
+          m_params(std::move(other.m_params)), m_query_params(std::move(other.m_query_params)),
+          m_query_parsed(other.m_query_parsed), m_state(std::move(other.m_state)), m_cancel(std::move(other.m_cancel)) {
         rebind_views();
     }
     Request &operator=(Request &&other) noexcept {
@@ -65,6 +68,7 @@ class Request {
             return *this;
         m_version = other.m_version;
         m_peer = std::move(other.m_peer);
+        m_exec = std::move(other.m_exec);
         m_body = std::move(other.m_body);
         m_method = other.m_method;
         m_method_token = std::move(other.m_method_token);
@@ -80,7 +84,7 @@ class Request {
         m_url = std::move(other.m_url);
         m_body_source = std::move(other.m_body_source);
         m_state = std::move(other.m_state);
-        m_stop = std::move(other.m_stop);
+        m_cancel = std::move(other.m_cancel);
         rebind_views();
         return *this;
     }
@@ -105,7 +109,7 @@ class Request {
     // (the source of `X-Forwarded-For` and friend).
     template <typename Executor>
     Request(Version version, const Executor &exec, asio::ip::tcp::endpoint peer)
-        : m_version(version), m_peer(std::move(peer)), m_body(exec) {}
+        : m_version(version), m_peer(std::move(peer)), m_exec(exec), m_body(exec) {}
 
     // Client-side construction: the caller builds a request to send and the
     // engine reads it back. No peer exists yet; one is only meaningful on the
@@ -113,7 +117,7 @@ class Request {
     // handing the request to the client, or set stream_body(true) to write it
     // as the exchange goes (Go's http.Request.Body with Close semantics).
     template <typename Executor>
-    explicit Request(Version version, const Executor &exec) : m_version(version), m_body(exec) {}
+    explicit Request(Version version, const Executor &exec) : m_version(version), m_exec(exec), m_body(exec) {}
 
     // --- request line / metadata ---
     Method method() const { return m_method; }
@@ -349,65 +353,84 @@ class Request {
     // It is the Go `r.Context()` / axum `CancellationToken` shape, and like both
     // it is *cooperative*: a handler that never observes it is not stopped by it.
     //
-    //   * flag side  — cancel()/cancelled()/cancel_token(): thread-safe, usable
-    //     from any thread or executor (an engine fires it from the connection
-    //     executor).
-    //   * wait side  — wait_cancelled(): resumes on the executor of the coroutine
-    //     that awaits it. It binds its internal wake-up to *that* executor, never
-    //     to the connection's, so it composes correctly inside
-    //     `co_await (work() || req->wait_cancelled())` — asio's `operator||`
-    //     spawns both operands on the awaiting coroutine's executor, so the timer
-    //     and this wait end up on one executor by construction. The cancel side
-    //     only ever `post`s to that executor, so a cross-thread cancel cannot
-    //     resume a coroutine on the wrong thread.
+    //   * flag side  — cancel()/cancelled(): safe from any thread.
+    //   * signal side — cancellation_slot(): bind it to the handler (or any
+    //     operation token) and every pending operation completes with
+    //     operation_aborted when the request is no longer wanted.
     //
-    // Typical use, fencing a slow wait against the peer leaving:
+    // cancel() sets the atomic flag first, then dispatches the signal emission
+    // onto the request's owner executor: asio::cancellation_signal is not
+    // thread-safe, while the flag is what a polling handler reads. A request
+    // that was cancelled before a slot had a handler installed does not replay
+    // the emission (asio semantics); engines cancel live requests, so the slot
+    // is already bound in every supported path.
     //
-    //   using namespace asio::experimental::awaitable_operators;
-    //   asio::steady_timer t{co_await asio::this_coro::executor};
-    //   t.expires_after(std::chrono::seconds(30));
-    //   co_await (t.async_wait(asio::use_awaitable) || req->wait_cancelled());
-    //   if (req->cancelled()) co_return;  // peer gone: stop, do not reply
+    // A cancellation_signal has exactly one slot, and installing a handler in
+    // it destroys the previous one. Request cancellation is consumed by several
+    // independent parties -- the engine's co_spawn binds the request slot to the
+    // handler coroutine, and a handler may also bind it to work it leaves
+    // running (a detached coroutine) -- so a single shared signal would let the
+    // inner bind overwrite the outer coroutine's cancellation_state. asio stores
+    // that state inside the parent slot, so the overwritten coroutine would
+    // later clear a dangling impl (SIGSEGV). Handing out one signal per call and
+    // fanning cancel() out over all of them keeps every consumer independent.
 
-    // Fires the cancellation signal. Idempotent; safe from any thread.
-    void cancel() { m_stop.request_stop(); }
+    struct CancelState {
+        std::mutex mutex; // guards signals; slot() may be called before dispatch
+        std::vector<std::shared_ptr<asio::cancellation_signal>> signals;
+        std::atomic<bool> cancelled{false};
+    };
+
+    ~Request() = default;
+
+    // Fires every cancellation signal handed out so far. Idempotent; safe from
+    // any thread.
+    void cancel() {
+        if (m_cancel->cancelled.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+        auto state = m_cancel;
+        auto emit = [state]() {
+            std::vector<std::shared_ptr<asio::cancellation_signal>> signals;
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                signals = state->signals;
+            }
+            for (auto &signal : signals) {
+                signal->emit(asio::cancellation_type::terminal);
+            }
+        };
+        if (!m_exec) {
+            emit();
+            return;
+        }
+        asio::dispatch(m_exec, std::move(emit));
+    }
 
     // Whether cancellation has been signalled. A cheap atomic read; poll it in a
     // loop-shaped handler instead of awaiting when that reads better.
-    [[nodiscard]] bool cancelled() const noexcept { return m_stop.stop_requested(); }
+    [[nodiscard]] bool cancelled() const noexcept { return m_cancel->cancelled.load(std::memory_order_acquire); }
 
-    // The underlying token, for registering a std::stop_callback directly.
-    [[nodiscard]] std::stop_token cancel_token() const noexcept { return m_stop.get_token(); }
-
-    // Suspends until the request is cancelled; returns immediately if it already
-    // was. Resumes on the awaiting coroutine's executor.
-    asio::awaitable<void> wait_cancelled() {
-        if (m_stop.stop_requested()) {
-            co_return; // fast path: no executor, no allocation
+    // The slot to bind to a pending operation:
+    // asio::bind_cancellation_slot(req->cancellation_slot(), token_or_handler).
+    //
+    // Each call returns a slot backed by its own signal, so independent
+    // operations (and nested coroutines) can all observe the same request
+    // cancellation without clobbering each other. The slot stays valid as long
+    // as the Request does; a slot handed out after cancel() does not replay the
+    // emission (asio semantics).
+    [[nodiscard]] asio::cancellation_slot cancellation_slot() const {
+        auto signal = std::make_shared<asio::cancellation_signal>();
+        {
+            std::lock_guard<std::mutex> lock(m_cancel->mutex);
+            m_cancel->signals.push_back(signal);
         }
-        auto exec = co_await asio::this_coro::executor;
-        // Lock-free `channel` (not `concurrent_channel`): every access happens on
-        // `exec` — creation here, the receive below, and the try_send that the
-        // stop_callback posts onto `exec` — so one thread drives it and the
-        // thread-safe variant would only add a lock nothing here needs.
-        using Notify = asio::experimental::channel<void(error_code)>;
-        auto wake = std::make_shared<Notify>(exec, 1);
-        // The callback runs on whatever thread calls cancel(). It must not touch
-        // asio state inline — that would resume this coroutine on the cancelling
-        // thread. It only posts onto the waiter's executor. If the request was
-        // already cancelled before this registration, the standard guarantees the
-        // callback fires immediately from this constructor, so there is no
-        // check-then-register race.
-        std::stop_callback cb{m_stop.get_token(), [wake, exec]() mutable {
-                                  asio::post(exec, [wake] { (void)wake->try_send(error_code{}); });
-                              }};
-        // Parked on `exec`; a cancel event, or `operator||` cancelling this
-        // branch, both complete it. `cb` is a local: the coroutine frame's
-        // destruction deregisters it. Even if a post is already queued when the
-        // frame dies, the lambda holds `wake` by shared_ptr, so nothing dangles.
-        auto [ec] = co_await wake->async_receive(asio::as_tuple(asio::use_awaitable));
-        (void)ec;
+        return signal->slot();
     }
+
+    // The connection/session executor this request belongs to. C++20 callers
+    // that want to spawn work back onto the owner use this.
+    [[nodiscard]] asio::any_io_executor executor() const noexcept { return m_exec; }
 
     // --- population API (engine side) ---
     // Router side: records one captured template segment. The value must be a
@@ -439,6 +462,10 @@ class Request {
   private:
     Version m_version;
     asio::ip::tcp::endpoint m_peer;
+    // The connection/session executor this request belongs to. Body keeps its
+    // own copy for its channel; this one is what cancel() dispatches through and
+    // what req->executor() exposes.
+    asio::any_io_executor m_exec;
     // Inline rather than behind a unique_ptr: the Body is owned for the
     // Request's whole life anyway, and the indirection cost a heap allocation
     // (plus its free) on every request the engines construct.
@@ -469,9 +496,10 @@ class Request {
     // type-erased; lookups scan from the back so the most recent set wins.
     std::vector<std::any> m_state;
 
-    // Request-scoped cancellation (see cancel()/wait_cancelled() above). One-shot
-    // and thread-safe; costs nothing until first observed.
-    std::stop_source m_stop;
+    // Request-scoped cancellation (see cancel()/cancellation_slot() above).
+    // Shared so a cross-thread cancel can post an emission that outlives the
+    // call without capturing a raw `this`.
+    std::shared_ptr<CancelState> m_cancel{std::make_shared<CancelState>()};
 
     // Views into m_target (stable after set_target/assign_head).
     std::string_view m_path;

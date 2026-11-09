@@ -61,9 +61,9 @@ struct Served {
 };
 
 Served serve(const StaticFiles &site, asio::io_context &ctx, const RequestPtr &req) {
-    auto writer = std::make_shared<FakeResponseSink>();
+    auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
     auto res = std::make_shared<ResponseWriter>(writer);
-    auto handled = run_on(ctx, site.try_serve(req, res));
+    auto handled = run_on(ctx, await_bool([&](auto done) { site.try_serve(req, res, std::move(done)); }));
     REQUIRE(handled.has_value());
     return Served{writer, *handled};
 }
@@ -620,10 +620,10 @@ TEST_CASE("static: the 404 page is served when there is one", "[static]") {
     auto site = load_standard(fx);
 
     asio::io_context ctx;
-    auto writer = std::make_shared<FakeResponseSink>();
+    auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
     auto res = std::make_shared<ResponseWriter>(writer);
     auto req = make_request(ctx, "/nope");
-    REQUIRE(run_on(ctx, site->serve_not_found(req, res)));
+    REQUIRE(run_on(ctx, await_void([&](auto done) { site->serve_not_found(req, res, std::move(done)); })));
 
     CHECK(writer->last_status == status::not_found);
     CHECK(writer->last_body == "<html>not found</html>");
@@ -636,10 +636,10 @@ TEST_CASE("static: the 404 is plain text when the site has no page", "[static]")
     auto site = load_standard(fx);
 
     asio::io_context ctx;
-    auto writer = std::make_shared<FakeResponseSink>();
+    auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
     auto res = std::make_shared<ResponseWriter>(writer);
     auto req = make_request(ctx, "/nope");
-    REQUIRE(run_on(ctx, site->serve_not_found(req, res)));
+    REQUIRE(run_on(ctx, await_void([&](auto done) { site->serve_not_found(req, res, std::move(done)); })));
 
     CHECK(writer->last_status == status::not_found);
     CHECK(writer->last_body == "404 Not Found");
@@ -716,10 +716,10 @@ TEST_CASE("static: no response ever carries a header twice", "[static]") {
         check_once(r.writer, "SPA fallback");
     }
     {
-        auto writer = std::make_shared<FakeResponseSink>();
+        auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
         auto res = std::make_shared<ResponseWriter>(writer);
         auto req = make_request(ctx, "/nope");
-        REQUIRE(run_on(ctx, site->serve_not_found(req, res)));
+        REQUIRE(run_on(ctx, await_void([&](auto done) { site->serve_not_found(req, res, std::move(done)); })));
         check_once(writer, "404");
     }
 }

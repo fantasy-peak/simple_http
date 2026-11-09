@@ -1,50 +1,46 @@
 #pragma once
 
-// Server-Sent Events client (WHATWG HTML §9.2): an incremental parser plus a
-// thin wrapper over the streaming client. The parser is deliberately pure (no
-// sockets) so it is unit-testable; SseStream ties it to a Client exchange.
+// Server-Sent Events client (WHATWG HTML §9.2), C++17 token-only port.
 //
-//   auto sse = co_await simple_http::SseStream::open(client, "https://host/events");
-//   while (auto ev = co_await sse->next()) {
-//       if (ev->event == "message") handle(ev->data);
-//   }
+// The parser is pure and unit-testable; SseStream ties it to a Client exchange:
 //
-// Reconnection is the caller's policy: last_event_id() is exposed so a caller
-// can re-open with `SseOptions::last_event_id` and send Last-Event-ID (the
-// parser keeps the id across events, as the spec requires).
+//   client.async_open_sse(url, opts, [](error_code ec, std::shared_ptr<SseStream> sse) { ... });
+//   sse->async_next([](error_code ec, SseEvent event) { ... });
+//
+// End-of-stream surfaces as asio::error::eof so the caller decides whether to
+// reconnect (last_event_id() is exposed for that).
 
 #include <algorithm>
+#include <boost/asio/any_completion_handler.hpp>
+#include <boost/asio/async_result.hpp>
 #include <charconv>
 #include <cstddef>
 #include <deque>
-#include <expected>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
-#include "../proto/body.h" // ReadResult
-#include "http.h"          // Client, Stream, StreamSpec
+#include "../proto/body.h"
+#include "http.h"
 
 namespace simple_http {
 
 struct SseEvent {
     std::string event{"message"};
     std::string data;
-    std::string id; // current Last-Event-ID, empty before any id field
+    std::string id;
     std::optional<int> retry_ms;
 };
 
 struct SseOptions {
-    Headers headers;                 // extra request headers (auth, cookies)
-    std::string last_event_id;       // sent as Last-Event-ID
-    bool require_event_stream{true}; // reject a 200 that is not text/event-stream
+    Headers headers;
+    std::string last_event_id;
+    bool require_event_stream{true};
 };
 
-// Incremental text/event-stream parser. feed() accepts arbitrary chunk
-// boundaries (including a CR/LF split across chunks); finish() dispatches a
-// final event at end-of-stream.
 class SseParser {
   public:
     std::vector<SseEvent> feed(std::string_view bytes) {
@@ -96,7 +92,7 @@ class SseParser {
             return;
         }
         if (line.front() == ':') {
-            return; // comment
+            return;
         }
         const auto colon = line.find(':');
         const auto field = line.substr(0, colon);
@@ -128,21 +124,19 @@ class SseParser {
     }
 
     void dispatch(std::vector<SseEvent> &out) {
-        // An event with no data line is not dispatched, but its id/event fields
-        // stay pending until the next block, matching the spec's buffer reset.
         if (!m_has_data) {
             m_event.clear();
             return;
         }
-        SseEvent ev;
-        ev.event = m_event.empty() ? "message" : m_event;
-        ev.data = std::move(m_data);
-        if (!ev.data.empty() && ev.data.back() == '\n') {
-            ev.data.pop_back();
+        SseEvent event;
+        event.event = m_event.empty() ? "message" : m_event;
+        event.data = std::move(m_data);
+        if (!event.data.empty() && event.data.back() == '\n') {
+            event.data.pop_back();
         }
-        ev.id = m_id;
-        ev.retry_ms = m_retry;
-        out.push_back(std::move(ev));
+        event.id = m_id;
+        event.retry_ms = m_retry;
+        out.push_back(std::move(event));
         m_data.clear();
         m_has_data = false;
         m_event.clear();
@@ -157,83 +151,118 @@ class SseParser {
     bool m_has_data{false};
 };
 
-// A live SSE response. next() yields one complete event per call; end-of-stream
-// surfaces as the error channel (asio::error::eof) so the caller can decide
-// whether to reconnect.
-class SseStream {
+class SseStream : public std::enable_shared_from_this<SseStream> {
   public:
-    explicit SseStream(Stream stream) : m_stream(std::move(stream)) {}
+    explicit SseStream(std::shared_ptr<Stream> stream) : m_stream(std::move(stream)) {}
 
-    static asio::awaitable<std::expected<SseStream, error_code>> open(Client &client, std::string url,
-                                                                      SseOptions opts = {}) {
-        StreamSpec spec;
-        spec.headers = std::move(opts.headers);
-        if (!opts.last_event_id.empty()) {
-            spec.headers.add("last-event-id", opts.last_event_id);
-        }
-        auto opened = co_await client.open_stream(std::move(url), std::move(spec));
-        if (!opened) {
-            co_return std::unexpected{opened.error()};
-        }
-        Stream stream = std::move(*opened);
-        // The explicit-stream path keeps the request body open until it is
-        // finished. An SSE request has no body, so finish it before waiting for
-        // the response; otherwise the write end never closes and a server that
-        // waits for the request to end never sends its head.
-        if (auto ec = co_await stream.finish()) {
-            co_return std::unexpected{ec};
-        }
-        auto head = co_await stream.read_head();
-        if (!head) {
-            co_return std::unexpected{head.error()};
-        }
-        if (head->status != status::ok) {
-            co_return std::unexpected{make_error_code(asio::error::invalid_argument)};
-        }
-        if (opts.require_event_stream) {
-            const auto content_type = head->header("content-type");
-            if (!content_type || content_type->find("text/event-stream") == std::string_view::npos) {
-                co_return std::unexpected{make_error_code(asio::error::invalid_argument)};
-            }
-        }
-        co_return SseStream(std::move(stream));
+    // Opens the exchange, finishes the (empty) request body, verifies the head,
+    // and completes with the stream handle.
+    template <typename Token>
+    static auto async_open(Client &client, std::string url, SseOptions options, Token &&token) {
+        return asio::async_initiate<Token, void(error_code, std::shared_ptr<SseStream>)>(
+            [&client, url = std::move(url), options = std::move(options)](auto handler) mutable {
+                StreamSpec spec;
+                spec.headers = std::move(options.headers);
+                if (!options.last_event_id.empty())
+                    spec.headers.add("last-event-id", options.last_event_id);
+                const bool require_event_stream = options.require_event_stream;
+                client.async_open_stream(
+                    std::move(url), std::move(spec), 0,
+                    [require_event_stream, handler = std::move(handler)](error_code ec,
+                                                                         std::shared_ptr<Stream> stream) mutable {
+                        if (ec) {
+                            std::move(handler)(ec, nullptr);
+                            return;
+                        }
+                        stream->async_finish(std::string{}, [stream, require_event_stream,
+                                                             handler = std::move(handler)](error_code fec) mutable {
+                            if (fec) {
+                                std::move(handler)(fec, nullptr);
+                                return;
+                            }
+                            stream->async_read_head([stream, require_event_stream, handler = std::move(handler)](
+                                                        error_code hec, detail::ResponseHead head) mutable {
+                                if (hec) {
+                                    std::move(handler)(hec, nullptr);
+                                    return;
+                                }
+                                if (head.status != status::ok) {
+                                    std::move(handler)(make_error_code(asio::error::invalid_argument), nullptr);
+                                    return;
+                                }
+                                if (require_event_stream) {
+                                    const auto content_type = head.header("content-type");
+                                    if (!content_type ||
+                                        content_type->find("text/event-stream") == std::string_view::npos) {
+                                        std::move(handler)(make_error_code(asio::error::invalid_argument), nullptr);
+                                        return;
+                                    }
+                                }
+                                std::move(handler)(error_code{}, std::make_shared<SseStream>(std::move(stream)));
+                            });
+                        });
+                    });
+            },
+            token);
     }
 
-    asio::awaitable<std::expected<SseEvent, error_code>> next() {
-        for (;;) {
-            if (!m_pending.empty()) {
-                auto ev = std::move(m_pending.front());
-                m_pending.pop_front();
-                if (!ev.id.empty()) {
-                    m_last_id = ev.id;
-                }
-                co_return ev;
-            }
-            if (m_eof) {
-                co_return std::unexpected{make_error_code(asio::error::eof)};
-            }
-            auto chunk = co_await m_stream.read();
-            if (!chunk) {
-                co_return std::unexpected{chunk.error()};
-            }
-            if (chunk->eof) {
-                m_eof = true;
-                for (auto &ev : m_parser.finish()) {
-                    m_pending.push_back(std::move(ev));
-                }
-                continue;
-            }
-            for (auto &ev : m_parser.feed(chunk->data)) {
-                m_pending.push_back(std::move(ev));
-            }
-        }
+    template <typename Token> auto async_next(Token &&token) {
+        return asio::async_initiate<Token, void(error_code, SseEvent)>(
+            [self = this->shared_from_this()](auto handler) mutable {
+                self->next_impl(
+                    std::make_shared<asio::any_completion_handler<void(error_code, SseEvent)>>(std::move(handler)));
+            },
+            token);
+    }
+
+    // Abandons the underlying exchange (the caller does not plan to read to EOF).
+    void abort() {
+        if (m_stream)
+            m_stream->abort();
     }
 
     [[nodiscard]] const std::string &last_event_id() const noexcept { return m_last_id; }
     [[nodiscard]] bool eof() const noexcept { return m_eof && m_pending.empty(); }
 
   private:
-    Stream m_stream;
+    void next_impl(std::shared_ptr<asio::any_completion_handler<void(error_code, SseEvent)>> done) {
+        for (;;) {
+            if (!m_pending.empty()) {
+                SseEvent event = std::move(m_pending.front());
+                m_pending.pop_front();
+                if (!event.id.empty())
+                    m_last_id = event.id;
+                auto callback = std::move(*done);
+                std::move(callback)(error_code{}, std::move(event));
+                return;
+            }
+            if (m_eof) {
+                auto callback = std::move(*done);
+                std::move(callback)(make_error_code(asio::error::eof), SseEvent{});
+                return;
+            }
+            auto self = this->shared_from_this();
+            m_stream->async_read([self, done = std::move(done)](error_code ec, ReadResult chunk) mutable {
+                if (ec) {
+                    auto callback = std::move(*done);
+                    std::move(callback)(ec, SseEvent{});
+                    return;
+                }
+                if (chunk.eof) {
+                    self->m_eof = true;
+                    for (auto &event : self->m_parser.finish())
+                        self->m_pending.push_back(std::move(event));
+                } else {
+                    for (auto &event : self->m_parser.feed(chunk.data))
+                        self->m_pending.push_back(std::move(event));
+                }
+                self->next_impl(std::move(done));
+            });
+            return;
+        }
+    }
+
+    std::shared_ptr<Stream> m_stream;
     SseParser m_parser;
     std::deque<SseEvent> m_pending;
     std::string m_last_id;

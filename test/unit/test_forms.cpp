@@ -30,9 +30,9 @@ RequestPtr make_request(asio::io_context &ctx, std::string target, Method method
 }
 
 std::shared_ptr<FakeResponseSink> dispatch(asio::io_context &ctx, Router &router, RequestPtr req) {
-    auto writer = std::make_shared<FakeResponseSink>();
+    auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
     auto res = std::make_shared<ResponseWriter>(writer);
-    REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
+    REQUIRE(run_on(ctx, await_dispatch(router, req, res)));
     return writer;
 }
 
@@ -248,15 +248,15 @@ TEST_CASE("proto/request: cookie() picks a name from the Cookie header", "[forms
 
 TEST_CASE("proto/response: set_cookie formats a Set-Cookie header", "[forms]") {
     asio::io_context ctx;
-    auto writer = std::make_shared<FakeResponseSink>();
+    auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
     auto res = std::make_shared<ResponseWriter>(writer);
-    REQUIRE(run_on(ctx, res->status(status::ok).send("")));
+    REQUIRE(run_on(ctx, res->status(status::ok).async_send("", asio::use_awaitable)));
     // (set_cookie is a builder; exercise it directly below.)
-    auto writer2 = std::make_shared<FakeResponseSink>();
+    auto writer2 = std::make_shared<FakeResponseSink>(ctx.get_executor());
     auto res2 = std::make_shared<ResponseWriter>(writer2);
     res2->set_cookie("sid", "abc", std::chrono::seconds{3600}, "/", "", true, true, "Lax");
     res2->set_cookie("tricky", "a;b");
-    REQUIRE(run_on(ctx, res2->status(status::ok).send("")));
+    REQUIRE(run_on(ctx, res2->status(status::ok).async_send("", asio::use_awaitable)));
     CHECK(writer2->header(field::set_cookie) == "sid=abc; Path=/; Max-Age=3600; Secure; HttpOnly; SameSite=Lax");
     // The second Set-Cookie is a separate field; Headers::get returns the first.
     CHECK(writer2->last_headers.count(field::set_cookie) == 2);
@@ -274,7 +274,7 @@ TEST_CASE("middleware: redirect_slashes 301s the slash form to the canonical pat
     Router router;
     router.use(middleware::redirect_slashes());
     router.route({Method::Get}, "/pets", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(status::ok).send("pets");
+        co_await res->status(status::ok).async_send("pets", asio::use_awaitable);
     });
 
     asio::io_context ctx;
@@ -305,7 +305,7 @@ TEST_CASE("proto/multipart: read_multipart_body on a request", "[forms]") {
     (void)req->body().feed("--xyz\r\nContent-Disposition: form-data; name=\"n\"\r\n\r\nv\r\n--xyz--\r\n");
     req->body().finish();
 
-    auto form = run_on(ctx, read_multipart_body(*req));
+    auto form = run_on(ctx, as_expected(read_multipart_body(*req, asio::as_tuple(asio::use_awaitable))));
     REQUIRE(form.has_value());
     REQUIRE(form->has_value());
     CHECK((**form)[0].name == "n");
@@ -320,7 +320,7 @@ TEST_CASE("proto/multipart: read_urlencoded_body on a request", "[forms]") {
     (void)req->body().feed("a=1&b=two+words");
     req->body().finish();
 
-    auto form = run_on(ctx, read_urlencoded_body(*req));
+    auto form = run_on(ctx, as_expected(read_urlencoded_body(*req, asio::as_tuple(asio::use_awaitable))));
     REQUIRE(form.has_value());
     REQUIRE(form->has_value());
     CHECK((*form)->get("a") == "1");
@@ -331,32 +331,32 @@ TEST_CASE("proto/multipart: read_urlencoded_body on a request", "[forms]") {
 
 TEST_CASE("proto/response: redirect sets Status and Location", "[forms]") {
     asio::io_context ctx;
-    auto writer = std::make_shared<FakeResponseSink>();
+    auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
     auto res = std::make_shared<ResponseWriter>(writer);
-    REQUIRE(run_on(ctx, res->redirect("/login").send("")));
+    REQUIRE(run_on(ctx, res->redirect("/login").async_send("", asio::use_awaitable)));
     CHECK(writer->last_status == status::found);
     CHECK(writer->header(field::location) == "/login");
 
-    auto writer2 = std::make_shared<FakeResponseSink>();
+    auto writer2 = std::make_shared<FakeResponseSink>(ctx.get_executor());
     auto res2 = std::make_shared<ResponseWriter>(writer2);
-    REQUIRE(run_on(ctx, res2->redirect("/moved", status::permanent_redirect).send("")));
+    REQUIRE(run_on(ctx, res2->redirect("/moved", status::permanent_redirect).async_send("", asio::use_awaitable)));
     CHECK(writer2->last_status == status::permanent_redirect);
     CHECK(writer2->header(field::location) == "/moved");
 }
 
 TEST_CASE("proto/response: SSE frames are well-formed events", "[forms]") {
     asio::io_context ctx;
-    auto writer = std::make_shared<FakeResponseSink>();
+    auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
     auto res = std::make_shared<ResponseWriter>(writer);
 
-    REQUIRE(run_on(ctx, res->sse_begin()));
+    REQUIRE(run_on(ctx, res->async_sse_begin(asio::use_awaitable)));
     CHECK(writer->begun);
     CHECK(writer->last_headers.get("content-type") == "text/event-stream; charset=utf-8");
     CHECK(writer->last_headers.get("cache-control") == "no-cache");
 
-    REQUIRE(run_on(ctx, res->sse_event("hello")));
-    REQUIRE(run_on(ctx, res->sse_event("l1\nl2", "update", "42")));
-    REQUIRE(run_on(ctx, res->sse_comment("keepalive")));
+    REQUIRE(run_on(ctx, res->async_sse_event("hello", asio::use_awaitable)));
+    REQUIRE(run_on(ctx, res->async_sse_event("l1\nl2", "update", "42", "", asio::use_awaitable)));
+    REQUIRE(run_on(ctx, res->async_sse_comment("keepalive", asio::use_awaitable)));
 
     CHECK(writer->chunks.size() == 3);
     CHECK(writer->chunks[0] == "data: hello\n\n");
@@ -373,7 +373,7 @@ TEST_CASE("middleware: real_ip resolves from X-Forwarded-For", "[forms]") {
     router.route(any_methods, "/ip", [&](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
         const auto *ip = req->get_state<middleware::ClientIp>();
         seen = ip ? ip->value : "";
-        co_await res->status(status::ok).send("ok");
+        co_await res->status(status::ok).async_send("ok", asio::use_awaitable);
     });
 
     asio::io_context ctx;
@@ -396,7 +396,7 @@ TEST_CASE("middleware: real_ip skips trusted proxies right-to-left", "[forms]") 
     router.route(any_methods, "/ip", [&](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
         const auto *ip = req->get_state<middleware::ClientIp>();
         seen = ip ? ip->value : "";
-        co_await res->status(status::ok).send("ok");
+        co_await res->status(status::ok).async_send("ok", asio::use_awaitable);
     });
 
     asio::io_context ctx;
@@ -418,7 +418,7 @@ TEST_CASE("middleware: clean_path normalizes and rejects traversal", "[forms]") 
     router.use(middleware::clean_path());
     router.route({Method::Get}, "/a/b", [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
         seen.push_back("ab");
-        co_await res->status(status::ok).send("ok");
+        co_await res->status(status::ok).async_send("ok", asio::use_awaitable);
     });
 
     asio::io_context ctx;
@@ -451,7 +451,7 @@ TEST_CASE("middleware: strip_prefix re-mounts a sub-application at its root", "[
     router.use(middleware::strip_prefix("/api"));
     router.route({Method::Get}, "/users", [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
         seen.push_back("users");
-        co_await res->status(status::ok).send("users");
+        co_await res->status(status::ok).async_send("users", asio::use_awaitable);
     });
 
     asio::io_context ctx;
@@ -481,16 +481,16 @@ TEST_CASE("middleware: strip_prefix re-mounts a sub-application at its root", "[
 TEST_CASE("proto/response: set_cookie can delete with a negative Max-Age", "[forms]") {
     asio::io_context ctx;
     // 0 is the default ("unspecified"), matching Go, so it emits no Max-Age.
-    auto writer = std::make_shared<FakeResponseSink>();
+    auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
     auto res = std::make_shared<ResponseWriter>(writer);
     res->set_cookie("sid", "", std::chrono::seconds{0}, "/");
-    REQUIRE(run_on(ctx, res->status(status::ok).send("")));
+    REQUIRE(run_on(ctx, res->status(status::ok).async_send("", asio::use_awaitable)));
     CHECK(writer->header(field::set_cookie) == "sid=; Path=/");
 
     // Go's http.SetCookie: a negative MaxAge is "delete now" and emits 0.
-    auto writer2 = std::make_shared<FakeResponseSink>();
+    auto writer2 = std::make_shared<FakeResponseSink>(ctx.get_executor());
     auto res2 = std::make_shared<ResponseWriter>(writer2);
     res2->set_cookie("old", "", std::chrono::seconds{-5}, "/");
-    REQUIRE(run_on(ctx, res2->status(status::ok).send("")));
+    REQUIRE(run_on(ctx, res2->status(status::ok).async_send("", asio::use_awaitable)));
     CHECK(writer2->header(field::set_cookie) == "old=; Path=/; Max-Age=0");
 }

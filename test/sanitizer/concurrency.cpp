@@ -29,8 +29,11 @@
 
 #include "simple_http.h"
 
+#include "../support/coro_compat.h"
+
 namespace asio = boost::asio;
 using namespace simple_http;
+using namespace simple_http::test;
 using namespace std::chrono_literals;
 
 namespace {
@@ -56,66 +59,66 @@ asio::awaitable<void> run_client(unsigned short port, int id, int iterations) {
 
     for (int i = 0; i < iterations; ++i) {
         {
-            auto response = co_await client.get(base + "/plain").send();
+            auto response = co_await client_send(client.get(base + "/plain"));
             check(response.has_value(), "GET /plain transport");
             if (response) {
-                auto body = co_await response->text();
+                const std::string &body = response->text();
                 check(response->status() == status::ok, "GET /plain status");
-                check(body && *body == "ok", "GET /plain body");
+                check(body == "ok", "GET /plain body");
             }
         }
         {
             const std::string payload = "body-" + std::to_string(id) + "-" + std::to_string(i);
-            auto response = co_await client.post(base + "/echo").body(payload).send();
+            auto response = co_await client_send(client.post(base + "/echo").body(payload));
             check(response.has_value(), "POST /echo transport");
             if (response) {
-                auto body = co_await response->text();
-                check(body && *body == payload, "POST /echo body");
+                const std::string &body = response->text();
+                check(body == payload, "POST /echo body");
             }
         }
         {
-            auto response = co_await client.get(base + "/compress").send();
+            auto response = co_await client_send(client.get(base + "/compress"));
             check(response.has_value(), "GET /compress transport");
             if (response) {
-                auto body = co_await response->text();
+                const std::string &body = response->text();
                 check(response->status() == status::ok, "GET /compress status");
-                check(body && body->size() == 4096, "GET /compress body size");
+                check(body.size() == 4096, "GET /compress body size");
             }
         }
         {
             // 200 or 429 are both correct: the shared limiter may be saturated.
-            auto response = co_await client.get(base + "/rate").send();
+            auto response = co_await client_send(client.get(base + "/rate"));
             check(response.has_value(), "GET /rate transport");
             if (response) {
-                (void)co_await response->text();
+                (void)response->text();
             }
         }
         {
-            auto response = co_await client.get(base + "/cross").send();
+            auto response = co_await client_send(client.get(base + "/cross"));
             check(response.has_value(), "GET /cross transport");
             if (response) {
-                auto body = co_await response->text();
+                const std::string &body = response->text();
                 check(response->status() == status::ok, "GET /cross status");
-                check(body && *body == "cross done\n", "GET /cross body");
+                check(body == "cross done\n", "GET /cross body");
             }
         }
     }
 
     // WebSocket lifecycle: open, exchange a few messages, close.
-    auto ws = co_await client.open_websocket("ws://127.0.0.1:" + std::to_string(port) + "/ws");
+    auto ws = co_await client_open_websocket(client, "ws://127.0.0.1:" + std::to_string(port) + "/ws");
     check(ws.has_value(), "WebSocket open");
     if (ws) {
         for (int i = 0; i < 5; ++i) {
             const std::string message = "ws-" + std::to_string(id) + "-" + std::to_string(i);
-            const auto write_result = co_await (*ws)->write_text(message);
+            const auto write_result = co_await ws_write_text(**ws, message);
             check(write_result == error_code{}, "WebSocket write");
-            auto reply = co_await (*ws)->read();
+            auto reply = co_await ws_read(**ws);
             check(reply.has_value(), "WebSocket read");
             if (reply) {
                 check(reply->data == message, "WebSocket echo");
             }
         }
-        (void)co_await (*ws)->close();
+        (void)co_await ws_close(**ws);
     }
     co_return;
 }
@@ -147,42 +150,42 @@ int main(int argc, char **argv) {
     auto limiter = std::make_shared<middleware::RateLimiter>(/*rate=*/1000.0, /*burst=*/10000,
                                                              /*max_keys=*/64);
     server.route(any_methods, "/plain", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(status::ok).send("ok");
+        co_await res->status(status::ok).async_send("ok", asio::use_awaitable);
     });
     server.route(any_methods, "/echo", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
-        auto body = co_await req->body().read_all();
-        co_await res->status(status::ok).send(body ? std::move(*body) : std::string{});
+        auto body = co_await body_read_all(req->body());
+        co_await res->status(status::ok).async_send(body ? std::move(*body) : std::string{}, asio::use_awaitable);
     });
     server.route(any_methods, "/compress", {middleware::compress(CompressionConfig{.min_bytes = 1})},
                  [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-                     co_await res->status(status::ok).content_type("text/plain").send(std::string(4096, 'c'));
+                     co_await res->status(status::ok).content_type("text/plain").async_send(std::string(4096, 'c'), asio::use_awaitable);
                  });
     server.route(
         any_methods, "/rate", {middleware::rate_limit(limiter)},
-        [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(status::ok).send("ok"); });
+        [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(status::ok).async_send("ok", asio::use_awaitable); });
 
     // The handler starts on the connection executor but the writes happen on a
     // different one. ResponseWriter hops internally; this is the path that
     // catches a missing hop or a lifetime mistake under TSan/ASan.
     server.route(any_methods, "/cross", [&cross_io](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-        if (auto ec = co_await res->status(status::ok).content_type("text/plain").begin()) {
+        if (auto ec = co_await as_ec(res->status(status::ok).content_type("text/plain").async_begin(asio::as_tuple(asio::use_awaitable)))) {
             co_return;
         }
         asio::co_spawn(
             cross_io,
             [res]() -> asio::awaitable<void> {
-                (void)co_await res->write("cross ");
-                (void)co_await res->finish("done\n");
+                (void)co_await res->async_write("cross ", asio::use_awaitable);
+                (void)co_await res->async_finish("done\n", asio::use_awaitable);
             },
             asio::detached);
     });
     server.ws_route("/ws", [](RequestPtr, std::shared_ptr<WebSocket> ws) -> asio::awaitable<void> {
         for (;;) {
-            auto message = co_await ws->read();
+            auto message = co_await ws_read(*ws);
             if (!message) {
                 break;
             }
-            if (auto ec = co_await ws->write(message->data, message->text)) {
+            if (auto ec = co_await ws_write(*ws, message->data, message->text)) {
                 break;
             }
         }

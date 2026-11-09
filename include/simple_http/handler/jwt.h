@@ -1,15 +1,16 @@
 #pragma once
 
-// JWT bearer authentication (HS256 / RS256 / ES256) plus scope/role checks.
+// JWT bearer authentication (HS256 / RS256 / ES256) plus scope/role checks --
+// C++17 token-only port.
 //
 // This is deliberately a verifier, not an authorization server: it validates a
 // compact JWS, checks the standard time/issuer/audience claims, and publishes a
 // Principal on the request. Token issuance, OAuth2/OIDC discovery and JWKS
 // fetching are separate concerns and are left to the caller or a later module.
 //
-//     server.use(simple_http::middleware::jwt(JwtConfig{
-//         .algorithms = {"RS256"},
-//         .public_key_pem = read_file("public.pem"),
+//     server.use(simple_http::middleware::jwt(simple_http::JwtConfig{
+//         .algorithms = {"RS256"},          // C++20 designated init; assign
+//         .public_key_pem = read_file("public.pem"), // fields individually in C++17
 //         .issuer = "https://issuer.example",
 //         .audience = "my-api",
 //     }));
@@ -21,6 +22,14 @@
 //   * HMAC comparison is constant-time;
 //   * `exp` is required by default and checked with a small leeway, as are
 //     `nbf`, `iss` and `aud` when configured.
+//
+// The header/payload parser uses glaze, so this whole header is part of the
+// glaze-gated surface (core/glaze_support.h). The middleware itself performs no
+// I/O and completes synchronously.
+
+#include "../core/glaze_support.h"
+
+#if SIMPLE_HTTP_CPP17_ENABLE_GLAZE
 
 #include <array>
 #include <chrono>
@@ -32,7 +41,6 @@
 #include <utility>
 #include <vector>
 
-#include <glaze/glaze.hpp>
 #include <openssl/bn.h>
 #include <openssl/crypto.h>
 #include <openssl/ecdsa.h>
@@ -43,6 +51,7 @@
 #include "../core/base64.h"
 #include "../core/http_date.h"
 #include "../core/http_status.h"
+#include "../core/logging.h"
 #include "../core/types.h"
 #include "../proto/error_body.h"
 #include "handler.h"
@@ -73,8 +82,8 @@ struct JwtConfig {
     std::string public_key_pem;
     // A static JWKS document (RFC 7517). When non-empty it takes precedence over
     // public_key_pem and keys are selected by the token's `kid` (or the single
-    // key when there is exactly one). Fetch it with fetch_jwks_json() and pass
-    // the body here; refresh is the caller's policy.
+    // key when there is exactly one). Fetch it with async_fetch_jwks_json() and
+    // pass the body here; refresh is the caller's policy.
     std::string jwks_json;
     // Claim checks. Empty issuer/audience disables that check.
     std::string issuer;
@@ -255,14 +264,15 @@ inline bool has_role(const Principal &principal, std::string_view role) {
 
 namespace middleware {
 
-inline asio::awaitable<void> jwt_reject(ResponsePtr res, int status_code, std::string_view message) {
+// Writes the standard 401/403 JSON body and completes `done`.
+inline void jwt_reject(const ResponsePtr &res, int status_code, std::string_view message, HandlerCompletion done) {
     res->status(status_code);
     if (status_code == status::unauthorized) {
         res->header("www-authenticate", "Bearer error=\"invalid_token\"");
     }
-    (void)co_await write_error(res, status_code,
-                               JsonError{.code = status_code == status::unauthorized ? "unauthorized" : "forbidden",
-                                         .message = std::string{message}});
+    JsonError body{status_code == status::unauthorized ? "unauthorized" : "forbidden", std::string{message},
+                   std::nullopt};
+    async_write_error(res, status_code, std::move(body), finish_with(std::move(done)));
 }
 
 inline Middleware jwt(JwtConfig config = {}) {
@@ -277,7 +287,7 @@ inline Middleware jwt(JwtConfig config = {}) {
     if (jwks_configured) {
         auto parsed = Jwks::parse(config.jwks_json);
         if (!parsed) {
-            SIMPLE_HTTP_ERROR_LOG("jwt: {}", parsed.error());
+            SIMPLE_HTTP_ERROR_LOG("jwt: invalid JWKS document");
             jwks = std::make_shared<Jwks>();
         } else {
             jwks = std::make_shared<Jwks>(std::move(*parsed));
@@ -285,15 +295,15 @@ inline Middleware jwt(JwtConfig config = {}) {
     }
 
     return [config = std::move(config), public_key = std::move(public_key), jwks = std::move(jwks),
-            jwks_configured](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
+            jwks_configured](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next, HandlerCompletion done) {
         const auto header = req->header(config.header_name);
         if (!header) {
             if (config.optional) {
-                co_await next(std::move(req), std::move(res), ssl);
+                next(std::move(req), std::move(res), ssl, std::move(done));
             } else {
-                co_await jwt_reject(res, status::unauthorized, "missing bearer token");
+                jwt_reject(res, status::unauthorized, "missing bearer token", std::move(done));
             }
-            co_return;
+            return;
         }
 
         std::string token{*header};
@@ -301,8 +311,8 @@ inline Middleware jwt(JwtConfig config = {}) {
             const std::string prefix = config.scheme + " ";
             if (token.size() <= prefix.size() ||
                 !iequals_ci(std::string_view{token}.substr(0, prefix.size()), prefix)) {
-                co_await jwt_reject(res, status::unauthorized, "invalid authorization scheme");
-                co_return;
+                jwt_reject(res, status::unauthorized, "invalid authorization scheme", std::move(done));
+                return;
             }
             token.erase(0, prefix.size());
         }
@@ -311,8 +321,8 @@ inline Middleware jwt(JwtConfig config = {}) {
         const auto second = first == std::string::npos ? std::string::npos : token.find('.', first + 1);
         if (first == std::string::npos || second == std::string::npos ||
             token.find('.', second + 1) != std::string::npos) {
-            co_await jwt_reject(res, status::unauthorized, "malformed JWT");
-            co_return;
+            jwt_reject(res, status::unauthorized, "malformed JWT", std::move(done));
+            return;
         }
 
         const std::string_view token_view{token};
@@ -320,8 +330,8 @@ inline Middleware jwt(JwtConfig config = {}) {
         const std::string_view payload_b64 = token_view.substr(first + 1, second - first - 1);
         const std::string_view signature_b64 = token_view.substr(second + 1);
         if (header_b64.empty() || payload_b64.empty() || signature_b64.empty()) {
-            co_await jwt_reject(res, status::unauthorized, "malformed JWT");
-            co_return;
+            jwt_reject(res, status::unauthorized, "malformed JWT", std::move(done));
+            return;
         }
 
         jwt_detail::Header jwt_header{};
@@ -335,30 +345,30 @@ inline Middleware jwt(JwtConfig config = {}) {
         // token; every key that matters is checked explicitly below.
         constexpr auto jwt_opts = glz::opts{.error_on_unknown_keys = false};
         if (auto ec = glz::read<jwt_opts>(jwt_header, header_json); ec) {
-            co_await jwt_reject(res, status::unauthorized, "malformed JWT header");
-            co_return;
+            jwt_reject(res, status::unauthorized, "malformed JWT header", std::move(done));
+            return;
         }
         if (auto ec = glz::read<jwt_opts>(payload, payload_json); ec) {
-            co_await jwt_reject(res, status::unauthorized, "malformed JWT payload");
-            co_return;
+            jwt_reject(res, status::unauthorized, "malformed JWT payload", std::move(done));
+            return;
         }
 
         if (!jwt_detail::allowed_algorithm(config, jwt_header.alg) || jwt_header.alg == "none") {
-            co_await jwt_reject(res, status::unauthorized, "disallowed JWT algorithm");
-            co_return;
+            jwt_reject(res, status::unauthorized, "disallowed JWT algorithm", std::move(done));
+            return;
         }
 
         std::string_view secret = config.secret;
         EVP_PKEY *signing_key = public_key.get();
         if (jwks_configured) {
             if (!jwks || jwks->empty()) {
-                co_await jwt_reject(res, status::unauthorized, "JWT key set unavailable");
-                co_return;
+                jwt_reject(res, status::unauthorized, "JWT key set unavailable", std::move(done));
+                return;
             }
             const JwkKey *key = jwks->find(jwt_header.kid, jwt_header.alg);
             if (!key) {
-                co_await jwt_reject(res, status::unauthorized, "unknown JWT key");
-                co_return;
+                jwt_reject(res, status::unauthorized, "unknown JWT key", std::move(done));
+                return;
             }
             if (!key->secret.empty()) {
                 secret = key->secret;
@@ -370,72 +380,73 @@ inline Middleware jwt(JwtConfig config = {}) {
         }
         if (!jwt_detail::verify_signature(secret, signing_key, jwt_header.alg, jwt_detail::signing_input(token, second),
                                           signature)) {
-            co_await jwt_reject(res, status::unauthorized, "invalid JWT signature");
-            co_return;
+            jwt_reject(res, status::unauthorized, "invalid JWT signature", std::move(done));
+            return;
         }
 
         const std::int64_t now = now_unix();
         const std::int64_t leeway = config.leeway.count();
         if (config.require_exp && payload.exp == 0) {
-            co_await jwt_reject(res, status::unauthorized, "JWT has no exp claim");
-            co_return;
+            jwt_reject(res, status::unauthorized, "JWT has no exp claim", std::move(done));
+            return;
         }
         if (payload.exp != 0 && now > payload.exp + leeway) {
-            co_await jwt_reject(res, status::unauthorized, "JWT has expired");
-            co_return;
+            jwt_reject(res, status::unauthorized, "JWT has expired", std::move(done));
+            return;
         }
         if (payload.nbf != 0 && now + leeway < payload.nbf) {
-            co_await jwt_reject(res, status::unauthorized, "JWT is not valid yet");
-            co_return;
+            jwt_reject(res, status::unauthorized, "JWT is not valid yet", std::move(done));
+            return;
         }
         if (!config.issuer.empty() && payload.iss != config.issuer) {
-            co_await jwt_reject(res, status::unauthorized, "JWT issuer mismatch");
-            co_return;
+            jwt_reject(res, status::unauthorized, "JWT issuer mismatch", std::move(done));
+            return;
         }
         if (!config.audience.empty() && payload.aud != config.audience) {
-            co_await jwt_reject(res, status::unauthorized, "JWT audience mismatch");
-            co_return;
+            jwt_reject(res, status::unauthorized, "JWT audience mismatch", std::move(done));
+            return;
         }
 
-        Principal principal{payload.sub,   payload.iss, payload.aud, jwt_detail::split_space(payload.scope),
-                            payload.roles, payload.exp};
-        req->set_state(std::move(principal));
-        co_await next(std::move(req), std::move(res), ssl);
+        Principal identity{payload.sub,   payload.iss, payload.aud, jwt_detail::split_space(payload.scope),
+                           payload.roles, payload.exp};
+        req->set_state(std::move(identity));
+        next(std::move(req), std::move(res), ssl, std::move(done));
     };
 }
 
 inline Middleware require_scope(std::string scope) {
     return
-        [scope = std::move(scope)](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
+        [scope = std::move(scope)](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next, HandlerCompletion done) {
             const Principal *identity = principal(*req);
             if (!identity) {
-                co_await jwt_reject(res, status::unauthorized, "authentication required");
-                co_return;
+                jwt_reject(res, status::unauthorized, "authentication required", std::move(done));
+                return;
             }
             if (!jwt_detail::has_scope(*identity, scope)) {
-                co_await jwt_reject(res, status::forbidden, "insufficient scope");
-                co_return;
+                jwt_reject(res, status::forbidden, "insufficient scope", std::move(done));
+                return;
             }
-            co_await next(std::move(req), std::move(res), ssl);
+            next(std::move(req), std::move(res), ssl, std::move(done));
         };
 }
 
 inline Middleware require_role(std::string role) {
-    return
-        [role = std::move(role)](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
-            const Principal *identity = principal(*req);
-            if (!identity) {
-                co_await jwt_reject(res, status::unauthorized, "authentication required");
-                co_return;
-            }
-            if (!jwt_detail::has_role(*identity, role)) {
-                co_await jwt_reject(res, status::forbidden, "insufficient role");
-                co_return;
-            }
-            co_await next(std::move(req), std::move(res), ssl);
-        };
+    return [role = std::move(role)](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next, HandlerCompletion done) {
+        const Principal *identity = principal(*req);
+        if (!identity) {
+            jwt_reject(res, status::unauthorized, "authentication required", std::move(done));
+            return;
+        }
+        if (!jwt_detail::has_role(*identity, role)) {
+            jwt_reject(res, status::forbidden, "insufficient role", std::move(done));
+            return;
+        }
+        next(std::move(req), std::move(res), ssl, std::move(done));
+    };
 }
 
 } // namespace middleware
 
 } // namespace simple_http
+
+#endif // SIMPLE_HTTP_CPP17_ENABLE_GLAZE

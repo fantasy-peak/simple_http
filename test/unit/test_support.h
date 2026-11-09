@@ -10,11 +10,14 @@
 #include <atomic>
 #include <boost/asio.hpp>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <expected>
 #include <functional>
 #include <memory>
+#include <expected>
 #include <optional>
+#include <tuple>
 #include <span>
 #include <string>
 #include <utility>
@@ -152,12 +155,238 @@ inline bool run(asio::awaitable<void> op, std::chrono::milliseconds timeout = st
 template <typename F>
 concept AwaitableFactory = requires(F f) { f(); };
 
+// --- driving callback seams from a coroutine test ----------------------------
+
+// Router::dispatch and middleware Next are callback-based in the token port.
+// These wrap them as awaitables so a test can keep `run_on(ctx, ...)`.
+inline asio::awaitable<void> await_dispatch(const Router &router, RequestPtr req, ResponsePtr res,
+                                            SslHandle ssl = std::nullopt) {
+    auto token = asio::use_awaitable;
+    co_await asio::async_initiate<decltype(token), void()>(
+        [&](auto handler) {
+            router.dispatch(std::move(req), std::move(res), ssl,
+                            [handler = std::move(handler)]() mutable { std::move(handler)(); });
+        },
+        token);
+}
+
+inline asio::awaitable<void> await_next(const Next &next, RequestPtr req, ResponsePtr res,
+                                        SslHandle ssl = std::nullopt) {
+    auto token = asio::use_awaitable;
+    co_await asio::async_initiate<decltype(token), void()>(
+        [&](auto handler) {
+            next(std::move(req), std::move(res), ssl,
+                 [handler = std::move(handler)]() mutable { std::move(handler)(); });
+        },
+        token);
+}
+
+
+// --- expected/value shims for the token API --------------------------------
+//
+// The token port completed with void(error_code[, T]) signatures. The tests
+// were written against awaitables returning std::expected, so these thin
+// coroutine adapters let a call site keep its value-or-error shape without
+// reintroducing a library-level compatibility layer.
+
+template <typename T>
+asio::awaitable<std::expected<T, error_code>> as_expected(asio::awaitable<std::tuple<error_code, T>> op) {
+    auto [ec, value] = co_await std::move(op);
+    if (ec)
+        co_return std::unexpected{ec};
+    co_return std::move(value);
+}
+
+inline asio::awaitable<std::expected<void, error_code>>
+as_expected_void(asio::awaitable<std::tuple<error_code>> op) {
+    auto [ec] = co_await std::move(op);
+    if (ec)
+        co_return std::unexpected{ec};
+    co_return std::expected<void, error_code>{};
+}
+
+inline asio::awaitable<error_code> as_ec(asio::awaitable<std::tuple<error_code>> op) {
+    auto [ec] = co_await std::move(op);
+    co_return ec;
+}
+
+inline asio::awaitable<std::expected<std::string, error_code>> body_read_all(Body &body) {
+    return as_expected(body.async_read_all(asio::as_tuple(asio::use_awaitable)));
+}
+
+inline asio::awaitable<std::expected<ReadResult, error_code>> body_read(Body &body) {
+    return as_expected(body.async_read(asio::as_tuple(asio::use_awaitable)));
+}
+
+inline asio::awaitable<std::expected<WsMessage, error_code>> ws_read(WebSocket &ws) {
+    return as_expected(ws.async_read(asio::as_tuple(asio::use_awaitable)));
+}
+
+inline asio::awaitable<error_code> ws_write(WebSocket &ws, std::string data, bool text) {
+    return as_ec(ws.async_write(std::move(data), text, asio::as_tuple(asio::use_awaitable)));
+}
+
+inline asio::awaitable<error_code> ws_write_view(WebSocket &ws, std::string_view data, bool text) {
+    return as_ec(ws.async_write_view(data, text, asio::as_tuple(asio::use_awaitable)));
+}
+
+inline asio::awaitable<error_code> ws_write_text(WebSocket &ws, std::string data) {
+    return as_ec(ws.async_write_text(std::move(data), asio::as_tuple(asio::use_awaitable)));
+}
+
+inline asio::awaitable<error_code> ws_write_binary(WebSocket &ws, std::string data) {
+    return as_ec(ws.async_write_binary(std::move(data), asio::as_tuple(asio::use_awaitable)));
+}
+
+// Starts an engine's run() loop and completes when the engine reports done.
+template <typename Engine, typename HandlerFn>
+asio::awaitable<void> run_engine(Engine &engine, HandlerFn &&fn, std::string initial = {}) {
+    auto token = asio::use_awaitable;
+    auto dispatcher = detail::make_callback_handler(std::forward<HandlerFn>(fn));
+    co_await asio::async_initiate<decltype(token), void()>(
+        [&](auto handler) {
+            // engine.run's on_done is a std::function (copyable); the completion
+            // handler is move-only, so keep it behind a shared_ptr.
+            auto completion =
+                std::make_shared<asio::any_completion_handler<void()>>(std::move(handler));
+            engine.run(std::move(dispatcher), std::move(initial), {}, {}, {},
+                       [completion]() mutable { std::move(*completion)(); });
+        },
+        token);
+}
+
+
+// Some library seams are type-erased completion handlers rather than token
+// templates (StaticFiles::try_serve, serve_not_found). These bridge them back
+// to awaitables for the tests.
+template <typename Start> asio::awaitable<bool> await_bool(Start &&start) {
+    auto token = asio::use_awaitable;
+    co_return co_await asio::async_initiate<decltype(token), void(bool)>(
+        [&](auto handler) { start(std::move(handler)); }, token);
+}
+
+template <typename Start> asio::awaitable<void> await_void(Start &&start) {
+    auto token = asio::use_awaitable;
+    co_await asio::async_initiate<decltype(token), void()>(
+        [&](auto handler) { start(std::move(handler)); }, token);
+}
+
+
+template <typename Start> asio::awaitable<bool> await_connected(Start &&start) {
+    auto token = asio::use_awaitable;
+    co_return co_await asio::async_initiate<decltype(token), void(error_code, bool)>(
+        [&](auto handler) { start(std::move(handler)); }, token);
+}
+
+template <typename Start> asio::awaitable<error_code> await_error(Start &&start) {
+    auto token = asio::as_tuple(asio::use_awaitable);
+    auto result = co_await asio::async_initiate<decltype(token), void(error_code)>(
+        [&](auto handler) { start(std::move(handler)); }, token);
+    co_return std::get<0>(result);
+}
+
+
+inline asio::awaitable<error_code> ws_ping(WebSocket &ws, std::string payload) {
+    return as_ec(ws.async_ping(std::move(payload), asio::as_tuple(asio::use_awaitable)));
+}
+
+inline asio::awaitable<error_code> ws_close(WebSocket &ws) {
+    return as_ec(ws.async_close(asio::as_tuple(asio::use_awaitable)));
+}
+
+inline asio::awaitable<error_code> ws_close(WebSocket &ws, std::uint16_t code, std::string reason) {
+    return as_ec(ws.async_close(code, std::move(reason), asio::as_tuple(asio::use_awaitable)));
+}
+
+
+inline asio::awaitable<error_code> ws_enable_compression(WebSocket &ws, bool enable) {
+    return as_ec(ws.async_enable_write_compression(enable, asio::as_tuple(asio::use_awaitable)));
+}
+
+inline asio::awaitable<error_code> ws_set_compression_level(WebSocket &ws, int level) {
+    return as_ec(ws.async_set_compression_level(level, asio::as_tuple(asio::use_awaitable)));
+}
+
+
+// --- coroutine middleware ------------------------------------------------
+//
+// Middleware is callback-shaped in the token port. The unit tests express the
+// same before/after logic as coroutines, so this test-side adapter bridges the
+// two: `next` is awaitable again, and the coroutine is spawned with the
+// request's cancellation slot. Exceptions use the handler policy (500 if the
+// response has not started, close otherwise).
+
+class CoroutineNext {
+  public:
+    explicit CoroutineNext(Next next) : m_next(std::move(next)) {}
+
+    asio::awaitable<void> operator()(RequestPtr req, ResponsePtr res, SslHandle ssl) const {
+        auto token = asio::use_awaitable;
+        co_await asio::async_initiate<decltype(token), void()>(
+            [&](auto handler) {
+                m_next(std::move(req), std::move(res), ssl,
+                       [handler = std::move(handler)]() mutable { std::move(handler)(); });
+            },
+            token);
+    }
+
+  private:
+    Next m_next;
+};
+
+template <typename F> Middleware coro_middleware(F fn) {
+    return [fn = std::move(fn)](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next,
+                                HandlerCompletion done) {
+        auto executor = req ? req->executor() : asio::any_io_executor{};
+        auto req_keep = req;
+        auto res_keep = res;
+        asio::co_spawn(
+            executor,
+            [fn = std::move(fn), req = std::move(req), res = std::move(res), ssl,
+             next = std::move(next)]() mutable -> asio::awaitable<void> {
+                co_await fn(std::move(req), std::move(res), ssl, CoroutineNext(std::move(next)));
+            },
+            asio::bind_cancellation_slot(
+                req_keep ? req_keep->cancellation_slot() : asio::cancellation_slot{},
+                [done = std::move(done), req_keep, res_keep](std::exception_ptr ep) mutable {
+                    if (!ep) {
+                        std::move(done)();
+                        return;
+                    }
+                    if (req_keep && req_keep->cancelled()) {
+                        std::move(done)();
+                        return;
+                    }
+                    if (!res_keep) {
+                        std::move(done)();
+                        return;
+                    }
+                    if (res_keep->started()) {
+                        res_keep->async_close([done = std::move(done)](error_code) mutable { std::move(done)(); });
+                    } else {
+                        res_keep->status(status::internal_server_error);
+                        res_keep->async_send("", [done = std::move(done)](error_code) mutable { std::move(done)(); });
+                    }
+                }));
+    };
+}
+
 // --- a scripted byte stream --------------------------------------------------
 
 // Satisfies the transport concept with preloaded input and recorded output, so
 // the WebSocket backend (and anything else driven by a transport) can be tested
 // without a socket. Reads hand out the queued chunks in order and report EOF
 // once they run out; writes are appended to `written`.
+// Wraps an initiation so it exposes its executor, which cancellation tokens
+// such as asio::cancel_after require from any non-Asio initiation.
+template <typename F> struct ExecInit {
+    using executor_type = asio::any_io_executor;
+    F fn;
+    asio::any_io_executor ex;
+    executor_type get_executor() const noexcept { return ex; }
+    template <typename Handler> void operator()(Handler &&handler) { fn(std::forward<Handler>(handler)); }
+};
+
 class MockTransport {
   public:
     explicit MockTransport(asio::any_io_executor ex) : m_executor(std::move(ex)) {}
@@ -190,7 +419,88 @@ class MockTransport {
 
     bool closed() const { return m_closed; }
 
-    asio::awaitable<IoResult> async_read_some(ByteSpan buffer) {
+    template <typename Token> auto async_read_some(ByteSpan buffer, Token &&token) {
+        auto initiation = [this, buffer](auto handler) {
+            // Honour the caller's cancellation slot the way a real transport
+            // does: co_spawn binds it to the coroutine, so a per-operation
+            // deadline can actually unblock a parked read.
+            auto slot = asio::get_associated_cancellation_slot(handler);
+            auto completion = [handler = std::move(handler)](std::exception_ptr ep, IoResult r) mutable {
+                if (ep) {
+                    std::move(handler)(make_error_code(asio::error::operation_aborted), 0);
+                    return;
+                }
+                std::move(handler)(r.first, r.second);
+            };
+            asio::co_spawn(m_executor, do_read_some(buffer),
+                           asio::bind_cancellation_slot(slot, std::move(completion)));
+        };
+        return asio::async_initiate<Token, void(error_code, std::size_t)>(
+            ExecInit<decltype(initiation)>{std::move(initiation), m_executor}, token);
+    }
+
+    template <typename Token> auto async_read(ByteSpan buffer, Token &&token) {
+        auto initiation = [this, buffer](auto handler) {
+            auto slot = asio::get_associated_cancellation_slot(handler);
+            auto completion = [handler = std::move(handler)](std::exception_ptr ep, IoResult r) mutable {
+                if (ep) {
+                    std::move(handler)(make_error_code(asio::error::operation_aborted), 0);
+                    return;
+                }
+                std::move(handler)(r.first, r.second);
+            };
+            asio::co_spawn(m_executor, do_read(buffer),
+                           asio::bind_cancellation_slot(slot, std::move(completion)));
+        };
+        return asio::async_initiate<Token, void(error_code, std::size_t)>(
+            ExecInit<decltype(initiation)>{std::move(initiation), m_executor}, token);
+    }
+
+    template <typename Token> auto async_write(ConstByteSpan buffer, Token &&token) {
+        auto initiation = [this, buffer](auto handler) {
+            asio::co_spawn(m_executor, do_write(buffer),
+                           [handler = std::move(handler)](std::exception_ptr ep, IoResult r) mutable {
+                               if (ep) {
+                                   std::move(handler)(make_error_code(asio::error::operation_aborted), 0);
+                                   return;
+                               }
+                               std::move(handler)(r.first, r.second);
+                           });
+        };
+        return asio::async_initiate<Token, void(error_code, std::size_t)>(
+            ExecInit<decltype(initiation)>{std::move(initiation), m_executor}, token);
+    }
+
+    template <typename Token> auto async_write_seq(boost::span<const ConstByteSpan> buffers, Token &&token) {
+        auto initiation = [this, buffers](auto handler) {
+            asio::co_spawn(m_executor, do_write_seq(buffers),
+                           [handler = std::move(handler)](std::exception_ptr ep, IoResult r) mutable {
+                               if (ep) {
+                                   std::move(handler)(make_error_code(asio::error::operation_aborted), 0);
+                                   return;
+                               }
+                               std::move(handler)(r.first, r.second);
+                           });
+        };
+        return asio::async_initiate<Token, void(error_code, std::size_t)>(
+            ExecInit<decltype(initiation)>{std::move(initiation), m_executor}, token);
+    }
+
+    auto get_executor() { return m_executor; }
+
+    asio::ip::tcp::endpoint peer() const { return {}; }
+
+    SslHandle tls_handle() const { return std::nullopt; }
+
+    template <typename Token> auto async_shutdown(Token &&token) {
+        auto initiation = [](auto handler) { std::move(handler)(error_code{}); };
+        return asio::async_initiate<Token, void(error_code)>(
+            ExecInit<decltype(initiation)>{std::move(initiation), m_executor}, token);
+    }
+    void close() { m_closed = true; }
+
+  private:
+    asio::awaitable<IoResult> do_read_some(ByteSpan buffer) {
         while (m_in.empty() && m_hold_open) {
             asio::steady_timer timer{m_executor, std::chrono::milliseconds(1)};
             co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
@@ -206,10 +516,10 @@ class MockTransport {
         co_return IoResult{error_code{}, take};
     }
 
-    asio::awaitable<IoResult> async_read(ByteSpan buffer) {
+    asio::awaitable<IoResult> do_read(ByteSpan buffer) {
         std::size_t got = 0;
         while (got < buffer.size()) {
-            auto [ec, n] = co_await async_read_some(buffer.subspan(got));
+            auto [ec, n] = co_await do_read_some(buffer.subspan(got));
             got += n;
             if (ec)
                 co_return IoResult{ec, got};
@@ -217,13 +527,13 @@ class MockTransport {
         co_return IoResult{error_code{}, got};
     }
 
-    asio::awaitable<IoResult> async_write(ConstByteSpan buffer) {
+    asio::awaitable<IoResult> do_write(ConstByteSpan buffer) {
         m_writes.emplace_back(reinterpret_cast<const char *>(buffer.data()), buffer.size());
         m_written.append(m_writes.back());
         co_return IoResult{error_code{}, buffer.size()};
     }
 
-    asio::awaitable<IoResult> async_write_seq(std::span<const ConstByteSpan> buffers) {
+    asio::awaitable<IoResult> do_write_seq(boost::span<const ConstByteSpan> buffers) {
         std::string chunk;
         for (const auto &buffer : buffers) {
             chunk.append(reinterpret_cast<const char *>(buffer.data()), buffer.size());
@@ -232,15 +542,6 @@ class MockTransport {
         m_written.append(chunk);
         co_return IoResult{error_code{}, chunk.size()};
     }
-
-    auto get_executor() { return m_executor; }
-
-    asio::ip::tcp::endpoint peer() const { return {}; }
-
-    SslHandle tls_handle() const { return std::nullopt; }
-
-    asio::awaitable<void> shutdown() { co_return; }
-    void close() { m_closed = true; }
 
   private:
     asio::any_io_executor m_executor;
@@ -257,64 +558,73 @@ class MockTransport {
 // can be exercised without a connection. Records the last call's arguments.
 class FakeResponseSink : public ResponseSink {
   public:
-    asio::awaitable<error_code> send(int status, Headers headers, std::string body) override {
+    explicit FakeResponseSink(asio::any_io_executor executor = asio::system_executor{})
+        : m_executor(std::move(executor)) {}
+
+    void send(int status, Headers headers, std::string body, WriteCompletion done) override {
         ++calls;
         last_status = status;
         last_headers = std::move(headers);
         last_body = std::move(body);
         sent_bodyless = false;
-        co_return error_code{};
+        std::move(done)(error_code{});
     }
 
-    asio::awaitable<error_code> send_headers(int status, Headers headers) override {
+    void send_headers(int status, Headers headers, WriteCompletion done) override {
         ++calls;
         last_status = status;
         last_headers = std::move(headers);
         begun = true;
-        co_return error_code{};
+        std::move(done)(error_code{});
     }
 
-    asio::awaitable<error_code> send_chunk(std::string data) override {
+    void send_chunk(std::string data, WriteCompletion done) override {
         chunks.push_back(std::move(data));
-        co_return error_code{};
+        std::move(done)(error_code{});
     }
 
-    asio::awaitable<error_code> send_last(std::string data) override {
+    void send_last(std::string data, WriteCompletion done) override {
         chunks.push_back(std::move(data));
         finished = true;
-        co_return error_code{};
+        std::move(done)(error_code{});
     }
 
-    asio::awaitable<error_code> send_trailers(Headers trailers) override {
+    void send_trailers(Headers trailers, WriteCompletion done) override {
         ++calls;
         last_trailers = std::move(trailers);
         sent_trailers = true;
-        co_return error_code{};
+        std::move(done)(error_code{});
     }
 
-    asio::awaitable<error_code> send_bodyless(int status, Headers headers) override {
+    void send_bodyless(int status, Headers headers, WriteCompletion done) override {
         ++calls;
         last_status = status;
         last_headers = std::move(headers);
         sent_bodyless = true;
-        co_return error_code{};
+        std::move(done)(error_code{});
     }
 
-    asio::awaitable<error_code> send_continue() override {
+    void send_continue(WriteCompletion done) override {
         ++continues;
-        co_return error_code{};
+        std::move(done)(error_code{});
     }
 
     bool head_request() const noexcept override { return head; }
 
-    asio::awaitable<bool> connected() const override { co_return open; }
-
-    asio::awaitable<void> close() override {
-        open = false;
-        co_return;
+    void connected(ConnectedCompletion done) const override {
+        std::move(done)(error_code{}, open);
     }
 
+    void close(WriteCompletion done) override {
+        open = false;
+        std::move(done)(error_code{});
+    }
+
+    asio::any_io_executor get_executor() const override { return m_executor; }
+
     Version version() const override { return ver; }
+
+    asio::any_io_executor m_executor;
 
     // recorded state
     int calls{0};

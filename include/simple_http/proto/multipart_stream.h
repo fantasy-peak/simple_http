@@ -11,13 +11,13 @@
 //   };
 //   cb.on_part_data = [&](std::string_view d) { current->write(d.data(), d.size()); return true; };
 //   cb.on_part_end = [&] { current->close(); };
-//   co_await read_multipart_stream(req->body(), boundary, cb);
+//   read_multipart_stream(req->body(), boundary, std::move(cb), token);
 //
 // Boundaries split across reads are handled; the parser keeps only the tail
 // that could be the start of a boundary.
 
+#include <boost/asio/compose.hpp>
 #include <cstddef>
-#include <expected>
 #include <functional>
 #include <string>
 #include <string_view>
@@ -228,28 +228,60 @@ class MultipartStreamParser {
     Phase m_phase{Phase::Start};
 };
 
-// Reads a request body through an incremental parser. Returns an error when the
-// body is malformed or a callback aborts.
-inline asio::awaitable<std::expected<void, error_code>>
-read_multipart_stream(Body &body, std::string boundary, MultipartStreamCallbacks cb,
-                      std::size_t max_part_bytes = 16 * 1024 * 1024, std::size_t max_parts = 100) {
-    MultipartStreamParser parser(std::move(boundary), max_part_bytes, max_parts);
-    for (;;) {
-        auto chunk = co_await body.read();
-        if (!chunk) {
-            co_return std::unexpected{chunk.error()};
+namespace detail {
+
+struct MultipartStreamOp {
+    Body &body;
+    MultipartStreamParser parser;
+    MultipartStreamCallbacks callbacks;
+    bool started{false};
+
+    asio::any_io_executor get_executor() const noexcept { return body.get_executor(); }
+
+    template <typename Self> void operator()(Self &self, error_code ec = {}, ReadResult chunk = {}) {
+        if (!started) {
+            started = true;
+            body.async_read(std::move(self));
+            return;
         }
-        if (chunk->eof) {
-            break;
+        if (ec) {
+            self.complete(ec);
+            return;
         }
-        if (!parser.feed(chunk->data, cb)) {
-            co_return std::unexpected{make_error_code(asio::error::invalid_argument)};
+        if (chunk.eof) {
+            if (!parser.finish(callbacks)) {
+                self.complete(boost::system::errc::make_error_code(boost::system::errc::invalid_argument));
+                return;
+            }
+            self.complete(error_code{});
+            return;
         }
+        if (!parser.feed(chunk.data, callbacks)) {
+            self.complete(boost::system::errc::make_error_code(boost::system::errc::invalid_argument));
+            return;
+        }
+        body.async_read(std::move(self));
     }
-    if (!parser.finish(cb)) {
-        co_return std::unexpected{make_error_code(asio::error::invalid_argument)};
-    }
-    co_return std::expected<void, error_code>{};
+};
+
+} // namespace detail
+
+// Reads a request body through an incremental parser. Completion signature:
+// void(error_code); an error means the body was malformed or a callback aborted.
+template <typename Token>
+auto read_multipart_stream(Body &body, std::string boundary, MultipartStreamCallbacks cb, std::size_t max_part_bytes,
+                           std::size_t max_parts, Token &&token) {
+    return asio::async_compose<Token, void(error_code)>(
+        detail::MultipartStreamOp{body, MultipartStreamParser(std::move(boundary), max_part_bytes, max_parts),
+                                  std::move(cb)},
+        token, body.get_executor());
+}
+
+// Convenience overload with the library defaults (16 MiB/part, 100 parts).
+template <typename Token>
+auto read_multipart_stream(Body &body, std::string boundary, MultipartStreamCallbacks cb, Token &&token) {
+    return read_multipart_stream(body, std::move(boundary), std::move(cb), 16 * 1024 * 1024, 100,
+                                 std::forward<Token>(token));
 }
 
 } // namespace simple_http

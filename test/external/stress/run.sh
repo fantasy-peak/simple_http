@@ -72,6 +72,9 @@ WS_RESP_SIZE="${WS_RESP_SIZE:-1024}"       # ws 响应包字节（两端 /echo1k
 # 改动后必跑顺序（内建）：先符合性（simple_http 的 test/external/conformance/run.sh，仅 cpp
 # 目标那一轮跑），全绿才继续压力测试。设 RUN_CONFORMANCE=0 可跳过符合性。
 RUN_CONFORMANCE="${RUN_CONFORMANCE:-1}"
+# 服务端是否提供 HTTP/3 (UDP :7792)。C++23 版默认提供；C++17 移植版没有 QUIC，
+# 用 STRESS_HTTP3=0 运行时不等待该端口，h3 档自动跳过。
+HTTP3="${STRESS_HTTP3:-1}"
 # ====================================================================
 
 select_target() {
@@ -176,13 +179,19 @@ start_server() {
         head_ "构建 server"
         ( cd "$ROOT" && eval "$BUILD_SERVER" ) || { bad "构建 server 失败：$BUILD_SERVER"; return 1; }
     fi
-    head_ "启动被测服务器（目标 $TARGET，端口 ws=$PORT_WS h2c=$PORT_H2C h1=$PORT_H1 h3=$PORT_H3）"
+    if [[ "$HTTP3" == "1" ]]; then
+        head_ "启动被测服务器（目标 $TARGET，端口 ws=$PORT_WS h2c=$PORT_H2C h1=$PORT_H1 h3=$PORT_H3）"
+    else
+        head_ "启动被测服务器（目标 $TARGET，端口 ws=$PORT_WS h2c=$PORT_H2C h1=$PORT_H1；无 h3）"
+    fi
     # 必须在仓库根目录起：证书路径是相对路径。
     ( cd "$ROOT" && exec "$SERVER_BIN" >"${CACHE}/server.log" 2>&1 ) &
     SERVER_PID=$!
 
     local port ready i
-    for port in "$PORT_H1" "$PORT_H2C" "$PORT_H3" "$PORT_WS"; do
+    local ports=("$PORT_H1" "$PORT_H2C" "$PORT_WS")
+    [[ "$HTTP3" == "1" ]] && ports+=("$PORT_H3")
+    for port in "${ports[@]}"; do
         ready=0
         for i in $(seq 1 50); do
             if (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then ready=1; break; fi
@@ -451,7 +460,13 @@ run_target_suites() {
 
     want h1 && run_h1
     want h2 && run_h2
-    want h3 && run_h3
+    if want h3; then
+        if [[ "$HTTP3" == "1" ]]; then
+            run_h3
+        else
+            warn "跳过 h3 档：该服务端没有 HTTP/3（STRESS_HTTP3=0）"
+        fi
+    fi
     want ws && run_ws
 
     stop_server

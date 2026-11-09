@@ -1,5 +1,9 @@
 #pragma once
 
+#include "../core/glaze_support.h"
+
+#if SIMPLE_HTTP_CPP17_ENABLE_GLAZE
+
 // OpenAPI integration glue: JSON Schemas from C++ types via glaze's
 // compile-time reflection. An aggregate struct is reflected with no metadata
 // and `schema_json<T>()` returns its JSON Schema, which router.h records into
@@ -14,7 +18,8 @@
 
 #include <algorithm>
 #include <array>
-#include <boost/asio/awaitable.hpp>
+#include <boost/asio/any_io_executor.hpp>
+#include <boost/asio/compose.hpp>
 #include <cstddef>
 #include <glaze/glaze.hpp>
 #include <glaze/json/schema.hpp>
@@ -253,28 +258,53 @@ struct BodyError {
 // fills `err`) so the handler answers; the handler itself decides the shape.
 //
 //     openapi::BodyError err;
-//     auto in = co_await openapi::read_body<CreateUserReq>(*req, err);
-//     if (!in) { co_await res->status(err.status).json(...); co_return; }
-template <typename TReq> boost::asio::awaitable<std::optional<TReq>> read_body(Request &req, BodyError &err) {
-    auto raw = co_await req.body().read_all();
-    if (!raw) {
-        err = {400, "request body unreadable"};
-        co_return std::nullopt;
+//     auto in = await openapi::async_read_body<CreateUserReq>(*req, err);
+//     if (!in) { await res->status(err.status).json(...); return; }
+namespace detail {
+
+template <typename TReq> struct ReadBodyOp {
+    Request &request;
+    BodyError &error;
+    bool started{false};
+
+    asio::any_io_executor get_executor() const noexcept { return request.executor(); }
+
+    template <typename Self> void operator()(Self &self, error_code ec = {}, std::string raw = {}) {
+        if (!started) {
+            started = true;
+            request.body().async_read_all(std::move(self));
+            return;
+        }
+        if (ec) {
+            error = {400, "request body unreadable"};
+            self.complete(std::optional<TReq>{});
+            return;
+        }
+        // Strict pass: required (non-nullable) fields must be present.
+        TReq out{};
+        if (auto read_ec = glz::read<glz::opts{.error_on_missing_keys = true}>(out, raw); !read_ec) {
+            self.complete(std::optional<TReq>(std::move(out)));
+            return;
+        }
+        // Distinguish "valid JSON, missing required field" (422) from "does not
+        // parse or type-match at all" (400) by a lenient second read.
+        TReq lenient{};
+        if (auto lax = glz::read<glz::opts{}>(lenient, raw); !lax) {
+            error = {422, "request body violates the declared required fields"};
+        } else {
+            error = {400, "request body is malformed for the declared type"};
+        }
+        self.complete(std::optional<TReq>{});
     }
-    // Strict pass: required (non-nullable) fields must be present.
-    TReq out{};
-    if (auto ec = glz::read<glz::opts{.error_on_missing_keys = true}>(out, *raw); !ec) {
-        co_return out;
-    }
-    // Distinguish "valid JSON, missing required field" (422) from "does not
-    // parse or type-matches at all" (400) by a lenient second read.
-    TReq lenient{};
-    if (auto lax = glz::read<glz::opts{}>(lenient, *raw); !lax) {
-        err = {422, "request body violates the declared required fields"};
-    } else {
-        err = {400, "request body is malformed for the declared type"};
-    }
-    co_return std::nullopt;
+};
+
+} // namespace detail
+
+// Token-based form of the coroutine read_body: completion signature
+// void(std::optional<TReq>); `err` carries the status/message on failure.
+template <typename TReq, typename Token> auto async_read_body(Request &req, BodyError &err, Token &&token) {
+    return asio::async_compose<Token, void(std::optional<TReq>)>(detail::ReadBodyOp<TReq>{req, err}, token,
+                                                                 req.executor());
 }
 
 // Marker: "no request body". A route that takes no body simply omits
@@ -423,10 +453,6 @@ inline SecurityScheme api_key(std::string name, std::string in = "header") {
 // must equal the route template's `{name}`s (checked at registration) and each
 // field's type is that path parameter's schema.
 
-// The default "no descriptor": route()'s trailing parameter type, so a route
-// that passes nothing is not documented.
-struct NoDoc {};
-
 class Operation {
   public:
     // --- typed slots: the type is reduced to its schema string right here ---
@@ -564,3 +590,5 @@ inline void record_operation(OpenApiSpec &spec, const Operation &op, const std::
 
 } // namespace openapi
 } // namespace simple_http
+
+#endif // SIMPLE_HTTP_CPP17_ENABLE_GLAZE

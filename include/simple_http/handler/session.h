@@ -17,12 +17,13 @@
 //     }));
 //
 //     server.route({Method::Post}, "/login",
-//         [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
+//         [](RequestPtr req, ResponsePtr res, HandlerCompletion done) {
 //             if (auto *s = simple_http::session(*req)) {
 //                 s->regenerate_id();          // session-fixation defense
 //                 s->set("uid", "42");
 //             }
-//             co_await res->status(status::no_content).send("");
+//             res->status(status::no_content);
+//             res->async_send("", finish_with(std::move(done)));
 //         });
 //
 // The cookie carries only an opaque id; values live in the store and are never
@@ -32,7 +33,6 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
-#include <expected>
 #include <functional>
 #include <map>
 #include <memory>
@@ -44,11 +44,14 @@
 #include <unordered_map>
 #include <utility>
 
+#include <boost/asio/any_completion_handler.hpp>
 #include <openssl/rand.h>
 
 #include "../core/base64.h"
+#include "../core/compat.h"
 #include "../core/http_date.h"
 #include "../core/logging.h"
+#include "../proto/response_writer.h"
 #include "handler.h"
 
 namespace simple_http {
@@ -91,10 +94,14 @@ struct SessionData {
 // store); the middleware runs on the connection executor and awaits them.
 class SessionStore {
   public:
+    using LoadCompletion = asio::any_completion_handler<void(error_code, std::optional<SessionData>)>;
+
     virtual ~SessionStore() = default;
-    virtual asio::awaitable<std::optional<SessionData>> load(std::string_view id) = 0;
-    virtual asio::awaitable<void> save(std::string_view id, const SessionData &data) = 0;
-    virtual asio::awaitable<void> destroy(std::string_view id) = 0;
+    // Completion: void(error_code, std::optional<SessionData>). The id is passed
+    // by value so an asynchronous store never holds a view into the request.
+    virtual void load(std::string id, LoadCompletion done) = 0;
+    virtual void save(std::string id, const SessionData &data, WriteCompletion done) = 0;
+    virtual void destroy(std::string id, WriteCompletion done) = 0;
 };
 
 // In-process store. All operations are synchronous internally but expose the
@@ -104,36 +111,42 @@ class MemorySessionStore final : public SessionStore {
   public:
     explicit MemorySessionStore(std::size_t max_sessions = 100000) : m_max_sessions(max_sessions) {}
 
-    asio::awaitable<std::optional<SessionData>> load(std::string_view id) override {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        auto it = m_sessions.find(std::string{id});
-        if (it == m_sessions.end()) {
-            co_return std::nullopt;
+    void load(std::string id, LoadCompletion done) override {
+        std::optional<SessionData> out;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            auto it = m_sessions.find(id);
+            if (it != m_sessions.end()) {
+                if (it->second.expires_unix != 0 && it->second.expires_unix <= now_unix()) {
+                    m_sessions.erase(it);
+                } else {
+                    out = it->second;
+                }
+            }
         }
-        if (it->second.expires_unix != 0 && it->second.expires_unix <= now_unix()) {
-            m_sessions.erase(it);
-            co_return std::nullopt;
-        }
-        co_return it->second;
+        std::move(done)(error_code{}, std::move(out));
     }
 
-    asio::awaitable<void> save(std::string_view id, const SessionData &data) override {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        evict_expired();
-        if (m_max_sessions != 0 && m_sessions.size() >= m_max_sessions) {
-            // Bounded memory: drop the oldest entry we can find. Session stores
-            // are not a cache; this is a safety valve against unbounded growth,
-            // not an LRU policy.
-            m_sessions.erase(m_sessions.begin());
+    void save(std::string id, const SessionData &data, WriteCompletion done) override {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            evict_expired();
+            if (m_max_sessions != 0 && m_sessions.size() >= m_max_sessions) {
+                // Bounded memory: drop the oldest entry we can find. Session
+                // stores are not a cache; this is a safety valve, not an LRU.
+                m_sessions.erase(m_sessions.begin());
+            }
+            m_sessions[std::move(id)] = data;
         }
-        m_sessions[std::string{id}] = data;
-        co_return;
+        std::move(done)(error_code{});
     }
 
-    asio::awaitable<void> destroy(std::string_view id) override {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_sessions.erase(std::string{id});
-        co_return;
+    void destroy(std::string id, WriteCompletion done) override {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_sessions.erase(id);
+        }
+        std::move(done)(error_code{});
     }
 
     std::size_t size() const {
@@ -176,7 +189,7 @@ class Session {
         : m_id(std::move(id)), m_data(std::move(data)), m_set_cookie(std::move(set_cookie)) {}
 
     [[nodiscard]] std::string_view id() const noexcept { return m_id; }
-    [[nodiscard]] bool contains(std::string_view key) const { return m_data.values.contains(key); }
+    [[nodiscard]] bool contains(std::string_view key) const { return m_data.values.find(key) != m_data.values.end(); }
 
     [[nodiscard]] std::optional<std::string_view> get(std::string_view key) const {
         const auto it = m_data.values.find(key);
@@ -243,54 +256,62 @@ namespace middleware {
 // into a response after the head has gone out).
 inline Middleware session(std::shared_ptr<SessionStore> store, SessionConfig config = {}) {
     return [store = std::move(store), config = std::move(config)](RequestPtr req, ResponsePtr res, SslHandle ssl,
-                                                                  Next next) -> asio::awaitable<void> {
+                                                                  Next next, HandlerCompletion done) {
         if (!store) {
-            co_await next(std::move(req), std::move(res), ssl);
-            co_return;
+            next(std::move(req), std::move(res), ssl, std::move(done));
+            return;
         }
+        auto cookie = req->cookie(config.cookie_name);
 
-        std::string id;
-        SessionData data;
-        bool fresh = false;
-        if (const auto cookie = req->cookie(config.cookie_name); cookie && !cookie->empty()) {
-            auto loaded = co_await store->load(*cookie);
-            if (loaded) {
-                id = std::string{*cookie};
+        auto after_load = [store, config, req, res, ssl, next,
+                           done = std::move(done)](error_code ec, std::optional<SessionData> loaded) mutable {
+            std::string id;
+            SessionData data;
+            bool fresh = false;
+            if (!ec && loaded) {
+                id = std::string{*req->cookie(config.cookie_name)};
                 data = std::move(*loaded);
             }
-        }
-        if (id.empty()) {
-            id = random_token(32);
-            fresh = true;
-        }
+            if (id.empty()) {
+                id = random_token(32);
+                fresh = true;
+            }
+            auto set_cookie = [res, config](std::string_view value) {
+                res->set_cookie(config.cookie_name, std::string{value}, config.max_age, config.path, "", config.secure,
+                                config.http_only, config.same_site);
+            };
+            const std::string original_id = id;
+            auto current = std::make_shared<Session>(id, std::move(data), set_cookie);
+            req->set_state(current);
+            if (fresh || config.rolling) {
+                set_cookie(current->id());
+            }
 
-        auto set_cookie = [res, config](std::string_view value) {
-            res->set_cookie(config.cookie_name, std::string{value}, config.max_age, config.path, "", config.secure,
-                            config.http_only, config.same_site);
+            auto after_chain = [store, config, current, original_id, done = std::move(done)]() mutable {
+                auto save_if_dirty = [store, config, current, done = std::move(done)]() mutable {
+                    if (!current->dirty()) {
+                        std::move(done)();
+                        return;
+                    }
+                    SessionData out = current->data();
+                    out.expires_unix = config.max_age.count() > 0 ? now_unix() + config.max_age.count() : 0;
+                    store->save(std::string{current->id()}, out, finish_with(std::move(done)));
+                };
+                if (!original_id.empty() && current->id() != original_id) {
+                    store->destroy(original_id,
+                                   [save_if_dirty = std::move(save_if_dirty)](error_code) mutable { save_if_dirty(); });
+                    return;
+                }
+                save_if_dirty();
+            };
+            next(std::move(req), std::move(res), ssl, std::move(after_chain));
         };
-        const std::string original_id = id;
-        auto current = std::make_shared<Session>(id, std::move(data), set_cookie);
-        req->set_state(current);
-        if (fresh || config.rolling) {
-            set_cookie(current->id());
-        }
 
-        co_await next(std::move(req), std::move(res), ssl);
-
-        // Session fixation defense: if the handler rotated the id (typically on
-        // login), the old id must stop working immediately.
-        if (!original_id.empty() && current->id() != original_id) {
-            co_await store->destroy(original_id);
+        if (cookie && !cookie->empty()) {
+            store->load(std::string{*cookie}, std::move(after_load));
+        } else {
+            after_load(error_code{}, std::nullopt);
         }
-        if (current->dirty()) {
-            SessionData out = current->data();
-            // max_age == 0 means a browser-session cookie; keep the server-side
-            // entry until the process/store decides otherwise rather than
-            // expiring it immediately.
-            out.expires_unix = config.max_age.count() > 0 ? now_unix() + config.max_age.count() : 0;
-            co_await store->save(current->id(), out);
-        }
-        co_return;
     };
 }
 

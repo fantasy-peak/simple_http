@@ -35,13 +35,11 @@
 #include <array>
 #include <atomic>
 #include <boost/asio.hpp>
-#include <boost/asio/experimental/awaitable_operators.hpp>
 #include <boost/asio/experimental/concurrent_channel.hpp>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
-#include <expected>
 #include <memory>
 #include <optional>
 #include <span>
@@ -54,6 +52,7 @@
 #include "../core/base64.h"
 #include "../core/http_field.h" // is_connection_specific_field
 #include "../core/http_method.h"
+#include "../core/http_status.h"
 #include "../core/limits.h"
 #include "../core/logging.h"
 #include "../core/types.h"
@@ -109,15 +108,15 @@ inline std::string h2_settings_base64url(const EngineLimits &limits) {
     return base64_url_encode(h2_settings_payload(limits));
 }
 
-template <TransportLike Transport> class Http2ClientSession;
+template <typename Transport> class Http2ClientSession;
 
 // One HTTP/2 stream, from the caller's side. The shared multiplexed-stream
 // skeleton (outcome gating, executor hop, forwarders) lives in
 // multiplexed_session.h; the session supplies the protocol operations.
-template <TransportLike Transport>
+template <typename Transport>
 using Http2ClientStream = MultiplexedClientStream<Http2ClientSession<Transport>, std::uint32_t>;
 
-template <TransportLike Transport>
+template <typename Transport>
 class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSession<Transport>> {
   public:
     using Executor = decltype(std::declval<Transport &>().get_executor());
@@ -153,9 +152,10 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
 
     // Sends the preface + our SETTINGS and starts the loops. Returns once the
     // connection is running (the loops hold the session alive themselves).
-    asio::awaitable<error_code> start() {
-        auto result = co_await start_impl(std::nullopt, {});
-        co_return result ? error_code{} : result.error();
+    void start(WriteCompletion done) {
+        start_impl(std::nullopt, {}, [done = std::move(done)](error_code ec, std::shared_ptr<ClientStream>) mutable {
+            std::move(done)(ec);
+        });
     }
 
     // Starts the connection and replays `seed` as stream 1 — the request that
@@ -164,46 +164,53 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
     // `initial` carries whatever the peer already sent after its 101 — the h2
     // connection preface and SETTINGS, typically, or even the response itself.
     // Dropping those bytes costs a round trip at best and hangs at worst.
-    asio::awaitable<std::expected<std::shared_ptr<ClientStream>, error_code>>
-    start_with_stream(std::shared_ptr<Request> seed, std::string initial = {}) {
-        auto result = co_await start_impl(std::move(seed), std::move(initial));
-        if (!result)
-            co_return std::unexpected{result.error()};
-        if (!*result)
-            co_return std::unexpected{make_error_code(client_errc::protocol_error)};
-        co_return *result;
+    void start_with_stream(std::shared_ptr<Request> seed, std::string initial, OpenCompletion done) {
+        start_impl(std::move(seed), std::move(initial),
+                   [done = std::move(done)](error_code ec, std::shared_ptr<ClientStream> stream) mutable {
+                       if (ec) {
+                           std::move(done)(ec, nullptr);
+                           return;
+                       }
+                       if (!stream) {
+                           std::move(done)(make_error_code(client_errc::protocol_error), nullptr);
+                           return;
+                       }
+                       std::move(done)(error_code{}, std::move(stream));
+                   });
     }
 
     // --- ClientSession ---
 
-    asio::awaitable<std::expected<std::shared_ptr<ClientStream>, error_code>>
-    open_stream(std::shared_ptr<Request> request) override {
-        co_await hop();
-        if (m_goaway_received)
-            co_return std::unexpected{make_error_code(client_errc::goaway)};
-        if (!m_alive)
-            co_return std::unexpected{make_error_code(client_errc::session_closed)};
-        // See h1_client's open_exchange: a spec asking for both an up-front body
-        // and a streamed one is a contradiction, and the two engines used to
-        // resolve it differently. One answer, in both places.
-        if (request->stream_body() && request->content_length() >= 0)
-            co_return std::unexpected{make_error_code(client_errc::invalid_spec)};
-        // The request's `close` keeps the connection out of the pool. HTTP/1.1
-        // sends `Connection: close` for it; HTTP/2 has no such header, so the
-        // intent has to be remembered here — this engine used not to read the
-        // field at all, and pooled the session anyway.
+    void open_stream(std::shared_ptr<Request> request, OpenCompletion done) override {
+        auto self = this->shared_from_this();
+        hop([self, request = std::move(request), done = std::move(done)]() mutable {
+            self->open_stream_impl(std::move(request), std::move(done));
+        });
+    }
+
+  private:
+    void open_stream_impl(std::shared_ptr<Request> request, OpenCompletion done) {
+        if (m_goaway_received) {
+            std::move(done)(make_error_code(client_errc::goaway), nullptr);
+            return;
+        }
+        if (!m_alive) {
+            std::move(done)(make_error_code(client_errc::session_closed), nullptr);
+            return;
+        }
+        if (request->stream_body() && request->content_length() >= 0) {
+            std::move(done)(make_error_code(client_errc::invalid_spec), nullptr);
+            return;
+        }
         if (request->close())
             m_close_requested = true;
-        // RFC 9113 §6.5.2: an *explicit* SETTINGS_MAX_CONCURRENT_STREAMS of 0
-        // means "no new streams may be opened" — only the unannounced initial
-        // value (no limit at all) is unlimited. A plain `value != 0` test would
-        // read an announced 0 as "unlimited" and keep opening streams the peer
-        // has forbidden (it can only answer with RSTs).
         if (m_peer_max_concurrent_announced && m_streams.size() >= m_peer_max_concurrent_streams) {
-            co_return std::unexpected{make_error_code(client_errc::too_many_streams)};
+            std::move(done)(make_error_code(client_errc::too_many_streams), nullptr);
+            return;
         }
-        if (m_next_stream_id > 0x7FFFFFFFu) { // client stream ids are odd and 31-bit
-            co_return std::unexpected{make_error_code(client_errc::too_many_streams)};
+        if (m_next_stream_id > 0x7FFFFFFFu) {
+            std::move(done)(make_error_code(client_errc::too_many_streams), nullptr);
+            return;
         }
 
         const std::uint32_t id = m_next_stream_id;
@@ -222,39 +229,52 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
         std::string block;
         if (auto ec = encode_request_head(*request, block); ec) {
             erase_stream(it);
-            co_return std::unexpected{ec};
+            std::move(done)(ec, nullptr);
+            return;
         }
 
-        // The up-front body, if there is one: read it whole, queue it as one
-        // DATA payload (the write path slices it to the frame size), and mark
-        // the stream's outbound done unless the caller will stream the rest.
-        std::string up_front;
-        if (!request->stream_body() && request->content_length() > 0) {
-            auto body = co_await request->body().read_all();
-            if (!body) {
-                erase_stream(it);
-                co_return std::unexpected{body.error()};
+        auto self = this->shared_from_this();
+        auto finish_open = [self, request, id, block = std::move(block),
+                            done = std::move(done)](error_code ec, std::string up_front) mutable {
+            if (ec) {
+                if (auto stream_it = self->m_streams.find(id); stream_it != self->m_streams.end())
+                    self->erase_stream(stream_it);
+                std::move(done)(ec, nullptr);
+                return;
             }
-            up_front = std::move(*body);
-        }
-        const bool have_body = !up_front.empty() || request->stream_body();
-        if (!up_front.empty()) {
-            st.out_queued = up_front.size();
-            st.out_queue.push_back(std::move(up_front));
-        }
-        if (!have_body || !request->stream_body())
-            st.out_finished = true; // whole body already queued
-        if (!have_body)
-            st.local_end = true;
-        auto handle = std::make_shared<Http2ClientStream<Transport>>(this->shared_from_this(), id, st.outcome);
-        st.handle = handle;
-        submit_headers(id, block, /*end_stream=*/!have_body);
-        flush();
+            auto stream_it = self->m_streams.find(id);
+            if (stream_it == self->m_streams.end()) {
+                std::move(done)(make_error_code(client_errc::session_closed), nullptr);
+                return;
+            }
+            Stream &stream = stream_it->second;
+            const bool have_body = !up_front.empty() || request->stream_body();
+            if (!up_front.empty()) {
+                stream.out_queued = up_front.size();
+                stream.out_queue.push_back(std::move(up_front));
+            }
+            if (!have_body || !request->stream_body())
+                stream.out_finished = true;
+            if (!have_body)
+                stream.local_end = true;
+            auto handle = std::make_shared<Http2ClientStream<Transport>>(self, id, stream.outcome);
+            stream.handle = handle;
+            self->submit_headers(id, block, /*end_stream=*/!have_body);
+            self->flush();
+            std::move(done)(error_code{}, handle);
+        };
 
-        SIMPLE_HTTP_ERROR_LOG("h2 client: stream {} opened on {}", id, m_authority);
-        co_return handle;
+        if (!request->stream_body() && request->content_length() > 0) {
+            request->body().async_read_all(
+                [finish_open = std::move(finish_open)](error_code ec, std::string body) mutable {
+                    finish_open(ec, std::move(body));
+                });
+            return;
+        }
+        finish_open(error_code{}, std::string{});
     }
 
+  public:
     // alive()/reusable()/keepable()/multiplexes()/authority()/executor() come
     // from MultiplexedClientSession. A request that asked to close
     // (`Request::close`) is what m_close_requested records: HTTP/2 has no
@@ -283,20 +303,27 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
     // Ends a streamed request with an HPACK trailer block. The block is sent as
     // trailing HEADERS with END_STREAM after every queued DATA frame, so it
     // cannot overtake the body.
-    asio::awaitable<error_code> stream_finish_trailers(std::uint32_t id, Headers trailers) {
-        co_await hop();
-        {
-            auto it = m_streams.find(id);
-            if (it == m_streams.end())
-                co_return make_error_code(client_errc::session_closed);
+    void stream_finish_trailers(std::uint32_t id, Headers trailers, WriteCompletion done) {
+        auto self = this->shared_from_this();
+        hop([self, id, trailers = std::move(trailers), done = std::move(done)]() mutable {
+            auto it = self->m_streams.find(id);
+            if (it == self->m_streams.end()) {
+                std::move(done)(make_error_code(client_errc::session_closed));
+                return;
+            }
             Stream &st = it->second;
-            if (st.write_error)
-                co_return st.write_error;
-            if (st.reset || st.failed)
-                co_return st.error ? st.error : make_error_code(client_errc::stream_reset);
-            if (st.local_end || st.out_finished)
-                co_return make_error_code(client_errc::body_not_streaming);
-
+            if (st.write_error) {
+                std::move(done)(st.write_error);
+                return;
+            }
+            if (st.reset || st.failed) {
+                std::move(done)(st.error ? st.error : make_error_code(client_errc::stream_reset));
+                return;
+            }
+            if (st.local_end || st.out_finished) {
+                std::move(done)(make_error_code(client_errc::body_not_streaming));
+                return;
+            }
             std::string block;
             for (const auto &[name, value] : trailers) {
                 if (name.empty() || name.front() == ':' || is_connection_specific(name) || contains_ctl(name) ||
@@ -307,178 +334,81 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
             }
             if (block.empty()) {
                 // Nothing valid to send: fall back to a normal END_STREAM.
-                co_return co_await stream_write(id, {}, true);
+                self->stream_write(id, {}, true, std::move(done));
+                return;
             }
             st.out_trailers = std::move(block);
             st.out_trailers_set = true;
             st.out_finished = true;
-        }
-        flush();
-        co_return error_code{};
+            self->flush();
+            std::move(done)(error_code{});
+        });
     }
 
-    asio::awaitable<error_code> stream_write(std::uint32_t id, std::string data, bool last) {
-        co_await hop();
-        {
-            auto it = m_streams.find(id);
-            if (it == m_streams.end())
-                co_return make_error_code(client_errc::session_closed);
-            Stream &st = it->second;
-            if (st.write_error)
-                co_return st.write_error; // a failed write poisons the stream
-            if (st.reset || st.failed)
-                co_return st.error ? st.error : make_error_code(client_errc::stream_reset);
-            if (st.local_end || st.out_finished)
-                co_return make_error_code(client_errc::body_not_streaming);
-        }
-
-        if (!data.empty()) {
-            // Backpressure: park while this stream's queue is over the high mark,
-            // so a fast writer is paced by the peer's window.
-            if (auto ec = co_await await_out_space(id); ec) {
-                // The stream may have been retired while we parked, so no
-                // reference taken before the suspension may be touched here.
-                // Re-resolving afterwards is what the id parameter is for.
-                if (auto retired = m_streams.find(id); retired != m_streams.end()) {
-                    retired->second.write_error = ec;
-                }
-                co_return ec;
+    void stream_write(std::uint32_t id, std::string data, bool last, WriteCompletion done) {
+        auto self = this->shared_from_this();
+        hop([self, id, data = std::move(data), last, done = std::move(done)]() mutable {
+            auto it = self->m_streams.find(id);
+            if (it == self->m_streams.end()) {
+                std::move(done)(make_error_code(client_errc::session_closed));
+                return;
             }
-            auto it = m_streams.find(id);
-            if (it == m_streams.end())
-                co_return make_error_code(client_errc::session_closed);
-            it->second.out_queued += data.size();
-            it->second.out_queue.push_back(std::move(data));
-        }
+            Stream &st = it->second;
+            if (st.write_error) {
+                std::move(done)(st.write_error);
+                return;
+            }
+            if (st.reset || st.failed) {
+                std::move(done)(st.error ? st.error : make_error_code(client_errc::stream_reset));
+                return;
+            }
+            if (st.local_end || st.out_finished) {
+                std::move(done)(make_error_code(client_errc::body_not_streaming));
+                return;
+            }
 
-        if (last) {
-            auto it = m_streams.find(id);
-            if (it == m_streams.end())
-                co_return make_error_code(client_errc::session_closed);
-            it->second.out_finished = true;
-        }
-        flush();
-        co_return error_code{};
+            const bool has_data = !data.empty();
+            auto enqueue = [self, id, data = std::move(data), last, done = std::move(done)](error_code ec) mutable {
+                if (ec) {
+                    if (auto found = self->m_streams.find(id); found != self->m_streams.end())
+                        found->second.write_error = ec;
+                    std::move(done)(ec);
+                    return;
+                }
+                auto stream_it = self->m_streams.find(id);
+                if (stream_it == self->m_streams.end()) {
+                    std::move(done)(make_error_code(client_errc::session_closed));
+                    return;
+                }
+                if (!data.empty()) {
+                    stream_it->second.out_queued += data.size();
+                    stream_it->second.out_queue.push_back(std::move(data));
+                }
+                if (last)
+                    stream_it->second.out_finished = true;
+                self->flush();
+                std::move(done)(error_code{});
+            };
+            if (has_data) {
+                self->await_out_space(id, std::move(enqueue));
+                return;
+            }
+            enqueue(error_code{});
+        });
     }
 
     // Waits for the response head without consuming body bytes: what read_head()
     // needs, and what read() calls first when the caller goes straight to the
     // body. The head itself is published to the caller's handle when it is
     // parsed.
-    asio::awaitable<error_code> await_stream_head(std::uint32_t id) {
-        co_await hop();
-        for (;;) {
-            auto it = m_streams.find(id);
-            if (it == m_streams.end()) {
-                // Retired already: the head was published to the handle when it
-                // was parsed, so reaching here means there never was one.
-                co_return make_error_code(client_errc::protocol_error);
-            }
-            Stream &st = it->second;
-            if (st.head_seen)
-                co_return error_code{};
-            if (st.failed || st.reset)
-                co_return outcome_error(*st.outcome);
-            if (st.remote_end)
-                co_return make_error_code(client_errc::protocol_error); // END_STREAM, no HEADERS
-
-            if (!st.in_notify) {
-                st.in_notify =
-                    std::make_shared<asio::experimental::concurrent_channel<void(error_code)>>(m_executor, 1);
-            }
-            auto notify = st.in_notify;
-            // Strong reference taken *before* the suspension: waking a parked
-            // reader is a posted handler (channel close / send), so by the time
-            // this resumes the stream may have been erased (it_finish /
-            // reset) or the whole map cleared (run_loops teardown) — the
-            // `Stream&` above would then be dangling. The outcome, being a
-            // shared_ptr, outlives the map entry and still says why we woke.
-            // (stream_read follows the same rule; without it a connection drop
-            // while a caller sits in read_head() is a heap-use-after-free.)
-            auto outcome = st.outcome;
-            auto [ec] = co_await notify->async_receive(asio::as_tuple(asio::use_awaitable));
-            if (ec)
-                co_return outcome_error(*outcome);
-        }
+    void await_stream_head(std::uint32_t id, WriteCompletion done) {
+        auto self = this->shared_from_this();
+        hop([self, id, done = std::move(done)]() mutable { self->await_head_impl(id, std::move(done)); });
     }
 
-    asio::awaitable<std::expected<ReadResult, error_code>> stream_read(std::uint32_t id) {
-        co_await hop();
-        if (!m_streams.contains(id)) {
-            co_return std::unexpected{make_error_code(client_errc::session_closed)};
-        }
-
-        // The head is not a body event: make sure it has been parsed (and thus
-        // published to the handle), then hand back body bytes. Re-resolved
-        // afterwards, because that await can retire the stream.
-        if (auto it = m_streams.find(id); it != m_streams.end() && !it->second.head_seen) {
-            if (auto ec = co_await await_stream_head(id); ec)
-                co_return std::unexpected{ec};
-        }
-
-        // Re-resolve on every pass. An await can retire this stream — a reset, a
-        // GOAWAY, the session closing — and a `Stream&` or an iterator captured
-        // before the suspension would then be dangling. (await_stream_head above
-        // already follows this rule; the rest of the session did not.)
-        for (;;) {
-            auto it = m_streams.find(id);
-            if (it == m_streams.end()) {
-                co_return std::unexpected{make_error_code(client_errc::session_closed)};
-            }
-            Stream &st = it->second;
-            if (!st.in_queue.empty()) {
-                std::string data = std::move(st.in_queue.front());
-                st.in_queue.pop_front();
-                st.in_bytes -= data.size();
-                // Credit exactly what the application took: un-consumed bytes keep
-                // the peer's window closed, which is what bounds our memory.
-                st.recv_owed_conn -= static_cast<std::int64_t>(data.size());
-                if (st.recv_owed_conn < 0)
-                    st.recv_owed_conn = 0;
-                credit_consumed(st, static_cast<std::int64_t>(data.size()));
-                flush();
-                co_return ReadResult::chunk(std::move(data));
-            }
-            // A terminal outcome may have been set by the connection teardown
-            // while DATA was still queued; the queue above is drained first, so
-            // a complete body survives a normal close. Only then report why the
-            // stream ended.
-            if (st.outcome->get() != StreamState::Open) {
-                auto terminal = outcome_result(*st.outcome);
-                erase_stream(it);
-                co_return terminal;
-            }
-            if (st.failed || st.reset) {
-                auto terminal = outcome_result(*st.outcome);
-                erase_stream(it);
-                co_return terminal;
-            }
-            if (st.remote_end) {
-                st.outcome->set(StreamState::Eof);
-                erase_stream(it);
-                co_return ReadResult::end();
-            }
-
-            if (!st.in_notify) {
-                st.in_notify =
-                    std::make_shared<asio::experimental::concurrent_channel<void(error_code)>>(m_executor, 1);
-            }
-            // `st` is not touched past this point. `outcome` is a shared_ptr, so it
-            // outlives the map entry and can still say why the wake happened even
-            // if the stream was retired while we waited.
-            auto notify = st.in_notify;
-            auto outcome = st.outcome;
-            auto [ec] = co_await notify->async_receive(asio::as_tuple(asio::use_awaitable));
-            if (ec) {
-                // A cancelled wait (the caller's deadline) must stop here:
-                // re-waiting under terminal cancellation would spin. A closed
-                // channel is teardown, where looping drains the queue before
-                // the terminal outcome is reported.
-                if (ec == asio::error::operation_aborted)
-                    co_return std::unexpected{ec};
-                continue;
-            }
-        }
+    void stream_read(std::uint32_t id, ReadCompletion done) {
+        auto self = this->shared_from_this();
+        hop([self, id, done = std::move(done)]() mutable { self->stream_read_impl(id, std::move(done)); });
     }
 
     bool stream_finished(std::uint32_t id) const {
@@ -501,6 +431,129 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
             self->send_rst_stream(id, codec::H2_CANCEL);
             self->it_finish(it, StreamState::Reset, make_error_code(client_errc::stream_reset));
             self->flush();
+        });
+    }
+
+  private:
+    void await_head_impl(std::uint32_t id, WriteCompletion done) {
+        auto it = m_streams.find(id);
+        if (it == m_streams.end()) {
+            std::move(done)(make_error_code(client_errc::protocol_error));
+            return;
+        }
+        Stream &st = it->second;
+        if (st.head_seen) {
+            std::move(done)(error_code{});
+            return;
+        }
+        if (st.failed || st.reset) {
+            std::move(done)(outcome_error(*st.outcome));
+            return;
+        }
+        if (st.remote_end) {
+            std::move(done)(make_error_code(client_errc::protocol_error));
+            return;
+        }
+        if (!st.in_notify) {
+            st.in_notify = std::make_shared<asio::experimental::concurrent_channel<void(error_code)>>(m_executor, 1);
+        }
+        auto notify = st.in_notify;
+        auto outcome = st.outcome;
+        auto self = this->shared_from_this();
+        notify->async_receive([self, id, notify, outcome, done = std::move(done)](error_code ec) mutable {
+            if (ec) {
+                std::move(done)(outcome_error(*outcome));
+                return;
+            }
+            self->await_head_impl(id, std::move(done));
+        });
+    }
+
+    void stream_read_impl(std::uint32_t id, ReadCompletion done) {
+        auto it = m_streams.find(id);
+        if (it == m_streams.end()) {
+            std::move(done)(make_error_code(client_errc::session_closed), ReadResult{});
+            return;
+        }
+        if (!it->second.head_seen) {
+            auto self = this->shared_from_this();
+            await_head_impl(id, [self, id, done = std::move(done)](error_code ec) mutable {
+                if (ec) {
+                    std::move(done)(ec, ReadResult{});
+                    return;
+                }
+                self->stream_read_impl(id, std::move(done));
+            });
+            return;
+        }
+        it = m_streams.find(id);
+        if (it == m_streams.end()) {
+            std::move(done)(make_error_code(client_errc::session_closed), ReadResult{});
+            return;
+        }
+        Stream &st = it->second;
+        if (!st.in_queue.empty()) {
+            std::string data = std::move(st.in_queue.front());
+            st.in_queue.pop_front();
+            st.in_bytes -= data.size();
+            st.recv_owed_conn -= static_cast<std::int64_t>(data.size());
+            if (st.recv_owed_conn < 0)
+                st.recv_owed_conn = 0;
+            credit_consumed(st, static_cast<std::int64_t>(data.size()));
+            flush();
+            std::move(done)(error_code{}, ReadResult::chunk(std::move(data)));
+            return;
+        }
+        if (st.outcome->get() != StreamState::Open) {
+            auto terminal = outcome_result(*st.outcome);
+            erase_stream(it);
+            if (terminal) {
+                std::move(done)(error_code{}, std::move(*terminal));
+            } else {
+                std::move(done)(terminal.error(), ReadResult{});
+            }
+            return;
+        }
+        if (st.failed || st.reset) {
+            auto terminal = outcome_result(*st.outcome);
+            erase_stream(it);
+            if (terminal) {
+                std::move(done)(error_code{}, std::move(*terminal));
+            } else {
+                std::move(done)(terminal.error(), ReadResult{});
+            }
+            return;
+        }
+        if (st.remote_end) {
+            st.outcome->set(StreamState::Eof);
+            erase_stream(it);
+            std::move(done)(error_code{}, ReadResult::end());
+            return;
+        }
+        if (!st.in_notify) {
+            st.in_notify = std::make_shared<asio::experimental::concurrent_channel<void(error_code)>>(m_executor, 1);
+        }
+        auto notify = st.in_notify;
+        auto outcome = st.outcome;
+        auto self = this->shared_from_this();
+        notify->async_receive([self, id, notify, outcome, done = std::move(done)](error_code ec) mutable {
+            if (ec == asio::error::operation_aborted) {
+                std::move(done)(ec, ReadResult{});
+                return;
+            }
+            if (self->m_streams.find(id) == self->m_streams.end()) {
+                // it_finish() erases the entry before waking the reader. The
+                // wake must still report the terminal state captured at that
+                // moment (stream_reset/refused/eof), not session_closed.
+                auto terminal = outcome_result(*outcome);
+                if (terminal) {
+                    std::move(done)(error_code{}, std::move(*terminal));
+                } else {
+                    std::move(done)(terminal.error(), ReadResult{});
+                }
+                return;
+            }
+            self->stream_read_impl(id, std::move(done));
         });
     }
 
@@ -549,62 +602,49 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
 
     // Returns the seeded stream's handle (or null when there is no seed), so the
     // caller — not a weak reference — keeps it alive.
-    asio::awaitable<std::expected<std::shared_ptr<ClientStream>, error_code>>
-    start_impl(std::optional<std::shared_ptr<Request>> seed, std::string carried_over) {
+    void start_impl(std::optional<std::shared_ptr<Request>> seed, std::string carried_over, OpenCompletion done) {
         m_authority = m_target.authority();
         m_recv_buf = std::move(carried_over);
-        // The prefacing bytes go out as one write: the 24-octet client preface
-        // followed by our SETTINGS frame (RFC 9113 §3.4). Sending the preface and
-        // SETTINGS together is fine — the peer's protocol detection reads the
-        // preface first and the rest stays buffered.
         const std::int32_t initial = m_limits.h2_initial_window;
         std::string out{codec::kH2ClientPreface};
         append_frame(out, codec::H2FrameType::Settings, 0, 0, h2_settings_payload(m_limits));
         if (initial > kClientInitialWindow) {
-            // Per-stream windows ride in SETTINGS; the connection-level window has
-            // no setting, only a WINDOW_UPDATE, so open it up explicitly.
-            std::string wu;
-            codec::append_u32(wu, static_cast<std::uint32_t>(initial - kClientInitialWindow));
-            append_frame(out, codec::H2FrameType::WindowUpdate, 0, 0, wu);
+            std::string window_update;
+            codec::append_u32(window_update, static_cast<std::uint32_t>(initial - kClientInitialWindow));
+            append_frame(out, codec::H2FrameType::WindowUpdate, 0, 0, window_update);
         }
         m_conn_recv_window = initial;
 
-        auto [ec, n] = co_await m_transport->async_write(std::as_bytes(std::span<const char>{out.data(), out.size()}));
-        (void)n;
-        if (ec)
-            co_return std::unexpected{ec};
-
-        // A seeded stream (h2c upgrade): the peer already has the request, so it
-        // is only recorded here. Its response arrives as a normal h2 response.
-        // The handle is handed back to the caller, which owns it from here on.
-        std::shared_ptr<ClientStream> seeded;
-        if (seed) {
-            auto [it, inserted] = m_streams.try_emplace(1);
-            (void)inserted;
-            stream_opened();
-            Stream &st = it->second;
-            init_stream(st, 1);
-            // The handle must be owned by *someone*: the session keeps only a weak
-            // reference (a strong one would be a cycle), so the caller gets it.
-            auto handle = std::make_shared<Http2ClientStream<Transport>>(this->shared_from_this(), 1, st.outcome);
-            st.handle = handle;
-            seeded = handle;
-            st.local_end = true;
-            st.out_finished = true;
-            m_last_stream_id = 1;
-            m_next_stream_id = 3; // the upgraded request took stream 1
-        }
-
-        m_alive = true;
-        m_deadline = std::chrono::steady_clock::now() + m_idle_timeout;
-        flush();
-        // The loops own the session while they run: a caller that drops its
-        // handle (an idle pooled session has no other owner) must not leave them
-        // running against a destroyed object.
-        asio::co_spawn(
-            m_executor, [self = this->shared_from_this()]() -> asio::awaitable<void> { co_await self->run_loops(); },
-            asio::detached);
-        co_return seeded;
+        auto self = this->shared_from_this();
+        auto bytes = std::make_shared<std::string>(std::move(out));
+        m_transport->async_write(ConstByteSpan{reinterpret_cast<const std::byte *>(bytes->data()), bytes->size()},
+                                 [self, bytes, seed, done = std::move(done)](error_code ec, std::size_t) mutable {
+                                     if (ec) {
+                                         std::move(done)(ec, nullptr);
+                                         return;
+                                     }
+                                     std::shared_ptr<ClientStream> seeded;
+                                     if (seed) {
+                                         auto [it, inserted] = self->m_streams.try_emplace(1);
+                                         (void)inserted;
+                                         self->stream_opened();
+                                         Stream &stream = it->second;
+                                         self->init_stream(stream, 1);
+                                         auto handle =
+                                             std::make_shared<Http2ClientStream<Transport>>(self, 1, stream.outcome);
+                                         stream.handle = handle;
+                                         seeded = handle;
+                                         stream.local_end = true;
+                                         stream.out_finished = true;
+                                         self->m_last_stream_id = 1;
+                                         self->m_next_stream_id = 3;
+                                     }
+                                     self->m_alive = true;
+                                     self->m_deadline = std::chrono::steady_clock::now() + self->m_idle_timeout;
+                                     self->flush();
+                                     self->run_loops();
+                                     std::move(done)(error_code{}, std::move(seeded));
+                                 });
     }
 
     void init_stream(Stream &st, std::uint32_t id) {
@@ -684,22 +724,106 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
 
     // --- serve loops ---
 
-    asio::awaitable<void> run_loops() {
-        using namespace asio::experimental::awaitable_operators;
-        co_await (read_loop() || write_loop() || watchdog());
+    void run_loops() {
+        auto self = this->shared_from_this();
+        if (m_idle_timeout.count() > 0) {
+            arm_watchdog();
+        }
+        read_loop();
+        write_loop();
+    }
+
+    void arm_watchdog() {
+        auto self = this->shared_from_this();
+        m_watchdog->expires_at(m_deadline);
+        m_watchdog->async_wait([self](error_code ec) {
+            if (ec || self->m_finished)
+                return;
+            if (std::chrono::steady_clock::now() >= self->m_deadline) {
+                SIMPLE_HTTP_ERROR_LOG("h2 client: {} idle for {}ms", self->m_authority, self->m_idle_timeout.count());
+                self->finish_session();
+                return;
+            }
+            self->arm_watchdog();
+        });
+    }
+
+    void read_loop() {
+        if (m_finished)
+            return;
+        if (!m_recv_buf.empty() && !parse_available()) {
+            finish_session();
+            return;
+        }
+        auto self = this->shared_from_this();
+        m_transport->async_read_some(
+            ByteSpan{m_read_scratch.data(), m_read_scratch.size()}, [self](error_code ec, std::size_t n) {
+                if (ec) {
+                    self->finish_session();
+                    return;
+                }
+                self->m_deadline = std::chrono::steady_clock::now() + self->m_idle_timeout;
+                self->m_recv_buf.append(reinterpret_cast<const char *>(self->m_read_scratch.data()), n);
+                if (!self->parse_available()) {
+                    self->finish_session();
+                    return;
+                }
+                self->flush();
+                self->read_loop();
+            });
+    }
+
+    void write_loop() {
+        if (m_finished)
+            return;
+        fill_data_frames();
+        if (!m_out.empty()) {
+            auto chunk = std::make_shared<std::string>(std::move(m_out));
+            m_out.clear();
+            m_deadline = std::chrono::steady_clock::now() + m_idle_timeout;
+            auto self = this->shared_from_this();
+            m_transport->async_write(ConstByteSpan{reinterpret_cast<const std::byte *>(chunk->data()), chunk->size()},
+                                     [self, chunk](error_code ec, std::size_t) {
+                                         if (ec || self->m_finished) {
+                                             self->finish_session();
+                                             return;
+                                         }
+                                         self->write_loop();
+                                     });
+            return;
+        }
+        if (m_goaway_sent && m_streams.empty()) {
+            finish_session();
+            return;
+        }
+        auto self = this->shared_from_this();
+        m_notify.async_receive([self](error_code ec) {
+            if (ec || self->m_finished) {
+                self->finish_session();
+                return;
+            }
+            self->write_loop();
+        });
+    }
+
+    void finish_session() {
+        if (m_finished)
+            return;
+        m_finished = true;
         m_alive = false;
-        // Release every writer parked on backpressure: the write loop is gone, so
-        // nothing will ever drain their queues.
+        m_watchdog->cancel();
+        m_notify.close();
         for (auto &[id, st] : m_streams) {
             if (st.out_space)
                 st.out_space->close();
             if (st.remote_end) {
-                // END_STREAM already arrived: the response is complete, even if
-                // the application has not drained the queued DATA yet. Mark it
-                // Eof and keep the entry so stream_read() can hand over what is
-                // already buffered instead of reporting a reset and dropping a
-                // complete body.
-                st.outcome->set(StreamState::Eof);
+                // A complete response may still have parsed bytes in the
+                // queue. Marking EOF here makes MultiplexedClientStream::read
+                // short-circuit to an empty end and silently drops the body;
+                // keep the stream Open until the reader drains it, then the
+                // normal remote_end path reports EOF.
+                if (st.in_queue.empty())
+                    st.outcome->set(StreamState::Eof);
             } else {
                 st.failed = true;
                 st.outcome->set(StreamState::Disconnect, make_error_code(asio::error::eof));
@@ -707,67 +831,22 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
             if (st.in_notify)
                 st.in_notify->close();
         }
-        // Deliberately NOT m_streams.clear(): the entries above still own the
-        // buffered tail a reader may be about to consume. They are erased by
-        // stream_read() once drained; the map dies with the session otherwise.
         m_active_streams.store(0, std::memory_order_release);
-        if (m_transport)
-            m_transport->close();
-        SIMPLE_HTTP_ERROR_LOG("h2 client: connection to {} closed", m_authority);
-        co_return;
-    }
-
-    asio::awaitable<void> read_loop() {
-        // Bytes handed over from the h2c upgrade (or an earlier read) are parsed
-        // before anything new arrives.
-        if (!m_recv_buf.empty() && !parse_available())
-            co_return;
-        std::array<std::byte, 32 * 1024> buf; // no init: read_some fills [0,n)
-        for (;;) {
-            auto [ec, n] = co_await m_transport->async_read_some(std::span<std::byte>{buf});
-            if (ec)
-                co_return; // EOF or a transport error ends the connection
-            m_deadline = std::chrono::steady_clock::now() + m_idle_timeout;
-            m_recv_buf.append(reinterpret_cast<const char *>(buf.data()), n);
-            if (!parse_available())
-                co_return; // connection-fatal: GOAWAY queued
-            flush();
+        auto self = this->shared_from_this();
+        auto close_transport = [self]() {
+            self->m_transport->close();
+            SIMPLE_HTTP_ERROR_LOG("h2 client: connection to {} closed", self->m_authority);
+        };
+        if (m_out.empty()) {
+            close_transport();
+            return;
         }
-    }
-
-    asio::awaitable<void> write_loop() {
-        std::string chunk;
-        for (;;) {
-            fill_data_frames(); // frame as much queued DATA as flow control allows
-            while (!m_out.empty()) {
-                chunk.clear();
-                chunk.swap(m_out);
-                m_deadline = std::chrono::steady_clock::now() + m_idle_timeout;
-                auto [ec, n] =
-                    co_await m_transport->async_write(std::as_bytes(std::span<const char>{chunk.data(), chunk.size()}));
-                (void)n;
-                if (ec)
-                    co_return;
-                fill_data_frames(); // a writer may have queued more while we wrote
-            }
-            if (m_goaway_sent && m_streams.empty())
-                co_return;
-            auto [ec] = co_await m_notify.async_receive(asio::as_tuple(asio::use_awaitable));
-            if (ec)
-                co_return;
-        }
-    }
-
-    asio::awaitable<void> watchdog() {
-        asio::steady_timer timer{m_executor};
-        for (;;) {
-            timer.expires_at(m_deadline);
-            co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
-            if (std::chrono::steady_clock::now() >= m_deadline)
-                break; // idle timeout elapsed
-        }
-        SIMPLE_HTTP_ERROR_LOG("h2 client: {} idle for {}ms", m_authority, m_idle_timeout.count());
-        co_return;
+        auto chunk = std::make_shared<std::string>(std::move(m_out));
+        m_out.clear();
+        m_transport->async_write(
+            ConstByteSpan{reinterpret_cast<const std::byte *>(chunk->data()), chunk->size()},
+            asio::cancel_after(std::chrono::seconds(2),
+                               [self, chunk, close_transport](error_code, std::size_t) { close_transport(); }));
     }
 
     void flush() { (void)m_notify.try_send(error_code{}); }
@@ -1402,7 +1481,8 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
 
     // Records a stream's terminal state on its outcome (so the handle keeps
     // answering) and wakes a reader parked on it.
-    void it_finish(std::unordered_map<std::uint32_t, Stream>::iterator it, StreamState state, error_code ec = {}) {
+    void it_finish(typename std::unordered_map<std::uint32_t, Stream>::iterator it, StreamState state,
+                   error_code ec = {}) {
         Stream &st = it->second;
         st.failed = st.failed || state == StreamState::Failed;
         st.outcome->set(state, ec);
@@ -1431,7 +1511,7 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
     // Drops a stream's state, first returning the connection-level credit it
     // still owed for delivered-but-unconsumed bytes (otherwise the connection
     // window would leak over a long-lived connection).
-    void erase_stream(std::unordered_map<std::uint32_t, Stream>::iterator it) {
+    void erase_stream(typename std::unordered_map<std::uint32_t, Stream>::iterator it) {
         Stream &st = it->second;
         if (st.recv_owed_conn > 0) {
             replenish_conn(st.recv_owed_conn);
@@ -1470,28 +1550,42 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
     // Takes the id rather than a `Stream&`: this coroutine suspends, and a
     // reference taken before the suspension would be dangling if the stream were
     // retired meanwhile — which is exactly what a reset or a GOAWAY does.
-    asio::awaitable<error_code> await_out_space(std::uint32_t id) {
-        for (;;) {
-            auto it = m_streams.find(id);
-            if (it == m_streams.end())
-                co_return make_error_code(client_errc::session_closed);
-            Stream &st = it->second;
-            if (st.failed || st.reset) {
-                co_return st.error ? st.error : make_error_code(client_errc::stream_reset);
-            }
-            if (st.out_queued <= kClientOutHighWatermark)
-                co_return error_code{};
-            if (!st.out_space) {
-                st.out_space =
-                    std::make_shared<asio::experimental::concurrent_channel<void(error_code)>>(m_executor, 1);
-            }
-            // The channel is a shared_ptr, so it survives the stream being erased;
-            // `st` is not touched after the await below.
-            auto space = st.out_space;
-            auto [ec] = co_await space->async_receive(asio::as_tuple(asio::use_awaitable));
-            if (ec)
-                co_return make_error_code(client_errc::session_closed);
+    void await_out_space(std::uint32_t id, WriteCompletion done) {
+        auto it = m_streams.find(id);
+        if (it == m_streams.end()) {
+            std::move(done)(make_error_code(client_errc::session_closed));
+            return;
         }
+        Stream &st = it->second;
+        if (st.failed || st.reset) {
+            std::move(done)(st.error ? st.error : make_error_code(client_errc::stream_reset));
+            return;
+        }
+        if (st.out_queued <= kClientOutHighWatermark) {
+            std::move(done)(error_code{});
+            return;
+        }
+        if (!st.out_space) {
+            st.out_space = std::make_shared<asio::experimental::concurrent_channel<void(error_code)>>(m_executor, 1);
+        }
+        auto space = st.out_space;
+        auto outcome = st.outcome;
+        auto self = this->shared_from_this();
+        space->async_receive([self, id, space, outcome, done = std::move(done)](error_code ec) mutable {
+            if (ec) {
+                // A reset/failed stream closed the space; report why it died
+                // rather than a generic session_closed.
+                const auto state = outcome->get();
+                if (state == StreamState::Reset || state == StreamState::Failed ||
+                    state == StreamState::Disconnect) {
+                    std::move(done)(outcome_error(*outcome));
+                } else {
+                    std::move(done)(make_error_code(client_errc::session_closed));
+                }
+                return;
+            }
+            self->await_out_space(id, std::move(done));
+        });
     }
 
     // --- send side: turn queued DATA into flow-controlled frames ---
@@ -1576,6 +1670,9 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
 
     asio::experimental::concurrent_channel<void(error_code)> m_notify;
     std::chrono::steady_clock::time_point m_deadline{};
+    std::shared_ptr<asio::steady_timer> m_watchdog{std::make_shared<asio::steady_timer>(m_executor)};
+    bool m_finished{false};
+    std::array<std::byte, 32 * 1024> m_read_scratch{};
 
     codec::HpackDecoder m_decoder; // connection-scoped: the dynamic table is shared
     std::unordered_map<std::uint32_t, Stream> m_streams;

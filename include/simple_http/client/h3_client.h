@@ -31,16 +31,14 @@
 #include <array>
 #include <atomic>
 #include <boost/asio.hpp>
-#include <boost/asio/experimental/awaitable_operators.hpp>
 #include <boost/asio/experimental/concurrent_channel.hpp>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
-#include <expected>
 #include <memory>
 #include <optional>
-#include <span>
+#include "../core/compat.h"
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -51,6 +49,7 @@
 #include "../core/http_method.h"
 #include "../core/limits.h"
 #include "../core/logging.h"
+#include "../core/result.h"
 #include "../core/resolve.h"
 #include "../core/types.h"
 #include "../core/version.h"
@@ -105,17 +104,25 @@ template <typename Executor> class QuicClientUdp : public std::enable_shared_fro
     }
 
     // Feed datagrams into the connection until the socket is closed.
-    asio::awaitable<void> receive_loop(std::shared_ptr<Connection> conn) {
-        std::array<std::uint8_t, 65535> buf{};
-        for (;;) {
-            asio::ip::udp::endpoint from;
-            auto [ec, n] =
-                co_await m_socket->async_receive_from(asio::buffer(buf), from, asio::as_tuple(asio::use_awaitable));
-            if (ec)
-                co_return;
-            conn->on_datagram(std::span<const std::uint8_t>{buf.data(), n}, from);
-        }
+    void receive_loop(std::shared_ptr<Connection> conn) {
+        auto buf = std::make_shared<std::array<std::uint8_t, 65535>>();
+        receive_next(std::move(conn), std::move(buf));
     }
+
+  private:
+    void receive_next(std::shared_ptr<Connection> conn, std::shared_ptr<std::array<std::uint8_t, 65535>> buf) {
+        auto self = this->shared_from_this();
+        auto from = std::make_shared<asio::ip::udp::endpoint>();
+        m_socket->async_receive_from(asio::buffer(*buf), *from,
+                                     [self, conn, buf, from](error_code ec, std::size_t n) mutable {
+                                         if (ec)
+                                             return;
+                                         conn->on_datagram(boost::span<const std::uint8_t>{buf->data(), n}, *from);
+                                         self->receive_next(std::move(conn), std::move(buf));
+                                     });
+    }
+
+  public:
 
     // Unblocks receive_loop. The connection's run() calls this when it ends.
     void close() {
@@ -161,81 +168,63 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
     using Clock = std::chrono::steady_clock;
     using Signal = h3::Signal;
 
+  private:
+    struct Stream;
+    using StreamMap = std::unordered_map<std::int64_t, std::shared_ptr<Stream>>;
+
+    struct ConnectState {
+        Executor ex;
+        SSL_CTX *ssl_ctx{nullptr};
+        ClientTarget target;
+        ClientTlsHandshake hs;
+        EngineLimits limits;
+        std::uint32_t max_udp_payload_size{0};
+        std::chrono::milliseconds connect_timeout{};
+        std::chrono::milliseconds idle_timeout{};
+        ResolveFn resolve_fn;
+        std::vector<asio::ip::udp::endpoint> ordered;
+        std::size_t next{0};
+        error_code last_error{make_error_code(asio::error::host_not_found)};
+        Clock::time_point deadline{};
+        asio::any_completion_handler<void(error_code, std::shared_ptr<Http3ClientSession>)> done;
+    };
+
+  public:
+
     // Dial and start a QUIC connection to `target`.
     //
     // `ssl_ctx` is the client's already-configured TLS context (verification,
     // CA, client certificate); `hs` carries SNI / host verification and the
-    // ALPN list, which for HTTP/3 must be exactly `h3`. The returned session has
-    // completed the handshake and has its control/QPACK streams open, or the
-    // expected holds why it could not.
-    static asio::awaitable<std::expected<std::shared_ptr<Http3ClientSession>, error_code>>
-    connect(Executor ex, SSL_CTX *ssl_ctx, const ClientTarget &target, const ClientTlsHandshake &hs,
-            const EngineLimits &limits, std::uint32_t max_udp_payload_size, std::chrono::milliseconds connect_timeout,
-            std::chrono::milliseconds idle_timeout, const ResolveFn &resolve_fn) {
-        if (!target.use_tls) {
-            // QUIC carries its own TLS 1.3: there is no plaintext form.
-            co_return std::unexpected{make_error_code(client_errc::version_not_negotiated)};
-        }
-
-        auto endpoints = co_await resolve_endpoints(resolve_fn, target.host, target.effective_port(), ex);
-        if (endpoints.first) {
-            co_return std::unexpected{endpoints.first};
-        }
-        if (endpoints.second.empty()) {
-            co_return std::unexpected{make_error_code(asio::error::host_not_found)};
-        }
-
-        // Try each address in turn. There is no socket-level connect to fail
-        // fast on (UDP), so an unreachable first address would otherwise burn
-        // the whole budget. IPv4 and IPv6 are interleaved (v4 first) and each
-        // non-final attempt is capped at kAttemptCap: a dead IPv6 route or a bad
-        // anycast address then costs seconds, not the whole deadline. The last
-        // address still gets everything that is left.
-        std::vector<asio::ip::udp::endpoint> ordered;
-        ordered.reserve(endpoints.second.size());
-        const auto v4_end = std::stable_partition(endpoints.second.begin(), endpoints.second.end(),
-                                                  [](const asio::ip::tcp::endpoint &e) { return e.address().is_v4(); });
-        for (auto v4 = endpoints.second.begin(), v6 = v4_end; v4 != v4_end || v6 != endpoints.second.end();) {
-            if (v4 != v4_end) {
-                ordered.emplace_back(v4->address(), v4->port());
-                ++v4;
-            }
-            if (v6 != endpoints.second.end()) {
-                ordered.emplace_back(v6->address(), v6->port());
-                ++v6;
-            }
-        }
-
-        constexpr auto kAttemptCap = std::chrono::seconds(5);
-        const auto deadline = connect_timeout.count() > 0 ? Clock::now() + connect_timeout : Clock::time_point::max();
-        error_code last_error = make_error_code(asio::error::host_not_found);
-        for (std::size_t i = 0; i < ordered.size(); ++i) {
-            std::chrono::milliseconds slice = connect_timeout;
-            if (connect_timeout.count() > 0) {
-                const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now());
-                if (remaining.count() <= 0)
-                    co_return std::unexpected{make_error_code(client_errc::connect_timeout)};
-                slice = remaining;
-                if (i + 1 < ordered.size() && slice > kAttemptCap)
-                    slice = std::chrono::duration_cast<std::chrono::milliseconds>(kAttemptCap);
-            }
-            auto attempt = co_await connect_one(ex, ssl_ctx, target, hs, limits, max_udp_payload_size, idle_timeout,
-                                                ordered[i], slice);
-            if (attempt)
-                co_return attempt;
-            last_error = attempt.error();
-            SIMPLE_HTTP_ERROR_LOG("h3 client: {} failed ({}), trying the next address",
-                                  ordered[i].address().to_string(), last_error.message());
-        }
-        co_return std::unexpected{last_error};
+    // ALPN list, which for HTTP/3 must be exactly `h3`. Completion:
+    // void(error_code, shared_ptr<Http3ClientSession>).
+    template <typename Token>
+    static auto async_connect(Executor ex, SSL_CTX *ssl_ctx, const ClientTarget &target, const ClientTlsHandshake &hs,
+                              const EngineLimits &limits, std::uint32_t max_udp_payload_size,
+                              std::chrono::milliseconds connect_timeout, std::chrono::milliseconds idle_timeout,
+                              const ResolveFn &resolve_fn, Token &&token) {
+        auto state = std::make_shared<ConnectState>();
+        state->ex = ex;
+        state->ssl_ctx = ssl_ctx;
+        state->target = target;
+        state->hs = hs;
+        state->limits = limits;
+        state->max_udp_payload_size = max_udp_payload_size;
+        state->connect_timeout = connect_timeout;
+        state->idle_timeout = idle_timeout;
+        state->resolve_fn = resolve_fn;
+        return asio::async_initiate<Token, void(error_code, std::shared_ptr<Http3ClientSession>)>(
+            [state](auto handler) {
+                state->done = std::move(handler);
+                connect_resolve(state);
+            },
+            token);
     }
 
     // One address, one QUIC connection attempt.
-    static asio::awaitable<std::expected<std::shared_ptr<Http3ClientSession>, error_code>>
-    connect_one(Executor ex, SSL_CTX *ssl_ctx, const ClientTarget &target, const ClientTlsHandshake &hs,
-                const EngineLimits &limits, std::uint32_t max_udp_payload_size, std::chrono::milliseconds idle_timeout,
-                const asio::ip::udp::endpoint &remote, std::chrono::milliseconds attempt_timeout) {
-        auto socket = std::make_shared<asio::ip::udp::socket>(ex);
+    static void connect_one(const std::shared_ptr<ConnectState> &state, const asio::ip::udp::endpoint &remote,
+                            std::chrono::milliseconds attempt_timeout,
+                            std::function<void(error_code, std::shared_ptr<Http3ClientSession>)> done) {
+        auto socket = std::make_shared<asio::ip::udp::socket>(state->ex);
         error_code ec;
         socket->open(remote.protocol(), ec);
         if (!ec)
@@ -243,31 +232,33 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
                 asio::ip::udp::endpoint(remote.address().is_v6() ? asio::ip::udp::v6() : asio::ip::udp::v4(), 0), ec);
         if (ec) {
             SIMPLE_HTTP_ERROR_LOG("h3 client: UDP socket setup failed: {}", ec.message());
-            co_return std::unexpected{ec};
+            std::move(done)(ec, nullptr);
+            return;
         }
         const asio::ip::udp::endpoint local = socket->local_endpoint(ec);
         if (ec) {
-            co_return std::unexpected{ec};
+            std::move(done)(ec, nullptr);
+            return;
         }
 
         auto udp = std::make_shared<Udp>(socket);
 
         quic::QuicConnectionConfig qcfg;
-        qcfg.max_udp_payload_size = max_udp_payload_size;
-        if (idle_timeout.count() > 0) {
-            qcfg.max_idle_timeout_ms = static_cast<std::uint64_t>(idle_timeout.count());
+        qcfg.max_udp_payload_size = state->max_udp_payload_size;
+        if (state->idle_timeout.count() > 0) {
+            qcfg.max_idle_timeout_ms = static_cast<std::uint64_t>(state->idle_timeout.count());
         }
         // A client is the receiver: these are the windows *we* advertise, and
         // they pace a large response. The server defaults (1 MiB connection /
         // 256 KiB stream) are sized for many small requests; a single 1.3 MB
         // page would otherwise wait on window updates every 256 KiB. 4 MiB /
-        // 1 MiB matches the h2 client's per-stream window and halves the
-        // round trips.
+        // 1 MiB matches the h2 client's per-stream window and halves the round
+        // trips.
         qcfg.initial_max_data = 4u << 20;
         qcfg.initial_max_stream_data_bidi_remote = 1u << 20;
 
         quic::QuicClientOptions options;
-        options.configure_ssl = [hs](SSL *ssl) -> error_code {
+        options.configure_ssl = [hs = state->hs](SSL *ssl) -> error_code {
             // QUIC is TLS 1.3 or nothing (RFC 9001 §4.2).
             if (SSL_set_min_proto_version(ssl, TLS1_3_VERSION) != 1 ||
                 SSL_set_max_proto_version(ssl, TLS1_3_VERSION) != 1) {
@@ -276,20 +267,103 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
             return apply_client_ssl_settings(ssl, hs);
         };
 
-        auto conn = std::make_shared<Connection>(ex, ssl_ctx, qcfg, std::move(options), local, remote, udp->sink());
+        auto conn = std::make_shared<Connection>(state->ex, state->ssl_ctx, qcfg, std::move(options), local, remote,
+                                                 udp->sink());
         if (!conn->init()) {
-            socket->close(ec);
-            co_return std::unexpected{make_error_code(client_errc::protocol_error)};
+            error_code ignored;
+            socket->close(ignored);
+            std::move(done)(make_error_code(client_errc::protocol_error), nullptr);
+            return;
         }
 
-        auto session = std::make_shared<Http3ClientSession>(ex, std::move(conn), std::move(udp), target, limits);
+        auto session =
+            std::make_shared<Http3ClientSession>(state->ex, std::move(conn), std::move(udp), state->target, state->limits);
         SIMPLE_HTTP_DEBUG_LOG("h3 client: connection built, waiting for handshake");
-        if (auto start_ec = co_await session->start(attempt_timeout))
-            co_return std::unexpected{start_ec};
-        SIMPLE_HTTP_DEBUG_LOG("h3 client: handshake complete and h3 ready");
-        co_return session;
+        session->start(attempt_timeout, [session, done = std::move(done)](error_code ec) mutable {
+            if (ec) {
+                std::move(done)(ec, nullptr);
+                return;
+            }
+            SIMPLE_HTTP_DEBUG_LOG("h3 client: handshake complete and h3 ready");
+            std::move(done)(error_code{}, session);
+        });
     }
 
+    static void connect_next(const std::shared_ptr<ConnectState> &state) {
+        if (state->next >= state->ordered.size()) {
+            std::move(state->done)(state->last_error, nullptr);
+            return;
+        }
+        std::chrono::milliseconds slice = state->connect_timeout;
+        if (state->connect_timeout.count() > 0) {
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(state->deadline - Clock::now());
+            if (remaining.count() <= 0) {
+                std::move(state->done)(make_error_code(client_errc::connect_timeout), nullptr);
+                return;
+            }
+            slice = remaining;
+            constexpr auto kAttemptCap = std::chrono::seconds(5);
+            if (state->next + 1 < state->ordered.size() && slice > kAttemptCap)
+                slice = std::chrono::duration_cast<std::chrono::milliseconds>(kAttemptCap);
+        }
+        const auto remote = state->ordered[state->next];
+        connect_one(state, remote, slice, [state, remote](error_code ec, std::shared_ptr<Http3ClientSession> session) {
+            if (session) {
+                std::move(state->done)(error_code{}, std::move(session));
+                return;
+            }
+            state->last_error = ec ? ec : make_error_code(client_errc::protocol_error);
+            SIMPLE_HTTP_ERROR_LOG("h3 client: {} failed ({}), trying the next address", remote.address().to_string(),
+                                  state->last_error.message());
+            ++state->next;
+            connect_next(state);
+        });
+    }
+
+    static void connect_resolve(const std::shared_ptr<ConnectState> &state) {
+        if (!state->target.use_tls) {
+            // QUIC carries its own TLS 1.3: there is no plaintext form.
+            std::move(state->done)(make_error_code(client_errc::version_not_negotiated), nullptr);
+            return;
+        }
+        async_resolve_endpoints(
+            state->resolve_fn, state->target.host, state->target.effective_port(), state->ex,
+            [state](error_code ec, std::vector<asio::ip::tcp::endpoint> endpoints) {
+                if (ec) {
+                    std::move(state->done)(ec, nullptr);
+                    return;
+                }
+                if (endpoints.empty()) {
+                    std::move(state->done)(make_error_code(asio::error::host_not_found), nullptr);
+                    return;
+                }
+                // Try each address in turn. There is no socket-level connect to
+                // fail fast on (UDP), so an unreachable first address would
+                // otherwise burn the whole budget. IPv4 and IPv6 are interleaved
+                // (v4 first) and each non-final attempt is capped at
+                // kAttemptCap: a dead IPv6 route or a bad anycast address then
+                // costs seconds, not the whole deadline.
+                const auto v4_end = std::stable_partition(endpoints.begin(), endpoints.end(),
+                                                          [](const asio::ip::tcp::endpoint &e) {
+                                                              return e.address().is_v4();
+                                                          });
+                for (auto v4 = endpoints.begin(), v6 = v4_end; v4 != v4_end || v6 != endpoints.end();) {
+                    if (v4 != v4_end) {
+                        state->ordered.emplace_back(v4->address(), v4->port());
+                        ++v4;
+                    }
+                    if (v6 != endpoints.end()) {
+                        state->ordered.emplace_back(v6->address(), v6->port());
+                        ++v6;
+                    }
+                }
+                state->deadline = state->connect_timeout.count() > 0 ? Clock::now() + state->connect_timeout
+                                                                     : Clock::time_point::max();
+                connect_next(state);
+            });
+    }
+
+  public:
     Http3ClientSession(Executor ex, std::shared_ptr<Connection> conn, std::shared_ptr<Udp> udp,
                        const ClientTarget &target, const EngineLimits &limits)
         : Base(std::move(ex), target.authority()), m_conn(std::move(conn)), m_udp(std::move(udp)), m_limits(limits) {}
@@ -304,54 +378,78 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
 
     // --- ClientSession ---
 
-    asio::awaitable<std::expected<std::shared_ptr<ClientStream>, error_code>>
-    open_stream(std::shared_ptr<Request> request) override {
-        co_await hop();
-        if (!m_alive)
-            co_return std::unexpected{make_error_code(client_errc::session_closed)};
-        if (m_goaway_received)
-            co_return std::unexpected{make_error_code(client_errc::goaway)};
-        if (h3() == nullptr)
-            co_return std::unexpected{make_error_code(client_errc::version_not_negotiated)};
-        if (request->stream_body() && request->content_length() >= 0)
-            co_return std::unexpected{make_error_code(client_errc::invalid_spec)};
-        if (request->close())
-            m_close_requested = true;
-
-        const auto id = m_conn->open_bidi_stream();
-        if (!id)
-            co_return std::unexpected{make_error_code(client_errc::too_many_streams)};
-
-        auto fresh = std::make_shared<Stream>();
-        fresh->outcome = std::make_shared<StreamOutcome>();
-        fresh->is_head = request->method() == Method::Head;
-        // Capacity-1 coalescing wake-ups on the session executor; see Stream.
-        fresh->in_space = std::make_shared<Channel>(m_executor, 1);
-        fresh->out_space = std::make_shared<Channel>(m_executor, 1);
-        m_streams.emplace(*id, fresh);
-        stream_opened();
-
-        // The up-front body (a non-streaming request): nghttp3 pulls it from the
-        // queue below, so read it before submitting the head. This awaits, so no
-        // iterator or Stream& may be held across it — the map can be rehashed by
-        // another exchange opening on this same executor.
-        std::string up_front;
-        // Only a declared, positive length means the Body has bytes to read: an
-        // absent body (-1) has nothing fed, and reading it would wait forever.
-        if (!request->stream_body() && request->content_length() > 0) {
-            auto body = co_await request->body().read_all();
-            if (!body) {
-                if (auto it = m_streams.find(*id); it != m_streams.end())
-                    erase_stream(it);
-                co_return std::unexpected{body.error()};
+    void open_stream(std::shared_ptr<Request> request, OpenCompletion done) override {
+        auto self = this->shared_from_this();
+        hop([self, request, done = std::move(done)]() mutable {
+            if (!self->m_alive) {
+                std::move(done)(make_error_code(client_errc::session_closed), nullptr);
+                return;
             }
-            up_front = std::move(*body);
-        }
+            if (self->m_goaway_received) {
+                std::move(done)(make_error_code(client_errc::goaway), nullptr);
+                return;
+            }
+            if (self->h3() == nullptr) {
+                std::move(done)(make_error_code(client_errc::version_not_negotiated), nullptr);
+                return;
+            }
+            if (request->stream_body() && request->content_length() >= 0) {
+                std::move(done)(make_error_code(client_errc::invalid_spec), nullptr);
+                return;
+            }
+            if (request->close())
+                self->m_close_requested = true;
 
-        auto it = m_streams.find(*id);
-        if (it == m_streams.end())
-            co_return std::unexpected{make_error_code(client_errc::session_closed)};
-        std::shared_ptr<Stream> st = it->second;
+            const auto id = self->m_conn->open_bidi_stream();
+            if (!id) {
+                std::move(done)(make_error_code(client_errc::too_many_streams), nullptr);
+                return;
+            }
+
+            auto fresh = std::make_shared<Stream>();
+            fresh->outcome = std::make_shared<StreamOutcome>();
+            fresh->is_head = request->method() == Method::Head;
+            // Capacity-1 coalescing wake-ups on the session executor; see Stream.
+            fresh->in_space = std::make_shared<Channel>(self->m_executor, 1);
+            fresh->out_space = std::make_shared<Channel>(self->m_executor, 1);
+            self->m_streams.emplace(*id, fresh);
+            self->stream_opened();
+
+            // The up-front body (a non-streaming request): nghttp3 pulls it from
+            // the queue below, so read it before submitting the head. Only a
+            // declared, positive length means the Body has bytes to read: an
+            // absent body (-1) has nothing fed, and reading it would wait
+            // forever.
+            auto submit = [self, request, id = *id, fresh](std::string up_front,
+                                                           OpenCompletion completion) mutable {
+                self->submit_open(request, id, fresh, std::move(up_front), std::move(completion));
+            };
+            if (!request->stream_body() && request->content_length() > 0) {
+                request->body().async_read_all(
+                    [self, id = *id, submit = std::move(submit), done = std::move(done)](
+                        error_code ec, std::string body) mutable {
+                        if (ec) {
+                            if (auto it = self->m_streams.find(id); it != self->m_streams.end())
+                                self->erase_stream(it->first);
+                            std::move(done)(ec, nullptr);
+                            return;
+                        }
+                        submit(std::move(body), std::move(done));
+                    });
+                return;
+            }
+            submit(std::string{}, std::move(done));
+        });
+    }
+
+  private:
+    void submit_open(std::shared_ptr<Request> request, std::int64_t id, std::shared_ptr<Stream> st,
+                     std::string up_front, OpenCompletion done) {
+        auto it = m_streams.find(id);
+        if (it == m_streams.end()) {
+            std::move(done)(make_error_code(client_errc::session_closed), nullptr);
+            return;
+        }
         if (!request->stream_body()) {
             if (!up_front.empty()) {
                 st->out_bytes = up_front.size();
@@ -363,11 +461,12 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         std::vector<nghttp3_nv> nva;
         std::deque<std::string> owned; // stable addresses: nva points into it
         if (auto ec = build_request_headers(*request, nva, owned)) {
-            erase_stream(it);
-            co_return std::unexpected{ec};
+            erase_stream(it->first);
+            std::move(done)(ec, nullptr);
+            return;
         }
 
-        auto handle = std::make_shared<Http3ClientStream<Executor>>(this->shared_from_this(), *id, st->outcome);
+        auto handle = std::make_shared<Http3ClientStream<Executor>>(this->shared_from_this(), id, st->outcome);
         st->handle = handle;
 
         // A reader is installed whenever bytes have to be delivered: a streaming
@@ -380,17 +479,19 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
             reader.read_data = &Http3ClientSession::read_request_data_trampoline;
             reader_ptr = &reader;
         }
-        const int rv = nghttp3_conn_submit_request(h3(), *id, nva.data(), nva.size(), reader_ptr, nullptr);
+        const int rv = nghttp3_conn_submit_request(h3(), id, nva.data(), nva.size(), reader_ptr, nullptr);
         if (rv != 0) {
-            SIMPLE_HTTP_ERROR_LOG("h3 client: submit_request failed (stream={}): {}", *id, nghttp3_strerror(rv));
-            erase_stream(it);
-            co_return std::unexpected{make_error_code(client_errc::protocol_error)};
+            SIMPLE_HTTP_ERROR_LOG("h3 client: submit_request failed (stream={}): {}", id, nghttp3_strerror(rv));
+            erase_stream(it->first);
+            std::move(done)(make_error_code(client_errc::protocol_error), nullptr);
+            return;
         }
         m_conn->flush();
-        SIMPLE_HTTP_DEBUG_LOG("h3 client: request submitted (stream={})", *id);
-        co_return handle;
+        SIMPLE_HTTP_DEBUG_LOG("h3 client: request submitted (stream={})", id);
+        std::move(done)(error_code{}, handle);
     }
 
+  public:
     Version version() const override { return Version::Http3; }
 
     void close() override {
@@ -399,147 +500,230 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
 
     // --- stream operations (called by Http3ClientStream, already hopped) ---
 
-    asio::awaitable<error_code> stream_write(std::int64_t id, std::string data, bool last) {
-        co_await hop();
-        {
-            auto it = m_streams.find(id);
-            if (it == m_streams.end())
-                co_return make_error_code(client_errc::session_closed);
-            Stream &st = *it->second;
-            if (st.reset || st.write_shut)
-                co_return make_error_code(client_errc::stream_reset);
-            if (st.out_eof)
-                co_return make_error_code(client_errc::body_not_streaming);
-        }
-        if (!data.empty()) {
-            if (auto ec = co_await await_out_space(id); ec)
-                co_return ec;
-            auto it = m_streams.find(id);
-            if (it == m_streams.end())
-                co_return make_error_code(client_errc::session_closed);
-            it->second->out_bytes += data.size();
-            it->second->out_q.push_back(std::move(data));
-        }
-        if (last) {
-            auto it = m_streams.find(id);
-            if (it == m_streams.end())
-                co_return make_error_code(client_errc::session_closed);
-            it->second->out_eof = true;
-        }
-        resume_stream(id);
-        m_conn->flush();
-        co_return error_code{};
-    }
-
-    asio::awaitable<error_code> await_stream_head(std::int64_t id) {
-        co_await hop();
-        for (;;) {
-            auto it = m_streams.find(id);
-            if (it == m_streams.end()) {
-                // Retired already: the head was published to the handle when it
-                // was parsed, so reaching here means there never was one.
-                co_return make_error_code(client_errc::protocol_error);
-            }
-            Stream &st = *it->second;
-            // An interim 100-continue is handed to the caller first: it is the
-            // "send your body now" signal. The cached head on the handle is
-            // invalidated so the next read_head() waits for the final response,
-            // exactly like the HTTP/1.1 session.
-            if (st.interim) {
-                ResponseHead interim = std::move(*st.interim);
-                st.interim.reset();
-                if (auto handle = st.handle.lock()) {
-                    handle->set_head(std::move(interim));
-                    handle->reset_head();
+    void stream_write(std::int64_t id, std::string data, bool last, WriteCompletion done) {
+        auto self = this->shared_from_this();
+        hop([self, id, data = std::move(data), last, done = std::move(done)]() mutable {
+            {
+                auto it = self->m_streams.find(id);
+                if (it == self->m_streams.end()) {
+                    std::move(done)(make_error_code(client_errc::session_closed));
+                    return;
                 }
-                co_return error_code{};
+                Stream &st = *it->second;
+                if (st.reset || st.write_shut) {
+                    std::move(done)(make_error_code(client_errc::stream_reset));
+                    return;
+                }
+                if (st.out_eof) {
+                    std::move(done)(make_error_code(client_errc::body_not_streaming));
+                    return;
+                }
             }
-            if (st.head_seen)
-                co_return error_code{};
-            if (st.failed || st.reset || st.outcome->get() != StreamState::Open)
-                co_return outcome_error(*st.outcome);
-            if (st.remote_end)
-                co_return make_error_code(client_errc::protocol_error); // FIN, no HEADERS
-
-            auto wake = st.in_space;
-            auto [ec] = co_await wake->async_receive(asio::as_tuple(asio::use_awaitable));
-            // A wake (state change) arrives with no error. Anything else is a
-            // cancelled/failed wait — typically the caller's deadline cancelling
-            // this coroutine — and re-waiting would spin under terminal
-            // cancellation, so report it.
-            if (ec)
-                co_return ec;
-        }
+            auto finish_write = [self, id, last, done = std::move(done)](error_code ec) mutable {
+                if (ec) {
+                    std::move(done)(ec);
+                    return;
+                }
+                auto it = self->m_streams.find(id);
+                if (it == self->m_streams.end()) {
+                    std::move(done)(make_error_code(client_errc::session_closed));
+                    return;
+                }
+                if (last)
+                    it->second->out_eof = true;
+                self->resume_stream(id);
+                self->m_conn->flush();
+                std::move(done)(error_code{});
+            };
+            if (data.empty()) {
+                finish_write(error_code{});
+                return;
+            }
+            self->await_out_space(
+                id, [self, id, data = std::move(data), finish_write = std::move(finish_write)](
+                        error_code ec) mutable {
+                    if (ec) {
+                        finish_write(ec);
+                        return;
+                    }
+                    auto it = self->m_streams.find(id);
+                    if (it == self->m_streams.end()) {
+                        finish_write(make_error_code(client_errc::session_closed));
+                        return;
+                    }
+                    it->second->out_bytes += data.size();
+                    it->second->out_q.push_back(std::move(data));
+                    finish_write(error_code{});
+                });
+        });
     }
 
+    void await_stream_head(std::int64_t id, WriteCompletion done) {
+        auto self = this->shared_from_this();
+        hop([self, id, done = std::move(done)]() mutable { self->head_step(id, std::move(done)); });
+    }
+
+  private:
+    void head_step(std::int64_t id, WriteCompletion done) {
+        auto it = m_streams.find(id);
+        if (it == m_streams.end()) {
+            // Retired already: the head was published to the handle when it was
+            // parsed, so reaching here means there never was one.
+            std::move(done)(make_error_code(client_errc::protocol_error));
+            return;
+        }
+        Stream &st = *it->second;
+        // An interim 100-continue is handed to the caller first: it is the
+        // "send your body now" signal. The cached head on the handle is
+        // invalidated so the next read_head() waits for the final response,
+        // exactly like the HTTP/1.1 session.
+        if (st.interim) {
+            ResponseHead interim = std::move(*st.interim);
+            st.interim.reset();
+            if (auto handle = st.handle.lock()) {
+                handle->set_head(std::move(interim));
+                handle->reset_head();
+            }
+            std::move(done)(error_code{});
+            return;
+        }
+        if (st.head_seen) {
+            std::move(done)(error_code{});
+            return;
+        }
+        if (st.failed || st.reset || st.outcome->get() != StreamState::Open) {
+            std::move(done)(outcome_error(*st.outcome));
+            return;
+        }
+        if (st.remote_end) {
+            std::move(done)(make_error_code(client_errc::protocol_error)); // FIN, no HEADERS
+            return;
+        }
+        auto wake = st.in_space;
+        auto outcome = st.outcome;
+        auto self = this->shared_from_this();
+        wake->async_receive([self, id, outcome, done = std::move(done)](error_code ec) mutable {
+            // A wake (state change) arrives with no error. Anything else is a
+            // cancelled/failed wait -- typically the caller's deadline
+            // cancelling this operation -- and re-waiting would spin under
+            // terminal cancellation, so report it. If the stream retired in the
+            // meantime, its terminal state is more useful than channel_closed.
+            if (ec) {
+                if (outcome->get() != StreamState::Open) {
+                    std::move(done)(outcome_error(*outcome));
+                } else {
+                    std::move(done)(ec);
+                }
+                return;
+            }
+            self->head_step(id, std::move(done));
+        });
+    }
+
+  public:
     // nghttp3 supports request trailers, but wiring them into this stream
     // adapter is a separate change; report it rather than dropping fields.
-    asio::awaitable<error_code> stream_finish_trailers(std::int64_t id, Headers trailers) {
+    void stream_finish_trailers(std::int64_t id, Headers trailers, WriteCompletion done) {
         (void)id;
         (void)trailers;
-        co_return make_error_code(client_errc::trailers_not_supported);
+        auto self = this->shared_from_this();
+        hop([self, done = std::move(done)]() mutable {
+            std::move(done)(make_error_code(client_errc::trailers_not_supported));
+        });
     }
 
-    asio::awaitable<std::expected<ReadResult, error_code>> stream_read(std::int64_t id) {
-        co_await hop();
-        if (!m_streams.contains(id))
-            co_return std::unexpected{make_error_code(client_errc::session_closed)};
-
-        if (auto it = m_streams.find(id); it != m_streams.end() && !it->second->head_seen) {
-            if (auto ec = co_await await_stream_head(id))
-                co_return std::unexpected{ec};
-        }
-
-        // Re-resolve every pass: an await can retire this stream.
-        for (;;) {
-            auto it = m_streams.find(id);
-            if (it == m_streams.end())
-                co_return std::unexpected{make_error_code(client_errc::session_closed)};
-            Stream &st = *it->second;
-            if (!st.in_queue.empty()) {
-                std::string data = std::move(st.in_queue.front());
-                st.in_queue.pop_front();
-                st.in_bytes -= data.size();
-                // Credit exactly what the application took: un-consumed bytes
-                // keep the peer's window closed, which is what bounds memory.
-                m_conn->extend_stream_offset(id, data.size());
-                m_conn->extend_connection_offset(data.size());
-                m_conn->flush();
-                co_return ReadResult::chunk(std::move(data));
+    void stream_read(std::int64_t id, ReadCompletion done) {
+        auto self = this->shared_from_this();
+        hop([self, id, done = std::move(done)]() mutable {
+            auto it = self->m_streams.find(id);
+            if (it == self->m_streams.end()) {
+                std::move(done)(make_error_code(client_errc::session_closed), ReadResult{});
+                return;
             }
-            if (st.failed || st.reset) {
-                auto terminal = outcome_result(*st.outcome);
-                erase_stream(it);
-                co_return terminal;
+            if (!it->second->head_seen) {
+                self->head_step(id, [self, id, done = std::move(done)](error_code ec) mutable {
+                    if (ec) {
+                        std::move(done)(ec, ReadResult{});
+                        return;
+                    }
+                    self->read_step(id, std::move(done));
+                });
+                return;
             }
-            if (st.remote_end) {
-                st.outcome->set(StreamState::Eof);
-                erase_stream(it);
-                co_return ReadResult::end();
-            }
-            // The connection went away (or the stream failed) without ending the
-            // body: report that rather than parking on a wake that never comes.
-            if (st.outcome->get() != StreamState::Open) {
-                auto terminal = outcome_result(*st.outcome);
-                erase_stream(it);
-                co_return terminal;
-            }
-
-            auto wake = st.in_space;
-            auto [ec] = co_await wake->async_receive(asio::as_tuple(asio::use_awaitable));
-            if (ec)
-                co_return std::unexpected{ec};
-        }
+            self->read_step(id, std::move(done));
+        });
     }
 
+  private:
+    // Re-resolve the stream every pass: an await can retire it.
+    void read_step(std::int64_t id, ReadCompletion done) {
+        auto it = m_streams.find(id);
+        if (it == m_streams.end()) {
+            std::move(done)(make_error_code(client_errc::session_closed), ReadResult{});
+            return;
+        }
+        Stream &st = *it->second;
+        if (!st.in_queue.empty()) {
+            std::string data = std::move(st.in_queue.front());
+            st.in_queue.pop_front();
+            st.in_bytes -= data.size();
+            // Credit exactly what the application took: un-consumed bytes keep
+            // the peer's window closed, which is what bounds memory.
+            m_conn->extend_stream_offset(id, data.size());
+            m_conn->extend_connection_offset(data.size());
+            m_conn->flush();
+            std::move(done)(error_code{}, ReadResult::chunk(std::move(data)));
+            return;
+        }
+        if (st.failed || st.reset) {
+            auto terminal = outcome_result(*st.outcome);
+            erase_stream(it->first);
+            if (terminal) {
+                std::move(done)(error_code{}, std::move(*terminal));
+            } else {
+                std::move(done)(terminal.error(), ReadResult{});
+            }
+            return;
+        }
+        if (st.remote_end) {
+            st.outcome->set(StreamState::Eof);
+            erase_stream(it->first);
+            std::move(done)(error_code{}, ReadResult::end());
+            return;
+        }
+        // The connection went away (or the stream failed) without ending the
+        // body: report that rather than parking on a wake that never comes.
+        if (st.outcome->get() != StreamState::Open) {
+            auto terminal = outcome_result(*st.outcome);
+            erase_stream(it->first);
+            if (terminal) {
+                std::move(done)(error_code{}, std::move(*terminal));
+            } else {
+                std::move(done)(terminal.error(), ReadResult{});
+            }
+            return;
+        }
+
+        auto wake = st.in_space;
+        auto self = this->shared_from_this();
+        wake->async_receive([self, id, done = std::move(done)](error_code ec) mutable {
+            if (ec) {
+                std::move(done)(ec, ReadResult{});
+                return;
+            }
+            self->read_step(id, std::move(done));
+        });
+    }
+
+  public:
     void stream_cancel(std::int64_t id) {
         asio::dispatch(m_executor, [self = this->shared_from_this(), id] {
             auto it = self->m_streams.find(id);
             if (it == self->m_streams.end())
                 return;
             self->m_conn->reset_stream(id, NGHTTP3_H3_REQUEST_CANCELLED);
-            self->it_finish(it, StreamState::Reset, make_error_code(client_errc::stream_reset));
-            self->erase_stream(it);
+            self->it_finish(it->first, StreamState::Reset, make_error_code(client_errc::stream_reset));
+            self->erase_stream(it->first);
             self->m_conn->flush();
         });
     }
@@ -570,7 +754,7 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         }
         out.stream_id = stream_id;
         out.fin = fin;
-        out.vec = std::span<const quic::ByteVec>(m_vec.data(), m_vec_count);
+        out.vec = boost::span<const quic::ByteVec>(m_vec.data(), m_vec_count);
         return out;
     }
 
@@ -602,7 +786,7 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
     // --- quic::Protocol: read side and events ---
 
     void on_stream_data(std::uint32_t flags, std::int64_t stream_id,
-                        std::span<const std::uint8_t> data) noexcept override {
+                        boost::span<const std::uint8_t> data) noexcept override {
         if (h3() == nullptr)
             return;
 
@@ -751,7 +935,11 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         if (m_h3 == nullptr && !m_failure_set)
             m_failure = make_error_code(asio::error::connection_refused);
         for (auto &[id, stream] : m_streams) {
-            if (stream->outcome->get() == StreamState::Open)
+            // A completed response may still have decoded bytes queued. Leave
+            // it Open so read_step() can hand them over and then report EOF;
+            // forcing Disconnect here would discard the body.
+            const bool drain_pending = stream->remote_end && !stream->in_queue.empty();
+            if (stream->outcome->get() == StreamState::Open && !drain_pending)
                 stream->outcome->set(StreamState::Disconnect);
             h3::wake(stream->in_space);
             h3::wake(stream->out_space);
@@ -841,7 +1029,7 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
 
     // --- trailer section (RFC 9110 §6.5, RFC 9114 §4.1) -------------------
 
-    bool on_trailers_begin(std::int64_t stream_id) noexcept override { return m_streams.contains(stream_id); }
+    bool on_trailers_begin(std::int64_t stream_id) noexcept override { return m_streams.find(stream_id) != m_streams.end(); }
 
     void on_trailer(std::int64_t stream_id, std::int32_t /*token*/, std::string_view name,
                     std::string_view value) noexcept override {
@@ -876,7 +1064,7 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         h3::wake(st.in_space);
     }
 
-    void on_data(std::int64_t stream_id, std::span<const std::uint8_t> data) noexcept override {
+    void on_data(std::int64_t stream_id, boost::span<const std::uint8_t> data) noexcept override {
         auto it = m_streams.find(stream_id);
         if (it == m_streams.end())
             return;
@@ -1021,56 +1209,66 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
     };
 
     // Start the connection and wait for the 1-RTT keys (when the HTTP/3 control
-    // streams can be opened).
-    asio::awaitable<error_code> start(std::chrono::milliseconds connect_timeout) {
+    // streams can be opened). Completion signature: void(error_code).
+    void start(std::chrono::milliseconds connect_timeout, std::function<void(error_code)> done) {
         m_ready = std::make_shared<Channel>(m_executor, 1);
-        asio::co_spawn(
-            m_executor, [self = this->shared_from_this()]() -> asio::awaitable<void> { co_await self->run(); },
-            asio::detached);
+        auto self = this->shared_from_this();
+        run();
 
-        auto wait_ready = [this]() -> asio::awaitable<bool> {
-            co_await m_ready->async_receive(asio::as_tuple(asio::use_awaitable));
-            co_return m_alive;
+        auto finished = std::make_shared<std::atomic<bool>>(false);
+        auto complete = [finished, done = std::move(done)](error_code ec) mutable {
+            if (finished->exchange(true))
+                return;
+            std::move(done)(ec);
         };
-        if (connect_timeout.count() <= 0) {
-            const bool ok = co_await wait_ready();
-            co_return ok ? error_code{} : m_failure;
+        std::shared_ptr<asio::steady_timer> timer;
+        if (connect_timeout.count() > 0) {
+            timer = std::make_shared<asio::steady_timer>(m_executor);
+            timer->expires_after(connect_timeout);
         }
-        using namespace asio::experimental::awaitable_operators;
-        auto timer_op = [connect_timeout]() -> asio::awaitable<void> {
-            asio::steady_timer timer{co_await asio::this_coro::executor};
-            timer.expires_after(connect_timeout);
-            co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+        auto wait_ready = [self, complete, timer]() mutable {
+            auto ready = self->m_ready;
+            ready->async_receive([self, complete, timer](error_code) mutable {
+                // The handshake won (or the connection failed before it): drop
+                // the deadline. Leaving it armed keeps the io_context busy for
+                // the whole connect_timeout even after a successful connect.
+                if (timer)
+                    timer->cancel();
+                std::move(complete)(self->m_alive ? error_code{} : self->m_failure);
+            });
         };
-        auto outcome = co_await (wait_ready() || timer_op());
-        if (auto *ok = std::get_if<bool>(&outcome))
-            co_return *ok ? error_code{} : m_failure;
-        shutdown_now();
-        co_return make_error_code(client_errc::connect_timeout);
+        if (timer) {
+            timer->async_wait([self, timer, complete](error_code ec) mutable {
+                if (ec)
+                    return;
+                self->shutdown_now();
+                std::move(complete)(make_error_code(client_errc::connect_timeout));
+            });
+        }
+        wait_ready();
     }
 
-    asio::awaitable<void> run() {
-        m_conn->set_protocol(this->shared_from_this());
-        asio::co_spawn(
-            m_executor,
-            [self = this->shared_from_this()]() -> asio::awaitable<void> {
-                co_await self->m_udp->receive_loop(self->m_conn);
-            },
-            asio::detached);
-        co_await m_conn->run();
-        m_udp->close();
-        m_alive = false;
-        m_conn_closed = true;
-        // finish_close() normally already ran on_connection_closed; keep the
-        // streams' waiters guaranteed to wake even if it did not.
-        for (auto &[id, stream] : m_streams) {
-            if (stream->outcome->get() == StreamState::Open)
-                stream->outcome->set(StreamState::Disconnect);
-            h3::wake(stream->in_space);
-            h3::wake(stream->out_space);
-        }
-        if (m_ready)
-            (void)m_ready->try_send(error_code{});
+    void run() {
+        auto self = this->shared_from_this();
+        m_conn->set_protocol(self);
+        m_udp->receive_loop(m_conn);
+        m_conn->run();
+        m_conn->async_await_closed([self]() mutable {
+            self->m_udp->close();
+            self->m_alive = false;
+            self->m_conn_closed = true;
+            // finish_close() normally already ran on_connection_closed; keep the
+            // streams' waiters guaranteed to wake even if it did not.
+            for (auto &[id, stream] : self->m_streams) {
+                const bool drain_pending = stream->remote_end && !stream->in_queue.empty();
+                if (stream->outcome->get() == StreamState::Open && !drain_pending)
+                    stream->outcome->set(StreamState::Disconnect);
+                h3::wake(stream->in_space);
+                h3::wake(stream->out_space);
+            }
+            if (self->m_ready)
+                (void)self->m_ready->try_send(error_code{});
+        });
     }
 
     void shutdown_now() {
@@ -1184,32 +1382,55 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         (void)nghttp3_conn_resume_stream(m_h3, id);
     }
 
-    asio::awaitable<error_code> await_out_space(std::int64_t id) {
-        for (;;) {
-            auto it = m_streams.find(id);
-            if (it == m_streams.end())
-                co_return make_error_code(client_errc::session_closed);
-            Stream &st = *it->second;
-            if (st.write_shut)
-                co_return make_error_code(client_errc::stream_reset);
-            if (st.out_write - st.out_ack <= h3::kOutLowWatermark)
-                co_return error_code{};
-            auto space = st.out_space;
-            auto [ec] = co_await space->async_receive(asio::as_tuple(asio::use_awaitable));
-            if (ec)
-                co_return ec;
+    void await_out_space(std::int64_t id, WriteCompletion done) {
+        auto it = m_streams.find(id);
+        if (it == m_streams.end()) {
+            std::move(done)(make_error_code(client_errc::session_closed));
+            return;
         }
+        Stream &st = *it->second;
+        if (st.write_shut) {
+            std::move(done)(make_error_code(client_errc::stream_reset));
+            return;
+        }
+        if (st.out_write - st.out_ack <= h3::kOutLowWatermark) {
+            std::move(done)(error_code{});
+            return;
+        }
+        auto space = st.out_space;
+        auto outcome = st.outcome;
+        auto self = this->shared_from_this();
+        space->async_receive([self, id, space, outcome, done = std::move(done)](error_code ec) mutable {
+            if (ec) {
+                // The wake channel is closed when the stream retires. Report the
+                // stream's terminal state (reset/failed/disconnect), not the
+                // generic channel error; only a still-open stream is a caller
+                // cancellation, which passes through.
+                if (outcome->get() != StreamState::Open) {
+                    std::move(done)(outcome_error(*outcome));
+                } else {
+                    std::move(done)(ec);
+                }
+                return;
+            }
+            self->await_out_space(id, std::move(done));
+        });
     }
 
-    void it_finish(std::unordered_map<std::int64_t, std::shared_ptr<Stream>>::iterator it, StreamState state,
-                   error_code ec) {
+    void it_finish(std::int64_t id, StreamState state, error_code ec) {
+        auto it = m_streams.find(id);
+        if (it == m_streams.end())
+            return;
         if (it->second->outcome->get() == StreamState::Open)
             it->second->outcome->set(state, std::move(ec));
         h3::wake(it->second->in_space);
         h3::wake(it->second->out_space);
     }
 
-    void erase_stream(std::unordered_map<std::int64_t, std::shared_ptr<Stream>>::iterator it) {
+    void erase_stream(std::int64_t id) {
+        auto it = m_streams.find(id);
+        if (it == m_streams.end())
+            return;
         h3::wake(it->second->in_space);
         h3::wake(it->second->out_space);
         m_streams.erase(it);
@@ -1225,7 +1446,7 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
     error_code m_failure{make_error_code(client_errc::version_not_negotiated)};
     bool m_failure_set{false};
     Signal m_ready;
-    std::unordered_map<std::int64_t, std::shared_ptr<Stream>> m_streams;
+    StreamMap m_streams;
     std::array<quic::ByteVec, 8> m_vec{};
     std::size_t m_vec_count{0};
 };

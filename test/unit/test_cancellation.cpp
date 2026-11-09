@@ -38,58 +38,54 @@ void cancel_after(asio::io_context &ctx, RequestPtr req, std::chrono::millisecon
 }
 
 std::shared_ptr<FakeResponseSink> run_chain(asio::io_context &ctx, Router &router, RequestPtr req) {
-    auto writer = std::make_shared<FakeResponseSink>();
+    auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
     auto res = std::make_shared<ResponseWriter>(writer);
-    REQUIRE(run_on(ctx, router.dispatch(req, res, std::nullopt)));
+    REQUIRE(run_on(ctx, await_dispatch(router, req, res)));
     return writer;
 }
 
 } // namespace
 
-TEST_CASE("request: wait_cancelled returns at once when already cancelled", "[cancellation]") {
+TEST_CASE("request: cancel() flips the flag and is idempotent", "[cancellation]") {
     asio::io_context ctx;
     auto req = make_request(ctx);
+    CHECK_FALSE(req->cancelled());
     req->cancel();
-
-    bool woke = false;
-    REQUIRE(run_on(ctx, [&]() -> asio::awaitable<void> {
-        co_await req->wait_cancelled();
-        woke = true;
-    }()));
-    CHECK(woke);
     CHECK(req->cancelled());
-    CHECK(req->cancel_token().stop_requested());
-}
-
-TEST_CASE("request: wait_cancelled wakes on cancel from another coroutine", "[cancellation]") {
-    asio::io_context ctx;
-    auto req = make_request(ctx);
-
-    bool woke = false;
-    cancel_after(ctx, req, std::chrono::milliseconds(20));
-    REQUIRE(run_on(ctx, [&]() -> asio::awaitable<void> {
-        co_await req->wait_cancelled();
-        woke = true;
-    }()));
-    CHECK(woke);
+    req->cancel(); // idempotent
     CHECK(req->cancelled());
 }
 
-TEST_CASE("request: wait_cancelled composes with a timer via operator||", "[cancellation]") {
-    using namespace asio::experimental::awaitable_operators;
+TEST_CASE("request: a slot-bound operation is cancelled from another coroutine", "[cancellation]") {
     asio::io_context ctx;
     auto req = make_request(ctx);
 
-    bool cancelled_won = false;
+    error_code outcome = make_error_code(asio::error::would_block);
     cancel_after(ctx, req, std::chrono::milliseconds(20));
     REQUIRE(run_on(ctx, [&]() -> asio::awaitable<void> {
         asio::steady_timer slow{co_await asio::this_coro::executor};
         slow.expires_after(std::chrono::seconds(30));
-        auto outcome = co_await (slow.async_wait(asio::as_tuple(asio::use_awaitable)) || req->wait_cancelled());
-        cancelled_won = outcome.index() == 1; // the token (second operand) won
+        auto [ec] = co_await slow.async_wait(asio::bind_cancellation_slot(
+            req->cancellation_slot(), asio::as_tuple(asio::use_awaitable)));
+        outcome = ec;
     }()));
-    CHECK(cancelled_won);
+    CHECK(outcome == asio::error::operation_aborted);
     CHECK(req->cancelled());
+}
+
+TEST_CASE("request: an operation not bound to the slot is unaffected", "[cancellation]") {
+    asio::io_context ctx;
+    auto req = make_request(ctx);
+    req->cancel();
+
+    bool completed = false;
+    REQUIRE(run_on(ctx, [&]() -> asio::awaitable<void> {
+        asio::steady_timer quick{co_await asio::this_coro::executor};
+        quick.expires_after(std::chrono::milliseconds(5));
+        auto [ec] = co_await quick.async_wait(asio::as_tuple(asio::use_awaitable));
+        completed = !ec;
+    }()));
+    CHECK(completed);
 }
 
 TEST_CASE("middleware: timeout answers 504 when the handler overruns", "[cancellation]") {
@@ -99,7 +95,7 @@ TEST_CASE("middleware: timeout answers 504 when the handler overruns", "[cancell
         asio::steady_timer t{co_await asio::this_coro::executor};
         t.expires_after(std::chrono::seconds(5));
         co_await t.async_wait(asio::use_awaitable); // the deadline must cancel this
-        co_await res->status(status::ok).send("too late");
+        co_await res->status(status::ok).async_send("too late", asio::use_awaitable);
     });
 
     asio::io_context ctx;
@@ -116,7 +112,7 @@ TEST_CASE("middleware: timeout leaves a handler that finishes in time alone", "[
     Router router;
     router.use(middleware::timeout(std::chrono::seconds(5)));
     router.route({Method::Get}, "/fast", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(status::ok).send("ok");
+        co_await res->status(status::ok).async_send("ok", asio::use_awaitable);
     });
 
     asio::io_context ctx;
@@ -129,16 +125,16 @@ TEST_CASE("middleware: timeout does not kill a stream that keeps producing", "[c
     Router router;
     router.use(middleware::timeout(std::chrono::milliseconds(50)));
     router.route({Method::Get}, "/stream", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(status::ok).content_type("text/plain").begin();
+        co_await res->status(status::ok).content_type("text/plain").async_begin(asio::use_awaitable);
         // Ten chunks, 20 ms apart: ~200 ms total, four times the deadline, but
         // never idle for more than 20 ms — the stream must survive.
         for (int i = 0; i < 10; ++i) {
             asio::steady_timer t{co_await asio::this_coro::executor};
             t.expires_after(std::chrono::milliseconds(20));
             co_await t.async_wait(asio::use_awaitable);
-            co_await res->write("x");
+            co_await res->async_write("x", asio::use_awaitable);
         }
-        co_await res->finish();
+        co_await res->async_finish(asio::use_awaitable);
     });
 
     asio::io_context ctx;
@@ -152,12 +148,12 @@ TEST_CASE("middleware: timeout aborts a stream that goes silent", "[cancellation
     Router router;
     router.use(middleware::timeout(std::chrono::milliseconds(50)));
     router.route({Method::Get}, "/stall", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(status::ok).content_type("text/plain").begin();
-        co_await res->write("first");
+        co_await res->status(status::ok).content_type("text/plain").async_begin(asio::use_awaitable);
+        co_await res->async_write("first", asio::use_awaitable);
         asio::steady_timer t{co_await asio::this_coro::executor};
         t.expires_after(std::chrono::seconds(5)); // then silence
         co_await t.async_wait(asio::use_awaitable);
-        co_await res->finish();
+        co_await res->async_finish(asio::use_awaitable);
     });
 
     asio::io_context ctx;
@@ -180,14 +176,17 @@ TEST_CASE("middleware: timeout fires the token for work the handler left running
                      asio::co_spawn(
                          exec,
                          [req, detached_saw_cancel]() -> asio::awaitable<void> {
-                             co_await req->wait_cancelled();
-                             *detached_saw_cancel = true;
+                             asio::steady_timer wait{co_await asio::this_coro::executor};
+                             wait.expires_after(std::chrono::seconds(30));
+                             auto [ec] = co_await wait.async_wait(asio::bind_cancellation_slot(
+                                 req->cancellation_slot(), asio::as_tuple(asio::use_awaitable)));
+                             *detached_saw_cancel = (ec == asio::error::operation_aborted);
                          },
                          asio::detached);
                      asio::steady_timer t{exec};
                      t.expires_after(std::chrono::seconds(5));
                      co_await t.async_wait(asio::use_awaitable); // the deadline must cancel this
-                     co_await res->status(status::ok).send("too late");
+                     co_await res->status(status::ok).async_send("too late", asio::use_awaitable);
                  });
 
     asio::io_context ctx;
@@ -197,9 +196,10 @@ TEST_CASE("middleware: timeout fires the token for work the handler left running
 }
 
 TEST_CASE("response: started() flips once the head goes out", "[cancellation]") {
-    auto sink = std::make_shared<FakeResponseSink>();
+    asio::io_context ctx;
+    auto sink = std::make_shared<FakeResponseSink>(ctx.get_executor());
     ResponseWriter res{sink};
     CHECK_FALSE(res.started());
-    REQUIRE(run([&]() -> asio::awaitable<void> { co_await res.send("x"); }()));
+    REQUIRE(run([&]() -> asio::awaitable<void> { co_await res.async_send("x", asio::use_awaitable); }()));
     CHECK(res.started());
 }

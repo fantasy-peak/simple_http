@@ -54,7 +54,7 @@ struct SecureHeadersConfig {
 };
 
 inline Middleware secure_headers(SecureHeadersConfig cfg = {}) {
-    return [cfg = std::move(cfg)](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
+    return [cfg = std::move(cfg)](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next, HandlerCompletion done) {
         // Before the chain: the headers ride along with whatever send() the
         // handler (or the router's own 404/405/OPTIONS) emits next.
         if (!cfg.content_security_policy.empty()) {
@@ -85,7 +85,7 @@ inline Middleware secure_headers(SecureHeadersConfig cfg = {}) {
             }
             res->header(field::strict_transport_security, std::move(hsts));
         }
-        co_await next(std::move(req), std::move(res), ssl);
+        next(std::move(req), std::move(res), ssl, std::move(done));
     };
 }
 

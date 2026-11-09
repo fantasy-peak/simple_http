@@ -278,13 +278,13 @@ inline void apply_preflight(const CorsConfig &cfg, const RequestPtr &req, const 
 // before any handler or static site writes a header. Called later, merge
 // instead.
 inline Middleware make_cors_middleware(CorsConfig cfg) {
-    return [cfg = std::move(cfg)](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next) -> asio::awaitable<void> {
+    return [cfg = std::move(cfg)](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next, HandlerCompletion done) {
         // A missing or empty Origin is a pass-through rather than a dereference:
         // only cross-origin requests are CORS-filtered.
         const auto origin = req->header(field::origin);
         if (!origin || origin->empty()) {
-            co_await next(std::move(req), std::move(res), ssl);
-            co_return;
+            next(std::move(req), std::move(res), ssl, std::move(done));
+            return;
         }
 
         // A preflight is exactly "OPTIONS + Access-Control-Request-Method". A plain
@@ -327,16 +327,16 @@ inline Middleware make_cors_middleware(CorsConfig cfg) {
                 // framed empty body on a keep-alive connection desynchronizes the
                 // peer.
                 res->status(status::no_content);
-                (void)co_await res->send_bodyless();
-                co_return; // answered here — a preflight never reaches a route
+                res->async_send_bodyless(finish_with(std::move(done)));
+                return; // answered here — a preflight never reaches a route
             }
 
             if (!cfg.expose_headers.empty()) {
                 res->header(field::access_control_expose_headers, cors_detail::join(cfg.expose_headers, ", "));
             }
             // CORS is a browser gate, not authorization: the route still runs.
-            co_await next(std::move(req), std::move(res), ssl);
-            co_return;
+            next(std::move(req), std::move(res), ssl, std::move(done));
+            return;
         }
 
         // An origin the policy does not allow: not one CORS header, so the browser
@@ -352,10 +352,10 @@ inline Middleware make_cors_middleware(CorsConfig cfg) {
             // for an allowed origin.
             res->replace_header(field::vary, "Origin");
             res->status(status::no_content);
-            (void)co_await res->send_bodyless();
-            co_return;
+            res->async_send_bodyless(finish_with(std::move(done)));
+            return;
         }
-        co_await next(std::move(req), std::move(res), ssl);
+        next(std::move(req), std::move(res), ssl, std::move(done));
     };
 }
 

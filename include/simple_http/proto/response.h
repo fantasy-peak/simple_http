@@ -1,24 +1,32 @@
 #pragma once
 
-// ResponseWriter: the user-facing, fluent, version-agnostic reply handle.
+// ResponseWriter: the user-facing, fluent, version-agnostic reply handle
+// (C++17 token-only port).
 //
-// ResponseWriter holds a ResponseSink and forwards to it. Because the sink is
-// polymorphic and its write operations are awaitable, ResponseWriter has zero
-// protocol-version branching and its writes are safe from any thread (the
-// sink hops onto the connection executor internally).
+// ResponseWriter holds a ResponseSink and forwards to it. Every I/O operation is
+// an Asio initiating function taking an explicit completion token; the state
+// mutations (status/header/content_type/set_cookie/trailer) stay synchronous and
+// owner-only. The caller's token decides whether a failure is an error_code
+// value (callback / as_tuple / redirect_error) or an exception (use_awaitable).
 //
 // Two usage modes:
-//   one-shot:  co_await res.status(status::ok).header("k","v").send("body");
-//   streaming: co_await res.status(status::ok).begin();
-//              co_await res.write("chunk"); ...; co_await res.finish();
+//   one-shot:  res.async_send("body", token);
+//   streaming: res.async_begin(token); res.async_write(chunk, token); ...
+//
+// Multi-step operations (send with trailers, finish with trailers) are written
+// as asio::async_compose state machines so the associated executor / allocator /
+// cancellation slot survives every intermediate sink call.
 
 #include <atomic>
-#include <boost/asio/awaitable.hpp>
+#include <boost/asio/any_completion_handler.hpp>
+#include <boost/asio/any_io_executor.hpp>
+#include <boost/asio/compose.hpp>
 #include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 
 #include "../core/http_field.h"
@@ -47,29 +55,10 @@ class ResponseWriter {
         m_status = code;
         return *this;
     }
-    // The status code this response will be — or was — sent with. A middleware
-    // reads it in its after-phase (after `co_await next(...)` resumed) to see
-    // what the handler or the router's built-in replies ended on.
     int status() const { return m_status; }
-    // Whether the response head has already gone out (send()/begin()/
-    // send_bodyless() was called). A middleware uses this to decide whether it
-    // can still substitute its own reply — before it starts it can, after it
-    // starts the only honest action is close(). It is the same ResponseWriter
-    // object all the way down the chain, so the flag the handler sets is what a
-    // middleware observes.
     bool started() const { return m_started; }
-    // A monotonic counter bumped at the start of every write. A middleware reads
-    // it to observe response progress without a callback — e.g. an idle timeout
-    // polls it and resets its deadline when it advances. Cheap (a relaxed atomic)
-    // and safe from any thread.
     [[nodiscard]] std::uint64_t activity() const noexcept { return m_activity.load(std::memory_order_relaxed); }
     ResponseWriter &header(std::string_view name, std::string value) {
-        // A field name or value carrying CR/LF/NUL would splice arbitrary bytes
-        // into the head — response splitting, and this library's own reverse proxy
-        // is exactly the kind of intermediary that turns it into a real attack.
-        // HTTP/2 already refuses the whole stream for it; enforcing that only
-        // there made the same handler code safe on one protocol and dangerous on
-        // the other, so it is enforced once, here, at the boundary that writes.
         if (contains_ctl(name) || contains_ctl(value)) {
             SIMPLE_HTTP_ERROR_LOG("response field with CR/LF/NUL rejected");
             m_field_rejected = true;
@@ -79,10 +68,6 @@ class ResponseWriter {
         return *this;
     }
 
-    // Replaces every field with `name` (the last set wins) instead of appending
-    // a duplicate — the override a middleware-provided default (security
-    // headers, CORS Vary) needs from a handler: `res->replace_header(field::x_frame_options, "SAMEORIGIN")`.
-    // Like header(), a CR/LF/NUL in either part refuses the whole field.
     ResponseWriter &replace_header(std::string_view name, std::string value) {
         if (contains_ctl(name) || contains_ctl(value)) {
             SIMPLE_HTTP_ERROR_LOG("response field with CR/LF/NUL rejected");
@@ -95,10 +80,6 @@ class ResponseWriter {
     }
     ResponseWriter &content_type(std::string_view ct) { return header("content-type", std::string{ct}); }
 
-    // Builds and adds one Set-Cookie header (RFC 6265), returning *this for
-    // chaining. A value containing characters the cookie grammar does not allow
-    // (;, ,, space, quote, backslash) is quoted with "...", mirroring Go's
-    // http.SetCookie. SameSite takes "Lax" / "Strict" / "None".
     ResponseWriter &set_cookie(std::string name, std::string value, std::chrono::seconds max_age = {},
                                std::string path = {}, std::string domain = {}, bool secure = false,
                                bool http_only = false, std::string same_site = {}) {
@@ -141,107 +122,86 @@ class ResponseWriter {
     }
 
     // --- one-shot ---
-    [[nodiscard]] asio::awaitable<error_code> send(std::string body = {}) {
-        if (m_field_rejected) {
-            co_return make_error_code(asio::error::invalid_argument);
-        }
-        // A response has exactly one head. Refusing a second one here is what
-        // lets invoke_handler's 500 fallback check started() instead of
-        // splicing a second status line onto the wire.
-        if (m_started) {
-            co_return make_error_code(asio::error::invalid_argument);
-        }
-        note_activity();
-        apply_defaults();
-        m_started = true;
-        // 204/304 carry no content, so nothing follows the header block (RFC
-        // 9110 §15.3.5/§15.4.5) - and there is nowhere for a trailer section
-        // either. h1 already routed these to send_bodyless() inside its own
-        // send(); doing it here gives h2/h3 the same rule (they used to emit the
-        // body as DATA when a handler passed one).
-        if (m_status == status::no_content || m_status == status::not_modified) {
-            co_return co_await m_writer->send_bodyless(m_status, std::move(m_headers));
-        }
-        if (!m_trailers.empty()) {
-            // A response to HEAD has no body and therefore no trailer section,
-            // but it should still carry the Content-Length a GET would have
-            // produced. HTTP/1.0 has no chunked framing to hang a trailer
-            // section on either. Both keep the one-shot framing (and its known
-            // length) and drop the fields instead of switching to a streamed
-            // response that would have to be close-delimited.
-            if (m_writer->head_request() || m_writer->version() == Version::Http1) {
-                co_return co_await m_writer->send(m_status, std::move(m_headers), std::move(body));
-            }
-            // A response carrying trailers cannot be one-shot: the fields follow
-            // the body, so it is framed as a stream (chunked on HTTP/1.x) and
-            // closed by the trailer section. `send()` on a trailer-less response
-            // keeps the one-shot framing (a known Content-Length on HTTP/1.x).
-            co_return co_await send_stream(std::move(body), std::move(m_trailers));
-        }
-        co_return co_await m_writer->send(m_status, std::move(m_headers), std::move(body));
+
+    // Completion signature: void(error_code).
+    template <typename Token> auto async_send(Token &&token) {
+        return async_send(std::string{}, std::forward<Token>(token));
     }
 
-    // Status + headers with no body and no body framing at all (204/304 and every
-    // response to HEAD): the client sees the response end at the header block.
-    [[nodiscard]] asio::awaitable<error_code> send_bodyless() {
-        if (m_field_rejected) {
-            co_return make_error_code(asio::error::invalid_argument);
+    template <typename Token> auto async_send(std::string body, Token &&token) {
+        error_code pre = prepare_one_shot();
+        Mode mode = Mode::Direct;
+        if (!pre) {
+            if (m_status == status::no_content || m_status == status::not_modified) {
+                mode = Mode::Bodyless;
+            } else if (!m_trailers.empty() && !m_writer->head_request() && m_writer->version() != Version::Http1) {
+                // A response carrying trailers cannot be one-shot: the fields
+                // follow the body, so it is framed as a stream (chunked on
+                // HTTP/1.x) and closed by the trailer section. A HEAD response
+                // or an HTTP/1.0 peer keeps the one-shot framing and drops the
+                // fields instead.
+                mode = Mode::Stream;
+            }
         }
-        note_activity();
-        apply_defaults();
-        m_started = true;
-        co_return co_await m_writer->send_bodyless(m_status, std::move(m_headers));
+        return compose_send(pre, mode, std::move(body), std::forward<Token>(token));
+    }
+
+    // Status + headers with no body and no body framing at all (204/304 and
+    // every response to HEAD).
+    template <typename Token> auto async_send_bodyless(Token &&token) {
+        error_code pre = prepare_one_shot(false);
+        return compose_send(pre, Mode::Bodyless, std::string{}, std::forward<Token>(token));
     }
 
     // --- streaming ---
-    [[nodiscard]] asio::awaitable<error_code> begin() {
-        if (m_field_rejected) {
-            co_return make_error_code(asio::error::invalid_argument);
-        }
-        note_activity();
-        apply_defaults();
-        m_started = true;
-        co_return co_await m_writer->send_headers(m_status, std::move(m_headers));
+    template <typename Token> auto async_begin(Token &&token) {
+        error_code pre = prepare_one_shot(false);
+        auto sink = m_writer;
+        const int code = m_status;
+        auto headers = std::move(m_headers);
+        return compose_one(pre, sink->get_executor(), std::forward<Token>(token),
+                           [sink, code, headers = std::move(headers)](WriteCompletion done) mutable {
+                               sink->send_headers(code, std::move(headers), std::move(done));
+                           });
     }
 
-    // Sends an interim 1xx response (100 Continue) so a client that sent
-    // `Expect: 100-continue` starts uploading. HTTP/1.x writes it to the wire;
-    // HTTP/2 and HTTP/3 have no equivalent here and report success without
-    // writing. The engine never sends one on its own: a handler that accepts
-    // the upload asks for it here, then reads the body. (HTTP/1.x still closes
-    // the connection after any response that leaves the body unread.)
-    [[nodiscard]] asio::awaitable<error_code> send_continue() {
+    // Sends an interim 1xx response (100 Continue).
+    template <typename Token> auto async_send_continue(Token &&token) {
         note_activity();
-        co_return co_await m_writer->send_continue();
+        auto sink = m_writer;
+        return compose_one(error_code{}, sink->get_executor(), std::forward<Token>(token),
+                           [sink](WriteCompletion done) mutable { sink->send_continue(std::move(done)); });
     }
-    [[nodiscard]] asio::awaitable<error_code> write(std::string data) {
+
+    template <typename Token> auto async_write(std::string data, Token &&token) {
         note_activity();
-        return m_writer->send_chunk(std::move(data));
+        auto sink = m_writer;
+        return compose_one(error_code{}, sink->get_executor(), std::forward<Token>(token),
+                           [sink, data = std::move(data)](WriteCompletion done) mutable {
+                               sink->send_chunk(std::move(data), std::move(done));
+                           });
     }
-    [[nodiscard]] asio::awaitable<error_code> finish(std::string data = {}) {
+
+    template <typename Token> auto async_finish(Token &&token) {
+        return async_finish(std::string{}, std::forward<Token>(token));
+    }
+
+    template <typename Token> auto async_finish(std::string data, Token &&token) {
         note_activity();
+        auto sink = m_writer;
         // Trailer fields accumulated with trailer() end the response instead of
-        // the final body chunk, so a `finish()` after them still emits them. The
-        // response head already went out in begin(), so any final body bytes go
-        // out as an ordinary chunk and the trailer section closes the stream.
+        // the final body chunk, so a finish() after them still emits them.
         if (!m_trailers.empty()) {
-            if (!data.empty()) {
-                if (auto ec = co_await m_writer->send_chunk(std::move(data)); ec) {
-                    co_return ec;
-                }
-            }
-            co_return co_await m_writer->send_trailers(std::move(m_trailers));
+            const error_code pre = m_field_rejected ? make_error_code(asio::error::invalid_argument) : error_code{};
+            auto trailers = std::move(m_trailers);
+            return compose_finish_trailers(pre, std::move(data), std::move(trailers), sink, std::forward<Token>(token));
         }
-        co_return co_await m_writer->send_last(std::move(data));
+        return compose_one(error_code{}, sink->get_executor(), std::forward<Token>(token),
+                           [sink, data = std::move(data)](WriteCompletion done) mutable {
+                               sink->send_last(std::move(data), std::move(done));
+                           });
     }
 
-    // Accumulates one trailer field (RFC 9110 §6.5), sent when the response ends
-    // via finish() or finish_trailers(). Trailer fields must not be pseudo-headers
-    // or framing headers; a CR/LF/NUL is refused exactly as it is for header().
-    //   co_await res->status(status::ok).begin();
-    //   co_await res->write(chunk);
-    //   res->trailer("server-timing", "db;dur=53");
-    //   co_await res->finish();
     ResponseWriter &trailer(std::string_view name, std::string value) {
         if (contains_ctl(name) || contains_ctl(value)) {
             SIMPLE_HTTP_ERROR_LOG("response trailer with CR/LF/NUL rejected");
@@ -255,77 +215,139 @@ class ResponseWriter {
     bool has_trailers() const { return !m_trailers.empty(); }
 
     // Ends a streamed response with the given trailing field section, replacing
-    // the final finish(). Available even when no trailer() was accumulated.
-    [[nodiscard]] asio::awaitable<error_code> finish_trailers(Headers trailers) {
-        if (m_field_rejected) {
-            co_return make_error_code(asio::error::invalid_argument);
-        }
-        // Same boundary rule as trailer(name, value): a CR/LF/NUL in either
-        // part would splice bytes into the trailer section and split the
-        // response. The bulk overload used to skip this check entirely.
+    // the final finish(). Completion signature: void(error_code).
+    template <typename Token> auto async_finish_trailers(Headers trailers, Token &&token) {
         for (const auto &[name, value] : trailers) {
             if (contains_ctl(name) || contains_ctl(value)) {
                 SIMPLE_HTTP_ERROR_LOG("response trailer with CR/LF/NUL rejected");
                 m_field_rejected = true;
-                co_return make_error_code(asio::error::invalid_argument);
+                break;
             }
         }
         note_activity();
-        co_return co_await m_writer->send_trailers(std::move(trailers));
+        auto sink = m_writer;
+        const error_code pre = m_field_rejected ? make_error_code(asio::error::invalid_argument) : error_code{};
+        return compose_finish_trailers(pre, std::string{}, std::move(trailers), sink, std::forward<Token>(token));
     }
-    // Ends a streamed response with the fields accumulated by trailer().
-    [[nodiscard]] asio::awaitable<error_code> finish_trailers() { return finish_trailers(std::move(m_trailers)); }
+
+    template <typename Token> auto async_finish_trailers(Token &&token) {
+        return async_finish_trailers(std::move(m_trailers), std::forward<Token>(token));
+    }
 
     // --- connection state ---
-    // Both hop onto the connection executor inside the writer, like the writes.
-    [[nodiscard]] asio::awaitable<bool> connected() const { return m_writer->connected(); }
-    [[nodiscard]] asio::awaitable<void> close() { return m_writer->close(); }
+    template <typename Token> auto async_connected(Token &&token) const {
+        auto sink = m_writer;
+        return compose_connected(sink->get_executor(), std::forward<Token>(token),
+                                 [sink](ConnectedCompletion done) { sink->connected(std::move(done)); });
+    }
+
+    template <typename Token> auto async_close(Token &&token) {
+        auto sink = m_writer;
+        return compose_one(error_code{}, sink->get_executor(), std::forward<Token>(token),
+                           [sink](WriteCompletion done) mutable { sink->close(std::move(done)); });
+    }
+
     Version version() const { return m_writer->version(); }
 
     // --- redirect & SSE helpers ---
 
-    // Fluent redirect: sets `Location` and the status (302 Found by default —
-    // status::see_other for a POST→GET transition, status::permanent_redirect
-    // for a moved-forever). The Location header goes through header(), so a
-    // CR/LF/NUL injection is refused there, not emitted. Use with .send(""):
-    //   co_await res->redirect("/login").send("");
     ResponseWriter &redirect(std::string location, int code = status::found) {
         m_status = code;
         return header(field::location, std::move(location));
     }
 
-    // Server-Sent Events (SSE, text/event-stream): a thin stream wrapper.
-    //   co_await res->status(status::ok).sse_begin();
-    //   co_await res->sse_event("hello");               // data: hello\n\n
-    //   co_await res->sse_event("l1\nl2");              // two data: lines, one event
-    //   co_await res->sse_event("payload", "update", "42", ""); // + event: and id:
-    //   co_await res->sse_comment("keepalive");         // : keepalive\n\n
-    // The connection stays open (h1 chunked / h2 DATA frames) until the handler
-    // returns or the client goes away; returning without finish() leaves the
-    // stream half-open, which the engine closes as part of cleanup.
-    [[nodiscard]] asio::awaitable<error_code> sse_begin() {
+    template <typename Token> auto async_sse_begin(Token &&token) {
         header(field::content_type, "text/event-stream; charset=utf-8");
         header("cache-control", "no-cache");
-        return begin();
+        return async_begin(std::forward<Token>(token));
     }
-    [[nodiscard]] asio::awaitable<error_code> sse_event(std::string data, std::string event = {}, std::string id = {},
-                                                        std::string retry = {}) {
-        return write(render_sse(data, event, id, retry));
+    template <typename Token>
+    auto async_sse_event(std::string data, std::string event, std::string id, std::string retry, Token &&token) {
+        return async_write(render_sse(data, event, id, retry), std::forward<Token>(token));
     }
-    [[nodiscard]] asio::awaitable<error_code> sse_comment(std::string text) {
-        return write(": " + std::move(text) + "\n\n");
+    template <typename Token> auto async_sse_event(std::string data, Token &&token) {
+        return async_sse_event(std::move(data), {}, {}, {}, std::forward<Token>(token));
+    }
+    template <typename Token> auto async_sse_comment(std::string text, Token &&token) {
+        return async_write(": " + std::move(text) + "\n\n", std::forward<Token>(token));
     }
 
     ResponseSink &writer() { return *m_writer; }
-
-    // The accumulated response fields. The WebSocket upgrade path reads this to
-    // fold middleware-set headers into the 101 handshake.
     const Headers &headers() const { return m_headers; }
 
+    // A sink operation adapter used by the connect/close/one-shot helpers. The
+    // token's associated properties are carried by `composed` (the async_compose
+    // handler), which is wrapped into any_completion_handler at the sink edge.
+    template <typename Token, typename Fn>
+    static auto compose_one(error_code pre, asio::any_io_executor ex, Token &&token, Fn &&fn) {
+        // Keep a copy for async_compose's I/O object: moving `ex` into the
+        // composed operation would leave this argument empty, and the two
+        // arguments are evaluated in an unspecified order (a moved-from
+        // any_io_executor throws bad_executor when the work guard is built).
+        auto executor = ex;
+        return asio::async_compose<Token, void(error_code)>(
+            OneOp<std::decay_t<Fn>>{pre, std::forward<Fn>(fn), std::move(ex)}, token, executor);
+    }
+
+    template <typename Token, typename Fn>
+    static auto compose_connected(asio::any_io_executor ex, Token &&token, Fn &&fn) {
+        auto executor = ex;
+        return asio::async_compose<Token, void(error_code, bool)>(
+            ConnectedOp<std::decay_t<Fn>>{std::forward<Fn>(fn), std::move(ex)}, token, executor);
+    }
+
   private:
+    enum class Mode { Direct, Bodyless, Stream };
+    enum class Phase { Start, Headers, Chunk, Trailers, Final };
+
+    // Synchronous pre-flight shared by send/send_bodyless/begin: field
+    // rejection, single-head rule, defaults and the activity counter.
+    error_code prepare_one_shot(bool require_first_head = true) {
+        if (m_field_rejected) {
+            return make_error_code(asio::error::invalid_argument);
+        }
+        // A response has exactly one head. Refusing a second one here is what
+        // lets invoke_handler's 500 fallback check started() instead of
+        // splicing a second status line onto the wire. send_bodyless()/begin()
+        // keep the historical shape: they only set the flag.
+        if (require_first_head && m_started) {
+            return make_error_code(asio::error::invalid_argument);
+        }
+        note_activity();
+        apply_defaults();
+        m_started = true;
+        return {};
+    }
+
+    template <typename Token> auto compose_send(error_code pre, Mode mode, std::string body, Token &&token) {
+        auto state = std::make_shared<SendState>();
+        state->pre = pre;
+        state->mode = mode;
+        state->sink = m_writer;
+        state->status = m_status;
+        state->headers = std::move(m_headers);
+        state->body = std::move(body);
+        if (mode == Mode::Stream) {
+            state->trailers = std::move(m_trailers);
+        }
+        auto ex = state->sink->get_executor();
+        return asio::async_compose<Token, void(error_code)>(SendOp{std::move(state)}, token, ex);
+    }
+
+    template <typename Token>
+    auto compose_finish_trailers(error_code pre, std::string data, Headers trailers, std::shared_ptr<ResponseSink> sink,
+                                 Token &&token) {
+        auto state = std::make_shared<FinishTrailersState>();
+        state->pre = pre;
+        state->sink = std::move(sink);
+        state->data = std::move(data);
+        state->trailers = std::move(trailers);
+        auto ex = state->sink->get_executor();
+        return asio::async_compose<Token, void(error_code)>(FinishTrailersOp{std::move(state)}, token, ex);
+    }
+
     // Renders one SSE event frame: optional event/id/retry fields, then one
-    // "data: " line per line of `data` (so multi-line payloads stay one event
-    // for the client), closed by a blank line.
+    // "data: " line per line of `data`, closed by a blank line.
     static std::string render_sse(std::string_view data, std::string_view event, std::string_view id,
                                   std::string_view retry) {
         std::string frame;
@@ -358,34 +380,12 @@ class ResponseWriter {
         frame += '\n';
         return frame;
     }
-    // Frames a one-shot response whose end is a trailer section: headers
-    // (chunked on HTTP/1.x), an optional body chunk, then the trailers. Only for
-    // send(), where the head has not gone out yet; the streaming finish() path
-    // has already sent its head in begin().
-    [[nodiscard]] asio::awaitable<error_code> send_stream(std::string body, Headers trailers) {
-        if (auto ec = co_await m_writer->send_headers(m_status, std::move(m_headers)); ec) {
-            co_return ec;
-        }
-        if (!body.empty()) {
-            if (auto ec = co_await m_writer->send_chunk(std::move(body)); ec) {
-                co_return ec;
-            }
-        }
-        co_return co_await m_writer->send_trailers(std::move(trailers));
-    }
 
     // Fill in Date, Server and Content-Type if the handler did not set them.
-    //
-    // Date is not cosmetic: RFC 9110 §6.6.1 requires an origin server to send it
-    // on every response except the 1xx/5xx cases it exempts, and caches use it
-    // for freshness/age calculations. The static-file layer already set it by
-    // hand; doing it here makes the guarantee hold for every route and every
-    // protocol (h1/h2/h3 all go through this ResponseWriter).
     void apply_defaults() {
         ensure_date(m_headers);
         // 204/304 carry no content, so a default Content-Type would describe
-        // something that does not exist (RFC 9110 §15.3.5/§15.4.5). A handler
-        // that set one explicitly still gets it.
+        // something that does not exist (RFC 9110 §15.3.5/§15.4.5).
         if (m_status != status::no_content && m_status != status::not_modified && !m_headers.contains("content-type")) {
             m_headers.add_lower("content-type", "text/plain");
         }
@@ -394,18 +394,173 @@ class ResponseWriter {
         }
     }
 
+    template <typename Fn> struct OneOp {
+        error_code pre;
+        Fn fn;
+        asio::any_io_executor ex;
+        bool started{false};
+
+        asio::any_io_executor get_executor() const noexcept { return ex; }
+
+        template <typename Self> void operator()(Self &self, error_code ec = {}) {
+            if (!started) {
+                started = true;
+                if (pre) {
+                    self.complete(pre);
+                    return;
+                }
+                auto action = std::move(fn);
+                action(WriteCompletion(std::move(self)));
+                return;
+            }
+            self.complete(ec);
+        }
+    };
+
+    template <typename Fn> struct ConnectedOp {
+        Fn fn;
+        asio::any_io_executor ex;
+        bool started{false};
+
+        asio::any_io_executor get_executor() const noexcept { return ex; }
+
+        template <typename Self> void operator()(Self &self, error_code ec = {}, bool value = false) {
+            if (!started) {
+                started = true;
+                auto action = std::move(fn);
+                action(ConnectedCompletion(std::move(self)));
+                return;
+            }
+            self.complete(ec, value);
+        }
+    };
+
+    // Multi-step response operations keep their state behind a shared_ptr:
+    // async_compose moves the implementation into the completion handler when
+    // the next operation is started, so data stored directly in the operation
+    // would be moved-from exactly when the next step needs it.
+    struct SendState {
+        error_code pre;
+        Mode mode{Mode::Direct};
+        std::shared_ptr<ResponseSink> sink;
+        int status{0};
+        Headers headers;
+        std::string body;
+        Headers trailers;
+        Phase phase{Phase::Start};
+    };
+
+    struct SendOp {
+        std::shared_ptr<SendState> st;
+        bool started{false};
+
+        asio::any_io_executor get_executor() const noexcept { return st->sink->get_executor(); }
+
+        template <typename Self> void operator()(Self &self, error_code ec = {}) {
+            auto state = st; // keep the state alive across the move of `self`
+            if (!started) {
+                started = true;
+                if (state->pre) {
+                    self.complete(state->pre);
+                    return;
+                }
+                switch (state->mode) {
+                case Mode::Bodyless:
+                    state->phase = Phase::Final;
+                    state->sink->send_bodyless(state->status, std::move(state->headers),
+                                               WriteCompletion(std::move(self)));
+                    return;
+                case Mode::Direct:
+                    state->phase = Phase::Final;
+                    state->sink->send(state->status, std::move(state->headers), std::move(state->body),
+                                      WriteCompletion(std::move(self)));
+                    return;
+                case Mode::Stream:
+                    state->phase = Phase::Headers;
+                    state->sink->send_headers(state->status, std::move(state->headers),
+                                              WriteCompletion(std::move(self)));
+                    return;
+                }
+                return;
+            }
+            if (ec) {
+                self.complete(ec);
+                return;
+            }
+            switch (state->phase) {
+            case Phase::Headers:
+                if (!state->body.empty()) {
+                    state->phase = Phase::Chunk;
+                    state->sink->send_chunk(std::move(state->body), WriteCompletion(std::move(self)));
+                    return;
+                }
+                state->phase = Phase::Trailers;
+                state->sink->send_trailers(std::move(state->trailers), WriteCompletion(std::move(self)));
+                return;
+            case Phase::Chunk:
+                state->phase = Phase::Trailers;
+                state->sink->send_trailers(std::move(state->trailers), WriteCompletion(std::move(self)));
+                return;
+            case Phase::Final:
+            case Phase::Trailers:
+            case Phase::Start:
+            default:
+                self.complete(error_code{});
+                return;
+            }
+        }
+    };
+
+    struct FinishTrailersState {
+        error_code pre;
+        std::shared_ptr<ResponseSink> sink;
+        std::string data;
+        Headers trailers;
+        Phase phase{Phase::Start};
+    };
+
+    struct FinishTrailersOp {
+        std::shared_ptr<FinishTrailersState> st;
+        bool started{false};
+
+        asio::any_io_executor get_executor() const noexcept { return st->sink->get_executor(); }
+
+        template <typename Self> void operator()(Self &self, error_code ec = {}) {
+            auto state = st;
+            if (!started) {
+                started = true;
+                if (state->pre) {
+                    self.complete(state->pre);
+                    return;
+                }
+                if (!state->data.empty()) {
+                    state->phase = Phase::Chunk;
+                    state->sink->send_chunk(std::move(state->data), WriteCompletion(std::move(self)));
+                    return;
+                }
+                state->phase = Phase::Trailers;
+                state->sink->send_trailers(std::move(state->trailers), WriteCompletion(std::move(self)));
+                return;
+            }
+            if (ec) {
+                self.complete(ec);
+                return;
+            }
+            if (state->phase == Phase::Chunk) {
+                state->phase = Phase::Trailers;
+                state->sink->send_trailers(std::move(state->trailers), WriteCompletion(std::move(self)));
+                return;
+            }
+            self.complete(error_code{});
+        }
+    };
+
     std::shared_ptr<ResponseSink> m_writer;
     int m_status{status::ok};
     Headers m_headers;
-    // Trailer fields accumulated with trailer(); sent by finish()/finish_trailers().
     Headers m_trailers;
-    // Set when header() refused a field; the response is then not sent at all.
-    // Emitting the rest would put a head on the wire that the handler did not
-    // intend — and the whole point of rejecting at header() was to not do that.
     bool m_field_rejected{false};
-    // Set once the head has gone out (see started()).
     bool m_started{false};
-    // Bumped by note_activity() at the start of every write (see activity()).
     std::atomic<std::uint64_t> m_activity{0};
 
     void note_activity() { m_activity.fetch_add(1, std::memory_order_relaxed); }

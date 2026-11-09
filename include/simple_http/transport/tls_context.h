@@ -10,17 +10,17 @@
 #include <openssl/ssl.h>
 
 #include <boost/asio/ssl.hpp>
+#include <boost/core/span.hpp>
 #include <cstdint>
 #include <filesystem>
-#include <format>
 #include <functional>
 #include <optional>
-#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "../core/format.h"
 #include "../core/logging.h"
 #include "../core/tls_version.h" // TlsMinVersion
 #include "../core/types.h"       // error_code: used below, and this header must stand alone
@@ -55,7 +55,7 @@ inline const std::vector<unsigned char> &alpn_wire_list() {
 
 // TLS wire format for an explicit protocol list, in preference order. An
 // empty span means "use alpn_wire_list()" (the historical h2 + http/1.1 set).
-inline std::vector<unsigned char> make_alpn_wire_list(std::span<const std::string_view> protocols) {
+inline std::vector<unsigned char> make_alpn_wire_list(boost::span<const std::string_view> protocols) {
     std::vector<unsigned char> out;
     std::size_t bytes = 0;
     for (auto protocol : protocols)
@@ -75,7 +75,7 @@ class TlsContext {
     // `alpn` overrides the advertised protocol list. The listener policy
     // (`TlsHttp`) is translated here, so a listener configured as
     // HTTP/1.1-only really offers http/1.1 and no h2.
-    explicit TlsContext(const TlsConfig &cfg, std::span<const std::string_view> alpn = {})
+    explicit TlsContext(const TlsConfig &cfg, boost::span<const std::string_view> alpn = {})
         : m_ctx(context_method(cfg)) {
         if (cfg.min_version == TlsMinVersion::Tls12) {
             // tls_server spans 1.2/1.3; pin the floor so 1.0/1.1 remain off.
@@ -103,12 +103,12 @@ class TlsContext {
         return std::filesystem::is_regular_file(path, ec) && !ec;
     }
 
-    void configure(const TlsConfig &cfg, std::span<const std::string_view> alpn) {
+    void configure(const TlsConfig &cfg, boost::span<const std::string_view> alpn) {
         if (!is_regular_file(cfg.cert_chain_file)) {
-            throw std::runtime_error(std::format("TLS certificate not found: {}", cfg.cert_chain_file));
+            throw std::runtime_error(simple_http::format("TLS certificate not found: {}", cfg.cert_chain_file));
         }
         if (!is_regular_file(cfg.private_key_file)) {
-            throw std::runtime_error(std::format("TLS private key not found: {}", cfg.private_key_file));
+            throw std::runtime_error(simple_http::format("TLS private key not found: {}", cfg.private_key_file));
         }
 
         // Version policy is expressed by the context flavour chosen in the
@@ -138,17 +138,17 @@ class TlsContext {
         error_code ec;
         m_ctx.use_certificate_chain_file(cfg.cert_chain_file, ec);
         if (ec) {
-            throw std::runtime_error(std::format("use_certificate_chain_file: {}", ec.message()));
+            throw std::runtime_error(simple_http::format("use_certificate_chain_file: {}", ec.message()));
         }
         m_ctx.use_private_key_file(cfg.private_key_file, asio::ssl::context::pem, ec);
         if (ec) {
-            throw std::runtime_error(std::format("use_private_key_file: {}", ec.message()));
+            throw std::runtime_error(simple_http::format("use_private_key_file: {}", ec.message()));
         }
 
         install_alpn(alpn);
     }
 
-    void install_alpn(std::span<const std::string_view> alpn) {
+    void install_alpn(boost::span<const std::string_view> alpn) {
         m_alpn = alpn.empty() ? alpn_wire_list() : make_alpn_wire_list(alpn);
         SSL_CTX_set_alpn_select_cb(
             m_ctx.native_handle(),

@@ -73,9 +73,9 @@ RequestPtr make_request(asio::io_context &ctx, std::string path, Method method =
 
 std::shared_ptr<FakeResponseSink> dispatch(asio::io_context &ctx, Router &router, const std::string &path,
                                            Method method = Method::Get) {
-    auto writer = std::make_shared<FakeResponseSink>();
+    auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
     auto res = std::make_shared<ResponseWriter>(writer);
-    REQUIRE(run_on(ctx, router.dispatch(make_request(ctx, path, method), res, std::nullopt)));
+    REQUIRE(run_on(ctx, await_dispatch(router, make_request(ctx, path, method), res)));
     return writer;
 }
 
@@ -128,12 +128,12 @@ TEST_CASE("openapi: routes carrying operation descriptors register and collect s
     Router router;
     router.route(
         {Method::Get}, "/users/{id}",
-        [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(status::ok).send("user"); },
+        [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(status::ok).async_send("user", asio::use_awaitable); },
         openapi::doc().response<UserProfile>());
     router.route(
         {Method::Post}, "/users",
         [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-            co_await res->status(status::created).send("created");
+            co_await res->status(status::created).async_send("created", asio::use_awaitable);
         },
         openapi::doc()
             .request_body<CreateUserReq>()
@@ -243,7 +243,7 @@ TEST_CASE("openapi: document and Swagger UI are served", "[openapi]") {
     Router router;
     router.route(
         {Method::Get}, "/users/{id}",
-        [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(status::ok).send("user"); },
+        [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(status::ok).async_send("user", asio::use_awaitable); },
         openapi::doc().response<UserProfile>());
     router.serve_openapi("/openapi.json");
     router.serve_swagger_ui("/swagger", "/openapi.json");

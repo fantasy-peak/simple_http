@@ -1,247 +1,433 @@
 #pragma once
 
-// The public client API, flat in `simple_http::` — a single surface modelled on
-// Go net/http and Rust reqwest (with hyper/tokio on the explicit-stream side):
+// Public outbound client API (C++17 token-only port).
 //
-//   借用 Go / reqwest：连接不可见（Client 内部管池/复用/重试/重定向/Cookie），
-//   请求用 RequestBuilder 链式构造（query 自动编码、basic/bearer auth、json body），
-//   响应对象可 error_for_status()/text()/json<T>()，body() 是统一读流（Go resp.Body）。
-//   借用 hyper/tokio：Stream 是一条双向流（写端=请求体、读端=响应体；h2 可交织），
-//   send_stream()/open_stream() 是它的入口；客户端 WebSocket（open_websocket）也
-//   从这里长出。
+//   client.get(url).header("x", "y").send(token);       // void(error_code, Response)
+//   client.post(url).body(payload).send(token);
+//   client.open_stream(url, spec, token);               // void(error_code, Stream)
 //
-//   client.get(url).query({{"page","2"}}).basic_auth(u,p).send();  // → expected<Response, error_code>
-//   client.send(shared_ptr<Request>)   // Go http.Client.Do —— Request 两端共用
-//   client.open_websocket("ws://host") // → shared_ptr<WebSocket>（复用服务端句柄）
-//   auto up = co_await client.open_stream(url, {.method=Method::Post});
-//   co_await up->write(chunk); … co_await up->finish();
-//   auto head = co_await up->read_head(); while (auto c = co_await up->read()) …;
-//
-// 便捷 send() 复用既有的、经过验证的便捷层（重定向/连接重试/Cookie jar/h2c/
-// 自动解压都在里面），因此它是"缓冲投递"（Response 已持有 body）；显式
-// open_stream() 是全流式新管道（Stream 上写与读自行驱动）。两条路径共享同一
-// 底层会话内核（detail::ClientEngine；h1 半双工时序、h2 独立收发队列 + 双窗口/水位）。
+// This first port covers HTTP/1.1 (plaintext and TLS), redirects, cookies and
+// the buffered convenience path. HTTP/2 multiplexing, outbound proxies,
+// automatic decompression and the WebSocket client are the next phases; the
+// types keep their shape so callers can migrate incrementally.
 
 #include <algorithm>
-#include <charconv>
+#include <boost/asio.hpp>
+#include <boost/asio/any_completion_handler.hpp>
+#include <boost/asio/any_io_executor.hpp>
+#include <boost/asio/async_result.hpp>
+#include <boost/asio/cancel_after.hpp>
+#include <boost/asio/ssl.hpp>
 #include <chrono>
-#include <expected>
-#include <initializer_list>
+#include <cstdio>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
-#include <type_traits>
 #include <utility>
-#include <vector>
 
-#include <glaze/glaze.hpp>
-
-#include "../core/base64.h" // basic_auth
-#include "../core/http_date.h"
+#include "../core/base64.h"
+#include "../core/content_encoding.h"
 #include "../core/http_field.h"
 #include "../core/http_method.h"
 #include "../core/http_status.h"
-#include "../core/mime.h" // mime::app_json
+#include "../core/result.h"
 #include "../core/types.h"
-#include "../core/url_encoding.h" // query_escape
-#include "../proto/multipart.h"   // MultipartForm (client-side multipart body)
+#include "../core/url_encoding.h"
+#include "../proto/headers.h"
+#include "../proto/request.h"
+#include "../transport/tcp_transport.h"
+#include "../transport/tls_transport.h"
 #include "client_config.h"
+#include "client_stream.h"
 #include "cookie_jar.h"
-#include "http_client.h" // detail::ClientEngine — the connection engine
+#include "decompressing_stream.h"
+#include "h1_client.h"
+#include "h2_client.h"
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+#include "h3_client.h"
+#endif
+#include "proxy.h"
+#include "tls_client.h"
 #include "url.h"
-#include "ws_client.h" // WebSocketSpec / detail::ws_upgrade (open_websocket)
+#include "ws_client.h"
 
 namespace simple_http {
 
 namespace asio = boost::asio;
 
-// The layered deadline used by Stream: bounds one expected-returning awaitable
-// with a timer, reporting the given client_errc on timeout. limit <= 0 means no
-// bound, so a zero budget (the default) never triggers.
-// Builds and configures one client-side TLS context. Assign it to
-// TlsClientConfig::shared_context to share it across several Clients (an
-// SSL_CTX is reference-counted and thread-safe once fully configured). A
-// Client otherwise builds its own context from its TlsClientConfig.
-inline std::shared_ptr<asio::ssl::context> make_client_tls_context(const TlsClientConfig &cfg) {
-    return detail::make_client_ssl_context(cfg);
-}
-
 namespace detail {
-template <typename T>
-asio::awaitable<std::expected<T, error_code>> deadline(asio::awaitable<std::expected<T, error_code>> op,
-                                                       std::chrono::milliseconds limit, client_errc on_timeout) {
-    using namespace asio::experimental::awaitable_operators;
-    if (limit.count() <= 0) {
-        co_return co_await std::move(op);
-    }
-    auto timer_op = [limit]() -> asio::awaitable<void> {
-        asio::steady_timer timer{co_await asio::this_coro::executor};
-        timer.expires_after(limit);
-        co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
-    };
-    auto outcome = co_await (std::move(op) || timer_op());
-    if (auto *value = std::get_if<std::expected<T, error_code>>(&outcome)) {
-        co_return std::move(*value);
-    }
-    co_return std::unexpected{make_error_code(on_timeout)};
-}
+// Marks a request whose Accept-Encoding the client injected itself; only those
+// responses are eligible for transparent decompression (Go's Transport rule).
+struct AutoDecompressMark {};
 } // namespace detail
 
-// --- request-level knobs for the explicit stream path -------------------------
+// --- buffered response -------------------------------------------------------
+
+class Response {
+  public:
+    Response() = default;
+    // A buffered Response owns its bytes only. Keeping the (already finished)
+    // stream here pinned the whole h1/h2/h3 session alive for as long as the
+    // caller held the Response -- after Client::close() it was the last
+    // reference to a closed connection.
+    Response(detail::ResponseHead head, std::string body) : m_head(std::move(head)), m_body(std::move(body)) {}
+
+    int status() const { return m_head.status; }
+    Version version() const { return m_head.version; }
+    const Headers &headers() const { return m_head.headers; }
+    std::optional<std::string_view> header(std::string_view name) const { return m_head.header(name); }
+    std::optional<std::string> header_owned(std::string_view name) const {
+        auto value = m_head.header(name);
+        return value ? std::optional<std::string>{*value} : std::nullopt;
+    }
+    bool ok() const { return m_head.status >= 200 && m_head.status < 300; }
+    bool bodyless() const { return m_head.bodyless; }
+    bool uncompressed() const { return m_head.uncompressed; }
+
+    // 2xx -> empty error; anything else -> client_errc::http_status (the real
+    // status stays readable through status()).
+    error_code error_for_status() const { return ok() ? error_code{} : make_error_code(client_errc::http_status); }
+
+    const std::string &text() const { return m_body; }
+    const std::string &bytes() const { return m_body; }
+
+    // A Response is only produced by the buffered send() path, which has
+    // already drained the exchange into m_body. Completing from m_body here is
+    // the contract; walking m_stream would ask a finished exchange for more
+    // bytes (session_closed on h1, an empty EOF on h2/h3) and could even read
+    // the next response when the connection has been reused.
+    template <typename Token> auto async_read_all(std::size_t max_bytes, Token &&token) {
+        if (max_bytes != 0 && m_body.size() > max_bytes) {
+            return asio::async_initiate<Token, void(error_code, std::string)>(
+                [](auto handler) {
+                    std::move(handler)(make_error_code(client_errc::body_too_large), std::string{});
+                },
+                token);
+        }
+        return asio::async_initiate<Token, void(error_code, std::string)>(
+            [body = m_body](auto handler) mutable { std::move(handler)(error_code{}, std::move(body)); }, token);
+    }
+
+  private:
+    detail::ResponseHead m_head;
+    std::string m_body;
+};
+
+// --- explicit stream ---------------------------------------------------------
 
 struct StreamSpec {
     Method method{Method::Get};
-    // Path + query, in origin-form. Empty = the URL's own target.
-    std::string target;
+    std::string target; // path + query; empty = the URL's own target
     Headers headers;
     // Ask the peer to acknowledge before the body is sent (Expect:
-    // 100-continue). The interim 100 is delivered to the caller *as the head*
-    // of the exchange: read_head() returns status 100 (bodyless) once the peer
-    // agreed, and the caller then sends the body and reads again for the real
-    // response. If the peer answers with a final status instead (e.g. 417 or a
-    // 4xx that refuses the body), read_head() returns that and the caller
-    // should not write. So: `read_head()` first, then write only on a 100.
-    // (A caller that skips the read_head() and writes immediately makes the
-    // header pointless but does not hang.)
+    // 100-continue). The interim 100 is delivered to the caller as the head of
+    // the exchange: read_head() returns status 100 once the peer agreed, and the
+    // caller then sends the body and reads again for the real response.
     bool expect_100_continue{false};
-    // Request `Connection: close` (HTTP/1.1) / keep the connection out of the
-    // pool (any version): a one-shot request that must not be reused.
+    // Request Connection: close (HTTP/1.1) / keep the connection out of the pool.
     bool close{false};
     // Per-stream budgets. 0 = the Client's defaults.
     std::chrono::milliseconds response_head_timeout{};
     std::chrono::milliseconds body_idle_timeout{};
-    // Per-request version policy. Empty = the Client's default_version. Lets
-    // one Client speak h2 to one origin and h3 to another without giving up
-    // its single kept connection per origin (the policy is part of the
-    // connection key).
     std::optional<HttpVersionPolicy> version{};
-
-    // Automatic Expect: 100-continue. When true, the request carries the Expect
-    // header and the first write()/finish() waits up to continue_timeout for
-    // the interim 100. A 100 lets the body proceed; a final response makes
-    // write() return client_errc::expectation_failed (read the response with
-    // read_head()/read()); a timeout sends the body anyway, like Go. HTTP/1.1
-    // and HTTP/3 surface the interim response; HTTP/2 currently sends the body
-    // immediately.
+    // Automatic Expect: 100-continue: the request carries the header and the
+    // first write()/finish() waits up to continue_timeout for the interim 100.
     bool auto_expect_continue{false};
     std::chrono::milliseconds continue_timeout{1000};
 };
 
-// --- the explicit, full-duplex stream (hyper/tokio model) ---------------------
-//
-// One stream has a write end (the request body) and a read end (the response
-// head and body) on the same object. HTTP/1.1 is half-duplex by protocol: the
-// write end closes at finish() and the read end opens after; HTTP/2's separate
-// send/receive queues let them interleave. This is also the shape a future
-// WebSocket client grows from.
 class Stream {
   public:
-    // Constructed by the public client (open_stream / open_target); public so
-    // the stream can be owned via shared_ptr/make_shared.
+    // Constructed by the public client (open_stream). The budgets are captured
+    // here so each read/head is bounded independently of later config changes.
     explicit Stream(std::shared_ptr<detail::ClientStream> stream, std::chrono::milliseconds head_timeout = {},
                     std::chrono::milliseconds idle_timeout = {}, bool auto_expect_continue = false,
                     std::chrono::milliseconds continue_timeout = std::chrono::milliseconds{1000})
         : m_stream(std::move(stream)), m_head_timeout(head_timeout), m_idle_timeout(idle_timeout),
           m_auto_expect_continue(auto_expect_continue), m_continue_timeout(continue_timeout) {}
 
-    // --- write end: the request body ---
-    [[nodiscard]] asio::awaitable<error_code> write(std::string chunk) {
-        if (auto ec = co_await ensure_continue(); ec) {
-            co_return ec;
-        }
-        co_return co_await m_stream->write(std::move(chunk));
+    template <typename Token> auto async_write(std::string data, Token &&token) {
+        return start_write_op(std::move(data), false, {}, std::forward<Token>(token));
     }
-    // Ends the body; after this the write end is closed (h1: the read end
-    // opens; h2: END_STREAM is sent).
-    [[nodiscard]] asio::awaitable<error_code> finish(std::string last = {}) {
-        if (auto ec = co_await ensure_continue(); ec) {
-            co_return ec;
-        }
-        co_return co_await m_stream->finish(std::move(last));
+    template <typename Token> auto async_finish(std::string data, Token &&token) {
+        return start_write_op(std::move(data), true, {}, std::forward<Token>(token));
     }
-    // Ends a streamed body with request trailers (RFC 9110 §6.5). Set the
-    // request's `Trailer` header before opening the stream so a peer knows which
-    // fields to expect. HTTP/1.1 is implemented; HTTP/2/3 currently return
-    // client_errc::trailers_not_supported.
-    [[nodiscard]] asio::awaitable<error_code> finish_trailers(Headers trailers) {
-        if (auto ec = co_await ensure_continue(); ec) {
-            co_return ec;
-        }
-        co_return co_await m_stream->finish_trailers(std::move(trailers));
+    template <typename Token> auto async_finish_trailers(Headers trailers, Token &&token) {
+        return start_write_op(std::string{}, false, std::move(trailers), std::forward<Token>(token));
     }
 
-    // --- read end: the response ---
     // Bounded by the response-head (TTFB) budget: a slow service fails here as
     // client_errc::response_head_timeout, independently of body pace.
-    [[nodiscard]] asio::awaitable<std::expected<detail::ResponseHead, error_code>> read_head() {
-        return detail::deadline(m_stream->read_head(), m_head_timeout, client_errc::response_head_timeout);
+    template <typename Token> auto async_read_head(Token &&token) {
+        return read_head_with(m_head_timeout, std::forward<Token>(token));
     }
-    // Each read is bounded by the body-idle budget (silence between chunks);
-    // a download that keeps flowing is never cut off.
-    [[nodiscard]] asio::awaitable<std::expected<ReadResult, error_code>> read() {
-        return detail::deadline(m_stream->read(), m_idle_timeout, client_errc::body_idle_timeout);
+    // Each read is bounded by the body-idle budget (silence between chunks).
+    template <typename Token> auto async_read(Token &&token) {
+        return read_with(m_idle_timeout, std::forward<Token>(token));
     }
-    [[nodiscard]] asio::awaitable<std::expected<std::string, error_code>> read_all(std::size_t max_bytes = 0) {
-        return m_stream->read_all(max_bytes);
+    template <typename Token> auto async_read_all(std::size_t max_bytes, Token &&token) {
+        auto stream = m_stream;
+        return asio::async_initiate<Token, void(error_code, std::string)>(
+            [stream, max_bytes](auto handler) mutable { stream->async_read_all(max_bytes, std::move(handler)); },
+            token);
     }
-    // The head, once read_head() (or read()) has completed; default-constructed
-    // (status 0) before that.
     const detail::ResponseHead &head() const { return m_stream->head(); }
-    // Trailer fields received after the body (RFC 9110 §6.5), complete once
-    // read() reported end-of-body. Empty when the peer sent none.
-    [[nodiscard]] const Headers &trailers() const { return m_stream->response_trailers(); }
+    const Headers &trailers() const { return m_stream->response_trailers(); }
+    bool finished() const { return m_stream->finished(); }
 
-    Version version() const { return m_stream->version(); }
-
-    // Cancels the exchange: h2 resets the stream (and returns the window
-    // credit), h1 closes the connection.
-    [[nodiscard]] asio::awaitable<void> abort() {
-        (void)co_await m_stream->cancel();
-        // Release the engine's single-connection h1 gate now. Waiting for the
-        // destructor would let a caller that keeps this handle alive block every
-        // later request to the same origin on acquire() forever (the aborted
-        // session is dead, so the next request dials a new connection and then
-        // parks on a gate nobody holds).
+    // Cancels the exchange and releases the engine's single-connection gate
+    // now: waiting for the destructor would block later requests to the same
+    // origin on a gate nobody holds.
+    void abort() {
+        m_stream->async_cancel(asio::detached);
         m_stream->run_destroy_hook();
-        co_return;
     }
-
-  private:
-    friend class Client;
 
     // Automatic Expect: 100-continue, performed once before the first body
     // byte. A 100 means "go"; a final response is surfaced as
-    // expectation_failed and remains readable; a timed-out wait sends the body
-    // anyway (a peer that ignores Expect must not stall the upload).
-    [[nodiscard]] asio::awaitable<error_code> ensure_continue() {
-        if (!m_auto_expect_continue || m_continue_checked) {
-            co_return error_code{};
-        }
-        m_continue_checked = true;
-        // h1 and h2 surface the interim 100; h3 servers have no 1xx API, so the
-        // client sends the body without waiting.
-        if (m_stream->version() != Version::Http11 && m_stream->version() != Version::Http2) {
-            co_return error_code{};
-        }
-        auto head =
-            co_await detail::deadline(m_stream->read_head(), m_continue_timeout, client_errc::response_head_timeout);
-        if (!head) {
-            // No interim answer in time: proceed with the body, as Go's
-            // ExpectContinueTimeout does with a peer that ignores the header.
-            if (head.error() == make_error_code(client_errc::response_head_timeout)) {
-                co_return error_code{};
-            }
-            co_return head.error();
-        }
-        if (head->status == status::continue_) {
-            // The interim head was handed to us; the final response still
-            // follows, so the next read_head() must parse it.
-            m_stream->clear_head_cache();
-            co_return error_code{};
-        }
-        co_return make_error_code(client_errc::expectation_failed);
+    // expectation_failed; a timed-out wait sends the body anyway (Go's
+    // ExpectContinueTimeout behaviour for a peer that ignores the header).
+    template <typename Token> auto async_ensure_continue(Token &&token) {
+        return asio::async_compose<Token, void(error_code)>(EnsureContinueOp{*this}, token, m_stream->head_executor());
     }
+
+  private:
+    template <typename Token> auto start_write_op(std::string data, bool finish, Headers trailers, Token &&token) {
+        return asio::async_compose<Token, void(error_code)>(
+            WriteOp{*this, std::move(data), finish, std::move(trailers)}, token, m_stream->head_executor());
+    }
+
+    template <typename Token> auto read_head_with(std::chrono::milliseconds timeout, Token &&token) {
+        auto stream = m_stream;
+        return asio::async_initiate<Token, void(error_code, detail::ResponseHead)>(
+            [stream, timeout](auto handler) {
+                struct State {
+                    std::shared_ptr<detail::ClientStream> stream;
+                    std::chrono::milliseconds timeout;
+                    asio::any_completion_handler<void(error_code, detail::ResponseHead)> done;
+                    asio::steady_timer timer;
+                    asio::cancellation_signal signal;
+                    bool finished{false};
+                    bool timed_out{false};
+
+                    State(std::shared_ptr<detail::ClientStream> s, std::chrono::milliseconds t)
+                        : stream(std::move(s)), timeout(t), timer(stream->head_executor()) {}
+                };
+                auto state = std::make_shared<State>(stream, timeout);
+                state->done = std::move(handler);
+                auto finish = [state](error_code ec, detail::ResponseHead head) mutable {
+                    if (state->finished)
+                        return;
+                    state->finished = true;
+                    state->timer.cancel();
+                    std::move(state->done)(ec, std::move(head));
+                };
+                if (state->timeout.count() > 0) {
+                    state->timer.expires_after(state->timeout);
+                    state->timer.async_wait([state](error_code ec) mutable {
+                        if (ec || state->finished)
+                            return;
+                        state->timed_out = true;
+                        state->signal.emit(asio::cancellation_type::terminal);
+                    });
+                }
+                state->stream->async_read_head(asio::bind_cancellation_slot(
+                    state->signal.slot(), [state, finish](error_code ec, detail::ResponseHead head) mutable {
+                        if (ec == asio::error::operation_aborted && state->timed_out) {
+                            std::move(finish)(make_error_code(client_errc::response_head_timeout),
+                                              detail::ResponseHead{});
+                            return;
+                        }
+                        std::move(finish)(ec, std::move(head));
+                    }));
+            },
+            token);
+    }
+
+    template <typename Token> auto read_with(std::chrono::milliseconds timeout, Token &&token) {
+        auto stream = m_stream;
+        return asio::async_initiate<Token, void(error_code, ReadResult)>(
+            [stream, timeout](auto handler) {
+                struct State {
+                    std::shared_ptr<detail::ClientStream> stream;
+                    std::chrono::milliseconds timeout;
+                    asio::any_completion_handler<void(error_code, ReadResult)> done;
+                    asio::steady_timer timer;
+                    asio::cancellation_signal signal;
+                    bool finished{false};
+                    bool timed_out{false};
+
+                    State(std::shared_ptr<detail::ClientStream> s, std::chrono::milliseconds t)
+                        : stream(std::move(s)), timeout(t), timer(stream->head_executor()) {}
+                };
+                auto state = std::make_shared<State>(stream, timeout);
+                state->done = std::move(handler);
+                auto finish = [state](error_code ec, ReadResult result) mutable {
+                    if (state->finished)
+                        return;
+                    state->finished = true;
+                    state->timer.cancel();
+                    std::move(state->done)(ec, std::move(result));
+                };
+                if (state->timeout.count() > 0) {
+                    state->timer.expires_after(state->timeout);
+                    state->timer.async_wait([state](error_code ec) mutable {
+                        if (ec || state->finished)
+                            return;
+                        state->timed_out = true;
+                        state->signal.emit(asio::cancellation_type::terminal);
+                    });
+                }
+                state->stream->async_read(asio::bind_cancellation_slot(
+                    state->signal.slot(), [state, finish](error_code ec, ReadResult result) mutable {
+                        if (ec == asio::error::operation_aborted && state->timed_out) {
+                            std::move(finish)(make_error_code(client_errc::body_idle_timeout), ReadResult{});
+                            return;
+                        }
+                        std::move(finish)(ec, std::move(result));
+                    }));
+            },
+            token);
+    }
+
+    struct WriteOp {
+        Stream &self;
+        std::string data;
+        bool finish;
+        Headers trailers;
+        int phase{0};
+
+        asio::any_io_executor get_executor() const { return self.m_stream->head_executor(); }
+
+        template <typename Self> void start(Self &s) {
+            if (finish) {
+                self.m_stream->async_finish(std::move(data), std::move(s));
+            } else if (!trailers.empty()) {
+                self.m_stream->async_finish_trailers(std::move(trailers), std::move(s));
+            } else {
+                self.m_stream->async_write(std::move(data), std::move(s));
+            }
+        }
+
+        template <typename Self> void operator()(Self &s, error_code ec = {}) {
+            if (phase == 0) {
+                if (!self.m_auto_expect_continue || self.m_continue_checked) {
+                    phase = 2;
+                    start(s);
+                    return;
+                }
+                phase = 1;
+                self.async_ensure_continue(std::move(s));
+                return;
+            }
+            if (phase == 1) {
+                if (ec) {
+                    s.complete(ec);
+                    return;
+                }
+                phase = 2;
+                start(s);
+                return;
+            }
+            s.complete(ec);
+        }
+    };
+
+    struct EnsureContinueOp {
+        Stream &self;
+        int phase{0};
+
+        asio::any_io_executor get_executor() const { return self.m_stream->head_executor(); }
+
+        template <typename Self> void operator()(Self &s, error_code ec = {}, detail::ResponseHead head = {}) {
+            if (phase == 0) {
+                phase = 1;
+                self.m_continue_checked = true;
+                if (!self.m_auto_expect_continue) {
+                    s.complete(error_code{});
+                    return;
+                }
+                // h1 and h2 surface the interim 100; h3 servers have no 1xx API,
+                // so the client sends the body without waiting.
+                if (self.m_stream->version() != Version::Http11 && self.m_stream->version() != Version::Http2) {
+                    s.complete(error_code{});
+                    return;
+                }
+                self.read_head_with(self.m_continue_timeout, std::move(s));
+                return;
+            }
+            if (ec == make_error_code(client_errc::response_head_timeout)) {
+                // No interim answer in time: proceed with the body, as Go does
+                // with a peer that ignores the header.
+                s.complete(error_code{});
+                return;
+            }
+            if (ec) {
+                s.complete(ec);
+                return;
+            }
+            if (head.status == status::continue_) {
+                // The interim head was handed to us; the final response still
+                // follows, so the next read_head() must parse it.
+                self.m_stream->clear_head_cache();
+                s.complete(error_code{});
+                return;
+            }
+            s.complete(make_error_code(client_errc::expectation_failed));
+        }
+    };
+
+    struct ReadHeadOp {
+        Stream &self;
+        std::chrono::milliseconds timeout;
+        int phase{0};
+
+        asio::any_io_executor get_executor() const { return self.m_stream->head_executor(); }
+
+        template <typename Self> void operator()(Self &s, error_code ec = {}, detail::ResponseHead head = {}) {
+            if (phase == 0) {
+                phase = 1;
+                if (timeout.count() > 0) {
+                    self.m_stream->async_read_head(asio::cancel_after(timeout, std::move(s)));
+                } else {
+                    self.m_stream->async_read_head(std::move(s));
+                }
+                return;
+            }
+            if (ec == asio::error::operation_aborted || ec == asio::error::timed_out) {
+                s.complete(make_error_code(client_errc::response_head_timeout), detail::ResponseHead{});
+                return;
+            }
+            s.complete(ec, std::move(head));
+        }
+    };
+
+    struct ReadOp {
+        Stream &self;
+        std::chrono::milliseconds timeout;
+        int phase{0};
+
+        asio::any_io_executor get_executor() const { return self.m_stream->head_executor(); }
+
+        template <typename Self> void operator()(Self &s, error_code ec = {}, ReadResult result = {}) {
+            if (phase == 0) {
+                phase = 1;
+                if (timeout.count() > 0) {
+                    self.m_stream->async_read(asio::cancel_after(timeout, std::move(s)));
+                } else {
+                    self.m_stream->async_read(std::move(s));
+                }
+                return;
+            }
+            if (ec == asio::error::operation_aborted || ec == asio::error::timed_out) {
+                s.complete(make_error_code(client_errc::body_idle_timeout), ReadResult{});
+                return;
+            }
+            s.complete(ec, std::move(result));
+        }
+    };
 
     std::shared_ptr<detail::ClientStream> m_stream;
     std::chrono::milliseconds m_head_timeout{};
@@ -251,172 +437,223 @@ class Stream {
     bool m_continue_checked{false};
 };
 
-// --- the response lens --------------------------------------------------------
-//
-// Two shapes, one interface:
-//   * buffered  — from the convenience send(): the body is already in hand,
-//                 text()/json<T>() are immediate and read() replays it;
-//   * streaming — from open_stream()/send_stream(): body() is a live Body bound
-//                 to the exchange's read end, so text()/json<T>()/read_all()
-//                 pull it and read() streams it. Go's http.Response.Body is the
-//                 same shape: a read stream owned by the response.
-class Response {
+class Client;
+class RequestBuilder;
+
+// --- client ------------------------------------------------------------------
+
+class Client : public std::enable_shared_from_this<Client> {
   public:
-    int status() const { return m_head.status; }
-    Version version() const { return m_head.version; }
-    const Headers &headers() const { return m_head.headers; }
-    // A view into this Response's headers: valid while the Response is alive.
-    std::optional<std::string_view> header(std::string_view name) const { return m_head.header(name); }
-    // An owned copy: safe to hold past the Response (production P0 — views
-    // dangle the moment the Response goes away).
-    std::optional<std::string> header_owned(std::string_view name) const {
-        auto value = m_head.header(name);
-        return value ? std::optional<std::string>{*value} : std::nullopt;
+    Client(asio::any_io_executor executor, ClientConfig config = {})
+        : m_executor(std::move(executor)), m_config(std::move(config)) {
+        if (m_config.tls.verify_peer || !m_config.tls.cert_chain_file.empty())
+            m_tls_context = detail::make_client_ssl_context(m_config.tls);
     }
-    bool ok() const { return m_head.status >= 200 && m_head.status < 300; }
-    bool bodyless() const { return m_head.bodyless; }
-    // True when the client transparently decoded this body (Go's
-    // Response.Uncompressed); Content-Encoding/Content-Length are then absent.
-    bool uncompressed() const { return m_head.uncompressed; }
+    Client(const Client &) = delete;
+    Client &operator=(const Client &) = delete;
 
-    // 2xx → this; anything else → unexpected{client_errc::http_status} (the
-    // real status stays readable via status()): the reqwest error_for_status().
-    std::expected<const Response *, error_code> error_for_status() const {
-        if (ok()) {
-            return this;
-        }
-        return std::unexpected{make_error_code(client_errc::http_status)};
-    }
+    RequestBuilder get(std::string url) const;
+    RequestBuilder post(std::string url) const;
+    RequestBuilder put(std::string url) const;
+    RequestBuilder del(std::string url) const;
+    RequestBuilder head(std::string url) const;
+    RequestBuilder patch(std::string url) const;
+    RequestBuilder request(Method method, std::string url) const;
 
-    // The response body as a uniform read stream — the counterpart of the
-    // server's Request::body(). Buffered shape replays the captured body;
-    // streaming shape reads the live exchange (Go's http.Response.Body).
-    Body &body() { return *m_body; }
-    const Body &body() const { return *m_body; }
+    const ClientConfig &config() const { return m_config; }
+    asio::any_io_executor executor() const { return m_executor; }
 
-    // --- buffered consumption ---
-    [[nodiscard]] asio::awaitable<std::expected<std::string, error_code>> text() { co_return co_await bytes(); }
-    [[nodiscard]] asio::awaitable<std::expected<std::string, error_code>> bytes() {
-        co_return co_await read_all(m_body_cap);
-    }
-    template <typename T> [[nodiscard]] asio::awaitable<std::expected<T, error_code>> json() {
-        auto raw = co_await read_all(m_body_cap);
-        if (!raw) {
-            co_return std::unexpected{raw.error()};
-        }
-        auto value = glz::read_json<T>(*raw);
-        if (!value) {
-            co_return std::unexpected{make_error_code(asio::error::invalid_argument)};
-        }
-        co_return std::move(*value);
-    }
-
-    // --- streaming consumption ---
-    [[nodiscard]] asio::awaitable<std::expected<ReadResult, error_code>> read() {
-        if (m_body->is_pull() || !m_body->eof()) {
-            co_return co_await m_body->read();
-        }
-        co_return ReadResult::end();
-    }
-    [[nodiscard]] asio::awaitable<std::expected<std::string, error_code>> read_all(std::size_t max_bytes = 0) {
-        // Body::read_all caps nothing, so the convenience budget is enforced
-        // here (the streaming shape's underlying ClientStream::read_all also
-        // enforces it — this covers the buffered shape too).
-        std::string out;
-        for (;;) {
-            auto r = co_await m_body->read();
-            if (!r)
-                co_return std::unexpected{r.error()};
-            if (r->eof)
-                co_return out;
-            if (max_bytes != 0 && out.size() + r->data.size() > max_bytes)
-                co_return std::unexpected{make_error_code(client_errc::body_too_large)};
-            out.append(r->data);
+    // Closes the kept connection (if any). Call it before dropping the
+    // io_context: a multiplexed session keeps a read pending for keep-alive, so
+    // the context would not otherwise run out of work.
+    void close() const {
+        if (m_cached_session) {
+            m_cached_session->close();
+            m_cached_session.reset();
         }
     }
 
-    [[nodiscard]] asio::awaitable<void> abort() {
-        if (m_stream) {
-            (void)co_await m_stream->cancel();
-        }
-        co_return;
+    // Buffered send: follows redirects, applies the cookie jar, reads the whole
+    // body (bounded by `max_body_bytes`, 0 = the configured limit).
+    template <typename Token>
+    auto async_send(std::shared_ptr<Request> request, std::string url, std::size_t max_body_bytes,
+                    Token &&token) const {
+        return async_send(std::move(request), std::move(url), max_body_bytes, {}, {}, std::forward<Token>(token));
     }
 
-  public:
-    // Buffered shape (from the convenience send()): status/headers + a captured
-    // body. Public so tests and Response decorators can build one by hand;
-    // ordinary callers get it from Client::send().
-    explicit Response(detail::ResponseHead head, std::string body)
-        : m_head(std::move(head)), m_body(std::make_shared<Body>(asio::system_executor{})) {
-        // Buffered replay: the captured body, delivered as one pull chunk.
-        m_body->set_pull_provider(
-            [body = std::move(body)]() mutable -> asio::awaitable<std::expected<ReadResult, error_code>> {
-                if (body.empty())
-                    co_return ReadResult::end();
-                std::string out = std::move(body);
-                co_return ReadResult::chunk(std::move(out));
-            });
+    // Buffered send with the layered per-request budgets. `response_head_timeout`
+    // / `body_idle_timeout` (0 = the Client's defaults) are the RequestBuilder
+    // overrides; ClientConfig::request_timeout still bounds the whole call.
+    template <typename Token>
+    auto async_send(std::shared_ptr<Request> request, std::string url, std::size_t max_body_bytes,
+                    std::chrono::milliseconds response_head_timeout, std::chrono::milliseconds body_idle_timeout,
+                    Token &&token) const {
+        return async_send(std::move(request), std::move(url), max_body_bytes, response_head_timeout, body_idle_timeout,
+                          std::nullopt, std::forward<Token>(token));
     }
-    // Streaming shape (from open_stream()/send_stream()): the read end of a
-    // live exchange, plus the head parsed on the way. The exchange's reads are
-    // wired in as the Body's pull provider, so body()/read() pull the stream.
-    // `body_cap` bounds what the buffered readers (bytes()/text()/json()) may
-    // accumulate from the live exchange — a peer streaming a body without end
-    // must not be read into memory unbounded; 0 = unlimited (the historical
-    // behaviour, kept for callers that opt out explicitly).
-    explicit Response(std::shared_ptr<detail::ClientStream> stream, detail::ResponseHead head,
-                      asio::any_io_executor exec, std::size_t body_cap = 0)
-        : m_head(std::move(head)), m_stream(std::move(stream)), m_body_cap(body_cap),
-          m_body(std::make_shared<Body>(std::move(exec))) {
-        // The provider holds the stream by weak_ptr, not shared_ptr: a strong
-        // capture would give the Body (a handle the caller may keep) a hard
-        // reference into the exchange graph — the exact shape that turns into a
-        // reference cycle the moment a stream ever needs to point back at the
-        // Body/Response (the h2 engine once leaked via such a cycle). The Body
-        //'s lifetime is a subset of the Response's anyway (it is not copyable
-        // and only reachable through body()), so a weak capture costs nothing
-        // on the valid paths — a read only ever races the Response's death if
-        // the caller has abused the Body's lifetime, and that gets a clean
-        // not_connected rather than a use-after-free.
-        m_body->set_pull_provider([weak = std::weak_ptr<detail::ClientStream>{
-                                       m_stream}]() mutable -> asio::awaitable<std::expected<ReadResult, error_code>> {
-            auto stream = weak.lock();
-            if (!stream)
-                co_return std::unexpected{make_error_code(asio::error::not_connected)};
-            co_return co_await stream->read();
-        });
+
+    template <typename Token>
+    auto async_send(std::shared_ptr<Request> request, std::string url, std::size_t max_body_bytes,
+                    std::chrono::milliseconds response_head_timeout, std::chrono::milliseconds body_idle_timeout,
+                    std::optional<HttpVersionPolicy> version, Token &&token) const {
+        const HttpVersionPolicy effective = version ? *version : m_config.default_version;
+        auto keep = keep_alive();
+        return asio::async_initiate<Token, void(error_code, Response)>(
+            [keep, request = std::move(request), url = std::move(url), max_body_bytes, response_head_timeout,
+             body_idle_timeout, effective](auto handler) mutable {
+                const std::chrono::milliseconds overall = keep->m_config.request_timeout;
+                if (overall.count() <= 0) {
+                    keep->send_hop(std::move(request), std::move(url), max_body_bytes, 0, 0, response_head_timeout,
+                                   body_idle_timeout, effective, std::move(handler));
+                    return;
+                }
+                // Overall budget: the per-phase deadlines are a subset, but a
+                // server that dribbles bytes forever must still be cut off.
+                struct State {
+                    asio::any_completion_handler<void(error_code, Response)> done;
+                    std::shared_ptr<asio::steady_timer> timer;
+                    bool finished{false};
+                };
+                auto state = std::make_shared<State>();
+                state->done = std::move(handler);
+                state->timer = std::make_shared<asio::steady_timer>(keep->m_executor);
+                state->timer->expires_after(overall);
+                auto finish = [state](error_code ec, Response response) {
+                    if (state->finished) {
+                        return;
+                    }
+                    state->finished = true;
+                    state->timer->cancel();
+                    auto completion = std::move(state->done);
+                    std::move(completion)(ec, std::move(response));
+                };
+                state->timer->async_wait([finish](error_code ec) mutable {
+                    if (ec) {
+                        return;
+                    }
+                    finish(make_error_code(client_errc::request_timeout), Response{});
+                });
+                keep->send_hop(std::move(request), std::move(url), max_body_bytes, 0, 0, response_head_timeout,
+                               body_idle_timeout, effective,
+                               [finish](error_code ec, Response response) mutable { finish(ec, std::move(response)); });
+            },
+            token);
+    }
+
+    // Client-side WebSocket over HTTP/1.1. Accepts ws:// and wss:// URLs.
+    template <typename Token> auto async_open_websocket(std::string url, WebSocketSpec spec, Token &&token) {
+        auto keep = keep_alive();
+        return asio::async_initiate<Token, void(error_code, std::shared_ptr<WebSocket>)>(
+            [keep, url = std::move(url), spec = std::move(spec)](auto handler) mutable {
+                keep->open_ws_hop(std::move(url), std::move(spec), std::move(handler));
+            },
+            token);
+    }
+
+    // Explicit stream. No redirects, cookies or retries are applied (matching
+    // the C++23 open_stream contract).
+    template <typename Token>
+    auto async_open_stream(std::string url, StreamSpec spec, std::size_t max_body_bytes, Token &&token) const {
+        auto keep = keep_alive();
+        return asio::async_initiate<Token, void(error_code, std::shared_ptr<Stream>)>(
+            [keep, url = std::move(url), spec = std::move(spec), max_body_bytes](auto handler) mutable {
+                keep->open_stream_hop(std::move(url), std::move(spec), max_body_bytes, std::move(handler));
+            },
+            token);
     }
 
   private:
     friend class RequestBuilder;
-    friend class Client;
-    detail::ResponseHead m_head;
-    std::shared_ptr<Body> m_body;                   // uniform read stream
-    std::shared_ptr<detail::ClientStream> m_stream; // streaming shape
-    std::size_t m_body_cap{0};                      // bytes()/text()/json() accumulate at most this
+    using DialDone = asio::any_completion_handler<void(error_code, std::shared_ptr<detail::ClientSession>)>;
+
+    void send_hop(std::shared_ptr<Request> request, std::string url, std::size_t max_body_bytes, std::size_t redirects,
+                  std::size_t retries, std::chrono::milliseconds response_head_timeout,
+                  std::chrono::milliseconds body_idle_timeout, HttpVersionPolicy version,
+                  asio::any_completion_handler<void(error_code, Response)> done) const;
+    void open_stream_hop(std::string url, StreamSpec spec, std::size_t max_body_bytes,
+                         asio::any_completion_handler<void(error_code, std::shared_ptr<Stream>)> done) const;
+    void dial(const detail::Url &url, HttpVersionPolicy version, DialDone done) const;
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+    void dial_h3(const detail::Url &url, DialDone done) const;
+#endif
+    void dial_via_proxy(const detail::Url &url, const ProxyConfig &proxy, HttpVersionPolicy version,
+                        DialDone done) const;
+    // Builds the h1/h2 session for an already-connected byte stream. `version`
+    // is the per-request policy (already resolved against the Client default).
+    template <typename Transport>
+    void start_session(std::shared_ptr<Transport> transport, const detail::Url &url, HttpVersionPolicy version,
+                       DialDone done) const;
+    // Builds the session for a TLS origin from the ALPN result (h2 or h1).
+    template <typename Transport>
+    void start_negotiated_session(std::shared_ptr<Transport> transport, const detail::Url &url,
+                                  HttpVersionPolicy version, DialDone done) const;
+    // Runs the origin TLS handshake over an already-connected (possibly nested)
+    // transport, then starts the negotiated session.
+    template <typename Transport>
+    void tls_handshake_and_start(std::shared_ptr<Transport> transport, const detail::Url &url,
+                                 HttpVersionPolicy version, DialDone done) const;
+    void open_ws_hop(std::string url, WebSocketSpec spec,
+                     asio::any_completion_handler<void(error_code, std::shared_ptr<WebSocket>)> done) const;
+    void open_ws_via_proxy(const detail::Url &url, const ProxyConfig &proxy, std::string path, std::string authority,
+                           WebSocketSpec spec,
+                           asio::any_completion_handler<void(error_code, std::shared_ptr<WebSocket>)> done) const;
+    template <typename Transport>
+    void begin_ws_upgrade(std::shared_ptr<Transport> transport, std::string authority, std::string path,
+                          WebSocketSpec spec,
+                          asio::any_completion_handler<void(error_code, std::shared_ptr<WebSocket>)> done) const;
+    template <typename Transport>
+    void
+    ws_tls_handshake_and_start(std::shared_ptr<Transport> transport, std::string authority, std::string path,
+                               WebSocketSpec spec, std::string sni,
+                               asio::any_completion_handler<void(error_code, std::shared_ptr<WebSocket>)> done) const;
+    // An owning reference to this Client when it is owned by a shared_ptr, or a
+    // non-owning alias when it lives on the stack. Every asynchronous callback
+    // captures this instead of a raw `this`, so a heap-allocated Client cannot
+    // be destroyed while a dial/send/WebSocket operation is still in flight
+    // (ASan found a UAF in dial_via_proxy's DNS completion). A stack Client
+    // relies on the awaitable contract: it must outlive the operation.
+    std::shared_ptr<Client> keep_alive() const {
+        // The non-const overload is used deliberately: the const overload of
+        // weak_from_this() yields weak_ptr<const Client>, and every call site
+        // is a const member on an object that is not actually const.
+        if (auto keep = const_cast<Client *>(this)->weak_from_this().lock()) {
+            return keep;
+        }
+        return std::shared_ptr<Client>(std::shared_ptr<Client>{}, const_cast<Client *>(this));
+    }
+
+    std::shared_ptr<detail::ClientSession> take_cached(std::string_view origin, HttpVersionPolicy version) const;
+    void cache(std::string origin, std::shared_ptr<detail::ClientSession> session) const;
+
+    asio::any_io_executor m_executor;
+    ClientConfig m_config;
+    std::shared_ptr<asio::ssl::context> m_tls_context;
+    mutable std::string m_cached_origin;
+    mutable std::shared_ptr<detail::ClientSession> m_cached_session;
 };
-
-// --- the request builder (reqwest RequestBuilder) -----------------------------
-
-class Client;
 
 class RequestBuilder {
   public:
-    // --- collection ---
+    RequestBuilder(const Client *client, Method method, std::string url)
+        : m_client(client), m_method(method), m_url(std::move(url)) {}
+
     RequestBuilder &query(std::initializer_list<std::pair<std::string_view, std::string_view>> kv) {
-        for (const auto &[k, v] : kv) {
-            m_query.emplace_back(std::string{k}, std::string{v});
+        if (kv.size() != 0) {
+            std::string addition;
+            for (const auto &[key, value] : kv) {
+                if (!addition.empty())
+                    addition.push_back('&');
+                addition += query_escape(key);
+                addition.push_back('=');
+                addition += query_escape(value);
+            }
+            m_url += (m_url.find('?') == std::string::npos ? '?' : '&');
+            m_url += addition;
         }
         return *this;
     }
     RequestBuilder &header(std::string_view name, std::string value) {
         m_headers.add(std::string{name}, std::move(value));
-        return *this;
-    }
-    // Cap on the response body a buffered send() will accept (0 = ClientConfig
-    // / EngineLimits default).
-    RequestBuilder &max_body_bytes(std::size_t max) {
-        m_max_body_bytes = max;
         return *this;
     }
     RequestBuilder &headers(Headers h) {
@@ -425,739 +662,1164 @@ class RequestBuilder {
     }
     RequestBuilder &content_type(std::string_view ct) { return header("content-type", std::string{ct}); }
     RequestBuilder &basic_auth(std::string user, std::string pass) {
-        m_headers.add(std::string{field::authorization}, "Basic " + base64_encode(user + ":" + pass));
-        return *this;
+        return header(field::authorization, "Basic " + base64_encode(user + ":" + pass));
     }
     RequestBuilder &bearer_auth(std::string token) {
-        m_headers.add(std::string{field::authorization}, "Bearer " + std::move(token));
+        return header(field::authorization, "Bearer " + std::move(token));
+    }
+    RequestBuilder &body(std::string value) {
+        m_body = std::move(value);
         return *this;
     }
-    RequestBuilder &body(std::string body) {
-        m_body = std::move(body);
+    RequestBuilder &max_body_bytes(std::size_t value) {
+        m_max_body_bytes = value;
         return *this;
     }
-    template <typename T> RequestBuilder &json(const T &value) {
-        auto serialized = glz::write_json(value);
-        if (!serialized) {
-            m_body.clear();
-            m_json_failed = true;
-            return *this;
-        }
-        m_body = std::move(*serialized);
-        return content_type(mime::app_json);
-    }
-    // Multipart/form-data body (proto/multipart.h's MultipartForm): serializes
-    // the form and sets `Content-Type: multipart/form-data; boundary=...`,
-    // replacing any content type set earlier. Go's NewRequest with a
-    // multipart.Writer, reqwest's .multipart(form).
-    RequestBuilder &multipart(MultipartForm form) {
-        m_headers.erase(field::content_type);
-        m_body = form.release_body();
-        return content_type(form.content_type());
-    }
-    // Layered timeouts: head = time to the first response byte, idle = silence
-    // between body reads. 0 keeps the Client's default.
     RequestBuilder &timeout(std::chrono::milliseconds head, std::chrono::milliseconds idle = {}) {
         m_head_timeout = head;
         m_idle_timeout = idle;
         return *this;
     }
-    // Per-request version policy, overriding ClientConfig::default_version.
     RequestBuilder &version(HttpVersionPolicy policy) {
         m_version = policy;
         return *this;
     }
 
-    // --- delivery ---
-    // Buffered convenience: writes the collected body, reads the whole
-    // response (redirects / cookie jar / pooled-retry / h2c / decompression all
-    // handled), and returns a buffered Response.
-    [[nodiscard]] asio::awaitable<std::expected<Response, error_code>> send() const;
-    // Streaming response: the collected body (`body()`/`json()`/`multipart()`)
-    // is written as the first chunk, then the caller drives the rest and calls
-    // finish(). Use Client::open_stream() when there is no builder body.
-    [[nodiscard]] asio::awaitable<std::expected<Stream, error_code>> send_stream() const;
-
-  private:
-    friend class Client;
-    RequestBuilder(const Client *client, Method method, std::string url)
-        : m_client(client), m_method(method), m_url(std::move(url)) {}
-
-    // The final URL: the collected query is percent-encoded and appended.
-    std::string build_url() const {
-        if (m_query.empty()) {
-            return m_url;
-        }
-        std::string out = m_url;
-        if (out.find('?') == std::string::npos) {
-            out.push_back('?');
-        } else {
-            out.push_back('&');
-        }
-        bool first = true;
-        for (const auto &[k, v] : m_query) {
-            if (!first) {
-                out.push_back('&');
+    template <typename Token> auto send(Token &&token) {
+        auto request = std::make_shared<Request>(Version::Http11, m_client->executor());
+        request->set_method(m_method);
+        request->mutable_headers() = m_headers;
+        const auto &config = m_client->config();
+        if (config.auto_decompress && m_method != Method::Head && !request->header(field::accept_encoding) &&
+            !request->header(field::range) && !config.accept_encodings.empty()) {
+            std::string accept;
+            for (const auto &coding : config.accept_encodings) {
+                if (!accept.empty())
+                    accept += ", ";
+                accept += coding;
             }
-            first = false;
-            out += query_escape(k);
-            out.push_back('=');
-            out += query_escape(v);
+            request->mutable_headers().add(std::string{field::accept_encoding}, std::move(accept));
+            request->set_state(detail::AutoDecompressMark{});
         }
-        return out;
+        if (!m_body.empty())
+            request->set_body(m_body);
+        if (m_method == Method::Head)
+            request->set_close(false);
+        const std::size_t cap = m_max_body_bytes != 0 ? m_max_body_bytes : m_client->config().limits.max_body_bytes;
+        return m_client->async_send(std::move(request), m_url, cap, m_head_timeout, m_idle_timeout, m_version,
+                                    std::forward<Token>(token));
     }
 
-    const Client *m_client{nullptr};
-    Method m_method{Method::Get};
+  private:
+    const Client *m_client;
+    Method m_method;
     std::string m_url;
-    std::vector<std::pair<std::string, std::string>> m_query;
     Headers m_headers;
     std::string m_body;
     std::size_t m_max_body_bytes{0};
     std::chrono::milliseconds m_head_timeout{};
     std::chrono::milliseconds m_idle_timeout{};
-    std::optional<HttpVersionPolicy> m_version{};
-    bool m_json_failed{false};
+    std::optional<HttpVersionPolicy> m_version;
 };
 
-// --- the client facade --------------------------------------------------------
-
-// Connection dials, for diagnostics.
-struct Stats {
-    std::size_t connections_opened{0}; // fresh TCP/TLS connections dialed
-};
-
-class Client {
-  public:
-    // Pinned to `ex` for its whole life (model A): the caller guarantees that
-    // executor is driven by a single thread. Every operation of this Client
-    // runs on it — a call initiated from another executor hops onto it at the
-    // entry point — which is what lets the engine below run without any locks.
-    // (The io_context must outlive the Client's sessions: drain it before
-    // tearing it down — the same contract as the server's worker contexts.)
-    explicit Client(asio::any_io_executor ex, ClientConfig cfg = {})
-        : m_executor(std::move(ex)), m_cfg(std::move(cfg)),
-          m_impl(std::make_shared<detail::ClientEngine>(m_executor, m_cfg)) {}
-
-    Client(const Client &) = delete;
-    Client &operator=(const Client &) = delete;
-
-    const ClientConfig &config() const { return m_cfg; }
-
-    // --- convenience (half-duplex, reqwest-style) ---
-    RequestBuilder get(std::string url) const { return RequestBuilder(this, Method::Get, std::move(url)); }
-    RequestBuilder post(std::string url) const { return RequestBuilder(this, Method::Post, std::move(url)); }
-    RequestBuilder put(std::string url) const { return RequestBuilder(this, Method::Put, std::move(url)); }
-    RequestBuilder del(std::string url) const { return RequestBuilder(this, Method::Delete, std::move(url)); }
-    RequestBuilder head(std::string url) const { return RequestBuilder(this, Method::Head, std::move(url)); }
-    RequestBuilder patch(std::string url) const { return RequestBuilder(this, Method::Patch, std::move(url)); }
-    RequestBuilder request(Method method, std::string url) const {
-        return RequestBuilder(this, method, std::move(url));
-    }
-
-    // --- explicit send (Go's http.Client.Do) ---
-    // Sends a fully-built request (method/url/headers/body already set — see
-    // Request::set_url) and returns the buffered response, applying the
-    // convenience policy (redirects, cookies, pooled-retry). The request's body
-    // travels alongside for replay (Request::clone_for_replay), so 307/308
-    // redirects can resend it. `url` overrides the Request's own target when
-    // the request only carries an origin-form target.
-    // `version` overrides ClientConfig::default_version for this request (and
-    // every redirect hop it follows). `response_head_timeout` / `body_idle_timeout`
-    // are the layered per-phase budgets (0 = the Client's defaults); `timeout`
-    // stays the overall request budget.
-    [[nodiscard]] asio::awaitable<std::expected<Response, error_code>>
-    send(std::shared_ptr<Request> request, std::string url = {}, std::size_t max_body_bytes = 0,
-         std::chrono::milliseconds timeout = {}, std::optional<HttpVersionPolicy> version = std::nullopt,
-         std::chrono::milliseconds response_head_timeout = {}, std::chrono::milliseconds body_idle_timeout = {}) const {
-        co_await hop(); // everything below (incl. the request's Body channel) runs on the pinned executor
-        // A directly fed body lives in the Request's Body channel, not in
-        // body_source(). The redirect/retry loop rebuilds each hop from the
-        // source, so collect the fed bytes here (the documented client-side
-        // workflow is feed()+finish() before handing the request over). Without
-        // this, such a request went out with an empty body while still claiming
-        // its original framing.
-        std::string direct_body = request->body_source();
-        if (request->stream_body()) {
-            // This is the buffered path: there is no write side to service a
-            // streaming request. Answering it silently with no body is data
-            // loss, so refuse it instead.
-            co_return std::unexpected{make_error_code(asio::error::invalid_argument)};
-        }
-        if (direct_body.empty() && request->body().fed()) {
-            // Reading an unfinished body would wait forever; the caller must
-            // finish() what it fed.
-            if (!request->body().finished())
-                co_return std::unexpected{make_error_code(asio::error::invalid_argument)};
-            auto collected = co_await request->body().read_all();
-            if (!collected)
-                co_return std::unexpected{collected.error()};
-            direct_body = std::move(*collected);
-        }
-        std::string current_url = url;
-        detail::ClientTarget target;
-        std::string url_target;
-        if (current_url.empty()) {
-            // The Request carries a full URL: derive the authority from it.
-            if (request->url().empty())
-                co_return std::unexpected{make_error_code(client_errc::bad_url)};
-            current_url = request->url();
-        }
-        auto parsed = detail::parse_url(current_url);
-        if (!parsed)
-            co_return std::unexpected{parsed.error()};
-        target = parsed->to_target();
-        const HttpVersionPolicy effective_version = version.value_or(m_cfg.default_version);
-        target.version = effective_version;
-        target.h2c = m_cfg.default_h2c;
-        url_target = request->target().empty() ? std::string{parsed->target} : std::string{request->target()};
-        if (request->target().empty())
-            request->set_target(url_target);
-
-        const std::size_t cap = max_body_bytes != 0 ? max_body_bytes : m_cfg.limits.max_body_bytes;
-        const std::chrono::milliseconds limit = timeout.count() != 0 ? timeout : m_cfg.request_timeout;
-        // Go's http.Client feeds the jar before *every* request, including the
-        // first one. The redirect loop used to be the only place that asked the
-        // jar, so a session established by an earlier send() was silently
-        // dropped on the next independent send(). Merge with an explicit Cookie
-        // header the caller set (Go's AddCookie appends as well).
-        Headers headers{request->headers()};
-        if (m_cfg.cookie_jar) {
-            std::string jar_cookie = m_cfg.cookie_jar->cookie_header(current_url);
-            if (!jar_cookie.empty()) {
-                // Copy before erase: get() returns a view into the header store.
-                std::string explicit_cookie;
-                if (const auto current = headers.get("cookie"); current && !current->empty())
-                    explicit_cookie.assign(*current);
-                headers.erase("cookie");
-                if (!explicit_cookie.empty()) {
-                    explicit_cookie += "; ";
-                    explicit_cookie += jar_cookie;
-                    headers.add("cookie", std::move(explicit_cookie));
-                } else {
-                    headers.add("cookie", std::move(jar_cookie));
-                }
-            }
-        }
-        co_return co_await follow_redirects(
-            m_impl, m_cfg, std::move(target), request->method(), std::string{request->method_token()},
-            std::move(headers), std::move(direct_body), request->close(), std::move(url_target), cap, limit,
-            m_cfg.max_redirects, std::move(current_url), effective_version, response_head_timeout, body_idle_timeout);
-    }
-
-    // --- explicit streaming (full-duplex) ---
-    [[nodiscard]] asio::awaitable<std::expected<Stream, error_code>> open_stream(std::string url,
-                                                                                 StreamSpec spec = {}) const {
-        co_await hop();
-        // Hold the engine for the whole open: this coroutine references it
-        // across suspensions (and the engine is only kept alive by the Client's
-        // m_impl otherwise), so dropping the Client mid-await must not free it
-        // out from under the resumed frame.
-        const auto engine = m_impl;
-        auto parsed = detail::parse_url(url);
-        if (!parsed) {
-            co_return std::unexpected{parsed.error()};
-        }
-        if (spec.target.empty()) {
-            spec.target = std::string{parsed->target};
-        }
-        // A per-StreamSpec policy overrides the Client's default; the policy is
-        // part of the engine's connection key, so different policies to the
-        // same origin get separate kept connections.
-        detail::ClientTarget target = parsed->to_target();
-        target.version = spec.version.value_or(m_cfg.default_version);
-        target.h2c = m_cfg.default_h2c;
-        auto inner = std::make_shared<Request>(Version::Http11, co_await asio::this_coro::executor);
-        inner->set_method(spec.method);
-        inner->set_target(std::move(spec.target));
-        inner->mutable_headers() = std::move(spec.headers);
-        if (spec.expect_100_continue || spec.auto_expect_continue) {
-            inner->mutable_headers().add(std::string{field::expect}, "100-continue");
-        }
-        inner->set_close(spec.close);
-        inner->set_stream_body(true); // the write end stays open on the Stream
-        auto opened = co_await engine->open_stream(std::move(target), std::move(inner));
-        if (!opened) {
-            co_return std::unexpected{opened.error()};
-        }
-        const std::chrono::milliseconds head =
-            spec.response_head_timeout.count() > 0 ? spec.response_head_timeout : m_cfg.response_head_timeout;
-        const std::chrono::milliseconds idle =
-            spec.body_idle_timeout.count() > 0 ? spec.body_idle_timeout : m_cfg.body_idle_timeout;
-        co_return Stream{std::move(opened->stream), head, idle, spec.auto_expect_continue, spec.continue_timeout};
-    }
-
-    // --- WebSocket client (RFC 6455) ---
-    // Dial and upgrade to `url` (ws:// or wss://), returning a WebSocket handle
-    // identical to the server's — read() pulls whole messages, write_text/
-    // write_binary serialize via one write pump, close() sends a Close frame.
-    // `spec` carries extra request headers and an optional Origin.
-    [[nodiscard]] asio::awaitable<std::expected<std::shared_ptr<WebSocket>, error_code>>
-    open_websocket(std::string url, WebSocketSpec spec = {}) const {
-        co_await hop();
-        // Keep the engine alive across the dial (see open_stream): the coroutine
-        // references it while suspended, and only the Client's m_impl owns it.
-        const auto engine = m_impl;
-        // ws:// vs wss:// are http:// vs https:// with an upgrade; normalize so
-        // the shared URL parser (which the Scheme-less client already uses) can
-        // handle host/port/path, then remember the TLS choice.
-        const bool is_tls = url.rfind("wss://", 0) == 0;
-        const bool is_ws = url.rfind("ws://", 0) == 0;
-        if (!is_ws && !is_tls) {
-            co_return std::unexpected{make_error_code(client_errc::bad_url)};
-        }
-        const std::string http_url =
-            std::string{is_tls ? "https://" : "http://"} + std::string{url}.substr(url.find("://") + 3);
-        auto parsed = detail::parse_url(http_url);
-        if (!parsed) {
-            co_return std::unexpected{parsed.error()};
-        }
-
-        detail::ClientTarget target = parsed->to_target();
-        target.use_tls = is_tls;
-        target.version = HttpVersionPolicy::Http11; // WebSocket is HTTP/1-based
-        target.h2c = H2cMode::Off;
-
-        auto dialed = co_await engine->dial_transport(target, co_await asio::this_coro::executor);
-        if (!dialed)
-            co_return std::unexpected{dialed.error()};
-
-        const std::string authority = target.authority();
-        const std::string path = std::string{parsed->target};
-        co_return co_await std::visit(
-            [&](auto &typed) -> asio::awaitable<std::expected<std::shared_ptr<WebSocket>, error_code>> {
-                co_return co_await detail::ws_upgrade(typed, authority, path, spec, m_cfg.idle_timeout,
-                                                      m_cfg.response_head_timeout);
-            },
-            dialed->transport);
-    }
-
-    // Connection dials (one Client keeps a single connection, re-dialed on a
-    // transport loss).
-    Stats stats() const { return Stats{m_impl->opened_count()}; }
-
-    // [internal — the reverse proxy's channel] Opens a stream by ClientTarget,
-    // keeping the h2c-upgrade path the proxy needs. Public users call
-    // open_stream(url) — this is library-internal because it reaches into
-    // connection policy (client/http_proxy.h).
-    struct OpenTargetStream {
-        std::shared_ptr<Stream> stream;
-    };
-    [[nodiscard]] asio::awaitable<std::expected<OpenTargetStream, error_code>>
-    open_target(detail::ClientTarget target, std::shared_ptr<Request> request) const {
-        co_await hop();
-        const auto engine = m_impl; // keep it alive across the open (see open_stream)
-        auto opened = co_await engine->open_stream(std::move(target), std::move(request));
-        if (!opened) {
-            co_return std::unexpected{opened.error()};
-        }
-        // open_target is the reverse proxy's entry point: apply the same layered
-        // budgets the public open_stream() path uses, or the proxy would wait for
-        // an upstream response head with a zero (unbounded) timeout.
-        co_return OpenTargetStream{
-            std::make_shared<Stream>(std::move(opened->stream), m_cfg.response_head_timeout, m_cfg.body_idle_timeout)};
-    }
-
-  private:
-    friend class RequestBuilder;
-
-    // Hops onto the pinned executor (model A); an inline dispatch when already
-    // there. Every public entry point (and RequestBuilder::send) does this
-    // first, so a Client may be driven from any thread — the work lands on its
-    // single executor.
-    asio::awaitable<void> hop() const { co_await asio::dispatch(asio::bind_executor(m_executor, asio::use_awaitable)); }
-
-    // --- convenience internals (redirect / cookie / retry) ---
-    // The convenience layer's one buffered exchange: one request, with the
-    // configured retry policy. Returns a buffered Response. The engine owns the
-    // connection lifecycle (the single kept connection, free transparent re-dial
-    // on transport loss); what is left here is the read-phase retry policy.
-    static asio::awaitable<std::expected<Response, error_code>>
-    exchange_once(std::shared_ptr<detail::ClientEngine> impl, detail::ClientTarget target,
-                  std::shared_ptr<Request> request, const std::string &url_target, std::size_t cap,
-                  std::chrono::milliseconds limit, const RetryPolicy &retry,
-                  std::chrono::milliseconds response_head_timeout, std::chrono::milliseconds body_idle_timeout) {
-        if (request->target().empty())
-            request->set_target(url_target.empty() ? "/" : url_target);
-
-        // One budget for the whole request: the engine's open-phase retries and
-        // this loop's read-phase retries count against the same max_retries, and
-        // the request's overall deadline (request_timeout) bounds them so a set
-        // of backoff sleeps cannot stretch the call past what the caller asked
-        // for. Each attempt then reads under however much budget is left.
-        detail::RetryBudget budget{&retry, 0};
-        if (limit.count() > 0)
-            budget.deadline = std::chrono::steady_clock::now() + limit;
-        bool stale_redialed = false; // one free replay for a reused kept connection that dropped
-        auto remaining_budget = [&budget, limit]() -> std::chrono::milliseconds {
-            if (budget.deadline == std::chrono::steady_clock::time_point{})
-                return limit;
-            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(budget.deadline -
-                                                                                    std::chrono::steady_clock::now());
-            return left.count() > 0 ? std::chrono::milliseconds{left} : std::chrono::milliseconds{0};
-        };
-        for (;;) {
-            auto opened = co_await impl->start_exchange(
-                target, request->clone_for_replay(co_await asio::this_coro::executor), url_target, &budget);
-            if (!opened)
-                co_return std::unexpected{opened.error()};
-            auto &stream = opened->stream;
-
-            const auto remaining = remaining_budget();
-            // 0 is the documented "no limit" (ClientConfig::request_timeout and
-            // the RequestBuilder override); only an actual budget can expire.
-            if (limit.count() > 0 && remaining.count() <= 0)
-                co_return std::unexpected{make_error_code(client_errc::request_timeout)};
-            auto response = co_await read_exchange(stream, cap, remaining, response_head_timeout, body_idle_timeout);
-            if (response) {
-                if (detail::retry_status_allowed(budget, *request, response->status())) {
-                    const auto retry_after = response->header("retry-after");
-                    const auto delay =
-                        retry_after ? detail::retry_after_delay(*retry_after) : std::chrono::milliseconds{0};
-                    SIMPLE_HTTP_WARN_LOG("client: {} returned {} (Retry-After {}), retry {} of {}", target.authority(),
-                                         response->status(),
-                                         retry_after ? std::string{*retry_after} : std::string{"none"}, budget.used,
-                                         retry.max_retries);
-                    // The response body has been consumed; the kept h1 gate is
-                    // free for the next attempt even though this stream handle
-                    // is still in scope.
-                    if (opened->gate_token)
-                        impl->release_h1_gate(opened->gate_token);
-                    co_await detail::retry_sleep_for(retry, budget.used, delay, budget.deadline);
-                    continue;
-                }
-                co_return std::move(*response);
-            }
-
-            const error_code ec = response.error();
-            // The exchange on the kept h1 connection is over: hand the gate back
-            // now, before the retry/redial decision below queues anything onto
-            // it — and before cancel() fails the session (that failure must not
-            // be what releases the gate, or a waiter would wake onto a dying
-            // connection).
-            if (opened->gate_token)
-                impl->release_h1_gate(opened->gate_token);
-            (void)co_await stream->cancel(); // h2: reset the stream, keeping the
-                                             // connection; h1: close it
-
-            // A transport failure on a *reused* kept connection may be a stale
-            // drop — the peer closed the connection while it sat idle, so this
-            // request provably never arrived. Give it one free re-dial (like the
-            // old rule that a stale pooled connection earns a replay) before the
-            // policy retries come into play. Not counting against max_retries.
-            // Replaying is only safe when the request can be reconstructed and
-            // re-executing it is harmless. A reused connection tells us the
-            // failure *may* be a stale drop, but it does not prove the request
-            // never arrived: a POST whose response head was already received
-            // and whose body read then failed would still be executed twice.
-            if (opened->reused && !request->stream_body() && is_idempotent(request->method()) &&
-                (detail::transport_failure(ec) || ec == make_error_code(client_errc::session_closed)) &&
-                !stale_redialed) {
-                SIMPLE_HTTP_ERROR_LOG("client: reading {} on the kept connection failed ({}), re-dialing once",
-                                      target.authority(), ec.message());
-                stale_redialed = true;
-                continue;
-            }
-
-            // Policy retries: re-sending after the request was written is only
-            // safe when the policy accepts it (the default keeps idempotent
-            // methods and provably-unprocessed streams), and never when the
-            // body cannot be rebuilt.
-            if (detail::retry_allowed(budget, *request, ec, /*pooled=*/false, /*request_sent=*/true)) {
-                SIMPLE_HTTP_ERROR_LOG("client: reading {} failed ({}), retry {} of {}", target.authority(),
-                                      ec.message(), budget.used, retry.max_retries);
-                co_await detail::retry_sleep(retry, budget.used, budget.deadline);
-                continue;
-            }
-            co_return std::unexpected{ec};
-        }
-    }
-
-    // One hop of the convenience layer: an exchange, then — when redirects are
-    // enabled and the response is a redirect with a Location — a rewritten next
-    // hop (method/body per the 301/302/303 vs 307/308 rules, cookies stored and
-    // replayed, https→http refused, `remaining` hops bound).
-    //
-    // The body travels as a string alongside the Request: once fed into the
-    // request's Body stream it cannot be taken back, but a redirect only ever
-    // needs the *same* body for 307/308 (and no body at all after 301/302/303
-    // rewrite to GET). So the convenience layer keeps the source and rebuilds
-    // the Request per hop — Go's http.Request.GetBody, concretely.
-    static asio::awaitable<std::expected<Response, error_code>>
-    follow_redirects(std::shared_ptr<detail::ClientEngine> impl, const ClientConfig &cfg, detail::ClientTarget target,
-                     Method method, std::string method_token, Headers headers, std::string body, bool close,
-                     std::string url_target, std::size_t cap, std::chrono::milliseconds limit, std::size_t remaining,
-                     std::string current_url, HttpVersionPolicy version,
-                     std::chrono::milliseconds response_head_timeout, std::chrono::milliseconds body_idle_timeout) {
-        // Saved before target is moved into the exchange: the next hop's origin
-        // comparison needs the current authority. Origin is scheme + host +
-        // port (RFC 9110 §4.3.1); comparing only the host would carry
-        // Authorization/Cookie across a port change, which Go does not.
-        const std::string current_host = target.host;
-        const std::uint16_t current_port = target.effective_port();
-        const bool current_tls = target.use_tls;
-        auto request = std::make_shared<Request>(Version::Http11, co_await asio::this_coro::executor);
-        // The raw token carries extension methods through the convenience path;
-        // set_method_token() also refreshes the enum.
-        // Both are needed again on the next hop: the method token for an
-        // extension method, and every caller header (User-Agent, Authorization,
-        // custom fields). Moving them here left the recursive call with empty
-        // values, so a redirect silently dropped them and the engine supplied
-        // its default User-Agent instead. Go's http.Client preserves them.
-        request->set_method_token(method_token.empty() ? std::string{to_string(method)} : method_token);
-        request->mutable_headers() = headers;
-        request->set_target(url_target.empty() ? "/" : url_target);
-        request->set_close(close); // Go's Request.Close survives the redirect loop
-        if (!body.empty())
-            request->set_body(body);
-        auto response = co_await exchange_once(impl, std::move(target), std::move(request), url_target, cap, limit,
-                                               cfg.retry, response_head_timeout, body_idle_timeout);
-        if (!response)
-            co_return std::unexpected{response.error()};
-
-        if (cfg.cookie_jar) {
-            cfg.cookie_jar->store(current_url, response->headers());
-        }
-
-        if (!is_redirect(response->status()))
-            co_return response;
-        // Over the configured hop budget: report the failure (and log where the
-        // chain ended) instead of silently handing back a redirect the caller
-        // asked us to follow — Go's http.Client returns the last response *and*
-        // an error here. max_redirects == 0 means "never follow": that budget is
-        // never spent, so the untouched 3xx comes back as-is.
-        if (remaining == 0) {
-            if (cfg.max_redirects == 0) {
-                co_return response;
-            }
-            SIMPLE_HTTP_ERROR_LOG("client: {} redirects followed, still at {} ({}) — giving up", cfg.max_redirects,
-                                  response->status(), current_url);
-            co_return std::unexpected{make_error_code(client_errc::too_many_redirects)};
-        }
-        const auto location = response->header(field::location);
-        if (!location || location->empty())
-            co_return response;
-
-        auto hop = resolve_redirect(current_url, version, cfg.default_h2c, url_target, *location);
-        if (!hop)
-            co_return std::unexpected{hop.error()};
-
-        // RFC 9110 §15.4: 303 always becomes GET; 301/302 do for any method
-        // other than GET/HEAD. 307/308 preserve the method and body.
-        if (response->status() == status::see_other ||
-            ((response->status() == status::moved_permanently || response->status() == status::found) &&
-             !get_like(method))) {
-            method = Method::Get;
-            method_token = "GET";
-            body.clear();
-            headers.erase("content-type"); // an empty GET carries no entity
-            headers.erase("content-length");
-        }
-
-        // A hop to a different origin must not carry the previous host's
-        // credentials — Go's http.Client rule. Cookies are replayed through the
-        // jar (domain-filtered) when one is configured; an ad-hoc Cookie header
-        // is dropped across origins either way.
-        const bool same_origin = iequals_ci(hop->target.host, current_host) &&
-                                 hop->target.effective_port() == current_port && hop->target.use_tls == current_tls;
-        if (!same_origin) {
-            headers.erase("authorization");
-            headers.erase("proxy-authorization");
-            headers.erase("cookie");
-        }
-
-        if (cfg.cookie_jar) {
-            std::string cookie = cfg.cookie_jar->cookie_header(hop->url);
-            if (!cookie.empty()) {
-                headers.erase("cookie");
-                headers.add("cookie", std::move(cookie));
-            }
-        }
-
-        // The next hop's origin-form target supersedes the old one; exchange_once
-        // only fills an empty one.
-        url_target = hop->url_target;
-        co_return co_await follow_redirects(std::move(impl), cfg, std::move(hop->target), method,
-                                            std::move(method_token), std::move(headers), std::move(body), close,
-                                            std::move(url_target), cap, limit, remaining - 1, std::move(hop->url),
-                                            version, response_head_timeout, body_idle_timeout);
-    }
-
-    // The tighter of a layered per-phase budget and the request's remaining
-    // overall budget; 0 means "no limit" on either axis. The reason tracks
-    // which side won, so a timeout is reported as the phase that actually
-    // expired (a per-phase budget) rather than always request_timeout.
-    struct Deadline {
-        std::chrono::milliseconds limit;
-        client_errc reason;
-    };
-    static Deadline effective_deadline(std::chrono::milliseconds phase, std::chrono::milliseconds overall,
-                                       client_errc phase_reason) {
-        if (phase.count() <= 0)
-            return {overall, client_errc::request_timeout};
-        if (overall.count() <= 0 || phase <= overall)
-            return {phase, phase_reason};
-        return {overall, client_errc::request_timeout};
-    }
-
-    // Reads the response of one exchange: head, then whole body. The head is
-    // bounded by the caller's response-head budget and each body read by the
-    // body-idle budget (a download that keeps flowing is not cut off); the
-    // request's overall budget still caps both.
-    static asio::awaitable<std::expected<Response, error_code>>
-    read_exchange(std::shared_ptr<detail::ClientStream> stream, std::size_t cap, std::chrono::milliseconds limit,
-                  std::chrono::milliseconds response_head_timeout, std::chrono::milliseconds body_idle_timeout) {
-        const auto head_deadline = effective_deadline(response_head_timeout, limit, client_errc::response_head_timeout);
-        const auto body_deadline = effective_deadline(body_idle_timeout, limit, client_errc::body_idle_timeout);
-        // Both expected layers matter: the outer one is the deadline, the inner
-        // is the exchange itself.
-        auto head =
-            co_await detail::await_with_deadline(stream->read_head(), head_deadline.limit, head_deadline.reason);
-        if (!head || !*head)
-            co_return std::unexpected{head ? (*head).error() : head.error()};
-        // An asked-for 100-continue is an *interim* head. read_head() hands it to
-        // a streaming caller so it can send its body, but the buffered path is
-        // already past that point and must report the final response (its body
-        // is what read() returns). read_head() caches nothing for the interim, so
-        // the next call parses the final head.
-        while ((*head)->status == status::continue_) {
-            head = co_await detail::await_with_deadline(stream->read_head(), head_deadline.limit, head_deadline.reason);
-            if (!head || !*head)
-                co_return std::unexpected{head ? (*head).error() : head.error()};
-        }
-
-        std::string body;
-        for (;;) {
-            auto chunk =
-                co_await detail::await_with_deadline(stream->read(), body_deadline.limit, body_deadline.reason);
-            if (!chunk || !*chunk)
-                co_return std::unexpected{chunk ? (*chunk).error() : chunk.error()};
-            if ((*chunk)->eof)
-                break;
-            if (cap != 0 && body.size() + (*chunk)->data.size() > cap)
-                co_return std::unexpected{make_error_code(client_errc::body_too_large)};
-            body.append((*chunk)->data);
-        }
-        co_return Response{std::move(**head), std::move(body)};
-    }
-
-    // Whether `status` is a redirect the convenience layer may follow.
-    static bool is_redirect(int status) noexcept {
-        return status == status::moved_permanently || status == status::found || status == status::see_other ||
-               status == status::temporary_redirect || status == status::permanent_redirect;
-    }
-
-    // GET and HEAD keep their method across a 301/302; every other method turns
-    // into GET (RFC 9110 §15.4; 307/308 keep the method).
-    static bool get_like(Method m) noexcept { return m == Method::Get || m == Method::Head; }
-
-    // One hop of a redirect chain: where the next request goes and what its
-    // request-target and absolute URL are.
-    struct RedirectHop {
-        detail::ClientTarget target;
-        std::string url_target; // origin-form for the next request
-        std::string url;        // absolute, for cookies and further hops
-    };
-
-    // Resolves one redirect hop from `current_url` (the absolute URL that
-    // produced the response), `current_target` (that request's origin-form
-    // target, for relative Locations) and the Location value. Accepts absolute
-    // URLs, scheme-relative ("//host/path"), root-relative ("/path") and
-    // path-relative ("next", "../up") forms. An https→http downgrade is
-    // refused (redirect_to_insecure), like Go's http.Client.
-    static std::expected<RedirectHop, error_code> resolve_redirect(const std::string &current_url,
-                                                                   HttpVersionPolicy version, H2cMode h2c,
-                                                                   const std::string &current_target,
-                                                                   std::string_view location) {
-        const detail::Url base = detail::parse_url(current_url).value_or(detail::Url{});
-        std::string whole;
-        if (location.starts_with("http://") || location.starts_with("https://")) {
-            whole.assign(location);
-        } else if (location.starts_with("//")) {
-            whole = base.scheme + ":" + std::string{location};
-        } else if (!location.empty() && location.front() == '/') {
-            whole = base.scheme + "://" + base.authority() + std::string{location};
-        } else {
-            // Path-relative: join against the directory of the current request.
-            std::string path{current_target};
-            if (const auto q = path.find('?'); q != std::string::npos)
-                path.erase(q);
-            const auto slash = path.rfind('/');
-            whole = base.scheme + "://" + base.authority() +
-                    (slash == std::string::npos ? "/" : path.substr(0, slash + 1)) + std::string{location};
-        }
-        auto url = detail::parse_url(whole);
-        if (!url)
-            return std::unexpected{url.error()};
-        if (base.use_tls() && !url->use_tls())
-            return std::unexpected{make_error_code(client_errc::redirect_to_insecure)};
-        RedirectHop hop;
-        hop.target = url->to_target();
-        hop.target.version = version;
-        hop.target.h2c = h2c;
-        hop.url_target = std::string{url->target};
-        hop.url = std::move(whole);
-        return hop;
-    }
-
-    ClientConfig m_cfg;
-    asio::any_io_executor m_executor; // the executor this Client is pinned to (model A)
-    std::shared_ptr<detail::ClientEngine> m_impl;
-};
-
-inline asio::awaitable<std::expected<Stream, error_code>> RequestBuilder::send_stream() const {
-    if (m_json_failed) {
-        co_return std::unexpected{make_error_code(asio::error::invalid_argument)};
-    }
-    auto stream = co_await m_client->open_stream(build_url(), StreamSpec{m_method,
-                                                                         {},
-                                                                         m_headers,
-                                                                         /*expect_100_continue=*/false,
-                                                                         /*close=*/false,
-                                                                         m_head_timeout,
-                                                                         m_idle_timeout,
-                                                                         m_version});
-    if (!stream) {
-        co_return std::unexpected{stream.error()};
-    }
-    // The builder's body (`body()`/`json()`/`multipart()`) is the request
-    // entity. StreamSpec describes only the head, so without this the body was
-    // silently dropped: `.json(obj).send_stream()` sent no entity while keeping
-    // the JSON Content-Type. Write it as the first chunk and leave the write
-    // end open — the caller still owns finish(), exactly like a hand-driven
-    // stream. (Calling finish() here made the caller's own finish() fail with
-    // body_not_streaming.)
-    if (!m_body.empty()) {
-        if (auto ec = co_await stream->write(std::string{m_body}); ec) {
-            co_return std::unexpected{ec};
-        }
-    }
-    co_return stream;
+inline RequestBuilder Client::get(std::string url) const { return RequestBuilder(this, Method::Get, std::move(url)); }
+inline RequestBuilder Client::post(std::string url) const { return RequestBuilder(this, Method::Post, std::move(url)); }
+inline RequestBuilder Client::put(std::string url) const { return RequestBuilder(this, Method::Put, std::move(url)); }
+inline RequestBuilder Client::del(std::string url) const {
+    return RequestBuilder(this, Method::Delete, std::move(url));
+}
+inline RequestBuilder Client::head(std::string url) const { return RequestBuilder(this, Method::Head, std::move(url)); }
+inline RequestBuilder Client::patch(std::string url) const {
+    return RequestBuilder(this, Method::Patch, std::move(url));
+}
+inline RequestBuilder Client::request(Method method, std::string url) const {
+    return RequestBuilder(this, method, std::move(url));
 }
 
-inline asio::awaitable<std::expected<Response, error_code>> RequestBuilder::send() const {
-    const std::string url = build_url();
-    if (m_json_failed) {
-        co_return std::unexpected{make_error_code(asio::error::invalid_argument)};
+// --- implementation ----------------------------------------------------------
+
+inline std::shared_ptr<detail::ClientSession> Client::take_cached(std::string_view origin,
+                                                                  HttpVersionPolicy version) const {
+    if (m_cached_session && m_cached_origin == origin && m_cached_session->alive()) {
+        auto session = m_cached_session;
+        if (version != HttpVersionPolicy::Auto) {
+            const Version wanted = version == HttpVersionPolicy::Http11   ? Version::Http11
+                                   : version == HttpVersionPolicy::Http2  ? Version::Http2
+                                                                          : Version::Http3;
+            if (session->version() != wanted) {
+                // Do not reuse a connection of the wrong version. Keep it in
+                // the cache: a failed dial then leaves the previous (still
+                // valid) connection available for a later Auto request.
+                return nullptr;
+            }
+        }
+        // A multiplexed session (h2/h3) can take another stream as long as it is
+        // keepable; a single-stream session (h1) needs its previous exchange
+        // finished before it can be reused. The old check refused multiplexed
+        // sessions outright, so every h2/h3 request redialed and abandoned the
+        // previous connection (which then sat on its QUIC idle timer).
+        const bool usable = session->multiplexes() ? session->keepable() : session->reusable();
+        if (usable) {
+            return session;
+        }
+        session->close();
+        m_cached_session.reset();
+    }
+    return nullptr;
+}
+
+inline void Client::cache(std::string origin, std::shared_ptr<detail::ClientSession> session) const {
+    m_cached_origin = std::move(origin);
+    m_cached_session = std::move(session);
+}
+
+// --- session construction -----------------------------------------------------
+
+template <typename Transport>
+inline void Client::start_session(std::shared_ptr<Transport> transport, const detail::Url &url,
+                                  HttpVersionPolicy version, DialDone done) const {
+    if (version == HttpVersionPolicy::Http2) {
+        auto h2_target = url.to_target();
+        h2_target.version = HttpVersionPolicy::Http2;
+        auto session = std::make_shared<detail::Http2ClientSession<Transport>>(transport, h2_target, m_config.limits,
+                                                                               m_config.idle_timeout);
+        session->start([session, done = std::move(done)](error_code sec) mutable {
+            if (sec) {
+                std::move(done)(sec, nullptr);
+                return;
+            }
+            std::move(done)(error_code{}, session);
+        });
+        return;
+    }
+    if (version == HttpVersionPolicy::Http3) {
+        std::move(done)(make_error_code(client_errc::version_not_negotiated), nullptr);
+        return;
+    }
+    auto session = std::make_shared<detail::Http1ClientSession<Transport>>(transport, url.authority(), m_config.limits);
+    std::move(done)(error_code{}, session);
+}
+
+template <typename Transport>
+inline void Client::start_negotiated_session(std::shared_ptr<Transport> transport, const detail::Url &url,
+                                             HttpVersionPolicy version, DialDone done) const {
+    if (version == HttpVersionPolicy::Http11 && transport->alpn_selected() == "h2") {
+        std::move(done)(make_error_code(client_errc::version_not_negotiated), nullptr);
+        return;
+    }
+    if (version == HttpVersionPolicy::Http2 && transport->alpn_selected() != "h2") {
+        std::move(done)(make_error_code(client_errc::version_not_negotiated), nullptr);
+        return;
+    }
+    if (transport->alpn_selected() == "h2") {
+        auto h2_target = url.to_target();
+        h2_target.version = HttpVersionPolicy::Http2;
+        auto session = std::make_shared<detail::Http2ClientSession<Transport>>(transport, h2_target, m_config.limits,
+                                                                               m_config.idle_timeout);
+        session->start([session, done = std::move(done)](error_code sec) mutable {
+            if (sec) {
+                std::move(done)(sec, nullptr);
+                return;
+            }
+            std::move(done)(error_code{}, session);
+        });
+        return;
+    }
+    auto session = std::make_shared<detail::Http1ClientSession<Transport>>(transport, url.authority(), m_config.limits);
+    std::move(done)(error_code{}, session);
+}
+
+template <typename Transport>
+inline void Client::tls_handshake_and_start(std::shared_ptr<Transport> transport, const detail::Url &url,
+                                            HttpVersionPolicy version, DialDone done) const {
+    detail::ClientTlsHandshake hs;
+    hs.sni = url.host;
+    hs.verify_host = m_config.tls.verify_host;
+    switch (version) {
+    case HttpVersionPolicy::Http11:
+        hs.alpn_wire = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+        break;
+    case HttpVersionPolicy::Http2:
+        // Force h2: offering http/1.1 would let the peer negotiate a version
+        // the caller explicitly refused.
+        hs.alpn_wire = {2, 'h', '2'};
+        break;
+    case HttpVersionPolicy::Auto:
+    default:
+        hs.alpn_wire = {2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+        break;
+    }
+    auto self = keep_alive();
+    detail::async_tls_client_handshake(
+        *transport, hs, [self, transport, url, version, done = std::move(done)](error_code hec) mutable {
+            if (hec) {
+                transport->close();
+                std::move(done)(hec, nullptr);
+                return;
+            }
+            self->start_negotiated_session(transport, url, version, std::move(done));
+        });
+}
+
+namespace detail {
+
+// Connects to `endpoints`, bounding the attempt by `limit` (0 = unbounded).
+// On timeout the socket is closed, which makes the composed async_connect
+// finish with operation_aborted; that completion is swallowed and the caller
+// sees client_errc::connect_timeout instead. The endpoint list is kept alive by
+// the shared state because async_connect only stores iterators into it.
+inline void async_connect_bounded(std::shared_ptr<asio::ip::tcp::socket> socket,
+                                  std::shared_ptr<std::vector<asio::ip::tcp::endpoint>> endpoints,
+                                  std::chrono::milliseconds limit, asio::any_io_executor ex,
+                                  asio::any_completion_handler<void(error_code, asio::ip::tcp::endpoint)> done) {
+    struct State {
+        std::shared_ptr<asio::ip::tcp::socket> socket;
+        std::shared_ptr<std::vector<asio::ip::tcp::endpoint>> endpoints;
+        std::shared_ptr<asio::steady_timer> timer;
+        asio::any_completion_handler<void(error_code, asio::ip::tcp::endpoint)> done;
+        bool finished{false};
+    };
+
+    auto state = std::make_shared<State>();
+    state->socket = std::move(socket);
+    state->endpoints = std::move(endpoints);
+    state->done = std::move(done);
+
+    auto finish = [state](error_code ec, asio::ip::tcp::endpoint peer) {
+        if (state->finished) {
+            return;
+        }
+        state->finished = true;
+        if (state->timer) {
+            state->timer->cancel();
+        }
+        auto completion = std::move(state->done);
+        std::move(completion)(ec, std::move(peer));
+    };
+
+    if (limit.count() > 0) {
+        state->timer = std::make_shared<asio::steady_timer>(ex);
+        state->timer->expires_after(limit);
+        state->timer->async_wait([state, finish](error_code ec) mutable {
+            if (ec) {
+                return; // the connect finished first and cancelled the timer
+            }
+            error_code ignored;
+            state->socket->cancel(ignored);
+            state->socket->close(ignored);
+            finish(make_error_code(client_errc::connect_timeout), asio::ip::tcp::endpoint{});
+        });
     }
 
-    // Hop onto the client's pinned executor *before* building the Request: its
-    // Body channel must be created on that executor (model A).
-    co_await asio::dispatch(asio::bind_executor(m_client->m_executor, asio::use_awaitable));
+    asio::async_connect(
+        *state->socket, *state->endpoints,
+        [state, finish](error_code ec, const asio::ip::tcp::endpoint &peer) mutable { finish(ec, peer); });
+}
 
-    auto request = std::make_shared<Request>(Version::Http11, co_await asio::this_coro::executor);
-    request->set_method(m_method);
-    request->set_url(url);
-    request->mutable_headers() = m_headers;
-    if (!m_body.empty()) {
-        request->set_body(m_body);
+// Reads a response head under a deadline. The timer emits into a cancellation
+// signal bound to the read, so the pending socket read is aborted and the
+// caller sees `reason` instead of the inner operation_aborted. A zero limit
+// disables the deadline.
+inline void async_read_head_bounded(std::shared_ptr<ClientStream> stream, std::chrono::milliseconds limit,
+                                    client_errc reason,
+                                    asio::any_completion_handler<void(error_code, ResponseHead)> done) {
+    struct State {
+        std::shared_ptr<ClientStream> stream;
+        client_errc reason;
+        asio::any_completion_handler<void(error_code, ResponseHead)> done;
+        asio::steady_timer timer;
+        asio::cancellation_signal signal;
+        bool finished{false};
+        bool timed_out{false};
+
+        State(std::shared_ptr<ClientStream> s, client_errc r)
+            : stream(std::move(s)), reason(r), timer(stream->head_executor()) {}
+    };
+
+    auto state = std::make_shared<State>(std::move(stream), reason);
+    state->done = std::move(done);
+    auto finish = [state](error_code ec, ResponseHead head) {
+        if (state->finished) {
+            return;
+        }
+        state->finished = true;
+        state->timer.cancel();
+        auto completion = std::move(state->done);
+        std::move(completion)(ec, std::move(head));
+    };
+    if (limit.count() > 0) {
+        state->timer.expires_after(limit);
+        state->timer.async_wait([state](error_code ec) {
+            if (ec || state->finished) {
+                return;
+            }
+            state->timed_out = true;
+            state->signal.emit(asio::cancellation_type::terminal);
+        });
+    }
+    state->stream->async_read_head(
+        asio::bind_cancellation_slot(state->signal.slot(), [state, finish](error_code ec, ResponseHead head) mutable {
+            if (ec == asio::error::operation_aborted && state->timed_out) {
+                finish(make_error_code(state->reason), ResponseHead{});
+                return;
+            }
+            finish(ec, std::move(head));
+        }));
+}
+
+// Same shape for a single body read (per-read idle deadline).
+inline void async_read_bounded(std::shared_ptr<ClientStream> stream, std::chrono::milliseconds limit,
+                               client_errc reason, asio::any_completion_handler<void(error_code, ReadResult)> done) {
+    struct State {
+        std::shared_ptr<ClientStream> stream;
+        client_errc reason;
+        asio::any_completion_handler<void(error_code, ReadResult)> done;
+        asio::steady_timer timer;
+        asio::cancellation_signal signal;
+        bool finished{false};
+        bool timed_out{false};
+
+        State(std::shared_ptr<ClientStream> s, client_errc r)
+            : stream(std::move(s)), reason(r), timer(stream->head_executor()) {}
+    };
+
+    auto state = std::make_shared<State>(std::move(stream), reason);
+    state->done = std::move(done);
+    auto finish = [state](error_code ec, ReadResult result) {
+        if (state->finished) {
+            return;
+        }
+        state->finished = true;
+        state->timer.cancel();
+        auto completion = std::move(state->done);
+        std::move(completion)(ec, std::move(result));
+    };
+    if (limit.count() > 0) {
+        state->timer.expires_after(limit);
+        state->timer.async_wait([state](error_code ec) {
+            if (ec || state->finished) {
+                return;
+            }
+            state->timed_out = true;
+            state->signal.emit(asio::cancellation_type::terminal);
+        });
+    }
+    state->stream->async_read(
+        asio::bind_cancellation_slot(state->signal.slot(), [state, finish](error_code ec, ReadResult result) mutable {
+            if (ec == asio::error::operation_aborted && state->timed_out) {
+                finish(make_error_code(state->reason), ReadResult{});
+                return;
+            }
+            finish(ec, std::move(result));
+        }));
+}
+
+// Read the whole body with a per-read idle deadline and an optional cap.
+// The pending read owns the state; the continuation is an ordinary function
+// rather than a shared std::function, which would capture the state it is
+// stored in and never be released.
+struct ReadAllBoundedState {
+    std::shared_ptr<ClientStream> stream;
+    std::size_t max_bytes{0};
+    std::chrono::milliseconds idle_limit;
+    asio::any_completion_handler<void(error_code, std::string)> done;
+    std::string out;
+    bool finished{false};
+};
+
+inline void read_all_bounded_next(const std::shared_ptr<ReadAllBoundedState> &state);
+
+inline void async_read_all_bounded(std::shared_ptr<ClientStream> stream, std::size_t max_bytes,
+                                   std::chrono::milliseconds idle_limit,
+                                   asio::any_completion_handler<void(error_code, std::string)> done) {
+    auto state = std::make_shared<ReadAllBoundedState>();
+    state->stream = std::move(stream);
+    state->max_bytes = max_bytes;
+    state->idle_limit = idle_limit;
+    state->done = std::move(done);
+    read_all_bounded_next(state);
+}
+
+inline void read_all_bounded_next(const std::shared_ptr<ReadAllBoundedState> &state) {
+    async_read_bounded(state->stream, state->idle_limit, client_errc::body_idle_timeout,
+                       [state](error_code ec, ReadResult chunk) {
+                           if (state->finished) {
+                               return;
+                           }
+                           if (ec) {
+                               state->finished = true;
+                               auto completion = std::move(state->done);
+                               std::move(completion)(ec, std::string{});
+                               return;
+                           }
+                           if (chunk.eof) {
+                               state->finished = true;
+                               auto completion = std::move(state->done);
+                               std::move(completion)(error_code{}, std::move(state->out));
+                               return;
+                           }
+                           if (state->max_bytes != 0 && state->out.size() + chunk.data.size() > state->max_bytes) {
+                               state->finished = true;
+                               auto completion = std::move(state->done);
+                               std::move(completion)(make_error_code(client_errc::body_too_large), std::string{});
+                               return;
+                           }
+                           state->out.append(chunk.data);
+                           read_all_bounded_next(state);
+                       });
+}
+
+} // namespace detail
+
+inline void Client::dial(const detail::Url &url, HttpVersionPolicy version, DialDone done) const {
+    if (version == HttpVersionPolicy::Http3) {
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+        dial_h3(url, std::move(done));
+        return;
+#else
+        std::move(done)(make_error_code(client_errc::version_not_negotiated), nullptr);
+        return;
+#endif
+    }
+    auto selection = detail::select_proxy(m_config, url.to_target());
+    if (!selection) {
+        std::move(done)(selection.error(), nullptr);
+        return;
+    }
+    if (*selection) {
+        dial_via_proxy(url, **selection, version, std::move(done));
+        return;
     }
 
-    // The builder's timeouts are layered (head / body-idle), not an overall
-    // request budget: hand them through as such. ClientConfig::request_timeout
-    // remains the overall bound.
-    co_return co_await m_client->send(std::move(request), url, m_max_body_bytes, {}, m_version, m_head_timeout,
-                                      m_idle_timeout);
+    auto self = keep_alive();
+    async_resolve_endpoints(
+        m_config.resolve, url.host, url.effective_port(), m_executor,
+        [self, url, version, done = std::move(done)](error_code ec,
+                                                     std::vector<asio::ip::tcp::endpoint> endpoints) mutable {
+            if (ec) {
+                std::move(done)(ec, nullptr);
+                return;
+            }
+            if (endpoints.empty()) {
+                std::move(done)(make_error_code(asio::error::host_not_found), nullptr);
+                return;
+            }
+            auto socket = std::make_shared<asio::ip::tcp::socket>(self->m_executor);
+            error_code option_ec;
+            if (self->m_config.tcp_nodelay) {
+                socket->set_option(asio::ip::tcp::no_delay(true), option_ec);
+            }
+            if (self->m_config.tcp_keepalive) {
+                socket->set_option(asio::socket_base::keep_alive(true), option_ec);
+            }
+            if (self->m_config.socket_setup) {
+                try {
+                    self->m_config.socket_setup(*socket);
+                } catch (const std::exception &) {
+                }
+            }
+            detail::async_connect_bounded(
+                socket, std::make_shared<std::vector<asio::ip::tcp::endpoint>>(std::move(endpoints)),
+                self->m_config.connect_timeout, self->m_executor,
+                [self, url, socket, version,
+                 done = std::move(done)](error_code cec, asio::ip::tcp::endpoint peer) mutable {
+                    if (cec) {
+                        std::move(done)(cec, nullptr);
+                        return;
+                    }
+                    if (!url.use_tls()) {
+                        self->start_session(std::make_shared<TcpStreamTransport>(socket, peer), url, version,
+                                            std::move(done));
+                        return;
+                    }
+                    auto context = self->m_tls_context;
+                    if (!context) {
+                        try {
+                            context = detail::make_client_ssl_context(self->m_config.tls);
+                        } catch (const std::exception &) {
+                            std::move(done)(make_error_code(client_errc::invalid_spec), nullptr);
+                            return;
+                        }
+                    }
+                    auto stream =
+                        std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(std::move(*socket), *context);
+                    self->tls_handshake_and_start(std::make_shared<TlsStreamTransport>(stream, peer), url, version,
+                                                  std::move(done));
+                });
+        });
+}
+
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+inline void Client::dial_h3(const detail::Url &url, DialDone done) const {
+    if (!url.use_tls()) {
+        // QUIC carries TLS 1.3 itself; there is no plain http:// form.
+        std::move(done)(make_error_code(client_errc::version_not_negotiated), nullptr);
+        return;
+    }
+    auto context = m_tls_context;
+    if (!context) {
+        try {
+            context = detail::make_client_ssl_context(m_config.tls);
+        } catch (const std::exception &) {
+            std::move(done)(make_error_code(client_errc::invalid_spec), nullptr);
+            return;
+        }
+    }
+    detail::ClientTlsHandshake hs;
+    hs.sni = m_config.tls.sni_override.empty() ? url.host : m_config.tls.sni_override;
+    hs.verify_host = m_config.tls.verify_host && m_config.tls.verify_peer;
+    // QUIC mandates ALPN; HTTP/3 offers exactly h3 (TlsClientConfig::alpn is a
+    // TCP-side override and does not apply here).
+    hs.alpn_wire.assign(quic::kHttp3AlpnWire.begin(), quic::kHttp3AlpnWire.end());
+
+    auto target = url.to_target();
+    target.version = HttpVersionPolicy::Http3;
+    detail::Http3ClientSession<asio::any_io_executor>::async_connect(
+        m_executor, context->native_handle(), target, hs, m_config.limits, m_config.quic_max_udp_payload_size,
+        m_config.connect_timeout, m_config.idle_timeout, m_config.resolve,
+        // Keep the SSL_CTX alive until the connection (and therefore SSL_new,
+        // which takes its own reference) has been created. When the Client had
+        // no context of its own, `context` above is a local that would otherwise
+        // die as soon as dial_h3 returns; ConnectState only stores a raw pointer.
+        [context, done = std::move(done)](
+            error_code ec, std::shared_ptr<detail::Http3ClientSession<asio::any_io_executor>> session) mutable {
+            if (ec) {
+                std::move(done)(ec, nullptr);
+                return;
+            }
+            std::move(done)(error_code{}, std::shared_ptr<detail::ClientSession>(std::move(session)));
+        });
+}
+#endif
+
+inline void Client::dial_via_proxy(const detail::Url &url, const ProxyConfig &proxy, HttpVersionPolicy version,
+                                   DialDone done) const {
+    auto self = keep_alive();
+    async_resolve_endpoints(
+        m_config.resolve, proxy.host, proxy.effective_port(), m_executor,
+        [self, url, proxy, version, done = std::move(done)](
+            error_code ec, std::vector<asio::ip::tcp::endpoint> endpoints) mutable {
+            if (ec) {
+                std::move(done)(ec, nullptr);
+                return;
+            }
+            if (endpoints.empty()) {
+                std::move(done)(make_error_code(asio::error::host_not_found), nullptr);
+                return;
+            }
+            auto socket = std::make_shared<asio::ip::tcp::socket>(self->m_executor);
+            detail::async_connect_bounded(
+                socket, std::make_shared<std::vector<asio::ip::tcp::endpoint>>(std::move(endpoints)),
+                self->m_config.connect_timeout, self->m_executor,
+                [self, url, proxy, socket, version, done = std::move(done)](error_code cec,
+                                                                            asio::ip::tcp::endpoint peer) mutable {
+                    if (cec) {
+                        std::move(done)(cec, nullptr);
+                        return;
+                    }
+                    SIMPLE_HTTP_DEBUG_LOG("client: tunnelling {} through proxy {}", url.authority(), proxy.authority());
+                    if (proxy.kind != ProxyKind::Https) {
+                        // Plaintext proxy leg: CONNECT/SOCKS5 on the socket, then
+                        // either the transport itself or the origin TLS inside it.
+                        auto after_tunnel = [self, url, socket, peer, version,
+                                             done = std::move(done)](error_code tec) mutable {
+                            if (tec) {
+                                error_code ignored;
+                                socket->close(ignored);
+                                std::move(done)(tec, nullptr);
+                                return;
+                            }
+                            if (!url.use_tls()) {
+                                self->start_session(std::make_shared<TcpStreamTransport>(socket, peer), url, version,
+                                                    std::move(done));
+                                return;
+                            }
+                            auto context = self->m_tls_context;
+                            if (!context) {
+                                try {
+                                    context = detail::make_client_ssl_context(self->m_config.tls);
+                                } catch (const std::exception &) {
+                                    std::move(done)(make_error_code(client_errc::invalid_spec), nullptr);
+                                    return;
+                                }
+                            }
+                            auto stream = std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(std::move(*socket),
+                                                                                                     *context);
+                            self->tls_handshake_and_start(std::make_shared<TlsStreamTransport>(stream, peer), url,
+                                                          version, std::move(done));
+                        };
+                        if (proxy.kind == ProxyKind::Socks5) {
+                            detail::async_socks5_connect(*socket, proxy, url.host, url.effective_port(),
+                                                         std::move(after_tunnel));
+                        } else {
+                            detail::async_http_connect(*socket, proxy, url.authority(), std::move(after_tunnel));
+                        }
+                        return;
+                    }
+
+                    // HTTPS proxy: TLS to the proxy, CONNECT inside it, then the
+                    // origin's own stream (plaintext inside the proxy TLS, or
+                    // TLS-over-TLS).
+                    std::shared_ptr<asio::ssl::context> proxy_context;
+                    try {
+                        proxy_context = detail::make_proxy_ssl_context(proxy, self->m_config.tls);
+                    } catch (const std::exception &e) {
+                        SIMPLE_HTTP_ERROR_LOG("client proxy: ssl context for {}: {}", proxy.authority(), e.what());
+                        error_code ignored;
+                        socket->close(ignored);
+                        std::move(done)(make_error_code(client_errc::proxy_error), nullptr);
+                        return;
+                    }
+                    auto inner =
+                        std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(std::move(*socket), *proxy_context);
+                    auto proxy_transport = std::make_shared<TlsStreamTransport>(inner, peer);
+                    detail::ClientTlsHandshake hs;
+                    hs.sni = proxy.server_name.empty() ? proxy.host : proxy.server_name;
+                    hs.verify_host = proxy.verify_peer && proxy.verify_host;
+                    hs.alpn_wire = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+                    detail::async_tls_client_handshake(
+                        *proxy_transport, hs,
+                        [self, url, proxy, proxy_transport, inner, peer, version,
+                         done = std::move(done)](error_code hec) mutable {
+                            if (hec) {
+                                proxy_transport->close();
+                                std::move(done)(hec, nullptr);
+                                return;
+                            }
+                            auto after_tunnel = [self, url, inner, peer, version,
+                                                 done = std::move(done)](error_code tec) mutable {
+                                if (tec) {
+                                    error_code ignored;
+                                    inner->lowest_layer().close(ignored);
+                                    std::move(done)(tec, nullptr);
+                                    return;
+                                }
+                                if (!url.use_tls()) {
+                                    // Plaintext origin inside the proxy's TLS
+                                    // connection: the proxy TLS stream is just the
+                                    // tunnel's byte stream.
+                                    self->start_session(std::make_shared<TlsStreamTransport>(inner, peer), url, version,
+                                                        std::move(done));
+                                    return;
+                                }
+                                auto context = self->m_tls_context;
+                                if (!context) {
+                                    try {
+                                        context = detail::make_client_ssl_context(self->m_config.tls);
+                                    } catch (const std::exception &) {
+                                        std::move(done)(make_error_code(client_errc::invalid_spec), nullptr);
+                                        return;
+                                    }
+                                }
+                                auto outer =
+                                    std::make_shared<asio::ssl::stream<asio::ssl::stream<asio::ip::tcp::socket>>>(
+                                        std::move(*inner), *context);
+                                self->tls_handshake_and_start(std::make_shared<NestedTlsTransport>(outer, peer), url,
+                                                              version, std::move(done));
+                            };
+                            if (proxy.kind == ProxyKind::Socks5) {
+                                detail::async_socks5_connect(*inner, proxy, url.host, url.effective_port(),
+                                                             std::move(after_tunnel));
+                            } else {
+                                detail::async_http_connect(*inner, proxy, url.authority(), std::move(after_tunnel));
+                            }
+                        });
+                });
+        });
+}
+
+inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, std::size_t max_body_bytes,
+                             std::size_t redirects, std::size_t retries,
+                             std::chrono::milliseconds response_head_timeout,
+                             std::chrono::milliseconds body_idle_timeout, HttpVersionPolicy version,
+                             asio::any_completion_handler<void(error_code, Response)> done) const {
+    // Per-request budgets override the Client's defaults (0 = use the default).
+    const std::chrono::milliseconds head_budget =
+        response_head_timeout.count() > 0 ? response_head_timeout : m_config.response_head_timeout;
+    const std::chrono::milliseconds idle_budget =
+        body_idle_timeout.count() > 0 ? body_idle_timeout : m_config.body_idle_timeout;
+
+    auto parsed = detail::parse_url(url);
+    if (!parsed) {
+        std::move(done)(parsed.error(), Response{});
+        return;
+    }
+    const detail::Url &target = *parsed;
+    request->set_target(std::string{target.target});
+    if (m_config.cookie_jar && !request->header(field::cookie)) {
+        const std::string cookies = m_config.cookie_jar->cookie_header(url);
+        if (!cookies.empty())
+            request->mutable_headers().add(std::string{field::cookie}, cookies);
+    }
+    const std::string origin = target.scheme + "://" + target.authority();
+    auto session = take_cached(origin, version);
+    auto self = keep_alive();
+    auto start = [self, request, url, target, origin, max_body_bytes, redirects, retries, head_budget, idle_budget,
+                  version, done = std::move(done)](std::shared_ptr<detail::ClientSession> ready) mutable {
+        auto open_done = [self, request, url, target, origin, max_body_bytes, redirects, retries, head_budget,
+                          idle_budget, version,
+                          done = std::move(done)](error_code oec,
+                                                  std::shared_ptr<detail::ClientStream> stream) mutable {
+            if (oec) {
+                std::move(done)(oec, Response{});
+                return;
+            }
+            detail::async_read_head_bounded(
+                stream, head_budget, client_errc::response_head_timeout,
+                [self, request, url, target, origin, max_body_bytes, redirects, retries, head_budget, idle_budget,
+                 stream, version, done = std::move(done)](error_code hec, detail::ResponseHead head) mutable {
+                    if (hec) {
+                        std::move(done)(hec, Response{});
+                        return;
+                    }
+                    const int status = head.status;
+                    const bool is_redirect =
+                        (status == 301 || status == 302 || status == 303 || status == 307 || status == 308);
+                    const auto location = head.header(field::location);
+                    if (is_redirect && location && self->m_config.max_redirects > 0) {
+                        if (redirects >= self->m_config.max_redirects) {
+                            std::move(done)(make_error_code(client_errc::too_many_redirects), Response{});
+                            return;
+                        }
+                        const std::string location_value{*location};
+                        detail::async_read_all_bounded(
+                            stream, 0, idle_budget,
+                            [self, request, url, target, origin, max_body_bytes, redirects, retries, head_budget,
+                             idle_budget, status, location_value, version,
+                             done = std::move(done)](error_code bec, std::string) mutable {
+                                if (bec) {
+                                    std::move(done)(bec, Response{});
+                                    return;
+                                }
+                                // Resolve the Location: absolute, or relative to
+                                // the current origin.
+                                std::string next_url;
+                                if (location_value.find("://") != std::string::npos) {
+                                    next_url = location_value;
+                                } else if (!location_value.empty() && location_value.front() == '/') {
+                                    next_url = target.scheme + "://" + target.authority() + location_value;
+                                } else {
+                                    next_url = url + "/" + location_value;
+                                }
+                                auto next = detail::parse_url(next_url);
+                                if (!next) {
+                                    std::move(done)(next.error(), Response{});
+                                    return;
+                                }
+                                const bool same_origin = next->scheme == target.scheme && next->host == target.host &&
+                                                         next->effective_port() == target.effective_port();
+                                // Replay from the saved body: the first hop
+                                // consumed the live Body, and a 307/308 must
+                                // resend the same entity. clone_for_replay keeps
+                                // the method token, target and headers.
+                                auto replay = request->clone_for_replay(self->m_executor);
+                                if (!same_origin) {
+                                    replay->mutable_headers().erase(field::authorization);
+                                    replay->mutable_headers().erase(field::cookie);
+                                }
+                                if (status == 303 ||
+                                    ((status == 301 || status == 302) && replay->method() != Method::Get &&
+                                     replay->method() != Method::Head)) {
+                                    replay->set_method(Method::Get);
+                                    // The entity is dropped on this hop. Mark
+                                    // the replay bodyless (unknown length) so
+                                    // the HTTP/1.1 writer does not advertise
+                                    // "content-length: 0" -- Go sends none.
+                                    replay->set_body(std::string{});
+                                    replay->set_stream_body(false);
+                                    replay->set_content_length(-1);
+                                }
+                                self->send_hop(std::move(replay), std::move(next_url), max_body_bytes, redirects + 1,
+                                               retries, head_budget, idle_budget, version, std::move(done));
+                            });
+                        return;
+                    }
+                    // max_redirects == 0 (or no Location): the 3xx is final.
+                    detail::async_read_all_bounded(
+                        stream, max_body_bytes, idle_budget,
+                        [self, url, request, head, stream, max_body_bytes, retries, head_budget, idle_budget, version,
+                         done = std::move(done)](error_code bec, std::string body) mutable {
+                            if (bec) {
+                                std::move(done)(bec, Response{});
+                                return;
+                            }
+                            if (self->m_config.cookie_jar)
+                                self->m_config.cookie_jar->store(url, head.headers);
+                            // Opt-in status retry (default off, matching Go and
+                            // reqwest): the body is consumed, so the retry is a
+                            // fresh exchange from the saved request source.
+                            const auto &policy = self->m_config.retry;
+                            const bool retry_status =
+                                retries < policy.max_retries && !policy.retry_statuses.empty() &&
+                                std::find(policy.retry_statuses.begin(), policy.retry_statuses.end(), head.status) !=
+                                    policy.retry_statuses.end() &&
+                                (is_idempotent(request->method()) || policy.retry_status_on_non_idempotent) &&
+                                !request->stream_body();
+                            if (retry_status) {
+                                const auto retry_after = head.header(field::retry_after);
+                                const auto delay =
+                                    retry_after ? retry_after_delay(*retry_after) : retry_delay(policy, retries + 1);
+                                SIMPLE_HTTP_WARN_LOG("client: {} returned {}, retry {} of {}", url, head.status,
+                                                     retries + 1, policy.max_retries);
+                                auto timer = std::make_shared<asio::steady_timer>(self->m_executor);
+                                timer->expires_after(delay);
+                                timer->async_wait(
+                                    [self, request, url, max_body_bytes, head_budget, idle_budget, retries, timer,
+                                     version, done = std::move(done)](error_code tec) mutable {
+                                        if (tec) {
+                                            return;
+                                        }
+                                        self->send_hop(request->clone_for_replay(self->m_executor), url,
+                                                       max_body_bytes,
+                                                       /*redirects=*/0, retries + 1, head_budget, idle_budget,
+                                                       version, std::move(done));
+                                    });
+                                return;
+                            }
+                            if (self->m_config.auto_decompress && request->get_state<detail::AutoDecompressMark>() &&
+                                request->method() != Method::Head && !request->header(field::range)) {
+                                if (const auto encoding = head.header(field::content_encoding)) {
+                                    const ContentCoding coding = parse_content_coding(*encoding);
+                                    const bool wanted = (coding == ContentCoding::Gzip &&
+                                                         std::find(self->m_config.accept_encodings.begin(),
+                                                                   self->m_config.accept_encodings.end(),
+                                                                   "gzip") != self->m_config.accept_encodings.end()) ||
+                                                        (coding == ContentCoding::Brotli &&
+                                                         std::find(self->m_config.accept_encodings.begin(),
+                                                                   self->m_config.accept_encodings.end(),
+                                                                   "br") != self->m_config.accept_encodings.end());
+                                    if (wanted) {
+                                        if (auto decoder = make_decoder(*encoding)) {
+                                            std::string decoded = decoder->write(body);
+                                            decoded += decoder->finish();
+                                            if (decoder->failed()) {
+                                                std::move(done)(make_error_code(client_errc::body_decode_failed),
+                                                                Response{});
+                                                return;
+                                            }
+                                            body = std::move(decoded);
+                                            head.headers.erase(field::content_encoding);
+                                            head.headers.erase(field::content_length);
+                                            head.uncompressed = true;
+                                        }
+                                    }
+                                }
+                            }
+                            Response response{head, std::move(body)};
+                            std::move(done)(error_code{}, std::move(response));
+                        });
+                });
+        };
+        if (ready) {
+            ready->open_stream(request, std::move(open_done));
+            return;
+        }
+        self->dial(target, version, [self, request, origin, open_done = std::move(open_done)](
+                                       error_code dec, std::shared_ptr<detail::ClientSession> session) mutable {
+            if (dec) {
+                open_done(dec, nullptr);
+                return;
+            }
+            self->cache(origin, session);
+            session->open_stream(request, std::move(open_done));
+        });
+    };
+    if (session) {
+        start(std::move(session));
+    } else {
+        start(nullptr);
+    }
+}
+
+inline void
+Client::open_stream_hop(std::string url, StreamSpec spec, std::size_t max_body_bytes,
+                        asio::any_completion_handler<void(error_code, std::shared_ptr<Stream>)> done) const {
+    auto parsed = detail::parse_url(url);
+    if (!parsed) {
+        std::move(done)(parsed.error(), nullptr);
+        return;
+    }
+    const detail::Url target = *parsed;
+    detail::ResponseDecoding decoding;
+    if (m_config.auto_decompress && spec.method != Method::Head && !spec.headers.get(field::accept_encoding) &&
+        !spec.headers.get(field::range) && !m_config.accept_encodings.empty()) {
+        const auto encodings = detail::normalize_accept_encodings(m_config.accept_encodings);
+        if (!encodings.empty()) {
+            spec.headers.add(std::string{field::accept_encoding}, detail::join_encodings(encodings));
+            decoding.enabled = true;
+            decoding.encodings = encodings;
+        }
+    }
+    auto request = std::make_shared<Request>(Version::Http11, m_executor);
+    request->set_method(spec.method);
+    request->set_target(spec.target.empty() ? std::string{target.target} : spec.target);
+    request->mutable_headers() = std::move(spec.headers);
+    if (spec.expect_100_continue || spec.auto_expect_continue) {
+        request->mutable_headers().add(std::string{field::expect}, "100-continue");
+    }
+    request->set_close(spec.close);
+    request->set_stream_body(true);
+    const std::chrono::milliseconds head_timeout =
+        spec.response_head_timeout.count() > 0 ? spec.response_head_timeout : m_config.response_head_timeout;
+    const std::chrono::milliseconds idle_timeout =
+        spec.body_idle_timeout.count() > 0 ? spec.body_idle_timeout : m_config.body_idle_timeout;
+    const bool auto_continue = spec.auto_expect_continue;
+    const std::chrono::milliseconds continue_timeout = spec.continue_timeout;
+    const HttpVersionPolicy version = spec.version ? *spec.version : m_config.default_version;
+    auto self = keep_alive();
+    dial(target, version,
+         [self, request, max_body_bytes, decoding, head_timeout, idle_timeout, auto_continue, continue_timeout,
+          done = std::move(done)](error_code ec, std::shared_ptr<detail::ClientSession> session) mutable {
+        if (ec) {
+            std::move(done)(ec, nullptr);
+            return;
+        }
+        session->open_stream(
+            request, [max_body_bytes, decoding, head_timeout, idle_timeout, auto_continue, continue_timeout,
+                      done = std::move(done)](error_code oec, std::shared_ptr<detail::ClientStream> stream) mutable {
+                if (oec) {
+                    std::move(done)(oec, nullptr);
+                    return;
+                }
+                auto wrapped = detail::maybe_decompressing_stream(std::move(stream), decoding, max_body_bytes);
+                std::move(done)(error_code{}, std::make_shared<Stream>(std::move(wrapped), head_timeout, idle_timeout,
+                                                                       auto_continue, continue_timeout));
+            });
+    });
+}
+
+template <typename Transport>
+inline void
+Client::begin_ws_upgrade(std::shared_ptr<Transport> transport, std::string authority, std::string path,
+                         WebSocketSpec spec,
+                         asio::any_completion_handler<void(error_code, std::shared_ptr<WebSocket>)> done) const {
+    detail::async_ws_upgrade(std::move(transport), std::move(authority), std::move(path), std::move(spec),
+                             m_config.idle_timeout, m_config.response_head_timeout, std::move(done));
+}
+
+template <typename Transport>
+inline void Client::ws_tls_handshake_and_start(
+    std::shared_ptr<Transport> transport, std::string authority, std::string path, WebSocketSpec spec, std::string sni,
+    asio::any_completion_handler<void(error_code, std::shared_ptr<WebSocket>)> done) const {
+    detail::ClientTlsHandshake hs;
+    hs.sni = std::move(sni);
+    hs.verify_host = m_config.tls.verify_host;
+    // A WebSocket must not negotiate h2, or the Upgrade would be impossible.
+    hs.alpn_wire = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+    auto self = keep_alive();
+    detail::async_tls_client_handshake(*transport, hs,
+                                       [self, transport, authority = std::move(authority), path = std::move(path),
+                                        spec = std::move(spec), done = std::move(done)](error_code hec) mutable {
+                                           if (hec) {
+                                               transport->close();
+                                               std::move(done)(hec, nullptr);
+                                               return;
+                                           }
+                                           self->begin_ws_upgrade(std::move(transport), std::move(authority),
+                                                                  std::move(path), std::move(spec), std::move(done));
+                                       });
+}
+
+inline void
+Client::open_ws_via_proxy(const detail::Url &url, const ProxyConfig &proxy, std::string path, std::string authority,
+                          WebSocketSpec spec,
+                          asio::any_completion_handler<void(error_code, std::shared_ptr<WebSocket>)> done) const {
+    auto resolver = std::make_shared<asio::ip::tcp::resolver>(m_executor);
+    auto self = keep_alive();
+    resolver->async_resolve(
+        proxy.host, std::to_string(proxy.effective_port()),
+        [self, url, proxy, path, authority, spec, resolver, done = std::move(done)](error_code ec,
+                                                                                    auto results) mutable {
+            if (ec) {
+                std::move(done)(ec, nullptr);
+                return;
+            }
+            auto socket = std::make_shared<asio::ip::tcp::socket>(self->m_executor);
+            asio::async_connect(
+                *socket, results,
+                [self, url, proxy, path, authority, spec, socket,
+                 done = std::move(done)](error_code cec, const asio::ip::tcp::endpoint &peer) mutable {
+                    if (cec) {
+                        std::move(done)(cec, nullptr);
+                        return;
+                    }
+                    if (proxy.kind != ProxyKind::Https) {
+                        auto after_tunnel = [self, url, socket, peer, path, authority, spec,
+                                             done = std::move(done)](error_code tec) mutable {
+                            if (tec) {
+                                error_code ignored;
+                                socket->close(ignored);
+                                std::move(done)(tec, nullptr);
+                                return;
+                            }
+                            if (!url.use_tls()) {
+                                self->begin_ws_upgrade(std::make_shared<TcpStreamTransport>(socket, peer),
+                                                       std::move(authority), std::move(path), std::move(spec),
+                                                       std::move(done));
+                                return;
+                            }
+                            auto context = self->m_tls_context;
+                            if (!context) {
+                                try {
+                                    context = detail::make_client_ssl_context(self->m_config.tls);
+                                } catch (const std::exception &) {
+                                    std::move(done)(make_error_code(client_errc::invalid_spec), nullptr);
+                                    return;
+                                }
+                            }
+                            auto stream = std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(std::move(*socket),
+                                                                                                     *context);
+                            self->ws_tls_handshake_and_start(std::make_shared<TlsStreamTransport>(stream, peer),
+                                                             std::move(authority), std::move(path), std::move(spec),
+                                                             url.host, std::move(done));
+                        };
+                        if (proxy.kind == ProxyKind::Socks5) {
+                            detail::async_socks5_connect(*socket, proxy, url.host, url.effective_port(),
+                                                         std::move(after_tunnel));
+                        } else {
+                            detail::async_http_connect(*socket, proxy, url.authority(), std::move(after_tunnel));
+                        }
+                        return;
+                    }
+
+                    std::shared_ptr<asio::ssl::context> proxy_context;
+                    try {
+                        proxy_context = detail::make_proxy_ssl_context(proxy, self->m_config.tls);
+                    } catch (const std::exception &e) {
+                        SIMPLE_HTTP_ERROR_LOG("client proxy: ssl context for {}: {}", proxy.authority(), e.what());
+                        error_code ignored;
+                        socket->close(ignored);
+                        std::move(done)(make_error_code(client_errc::proxy_error), nullptr);
+                        return;
+                    }
+                    auto inner =
+                        std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(std::move(*socket), *proxy_context);
+                    auto proxy_transport = std::make_shared<TlsStreamTransport>(inner, peer);
+                    detail::ClientTlsHandshake hs;
+                    hs.sni = proxy.server_name.empty() ? proxy.host : proxy.server_name;
+                    hs.verify_host = proxy.verify_peer && proxy.verify_host;
+                    hs.alpn_wire = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+                    detail::async_tls_client_handshake(
+                        *proxy_transport, hs,
+                        [self, url, proxy, proxy_transport, inner, peer, path, authority, spec,
+                         done = std::move(done)](error_code hec) mutable {
+                            if (hec) {
+                                proxy_transport->close();
+                                std::move(done)(hec, nullptr);
+                                return;
+                            }
+                            auto after_tunnel = [self, url, inner, peer, path, authority, spec,
+                                                 done = std::move(done)](error_code tec) mutable {
+                                if (tec) {
+                                    error_code ignored;
+                                    inner->lowest_layer().close(ignored);
+                                    std::move(done)(tec, nullptr);
+                                    return;
+                                }
+                                if (!url.use_tls()) {
+                                    self->begin_ws_upgrade(std::make_shared<TlsStreamTransport>(inner, peer),
+                                                           std::move(authority), std::move(path), std::move(spec),
+                                                           std::move(done));
+                                    return;
+                                }
+                                auto context = self->m_tls_context;
+                                if (!context) {
+                                    try {
+                                        context = detail::make_client_ssl_context(self->m_config.tls);
+                                    } catch (const std::exception &) {
+                                        std::move(done)(make_error_code(client_errc::invalid_spec), nullptr);
+                                        return;
+                                    }
+                                }
+                                auto outer =
+                                    std::make_shared<asio::ssl::stream<asio::ssl::stream<asio::ip::tcp::socket>>>(
+                                        std::move(*inner), *context);
+                                self->ws_tls_handshake_and_start(std::make_shared<NestedTlsTransport>(outer, peer),
+                                                                 std::move(authority), std::move(path), std::move(spec),
+                                                                 url.host, std::move(done));
+                            };
+                            if (proxy.kind == ProxyKind::Socks5) {
+                                detail::async_socks5_connect(*inner, proxy, url.host, url.effective_port(),
+                                                             std::move(after_tunnel));
+                            } else {
+                                detail::async_http_connect(*inner, proxy, url.authority(), std::move(after_tunnel));
+                            }
+                        });
+                });
+        });
+}
+
+inline void Client::open_ws_hop(std::string url, WebSocketSpec spec,
+                                asio::any_completion_handler<void(error_code, std::shared_ptr<WebSocket>)> done) const {
+    std::string http_url = url;
+    if (starts_with(url, "wss://")) {
+        http_url = "https://" + url.substr(6);
+    } else if (starts_with(url, "ws://")) {
+        http_url = "http://" + url.substr(5);
+    } else {
+        std::move(done)(make_error_code(client_errc::unsupported_scheme), nullptr);
+        return;
+    }
+    auto parsed = detail::parse_url(http_url);
+    if (!parsed) {
+        std::move(done)(parsed.error(), nullptr);
+        return;
+    }
+    const detail::Url target = *parsed;
+    const std::string path = std::string{target.target};
+    const std::string authority = target.authority();
+
+    auto selection = detail::select_proxy(m_config, target.to_target());
+    if (!selection) {
+        std::move(done)(selection.error(), nullptr);
+        return;
+    }
+    if (*selection) {
+        open_ws_via_proxy(target, **selection, path, authority, std::move(spec), std::move(done));
+        return;
+    }
+
+    auto resolver = std::make_shared<asio::ip::tcp::resolver>(m_executor);
+    auto self = keep_alive();
+    resolver->async_resolve(
+        target.host, std::to_string(target.effective_port()),
+        [self, target, resolver, path, authority, spec, done = std::move(done)](error_code ec, auto results) mutable {
+            if (ec) {
+                std::move(done)(ec, nullptr);
+                return;
+            }
+            auto socket = std::make_shared<asio::ip::tcp::socket>(self->m_executor);
+            asio::async_connect(
+                *socket, results,
+                [self, target, path, authority, spec, socket,
+                 done = std::move(done)](error_code cec, const asio::ip::tcp::endpoint &peer) mutable {
+                    if (cec) {
+                        std::move(done)(cec, nullptr);
+                        return;
+                    }
+                    if (!target.use_tls()) {
+                        self->begin_ws_upgrade(std::make_shared<TcpStreamTransport>(socket, peer), std::move(authority),
+                                               std::move(path), std::move(spec), std::move(done));
+                        return;
+                    }
+                    auto context = self->m_tls_context;
+                    if (!context) {
+                        try {
+                            context = detail::make_client_ssl_context(self->m_config.tls);
+                        } catch (const std::exception &) {
+                            std::move(done)(make_error_code(client_errc::invalid_spec), nullptr);
+                            return;
+                        }
+                    }
+                    auto stream =
+                        std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(std::move(*socket), *context);
+                    error_code ep_ec;
+                    const auto endpoint = stream->lowest_layer().remote_endpoint(ep_ec);
+                    auto transport = std::make_shared<TlsStreamTransport>(stream, endpoint);
+                    self->ws_tls_handshake_and_start(std::move(transport), std::move(authority), std::move(path),
+                                                     std::move(spec), target.host, std::move(done));
+                });
+        });
 }
 
 } // namespace simple_http

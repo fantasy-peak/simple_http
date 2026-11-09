@@ -101,7 +101,8 @@ inline std::string base64_decode_alphabet(const std::array<int, 256> &rev, std::
 inline const std::array<int, 256> &base64_std_reverse() {
     static constexpr std::array<int, 256> rev = [] {
         std::array<int, 256> table{};
-        table.fill(-1);
+        for (std::size_t k = 0; k < table.size(); ++k)
+            table[k] = -1;
         for (int i = 0; i < 64; ++i)
             table[static_cast<unsigned char>(base64_std_alphabet[i])] = i;
         return table;
@@ -112,7 +113,8 @@ inline const std::array<int, 256> &base64_std_reverse() {
 inline const std::array<int, 256> &base64_url_reverse() {
     static constexpr std::array<int, 256> rev = [] {
         std::array<int, 256> table{};
-        table.fill(-1);
+        for (std::size_t k = 0; k < table.size(); ++k)
+            table[k] = -1;
         for (int i = 0; i < 64; ++i)
             table[static_cast<unsigned char>(base64_url_alphabet[i])] = i;
         return table;

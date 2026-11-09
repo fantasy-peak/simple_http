@@ -24,9 +24,9 @@ RequestPtr make_request(asio::io_context &ctx, std::string path, Method method =
 
 std::shared_ptr<FakeResponseSink> dispatch(asio::io_context &ctx, Router &router, RequestPtr req,
                                            SslHandle ssl = std::nullopt) {
-    auto writer = std::make_shared<FakeResponseSink>();
+    auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
     auto res = std::make_shared<ResponseWriter>(writer);
-    REQUIRE(run_on(ctx, router.dispatch(req, res, ssl)));
+    REQUIRE(run_on(ctx, await_dispatch(router, req, res, ssl)));
     return writer;
 }
 
@@ -36,7 +36,7 @@ TEST_CASE("secure headers: the defensive baseline rides every response", "[secur
     Router router;
     router.use(middleware::secure_headers());
     router.route(any_methods, "/ok", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(status::ok).send("ok");
+        co_await res->status(status::ok).async_send("ok", asio::use_awaitable);
     });
 
     asio::io_context ctx;
@@ -55,7 +55,7 @@ TEST_CASE("secure headers: the router's own 404/405 answers get them too", "[sec
     Router router;
     router.use(middleware::secure_headers());
     router.route({Method::Get}, "/only", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(status::ok).send("ok");
+        co_await res->status(status::ok).async_send("ok", asio::use_awaitable);
     });
 
     asio::io_context ctx;
@@ -79,7 +79,7 @@ TEST_CASE("secure headers: HSTS is written only over TLS and only when configure
     cfg.hsts_preload = true;
     router.use(middleware::secure_headers(cfg));
     router.route(any_methods, "/ok", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(status::ok).send("ok");
+        co_await res->status(status::ok).async_send("ok", asio::use_awaitable);
     });
 
     asio::io_context ctx;
@@ -107,7 +107,7 @@ TEST_CASE("secure headers: a configured policy is emitted, and a handler overrid
         // A handler that needs a different value replaces the default in place,
         // so the wire sees exactly one X-Frame-Options.
         res->replace_header(field::x_frame_options, "DENY");
-        co_await res->status(status::ok).send("ok");
+        co_await res->status(status::ok).async_send("ok", asio::use_awaitable);
     });
 
     asio::io_context ctx;
