@@ -772,14 +772,15 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
     }
 
     void on_stream_stop_sending(std::int64_t stream_id, std::uint64_t app_error_code) noexcept override {
+        // The peer sent STOP_SENDING: it does not want the rest of this
+        // response. Stop producing on the write half (not the read half -- an
+        // earlier wiring called shutdown_stream_read here) and unpark a writer
+        // waiting on backpressure.
         auto it = m_streams.find(stream_id);
-        if (it != m_streams.end()) {
-            // The peer does not want the rest of this response. Unpark a writer
-            // parked on backpressure so it can observe that and stop.
+        if (it != m_streams.end())
             h3::wake(it->second->out_space);
-        }
         if (h3() != nullptr)
-            (void)nghttp3_conn_shutdown_stream_read(m_h3, stream_id);
+            (void)nghttp3_conn_shutdown_stream_write(m_h3, stream_id);
         (void)app_error_code;
     }
 
@@ -892,6 +893,18 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         return true;
     }
 
+    bool on_trailers_begin(std::int64_t stream_id) noexcept override {
+        // Trailer fields are not surfaced by the server, but nghttp3 does not
+        // bound the section: reject an oversized one like a header block.
+        if (m_h3 == nullptr || m_streams.find(stream_id) == m_streams.end())
+            return false;
+        if (nghttp3_conn_get_frame_payload_left2(m_h3, stream_id) > m_limits.max_header_bytes) {
+            m_oversize_stream = stream_id;
+            return false;
+        }
+        return true;
+    }
+
     void on_header(std::int64_t stream_id, std::int32_t /*token*/, std::string_view name,
                    std::string_view value) noexcept override {
         auto it = m_streams.find(stream_id);
@@ -935,6 +948,11 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         if (stream.headers_done)
             return; // trailers, which this layer does not surface
         stream.headers_done = true;
+        // A field callback already rejected this request (CR/LF/NUL). Do not
+        // dispatch it: the reset happens after nghttp3 returns from the read,
+        // but the handler would otherwise already have run.
+        if (m_invalid_stream == stream_id)
+            return;
 
         if (!finish_request(stream)) {
             m_invalid_stream = stream_id;

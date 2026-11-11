@@ -75,8 +75,15 @@ class TlsContext {
     // `alpn` overrides the advertised protocol list. The listener policy
     // (`TlsHttp`) is translated here, so a listener configured as
     // HTTP/1.1-only really offers http/1.1 and no h2.
-    explicit TlsContext(const TlsConfig &cfg, boost::span<const std::string_view> alpn = {})
+    //
+    // `require_alpn_match` turns "the client offered nothing we can speak" into
+    // a fatal handshake alert instead of NOACK. An HTTP/2-only listener must set
+    // it: NOACK lets the handshake succeed with no ALPN and the server then
+    // falls back to HTTP/1.1, silently defeating the policy.
+    explicit TlsContext(const TlsConfig &cfg, boost::span<const std::string_view> alpn = {},
+                        bool require_alpn_match = false)
         : m_ctx(context_method(cfg)) {
+        m_alpn_state.require_match = require_alpn_match;
         if (cfg.min_version == TlsMinVersion::Tls12) {
             // tls_server spans 1.2/1.3; pin the floor so 1.0/1.1 remain off.
             if (SSL_CTX_set_min_proto_version(m_ctx.native_handle(), TLS1_2_VERSION) != 1) {
@@ -148,26 +155,34 @@ class TlsContext {
         install_alpn(alpn);
     }
 
+    struct AlpnState {
+        std::vector<unsigned char> wire;
+        bool require_match{false};
+    };
+
     void install_alpn(boost::span<const std::string_view> alpn) {
-        m_alpn = alpn.empty() ? alpn_wire_list() : make_alpn_wire_list(alpn);
+        m_alpn_state.wire = alpn.empty() ? alpn_wire_list() : make_alpn_wire_list(alpn);
         SSL_CTX_set_alpn_select_cb(
             m_ctx.native_handle(),
             [](SSL *, const unsigned char **out, unsigned char *outlen, const unsigned char *in, unsigned int inlen,
                void *arg) -> int {
-                const auto &list = *static_cast<const std::vector<unsigned char> *>(arg);
-                if (SSL_select_next_proto(const_cast<unsigned char **>(out), outlen, list.data(),
-                                          static_cast<unsigned int>(list.size()), in,
+                const auto &state = *static_cast<const AlpnState *>(arg);
+                if (SSL_select_next_proto(const_cast<unsigned char **>(out), outlen, state.wire.data(),
+                                          static_cast<unsigned int>(state.wire.size()), in,
                                           inlen) != OPENSSL_NPN_NEGOTIATED) {
-                    return SSL_TLSEXT_ERR_NOACK;
+                    // A forced listener (HTTP/2-only) must fail closed; the
+                    // default h2+http/1.1 list may proceed without ALPN and let
+                    // the connection decide.
+                    return state.require_match ? SSL_TLSEXT_ERR_ALERT_FATAL : SSL_TLSEXT_ERR_NOACK;
                 }
                 return SSL_TLSEXT_ERR_OK;
             },
-            &m_alpn);
+            &m_alpn_state);
     }
 
     // Declared before the context it is registered with: the ALPN callback
     // holds a pointer to it, and members are destroyed in reverse order.
-    std::vector<unsigned char> m_alpn;
+    AlpnState m_alpn_state;
     asio::ssl::context m_ctx;
 };
 

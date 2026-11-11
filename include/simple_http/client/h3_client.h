@@ -115,9 +115,16 @@ template <typename Executor> class QuicClientUdp : public std::enable_shared_fro
         auto from = std::make_shared<asio::ip::udp::endpoint>();
         m_socket->async_receive_from(asio::buffer(*buf), *from,
                                      [self, conn, buf, from](error_code ec, std::size_t n) mutable {
-                                         if (ec)
-                                             return;
-                                         conn->on_datagram(boost::span<const std::uint8_t>{buf->data(), n}, *from);
+                                         if (ec) {
+                                             // ICMP port-unreachable surfaces as connection_refused on
+                                             // some stacks; treating any receive error as fatal left a
+                                             // live session that could never receive again. Only a
+                                             // cancelled/closed socket stops the loop.
+                                             if (ec == asio::error::operation_aborted || !self->m_socket->is_open())
+                                                 return;
+                                         } else {
+                                             conn->on_datagram(boost::span<const std::uint8_t>{buf->data(), n}, *from);
+                                         }
                                          self->receive_next(std::move(conn), std::move(buf));
                                      });
     }
@@ -949,7 +956,18 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
 
     bool on_headers_begin(std::int64_t stream_id) noexcept override {
         auto it = m_streams.find(stream_id);
-        return it != m_streams.end();
+        if (it == m_streams.end())
+            return false;
+        // nghttp3 does not enforce SETTINGS_MAX_FIELD_SECTION_SIZE locally; a
+        // peer could otherwise make the client buffer an arbitrarily large
+        // HEADERS block. Failing the callback aborts the connection (fail
+        // closed) before the fields are copied.
+        if (h3() != nullptr && nghttp3_conn_get_frame_payload_left2(h3(), stream_id) > m_limits.max_header_bytes) {
+            SIMPLE_HTTP_ERROR_LOG("h3 client: response header section exceeds {} bytes (stream={})",
+                                  m_limits.max_header_bytes, stream_id);
+            return false;
+        }
+        return true;
     }
 
     void on_header(std::int64_t stream_id, std::int32_t /*token*/, std::string_view name,
@@ -1027,7 +1045,14 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
     // --- trailer section (RFC 9110 §6.5, RFC 9114 §4.1) -------------------
 
     bool on_trailers_begin(std::int64_t stream_id) noexcept override {
-        return m_streams.find(stream_id) != m_streams.end();
+        if (m_streams.find(stream_id) == m_streams.end())
+            return false;
+        if (h3() != nullptr && nghttp3_conn_get_frame_payload_left2(h3(), stream_id) > m_limits.max_header_bytes) {
+            SIMPLE_HTTP_ERROR_LOG("h3 client: response trailer section exceeds {} bytes (stream={})",
+                                  m_limits.max_header_bytes, stream_id);
+            return false;
+        }
+        return true;
     }
 
     void on_trailer(std::int64_t stream_id, std::int32_t /*token*/, std::string_view name,
@@ -1442,6 +1467,18 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         auto it = m_streams.find(id);
         if (it == m_streams.end())
             return;
+        // Body bytes that reached the client but were never read still owe
+        // connection-level credit. ngtcp2 only refunds what is in its own
+        // reassembly buffer; without this, cancelling a few large downloads
+        // exhausts initial_max_data and stalls every later request on the
+        // reused session.
+        if (it->second->in_bytes > 0 && m_conn) {
+            const auto n = static_cast<std::uint64_t>(it->second->in_bytes);
+            m_conn->extend_stream_offset(id, n);
+            m_conn->extend_connection_offset(n);
+            it->second->in_bytes = 0;
+            it->second->in_queue.clear();
+        }
         h3::wake(it->second->in_space);
         h3::wake(it->second->out_space);
         m_streams.erase(it);

@@ -41,11 +41,6 @@ inline bool proxy_drops_response_field(std::string_view name) {
     return is_hop_by_hop_field(name) || name == "content-length" || name == "transfer-encoding";
 }
 
-inline bool request_has_body(const Request &request) {
-    return request.header(field::content_length).has_value() ||
-           header_has_token(request.headers(), field::transfer_encoding, "chunked");
-}
-
 } // namespace detail
 
 inline void run_http_proxy(RequestPtr req, ResponsePtr res, bool client_is_tls, HttpProxyTarget target,
@@ -93,9 +88,13 @@ inline void run_http_proxy(RequestPtr req, ResponsePtr res, bool client_is_tls, 
     auto outbound = std::make_shared<Request>(Version::Http11, req->executor());
     outbound->set_method_token(std::string{req->method_token()});
     outbound->set_target(forwarded_target);
+    // RFC 9110 §7.6.1: every field nominated by Connection is hop-by-hop too.
+    const auto inbound_conn_tokens = connection_tokens(req->headers());
     for (const auto &[name, value] : req->headers()) {
-        if (!detail::proxy_drops_request_field(name))
-            outbound->mutable_headers().add(name, value);
+        if (detail::proxy_drops_request_field(name) ||
+            std::find(inbound_conn_tokens.begin(), inbound_conn_tokens.end(), name) != inbound_conn_tokens.end())
+            continue;
+        outbound->mutable_headers().add(name, value);
     }
     std::string xff;
     if (target.preserve_inbound_forwarding) {
@@ -155,9 +154,13 @@ inline void run_http_proxy(RequestPtr req, ResponsePtr res, bool client_is_tls, 
                                    }
                                }
                                res->status(status);
+                               const auto outbound_conn_tokens = connection_tokens(headers);
                                for (const auto &[name, value] : headers) {
-                                   if (!detail::proxy_drops_response_field(name))
-                                       res->header(name, value);
+                                   if (detail::proxy_drops_response_field(name) ||
+                                       std::find(outbound_conn_tokens.begin(), outbound_conn_tokens.end(), name) !=
+                                           outbound_conn_tokens.end())
+                                       continue;
+                                   res->header(name, value);
                                }
                                res->async_send(std::string{response.text()}, [completion](error_code) mutable {
                                    auto callback = std::move(*completion);
@@ -166,17 +169,18 @@ inline void run_http_proxy(RequestPtr req, ResponsePtr res, bool client_is_tls, 
                            });
     };
 
-    if (detail::request_has_body(*req)) {
-        req->body().async_read_all([forward = std::move(forward), send_error](error_code ec, std::string body) mutable {
-            if (ec) {
-                send_error(status::bad_request, ec);
-                return;
-            }
-            forward(std::move(body));
-        });
-        return;
-    }
-    forward(std::string{});
+    // Always read the body to its end. HTTP/2/3 requests need not carry a
+    // content-length (END_STREAM delimits them), so inferring "no body" from
+    // the absence of CL silently dropped the body of every such proxied
+    // request. A bodyless request completes immediately (h1 None mode, h2/h3
+    // END_STREAM on the headers).
+    req->body().async_read_all([forward = std::move(forward), send_error](error_code ec, std::string body) mutable {
+        if (ec) {
+            send_error(status::bad_request, ec);
+            return;
+        }
+        forward(std::move(body));
+    });
 }
 
 } // namespace simple_http

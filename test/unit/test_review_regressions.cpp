@@ -745,3 +745,39 @@ TEST_CASE("review: h1 client accepts HTTP/1.0 and publishes bodyless", "[review]
     CHECK(head->version == Version::Http1);
     CHECK(head->bodyless);
 }
+
+// RFC 3986 §5.2 reference resolution for redirect Location values.
+TEST_CASE("review: redirect Location resolution follows RFC 3986", "[review][regression][client]") {
+    auto base = detail::parse_url("http://h/a/b?x=1");
+    REQUIRE(base.has_value());
+
+    CHECK(detail::resolve_redirect(*base, "c") == "http://h:80/a/c");
+    CHECK(detail::resolve_redirect(*base, "../c") == "http://h:80/c");
+    CHECK(detail::resolve_redirect(*base, "./c") == "http://h:80/a/c");
+    CHECK(detail::resolve_redirect(*base, "?y=2") == "http://h:80/a/b?y=2");
+    CHECK(detail::resolve_redirect(*base, "/x/./y/../z") == "http://h:80/x/z");
+    CHECK(detail::resolve_redirect(*base, "//other/x") == "http://other/x");
+    CHECK(detail::resolve_redirect(*base, "https://other/x") == "https://other/x");
+    CHECK(detail::resolve_redirect(*base, "#frag") == "http://h:80/a/b?x=1");
+}
+
+// An extracted synchronous handler runs after an asynchronous body read, so its
+// exception must still be turned into the standard 500 rather than escaping the
+// Asio completion handler.
+TEST_CASE("review: extract handler exceptions become 500", "[review][regression][framework]") {
+    asio::io_context ctx;
+    auto req = std::make_shared<Request>(Version::Http11, ctx.get_executor());
+    auto sink = std::make_shared<FakeResponseSink>(ctx.get_executor());
+    auto res = std::make_shared<ResponseWriter>(sink);
+
+    auto fn = std::make_shared<std::function<void(int, RequestPtr, ResponsePtr)>>(
+        [](int, RequestPtr, ResponsePtr) { throw std::runtime_error("handler boom"); });
+    bool done = false;
+    detail::invoke_extracted(fn, std::tuple<int>{1}, req, res, SslHandle{},
+                             HandlerCompletion([&done]() { done = true; }));
+    ctx.run_for(std::chrono::milliseconds(200));
+
+    CHECK(done);
+    CHECK(sink->last_status == status::internal_server_error);
+    CHECK(sink->last_body.empty());
+}

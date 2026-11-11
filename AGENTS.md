@@ -1054,6 +1054,34 @@ test/run.sh server-diff
     通道满且参数可重试；把 DATA 放进 `H3Stream::paused_frames`，在
     `on_consumed` 回到连接 executor 后 `drain_paused()` 回灌；END_STREAM 期间有
     停放帧时记 `finish_pending`，排空后再 `body().finish()`。
+59. **反代必须无条件读完请求体**：HTTP/2/3 用 END_STREAM 定界，不保证有
+    `content-length`。`http_proxy` 曾据此判断“无 body”，静默丢弃 DATA；
+    `req->body().async_read_all()` 对空体立即 EOF，直接调用即可。
+60. **h2 客户端 content-length 由会话独占**：请求头编码必须跳过调用方的
+    `content-length`（否则反代 h2→h2 出现两条）；响应侧解析一次，重复/超
+    INT64_MAX 拒绝，并在 DATA 到达与 END_STREAM 时核对总数；HEAD/204/304 跳过。
+61. **重定向 Location 按 RFC 3986 §5.2 解析**：绝对、`//host`、根相对、仅 query、
+    相对路径（合并目录 + 去点段）都要覆盖，不能 `url + "/" + location`；3xx 的
+    `Set-Cookie` 必须先入 jar 并为下一跳重新生成 Cookie；https→http 返回
+    `redirect_to_insecure`。
+62. **缓冲 `send()` 必须跳过 interim 1xx**：h1/h2 会话会把 100 作为 head 上抛；
+    `send_hop` 要 `clear_head_cache()` 后重读，否则返回 status=100 + 最终 body。
+63. **extract 的异步阶段异常也要转 500**：`invoke_extracted` 运行在 Json/Form
+    读完成回调里，必须自带 try/catch 和一次性 completion，不能逃出 io_context。
+64. **ALPN 策略要真正强制**：`Http2Only` 在无交集时返回
+    `SSL_TLSEXT_ERR_ALERT_FATAL`；客户端完全不带 ALPN 时 OpenSSL 不会调用选择
+    回调，服务端握手完成后发现没有 h2 必须关闭而不是 `run_h1`。直连 TLS 的
+    `sni_override` 与 `tls.alpn` 必须生效。
+65. **拨号预算覆盖 DNS/TLS/代理隧道**：`connect_timeout` 不只包 TCP connect；
+    DNS 结果、TLS 握手、CONNECT/SOCKS5 回复都要有 deadline，统一映射
+    `client_errc::connect_timeout`。
+66. **h3 中等项**：UDP 接收循环只对 operation_aborted/关闭停止；注册
+    `recv_stop_sending`（对端 STOP_SENDING），`stream_stop_sending` 是本端读关闭
+    通知，不能混用；非法请求头不得先派发 handler；响应头/trailer 用
+    `nghttp3_conn_get_frame_payload_left2` 限长；erase 流时把未读 `in_bytes`
+    的连接级流控额度归还。
+67. **代理与 TCP 选项**：`tcp_nodelay` 要按 listener 生效；HTTP 反代除固定
+    hop-by-hop 集合外，还要剥离 `Connection` 指名的字段（请求与响应两侧）。
 
 ---
 

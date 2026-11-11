@@ -36,10 +36,12 @@
 #include <atomic>
 #include <boost/asio.hpp>
 #include <boost/asio/experimental/concurrent_channel.hpp>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -222,6 +224,7 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
         stream_opened();
         Stream &st = it->second;
         init_stream(st, id);
+        st.is_head = request->method() == Method::Head;
         if (const auto expect = request->header("expect")) {
             st.expect_continue = icontains_ci(*expect, "100-continue");
         }
@@ -572,6 +575,11 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
         bool block_end_stream{false}; // the HEADERS frame that started the block carried END_STREAM
         bool expect_continue{false};  // request carried Expect: 100-continue
         bool interim_100_sent{false}; // the interim 100 was published to the handle
+        bool is_head{false};          // the request method was HEAD (bodyless response)
+        // §8.1.2.6: a declared content-length must equal the DATA payload total.
+        // -1 means no declaration; bodyless responses skip the check.
+        std::int64_t declared_content_length{-1};
+        std::uint64_t body_received{0};
         std::deque<std::string> in_queue;
         std::size_t in_bytes{0};
         std::shared_ptr<asio::experimental::concurrent_channel<void(error_code)>> in_notify;
@@ -630,6 +638,7 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
                                          self->stream_opened();
                                          Stream &stream = it->second;
                                          self->init_stream(stream, 1);
+                                         stream.is_head = (*seed)->method() == Method::Head;
                                          auto handle =
                                              std::make_shared<Http2ClientStream<Transport>>(self, 1, stream.outcome);
                                          stream.handle = handle;
@@ -698,7 +707,10 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
 
         bool saw_agent = false;
         for (const auto &[name, value] : request.headers()) {
-            if (name.empty() || name.front() == ':' || is_connection_specific(name))
+            // Framing belongs to the session: a caller-supplied content-length
+            // would be emitted twice (once here, once below) and a mismatch
+            // between the two is a request-smuggling shape.
+            if (name.empty() || name.front() == ':' || is_connection_specific(name) || name == "content-length")
                 continue;
             if (!is_http_token(name) || contains_ctl(name) || contains_ctl(value)) {
                 // Refuse the request instead of silently dropping the field: a
@@ -1203,6 +1215,10 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
         if (st.head_seen) {
             // A trailing field section: keep it for the caller (the reverse
             // proxy forwards it through Response::finish_trailers()).
+            if (!response_is_bodyless(st, st.head.status) && !content_length_ok(st)) {
+                reset_stream(id, codec::H2_PROTOCOL_ERROR);
+                return true;
+            }
             if (auto handle = st.handle.lock())
                 handle->set_trailers(std::move(headers));
             st.remote_end = true;
@@ -1234,22 +1250,60 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
         st.head.status = status;
         st.head.version = Version::Http2;
         st.head.headers = std::move(headers);
+        // §8.1.2.6: parse its content-length once, rejecting duplicates and
+        // values that cannot be represented. The body total is checked as DATA
+        // arrives and again at END_STREAM.
+        st.declared_content_length = -1;
+        st.body_received = 0;
+        if (st.head.headers.count("content-length") > 1) {
+            reset_stream(id, codec::H2_PROTOCOL_ERROR);
+            return true;
+        }
+        if (auto cl = st.head.headers.get("content-length")) {
+            std::uint64_t value = 0;
+            auto [ptr, ec] = std::from_chars(cl->data(), cl->data() + cl->size(), value);
+            if (cl->empty() || ec != std::errc{} || ptr != cl->data() + cl->size() ||
+                value > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+                reset_stream(id, codec::H2_PROTOCOL_ERROR);
+                return true;
+            }
+            st.declared_content_length = static_cast<std::int64_t>(value);
+        }
         // END_STREAM on the header block means the response has no body at all —
         // a response to HEAD, or a 204/304. It is never inferred from a missing
         // content-length.
-        st.head.bodyless = end_stream;
+        st.head.bodyless = end_stream || response_is_bodyless(st, status);
         st.head_seen = true;
+        if (end_stream) {
+            st.remote_end = true;
+            if (!response_is_bodyless(st, status) && !content_length_ok(st)) {
+                reset_stream(id, codec::H2_PROTOCOL_ERROR);
+                return true;
+            }
+        }
         // Publish the finished head to the caller's handle: read_head() then
         // works even after the stream has been retired (the session's entry is
         // gone by then, so the handle's own cache is what answers).
         if (auto handle = st.handle.lock())
             handle->set_head(st.head);
-        if (end_stream)
-            st.remote_end = true;
         // The outcome stays Open until the application has actually seen the head
         // (stream_read delivers it before it reports the end).
         wake(st);
         return true;
+    }
+
+    // Responses to HEAD and 204/304 carry no body and may legitimately declare a
+    // content-length (HEAD) without any DATA; the length check must skip them.
+    static bool response_is_bodyless(const Stream &st, int status) {
+        return st.is_head || status == status::no_content || status == status::not_modified;
+    }
+
+    // RFC 9113 §8.1.2.6: when the body ends, the sum of DATA payload lengths
+    // must equal a declared content-length. `reset_stream` also handles the
+    // flow-control credit for bytes already queued.
+    bool content_length_ok(const Stream &st) const {
+        return st.declared_content_length < 0 ||
+               static_cast<std::int64_t>(st.body_received) == st.declared_content_length;
     }
 
     static int parse_status(std::string_view value) {
@@ -1299,6 +1353,19 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
             return true;
         }
 
+        // §8.1.2.6: a body longer than the declared length is malformed. Check
+        // before queueing/crediting: the frame is not delivered, so hand the
+        // whole connection credit back (padding included) and reset the stream.
+        if (!data.empty()) {
+            st.body_received += data.size();
+            if (!response_is_bodyless(st, st.head.status) && st.declared_content_length >= 0 &&
+                static_cast<std::int64_t>(st.body_received) > st.declared_content_length) {
+                m_conn_recv_window += frame_len;
+                reset_stream(hdr.stream_id, codec::H2_PROTOCOL_ERROR);
+                return true;
+            }
+        }
+
         const std::int64_t padding = frame_len - static_cast<std::int64_t>(data.size());
         if (padding > 0)
             credit_consumed(st, padding); // never delivered, so credit it now
@@ -1307,8 +1374,15 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
             st.in_bytes += data.size();
             st.in_queue.emplace_back(data);
         }
-        if (hdr.has_flag(codec::H2_FLAG_END_STREAM))
+        if (hdr.has_flag(codec::H2_FLAG_END_STREAM)) {
             st.remote_end = true;
+            // Short body: fewer DATA bytes than declared. The queued bytes are
+            // discarded by erase_stream (which returns their credit).
+            if (!response_is_bodyless(st, st.head.status) && !content_length_ok(st)) {
+                reset_stream(hdr.stream_id, codec::H2_PROTOCOL_ERROR);
+                return true;
+            }
+        }
         wake(st);
         return true;
     }

@@ -841,32 +841,27 @@ template <typename Transport>
 inline void Client::tls_handshake_and_start(std::shared_ptr<Transport> transport, const detail::Url &url,
                                             HttpVersionPolicy version, DialDone done) const {
     detail::ClientTlsHandshake hs;
-    hs.sni = url.host;
+    // SNI override first: it is what a VIP/LB deployment needs, and the
+    // certificate is verified against the same name.
+    hs.sni = m_config.tls.sni_override.empty() ? url.host : m_config.tls.sni_override;
     hs.verify_host = m_config.tls.verify_host;
-    switch (version) {
-    case HttpVersionPolicy::Http11:
-        hs.alpn_wire = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
-        break;
-    case HttpVersionPolicy::Http2:
-        // Force h2: offering http/1.1 would let the peer negotiate a version
-        // the caller explicitly refused.
-        hs.alpn_wire = {2, 'h', '2'};
-        break;
-    case HttpVersionPolicy::Auto:
-    default:
-        hs.alpn_wire = {2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
-        break;
-    }
+    // TlsClientConfig::alpn overrides the policy-derived list. With no
+    // override, the caller's version policy decides (offering http/1.1 to an
+    // explicit h2 request would let the peer pick a refused version).
+    auto alpn_target = url.to_target();
+    alpn_target.version = version;
+    hs.alpn_wire = detail::alpn_wire_list(alpn_target, m_config.tls);
     auto self = keep_alive();
-    detail::async_tls_client_handshake(*transport, hs,
-                                       [self, transport, url, version, done = std::move(done)](error_code hec) mutable {
-                                           if (hec) {
-                                               transport->close();
-                                               std::move(done)(hec, nullptr);
-                                               return;
-                                           }
-                                           self->start_negotiated_session(transport, url, version, std::move(done));
-                                       });
+    detail::async_tls_client_handshake_bounded(
+        transport, hs, m_config.connect_timeout,
+        [self, transport, url, version, done = std::move(done)](error_code hec) mutable {
+            if (hec) {
+                transport->close();
+                std::move(done)(hec, nullptr);
+                return;
+            }
+            self->start_negotiated_session(transport, url, version, std::move(done));
+        });
 }
 
 namespace detail {
@@ -924,6 +919,89 @@ inline void async_connect_bounded(std::shared_ptr<asio::ip::tcp::socket> socket,
         [state, finish](error_code ec, const asio::ip::tcp::endpoint &peer) mutable { finish(ec, peer); });
 }
 
+// Resolves with the whole-dial connect budget. The underlying resolver is not
+// cancellable, but the one-shot completion means a late answer is ignored and
+// the caller stops waiting. Without this, a black-holed DNS server (or a custom
+// ResolveFn that never calls back) hung dial() forever.
+struct ResolveBoundedState {
+    std::shared_ptr<asio::steady_timer> timer;
+    asio::any_completion_handler<void(error_code, std::vector<asio::ip::tcp::endpoint>)> done;
+    bool finished{false};
+};
+
+inline void
+async_resolve_bounded(ResolveFn resolve, std::string host, std::uint16_t port, asio::any_io_executor ex,
+                      std::chrono::milliseconds limit,
+                      asio::any_completion_handler<void(error_code, std::vector<asio::ip::tcp::endpoint>)> done) {
+    auto state = std::make_shared<ResolveBoundedState>();
+    state->done = std::move(done);
+    auto finish = [state](error_code ec, std::vector<asio::ip::tcp::endpoint> endpoints) {
+        if (state->finished)
+            return;
+        state->finished = true;
+        if (state->timer)
+            state->timer->cancel();
+        auto completion = std::move(state->done);
+        std::move(completion)(ec, std::move(endpoints));
+    };
+    if (limit.count() > 0) {
+        state->timer = std::make_shared<asio::steady_timer>(ex);
+        state->timer->expires_after(limit);
+        state->timer->async_wait([state](error_code ec) {
+            if (ec || state->finished)
+                return;
+            state->finished = true;
+            auto completion = std::move(state->done);
+            std::move(completion)(make_error_code(client_errc::connect_timeout),
+                                  std::vector<asio::ip::tcp::endpoint>{});
+        });
+    }
+    async_resolve_endpoints(std::move(resolve), std::move(host), port, ex,
+                            [finish](error_code ec, std::vector<asio::ip::tcp::endpoint> endpoints) mutable {
+                                finish(ec, std::move(endpoints));
+                            });
+}
+
+// Bounds a CONNECT/SOCKS5 handshake. The tunnel operations touch a socket the
+// caller owns, so timeout means "close that socket, report connect_timeout";
+// their late completion is ignored. IPv6-only/WSL2 paths can otherwise drop a
+// SYN or a proxy reply and hang before TLS even starts.
+struct TunnelBoundedState {
+    std::shared_ptr<asio::steady_timer> timer;
+    asio::any_completion_handler<void(error_code)> done;
+    bool finished{false};
+};
+
+inline void async_proxy_tunnel_bounded(asio::any_io_executor ex, std::chrono::milliseconds limit,
+                                       std::function<void()> cancel,
+                                       asio::any_completion_handler<void(error_code)> done,
+                                       std::function<void(asio::any_completion_handler<void(error_code)>)> start) {
+    auto state = std::make_shared<TunnelBoundedState>();
+    state->done = std::move(done);
+    auto finish = [state](error_code ec) {
+        if (state->finished)
+            return;
+        state->finished = true;
+        if (state->timer)
+            state->timer->cancel();
+        auto completion = std::move(state->done);
+        std::move(completion)(ec);
+    };
+    if (limit.count() > 0) {
+        state->timer = std::make_shared<asio::steady_timer>(ex);
+        state->timer->expires_after(limit);
+        state->timer->async_wait([state, cancel = std::move(cancel)](error_code ec) mutable {
+            if (ec || state->finished)
+                return;
+            state->finished = true;
+            cancel();
+            auto completion = std::move(state->done);
+            std::move(completion)(make_error_code(client_errc::connect_timeout));
+        });
+    }
+    start(asio::any_completion_handler<void(error_code)>([finish](error_code ec) mutable { finish(ec); }));
+}
+
 // Reads a response head under a deadline. The timer emits into a cancellation
 // signal bound to the read, so the pending socket read is aborted and the
 // caller sees `reason` instead of the inner operation_aborted. A zero limit
@@ -973,6 +1051,48 @@ inline void async_read_head_bounded(std::shared_ptr<ClientStream> stream, std::c
             }
             finish(ec, std::move(head));
         }));
+}
+
+// Reads the final (non-informational) response head. The h1/h2 sessions surface
+// an interim 100 that answers Expect: 100-continue as the exchange head; the
+// buffered convenience path must discard it, clear the stream's head cache and
+// read again, or it would return status 100 with the real response's body.
+struct FinalHeadState {
+    std::shared_ptr<ClientStream> stream;
+    std::chrono::milliseconds limit;
+    client_errc reason;
+    asio::any_completion_handler<void(error_code, ResponseHead)> done;
+};
+
+inline void read_final_head_next(const std::shared_ptr<FinalHeadState> &state);
+
+inline void async_read_final_head_bounded(std::shared_ptr<ClientStream> stream, std::chrono::milliseconds limit,
+                                          client_errc reason,
+                                          asio::any_completion_handler<void(error_code, ResponseHead)> done) {
+    auto state = std::make_shared<FinalHeadState>();
+    state->stream = std::move(stream);
+    state->limit = limit;
+    state->reason = reason;
+    state->done = std::move(done);
+    read_final_head_next(state);
+}
+
+inline void read_final_head_next(const std::shared_ptr<FinalHeadState> &state) {
+    async_read_head_bounded(state->stream, state->limit, state->reason,
+                            [state](error_code ec, ResponseHead head) mutable {
+                                if (ec) {
+                                    auto completion = std::move(state->done);
+                                    std::move(completion)(ec, ResponseHead{});
+                                    return;
+                                }
+                                if (head.status >= 100 && head.status < 200) {
+                                    state->stream->clear_head_cache();
+                                    read_final_head_next(state);
+                                    return;
+                                }
+                                auto completion = std::move(state->done);
+                                std::move(completion)(error_code{}, std::move(head));
+                            });
 }
 
 // Same shape for a single body read (per-read idle deadline).
@@ -1134,6 +1254,91 @@ inline void discard_bounded_next(const std::shared_ptr<DiscardBoundedState> &sta
                        });
 }
 
+// RFC 3986 §5.2.4. Removes "." and ".." segments from a path, preserving a
+// leading slash and a trailing slash. Redirecting through "../" is legitimate;
+// refusing traversal belongs to the static-file key, not to URL resolution.
+inline bool has_prefix(std::string_view s, std::string_view prefix) {
+    return s.size() >= prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
+}
+
+inline std::string remove_dot_segments(std::string_view input) {
+    std::string output;
+    while (!input.empty()) {
+        if (has_prefix(input, "../")) {
+            input.remove_prefix(3);
+        } else if (has_prefix(input, "./")) {
+            input.remove_prefix(2);
+        } else if (has_prefix(input, "/./")) {
+            input.remove_prefix(2); // keep the leading '/'
+        } else if (input == "/.") {
+            input = "/";
+        } else if (has_prefix(input, "/../")) {
+            input.remove_prefix(3);
+            const auto slash = output.rfind('/');
+            output.erase(slash == std::string::npos ? 0 : slash);
+        } else if (input == "/..") {
+            input = "/";
+            const auto slash = output.rfind('/');
+            output.erase(slash == std::string::npos ? 0 : slash);
+        } else if (input == "." || input == "..") {
+            input = {};
+        } else {
+            const std::size_t start = input.front() == '/' ? 1 : 0;
+            const auto slash = input.find('/', start);
+            const std::size_t take = slash == std::string_view::npos ? input.size() : slash;
+            output.append(input.substr(0, take));
+            input.remove_prefix(take);
+        }
+    }
+    return output;
+}
+
+// Resolves a redirect Location against the URL of the request that produced it
+// (RFC 3986 §5.2). The result is an absolute URL; parse_url() validates it.
+// Absolute, scheme-relative, root-relative, query-only and path-relative
+// references are all covered.
+inline std::string resolve_redirect(const Url &base, std::string_view location) {
+    // Absolute URI: a valid scheme followed by ':'. A "://" substring alone is
+    // not enough — a relative path may contain one.
+    const auto colon = location.find(':');
+    if (colon != std::string_view::npos && colon > 0) {
+        bool scheme = (location[0] >= 'a' && location[0] <= 'z') || (location[0] >= 'A' && location[0] <= 'Z');
+        for (std::size_t i = 1; scheme && i < colon; ++i) {
+            const char c = location[i];
+            scheme = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '+' ||
+                     c == '-' || c == '.';
+        }
+        if (scheme)
+            return std::string{location};
+    }
+
+    const std::string origin = base.scheme + "://" + base.authority();
+    if (has_prefix(location, "//"))
+        return base.scheme + ":" + std::string{location};
+
+    std::string target;
+    if (!location.empty() && location.front() == '/') {
+        target = remove_dot_segments(location);
+    } else if (!location.empty() && location.front() == '?') {
+        target = std::string{base.path()} + std::string{location};
+    } else if (!location.empty() && location.front() == '#') {
+        target = std::string{base.target}; // fragment never goes on the wire
+    } else {
+        // Merge with the base path's directory, then remove dot segments.
+        const std::string_view base_path = base.path();
+        const auto slash = base_path.rfind('/');
+        std::string merged =
+            slash == std::string_view::npos ? std::string{"/"} : std::string{base_path.substr(0, slash + 1)};
+        merged.append(location);
+        target = remove_dot_segments(merged);
+    }
+    if (auto hash = target.find('#'); hash != std::string::npos)
+        target.resize(hash);
+    if (target.empty())
+        target = "/";
+    return origin + target;
+}
+
 } // namespace detail
 
 inline void Client::dial(const detail::Url &url, HttpVersionPolicy version, DialDone done) const {
@@ -1157,8 +1362,8 @@ inline void Client::dial(const detail::Url &url, HttpVersionPolicy version, Dial
     }
 
     auto self = keep_alive();
-    async_resolve_endpoints(
-        m_config.resolve, url.host, url.effective_port(), m_executor,
+    detail::async_resolve_bounded(
+        m_config.resolve, url.host, url.effective_port(), m_executor, m_config.connect_timeout,
         [self, url, version, done = std::move(done)](error_code ec,
                                                      std::vector<asio::ip::tcp::endpoint> endpoints) mutable {
             if (ec) {
@@ -1260,8 +1465,8 @@ inline void Client::dial_h3(const detail::Url &url, DialDone done) const {
 inline void Client::dial_via_proxy(const detail::Url &url, const ProxyConfig &proxy, HttpVersionPolicy version,
                                    DialDone done) const {
     auto self = keep_alive();
-    async_resolve_endpoints(
-        m_config.resolve, proxy.host, proxy.effective_port(), m_executor,
+    detail::async_resolve_bounded(
+        m_config.resolve, proxy.host, proxy.effective_port(), m_executor, m_config.connect_timeout,
         [self, url, proxy, version, done = std::move(done)](error_code ec,
                                                             std::vector<asio::ip::tcp::endpoint> endpoints) mutable {
             if (ec) {
@@ -1313,12 +1518,20 @@ inline void Client::dial_via_proxy(const detail::Url &url, const ProxyConfig &pr
                             self->tls_handshake_and_start(std::make_shared<TlsStreamTransport>(stream, peer), url,
                                                           version, std::move(done));
                         };
-                        if (proxy.kind == ProxyKind::Socks5) {
-                            detail::async_socks5_connect(*socket, proxy, url.host, url.effective_port(),
-                                                         std::move(after_tunnel));
-                        } else {
-                            detail::async_http_connect(*socket, proxy, url.authority(), std::move(after_tunnel));
-                        }
+                        detail::async_proxy_tunnel_bounded(
+                            self->m_executor, self->m_config.connect_timeout,
+                            [socket] {
+                                error_code ce;
+                                socket->close(ce);
+                            },
+                            asio::any_completion_handler<void(error_code)>(std::move(after_tunnel)),
+                            [socket, proxy, url](asio::any_completion_handler<void(error_code)> handler) mutable {
+                                if (proxy.kind == ProxyKind::Socks5)
+                                    detail::async_socks5_connect(*socket, proxy, url.host, url.effective_port(),
+                                                                 std::move(handler));
+                                else
+                                    detail::async_http_connect(*socket, proxy, url.authority(), std::move(handler));
+                            });
                         return;
                     }
 
@@ -1342,8 +1555,8 @@ inline void Client::dial_via_proxy(const detail::Url &url, const ProxyConfig &pr
                     hs.sni = proxy.server_name.empty() ? proxy.host : proxy.server_name;
                     hs.verify_host = proxy.verify_peer && proxy.verify_host;
                     hs.alpn_wire = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
-                    detail::async_tls_client_handshake(
-                        *proxy_transport, hs,
+                    detail::async_tls_client_handshake_bounded(
+                        proxy_transport, hs, self->m_config.connect_timeout,
                         [self, url, proxy, proxy_transport, inner, peer, version,
                          done = std::move(done)](error_code hec) mutable {
                             if (hec) {
@@ -1382,12 +1595,20 @@ inline void Client::dial_via_proxy(const detail::Url &url, const ProxyConfig &pr
                                 self->tls_handshake_and_start(std::make_shared<NestedTlsTransport>(outer, peer), url,
                                                               version, std::move(done));
                             };
-                            if (proxy.kind == ProxyKind::Socks5) {
-                                detail::async_socks5_connect(*inner, proxy, url.host, url.effective_port(),
-                                                             std::move(after_tunnel));
-                            } else {
-                                detail::async_http_connect(*inner, proxy, url.authority(), std::move(after_tunnel));
-                            }
+                            detail::async_proxy_tunnel_bounded(
+                                self->m_executor, self->m_config.connect_timeout,
+                                [inner] {
+                                    error_code ce;
+                                    inner->lowest_layer().close(ce);
+                                },
+                                asio::any_completion_handler<void(error_code)>(std::move(after_tunnel)),
+                                [inner, proxy, url](asio::any_completion_handler<void(error_code)> handler) mutable {
+                                    if (proxy.kind == ProxyKind::Socks5)
+                                        detail::async_socks5_connect(*inner, proxy, url.host, url.effective_port(),
+                                                                     std::move(handler));
+                                    else
+                                        detail::async_http_connect(*inner, proxy, url.authority(), std::move(handler));
+                                });
                         });
                 });
         });
@@ -1428,7 +1649,7 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
                 std::move(done)(oec, Response{});
                 return;
             }
-            detail::async_read_head_bounded(
+            detail::async_read_final_head_bounded(
                 stream, head_budget, client_errc::response_head_timeout,
                 [self, request, url, target, origin, max_body_bytes, redirects, retries, head_budget, idle_budget,
                  stream, version, done = std::move(done)](error_code hec, detail::ResponseHead head) mutable {
@@ -1446,6 +1667,10 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
                             return;
                         }
                         const std::string location_value{*location};
+                        // A redirect response's Set-Cookie applies before the
+                        // next hop, exactly like any other response.
+                        if (self->m_config.cookie_jar)
+                            self->m_config.cookie_jar->store(url, head.headers);
                         // Discard, don't buffer. A redirect body is irrelevant,
                         // and a peer must not be able to make the client hold an
                         // arbitrarily large one; past the drain budget the
@@ -1463,19 +1688,17 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
                                         return;
                                     }
                                 }
-                                // Resolve the Location: absolute, or relative to
-                                // the current origin.
-                                std::string next_url;
-                                if (location_value.find("://") != std::string::npos) {
-                                    next_url = location_value;
-                                } else if (!location_value.empty() && location_value.front() == '/') {
-                                    next_url = target.scheme + "://" + target.authority() + location_value;
-                                } else {
-                                    next_url = url + "/" + location_value;
-                                }
+                                // RFC 3986 §5.2 reference resolution.
+                                std::string next_url = detail::resolve_redirect(target, location_value);
                                 auto next = detail::parse_url(next_url);
                                 if (!next) {
                                     std::move(done)(next.error(), Response{});
+                                    return;
+                                }
+                                // A downgrade would put the next request (and any
+                                // credentials it carries) on the wire in clear.
+                                if (target.scheme == "https" && next->scheme == "http") {
+                                    std::move(done)(make_error_code(client_errc::redirect_to_insecure), Response{});
                                     return;
                                 }
                                 const bool same_origin = next->scheme == target.scheme && next->host == target.host &&
@@ -1485,6 +1708,11 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
                                 // resend the same entity. clone_for_replay keeps
                                 // the method token, target and headers.
                                 auto replay = request->clone_for_replay(self->m_executor);
+                                if (self->m_config.cookie_jar) {
+                                    // Re-derive from the jar for the new URL/path;
+                                    // the copied header describes the old path.
+                                    replay->mutable_headers().erase(field::cookie);
+                                }
                                 if (!same_origin) {
                                     replay->mutable_headers().erase(field::authorization);
                                     replay->mutable_headers().erase(field::cookie);
@@ -1700,17 +1928,18 @@ inline void Client::ws_tls_handshake_and_start(
     // A WebSocket must not negotiate h2, or the Upgrade would be impossible.
     hs.alpn_wire = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
     auto self = keep_alive();
-    detail::async_tls_client_handshake(*transport, hs,
-                                       [self, transport, authority = std::move(authority), path = std::move(path),
-                                        spec = std::move(spec), done = std::move(done)](error_code hec) mutable {
-                                           if (hec) {
-                                               transport->close();
-                                               std::move(done)(hec, nullptr);
-                                               return;
-                                           }
-                                           self->begin_ws_upgrade(std::move(transport), std::move(authority),
-                                                                  std::move(path), std::move(spec), std::move(done));
-                                       });
+    detail::async_tls_client_handshake_bounded(
+        transport, hs, m_config.connect_timeout,
+        [self, transport, authority = std::move(authority), path = std::move(path), spec = std::move(spec),
+         done = std::move(done)](error_code hec) mutable {
+            if (hec) {
+                transport->close();
+                std::move(done)(hec, nullptr);
+                return;
+            }
+            self->begin_ws_upgrade(std::move(transport), std::move(authority), std::move(path), std::move(spec),
+                                   std::move(done));
+        });
 }
 
 inline void
@@ -1766,12 +1995,20 @@ Client::open_ws_via_proxy(const detail::Url &url, const ProxyConfig &proxy, std:
                                                              std::move(authority), std::move(path), std::move(spec),
                                                              url.host, std::move(done));
                         };
-                        if (proxy.kind == ProxyKind::Socks5) {
-                            detail::async_socks5_connect(*socket, proxy, url.host, url.effective_port(),
-                                                         std::move(after_tunnel));
-                        } else {
-                            detail::async_http_connect(*socket, proxy, url.authority(), std::move(after_tunnel));
-                        }
+                        detail::async_proxy_tunnel_bounded(
+                            self->m_executor, self->m_config.connect_timeout,
+                            [socket] {
+                                error_code ce;
+                                socket->close(ce);
+                            },
+                            asio::any_completion_handler<void(error_code)>(std::move(after_tunnel)),
+                            [socket, proxy, url](asio::any_completion_handler<void(error_code)> handler) mutable {
+                                if (proxy.kind == ProxyKind::Socks5)
+                                    detail::async_socks5_connect(*socket, proxy, url.host, url.effective_port(),
+                                                                 std::move(handler));
+                                else
+                                    detail::async_http_connect(*socket, proxy, url.authority(), std::move(handler));
+                            });
                         return;
                     }
 
@@ -1792,8 +2029,8 @@ Client::open_ws_via_proxy(const detail::Url &url, const ProxyConfig &proxy, std:
                     hs.sni = proxy.server_name.empty() ? proxy.host : proxy.server_name;
                     hs.verify_host = proxy.verify_peer && proxy.verify_host;
                     hs.alpn_wire = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
-                    detail::async_tls_client_handshake(
-                        *proxy_transport, hs,
+                    detail::async_tls_client_handshake_bounded(
+                        proxy_transport, hs, self->m_config.connect_timeout,
                         [self, url, proxy, proxy_transport, inner, peer, path, authority, spec,
                          done = std::move(done)](error_code hec) mutable {
                             if (hec) {
@@ -1831,12 +2068,20 @@ Client::open_ws_via_proxy(const detail::Url &url, const ProxyConfig &proxy, std:
                                                                  std::move(authority), std::move(path), std::move(spec),
                                                                  url.host, std::move(done));
                             };
-                            if (proxy.kind == ProxyKind::Socks5) {
-                                detail::async_socks5_connect(*inner, proxy, url.host, url.effective_port(),
-                                                             std::move(after_tunnel));
-                            } else {
-                                detail::async_http_connect(*inner, proxy, url.authority(), std::move(after_tunnel));
-                            }
+                            detail::async_proxy_tunnel_bounded(
+                                self->m_executor, self->m_config.connect_timeout,
+                                [inner] {
+                                    error_code ce;
+                                    inner->lowest_layer().close(ce);
+                                },
+                                asio::any_completion_handler<void(error_code)>(std::move(after_tunnel)),
+                                [inner, proxy, url](asio::any_completion_handler<void(error_code)> handler) mutable {
+                                    if (proxy.kind == ProxyKind::Socks5)
+                                        detail::async_socks5_connect(*inner, proxy, url.host, url.effective_port(),
+                                                                     std::move(handler));
+                                    else
+                                        detail::async_http_connect(*inner, proxy, url.authority(), std::move(handler));
+                                });
                         });
                 });
         });

@@ -225,4 +225,51 @@ auto async_tls_client_handshake(Transport &transport, const ClientTlsHandshake &
     return transport.stream().async_handshake(asio::ssl::stream_base::client, std::forward<Token>(token));
 }
 
+// Client TLS handshake bounded by the dial budget. Closing the transport on
+// timeout unwinds the pending handshake; the aborted completion is mapped to
+// connect_timeout. A peer that completes TCP and then never sends a
+// ServerHello must not hang dial() forever.
+template <typename Transport>
+void async_tls_client_handshake_bounded(std::shared_ptr<Transport> transport, const ClientTlsHandshake &hs,
+                                        std::chrono::milliseconds limit,
+                                        asio::any_completion_handler<void(error_code)> done) {
+    struct State {
+        std::shared_ptr<Transport> transport;
+        asio::steady_timer timer;
+        asio::any_completion_handler<void(error_code)> done;
+        bool finished{false};
+
+        State(std::shared_ptr<Transport> t, asio::any_io_executor ex, asio::any_completion_handler<void(error_code)> d)
+            : transport(std::move(t)), timer(ex), done(std::move(d)) {}
+    };
+    auto executor = transport->get_executor();
+    auto state = std::make_shared<State>(std::move(transport), std::move(executor), std::move(done));
+    auto finish = [state](error_code ec) {
+        if (state->finished)
+            return;
+        state->finished = true;
+        state->timer.cancel();
+        auto completion = std::move(state->done);
+        std::move(completion)(ec);
+    };
+    if (limit.count() > 0) {
+        state->timer.expires_after(limit);
+        state->timer.async_wait([state](error_code ec) {
+            if (ec || state->finished)
+                return;
+            state->finished = true;
+            state->transport->close();
+            auto completion = std::move(state->done);
+            std::move(completion)(make_error_code(client_errc::connect_timeout));
+        });
+    }
+    async_tls_client_handshake(*state->transport, hs, [state, finish](error_code ec) mutable {
+        if (state->finished)
+            return;
+        if (ec == asio::error::operation_aborted)
+            ec = make_error_code(client_errc::connect_timeout);
+        finish(ec);
+    });
+}
+
 } // namespace simple_http::detail

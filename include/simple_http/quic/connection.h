@@ -31,6 +31,7 @@
 #include <ngtcp2/ngtcp2.h>
 #include <openssl/rand.h>
 
+#include "../core/compat.h"
 #include <algorithm>
 #include <array>
 #include <boost/asio.hpp>
@@ -44,7 +45,6 @@
 #include <limits>
 #include <memory>
 #include <optional>
-#include "../core/compat.h"
 #include <string>
 #include <string_view>
 #include <utility>
@@ -426,8 +426,8 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
                                void *user_data, void *) noexcept;
     static int cb_stream_reset(ngtcp2_conn *, std::int64_t stream_id, std::uint64_t final_size,
                                std::uint64_t app_error_code, void *user_data, void *) noexcept;
-    static int cb_stream_stop_sending(ngtcp2_conn *, std::int64_t stream_id, std::uint64_t app_error_code,
-                                      void *user_data, void *) noexcept;
+    static int cb_recv_stop_sending(ngtcp2_conn *, std::int64_t stream_id, std::uint64_t app_error_code,
+                                    void *user_data, void *) noexcept;
     static int cb_extend_max_stream_data(ngtcp2_conn *, std::int64_t stream_id, std::uint64_t max_data, void *user_data,
                                          void *) noexcept;
     static int cb_extend_max_remote_streams_bidi(ngtcp2_conn *, std::uint64_t max_streams, void *user_data) noexcept;
@@ -631,7 +631,7 @@ template <typename Executor> bool QuicConnection<Executor>::init() {
             cb.acked_stream_data_offset = &QuicConnection::cb_acked_stream_data_offset;
             cb.stream_close = &QuicConnection::cb_stream_close;
             cb.stream_reset = &QuicConnection::cb_stream_reset;
-            cb.stream_stop_sending = &QuicConnection::cb_stream_stop_sending;
+            cb.recv_stop_sending = &QuicConnection::cb_recv_stop_sending;
             cb.extend_max_stream_data = &QuicConnection::cb_extend_max_stream_data;
             cb.extend_max_remote_streams_bidi = &QuicConnection::cb_extend_max_remote_streams_bidi;
             cb.recv_tx_key = &QuicConnection::cb_recv_tx_key;
@@ -729,7 +729,7 @@ template <typename Executor> bool QuicConnection<Executor>::init() {
         cb.acked_stream_data_offset = &QuicConnection::cb_acked_stream_data_offset;
         cb.stream_close = &QuicConnection::cb_stream_close;
         cb.stream_reset = &QuicConnection::cb_stream_reset;
-        cb.stream_stop_sending = &QuicConnection::cb_stream_stop_sending;
+        cb.recv_stop_sending = &QuicConnection::cb_recv_stop_sending;
         cb.extend_max_stream_data = &QuicConnection::cb_extend_max_stream_data;
         cb.extend_max_remote_streams_bidi = &QuicConnection::cb_extend_max_remote_streams_bidi;
         cb.recv_tx_key = &QuicConnection::cb_recv_tx_key;
@@ -1326,8 +1326,8 @@ int QuicConnection<Executor>::cb_stream_reset(ngtcp2_conn *, std::int64_t stream
 }
 
 template <typename Executor>
-int QuicConnection<Executor>::cb_stream_stop_sending(ngtcp2_conn *, std::int64_t stream_id,
-                                                     std::uint64_t app_error_code, void *user_data, void *) noexcept {
+int QuicConnection<Executor>::cb_recv_stop_sending(ngtcp2_conn *, std::int64_t stream_id, std::uint64_t app_error_code,
+                                                   void *user_data, void *) noexcept {
     auto *self = from(user_data);
     if (auto proto = self->protocol())
         proto->on_stream_stop_sending(stream_id, app_error_code);

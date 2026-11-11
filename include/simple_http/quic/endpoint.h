@@ -31,6 +31,7 @@
 #include <ngtcp2/ngtcp2_crypto.h>
 #include <openssl/rand.h>
 
+#include "../core/compat.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -44,7 +45,6 @@
 #include <functional>
 #include <memory>
 #include <mutex>
-#include "../core/compat.h"
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -139,6 +139,10 @@ struct QuicEndpointConfig {
     std::size_t global_max_connections{0}; // ServerConfig::max_connections
     std::shared_ptr<std::atomic<std::size_t>> active;
     std::shared_ptr<std::atomic<std::size_t>> global_active;
+    // Called after a slot is released. The server uses it to re-arm TCP
+    // acceptors that paused at max_connections (the QUIC path decrements the
+    // shared counter itself, so Core::connection_released() cannot be called).
+    std::function<void()> on_released;
     // Every endpoint of one SO_REUSEPORT listener must derive Retry and
     // stateless-reset tokens from the same secret: a client that migrates (or a
     // retried Initial) can land on a different socket, and a token issued by one
@@ -185,7 +189,8 @@ template <typename ConnectionType> class SharedCidRegistry {
         // forwards every packet through here.
         asio::post(it->second.exec, [conn = std::move(conn), data = std::move(datagram), from]() mutable {
             conn->on_datagram(
-                boost::span<const std::uint8_t>{reinterpret_cast<const std::uint8_t *>(data.data()), data.size()}, from);
+                boost::span<const std::uint8_t>{reinterpret_cast<const std::uint8_t *>(data.data()), data.size()},
+                from);
         });
         return true;
     }
@@ -387,9 +392,8 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
             // empty: one event-loop wake-up serves a whole batch of datagrams
             // instead of one syscall per packet.
             for (;;) {
-                const int n =
-                    static_cast<int>(::recvmmsg(self->m_socket.native_handle(), state->msgs.data(), kRecvBatch, 0,
-                                                nullptr));
+                const int n = static_cast<int>(
+                    ::recvmmsg(self->m_socket.native_handle(), state->msgs.data(), kRecvBatch, 0, nullptr));
                 if (n <= 0) {
                     // EAGAIN/EWOULDBLOCK = drained; EINTR = try again next turn.
                     // A connection-refused here means a previous send drew an
@@ -401,9 +405,9 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
                         continue;
                     state->from[i].resize(state->msgs[i].msg_hdr.msg_namelen);
                     self->handle_datagram(
-                        boost::span<const std::uint8_t>{
-                            state->scratch.data() + static_cast<std::size_t>(i) * kMaxDatagram,
-                            static_cast<std::size_t>(state->msgs[i].msg_len)},
+                        boost::span<const std::uint8_t>{state->scratch.data() +
+                                                            static_cast<std::size_t>(i) * kMaxDatagram,
+                                                        static_cast<std::size_t>(state->msgs[i].msg_len)},
                         state->from[i]);
                 }
             }
@@ -582,10 +586,10 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
         // this a client that migrates to a fresh connection ID becomes
         // unreachable — and its packets look exactly like those of a connection
         // that never existed.
-        conn->set_cid_callbacks(
-            [self, weak = std::weak_ptr<Connection>(conn)](
-                boost::span<const std::uint8_t> cid, boost::span<const std::uint8_t>) { self->associate_cid(cid, weak); },
-            [self](boost::span<const std::uint8_t> cid) { self->dissociate_cid(cid); });
+        conn->set_cid_callbacks([self, weak = std::weak_ptr<Connection>(conn)](
+                                    boost::span<const std::uint8_t> cid,
+                                    boost::span<const std::uint8_t>) { self->associate_cid(cid, weak); },
+                                [self](boost::span<const std::uint8_t> cid) { self->dissociate_cid(cid); });
 
         if (!conn->init()) {
             release_connection();
@@ -608,8 +612,7 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
         auto self = this->shared_from_this();
         m_serve(conn, [self, conn]() mutable {
             conn->async_await_closed([self, conn]() mutable {
-                self->m_live.erase(std::remove(self->m_live.begin(), self->m_live.end(), conn),
-                                   self->m_live.end());
+                self->m_live.erase(std::remove(self->m_live.begin(), self->m_live.end(), conn), self->m_live.end());
                 // Its IDs are dead with it: nothing can route to this connection
                 // again, and the weak entries would otherwise outlive it by the
                 // process.
@@ -651,6 +654,8 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
             return;
         m_config.active->fetch_sub(1, std::memory_order_acq_rel);
         m_config.global_active->fetch_sub(1, std::memory_order_acq_rel);
+        if (m_config.on_released)
+            m_config.on_released();
     }
 
     // --- CID table ---------------------------------------------------------
@@ -898,8 +903,7 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
                 if (e == EAGAIN || e == EWOULDBLOCK) {
                     m_send_queue.push_front(std::move(item));
                     auto self = this->shared_from_this();
-                    m_socket.async_wait(asio::ip::udp::socket::wait_write,
-                                        [self](error_code) { self->drain_send(); });
+                    m_socket.async_wait(asio::ip::udp::socket::wait_write, [self](error_code) { self->drain_send(); });
                     return;
                 }
             }

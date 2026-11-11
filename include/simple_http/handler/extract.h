@@ -414,40 +414,83 @@ template <typename F, typename Tuple>
 void invoke_extracted(std::shared_ptr<F> fn, Tuple values, RequestPtr req, ResponsePtr res, SslHandle ssl,
                       HandlerCompletion done) {
     using D = F;
-    if constexpr (extracted_callback_ssl<D, Tuple>::value) {
-        std::apply(
-            [&](auto &&...args) {
-                (*fn)(std::forward<decltype(args)>(args)..., std::move(req), std::move(res), ssl, std::move(done));
-            },
-            std::move(values));
-    } else if constexpr (extracted_callback<D, Tuple>::value) {
-        std::apply(
-            [&](auto &&...args) {
-                (*fn)(std::forward<decltype(args)>(args)..., std::move(req), std::move(res), std::move(done));
-            },
-            std::move(values));
-    } else if constexpr (extracted_sync_ssl<D, Tuple>::value) {
-        std::apply(
-            [&](auto &&...args) { (*fn)(std::forward<decltype(args)>(args)..., std::move(req), std::move(res), ssl); },
-            std::move(values));
-        std::move(done)();
-    } else if constexpr (extracted_sync<D, Tuple>::value) {
-        std::apply(
-            [&](auto &&...args) { (*fn)(std::forward<decltype(args)>(args)..., std::move(req), std::move(res)); },
-            std::move(values));
-        std::move(done)();
+    const RequestPtr req_keep = req;
+    const ResponsePtr res_keep = res;
+    // The extracted handler runs *after* an asynchronous body read (Json/Form),
+    // outside invoke_handler's synchronous try/catch. Keep a one-shot completion
+    // here and turn an exception into the same 500/close contract.
+    auto completion = std::make_shared<HandlerCompletion>(std::move(done));
+    auto completed = std::make_shared<bool>(false);
+    auto finish = [completion, completed]() {
+        if (*completed)
+            return;
+        *completed = true;
+        auto callback = std::move(*completion);
+        if (callback)
+            std::move(callback)();
+    };
+    auto fail = [req_keep, res_keep, finish]() mutable {
+        if (req_keep && req_keep->cancelled()) {
+            finish();
+            return;
+        }
+        if (!res_keep) {
+            finish();
+            return;
+        }
+        if (res_keep->started()) {
+            res_keep->async_close([finish](error_code) mutable { finish(); });
+        } else {
+            res_keep->status(status::internal_server_error);
+            res_keep->async_send("", [finish](error_code) mutable { finish(); });
+        }
+    };
+    HandlerCompletion handed([finish]() mutable { finish(); });
+    try {
+        if constexpr (extracted_callback_ssl<D, Tuple>::value) {
+            std::apply(
+                [&](auto &&...args) {
+                    (*fn)(std::forward<decltype(args)>(args)..., std::move(req), std::move(res), ssl,
+                          std::move(handed));
+                },
+                std::move(values));
+        } else if constexpr (extracted_callback<D, Tuple>::value) {
+            std::apply(
+                [&](auto &&...args) {
+                    (*fn)(std::forward<decltype(args)>(args)..., std::move(req), std::move(res), std::move(handed));
+                },
+                std::move(values));
+        } else if constexpr (extracted_sync_ssl<D, Tuple>::value) {
+            std::apply(
+                [&](auto &&...args) {
+                    (*fn)(std::forward<decltype(args)>(args)..., std::move(req), std::move(res), ssl);
+                },
+                std::move(values));
+            finish();
+        } else if constexpr (extracted_sync<D, Tuple>::value) {
+            std::apply(
+                [&](auto &&...args) { (*fn)(std::forward<decltype(args)>(args)..., std::move(req), std::move(res)); },
+                std::move(values));
+            finish();
 #if defined(BOOST_ASIO_HAS_CO_AWAIT)
-    } else if constexpr (detail::extracted_coro_ssl<D, Tuple>::value) {
-        detail::execute_extracted_coroutine(req, res, std::move(done), fn,
-                                            std::tuple_cat(std::move(values), std::make_tuple(req, res, ssl)));
-    } else if constexpr (detail::extracted_coro<D, Tuple>::value) {
-        detail::execute_extracted_coroutine(req, res, std::move(done), fn,
-                                            std::tuple_cat(std::move(values), std::make_tuple(req, res)));
+        } else if constexpr (detail::extracted_coro_ssl<D, Tuple>::value) {
+            detail::execute_extracted_coroutine(req, res, std::move(handed), fn,
+                                                std::tuple_cat(std::move(values), std::make_tuple(req, res, ssl)));
+        } else if constexpr (detail::extracted_coro<D, Tuple>::value) {
+            detail::execute_extracted_coroutine(req, res, std::move(handed), fn,
+                                                std::tuple_cat(std::move(values), std::make_tuple(req, res)));
 #endif
-    } else {
-        static_assert(sizeof(F) == 0,
-                      "extract handler must be callable as (extracted..., RequestPtr, ResponsePtr[, SslHandle]"
-                      "[, HandlerCompletion]) or return a coroutine");
+        } else {
+            static_assert(sizeof(F) == 0,
+                          "extract handler must be callable as (extracted..., RequestPtr, ResponsePtr[, SslHandle]"
+                          "[, HandlerCompletion]) or return a coroutine");
+        }
+    } catch (const std::exception &e) {
+        SIMPLE_HTTP_ERROR_LOG("extract handler threw: {}", e.what());
+        fail();
+    } catch (...) {
+        SIMPLE_HTTP_ERROR_LOG("extract handler threw a non-std exception");
+        fail();
     }
 }
 

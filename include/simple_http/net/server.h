@@ -92,6 +92,9 @@ struct TcpListenerConfig {
     std::size_t acceptors{0};
     std::size_t max_connections{0};
     std::optional<EngineLimits> limits;
+    // TCP_NODELAY for connections accepted by this listener; ServerConfig's
+    // value is copied into the implicit listener.
+    bool tcp_nodelay{true};
     std::function<void(asio::ip::tcp::socket &)> socket_setup;
     std::function<void(asio::ip::tcp::acceptor &)> listener_setup;
 };
@@ -322,6 +325,7 @@ class Server {
             cfg.acceptors = m_cfg.acceptors;
             cfg.max_connections = m_cfg.max_connections;
             cfg.limits = m_cfg.limits;
+            cfg.tcp_nodelay = m_cfg.tcp_nodelay;
             cfg.socket_setup = m_cfg.socket_setup;
             cfg.listener_setup = m_cfg.listener_setup;
             switch (m_cfg.plaintext_protocols) {
@@ -378,7 +382,8 @@ class Server {
                         break;
                     }
                     listener->tls = std::make_shared<TlsContext>(
-                        *cfg.tls, boost::span<const std::string_view>{alpn.data(), alpn.size()});
+                        *cfg.tls, boost::span<const std::string_view>{alpn.data(), alpn.size()},
+                        cfg.alpn == TlsHttp::Http2Only);
                 } catch (const std::exception &e) {
                     SIMPLE_HTTP_ERROR_LOG("server: TLS setup failed: {}", e.what());
                     report.failures.push_back(ListenerFailure{cfg.name.empty() ? inet->host : cfg.name,
@@ -566,7 +571,7 @@ class Server {
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
     std::uint16_t quic_port() const { return m_quic_port.load(std::memory_order_acquire); }
 #endif
-    std::size_t active_connections() const { return m_core ? m_core->connections.load() : 0; }
+    std::size_t active_connections() const { return m_core ? m_core->connections->load() : 0; }
     std::size_t active_requests() const { return m_core ? m_core->requests.load() : 0; }
 
   private:
@@ -578,7 +583,7 @@ class Server {
         WsProxyLookup ws_proxy;
         WsLookup ws_regex;
         std::shared_ptr<IoCtxPool> pool;
-        std::atomic<std::size_t> connections{0};
+        std::shared_ptr<std::atomic<std::size_t>> connections{std::make_shared<std::atomic<std::size_t>>(0)};
         std::atomic<std::size_t> requests{0};
 
         // Connection lifecycle registry. `closers` lets stop() cancel idle
@@ -600,8 +605,7 @@ class Server {
             accept_waiters.push_back(std::move(waiter));
         }
 
-        void connection_released() {
-            connections.fetch_sub(1, std::memory_order_acq_rel);
+        void resume_accept_waiters() {
             std::function<void()> waiter;
             {
                 std::lock_guard<std::mutex> lock(lifecycle_mutex);
@@ -613,6 +617,11 @@ class Server {
             if (waiter) {
                 waiter();
             }
+        }
+
+        void connection_released() {
+            connections->fetch_sub(1, std::memory_order_acq_rel);
+            resume_accept_waiters();
         }
 
         void close_all() {
@@ -659,7 +668,7 @@ class Server {
         // At the limit, do not issue another accept: the kernel backlog applies
         // backpressure. Re-arm from connection_released() when a slot frees.
         if (listener->max_connections != 0 &&
-            listener->core->connections.load(std::memory_order_acquire) >= listener->max_connections) {
+            listener->core->connections->load(std::memory_order_acquire) >= listener->max_connections) {
             auto exec = slot.acceptor->get_executor();
             std::weak_ptr<ListenerState> weak_waiter = listener;
             listener->core->on_accept_capacity([weak_waiter, slot, exec] {
@@ -715,12 +724,12 @@ class Server {
 
     static void serve_socket(const std::shared_ptr<ListenerState> &listener, asio::ip::tcp::socket socket) {
         error_code ec;
-        socket.set_option(asio::ip::tcp::no_delay{true}, ec);
+        socket.set_option(asio::ip::tcp::no_delay{listener->cfg.tcp_nodelay}, ec);
         if (listener->cfg.socket_setup) {
             listener->cfg.socket_setup(socket);
         }
         auto core = listener->core;
-        core->connections.fetch_add(1, std::memory_order_acq_rel);
+        core->connections->fetch_add(1, std::memory_order_acq_rel);
         // The socket was created on its worker (see start_accept), so its own
         // executor is the one to run the engine on. Weak captures: a post that
         // is still queued at teardown must not keep the listener (and through
@@ -792,6 +801,14 @@ class Server {
                 }
                 if (transport->alpn_selected() == "h2") {
                     run_h2(alive, std::move(transport), std::string{}, closer);
+                    return;
+                }
+                // An HTTP/2-only listener must not fall back to h1 when the
+                // client sent no ALPN at all: OpenSSL does not invoke the
+                // select callback in that case, so the policy is enforced here.
+                if (alive->cfg.alpn == TlsHttp::Http2Only) {
+                    transport->close();
+                    alive->core->connection_released();
                     return;
                 }
                 run_h1(alive, std::move(transport), std::string{}, false, closer);
@@ -952,6 +969,15 @@ class Server {
         auto endpoint_config = m_cfg.quic_options;
         endpoint_config.max_connections = m_cfg.max_connections;
         endpoint_config.active = rt->active;
+        // The same counter the TCP accept path uses: max_connections is a
+        // server-wide budget, and active_connections() must include QUIC.
+        endpoint_config.global_active = core->connections;
+        endpoint_config.global_max_connections = m_cfg.max_connections;
+        std::weak_ptr<Core> weak_core = core;
+        endpoint_config.on_released = [weak_core] {
+            if (auto c = weak_core.lock())
+                c->resume_accept_waiters();
+        };
         if (RAND_bytes(endpoint_config.shared_secret.data(), static_cast<int>(endpoint_config.shared_secret.size())) !=
             1) {
             SIMPLE_HTTP_ERROR_LOG("server: QUIC could not generate the listener secret");
