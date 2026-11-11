@@ -44,6 +44,7 @@
 
 #include <nghttp3/nghttp3.h>
 
+#include "../../core/compat.h"
 #include <algorithm>
 #include <array>
 #include <boost/asio.hpp>
@@ -55,7 +56,6 @@
 #include <exception>
 #include <memory>
 #include <optional>
-#include "../../core/compat.h"
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -112,139 +112,134 @@ template <typename Connection> class Http3ResponseSink : public ResponseSink {
 
     void send(int status, Headers headers, std::string body, WriteCompletion done) override {
         auto weak = m_engine;
-        asio::dispatch(asio::bind_executor(
-            m_executor, [weak, id = m_stream_id, status, headers = std::move(headers), body = std::move(body),
-                         done = std::move(done)]() mutable {
-                auto eng = weak.lock();
-                if (!eng || !eng->alive() || !eng->stream_writable(id)) {
-                    std::move(done)(make_error_code(asio::error::not_connected));
-                    return;
-                }
-                ensure_date(headers);
-                // A response to HEAD has no body: the HEADERS frame ends the
-                // stream, and the headers still carry the Content-Length a GET
-                // would have produced.
-                const bool head = eng->method_is_head(id);
-                eng->begin_response(id, status, headers, /*end_stream=*/head, /*with_body=*/!head);
-                if (!head)
-                    eng->enqueue_body(id, std::move(body), /*last=*/true);
-                std::move(done)(error_code{});
-            }));
+        asio::dispatch(asio::bind_executor(m_executor, [weak, id = m_stream_id, status, headers = std::move(headers),
+                                                        body = std::move(body), done = std::move(done)]() mutable {
+            auto eng = weak.lock();
+            if (!eng || !eng->alive() || !eng->stream_writable(id)) {
+                std::move(done)(make_error_code(asio::error::not_connected));
+                return;
+            }
+            ensure_date(headers);
+            // A response to HEAD has no body: the HEADERS frame ends the
+            // stream, and the headers still carry the Content-Length a GET
+            // would have produced.
+            const bool head = eng->method_is_head(id);
+            eng->begin_response(id, status, headers, /*end_stream=*/head, /*with_body=*/!head);
+            if (!head)
+                eng->enqueue_body(id, std::move(body), /*last=*/true);
+            std::move(done)(error_code{});
+        }));
     }
 
     void send_bodyless(int status, Headers headers, WriteCompletion done) override {
         auto weak = m_engine;
-        asio::dispatch(asio::bind_executor(
-            m_executor, [weak, id = m_stream_id, status, headers = std::move(headers),
-                         done = std::move(done)]() mutable {
-                auto eng = weak.lock();
-                if (!eng || !eng->alive() || !eng->stream_writable(id)) {
-                    std::move(done)(make_error_code(asio::error::not_connected));
-                    return;
-                }
-                ensure_date(headers);
-                // No DATA frame follows, not even an empty one: the FIN that ends
-                // the HEADERS frame is what tells the client the message is over
-                // (§4.1).
-                eng->begin_response(id, status, headers, /*end_stream=*/true, /*with_body=*/false);
-                std::move(done)(error_code{});
-            }));
+        asio::dispatch(asio::bind_executor(m_executor, [weak, id = m_stream_id, status, headers = std::move(headers),
+                                                        done = std::move(done)]() mutable {
+            auto eng = weak.lock();
+            if (!eng || !eng->alive() || !eng->stream_writable(id)) {
+                std::move(done)(make_error_code(asio::error::not_connected));
+                return;
+            }
+            ensure_date(headers);
+            // No DATA frame follows, not even an empty one: the FIN that ends
+            // the HEADERS frame is what tells the client the message is over
+            // (§4.1).
+            eng->begin_response(id, status, headers, /*end_stream=*/true, /*with_body=*/false);
+            std::move(done)(error_code{});
+        }));
     }
 
     void send_headers(int status, Headers headers, WriteCompletion done) override {
         auto weak = m_engine;
-        asio::dispatch(asio::bind_executor(
-            m_executor, [weak, id = m_stream_id, status, headers = std::move(headers),
-                         done = std::move(done)]() mutable {
-                auto eng = weak.lock();
-                if (!eng || !eng->alive() || !eng->stream_writable(id)) {
-                    std::move(done)(make_error_code(asio::error::not_connected));
-                    return;
-                }
-                ensure_date(headers);
-                const bool head = eng->method_is_head(id);
-                // The body may follow, so the reader is installed even though
-                // nothing is queued yet: an absent reader means "this response
-                // has no body at all", which is what send_bodyless is for.
-                eng->begin_response(id, status, headers, /*end_stream=*/head, /*with_body=*/!head);
-                std::move(done)(error_code{});
-            }));
+        asio::dispatch(asio::bind_executor(m_executor, [weak, id = m_stream_id, status, headers = std::move(headers),
+                                                        done = std::move(done)]() mutable {
+            auto eng = weak.lock();
+            if (!eng || !eng->alive() || !eng->stream_writable(id)) {
+                std::move(done)(make_error_code(asio::error::not_connected));
+                return;
+            }
+            ensure_date(headers);
+            const bool head = eng->method_is_head(id);
+            // The body may follow, so the reader is installed even though
+            // nothing is queued yet: an absent reader means "this response
+            // has no body at all", which is what send_bodyless is for.
+            eng->begin_response(id, status, headers, /*end_stream=*/head, /*with_body=*/!head);
+            std::move(done)(error_code{});
+        }));
     }
 
     void send_chunk(std::string data, WriteCompletion done) override {
         auto weak = m_engine;
-        asio::dispatch(asio::bind_executor(
-            m_executor, [weak, id = m_stream_id, head = m_head_request, data = std::move(data),
-                         done = std::move(done)]() mutable {
-                auto eng = weak.lock();
-                // Deliberately NOT gating on nghttp3_conn_is_stream_writable2
-                // (which is what `stream_writable` is): that reports false while
-                // the stream is parked for WOULDBLOCK (READ_DATA_BLOCKED) -- and
-                // enqueueing the data is precisely what resumes it. Only a
-                // stream that is gone or reset by the peer is unsendable.
-                if (!eng || !eng->alive()) {
-                    std::move(done)(make_error_code(asio::error::not_connected));
-                    return;
-                }
-                if (head) {
-                    std::move(done)(error_code{}); // HEAD: no body
-                    return;
-                }
-                if (!eng->stream_sendable(id)) {
-                    std::move(done)(make_error_code(asio::error::not_connected));
-                    return;
-                }
-                // Backpressure: block while this stream's unacknowledged bytes
-                // are over the high mark, so a fast producer (a reverse proxy
-                // streaming an upstream body) is paced by the peer rather than
-                // by memory.
-                eng->async_await_out_space(
-                    id, [eng, id, data = std::move(data), done = std::move(done)](error_code ec) mutable {
-                        if (ec) {
-                            std::move(done)(ec);
-                            return;
-                        }
-                        eng->enqueue_body(id, std::move(data), /*last=*/false);
-                        std::move(done)(error_code{});
-                    });
-            }));
+        asio::dispatch(asio::bind_executor(m_executor, [weak, id = m_stream_id, head = m_head_request,
+                                                        data = std::move(data), done = std::move(done)]() mutable {
+            auto eng = weak.lock();
+            // Deliberately NOT gating on nghttp3_conn_is_stream_writable2
+            // (which is what `stream_writable` is): that reports false while
+            // the stream is parked for WOULDBLOCK (READ_DATA_BLOCKED) -- and
+            // enqueueing the data is precisely what resumes it. Only a
+            // stream that is gone or reset by the peer is unsendable.
+            if (!eng || !eng->alive()) {
+                std::move(done)(make_error_code(asio::error::not_connected));
+                return;
+            }
+            if (head) {
+                std::move(done)(error_code{}); // HEAD: no body
+                return;
+            }
+            if (!eng->stream_sendable(id)) {
+                std::move(done)(make_error_code(asio::error::not_connected));
+                return;
+            }
+            // Backpressure: block while this stream's unacknowledged bytes
+            // are over the high mark, so a fast producer (a reverse proxy
+            // streaming an upstream body) is paced by the peer rather than
+            // by memory.
+            eng->async_await_out_space(
+                id, [eng, id, data = std::move(data), done = std::move(done)](error_code ec) mutable {
+                    if (ec) {
+                        std::move(done)(ec);
+                        return;
+                    }
+                    eng->enqueue_body(id, std::move(data), /*last=*/false);
+                    std::move(done)(error_code{});
+                });
+        }));
     }
 
     void send_last(std::string data, WriteCompletion done) override {
         auto weak = m_engine;
-        asio::dispatch(asio::bind_executor(
-            m_executor, [weak, id = m_stream_id, head = m_head_request, data = std::move(data),
-                         done = std::move(done)]() mutable {
-                auto eng = weak.lock();
-                if (!eng || !eng->alive()) {
-                    std::move(done)(make_error_code(asio::error::not_connected));
-                    return;
-                }
-                if (head) {
-                    std::move(done)(error_code{}); // HEAD: no body
-                    return;
-                }
-                if (!eng->stream_sendable(id)) {
-                    std::move(done)(make_error_code(asio::error::not_connected));
-                    return;
-                }
-                eng->async_await_out_space(
-                    id, [eng, id, data = std::move(data), done = std::move(done)](error_code ec) mutable {
-                        if (ec) {
-                            std::move(done)(ec);
-                            return;
-                        }
-                        eng->enqueue_body(id, std::move(data), /*last=*/true);
-                        std::move(done)(error_code{});
-                    });
-            }));
+        asio::dispatch(asio::bind_executor(m_executor, [weak, id = m_stream_id, head = m_head_request,
+                                                        data = std::move(data), done = std::move(done)]() mutable {
+            auto eng = weak.lock();
+            if (!eng || !eng->alive()) {
+                std::move(done)(make_error_code(asio::error::not_connected));
+                return;
+            }
+            if (head) {
+                std::move(done)(error_code{}); // HEAD: no body
+                return;
+            }
+            if (!eng->stream_sendable(id)) {
+                std::move(done)(make_error_code(asio::error::not_connected));
+                return;
+            }
+            eng->async_await_out_space(
+                id, [eng, id, data = std::move(data), done = std::move(done)](error_code ec) mutable {
+                    if (ec) {
+                        std::move(done)(ec);
+                        return;
+                    }
+                    eng->enqueue_body(id, std::move(data), /*last=*/true);
+                    std::move(done)(error_code{});
+                });
+        }));
     }
 
     void send_trailers(Headers trailers, WriteCompletion done) override {
         auto weak = m_engine;
-        asio::dispatch(asio::bind_executor(
-            m_executor, [weak, id = m_stream_id, head = m_head_request, trailers = std::move(trailers),
-                         done = std::move(done)]() mutable {
+        asio::dispatch(
+            asio::bind_executor(m_executor, [weak, id = m_stream_id, head = m_head_request,
+                                             trailers = std::move(trailers), done = std::move(done)]() mutable {
                 auto eng = weak.lock();
                 if (!eng || !eng->alive()) {
                     std::move(done)(make_error_code(asio::error::not_connected));
@@ -280,12 +275,11 @@ template <typename Connection> class Http3ResponseSink : public ResponseSink {
 
     void close(WriteCompletion done) override {
         auto weak = m_engine;
-        asio::dispatch(asio::bind_executor(
-            m_executor, [weak, id = m_stream_id, done = std::move(done)]() mutable {
-                if (auto eng = weak.lock())
-                    eng->reset_stream(id, kH3RequestCancelled);
-                std::move(done)(error_code{});
-            }));
+        asio::dispatch(asio::bind_executor(m_executor, [weak, id = m_stream_id, done = std::move(done)]() mutable {
+            if (auto eng = weak.lock())
+                eng->reset_stream(id, kH3RequestCancelled);
+            std::move(done)(error_code{});
+        }));
     }
 
     Version version() const override { return Version::Http3; }
@@ -505,8 +499,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         auto self = this->shared_from_this();
         return asio::async_initiate<Token, void(error_code)>(
             [self, stream_id](auto handler) {
-                self->await_out_step(stream_id,
-                                     asio::any_completion_handler<void(error_code)>(std::move(handler)));
+                self->await_out_step(stream_id, asio::any_completion_handler<void(error_code)>(std::move(handler)));
             },
             token);
     }
@@ -666,12 +659,16 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
     }
 
     void on_stream_blocked(std::int64_t stream_id) noexcept override {
-        auto it = m_streams.find(stream_id);
-        if (it == m_streams.end())
-            return;
-        it->second->data_blocked = true;
+        // nghttp3 must be told for *every* stream, including the control and
+        // QPACK encoder/decoder uni streams, which are not in m_streams. If it
+        // is not blocked, next_stream_data() keeps returning the same bytes and
+        // the connection write loop spins forever after the peer advertises a
+        // zero uni-stream window.
         if (h3() != nullptr)
-            nghttp3_conn_block_stream(m_h3, stream_id);
+            (void)nghttp3_conn_block_stream(m_h3, stream_id);
+        auto it = m_streams.find(stream_id);
+        if (it != m_streams.end())
+            it->second->data_blocked = true;
     }
 
     void on_stream_shut_wr(std::int64_t stream_id) noexcept override {
@@ -980,17 +977,14 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
             return;
         }
 
-        // Hand the bytes to the Body, honouring its own bound: a peer that sends
-        // more than the handler will read must not be able to grow this queue
-        // without limit.
-        if (!stream.request->body().feed(std::string{reinterpret_cast<const char *>(data.data()), data.size()})) {
-            // The payload is never delivered, so it must not stay debited
-            // against the connection window (nghttp3 does not count DATA
-            // payload as consumed for us).
-            m_conn->extend_connection_offset(data.size());
-            stream.body_consumed->fetch_add(data.size(), std::memory_order_acq_rel);
-            reset_stream(stream_id, kH3RequestCancelled);
-            return;
+        // Hand the bytes to the Body, honouring its own bound. A full channel
+        // (the handler has not started reading yet, or is slower than the
+        // sender) is not an error: park the frame on this stream and feed it
+        // when read() frees a slot. Resetting here used to reject perfectly
+        // valid requests after ~1024 small DATA frames.
+        std::string chunk{reinterpret_cast<const char *>(data.data()), data.size()};
+        if (!stream.paused_frames.empty() || !stream.request->body().feed(std::move(chunk))) {
+            stream.paused_frames.push_back(std::move(chunk));
         }
         h3::wake(stream.in_space);
     }
@@ -1001,7 +995,10 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
             return;
         Stream &stream = *it->second;
         stream.request_complete = true;
-        (void)stream.request->body().finish();
+        if (stream.paused_frames.empty())
+            (void)stream.request->body().finish();
+        else
+            stream.finish_pending = true; // drained by drain_paused()
         spawn_handler(stream_id);
     }
 
@@ -1273,6 +1270,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
                 if (auto eng = weak.lock()) {
                     eng->m_conn->extend_stream_offset(stream_id, n);
                     eng->m_conn->extend_connection_offset(n);
+                    eng->drain_paused(stream_id);
                 }
             });
         });
@@ -1374,6 +1372,29 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
                 continue; // reset while queued
             it->second->queued = false;
             spawn_handler(stream_id);
+        }
+    }
+
+    // Moves parked DATA frames into the Body as the handler consumes, stopping
+    // as soon as the channel is full again. Runs on the connection executor:
+    // Body's channel (and ngtcp2's window state) are owner-only.
+    void drain_paused(std::int64_t stream_id) {
+        auto it = m_streams.find(stream_id);
+        if (it == m_streams.end())
+            return;
+        Stream &stream = *it->second;
+        while (!stream.paused_frames.empty()) {
+            std::string frame = std::move(stream.paused_frames.front());
+            // feed() leaves `frame` untouched when try_send fails.
+            if (!stream.request->body().feed(std::move(frame))) {
+                stream.paused_frames.front() = std::move(frame);
+                break;
+            }
+            stream.paused_frames.pop_front();
+        }
+        if (stream.paused_frames.empty() && stream.finish_pending) {
+            stream.finish_pending = false;
+            (void)stream.request->body().finish();
         }
     }
 

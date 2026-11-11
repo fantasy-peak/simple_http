@@ -761,12 +761,14 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
     }
 
     void on_stream_blocked(std::int64_t stream_id) noexcept override {
-        auto it = m_streams.find(stream_id);
-        if (it == m_streams.end())
-            return;
-        it->second->data_blocked = true;
+        // Control/QPACK uni streams are not in m_streams; block them too or the
+        // write loop keeps re-offering the same bytes and never returns to the
+        // event loop (mirror of the server-side fix).
         if (h3() != nullptr)
-            nghttp3_conn_block_stream(m_h3, stream_id);
+            (void)nghttp3_conn_block_stream(m_h3, stream_id);
+        auto it = m_streams.find(stream_id);
+        if (it != m_streams.end())
+            it->second->data_blocked = true;
     }
 
     void on_stream_shut_wr(std::int64_t stream_id) noexcept override {
@@ -1397,7 +1399,12 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
             std::move(done)(make_error_code(client_errc::stream_reset));
             return;
         }
-        if (st.out_write - st.out_ack <= h3::kOutLowWatermark) {
+        // Bound the accumulated queue, not the subset currently in flight:
+        // when the peer's flow-control window is shut, nghttp3 stops pulling
+        // from out_q while ACKs for already-sent bytes keep advancing out_ack,
+        // so out_write - out_ack stays near zero and the queue grows without
+        // limit. out_bytes is everything enqueued and not acknowledged.
+        if (st.out_bytes <= h3::kOutHighWatermark) {
             std::move(done)(error_code{});
             return;
         }

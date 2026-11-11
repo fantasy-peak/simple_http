@@ -1043,6 +1043,17 @@ test/run.sh server-diff
 55. **H2 的 content-length 在 END_STREAM 时必须核对**：HEADERS/CONTINUATION 直接带
     END_STREAM 时也要比较 `declared_content_length == body_received`；重复 CL、
     超过 INT64_MAX 的 CL、trailer 里的 framing/hop-by-hop 字段都要拒绝。
+56. **h3 单向流阻塞也必须通知 nghttp3**：control / QPACK encoder/decoder 流不在
+    `m_streams` 里；`on_stream_blocked()` 必须先对所有流调用
+    `nghttp3_conn_block_stream()`，否则 `next_stream_data()` 反复返回同一段字节，
+    连接写循环自旋，整条 I/O 线程被一个 `initial_max_stream_data_uni=0` 的对端挂死。
+57. **h3 客户端上传水位用 `out_bytes`**：`out_write - out_ack` 只表示“已交出但未
+    ACK”，对端流控关闭时 nghttp3 不再拉取，这个差值接近 0，`out_q` 会无界增长。
+    与服务端 `await_out_step` 一致，用 `out_bytes > kOutHighWatermark` 停车。
+58. **h3 请求体通道满必须停放，不能 reset**：`Body::feed()` 返回 false 只表示
+    通道满且参数可重试；把 DATA 放进 `H3Stream::paused_frames`，在
+    `on_consumed` 回到连接 executor 后 `drain_paused()` 回灌；END_STREAM 期间有
+    停放帧时记 `finish_pending`，排空后再 `body().finish()`。
 
 ---
 

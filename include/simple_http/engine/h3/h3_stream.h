@@ -110,6 +110,14 @@ struct H3Stream {
     // returned without consuming the body, so nobody will ever read it.
     bool read_stopped{false};
     bool in_fin{false};
+    // DATA frames nghttp3 delivered while the Body channel was full. They are
+    // moved into the channel as the handler reads; parking them here (instead
+    // of resetting the stream) keeps a fast sender from failing a handler that
+    // has not started reading yet.
+    std::deque<std::string> paused_frames;
+    // END_STREAM arrived while frames were parked; finish the Body only after
+    // the parked queue drains, or read() would report EOF early.
+    bool finish_pending{false};
     Signal in_space;
 
     // --- outbound body ------------------------------------------------------
