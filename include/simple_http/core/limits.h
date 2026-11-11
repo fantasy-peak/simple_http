@@ -30,7 +30,8 @@ struct EngineLimits {
     std::size_t max_header_bytes{64 * 1024};
     // Maximum request body size (Content-Length or accumulated chunked).
     // Exceeding it (or a Content-Length that overflows) is answered with 413
-    // Payload Too Large.
+    // Payload Too Large. 0 means "no limit"; h1, h2 and h3 all use that
+    // convention.
     std::size_t max_body_bytes{64ull * 1024 * 1024};
 
     // --- WebSocket ---

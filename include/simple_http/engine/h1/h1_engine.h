@@ -705,15 +705,25 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
 
     // --- body framing --------------------------------------------------------
 
+    // EngineLimits::max_body_bytes == 0 means "no limit", matching h2/h3.
+    std::uint64_t body_limit() const noexcept {
+        return m_limits.max_body_bytes == 0 ? std::numeric_limits<std::uint64_t>::max()
+                                            : static_cast<std::uint64_t>(m_limits.max_body_bytes);
+    }
+
     void setup_body_framing(bool chunked, std::optional<std::string_view> content_length) {
         m_body_state.reset();
+        // Trailer bytes are budgeted per message. Without this reset a keep-alive
+        // connection accumulates them across requests and a later, perfectly
+        // normal request is failed with message_size.
+        m_trailer_bytes = 0;
         if (chunked) {
             m_body_state.mode = BodyState::Mode::Chunked;
             return;
         }
         if (content_length) {
             std::uint64_t len = 0;
-            (void)parse_uint(*content_length, 10, m_limits.max_body_bytes, len);
+            (void)parse_uint(*content_length, 10, body_limit(), len);
             m_body_state.mode = BodyState::Mode::Fixed;
             m_body_state.remaining = len;
             if (len == 0)
@@ -818,7 +828,7 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
                 size_tok = size_tok.substr(0, semi);
             }
             std::uint64_t chunk_len = 0;
-            if (parse_uint(size_tok, 16, self->m_limits.max_body_bytes, chunk_len) != NumParse::Ok) {
+            if (parse_uint(size_tok, 16, self->body_limit(), chunk_len) != NumParse::Ok) {
                 self->body_failed(make_error_code(asio::error::invalid_argument), std::move(done));
                 return;
             }
@@ -827,7 +837,7 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
                 return;
             }
             self->m_body_state.total += chunk_len;
-            if (self->m_body_state.total > self->m_limits.max_body_bytes) {
+            if (self->m_limits.max_body_bytes != 0 && self->m_body_state.total > self->m_limits.max_body_bytes) {
                 self->body_failed(make_error_code(asio::error::message_size), std::move(done));
                 return;
             }
@@ -876,8 +886,7 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
                     const std::string_view name = trim_ows(std::string_view{trailer}.substr(0, colon));
                     const std::string_view value = trim_ows(std::string_view{trailer}.substr(colon + 1));
                     const std::string lower_name = ascii_lower_copy(name);
-                    if (!name.empty() && !contains_ctl(name) && !contains_ctl(value) &&
-                        !is_forbidden_trailer_field(lower_name)) {
+                    if (is_http_token(name) && !contains_ctl(value) && !is_forbidden_trailer_field(lower_name)) {
                         request->mutable_trailers().add_lower(lower_name, std::string{value});
                     }
                 }
@@ -999,6 +1008,15 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
     }
 
     void handle_websocket(const ParsedHead &head, Version version) {
+        // RFC 6455 §4.1/§4.2.1: the handshake is a GET over HTTP/1.1 with a
+        // 16-byte, base64-encoded key. Anything else is a bad handshake, not a
+        // route to fall through to.
+        const auto ws_key = head.headers.get("sec-websocket-key");
+        if (head.method != Method::Get || head.version != Version::Http11 || !ws_key ||
+            base64_decode(*ws_key).size() != 16) {
+            send_error_response(status::bad_request, {}, version);
+            return;
+        }
         // RFC 6455 §4.2.1 version gate.
         const auto ws_version = head.headers.get("sec-websocket-version");
         if (!ws_version) {
@@ -1143,7 +1161,10 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
             } else {
                 return NumParse::Invalid;
             }
-            if (v > (max - d) / base)
+            // Written this way rather than `v > (max - d) / base`: that form
+            // underflows when max < d (a limit of 0, or 1 for base 16), and the
+            // underflow silently turns an over-limit value into Ok.
+            if (v > max / base || (v == max / base && d > max % base))
                 return NumParse::Overflow;
             v = v * base + d;
         }
@@ -1203,7 +1224,7 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
                 return out;
             }
             std::uint64_t len = 0;
-            const auto parsed = parse_uint(*cl, 10, m_limits.max_body_bytes, len);
+            const auto parsed = parse_uint(*cl, 10, body_limit(), len);
             if (parsed == NumParse::Invalid) {
                 out.error_status = status::bad_request;
                 return out;
@@ -1261,7 +1282,7 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
                 self->start_h2c(std::move(head), std::move(*body));
                 return;
             }
-            if (body->size() + r.data.size() > self->m_limits.max_body_bytes) {
+            if (self->m_limits.max_body_bytes != 0 && body->size() + r.data.size() > self->m_limits.max_body_bytes) {
                 self->send_error_response(status::payload_too_large, {}, head.version);
                 return;
             }

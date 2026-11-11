@@ -189,8 +189,9 @@ inline std::string_view http_date_now() {
 // tolerated. They are the historical vehicle for cache-poisoning and
 // request-smuggling tricks, and no client worth supporting sends them.
 inline std::optional<std::int64_t> parse_http_date(std::string_view s) {
-    // "Sun, 06 Nov 1994 08:49:37 GMT"
-    if (s.size() < 29)
+    // "Sun, 06 Nov 1994 08:49:37 GMT" — exactly 29 bytes, GMT suffix included.
+    // Trailing junk or a different zone would otherwise be accepted as GMT.
+    if (s.size() != 29 || s.compare(26, 3, "GMT") != 0)
         return std::nullopt;
     auto digits = [&](std::size_t pos, std::size_t n) -> std::optional<int> {
         if (pos + n > s.size())

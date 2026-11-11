@@ -247,7 +247,11 @@ TEST_CASE("cors: a disallowed-origin preflight is 204 without headers", "[cors]"
     CHECK_FALSE(ran);
 }
 
-TEST_CASE("cors: allow_credentials mirrors the origin instead of *", "[cors]") {
+TEST_CASE("cors: credentials with an empty allowlist fails closed", "[cors]") {
+    // Reflecting an arbitrary Origin together with credentials is the classic
+    // "any site can read authenticated responses" misconfiguration. An empty
+    // allowlist cannot express a safe credential policy, so no CORS headers
+    // are emitted at all.
     Router router;
     router.cors(CorsConfig{.allow_credentials = true});
 
@@ -256,9 +260,8 @@ TEST_CASE("cors: allow_credentials mirrors the origin instead of *", "[cors]") {
     add_origin(req, "https://example.com");
     auto writer = dispatch(ctx, router, req);
 
-    CHECK(writer->header(field::access_control_allow_origin) == "https://example.com");
-    CHECK(writer->header(field::access_control_allow_credentials) == "true");
-    CHECK(writer->header(field::vary) == "Origin");
+    CHECK_FALSE(writer->has_header(field::access_control_allow_origin));
+    CHECK_FALSE(writer->has_header(field::access_control_allow_credentials));
 }
 
 TEST_CASE("cors: an explicit * entry with credentials still mirrors", "[cors]") {

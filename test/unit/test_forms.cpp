@@ -255,19 +255,55 @@ TEST_CASE("proto/response: set_cookie formats a Set-Cookie header", "[forms]") {
     auto writer2 = std::make_shared<FakeResponseSink>(ctx.get_executor());
     auto res2 = std::make_shared<ResponseWriter>(writer2);
     res2->set_cookie("sid", "abc", std::chrono::seconds{3600}, "/", "", true, true, "Lax");
-    res2->set_cookie("tricky", "a;b");
+    // cookie-octet values need no quoting and are emitted verbatim.
+    res2->set_cookie("plain", "a=b:c");
     REQUIRE(run_on(ctx, res2->status(status::ok).async_send("", asio::use_awaitable)));
     CHECK(writer2->header(field::set_cookie) == "sid=abc; Path=/; Max-Age=3600; Secure; HttpOnly; SameSite=Lax");
     // The second Set-Cookie is a separate field; Headers::get returns the first.
     CHECK(writer2->last_headers.count(field::set_cookie) == 2);
-    // A value with characters outside the cookie grammar is quoted.
-    bool found_quoted = false;
+    bool found_plain = false;
     for (const auto &[name, value] : writer2->last_headers) {
-        if (name == "set-cookie" && value.find("tricky") != std::string::npos) {
-            found_quoted = value.find("tricky=\"a;b\"") != std::string::npos;
-        }
+        if (name == "set-cookie" && value == "plain=a=b:c")
+            found_plain = true;
     }
-    CHECK(found_quoted);
+    CHECK(found_plain);
+}
+
+TEST_CASE("proto/response: set_cookie rejects bytes outside the cookie grammar", "[forms]") {
+    // RFC 6265 §4.1.1: quoting is not an escape. A DQUOTE, backslash, comma,
+    // semicolon, space or control byte would end the value and let an
+    // attacker-chosen attribute into the header, so the field is refused
+    // (which fails the response closed, like a CR/LF in header()).
+    const std::string bad_values[] = {"a;b", "a b", "a,b", "a\"b", "a\\b", "a\r\nb", std::string{"a\0b", 3}};
+    for (const auto &bad : bad_values) {
+        asio::io_context ctx;
+        auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
+        auto res = std::make_shared<ResponseWriter>(writer);
+        res->set_cookie("sid", bad);
+        CHECK_FALSE(run_on(ctx, res->status(status::ok).async_send("", asio::use_awaitable)));
+        CHECK_FALSE(writer->has_header(field::set_cookie));
+    }
+
+    const std::string bad_names[] = {"", "a b", "a=b", "a\r\nb"};
+    for (const auto &bad : bad_names) {
+        asio::io_context ctx;
+        auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
+        auto res = std::make_shared<ResponseWriter>(writer);
+        res->set_cookie(bad, "v");
+        CHECK_FALSE(run_on(ctx, res->status(status::ok).async_send("", asio::use_awaitable)));
+    }
+
+    // Attributes are restricted too: a ';' in Path/Domain would inject one.
+    for (const auto &bad : {std::string{"a;b"}, std::string{"a,b"}}) {
+        asio::io_context ctx;
+        auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
+        auto res = std::make_shared<ResponseWriter>(writer);
+        res->set_cookie("sid", "v", {}, bad, "", false, false, {});
+        CHECK_FALSE(run_on(ctx, res->status(status::ok).async_send("", asio::use_awaitable)));
+        res = std::make_shared<ResponseWriter>(writer = std::make_shared<FakeResponseSink>(ctx.get_executor()));
+        res->set_cookie("sid", "v", {}, "/", bad, false, false, {});
+        CHECK_FALSE(run_on(ctx, res->status(status::ok).async_send("", asio::use_awaitable)));
+    }
 }
 
 TEST_CASE("middleware: redirect_slashes 301s the slash form to the canonical path", "[forms]") {
@@ -493,4 +529,17 @@ TEST_CASE("proto/response: set_cookie can delete with a negative Max-Age", "[for
     res2->set_cookie("old", "", std::chrono::seconds{-5}, "/");
     REQUIRE(run_on(ctx, res2->status(status::ok).async_send("", asio::use_awaitable)));
     CHECK(writer2->header(field::set_cookie) == "old=; Path=/; Max-Age=0");
+}
+
+TEST_CASE("proto/multipart: CR/LF/NUL in a part parameter is rejected", "[forms]") {
+    // quote() only escapes '"' and '\\'; a CR/LF would splice a new part header
+    // into the body, and a NUL truncates it in anything that treats the body as
+    // a C string.
+    MultipartForm form{"B"};
+    CHECK_THROWS_AS(form.field("a\r\nb", "v"), std::invalid_argument);
+    CHECK_THROWS_AS(form.field(std::string{"a\0b", 3}, "v"), std::invalid_argument);
+    CHECK_THROWS_AS(form.file("n", "f\r\nx", "d"), std::invalid_argument);
+    CHECK_THROWS_AS(form.file("n", "f", "text/plain\r\nX-Injected: 1", "d"), std::invalid_argument);
+    CHECK_THROWS_AS(MultipartForm{"a\r\nb"}, std::invalid_argument);
+    CHECK_THROWS_AS((MultipartForm{std::string{"a\0b", 3}}), std::invalid_argument);
 }

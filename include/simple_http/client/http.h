@@ -689,15 +689,13 @@ class RequestBuilder {
         request->set_method(m_method);
         request->mutable_headers() = m_headers;
         const auto &config = m_client->config();
+        // Advertise only codings this build can actually decode; advertising an
+        // unsupported one makes the server compress a body we would then have to
+        // pass through raw (or fail to decode).
+        const auto encodings = detail::normalize_accept_encodings(config.accept_encodings);
         if (config.auto_decompress && m_method != Method::Head && !request->header(field::accept_encoding) &&
-            !request->header(field::range) && !config.accept_encodings.empty()) {
-            std::string accept;
-            for (const auto &coding : config.accept_encodings) {
-                if (!accept.empty())
-                    accept += ", ";
-                accept += coding;
-            }
-            request->mutable_headers().add(std::string{field::accept_encoding}, std::move(accept));
+            !request->header(field::range) && !encodings.empty()) {
+            request->mutable_headers().add(std::string{field::accept_encoding}, detail::join_encodings(encodings));
             request->set_state(detail::AutoDecompressMark{});
         }
         if (!m_body.empty())
@@ -1701,8 +1699,13 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
                                     std::move(done)(make_error_code(client_errc::redirect_to_insecure), Response{});
                                     return;
                                 }
-                                const bool same_origin = next->scheme == target.scheme && next->host == target.host &&
-                                                         next->effective_port() == target.effective_port();
+                                // Scheme and host are case-insensitive (RFC 3986
+                                // §3.1/§3.2.2); comparing raw bytes cleared
+                                // credentials on a mere spelling difference.
+                                const bool same_origin =
+                                    iequals_ci(next->scheme, target.scheme) &&
+                                    iequals_ci(next->host, target.host) &&
+                                    next->effective_port() == target.effective_port();
                                 // Replay from the saved body: the first hop
                                 // consumed the live Body, and a 307/308 must
                                 // resend the same entity. clone_for_replay keeps
@@ -1775,7 +1778,11 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
                                 });
                                 return;
                             }
-                            if (self->m_config.auto_decompress && request->get_state<detail::AutoDecompressMark>() &&
+                            // An empty body has nothing to decode; feeding it to
+                            // gzip/brotli reports a truncated stream and turns a
+                            // legitimate empty response into body_decode_failed.
+                            if (!body.empty() && self->m_config.auto_decompress &&
+                                request->get_state<detail::AutoDecompressMark>() &&
                                 request->method() != Method::Head && !request->header(field::range) && !head.bodyless &&
                                 head.status != status::no_content && head.status != status::not_modified) {
                                 if (const auto encoding = head.header(field::content_encoding)) {

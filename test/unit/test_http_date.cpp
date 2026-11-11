@@ -59,14 +59,13 @@ TEST_CASE("http_date: parsing rejects what it should not accept", "[http_date]")
     CHECK_FALSE(parse_http_date("Sun, 06 Xxx 1994 08:49:37 GMT").has_value());
     CHECK_FALSE(parse_http_date("Sun 06 Nov 1994 08:49:37 GMT").has_value()); // comma dropped
 
-    // The parser reads the first 29 bytes and does not look at what follows, nor
-    // at the "GMT" literal itself. Recorded rather than endorsed: it is not a
-    // smuggling vector here because the result is a number rather than a string
-    // that gets echoed back, and tightening it would reject dates some clients
-    // length-pad. Pinned so a change is deliberate.
-    CHECK(parse_http_date("Sun, 06 Nov 1994 08:49:37 UTC").has_value());
-    CHECK(parse_http_date("Sun, 06 Nov 1994 08:49:37 GMTX").has_value());
-    CHECK(parse_http_date("Sun, 06 Nov 1994 08:49:37 XXX").has_value());
+    // IMF-fixdate is exactly 29 bytes and ends in the literal "GMT". Accepting
+    // another zone abbreviation, a truncated/padded "GMT", or trailing junk
+    // would silently reinterpret a different instant as GMT.
+    CHECK_FALSE(parse_http_date("Sun, 06 Nov 1994 08:49:37 UTC").has_value());
+    CHECK_FALSE(parse_http_date("Sun, 06 Nov 1994 08:49:37 GMTX").has_value());
+    CHECK_FALSE(parse_http_date("Sun, 06 Nov 1994 08:49:37 XXX").has_value());
+    CHECK_FALSE(parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT junk").has_value());
 
     // A real value with the day-of-week wrong is still accepted: the weekday is
     // redundant, and refusing it would reject dates from clients that compute it

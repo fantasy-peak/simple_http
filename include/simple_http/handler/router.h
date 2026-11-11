@@ -181,7 +181,7 @@ class Router {
         }
         const std::string full_pattern = m_scopes.empty() ? pattern : scope_regex(pattern);
         try {
-            m_regex.emplace_back(RegexRoute{simple_http_regex::regex{full_pattern}, literal_prefix(full_pattern)},
+            m_regex.emplace_back(RegexRoute{simple_http_regex::regex{full_pattern}},
                                  std::move(*entry));
         } catch (const std::exception &e) {
             SIMPLE_HTTP_ERROR_LOG("invalid route regex [{}]: {}", pattern, e.what());
@@ -258,7 +258,7 @@ class Router {
         const std::string full_pattern = m_scopes.empty() ? pattern : scope_regex(pattern);
         try {
             m_ws_proxy_regex.emplace_back(
-                RegexRoute{simple_http_regex::regex{full_pattern}, literal_prefix(full_pattern)}, std::move(target));
+                RegexRoute{simple_http_regex::regex{full_pattern}}, std::move(target));
         } catch (const std::exception &e) {
             SIMPLE_HTTP_ERROR_LOG("invalid ws proxy regex [{}]: {}", pattern, e.what());
         }
@@ -279,7 +279,7 @@ class Router {
         const std::string full_pattern = m_scopes.empty() ? pattern : scope_regex(pattern);
         try {
             m_http_proxy_regex.emplace_back(
-                RegexRoute{simple_http_regex::regex{full_pattern}, literal_prefix(full_pattern)},
+                RegexRoute{simple_http_regex::regex{full_pattern}},
                 HttpProxyRoute{std::move(target), std::move(client_cfg), std::move(scoped_registration.second)});
         } catch (const std::exception &e) {
             SIMPLE_HTTP_ERROR_LOG("invalid http proxy regex [{}]: {}", pattern, e.what());
@@ -411,7 +411,7 @@ class Router {
         WsRouteEntry entry{std::move(handler), std::move(scoped_registration.second)};
         const std::string full_pattern = m_scopes.empty() ? pattern : scope_regex(pattern);
         try {
-            m_ws_regex.emplace_back(RegexRoute{simple_http_regex::regex{full_pattern}, literal_prefix(full_pattern)},
+            m_ws_regex.emplace_back(RegexRoute{simple_http_regex::regex{full_pattern}},
                                     std::move(entry));
         } catch (const std::exception &e) {
             SIMPLE_HTTP_ERROR_LOG("invalid ws route regex [{}]: {}", pattern, e.what());
@@ -440,8 +440,6 @@ class Router {
             return nullptr;
         }
         for (const auto &[route, entry] : m_ws_regex) {
-            if (!route.literal_prefix.empty() && !starts_with(path, route.literal_prefix))
-                continue;
             const std::string p{path};
             if (simple_http_regex::regex_match(p, route.pattern)) {
                 return &entry;
@@ -464,8 +462,6 @@ class Router {
             return std::nullopt;
         }
         for (const auto &[route, proxy] : m_http_proxy_regex) {
-            if (!route.literal_prefix.empty() && !starts_with(path, route.literal_prefix))
-                continue;
             const std::string p{path};
             simple_http_regex::smatch match;
             if (simple_http_regex::regex_match(p, match, route.pattern)) {
@@ -492,8 +488,6 @@ class Router {
             return std::nullopt;
         }
         for (const auto &[route, target] : m_ws_proxy_regex) {
-            if (!route.literal_prefix.empty() && !starts_with(path, route.literal_prefix))
-                continue;
             const std::string p{path};
             simple_http_regex::smatch m;
             if (simple_http_regex::regex_match(p, m, route.pattern)) {
@@ -711,8 +705,6 @@ class Router {
             bool method_mismatch = false;
             std::uint16_t mismatch_bits = 0;
             for (const auto &[route, entry] : m_regex) {
-                if (!route.literal_prefix.empty() && !starts_with(path, route.literal_prefix))
-                    continue;
                 if (!simple_http_regex::regex_match(owned_path, route.pattern))
                     continue;
                 if (method_allowed(entry, method)) {
@@ -901,12 +893,9 @@ class Router {
                 slot = entry;
             }
         }
-        if ((entry.method_bits & method_bit(Method::Get)) != 0) {
-            auto &head = tbl.by_method[static_cast<std::size_t>(Method::Head)];
-            if (!head) {
-                head = entry; // GET implies HEAD, unless HEAD is registered explicitly
-            }
-        }
+        // GET implies HEAD, but do not occupy the HEAD slot here: an explicit
+        // HEAD route registered later must be able to win. lookup() falls back
+        // to the GET entry when no HEAD handler exists.
     }
 
     static std::uint16_t method_allow_bits(const MethodTable &tbl) {
@@ -923,6 +912,13 @@ class Router {
         const std::size_t idx = static_cast<std::size_t>(m);
         if (idx < MethodTable::kSlots && tbl.by_method[idx]) {
             return &*tbl.by_method[idx];
+        }
+        // GET implies HEAD when no explicit HEAD handler was registered.
+        if (m == Method::Head) {
+            const auto &get = tbl.by_method[static_cast<std::size_t>(Method::Get)];
+            if (get) {
+                return &*get;
+            }
         }
         return tbl.any ? &*tbl.any : nullptr;
     }
@@ -1180,37 +1176,13 @@ class Router {
         res->async_send("", finish_with(std::move(done)));
     }
 
+    // No literal-prefix fast path: "/api|/admin" has the literal prefix "/api"
+    // but matches "/admin", and "/files/?" does not imply "/files/". A
+    // necessary-prefix test has to understand the whole regex, so every
+    // candidate is matched.
     struct RegexRoute {
         simple_http_regex::regex pattern;
-        std::string literal_prefix; // leading literal bytes; empty = starts with a metachar
     };
-
-    static std::string literal_prefix(std::string_view pattern) {
-        std::string out;
-        out.reserve(pattern.size());
-        for (char c : pattern) {
-            switch (c) {
-            case '\\':
-            case '^':
-            case '$':
-            case '.':
-            case '[':
-            case ']':
-            case '*':
-            case '+':
-            case '?':
-            case '(':
-            case ')':
-            case '{':
-            case '}':
-            case '|':
-                return out;
-            default:
-                out.push_back(c);
-            }
-        }
-        return out;
-    }
 
     // Transparent hashing/equality would be enough on C++20; boost::unordered_map
     // provides the heterogeneous find under C++17.

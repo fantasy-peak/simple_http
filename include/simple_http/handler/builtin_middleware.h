@@ -225,6 +225,12 @@ inline bool ip_covered(std::string_view entry, std::string_view ip) {
         if (entry[i] < '0' || entry[i] > '9') {
             return false;
         }
+        // 128 is the longest IPv6 prefix; rejecting here also keeps the
+        // accumulate from wrapping a huge configured value back into a small
+        // (and therefore over-trusting) prefix such as /0.
+        if (prefix > 128) {
+            return false;
+        }
         prefix = prefix * 10 + static_cast<unsigned>(entry[i] - '0');
     }
     // Separate error codes: reusing one lets a malformed network part stay at
@@ -289,45 +295,61 @@ inline Middleware real_ip(std::vector<std::string> trusted_proxies = {}) {
     return [trusted = std::move(trusted_proxies)](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next,
                                                   HandlerCompletion done) {
         if (real_ip_detail::peer_is_trusted(req->peer_address(), trusted)) {
+            // The header value becomes a trusted client identity downstream, so
+            // it has to parse as an address; a proxy that forwarded junk (or an
+            // attacker controlling a trusted hop) must not mint "evil" as an IP.
+            bool have_real = false;
             if (const auto x_real = req->header("x-real-ip"); x_real && !x_real->empty()) {
-                req->set_state(ClientIp{std::string{*x_real}});
-            } else if (const auto xff = req->header("x-forwarded-for")) {
-                std::vector<std::string_view> hops;
-                std::size_t pos = 0;
-                while (pos <= xff->size()) {
-                    const std::size_t comma = xff->find(',', pos);
-                    std::string_view hop =
-                        xff->substr(pos, comma == std::string_view::npos ? std::string_view::npos : comma - pos);
-                    while (!hop.empty() && hop.front() == ' ') {
-                        hop.remove_prefix(1);
-                    }
-                    while (!hop.empty() && hop.back() == ' ') {
-                        hop.remove_suffix(1);
-                    }
-                    if (!hop.empty()) {
-                        hops.push_back(hop);
-                    }
-                    if (comma == std::string_view::npos) {
-                        break;
-                    }
-                    pos = comma + 1;
+                error_code ip_ec;
+                asio::ip::make_address(std::string{*x_real}, ip_ec);
+                if (!ip_ec) {
+                    req->set_state(ClientIp{std::string{*x_real}});
+                    have_real = true;
                 }
-                if (!hops.empty()) {
-                    std::string_view chosen = hops.front();
-                    for (auto it = hops.rbegin(); it != hops.rend(); ++it) {
-                        bool is_trusted = false;
-                        for (const auto &t : trusted) {
-                            if (real_ip_detail::ip_covered(t, *it)) {
-                                is_trusted = true;
+            }
+            if (!have_real) {
+                if (const auto xff = req->header("x-forwarded-for")) {
+                    std::vector<std::string_view> hops;
+                    std::size_t pos = 0;
+                    while (pos <= xff->size()) {
+                        const std::size_t comma = xff->find(',', pos);
+                        std::string_view hop =
+                            xff->substr(pos, comma == std::string_view::npos ? std::string_view::npos : comma - pos);
+                        while (!hop.empty() && hop.front() == ' ') {
+                            hop.remove_prefix(1);
+                        }
+                        while (!hop.empty() && hop.back() == ' ') {
+                            hop.remove_suffix(1);
+                        }
+                        if (!hop.empty()) {
+                            hops.push_back(hop);
+                        }
+                        if (comma == std::string_view::npos) {
+                            break;
+                        }
+                        pos = comma + 1;
+                    }
+                    if (!hops.empty()) {
+                        std::string_view chosen = hops.front();
+                        for (auto it = hops.rbegin(); it != hops.rend(); ++it) {
+                            bool is_trusted = false;
+                            for (const auto &t : trusted) {
+                                if (real_ip_detail::ip_covered(t, *it)) {
+                                    is_trusted = true;
+                                    break;
+                                }
+                            }
+                            if (!is_trusted) {
+                                chosen = *it;
                                 break;
                             }
                         }
-                        if (!is_trusted) {
-                            chosen = *it;
-                            break;
+                        error_code chosen_ec;
+                        asio::ip::make_address(std::string{chosen}, chosen_ec);
+                        if (!chosen_ec) {
+                            req->set_state(ClientIp{std::string{chosen}});
                         }
                     }
-                    req->set_state(ClientIp{std::string{chosen}});
                 }
             }
         }
@@ -556,7 +578,12 @@ inline Middleware decompress_request(RequestDecompressionConfig config = {},
                 continue;
             }
             if (entry.back() == '/') {
-                if (starts_with(path, std::string_view{entry}.substr(0, entry.size() - 1))) {
+                // A directory entry must stop at a path-segment boundary: with a
+                // bare prefix, "/api/" also excluded "/apix". Match the bare
+                // prefix and its children, but nothing that merely shares the
+                // characters.
+                const std::string_view prefix{entry.data(), entry.size() - 1};
+                if (path == prefix || starts_with(path, entry)) {
                     covered = false;
                     break;
                 }
@@ -633,7 +660,12 @@ inline Middleware compress(CompressionConfig config = {}, std::function<bool(con
                 continue;
             }
             if (entry.back() == '/') {
-                if (starts_with(path, std::string_view{entry}.substr(0, entry.size() - 1))) {
+                // A directory entry must stop at a path-segment boundary: with a
+                // bare prefix, "/api/" also excluded "/apix". Match the bare
+                // prefix and its children, but nothing that merely shares the
+                // characters.
+                const std::string_view prefix{entry.data(), entry.size() - 1};
+                if (path == prefix || starts_with(path, entry)) {
                     covered = false;
                     break;
                 }

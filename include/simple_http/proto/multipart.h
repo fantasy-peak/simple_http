@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <optional>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -254,10 +255,13 @@ class MultipartForm {
     // An explicit boundary, for tests or callers who need a fixed one (Go's
     // multipart.Writer.Boundary()). The caller picks one that does not appear
     // in any part body.
-    explicit MultipartForm(std::string boundary) : m_boundary(std::move(boundary)) {}
+    explicit MultipartForm(std::string boundary) : m_boundary(std::move(boundary)) {
+        validate_param(m_boundary, "boundary");
+    }
 
     // A plain text field: Content-Disposition: form-data; name="...".
     MultipartForm &field(std::string name, std::string value) {
+        validate_param(name, "field name");
         m_parts.push_back(Part{std::move(name), {}, {}, std::move(value)});
         m_built = false;
         return *this;
@@ -266,6 +270,8 @@ class MultipartForm {
     // A file part whose content type comes from the filename's extension
     // (mime::by_extension; application/octet-stream when it has none).
     MultipartForm &file(std::string name, std::string filename, std::string data) {
+        validate_param(name, "field name");
+        validate_param(filename, "filename");
         // Compute the content type from the filename *before* it is moved into
         // the part (braced-init-list elements run left to right).
         std::string content_type{mime::by_extension(filename)};
@@ -277,6 +283,9 @@ class MultipartForm {
     // A file part with an explicit content type ("" omits the part's own
     // Content-Type header).
     MultipartForm &file(std::string name, std::string filename, std::string content_type, std::string data) {
+        validate_param(name, "field name");
+        validate_param(filename, "filename");
+        validate_param(content_type, "content type");
         m_parts.push_back(Part{std::move(name), std::move(filename), std::move(content_type), std::move(data)});
         m_built = false;
         return *this;
@@ -316,6 +325,14 @@ class MultipartForm {
     std::size_t content_length() const { return body().size(); }
 
   private:
+    // A CR/LF/NUL in a name, filename or content type would splice a new part
+    // header (or a whole part) into the body; `quote()` only escapes `"`/`\`.
+    // A bad parameter is a programming error, like Go's Writer contract.
+    static void validate_param(std::string_view value, const char *what) {
+        if (value.find_first_of("\r\n") != std::string_view::npos || value.find('\0') != std::string_view::npos)
+            throw std::invalid_argument(std::string{"multipart "} + what + " contains CR/LF/NUL");
+    }
+
     struct Part {
         std::string name;
         std::string filename;

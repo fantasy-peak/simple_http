@@ -174,9 +174,8 @@ inline void StaticFiles::try_serve(const RequestPtr &req, const ResponsePtr &res
     auto normalized = decode_and_normalize(req->path(), err);
     if (!normalized) {
         // A malformed or traversal path never reaches the filesystem, and never
-        // reaches the router either: it is answered here, with the connection
-        // closed. A request target this shape says the peer is not a browser,
-        // and there is nothing to gain by continuing to talk to it.
+        // reaches the router either: it is answered here with a 400. A request
+        // target this shape says the peer is not a browser.
         SIMPLE_HTTP_WARN_LOG("static: rejecting path [{}] from {} (err={})", std::string{req->path()},
                              req->peer_address(), static_cast<int>(err));
         res->status(status::bad_request);
@@ -198,7 +197,10 @@ inline void StaticFiles::try_serve(const RequestPtr &req, const ResponsePtr &res
     const StaticEntry *entry = m_table.find(*normalized);
     bool spa_hit = false;
     if (entry == nullptr && spa_eligible(*normalized)) {
-        entry = m_table.find("/" + m_config.spa_fallback);
+        // Keys are normalized with a leading '/', so a caller-supplied
+        // "/index.html" must not become "//index.html" (which never matches).
+        entry = m_table.find(m_config.spa_fallback.front() == '/' ? m_config.spa_fallback
+                                                                 : "/" + m_config.spa_fallback);
         spa_hit = entry != nullptr;
     }
     if (entry == nullptr) {

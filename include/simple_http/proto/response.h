@@ -52,6 +52,14 @@ class ResponseWriter {
 
     // --- fluent setters (return *this for chaining) ---
     ResponseWriter &status(int code) {
+        // RFC 9110 §15: a status code is exactly three digits, 100..599. A
+        // handler-set 0/9999 would serialize an illegal status line (and h2
+        // clients reset the stream), so refuse it like any other bad field.
+        if (code < 100 || code > 599) {
+            SIMPLE_HTTP_ERROR_LOG("response status {} outside 100..599 rejected", code);
+            m_field_rejected = true;
+            return *this;
+        }
         m_status = code;
         return *this;
     }
@@ -83,15 +91,21 @@ class ResponseWriter {
     ResponseWriter &set_cookie(std::string name, std::string value, std::chrono::seconds max_age = {},
                                std::string path = {}, std::string domain = {}, bool secure = false,
                                bool http_only = false, std::string same_site = {}) {
+        // RFC 6265 §4.1.1: cookie-name is a token and cookie-value is
+        // *cookie-octet (optionally DQUOTE-wrapped). Quoting is not an escape:
+        // an embedded DQUOTE/backslash (or a space/comma/semicolon) would end
+        // the value and start an attacker-chosen attribute. Refuse the field
+        // instead of emitting a malformed or injected Set-Cookie.
+        const bool valid = is_http_token(name) && valid_cookie_value(value) && valid_cookie_attribute(path, true) &&
+                           valid_cookie_attribute(domain, false) && (same_site.empty() || is_http_token(same_site));
+        if (!valid) {
+            SIMPLE_HTTP_ERROR_LOG("set_cookie: invalid name/value/attribute rejected");
+            m_field_rejected = true;
+            return *this;
+        }
         std::string field_value = std::move(name);
         field_value.push_back('=');
-        if (value.find_first_of(";, \"\\") != std::string::npos) {
-            field_value.push_back('"');
-            field_value += value;
-            field_value.push_back('"');
-        } else {
-            field_value += value;
-        }
+        field_value += value;
         if (!domain.empty()) {
             field_value += "; Domain=";
             field_value += domain;
@@ -149,13 +163,16 @@ class ResponseWriter {
     // Status + headers with no body and no body framing at all (204/304 and
     // every response to HEAD).
     template <typename Token> auto async_send_bodyless(Token &&token) {
-        error_code pre = prepare_one_shot(false);
+        // A response has exactly one head. Refuse a second one here too: h1 has
+        // no engine-side guard, and two status lines on one connection are the
+        // response-smuggling shape.
+        error_code pre = prepare_one_shot();
         return compose_send(pre, Mode::Bodyless, std::string{}, std::forward<Token>(token));
     }
 
     // --- streaming ---
     template <typename Token> auto async_begin(Token &&token) {
-        error_code pre = prepare_one_shot(false);
+        error_code pre = prepare_one_shot();
         auto sink = m_writer;
         const int code = m_status;
         auto headers = std::move(m_headers);
@@ -297,20 +314,41 @@ class ResponseWriter {
     }
 
   private:
+    // cookie-octet = %x21 / %x23-2B / %x2D-3A / %x3C-5B / %x5D-7E
+    static bool valid_cookie_value(std::string_view value) noexcept {
+        for (unsigned char c : value) {
+            const bool ok = c == 0x21 || (c >= 0x23 && c <= 0x2B) || (c >= 0x2D && c <= 0x3A) ||
+                            (c >= 0x3C && c <= 0x5B) || (c >= 0x5D && c <= 0x7E);
+            if (!ok)
+                return false;
+        }
+        return true;
+    }
+    // Path-value allows SP; Domain (a host) does not. Both exclude ';', ','
+    // and control bytes, which would inject another cookie attribute.
+    static bool valid_cookie_attribute(std::string_view value, bool allow_space) noexcept {
+        for (unsigned char c : value) {
+            if (c < 0x20 || c == 0x7F || c == ';' || c == ',')
+                return false;
+            if (!allow_space && c == ' ')
+                return false;
+        }
+        return true;
+    }
+
     enum class Mode { Direct, Bodyless, Stream };
     enum class Phase { Start, Headers, Chunk, Trailers, Final };
 
     // Synchronous pre-flight shared by send/send_bodyless/begin: field
     // rejection, single-head rule, defaults and the activity counter.
-    error_code prepare_one_shot(bool require_first_head = true) {
+    error_code prepare_one_shot() {
         if (m_field_rejected) {
             return make_error_code(asio::error::invalid_argument);
         }
         // A response has exactly one head. Refusing a second one here is what
         // lets invoke_handler's 500 fallback check started() instead of
-        // splicing a second status line onto the wire. send_bodyless()/begin()
-        // keep the historical shape: they only set the flag.
-        if (require_first_head && m_started) {
+        // splicing a second status line onto the wire.
+        if (m_started) {
             return make_error_code(asio::error::invalid_argument);
         }
         note_activity();

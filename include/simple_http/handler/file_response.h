@@ -61,26 +61,33 @@ struct SendFileOp {
     std::ifstream file;
     std::array<char, 64 * 1024> buffer{};
     error_code pre;
+    std::uintmax_t size{0};
     int stage{0};
 
     asio::any_io_executor get_executor() const noexcept { return response.writer().get_executor(); }
 
+    // Validates the file without touching the response: headers written here
+    // would survive a later open() failure and describe a body the caller is
+    // about to replace with a 404/500.
     error_code prepare() {
         std::error_code stat_ec;
-        const auto size = std::filesystem::file_size(path, stat_ec);
+        size = std::filesystem::file_size(path, stat_ec);
         if (stat_ec) {
             return boost::system::errc::make_error_code(boost::system::errc::no_such_file_or_directory);
         }
         if (options.max_bytes != 0 && size > options.max_bytes) {
             return boost::system::errc::make_error_code(boost::system::errc::file_too_large);
         }
+        return {};
+    }
+
+    void apply_headers() {
         const auto content_type =
             options.content_type.empty() ? std::string{mime::by_extension(path)} : options.content_type;
         response.content_type(content_type);
         if (options.set_content_length) {
             response.header(field::content_length, std::to_string(size));
         }
-        return {};
     }
 
     template <typename Self> void read_and_write(Self &self) {
@@ -107,14 +114,17 @@ struct SendFileOp {
                 self.complete(pre);
                 return;
             }
-            if (response.writer().head_request()) {
-                stage = 4;
-                response.async_send_bodyless(std::move(self));
-                return;
-            }
+            // Open before writing any head field: a failure here must leave the
+            // response untouched so the caller can still send its own 404/500.
             file.open(path, std::ios::binary);
             if (!file) {
                 self.complete(boost::system::errc::make_error_code(boost::system::errc::no_such_file_or_directory));
+                return;
+            }
+            apply_headers();
+            if (response.writer().head_request()) {
+                stage = 4;
+                response.async_send_bodyless(std::move(self));
                 return;
             }
             stage = 1;

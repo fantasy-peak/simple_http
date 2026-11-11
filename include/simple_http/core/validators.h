@@ -61,7 +61,18 @@ inline bool etag_matches(std::string_view header_value, std::string_view etag) {
     };
     std::size_t pos = 0;
     while (pos <= header_value.size()) {
-        auto comma = header_value.find(',', pos);
+        // Split on commas outside a quoted opaque-tag: an ETag may legally be
+        // `"a,b"`, and a plain find(',') would cut it in half and miss a 304.
+        std::size_t comma = pos;
+        bool quoted = false;
+        for (; comma < header_value.size(); ++comma) {
+            if (header_value[comma] == '"')
+                quoted = !quoted;
+            else if (header_value[comma] == ',' && !quoted)
+                break;
+        }
+        if (comma == header_value.size())
+            comma = std::string_view::npos;
         auto item = header_value.substr(pos, comma == std::string_view::npos ? std::string_view::npos : comma - pos);
         auto trimmed = strip(item);
         if (trimmed == "*")

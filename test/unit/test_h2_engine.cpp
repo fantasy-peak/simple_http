@@ -314,7 +314,9 @@ TEST_CASE("h2/engine: an early response does not abort the rest of the request b
 
     // An auth/limit-style handler: answer without ever reading the body.
     auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res,
-                         SslHandle) -> asio::awaitable<void> { co_await res->status(status::ok).async_send("denied", asio::use_awaitable); };
+                         SslHandle) -> asio::awaitable<void> {
+        co_await res->status(status::ok).async_send("denied", asio::use_awaitable);
+    };
     auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, limits);
     REQUIRE(run_on(ctx, run_engine(*engine, dispatcher)));
 
@@ -505,4 +507,117 @@ TEST_CASE("h2/engine: END_STREAM during a body pause is not lost", "[h2]") {
 
     CHECK(read_ok.load());
     CHECK(received.load() == kChunks * 4 + kLast);
+}
+
+// --- request field validation ---------------------------------------------
+
+namespace {
+
+// Runs one client SETTINGS + one HEADERS frame and reports what the engine did.
+struct ValidationOutcome {
+    bool completed{false};
+    bool dispatched{false};
+    bool rst_protocol_error{false};
+    bool goaway_protocol_error{false};
+};
+
+ValidationOutcome run_headers(const std::string &block, EngineLimits limits = {}) {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    std::string in{codec::kH2ClientPreface};
+    append_frame(in, H2FrameType::Settings, 0, 0, "");
+    append_frame(in, H2FrameType::Headers, H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM, 1, block);
+    transport->push(std::move(in));
+
+    ValidationOutcome out;
+    auto dispatcher = [&out](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter>,
+                             SslHandle) -> asio::awaitable<void> {
+        out.dispatched = true;
+        co_return;
+    };
+    auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, limits);
+    out.completed = run_on(ctx, run_engine(*engine, dispatcher));
+    out.rst_protocol_error = has_rst_stream(transport->written(), 1, codec::H2_PROTOCOL_ERROR);
+    out.goaway_protocol_error = has_goaway(transport->written(), codec::H2_PROTOCOL_ERROR);
+    return out;
+}
+
+std::string request_block(std::string method = "GET", std::string path = "/") {
+    std::string block;
+    hpack_append_literal(block, ":method", method);
+    hpack_append_literal(block, ":scheme", "https");
+    hpack_append_literal(block, ":path", path);
+    hpack_append_literal(block, ":authority", "example.com");
+    return block;
+}
+
+} // namespace
+
+TEST_CASE("h2/engine: a regular field name must be an HTTP token", "[h2]") {
+    auto block = request_block();
+    hpack_append_literal(block, "bad name", "v");
+    const auto out = run_headers(block);
+    REQUIRE(out.completed);
+    CHECK_FALSE(out.dispatched);
+    CHECK(out.rst_protocol_error);
+}
+
+TEST_CASE("h2/engine: a field value may not carry a non-CRLF control byte", "[h2]") {
+    auto block = request_block();
+    hpack_append_literal(block, "x-bad", std::string{"a\x01b", 3});
+    const auto out = run_headers(block);
+    REQUIRE(out.completed);
+    CHECK_FALSE(out.dispatched);
+    CHECK(out.rst_protocol_error);
+}
+
+TEST_CASE("h2/engine: :method must be a token", "[h2]") {
+    auto block = request_block("GE T");
+    const auto out = run_headers(block);
+    REQUIRE(out.completed);
+    CHECK_FALSE(out.dispatched);
+    CHECK(out.rst_protocol_error);
+}
+
+TEST_CASE("h2/engine: :path must be origin-form or *", "[h2]") {
+    for (const std::string path : {"a/b", "/a#frag", "/a b", "http://x/y"}) {
+        INFO("path: " << path);
+        auto block = request_block("GET", path);
+        const auto out = run_headers(block);
+        REQUIRE(out.completed);
+        CHECK_FALSE(out.dispatched);
+        CHECK(out.rst_protocol_error);
+    }
+    // "*" is legal for OPTIONS.
+    const auto star = run_headers(request_block("OPTIONS", "*"));
+    REQUIRE(star.completed);
+    CHECK(star.dispatched);
+}
+
+TEST_CASE("h2/engine: Host must agree with :authority and appear at most once", "[h2]") {
+    {
+        auto block = request_block();
+        hpack_append_literal(block, "host", "other.example");
+        const auto out = run_headers(block);
+        REQUIRE(out.completed);
+        CHECK_FALSE(out.dispatched);
+        CHECK(out.rst_protocol_error);
+    }
+    {
+        auto block = request_block();
+        hpack_append_literal(block, "host", "example.com");
+        hpack_append_literal(block, "host", "example.com");
+        const auto out = run_headers(block);
+        REQUIRE(out.completed);
+        CHECK_FALSE(out.dispatched);
+        CHECK(out.rst_protocol_error);
+    }
+    {
+        // The compliant pairing is accepted and :authority wins.
+        auto block = request_block();
+        hpack_append_literal(block, "host", "example.com");
+        const auto out = run_headers(block);
+        REQUIRE(out.completed);
+        CHECK(out.dispatched);
+    }
 }

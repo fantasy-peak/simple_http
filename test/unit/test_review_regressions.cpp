@@ -781,3 +781,70 @@ TEST_CASE("review: extract handler exceptions become 500", "[review][regression]
     CHECK(sink->last_status == status::internal_server_error);
     CHECK(sink->last_body.empty());
 }
+
+// Per-request state carries meaning, not just decoration: the buffered send()
+// path marks a request it may decode with AutoDecompressMark. A replay that
+// dropped the mark would return a gzip body the client itself advertised.
+TEST_CASE("review: clone_for_replay copies per-request state", "[review][regression]") {
+    asio::io_context ctx;
+    auto req = std::make_shared<Request>(Version::Http11, ctx.get_executor());
+    req->set_state(detail::AutoDecompressMark{});
+    req->set_state(42);
+
+    auto copy = req->clone_for_replay(ctx.get_executor());
+    CHECK(copy->get_state<detail::AutoDecompressMark>() != nullptr);
+    REQUIRE(copy->get_state<int>() != nullptr);
+    CHECK(*copy->get_state<int>() == 42);
+}
+
+// A second response head on one connection is the response-smuggling shape: h1
+// has no engine-side guard, so the facade must refuse it.
+TEST_CASE("review: a second response head is refused", "[review][regression]") {
+    asio::io_context ctx;
+    auto sink = std::make_shared<FakeResponseSink>(ctx.get_executor());
+    auto res = std::make_shared<ResponseWriter>(sink);
+
+    REQUIRE(run_on(ctx, res->status(status::ok).async_send("one", asio::use_awaitable)));
+    CHECK_FALSE(run_on(ctx, res->status(status::ok).async_begin(asio::use_awaitable)));
+    CHECK_FALSE(run_on(ctx, res->status(status::ok).async_send_bodyless(asio::use_awaitable)));
+    CHECK_FALSE(run_on(ctx, res->status(status::ok).async_send("two", asio::use_awaitable)));
+}
+
+TEST_CASE("review: field error messages escape every C0 control byte", "[review][regression]") {
+    std::vector<FieldError> errors;
+    // Split the hex escapes from following hex-digit letters ('c' in "code"):
+    // "\x1fcode" would otherwise be one 0x1FC escape.
+    errors.push_back(FieldError{"f\x01"
+                                "ield",
+                                "bad\x1f"
+                                "code",
+                                "m\x08"
+                                "sg"});
+    const std::string json = field_errors_json(errors);
+    CHECK(json.find("\\u0001") != std::string::npos);
+    CHECK(json.find("\\u001f") != std::string::npos);
+    CHECK(json.find("\\u0008") != std::string::npos);
+    CHECK(json.find('\x01') == std::string::npos);
+}
+
+// A status line is three digits in 100..599 (RFC 9110 §15). 0/9999 used to be
+// serialized verbatim; h2 clients reset the stream on the resulting frame.
+TEST_CASE("review: an out-of-range response status is refused", "[review][regression]") {
+    for (const int code : {0, 99, 600, 9999}) {
+        asio::io_context ctx;
+        auto sink = std::make_shared<FakeResponseSink>(ctx.get_executor());
+        auto res = std::make_shared<ResponseWriter>(sink);
+        res->status(code);
+        CHECK_FALSE(run_on(ctx, res->async_send("x", asio::use_awaitable)));
+        CHECK(sink->calls == 0);
+    }
+    // The valid boundaries still work.
+    for (const int code : {100, 599}) {
+        asio::io_context ctx;
+        auto sink = std::make_shared<FakeResponseSink>(ctx.get_executor());
+        auto res = std::make_shared<ResponseWriter>(sink);
+        res->status(code);
+        CHECK(run_on(ctx, res->async_send("", asio::use_awaitable)));
+        CHECK(sink->last_status == code);
+    }
+}

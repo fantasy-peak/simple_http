@@ -57,6 +57,15 @@ template <typename Transport>
 void async_ws_upgrade_impl(std::shared_ptr<Transport> transport, std::string authority, std::string path,
                            WebSocketSpec spec, std::chrono::milliseconds idle_timeout,
                            std::chrono::milliseconds handshake_timeout, WsOpenCompletion done) {
+    // Every one of these is spliced into the handshake head. headers are
+    // checked below; origin and the request-target are caller-controlled too
+    // (a common pattern is mirroring an inbound Origin), so a CR/LF there would
+    // inject an upgrade header just as readily.
+    if (contains_ctl(spec.origin) || contains_ctl(path) || contains_ctl(authority)) {
+        transport->close();
+        std::move(done)(make_error_code(asio::error::invalid_argument), nullptr);
+        return;
+    }
     const std::string key = ws_client_key();
     std::string request;
     request += "GET " + (path.empty() ? std::string{"/"} : path) + " HTTP/1.1\r\n";

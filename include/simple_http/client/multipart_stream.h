@@ -77,8 +77,10 @@ inline void stream_file_step(std::shared_ptr<Stream> stream, std::shared_ptr<std
                             });
         return;
     }
+    // A clean EOF sets only eofbit; fail() covers failbit too, so a read that
+    // stopped for any other reason is an error rather than a silent success.
     error_code result;
-    if (in->bad())
+    if (in->fail())
         result = make_error_code(boost::system::errc::io_error);
     auto callback = std::move(*done);
     std::move(callback)(result);
@@ -271,7 +273,8 @@ class MultipartStreamWriter : public std::enable_shared_from_this<MultipartStrea
             done(make_error_code(boost::system::errc::operation_not_permitted));
             return;
         }
-        if (!detail::valid_multipart_param(name) || !detail::valid_multipart_param(filename)) {
+        if (!detail::valid_multipart_param(name) || !detail::valid_multipart_param(filename) ||
+            !detail::valid_multipart_param(content_type)) {
             done(make_error_code(boost::system::errc::invalid_argument));
             return;
         }

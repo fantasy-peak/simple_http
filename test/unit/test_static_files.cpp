@@ -858,3 +858,18 @@ TEST_CASE("static: a SPA fallback with Range reports the range length", "[static
     CHECK(r.writer->header(field::content_length) == "2");
     CHECK(r.writer->last_body.size() == 2);
 }
+
+TEST_CASE("static: SPA fallback accepts a leading slash", "[static]") {
+    StaticFixture fx;
+    fx.make_standard_tree();
+
+    StaticFilesConfig cfg = standard_config(fx);
+    cfg.spa_fallback = "/index.html";
+    auto site = load_standard(fx, cfg);
+
+    asio::io_context ctx;
+    auto r = get(*site, ctx, "/spa/deep/link");
+    CHECK(r.handled);
+    CHECK(r.writer->last_status == status::ok);
+    CHECK(r.writer->last_body == "<html>root index</html>");
+}

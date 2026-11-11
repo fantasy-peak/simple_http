@@ -161,6 +161,12 @@ class Http2ResponseSink final : public ResponseSink, public std::enable_shared_f
                     std::move(done)(make_error_code(asio::error::not_connected));
                     return;
                 }
+                // 204 and 1xx carry no content; a handler-set Content-Length
+                // would describe a body that cannot exist. 304 may keep one
+                // (RFC 9110 §15.4.5), matching h1.
+                if (status == status::no_content || (status >= 100 && status < 200)) {
+                    headers.erase("content-length");
+                }
                 ensure_date(headers);
                 eng->submit_headers(self->m_stream_id, status, headers, /*end_stream=*/true);
                 std::move(done)(error_code{});
@@ -1287,14 +1293,19 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
             return false;
         }
         // RFC 9113 §5.1.1: a client opens odd-numbered streams, each higher than
-        // every stream it has opened before. A HEADERS on anything else - an even
-        // (server-initiated) id, or an id that goes backwards - is a connection
-        // error; tolerating it would let a peer open streams it must not.
+        // every stream it has opened before. An even (server-initiated) id is a
+        // connection error. An odd id at or below the highest opened one is
+        // closed (idle streams are implicitly closed once a higher id opens),
+        // so HEADERS there is a stream error, not a connection error.
+        bool closed_stream = false;
         if (m_streams.find(hdr.stream_id) == m_streams.end() && !is_new_client_stream(hdr.stream_id)) {
-            SIMPLE_HTTP_ERROR_LOG("h2: client opened stream {} (highest so far {}); GOAWAY", hdr.stream_id,
-                                  m_next_peer_stream_id);
-            go_away(codec::H2_PROTOCOL_ERROR);
-            return false;
+            if ((hdr.stream_id & 1u) != 1u) {
+                SIMPLE_HTTP_ERROR_LOG("h2: client opened stream {} (highest so far {}); GOAWAY", hdr.stream_id,
+                                      m_next_peer_stream_id);
+                go_away(codec::H2_PROTOCOL_ERROR);
+                return false;
+            }
+            closed_stream = true;
         }
         bool ok = false;
         std::string_view block =
@@ -1302,6 +1313,18 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
         if (!ok) {
             go_away(codec::H2_PROTOCOL_ERROR);
             return false;
+        }
+        if (closed_stream) {
+            // The field block still has to be decoded (and discarded) or the
+            // connection's HPACK dynamic table diverges from the peer's.
+            if (hdr.has_flag(codec::H2_FLAG_END_HEADERS)) {
+                if (!decode_discarded_header_block(block))
+                    return false;
+            } else {
+                begin_discarding_header_block(hdr, block);
+            }
+            reset_stream(hdr.stream_id, codec::H2_STREAM_CLOSED);
+            return true;
         }
 
         // §5.3.1: a stream cannot depend on itself. The priority prefix was just
@@ -1474,6 +1497,32 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
         return false;
     }
 
+    // RFC 9113 §8.3.1: :path is origin-form ("/" ...) or "*" for OPTIONS. It
+    // never carries a fragment, and a raw space would split an HTTP/1.1 request
+    // line when the proxy replays it.
+    static bool valid_h2_path(std::string_view p) noexcept {
+        if (p.empty())
+            return false;
+        if (p == "*")
+            return true;
+        if (p.front() != '/')
+            return false;
+        return p.find_first_of(" #\t") == std::string_view::npos;
+    }
+
+    // A field value may contain VCHAR, SP, HTAB and obs-text, but no other CTL
+    // and not DEL. contains_ctl() only knows CR/LF/NUL — enough to stop header
+    // injection, not enough to reject a malformed field.
+    static bool has_forbidden_value_byte(std::string_view s) noexcept {
+        for (unsigned char c : s) {
+            if (c == '\t')
+                continue;
+            if (c < 0x20 || c == 0x7F)
+                return true;
+        }
+        return false;
+    }
+
     // RFC 9113 §8.2.2: the HTTP/1.1 connection-specific fields, which a client
     // must not send in HTTP/2. A hop downstream that acted on one — say
     // `transfer-encoding: chunked` replayed through a proxy route — would be
@@ -1541,7 +1590,7 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
             // HTTP/1.1 message is built downstream (handlers, reverse proxy). A
             // request is malformed -> stream error (§8.1.1); the connection stays
             // usable.
-            if (contains_ctl(f.name) || contains_ctl(f.value)) {
+            if (contains_ctl(f.name) || has_forbidden_value_byte(f.value)) {
                 SIMPLE_HTTP_ERROR_LOG("h2 field with CR/LF/NUL (stream={}); resetting stream", stream_id);
                 reset_stream(stream_id, codec::H2_PROTOCOL_ERROR);
                 return true; // stream is gone: the caller must not dispatch it
@@ -1587,8 +1636,22 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
                 *seen = true;
 
                 if (f.name == ":method") {
+                    // The method is replayed into an HTTP/1.1 request line by
+                    // the reverse proxy and the WebSocket upstream handshake, so
+                    // it has to re-parse as a token.
+                    if (!is_http_token(f.value)) {
+                        malformed("invalid :method");
+                        return true;
+                    }
                     st.request->set_method_token(f.value);
                 } else if (f.name == ":path") {
+                    // Origin-form or "*" (OPTIONS); a fragment never belongs in
+                    // a request target, and a raw SP would split the request
+                    // line downstream.
+                    if (!valid_h2_path(f.value)) {
+                        malformed("invalid :path");
+                        return true;
+                    }
                     st.request->set_target(std::move(f.value));
                 } else if (f.name == ":authority") {
                     authority = std::move(f.value);
@@ -1602,6 +1665,14 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
             }
 
             seen_regular_field = true;
+            // RFC 9113 §8.2.1: a regular field name is an HTTP/1.1 token. HPACK
+            // can encode any byte, and this name is replayed into an HTTP/1.1
+            // upstream by the reverse proxy, so "bad name" or "x:y" must not
+            // survive into Request::headers().
+            if (!is_http_token(f.name)) {
+                malformed("invalid field name");
+                return true;
+            }
             if (has_upper_ascii(f.name)) {
                 malformed("uppercase field name");
                 return true;
@@ -1697,11 +1768,24 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
             }
         }
 
-        // :authority is HTTP/2's spelling of Host, and a compliant client sends
-        // it with no Host field at all — so without this every h2 request reaches
-        // handlers, and the reverse proxy's x-forwarded-host, host-less. Done
-        // after the loop so a real Host field wins over the synthesized one.
-        if (!authority.empty() && !st.request->mutable_headers().contains("host")) {
+        // :authority is HTTP/2's spelling of Host, and §8.3.1 makes it the
+        // authoritative value: a compliant client sends neither a Host field or
+        // sends one with the same value. A conflicting pair (or duplicate Host)
+        // is malformed, not a value to pick arbitrarily.
+        const std::size_t host_count = st.request->mutable_headers().count("host");
+        if (host_count > 1) {
+            malformed("duplicate Host");
+            return true;
+        }
+        if (!authority.empty()) {
+            if (host_count == 1) {
+                const auto host = st.request->header("host");
+                if (host && *host != authority) {
+                    malformed("Host and :authority disagree");
+                    return true;
+                }
+            }
+            st.request->mutable_headers().erase("host");
             st.request->mutable_headers().add_lower("host", std::move(authority));
         }
         // Dispatch is triggered by the caller once END_STREAM is also observed.

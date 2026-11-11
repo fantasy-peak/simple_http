@@ -315,7 +315,7 @@ using CoroNext = std::function<asio::awaitable<void>(RequestPtr, ResponsePtr, Ss
 
 - `use()` / `make_middleware()` 接受回调式或协程式；`make_middlewares(...)`
   用于 `group()` / `route()` / `ws_route()` 的 `std::vector<Middleware>` 参数混合两种形状。
-- 协程式内部用 `async_compose` 把 `Next` 适配成 awaitable，保留 associated
+- 协程式内部用 `asio::async_initiate` 把 `Next` 适配成 awaitable，保留 associated
   executor / allocator / cancellation slot。
 - Router 仍然是运行时注册表，内部统一为 type-erased `Middleware`；不要把链模板化。
 
@@ -337,8 +337,8 @@ using CoroNext = std::function<asio::awaitable<void>(RequestPtr, ResponsePtr, Ss
 
 1. 精确路径（方法感知）
 2. `{param}` 模板 trie
-3. HTTP 反代路由
-4. 本地正则
+3. 本地正则
+4. HTTP 反代路由
 5. 静态文件
 6. fallback
 7. 内建 404
@@ -352,6 +352,8 @@ using CoroNext = std::function<asio::awaitable<void>(RequestPtr, ResponsePtr, Ss
 - 405 / 自动 OPTIONS 是普通 keep-alive 响应，引擎会 drain 未读请求体。
 - WebSocket 查找：本地精确 ws → ws 反代 → 本地正则 ws。
 - CORS 不覆盖 WebSocket 升级，使用 `ws_origin()`。
+- 空 `allow_origins` + `allow_credentials=true` 是 fail-closed（不发 CORS 头）；
+  需要携带凭据的跨域必须显式 allowlist（或 `"*"`，表示仍镜像 Origin）。
 
 ### 4.3 框架层（State / Extractor / Validation / Auth）
 
@@ -430,6 +432,10 @@ co_await res->finish();
 `send()` 自动补 `Date`、`Server`、`Content-Type`（204/304 不补 Content-Type）；
 引擎会剥离 handler 设置的 hop-by-hop 字段（connection / keep-alive /
 transfer-encoding / proxy-connection / upgrade）。
+
+一个 `ResponseWriter` 只发送一个响应头：`send()` / `send_bodyless()` / `begin()`
+共享 `m_started` 检查，第二次调用返回 `invalid_argument`。`set_cookie()` 按
+RFC 6265 校验 name/value/属性，非法时与 `header()` 一样置 `m_field_rejected`。
 
 ### 4.5 WebSocket
 
@@ -551,6 +557,10 @@ server.serve_swagger_ui("/swagger", "/openapi.json");
 - 响应 trailers 用带 END_STREAM 的尾部 HEADERS。
 - 一次性响应**不发 Content-Length**（END_STREAM 界定），HEAD 例外。
 - RFC 8441 extended CONNECT（`:protocol: websocket`）默认开启，服务端支持。
+- 请求字段校验（§8.2.1/§8.3.1）：普通字段名必须是 token；`:method` 必须是 token；
+  `:path` 必须是 origin-form 或 `*` 且不含 `#`/SP；`host` 重复或与 `:authority`
+  不一致是流级 PROTOCOL_ERROR，一致时以 `:authority` 为准。
+- 响应 `send_bodyless` 对 204/1xx 剥离 handler 设置的 `content-length`（304 保留）。
 - Rapid Reset 防护：同时执行的 handler 上限 = `h2_max_concurrent_streams`；
   超出进 `h2_max_queued_streams` 队列；队列溢出 → `GOAWAY(ENHANCE_YOUR_CALM)`。
 
@@ -590,7 +600,7 @@ server.serve_swagger_ui("/swagger", "/openapi.json");
 |---|---|
 | `idle_timeout` | 120 s |
 | `max_header_bytes` | 64 KiB（431） |
-| `max_body_bytes` | 64 MiB（413） |
+| `max_body_bytes` | 64 MiB（413）；0 = 不限制，h1/h2/h3 一致 |
 | `ws_read_ahead_bytes` | 4 MiB |
 | `ws_compression` | false |
 | `h2_max_concurrent_streams` | 200 |
@@ -1082,6 +1092,64 @@ test/run.sh server-diff
     的连接级流控额度归还。
 67. **代理与 TCP 选项**：`tcp_nodelay` 要按 listener 生效；HTTP 反代除固定
     hop-by-hop 集合外，还要剥离 `Connection` 指名的字段（请求与响应两侧）。
+68. **h1 trailer 预算按消息复位**：`m_trailer_bytes` 必须在 `setup_body_framing`
+    归零；连接级累计会让长 keep-alive 连接上的后续正常请求被误判 `message_size`。
+    客户端侧同理：响应 trailer 段也要有 `max_header_bytes` 预算（L-16）。
+69. **h2 字段语法**：普通字段名必须是 token，值不得含 CR/LF/NUL 之外的其它 CTL
+    （`contains_ctl` 只覆盖三种）；`:method` 必须是 token，`:path` 必须是
+    origin-form 或 `*` 且无 `#`/SP。否则反代会把非法内容拼进 HTTP/1.1 上游。
+70. **h2 Host 与 `:authority`**：`host` 出现多次、或与 `:authority` 不一致都是
+    malformed（流级 PROTOCOL_ERROR）；一致时以 `:authority` 为准并删除 Host 字段。
+    不要再让 Host 静默覆盖 `:authority`。
+71. **响应只有一个头**：`send`/`send_bodyless`/`begin` 共用 `prepare_one_shot()`
+    的 `m_started` 检查；h1 没有引擎侧保护，重复发送就是响应走私。`status()`
+    拒绝 100..599 之外的值（0/9999 会生成非法状态行）。
+72. **`max_body_bytes == 0` = 不限制**：h1 的 `parse_uint` 上限、chunked 累计检查、
+    h2c body 检查都要用 `body_limit()`；h2/h3 本来就是该语义。
+73. **`parse_uint` 溢出守卫不能写成 `v > (max - d) / base`**：`max < d` 时会无符号
+    下溢并把超限值判为 Ok；用 `v > max / base || (v == max / base && d > max % base)`。
+74. **`set_cookie` 按 RFC 6265 拒绝而不是引号转义**：name 必须是 token，value 必须是
+    cookie-octet，Path/Domain/SameSite 不得含 `;`/`,`/CTL；引号不是转义。非法字段
+    与 `header()` 一样置 `m_field_rejected`，让响应失败而不是发出畸形 Set-Cookie。
+75. **CORS 空 allowlist + credentials 必须 fail-closed**：空 `allow_origins` 加
+    `allow_credentials` 无法表达安全策略，直接不发 CORS 头；显式 `"*"` 才走镜像逻辑。
+76. **`parse_http_date` 只接受 29 字节 IMF-fixdate**：必须校验 `GMT` 后缀并拒绝
+    尾随字节；不要把 `UTC`/`GMTX`/尾随垃圾当作 GMT。
+77. **`MultipartForm` / `MultipartStreamWriter` 的 part 参数校验**：name、filename、
+    content_type、boundary 中的 CR/LF/NUL 会注入 part 头，入口直接拒绝
+    （`MultipartForm` 抛 `invalid_argument`，流式写入返回 `invalid_argument`）。
+78. **h1 客户端流式请求的 body 边界**：`finish`/trailer 之后再写必须拒绝；已知
+    `Content-Length` 时累计写入量，超写/欠写都 `fail_exchange`（否则多余字节会变成
+    同连接上的下一个请求）。
+79. **`clone_for_replay` 必须复制 `m_state`**：`AutoDecompressMark` 等按类型存的
+    标记属于请求语义，丢掉会让重定向/重试后的响应不再解压。
+80. **`send_file` 先 open 再写头**：`prepare()` 只做 stat/上限检查；open 失败不得
+    在响应对象上留下 `content-type`/`content-length`。
+81. **WebSocket 握手校验**：服务端要求 GET + HTTP/1.1 + base64 解码后 16 字节的
+    `Sec-WebSocket-Key`，否则 400；客户端 origin/request-target 与 headers 一样
+    拒绝 CR/LF/NUL。SSE 行缓冲与响应 trailer 一样必须有上限。
+82. **GET 隐含 HEAD 不在注册时占槽**：`insert_entry` 不能把 GET entry 写进 HEAD
+    槽，否则后注册的显式 HEAD 永远被“已注册”挡住；改由 `lookup()` 在 HEAD 槽为空
+    时回退到 GET。Allow 位仍来自 GET entry 的 `method_bits`（含 HEAD）。
+83. **正则路由不能按字面前缀剪枝**：`/api|/admin` 的字面前缀是 `/api` 但匹配
+    `/admin`，`/files/?` 也不蕴含 `/files/`。匹配所有候选，不做 starts_with 预筛。
+84. **`etag_matches` 按引号感知切分列表**：opaque-tag 内允许逗号，`"a,b"` 不能被
+    当成两个条目。
+85. **静态 `spa_fallback` 的 key 以 `/` 开头**：`"/" + "/index.html"` 永不命中；
+    已有前导斜杠时不要再拼。
+86. **`real_ip` 只接受可解析地址**：`X-Real-IP`/选中的 `X-Forwarded-For` hop 必须
+    通过 `make_address`，否则不写入 `ClientIp`；`ip_covered` 的前缀解析要在
+    `prefix > 128` 时提前失败，避免累加回绕成 `/0`。
+87. **SSE 行与事件缓冲有界**：超过 `SseParser::max_line_bytes`（1 MiB）返回
+    `message_size`，不能无限追加 `m_buf`。
+88. **`send_file` / `multipart_stream` 的失败路径**：`send_file` 先 open 再写头；
+    `stream_file_step` 用 `fail()` 而不是 `bad()` 判定读失败（clean EOF 只置
+    eofbit）。
+89. **h2 客户端 `te` 响应头大小写不敏感**；`MultiplexedClientSession::stream_closed`
+    对计数做饱和递减，`finish_session()` 清零后不再下溢。
+90. **h2 已关闭流的 HEADERS 是流级 `STREAM_CLOSED`**：奇数 id 且不高于已见最大
+    id 表示已关闭/隐式关闭；解码并丢弃字段块（保持 HPACK 同步）后 RST_STREAM。
+    偶数 id 才是连接级 PROTOCOL_ERROR。
 
 ---
 

@@ -43,6 +43,12 @@ struct SseOptions {
 
 class SseParser {
   public:
+    // A line longer than this is not a legitimate SSE event; keeping it in
+    // m_buf forever is an unbounded allocation controlled by the peer.
+    static constexpr std::size_t max_line_bytes = 1u << 20;
+
+    bool overflowed() const noexcept { return m_overflow; }
+
     std::vector<SseEvent> feed(std::string_view bytes) {
         m_buf.append(bytes);
         std::vector<SseEvent> out;
@@ -72,6 +78,10 @@ class SseParser {
             pos = end + term;
         }
         m_buf.erase(0, pos);
+        if (m_buf.size() > max_line_bytes) {
+            m_buf.clear();
+            m_overflow = true;
+        }
         return out;
     }
 
@@ -144,6 +154,7 @@ class SseParser {
     }
 
     std::string m_buf;
+    bool m_overflow{false};
     std::string m_data;
     std::string m_event;
     std::string m_id;
@@ -192,8 +203,7 @@ class SseStream : public std::enable_shared_from_this<SseStream> {
                                 }
                                 if (require_event_stream) {
                                     const auto content_type = head.header("content-type");
-                                    if (!content_type ||
-                                        content_type->find("text/event-stream") == std::string_view::npos) {
+                                    if (!content_type || !icontains_ci(*content_type, "text/event-stream")) {
                                         std::move(handler)(make_error_code(asio::error::invalid_argument), nullptr);
                                         return;
                                     }
@@ -255,6 +265,11 @@ class SseStream : public std::enable_shared_from_this<SseStream> {
                 } else {
                     for (auto &event : self->m_parser.feed(chunk.data))
                         self->m_pending.push_back(std::move(event));
+                }
+                if (self->m_parser.overflowed()) {
+                    auto callback = std::move(*done);
+                    std::move(callback)(make_error_code(asio::error::message_size), SseEvent{});
+                    return;
                 }
                 self->next_impl(std::move(done));
             });

@@ -215,6 +215,10 @@ class Request {
         copy->m_url = m_url;
         copy->mutable_headers() = m_headers;
         copy->m_trailers = m_trailers;
+        // Middleware-installed marks (notably AutoDecompressMark) are part of
+        // the request's meaning: dropping them makes the replay treat a body
+        // the client itself negotiated as gzip as opaque compressed bytes.
+        copy->m_state = m_state;
         copy->m_close = m_close;
         copy->m_stream_body = m_stream_body;
         if (!m_body_source.empty()) {

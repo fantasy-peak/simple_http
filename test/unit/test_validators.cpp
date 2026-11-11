@@ -136,3 +136,11 @@ TEST_CASE("validators: Range numbers that overflow uint64 are refused", "[valida
     CHECK_FALSE(parse_range("bytes=18446744073709551616-", 10, bad).has_value());
     CHECK_FALSE(parse_range("bytes=0-18446744073709551616", 10, bad).has_value());
 }
+
+TEST_CASE("validators: ETag list splitting respects a quoted comma", "[validators]") {
+    // Opaque tags may contain commas; splitting with find(',') cut `"a,b"` in
+    // half and missed the match.
+    CHECK(etag_matches("\"a,b\", \"c\"", "\"a,b\""));
+    CHECK(etag_matches("\"c\", \"a,b\"", "\"a,b\""));
+    CHECK_FALSE(etag_matches("\"a,b\"", "\"a\""));
+}

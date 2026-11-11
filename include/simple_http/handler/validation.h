@@ -131,7 +131,14 @@ inline std::string field_errors_json(const std::vector<FieldError> &errors) {
                 out += "\\t";
                 break;
             default:
-                out.push_back(c);
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    static constexpr char hex[] = "0123456789abcdef";
+                    out += "\\u00";
+                    out.push_back(hex[(static_cast<unsigned char>(c) >> 4) & 0x0F]);
+                    out.push_back(hex[static_cast<unsigned char>(c) & 0x0F]);
+                } else {
+                    out.push_back(c);
+                }
             }
         }
         return out;

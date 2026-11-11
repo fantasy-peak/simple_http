@@ -65,7 +65,16 @@ class MultiplexedClientSession : public ClientSession, public std::enable_shared
     }
 
     void stream_opened() noexcept { m_active_streams.fetch_add(1, std::memory_order_release); }
-    void stream_closed() noexcept { m_active_streams.fetch_sub(1, std::memory_order_release); }
+    void stream_closed() noexcept {
+        // finish_session() zeroes the count before the remaining stream-table
+        // entries are erased, so a plain fetch_sub could wrap to SIZE_MAX and
+        // report a wildly wrong diagnostic number.
+        auto current = m_active_streams.load(std::memory_order_relaxed);
+        while (current != 0 &&
+               !m_active_streams.compare_exchange_weak(current, current - 1, std::memory_order_release,
+                                                       std::memory_order_relaxed)) {
+        }
+    }
 
     Executor m_executor;
     std::string m_authority;

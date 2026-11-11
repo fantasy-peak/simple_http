@@ -170,3 +170,45 @@ TEST_CASE("h1/body: connection-specific trailer fields are ignored", "[h1]") {
     CHECK(out.had_trailer);
     CHECK(out.trailer == "yes");
 }
+
+TEST_CASE("h1/body: the trailer budget is per message, not per connection", "[h1]") {
+    // Two keep-alive requests whose trailer sections are each under
+    // max_header_bytes but together exceed it. The budget used to live on the
+    // connection, so the second request failed with message_size.
+    EngineLimits limits;
+    limits.max_header_bytes = 120;
+    const std::string value(50, 'a');
+    const std::string request = "POST / HTTP/1.1\r\n"
+                                "Host: x\r\n"
+                                "Transfer-Encoding: chunked\r\n"
+                                "\r\n"
+                                "1\r\n"
+                                "a\r\n"
+                                "0\r\n"
+                                "X-Check: " +
+                                value +
+                                "\r\n"
+                                "\r\n";
+
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    transport->push(request + request);
+
+    std::vector<std::string> bodies;
+    auto dispatcher = [&bodies](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res,
+                                SslHandle) -> asio::awaitable<void> {
+        auto body = co_await body_read_all(req->body());
+        if (!body) {
+            co_await res->status(status::bad_request).async_send("bad", asio::use_awaitable);
+            co_return;
+        }
+        bodies.push_back(std::move(*body));
+        co_await res->status(status::ok).async_send("ok", asio::use_awaitable);
+    };
+
+    auto engine = std::make_shared<Http1Engine<MockTransport>>(transport, limits);
+    REQUIRE(run_on(ctx, run_engine(*engine, dispatcher)));
+    REQUIRE(bodies.size() == 2);
+    CHECK(bodies[0] == "a");
+    CHECK(bodies[1] == "a");
+}

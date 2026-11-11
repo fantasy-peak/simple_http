@@ -968,3 +968,42 @@ TEST_CASE("router: regex routes method-check too, and later patterns can resolve
         CHECK(w->header(field::allow) == "GET, HEAD, POST, OPTIONS");
     }
 }
+
+TEST_CASE("router: an explicit HEAD route overrides the GET fallback", "[router]") {
+    asio::io_context ctx;
+    {
+        Router router;
+        router.route({Method::Get}, "/g", body_handler("get"));
+        router.route({Method::Head}, "/g", body_handler("head"));
+        CHECK(method_dispatch(router, ctx, "/g", Method::Get)->last_body == "get");
+        CHECK(method_dispatch(router, ctx, "/g", Method::Head)->last_body == "head");
+    }
+    {
+        // Registration order must not matter.
+        Router router;
+        router.route({Method::Head}, "/g", body_handler("head"));
+        router.route({Method::Get}, "/g", body_handler("get"));
+        CHECK(method_dispatch(router, ctx, "/g", Method::Get)->last_body == "get");
+        CHECK(method_dispatch(router, ctx, "/g", Method::Head)->last_body == "head");
+    }
+}
+
+TEST_CASE("router: a regex alternation is not pruned by a literal prefix", "[router]") {
+    // "/api|/admin" has the literal prefix "/api"; a starts_with fast path
+    // skipped "/admin" even though the regex matches it.
+    Router router;
+    router.route_regex({Method::Get}, "/api|/admin", body_handler("either"));
+
+    asio::io_context ctx;
+    CHECK(method_dispatch(router, ctx, "/api", Method::Get)->last_body == "either");
+    CHECK(method_dispatch(router, ctx, "/admin", Method::Get)->last_body == "either");
+}
+
+TEST_CASE("router: an optional trailing slash regex is not pruned", "[router]") {
+    Router router;
+    router.route_regex({Method::Get}, "/files/?", body_handler("files"));
+
+    asio::io_context ctx;
+    CHECK(method_dispatch(router, ctx, "/files", Method::Get)->last_body == "files");
+    CHECK(method_dispatch(router, ctx, "/files/", Method::Get)->last_body == "files");
+}

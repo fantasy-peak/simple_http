@@ -879,6 +879,25 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
         out.append(payload);
     }
 
+    // HEADERS + CONTINUATION split by the peer's SETTINGS_MAX_FRAME_SIZE. Used
+    // for request trailers, whose block is caller-sized and may exceed it.
+    void append_field_block(std::string &out, std::uint32_t stream_id, std::string_view block, bool end_stream) const {
+        const std::size_t limit = std::max<std::size_t>(1, m_peer_max_frame_size);
+        std::size_t off = 0;
+        bool first = true;
+        do {
+            const std::size_t take = std::min(limit, block.size() - off);
+            const bool last = off + take == block.size();
+            std::uint8_t flags = last ? codec::H2_FLAG_END_HEADERS : 0;
+            if (first && end_stream)
+                flags |= codec::H2_FLAG_END_STREAM;
+            append_frame(out, first ? codec::H2FrameType::Headers : codec::H2FrameType::Continuation, flags, stream_id,
+                         block.substr(off, take));
+            first = false;
+            off += take;
+        } while (off < block.size());
+    }
+
     // Splits a header block into HEADERS + CONTINUATION frames, honouring the
     // peer's advertised frame size (a larger frame is a FRAME_SIZE_ERROR there).
     void submit_headers(std::uint32_t id, const std::string &block, bool end_stream) {
@@ -1201,7 +1220,9 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
                     return true;
                 }
             }
-            if (is_connection_specific(f.name) || (f.name == "te" && f.value != "trailers")) { // §8.2.2
+            // TE is the one connection-specific field HTTP/2 allows, and only
+            // with the value "trailers" (case-insensitive per RFC 9110 §5.6.2).
+            if (is_connection_specific(f.name) || (f.name == "te" && !iequals_ci(f.value, "trailers"))) { // §8.2.2
                 reset_stream(id, codec::H2_PROTOCOL_ERROR);
                 return true;
             }
@@ -1680,9 +1701,10 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
                     if (st.out_finished) {
                         if (st.out_trailers_set) {
                             // A trailing HEADERS block carries END_STREAM; the
-                            // preceding final DATA frame must not.
-                            append_frame(m_out, codec::H2FrameType::Headers,
-                                         codec::H2_FLAG_END_STREAM | codec::H2_FLAG_END_HEADERS, id, st.out_trailers);
+                            // preceding final DATA frame must not. Split it like
+                            // the initial block: a single oversized HEADERS is a
+                            // FRAME_SIZE_ERROR to the peer.
+                            append_field_block(m_out, id, st.out_trailers, /*end_stream=*/true);
                             st.out_trailers_set = false;
                         } else {
                             // The body is done: an empty DATA frame carries END_STREAM.

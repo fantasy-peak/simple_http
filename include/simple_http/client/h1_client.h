@@ -197,6 +197,7 @@ class Http1ClientSession final : public ClientSession,
 
     void release_exchange() {
         m_busy = false;
+        m_request_finished = false;
         m_chunk_remaining = 0;
         m_chunk_need_crlf = false;
         if (m_current_done)
@@ -248,11 +249,13 @@ class Http1ClientSession final : public ClientSession,
         m_awaiting_final = false;
         m_head_parsed = false;
         m_body_complete = false;
+        m_request_finished = false;
         m_chunk_remaining = 0;
         m_chunk_need_crlf = false;
         m_connection_error = {};
         m_in.clear();
         m_trailers = Headers{};
+        m_trailer_bytes = 0;
         m_current_done = std::make_shared<std::atomic<bool>>(false);
         auto stream = std::make_shared<Http1ClientStream<Transport>>(this->shared_from_this());
         m_current = stream;
@@ -371,8 +374,11 @@ class Http1ClientSession final : public ClientSession,
         out.append("\r\n");
 
         m_request_chunked = false;
+        m_stream_body_length = -1;
+        m_stream_body_sent = 0;
         if (request.stream_body()) {
             if (request.content_length() >= 0) {
+                m_stream_body_length = request.content_length();
                 out.append("content-length: ");
                 out.append(std::to_string(request.content_length()));
                 out.append("\r\n");
@@ -418,9 +424,24 @@ class Http1ClientSession final : public ClientSession,
             std::move(done)(make_error_code(client_errc::session_closed));
             return;
         }
-        if (!m_spec || !m_spec->stream_body()) {
+        if (!m_spec || !m_spec->stream_body() || m_request_finished) {
             std::move(done)(make_error_code(client_errc::body_not_streaming));
             return;
+        }
+        if (last)
+            m_request_finished = true; // a second write/finish must not reach the wire
+        // With a declared Content-Length the body is delimited by that number,
+        // not by END_STREAM: writing fewer bytes leaves the server waiting and
+        // writing more splices the excess onto the connection as the next
+        // request. Refuse both and tear the connection down.
+        if (!m_request_chunked && m_stream_body_length >= 0) {
+            const auto remaining = static_cast<std::uint64_t>(m_stream_body_length) - m_stream_body_sent;
+            if (data.size() > remaining || (last && data.size() < remaining)) {
+                fail_exchange(make_error_code(client_errc::invalid_spec));
+                std::move(done)(make_error_code(client_errc::invalid_spec));
+                return;
+            }
+            m_stream_body_sent += data.size();
         }
         std::string out;
         if (m_request_chunked) {
@@ -447,7 +468,7 @@ class Http1ClientSession final : public ClientSession,
     }
 
     void do_exchange_write_trailers(Headers trailers, WriteCompletion done) {
-        if (!m_busy || !m_spec || !m_spec->stream_body()) {
+        if (!m_busy || !m_spec || !m_spec->stream_body() || m_request_finished) {
             std::move(done)(make_error_code(client_errc::body_not_streaming));
             return;
         }
@@ -455,6 +476,7 @@ class Http1ClientSession final : public ClientSession,
             std::move(done)(make_error_code(client_errc::trailers_not_supported));
             return;
         }
+        m_request_finished = true; // the trailer terminator ends the request body
         std::string out = "0\r\n";
         for (const auto &[name, value] : trailers) {
             if (is_forbidden_trailer_field(name))
@@ -935,6 +957,12 @@ class Http1ClientSession final : public ClientSession,
     void read_trailers(ReadCompletion done) {
         const auto nl = m_in.find("\r\n");
         if (nl == std::string::npos) {
+            // The trailer section is head-sized, not body-sized: a peer that
+            // never sends the blank line must not grow m_in without bound.
+            if (m_trailer_bytes + m_in.size() > m_limits.max_header_bytes) {
+                fail_read(std::move(done), make_error_code(client_errc::header_too_large));
+                return;
+            }
             auto self = this->shared_from_this();
             read_more([self, done = std::move(done)](error_code ec, std::size_t) mutable {
                 if (ec) {
@@ -951,6 +979,11 @@ class Http1ClientSession final : public ClientSession,
                 current->set_trailers(m_trailers);
             }
             finish_body(std::move(done));
+            return;
+        }
+        m_trailer_bytes += nl + 2;
+        if (m_trailer_bytes > m_limits.max_header_bytes) {
+            fail_read(std::move(done), make_error_code(client_errc::header_too_large));
             return;
         }
         const std::string_view line{m_in.data(), nl};
@@ -974,7 +1007,10 @@ class Http1ClientSession final : public ClientSession,
         }
         auto self = this->shared_from_this();
         read_more([self, done = std::move(done)](error_code ec, std::size_t) mutable {
-            if (ec == asio::error::eof || ec == asio::error::connection_reset) {
+            // Only a clean EOF ends a close-delimited body. A connection reset
+            // means the peer disappeared mid-body; treating it as EOF returned
+            // a silently truncated response as if it were complete.
+            if (ec == asio::error::eof) {
                 self->m_close_after = true;
                 self->finish_body(std::move(done));
                 return;
@@ -1025,6 +1061,10 @@ class Http1ClientSession final : public ClientSession,
     std::uint64_t m_chunk_remaining{0};
     bool m_chunk_need_crlf{false};
     bool m_body_complete{false};
+    bool m_request_finished{false};        // final chunk / trailers already sent
+    std::int64_t m_stream_body_length{-1}; // declared Content-Length of a streamed body, -1 = chunked
+    std::uint64_t m_stream_body_sent{0};
+    std::size_t m_trailer_bytes{0}; // response trailer section budget, per exchange
     Headers m_trailers;
 };
 

@@ -398,10 +398,13 @@ TEST_CASE("proto/response: bodyless, streaming and state forwarding", "[proto]")
     CHECK(writer->last_body.empty());
     CHECK(writer->header("server") == std::string{server_product}); // defaults apply here too
 
-    REQUIRE(run_on(ctx, res.status(status::ok).async_begin(asio::use_awaitable)));
+    // A response has exactly one head, so the streaming half needs its own
+    // writer; reusing `res` here is the second-head case the facade refuses.
+    ResponseWriter stream{writer};
+    REQUIRE(run_on(ctx, stream.status(status::ok).async_begin(asio::use_awaitable)));
     CHECK(writer->begun);
-    REQUIRE(run_on(ctx, res.async_write("a", asio::use_awaitable)));
-    REQUIRE(run_on(ctx, res.async_finish("b", asio::use_awaitable)));
+    REQUIRE(run_on(ctx, stream.async_write("a", asio::use_awaitable)));
+    REQUIRE(run_on(ctx, stream.async_finish("b", asio::use_awaitable)));
     CHECK(writer->chunks == std::vector<std::string>{"a", "b"});
     CHECK(writer->finished);
 

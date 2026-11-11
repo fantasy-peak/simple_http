@@ -468,9 +468,16 @@ class H1Parser {
                 return false;
             }
             if (auth_end == target.size() || target[auth_end] != '/') {
-                // No path: origin-form is "/" plus any query.
+                // No path: origin-form is "/" plus any query. A fragment is
+                // never part of a request target, even when the path is absent
+                // (the branch below already rejects it).
+                const std::string_view tail = target.substr(auth_end);
+                if (tail.find('#') != std::string_view::npos) {
+                    m_error = 40002;
+                    return false;
+                }
                 std::string normalized{"/"};
-                normalized.append(target.substr(auth_end));
+                normalized.append(tail);
                 m_head.authority.assign(authority);
                 m_head.absolute_form = true;
                 m_head.target.assign(std::move(normalized));

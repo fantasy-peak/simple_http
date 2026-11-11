@@ -183,7 +183,12 @@ inline bool origin_allowed(const CorsConfig &cfg, std::string_view origin) {
         // With a predicate, the caller asked for a decision to be made; returning
         // true here ran the predicate never and turned a deny-everything policy
         // into allow-everything (the fail-open shape).
-        return cfg.allow_origin_fn ? cfg.allow_origin_fn(origin) : true;
+        if (cfg.allow_origin_fn)
+            return cfg.allow_origin_fn(origin);
+        // Reflecting an arbitrary Origin together with credentials is the
+        // classic "any site can read authenticated responses" misconfiguration.
+        // An empty allowlist cannot express a safe credential policy.
+        return !cfg.allow_credentials;
     }
     for (const auto &entry : allowed) {
         if (entry == "*" || iequals_ci(entry, origin) ||
