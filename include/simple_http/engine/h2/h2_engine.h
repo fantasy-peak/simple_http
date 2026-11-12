@@ -597,6 +597,9 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
                 it->second.request->cancel();
             }
         }
+        // §5.1: frames still in flight on this stream must be minimally
+        // processed and discarded, not answered.
+        remember_closed_stream(stream_id, /*local_reset=*/true);
         erase_stream(stream_id);
         flush();
     }
@@ -630,6 +633,38 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
     }
 
   private:
+    // Recently closed peer-initiated streams. RFC 9113 §5.1 answers a frame on
+    // a closed stream by how the stream closed: one we reset must be minimally
+    // processed and discarded, while one the peer closed may be treated as a
+    // STREAM_CLOSED connection error. An id that is neither open nor remembered
+    // was never opened (its id was skipped), which §5.1.1 makes a connection
+    // PROTOCOL_ERROR. Client stream ids are never reused, so a fixed ring of
+    // recent ids is enough; an id that ages out is treated like one never
+    // opened, which is the safe answer for a peer replaying old ids.
+    struct ClosedStream {
+        std::uint32_t id = 0;
+        bool local_reset = false;
+    };
+    static constexpr std::size_t kMaxClosedStreams = 256;
+    std::array<ClosedStream, kMaxClosedStreams> m_closed_streams{};
+    std::size_t m_closed_cursor = 0; // ring slot to overwrite next
+
+    // Records how a stream closed, so a later frame on its id gets the answer
+    // §5.1 prescribes (discard after our RST_STREAM, STREAM_CLOSED after the
+    // peer's close, PROTOCOL_ERROR when there is no record at all).
+    void remember_closed_stream(std::uint32_t stream_id, bool local_reset) {
+        m_closed_streams[m_closed_cursor] = ClosedStream{stream_id, local_reset};
+        m_closed_cursor = (m_closed_cursor + 1) % kMaxClosedStreams;
+    }
+
+    const ClosedStream *find_closed_stream(std::uint32_t stream_id) const {
+        for (const ClosedStream &entry : m_closed_streams) {
+            if (entry.id == stream_id)
+                return &entry;
+        }
+        return nullptr;
+    }
+
     struct Stream {
         std::shared_ptr<Request> request;
         std::shared_ptr<Http2ResponseSink<Transport>> writer;
@@ -1294,10 +1329,15 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
         }
         // RFC 9113 §5.1.1: a client opens odd-numbered streams, each higher than
         // every stream it has opened before. An even (server-initiated) id is a
-        // connection error. An odd id at or below the highest opened one is
-        // closed (idle streams are implicitly closed once a higher id opens),
-        // so HEADERS there is a stream error, not a connection error.
-        bool closed_stream = false;
+        // connection error. An odd id at or below the highest opened one is one
+        // of three things (§5.1):
+        //   * never opened (the id was skipped, so it is implicitly closed):
+        //     an unexpected stream identifier, a PROTOCOL_ERROR connection error;
+        //   * reset by us: later frames must be minimally processed and discarded
+        //     (the peer may have sent them before it saw our RST_STREAM);
+        //   * closed by the peer (RST_STREAM or END_STREAM): a STREAM_CLOSED
+        //     connection error.
+        bool discard_closed = false;
         if (m_streams.find(hdr.stream_id) == m_streams.end() && !is_new_client_stream(hdr.stream_id)) {
             if ((hdr.stream_id & 1u) != 1u) {
                 SIMPLE_HTTP_ERROR_LOG("h2: client opened stream {} (highest so far {}); GOAWAY", hdr.stream_id,
@@ -1305,7 +1345,20 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
                 go_away(codec::H2_PROTOCOL_ERROR);
                 return false;
             }
-            closed_stream = true;
+            const ClosedStream *closed = find_closed_stream(hdr.stream_id);
+            if (closed == nullptr) {
+                SIMPLE_HTTP_ERROR_LOG("h2: HEADERS on never-opened stream {} (highest so far {}); GOAWAY",
+                                      hdr.stream_id, m_next_peer_stream_id);
+                go_away(codec::H2_PROTOCOL_ERROR);
+                return false;
+            }
+            if (!closed->local_reset) {
+                SIMPLE_HTTP_ERROR_LOG("h2: HEADERS on closed stream {} (highest so far {}); GOAWAY", hdr.stream_id,
+                                      m_next_peer_stream_id);
+                go_away(codec::H2_STREAM_CLOSED);
+                return false;
+            }
+            discard_closed = true;
         }
         bool ok = false;
         std::string_view block =
@@ -1314,16 +1367,16 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
             go_away(codec::H2_PROTOCOL_ERROR);
             return false;
         }
-        if (closed_stream) {
-            // The field block still has to be decoded (and discarded) or the
-            // connection's HPACK dynamic table diverges from the peer's.
-            if (hdr.has_flag(codec::H2_FLAG_END_HEADERS)) {
-                if (!decode_discarded_header_block(block))
-                    return false;
-            } else {
-                begin_discarding_header_block(hdr, block);
-            }
-            reset_stream(hdr.stream_id, codec::H2_STREAM_CLOSED);
+        if (discard_closed) {
+            // §5.1: after sending RST_STREAM, frames on that stream are minimally
+            // processed and then discarded, never answered with another error
+            // (and never with RST_STREAM: no non-PRIORITY frame may be sent on a
+            // closed stream). The field block still has to be decoded (and
+            // discarded) or the connection's HPACK dynamic table diverges from
+            // the peer's.
+            if (hdr.has_flag(codec::H2_FLAG_END_HEADERS))
+                return decode_discarded_header_block(block);
+            begin_discarding_header_block(hdr, block);
             return true;
         }
 
@@ -1963,13 +2016,24 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
             // window; give that credit straight back.
             replenish_conn(frame_len);
             // §5.1: a stream the peer never opened is idle, and DATA there is a
-            // connection error; on a stream that has already closed it is a stream
-            // error instead. Which one it is, is what m_next_peer_stream_id says.
+            // connection error. A skipped id is implicitly closed, but it was
+            // never opened either. On a closed stream the cause decides (§5.1):
+            // frames after our own RST_STREAM are minimally processed and
+            // discarded; frames after the peer's RST_STREAM (or END_STREAM) may
+            // be treated as a STREAM_CLOSED connection error.
             if (hdr.stream_id > m_next_peer_stream_id) {
                 go_away(codec::H2_PROTOCOL_ERROR);
                 return false;
             }
-            reset_stream(hdr.stream_id, codec::H2_STREAM_CLOSED);
+            const ClosedStream *closed = find_closed_stream(hdr.stream_id);
+            if (closed == nullptr) {
+                go_away(codec::H2_PROTOCOL_ERROR);
+                return false;
+            }
+            if (closed->local_reset)
+                return true; // credit already returned above
+            go_away(codec::H2_STREAM_CLOSED);
+            return false;
         }
         return true;
     }
@@ -2068,6 +2132,7 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
         }
         (void)it->second.request->body().fail(make_error_code(asio::error::connection_reset));
         it->second.request->cancel(); // peer reset: signal the handler's token
+        remember_closed_stream(hdr.stream_id, /*local_reset=*/false);
         erase_stream(hdr.stream_id);
         return true;
     }
@@ -2211,6 +2276,9 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
             return;
         }
         if (it->second.half_closed_remote && it->second.end_stream_sent) {
+            // Both halves ended: §5.1 lets a later frame be a STREAM_CLOSED
+            // connection error (it is not a stream we reset).
+            remember_closed_stream(stream_id, /*local_reset=*/false);
             erase_stream(stream_id);
         }
     }

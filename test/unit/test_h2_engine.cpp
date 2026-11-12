@@ -239,6 +239,75 @@ TEST_CASE("h2/engine: DATA already in flight for a refused stream is not a conne
     CHECK_FALSE(has_goaway(transport->written(), codec::H2_PROTOCOL_ERROR));
 }
 
+TEST_CASE("h2/engine: a stream the peer reset answers later HEADERS with STREAM_CLOSED", "[h2]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+
+    // RFC 9113 §5.1: once both sides are done with a stream, a later frame may be
+    // a connection error of type STREAM_CLOSED. Stream 1 opens, the peer resets
+    // it, and then a HEADERS arrives for the same id.
+    std::string in{codec::kH2ClientPreface};
+    append_frame(in, H2FrameType::Settings, 0, 0, "");
+    in += headers_frame(1, /*end_stream=*/false);
+    in += rst_frame(1);
+    in += headers_frame(1, /*end_stream=*/true);
+    transport->push(std::move(in));
+
+    auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter>,
+                         SslHandle) -> asio::awaitable<void> { co_await park_briefly(); };
+    auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, EngineLimits{});
+    REQUIRE(run_on(ctx, run_engine(*engine, dispatcher)));
+
+    CHECK(has_goaway(transport->written(), codec::H2_STREAM_CLOSED));
+}
+
+TEST_CASE("h2/engine: a skipped stream id is a PROTOCOL_ERROR connection error", "[h2]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+
+    // RFC 9113 §5.1.1: opening stream 5 implicitly closes the idle stream 3, but
+    // 3 was never opened, so a HEADERS on it is an unexpected stream identifier.
+    std::string in{codec::kH2ClientPreface};
+    append_frame(in, H2FrameType::Settings, 0, 0, "");
+    in += headers_frame(5, /*end_stream=*/true);
+    in += headers_frame(3, /*end_stream=*/true);
+    transport->push(std::move(in));
+
+    auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter>,
+                         SslHandle) -> asio::awaitable<void> { co_await park_briefly(); };
+    auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, EngineLimits{});
+    REQUIRE(run_on(ctx, run_engine(*engine, dispatcher)));
+
+    CHECK(has_goaway(transport->written(), codec::H2_PROTOCOL_ERROR));
+}
+
+TEST_CASE("h2/engine: HEADERS after our own RST_STREAM is discarded, not answered", "[h2]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+
+    EngineLimits limits;
+    limits.h2_max_concurrent_streams = 1;
+
+    // RFC 9113 §5.1: after an endpoint sends RST_STREAM it MUST minimally process
+    // and discard frames that were already in flight, not answer them with
+    // another error (and never with RST_STREAM on a closed stream).
+    std::string in{codec::kH2ClientPreface};
+    append_frame(in, H2FrameType::Settings, 0, 0, "");
+    in += headers_frame(1, /*end_stream=*/false); // fills the table
+    in += headers_frame(3, /*end_stream=*/true);  // refused: RST_STREAM(REFUSED_STREAM)
+    in += headers_frame(3, /*end_stream=*/true);  // sent before the peer saw that reset
+    transport->push(std::move(in));
+
+    auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter>,
+                         SslHandle) -> asio::awaitable<void> { co_await park_briefly(); };
+    auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, EngineLimits{limits});
+    REQUIRE(run_on(ctx, run_engine(*engine, dispatcher)));
+
+    CHECK(has_rst_stream(transport->written(), 3, codec::H2_REFUSED_STREAM));
+    CHECK_FALSE(has_goaway(transport->written(), codec::H2_STREAM_CLOSED));
+    CHECK_FALSE(has_goaway(transport->written(), codec::H2_PROTOCOL_ERROR));
+}
+
 TEST_CASE("h2/engine: a refused split head still drains its CONTINUATION frames", "[h2]") {
     asio::io_context ctx;
     auto transport = std::make_shared<MockTransport>(ctx.get_executor());
