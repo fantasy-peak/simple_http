@@ -5,8 +5,9 @@
     ["linux|x86_64"] = {
         ["boost#b7c83bea"] = {
             repo = {
-                commit = "cfac10608ab185212399abef05458d9104e1495c",
-                url = "https://github.com/fantasy-peak/xmake-repo.git"
+                branch = "master",
+                commit = "1730b3e52c29bc0dc5dcdc4a1aeb0d3f362f2c10",
+                url = "https://gitcode.com/xmake-io/xmake-repo.git"
             },
             version = "1.92.0"
         },
@@ -36,24 +37,27 @@
         },
         ["glaze#f56260b5"] = {
             repo = {
-                commit = "cfac10608ab185212399abef05458d9104e1495c",
-                url = "https://github.com/fantasy-peak/xmake-repo.git"
+                branch = "master",
+                commit = "1730b3e52c29bc0dc5dcdc4a1aeb0d3f362f2c10",
+                url = "https://gitcode.com/xmake-io/xmake-repo.git"
             },
             version = "v7.9.0"
         },
         ["nghttp3#f56260b5"] = {
             repo = {
-                commit = "cfac10608ab185212399abef05458d9104e1495c",
-                url = "https://github.com/fantasy-peak/xmake-repo.git"
+                branch = "master",
+                commit = "1730b3e52c29bc0dc5dcdc4a1aeb0d3f362f2c10",
+                url = "https://gitcode.com/xmake-io/xmake-repo.git"
             },
             version = "v1.18.0"
         },
-        ["ngtcp2#f56260b5"] = {
+        ["ngtcp2#02ac10ac"] = {
             repo = {
-                commit = "cfac10608ab185212399abef05458d9104e1495c",
-                url = "https://github.com/fantasy-peak/xmake-repo.git"
+                branch = "master",
+                commit = "1730b3e52c29bc0dc5dcdc4a1aeb0d3f362f2c10",
+                url = "https://gitcode.com/xmake-io/xmake-repo.git"
             },
-            version = "1.25.0"
+            version = "1.26.0"
         },
         ["ninja#f56260b5"] = {
             repo = {
@@ -65,15 +69,17 @@
         },
         ["openssl4#f56260b5"] = {
             repo = {
-                commit = "cfac10608ab185212399abef05458d9104e1495c",
-                url = "https://github.com/fantasy-peak/xmake-repo.git"
+                branch = "master",
+                commit = "1730b3e52c29bc0dc5dcdc4a1aeb0d3f362f2c10",
+                url = "https://gitcode.com/xmake-io/xmake-repo.git"
             },
             version = "4.0.3"
         },
         ["sfparse#f56260b5"] = {
             repo = {
-                commit = "cfac10608ab185212399abef05458d9104e1495c",
-                url = "https://github.com/fantasy-peak/xmake-repo.git"
+                branch = "master",
+                commit = "1730b3e52c29bc0dc5dcdc4a1aeb0d3f362f2c10",
+                url = "https://gitcode.com/xmake-io/xmake-repo.git"
             },
             version = "2024.12.15"
         },

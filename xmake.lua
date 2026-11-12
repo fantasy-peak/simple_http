@@ -22,10 +22,12 @@ set_policy("package.librarydeps.strict_compatibility", true)
 -- SSL_set_quic_tls_cbs，从而构建 libngtcp2_crypto_ossl），nghttp3 那份也在。
 -- 注意：这里不能用 /opt/h3/lib 的预编译库——那是对系统 OpenSSL 3.5.5 编的，
 -- 而本仓库用的是 openssl4 3.6.3，混链是 ABI 风险。让 xmake 从源码构建。
-add_repositories("my_private_repo https://github.com/fantasy-peak/xmake-repo.git")
+-- 注意 configs 的值是字符串（nginx recipe 的 values 是 {"openssl3", "openssl4"}）；
+-- 写成裸标识符 openssl4 会被当成未定义的 Lua 全局变量（nil），配置键直接消失，
+-- 包会回落到默认的 openssl=false，导致 openssl4 既不解析也不安装。
+add_requires("ngtcp2",{configs = {openssl = "openssl4"}})
 add_requires("boost", {configs = {cmake = true, asio=true, regex=true}})
-add_requires("openssl4", {system = false})
-add_requires("ngtcp2", "nghttp3")
+add_requires("nghttp3")
 add_requires("catch2")  -- Catch2 unit/regression suites
 -- glaze is an unconditional dependency: OpenAPI schemas and the JSON helpers
 -- (proto/json.h, read_json_body / write_json). Header-only, no transitive deps.

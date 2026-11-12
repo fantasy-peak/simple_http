@@ -15,9 +15,10 @@
 //   * std::format / std::format_string -> core/format.h's `{}` subset;
 //   * std::source_location              -> core/source_location.h;
 //   * std::span<const Attr>             -> boost::span<const Attr>;
-//   * std::atomic<std::shared_ptr<>>    -> atomic_load/atomic_store free
-//     functions on a shared_ptr (the C++17 spelling of the same guarantee:
-//     a reader inside a sink keeps that sink alive across a swap).
+//   * std::atomic<std::shared_ptr<>>    -> gated on __cpp_lib_atomic_shared_ptr:
+//     std::atomic<std::shared_ptr<LogSink>> when available, otherwise the
+//     atomic_load/atomic_store free functions (the C++17 spelling of the same
+//     guarantee: a reader inside a sink keeps that sink alive across a swap).
 //
 // Logging can be compiled out entirely with SIMPLE_HTTP_ENABLE_LOG=0, or
 // compiled down to a minimum level with SIMPLE_HTTP_LOG_ACTIVE_LEVEL.
@@ -142,14 +143,38 @@ class LogSink {
 
 namespace detail {
 
-// The installed sink. The C++17 spelling of std::atomic<std::shared_ptr<>>:
-// a reader gets a single atomic load, a writer a safe swap, and a thread inside
-// a sink holds its own shared_ptr, so a swap cannot pull the sink out from
-// under it.
+// The installed sink. std::atomic<std::shared_ptr<>> where the standard library
+// provides it (C++20+), with the C++17 free functions as the fallback. Either
+// spelling gives a reader a single atomic load, a writer a safe swap, and a
+// thread inside a sink its own shared_ptr, so a swap cannot pull the sink out
+// from under it. The feature test keeps the headers parsing under -std=c++17
+// (test_cpp17_smoke) without tripping the C++20 deprecation warning on C++23
+// builds.
+#if defined(__cpp_lib_atomic_shared_ptr) && __cpp_lib_atomic_shared_ptr >= 201711L
+
+inline std::atomic<std::shared_ptr<LogSink>> &sink_slot() noexcept {
+    static std::atomic<std::shared_ptr<LogSink>> slot;
+    return slot;
+}
+
+inline std::shared_ptr<LogSink> load_sink() noexcept { return sink_slot().load(std::memory_order_acquire); }
+
+inline void store_sink(std::shared_ptr<LogSink> sink) noexcept {
+    sink_slot().store(std::move(sink), std::memory_order_release);
+}
+
+#else
+
 inline std::shared_ptr<LogSink> &sink_slot() noexcept {
     static std::shared_ptr<LogSink> slot;
     return slot;
 }
+
+inline std::shared_ptr<LogSink> load_sink() noexcept { return std::atomic_load(&sink_slot()); }
+
+inline void store_sink(std::shared_ptr<LogSink> sink) noexcept { std::atomic_store(&sink_slot(), std::move(sink)); }
+
+#endif
 
 // The value of an attr rendered for the text sink.
 inline std::string attr_text(const Attr &attr) {
@@ -226,7 +251,7 @@ class StreamSink final : public FileSinkBase {
 // its args and emits a record with no attrs.
 template <typename... Args>
 void dispatch(LogLevel level, std::string_view category, source_location where, std::string_view fmt, Args &&...args) {
-    auto sink = std::atomic_load(&sink_slot());
+    auto sink = load_sink();
     if (!sink || !sink->enabled(level)) {
         return; // nothing is formatted for a record the sink would drop
     }
@@ -237,7 +262,7 @@ void dispatch(LogLevel level, std::string_view category, source_location where, 
 // Structured entry point: a ready message plus typed attributes.
 inline void emit_attrs(LogLevel level, std::string_view category, source_location where, std::string_view message,
                        boost::span<const Attr> attrs) {
-    auto sink = std::atomic_load(&sink_slot());
+    auto sink = load_sink();
     if (!sink || !sink->enabled(level)) {
         return;
     }
@@ -248,9 +273,9 @@ inline void emit_attrs(LogLevel level, std::string_view category, source_locatio
 
 // Installs `sink` (nullptr drops every record). Safe to call at any time, from
 // any thread, while other threads are logging.
-inline void set_log_sink(std::shared_ptr<LogSink> sink) { std::atomic_store(&detail::sink_slot(), std::move(sink)); }
+inline void set_log_sink(std::shared_ptr<LogSink> sink) { detail::store_sink(std::move(sink)); }
 
-inline std::shared_ptr<LogSink> log_sink() noexcept { return std::atomic_load(&detail::sink_slot()); }
+inline std::shared_ptr<LogSink> log_sink() noexcept { return detail::load_sink(); }
 
 // Writes to stderr: "<level> <file>:<line>: <message> [key=value ...]".
 inline std::shared_ptr<LogSink> make_stderr_sink(LogLevel minimum = LogLevel::Info) {
