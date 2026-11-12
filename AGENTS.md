@@ -1150,6 +1150,11 @@ test/run.sh server-diff
 90. **h2 已关闭流的 HEADERS 是流级 `STREAM_CLOSED`**：奇数 id 且不高于已见最大
     id 表示已关闭/隐式关闭；解码并丢弃字段块（保持 HPACK 同步）后 RST_STREAM。
     偶数 id 才是连接级 PROTOCOL_ERROR。
+91. **h2 客户端连接级接收窗口固定从 65535 起**：`SETTINGS_INITIAL_WINDOW_SIZE`
+    只影响每条流；`m_conn_recv_window` 初始化为
+    `max(h2_initial_window, 65535)`，且只有大于 65535 时才发连接级
+    WINDOW_UPDATE。把配置的更小值当成连接窗口会把合规流量误判为
+    `FLOW_CONTROL_ERROR`；`replenish_conn` 的批量阈值同理。
 
 ---
 

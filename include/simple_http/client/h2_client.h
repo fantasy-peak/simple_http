@@ -621,7 +621,11 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
             codec::append_u32(window_update, static_cast<std::uint32_t>(initial - kClientInitialWindow));
             append_frame(out, codec::H2FrameType::WindowUpdate, 0, 0, window_update);
         }
-        m_conn_recv_window = initial;
+        // §6.9.2: the connection-level window is fixed at 65535 initially and
+        // can only be grown by WINDOW_UPDATE. SETTINGS_INITIAL_WINDOW_SIZE is a
+        // per-stream value; recording a smaller connection window here rejects
+        // compliant traffic that fits the real 65535-octet budget.
+        m_conn_recv_window = std::max(initial, kClientInitialWindow);
 
         auto self = this->shared_from_this();
         auto bytes = std::make_shared<std::string>(std::move(out));
@@ -1558,7 +1562,9 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
     // until the threshold, then emit one WINDOW_UPDATE.
     void replenish_conn(std::int64_t n) {
         m_conn_recv_pending += n;
-        if (m_conn_recv_pending >= m_limits.h2_initial_window / 2) {
+        // Batch against the real connection window (>= 65535), not a configured
+        // per-stream INITIAL_WINDOW_SIZE that may be smaller or zero.
+        if (m_conn_recv_pending >= std::max(m_limits.h2_initial_window, kClientInitialWindow) / 2) {
             send_window_update(0, static_cast<std::uint32_t>(m_conn_recv_pending));
             m_conn_recv_window += m_conn_recv_pending;
             m_conn_recv_pending = 0;

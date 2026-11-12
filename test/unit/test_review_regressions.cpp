@@ -295,6 +295,28 @@ void append_h2_frame(std::string &out, codec::H2FrameType type, std::uint8_t fla
                                   flags, stream_id);
     out.append(payload);
 }
+
+// Scans a recorded client->server byte stream (preface included) for a GOAWAY
+// carrying `code`.
+bool written_has_goaway(const std::string &written, std::uint32_t code) {
+    std::string_view w{written};
+    if (w.substr(0, codec::kH2ClientPreface.size()) == codec::kH2ClientPreface)
+        w.remove_prefix(codec::kH2ClientPreface.size());
+    for (std::size_t i = 0; i + codec::kH2FrameHeaderSize <= w.size();) {
+        codec::H2FrameHeader hdr;
+        if (!codec::parse_frame_header(w.substr(i), hdr))
+            return false;
+        const std::size_t end = i + codec::kH2FrameHeaderSize + hdr.length;
+        if (end > w.size())
+            return false;
+        if (hdr.type == static_cast<std::uint8_t>(codec::H2FrameType::Goaway) && hdr.length >= 8 &&
+            codec::read_u32(w, i + codec::kH2FrameHeaderSize + 4) == code) {
+            return true;
+        }
+        i = end;
+    }
+    return false;
+}
 } // namespace
 
 // A peer may send the complete response and then close the connection before
@@ -847,4 +869,68 @@ TEST_CASE("review: an out-of-range response status is refused", "[review][regres
         CHECK(run_on(ctx, res->async_send("", asio::use_awaitable)));
         CHECK(sink->last_status == code);
     }
+}
+
+// L-25: the HTTP/2 *connection* receive window always starts at 65535
+// (RFC 9113 §6.9.2); SETTINGS_INITIAL_WINDOW_SIZE only changes per-stream
+// windows. A client that records its connection window as a configured
+// smaller value rejects compliant traffic as FLOW_CONTROL_ERROR.
+TEST_CASE("review: h2 connection window is 65535 even with a smaller stream window", "[review][regression][client]") {
+    using Session = detail::Http2ClientSession<MockTransport>;
+    asio::io_context ctx;
+    auto pump = [&ctx] {
+        ctx.restart();
+        ctx.run_for(std::chrono::milliseconds(200));
+    };
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    transport->hold_open();
+
+    std::string settings;
+    append_h2_frame(settings, codec::H2FrameType::Settings, 0, 0, {});
+    transport->push(std::move(settings));
+
+    EngineLimits limits;
+    limits.h2_initial_window = 16384; // below the fixed 65535 connection window
+
+    detail::ClientTarget target;
+    target.host = "example.com";
+    target.port = 80;
+    auto session = std::make_shared<Session>(transport, target, limits, std::chrono::milliseconds{0});
+    bool started = false;
+    session->start([&started](error_code ec) { started = !ec; });
+    pump();
+    REQUIRE(started);
+
+    auto open = [&](const char *path) {
+        auto request = std::make_shared<Request>(Version::Http11, ctx.get_executor());
+        request->set_method(Method::Get);
+        request->set_target(path);
+        std::shared_ptr<detail::ClientStream> stream;
+        session->open_stream(request, [&stream](error_code ec, std::shared_ptr<detail::ClientStream> s) {
+            if (!ec)
+                stream = std::move(s);
+        });
+        pump();
+        REQUIRE(stream);
+        return stream;
+    };
+    auto first = open("/one");
+    auto second = open("/two");
+
+    std::string response;
+    for (const std::uint32_t id : {1u, 3u}) {
+        std::string block;
+        codec::hpack_append_indexed(block, 8); // :status 200
+        append_h2_frame(response, codec::H2FrameType::Headers, codec::H2_FLAG_END_HEADERS, id, block);
+    }
+    // Each stream stays inside its own 16384-octet window; together they use
+    // 32768 of the connection's 65535, so a compliant peer may send both
+    // without waiting for any WINDOW_UPDATE.
+    const std::string chunk(16384, 'x');
+    append_h2_frame(response, codec::H2FrameType::Data, 0, 1, chunk);
+    append_h2_frame(response, codec::H2FrameType::Data, 0, 3, chunk);
+    transport->push(std::move(response));
+    pump();
+
+    CHECK_FALSE(written_has_goaway(transport->written(), codec::H2_FLOW_CONTROL_ERROR));
 }
