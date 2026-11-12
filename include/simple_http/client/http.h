@@ -62,6 +62,15 @@ namespace detail {
 // Marks a request whose Accept-Encoding the client injected itself; only those
 // responses are eligible for transparent decompression (Go's Transport rule).
 struct AutoDecompressMark {};
+
+// Lets the buffered send's overall request_timeout stop the exchange it is
+// waiting on. Completing the caller while the inner hop still runs would let
+// that hop touch a Client the caller has already destroyed (the Client may be
+// a stack object; keep_alive() is only an alias for those).
+struct HopCancel {
+    bool cancelled{false};
+    std::shared_ptr<ClientStream> stream;
+};
 } // namespace detail
 
 // --- buffered response -------------------------------------------------------
@@ -503,14 +512,20 @@ class Client : public std::enable_shared_from_this<Client> {
                 const std::chrono::milliseconds overall = keep->m_config.request_timeout;
                 if (overall.count() <= 0) {
                     keep->send_hop(std::move(request), std::move(url), max_body_bytes, 0, 0, response_head_timeout,
-                                   body_idle_timeout, effective, std::move(handler));
+                                   body_idle_timeout, effective, nullptr, std::move(handler));
                     return;
                 }
                 // Overall budget: the per-phase deadlines are a subset, but a
                 // server that dribbles bytes forever must still be cut off.
+                // The caller is notified immediately. The still-running inner
+                // hop must not touch this Client afterwards (a stack Client
+                // dies with the awaitable frame), so it observes `cancelled`
+                // through a shared flag before every use of `self`; the stream
+                // handle lets the timer abort the pending read as well.
                 struct State {
                     asio::any_completion_handler<void(error_code, Response)> done;
                     std::shared_ptr<asio::steady_timer> timer;
+                    std::shared_ptr<detail::HopCancel> cancel{std::make_shared<detail::HopCancel>()};
                     bool finished{false};
                 };
                 auto state = std::make_shared<State>();
@@ -526,14 +541,19 @@ class Client : public std::enable_shared_from_this<Client> {
                     auto completion = std::move(state->done);
                     std::move(completion)(ec, std::move(response));
                 };
-                state->timer->async_wait([finish](error_code ec) mutable {
-                    if (ec) {
+                state->timer->async_wait([state, finish](error_code ec) mutable {
+                    if (ec || state->finished) {
                         return;
+                    }
+                    state->cancel->cancelled = true;
+                    if (state->cancel->stream) {
+                        state->cancel->stream->async_cancel(asio::detached);
+                        state->cancel->stream.reset();
                     }
                     finish(make_error_code(client_errc::request_timeout), Response{});
                 });
                 keep->send_hop(std::move(request), std::move(url), max_body_bytes, 0, 0, response_head_timeout,
-                               body_idle_timeout, effective,
+                               body_idle_timeout, effective, state->cancel,
                                [finish](error_code ec, Response response) mutable { finish(ec, std::move(response)); });
             },
             token);
@@ -568,6 +588,7 @@ class Client : public std::enable_shared_from_this<Client> {
     void send_hop(std::shared_ptr<Request> request, std::string url, std::size_t max_body_bytes, std::size_t redirects,
                   std::size_t retries, std::chrono::milliseconds response_head_timeout,
                   std::chrono::milliseconds body_idle_timeout, HttpVersionPolicy version,
+                  std::shared_ptr<detail::HopCancel> cancel,
                   asio::any_completion_handler<void(error_code, Response)> done) const;
     void open_stream_hop(std::string url, StreamSpec spec, std::size_t max_body_bytes,
                          asio::any_completion_handler<void(error_code, std::shared_ptr<Stream>)> done) const;
@@ -1616,7 +1637,14 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
                              std::size_t redirects, std::size_t retries,
                              std::chrono::milliseconds response_head_timeout,
                              std::chrono::milliseconds body_idle_timeout, HttpVersionPolicy version,
+                             std::shared_ptr<detail::HopCancel> cancel,
                              asio::any_completion_handler<void(error_code, Response)> done) const {
+    // The overall request_timeout may already have completed the caller and
+    // destroyed a stack Client; do not touch `this` past this point.
+    if (cancel && cancel->cancelled) {
+        std::move(done)(make_error_code(asio::error::operation_aborted), Response{});
+        return;
+    }
     // Per-request budgets override the Client's defaults (0 = use the default).
     const std::chrono::milliseconds head_budget =
         response_head_timeout.count() > 0 ? response_head_timeout : m_config.response_head_timeout;
@@ -1639,18 +1667,33 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
     auto session = take_cached(origin, version);
     auto self = keep_alive();
     auto start = [self, request, url, target, origin, max_body_bytes, redirects, retries, head_budget, idle_budget,
-                  version, done = std::move(done)](std::shared_ptr<detail::ClientSession> ready) mutable {
+                  version, cancel, done = std::move(done)](std::shared_ptr<detail::ClientSession> ready) mutable {
         auto open_done = [self, request, url, target, origin, max_body_bytes, redirects, retries, head_budget,
-                          idle_budget, version, done = std::move(done)](
+                          idle_budget, version, cancel, done = std::move(done)](
                              error_code oec, std::shared_ptr<detail::ClientStream> stream) mutable {
             if (oec) {
                 std::move(done)(oec, Response{});
                 return;
             }
+            if (cancel) {
+                // The overall budget may have expired while this hop was
+                // dialing/opening; do not start an exchange the caller is no
+                // longer waiting for.
+                if (cancel->cancelled) {
+                    stream->async_cancel(asio::detached);
+                    std::move(done)(make_error_code(asio::error::operation_aborted), Response{});
+                    return;
+                }
+                cancel->stream = stream;
+            }
             detail::async_read_final_head_bounded(
                 stream, head_budget, client_errc::response_head_timeout,
                 [self, request, url, target, origin, max_body_bytes, redirects, retries, head_budget, idle_budget,
-                 stream, version, done = std::move(done)](error_code hec, detail::ResponseHead head) mutable {
+                 stream, version, cancel, done = std::move(done)](error_code hec, detail::ResponseHead head) mutable {
+                    if (cancel && cancel->cancelled) {
+                        std::move(done)(make_error_code(asio::error::operation_aborted), Response{});
+                        return;
+                    }
                     if (hec) {
                         std::move(done)(hec, Response{});
                         return;
@@ -1677,8 +1720,12 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
                         detail::async_discard_bounded(
                             stream, 256 * 1024, idle_budget,
                             [stream, self, request, url, target, origin, max_body_bytes, redirects, retries,
-                             head_budget, idle_budget, status, location_value, version,
+                             head_budget, idle_budget, status, location_value, version, cancel,
                              done = std::move(done)](error_code bec) mutable {
+                                if (cancel && cancel->cancelled) {
+                                    std::move(done)(make_error_code(asio::error::operation_aborted), Response{});
+                                    return;
+                                }
                                 if (bec) {
                                     stream->async_cancel(asio::detached);
                                     if (bec == asio::error::operation_aborted) {
@@ -1732,7 +1779,7 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
                                     replay->set_content_length(-1);
                                 }
                                 self->send_hop(std::move(replay), std::move(next_url), max_body_bytes, redirects + 1,
-                                               retries, head_budget, idle_budget, version, std::move(done));
+                                               retries, head_budget, idle_budget, version, cancel, std::move(done));
                             });
                         return;
                     }
@@ -1740,7 +1787,11 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
                     detail::async_read_all_bounded(
                         stream, max_body_bytes, idle_budget,
                         [self, url, request, head, stream, max_body_bytes, retries, head_budget, idle_budget, version,
-                         done = std::move(done)](error_code bec, std::string body) mutable {
+                         cancel, done = std::move(done)](error_code bec, std::string body) mutable {
+                            if (cancel && cancel->cancelled) {
+                                std::move(done)(make_error_code(asio::error::operation_aborted), Response{});
+                                return;
+                            }
                             if (bec) {
                                 std::move(done)(bec, Response{});
                                 return;
@@ -1766,14 +1817,18 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
                                 auto timer = std::make_shared<asio::steady_timer>(self->m_executor);
                                 timer->expires_after(delay);
                                 timer->async_wait([self, request, url, max_body_bytes, head_budget, idle_budget,
-                                                   retries, timer, version,
+                                                   retries, timer, version, cancel,
                                                    done = std::move(done)](error_code tec) mutable {
                                     if (tec) {
                                         return;
                                     }
+                                    if (cancel && cancel->cancelled) {
+                                        std::move(done)(make_error_code(asio::error::operation_aborted), Response{});
+                                        return;
+                                    }
                                     self->send_hop(request->clone_for_replay(self->m_executor), url, max_body_bytes,
                                                    /*redirects=*/0, retries + 1, head_budget, idle_budget, version,
-                                                   std::move(done));
+                                                   cancel, std::move(done));
                                 });
                                 return;
                             }
@@ -1841,8 +1896,12 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
             return;
         }
         self->dial(target, version,
-                   [self, request, origin, open_done = std::move(open_done)](
+                   [self, request, origin, cancel, open_done = std::move(open_done)](
                        error_code dec, std::shared_ptr<detail::ClientSession> session) mutable {
+                       if (cancel && cancel->cancelled) {
+                           open_done(make_error_code(asio::error::operation_aborted), nullptr);
+                           return;
+                       }
                        if (dec) {
                            open_done(dec, nullptr);
                            return;

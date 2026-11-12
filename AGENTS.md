@@ -1157,6 +1157,11 @@ test/run.sh server-diff
     `max(h2_initial_window, 65535)`，且只有大于 65535 时才发连接级
     WINDOW_UPDATE。把配置的更小值当成连接窗口会把合规流量误判为
     `FLOW_CONTROL_ERROR`；`replenish_conn` 的批量阈值同理。
+92. **`request_timeout` 立即回调且不得 UAF**：整体预算到点时先置共享
+    `HopCancel::cancelled`、best-effort `async_cancel` 当前 stream，然后**立即**
+    完成调用者（不能等内层排空）。内层续延在解引用 `Client` 之前必须检查该标志；
+    栈上 `Client` 的 `keep_alive()` 只是别名 `shared_ptr`，不负责保活。ASan 的
+    client-diff policy 组覆盖此路径。
 
 ---
 
