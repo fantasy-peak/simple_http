@@ -725,7 +725,9 @@ Python 侧只需要 `httpx`、`jsonschema`、`brotli`（`test/requirements.txt`�
   `GOAWAY(ENHANCE_YOUR_CALM)`。Go `net/http` 无对应能力，因此输出 PASS/FAIL
   而不是双 target。h2c 夹具（`:7821`）把 `h2_max_queued_streams` 调小，否则
   RFC 9113 §5.1.2 的 `REFUSED_STREAM` 会先于队列溢出触发；upgrade 检查走
-  `:7820` 嗅探监听器。
+  `:7820` 嗅探监听器。该夹具的 `/delay` 等待显式脱离请求的取消槽（与 Go 参考
+  服务端的 `time.Sleep` 一致）：Rapid Reset 门线只在 handler 被 reset 后仍继续
+  占用执行槽位时才可达，绑定取消槽会让 handler 提前退出、队列永不溢出。
 
 每个组是独立可执行程序（C++ 用 `DIFF_GROUP_*`，Go 用 `-ldflags -X main.defaultGroup`）。
 观测是 JSONL，字段为 `case/target/status/version/headers/body/body_encoding/framing/error/notes`。
@@ -1149,9 +1151,13 @@ test/run.sh server-diff
     eofbit）。
 89. **h2 客户端 `te` 响应头大小写不敏感**；`MultiplexedClientSession::stream_closed`
     对计数做饱和递减，`finish_session()` 清零后不再下溢。
-90. **h2 已关闭流的 HEADERS 是流级 `STREAM_CLOSED`**：奇数 id 且不高于已见最大
-    id 表示已关闭/隐式关闭；解码并丢弃字段块（保持 HPACK 同步）后 RST_STREAM。
-    偶数 id 才是连接级 PROTOCOL_ERROR。
+90. **h2 关闭流上的帧按关闭原因处理**（RFC 9113 §5.1）：引擎用定长环记录最近
+    256 条已关闭流的 id 与原因。从未打开（跳号、隐式关闭）是 §5.1.1 的
+    unexpected stream identifier → `GOAWAY(PROTOCOL_ERROR)`；本端发过
+    RST_STREAM 的流，后续帧最小处理（HEADERS 走 HPACK 解码）后丢弃、不回应；
+    对端 RST_STREAM 或双方 END_STREAM 关闭的流 → `GOAWAY(STREAM_CLOSED)`。
+    关闭流上不得再发非 PRIORITY 帧，所以不要用 RST_STREAM 回应。偶数 id 仍是
+    连接级 PROTOCOL_ERROR。
 91. **h2 客户端连接级接收窗口固定从 65535 起**：`SETTINGS_INITIAL_WINDOW_SIZE`
     只影响每条流；`m_conn_recv_window` 初始化为
     `max(h2_initial_window, 65535)`，且只有大于 65535 时才发连接级

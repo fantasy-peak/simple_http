@@ -727,8 +727,15 @@ func checkRapidReset(addr string) error {
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
+		// Bound the read by the loop's own deadline: without this the socket's
+		// longer deadline would turn a missing GOAWAY into a 10-second
+		// "connection ended" error instead of the assertion below.
+		_ = c.conn.SetReadDeadline(deadline)
 		typ, flags, _, payload, err := c.readFrame()
 		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				break // our own deadline: no GOAWAY was sent
+			}
 			return fmt.Errorf("connection ended without GOAWAY: %v", err)
 		}
 		switch typ {

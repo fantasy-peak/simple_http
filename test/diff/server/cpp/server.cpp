@@ -31,6 +31,7 @@
 #include <thread>
 #include <vector>
 
+#include <boost/asio/bind_cancellation_slot.hpp>
 #include <glaze/glaze.hpp>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
@@ -380,7 +381,17 @@ template <typename ServerT> void register_routes(ServerT &server, const std::sha
                      const auto ms = static_cast<int>(query_uint(req->query(), "ms", 100));
                      asio::steady_timer timer{co_await asio::this_coro::executor};
                      timer.expires_after(std::chrono::milliseconds(ms));
-                     co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+                     // The Rapid Reset probe resets these streams and expects the
+                     // handlers to keep occupying their executing slots (the cap
+                     // it probes is about handlers, not stream-table entries).
+                     // Handlers are spawned with the request's cancellation slot
+                     // bound, so an RST_STREAM would cancel this wait and free the
+                     // slot early; the probe's queue would then never overflow and
+                     // its GOAWAY assertion would race. Detach this wait from that
+                     // slot, matching the Go reference server, whose time.Sleep is
+                     // not cancellable either.
+                     co_await timer.async_wait(
+                         asio::bind_cancellation_slot(asio::cancellation_slot{}, asio::as_tuple(asio::use_awaitable)));
                      co_await res->status(status::ok).async_send("delayed", asio::use_awaitable);
                  });
 
