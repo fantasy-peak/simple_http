@@ -192,7 +192,8 @@ def run_current_suites(root: Path, bin_dir: Path, suites: list[str], jobs: int,
     cmd = [sys.executable, str(root / "test" / "run.py"),
            "--bin-dir", str(bin_dir), "--jobs", str(jobs),
            "--parallel", str(parallel),
-           "--report-dir", str(report_dir), *suites]
+           "--report-dir", str(report_dir),
+           "--suites", ",".join(suites)]
     return run(cmd, cwd=root, env=env, log_path=report_dir / "runner.log")
 
 
