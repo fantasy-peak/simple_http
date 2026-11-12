@@ -144,8 +144,7 @@ class MultipartStreamWriter : public std::enable_shared_from_this<MultipartStrea
         return asio::async_initiate<Token, void(error_code)>(
             [self, name = std::move(name), value = std::move(value)](auto handler) mutable {
                 auto done = std::make_shared<detail::MultipartDone>(std::move(handler));
-                self->write_part_head(name, {}, {},
-                                      [self, value = std::move(value), done](error_code ec) mutable {
+                self->write_part_head(name, {}, {}, [self, value = std::move(value), done](error_code ec) mutable {
                     if (ec) {
                         auto callback = std::move(*done);
                         std::move(callback)(ec);
@@ -165,21 +164,21 @@ class MultipartStreamWriter : public std::enable_shared_from_this<MultipartStrea
                          Token &&token) {
         auto self = shared_from_this();
         return asio::async_initiate<Token, void(error_code)>(
-            [self, name = std::move(name), filename = std::move(filename),
-             content_type = std::move(content_type), data = std::move(data)](auto handler) mutable {
+            [self, name = std::move(name), filename = std::move(filename), content_type = std::move(content_type),
+             data = std::move(data)](auto handler) mutable {
                 auto done = std::make_shared<detail::MultipartDone>(std::move(handler));
                 self->write_part_head(name, filename, content_type,
                                       [self, data = std::move(data), done](error_code ec) mutable {
-                                    if (ec) {
-                                        auto callback = std::move(*done);
-                                        std::move(callback)(ec);
-                                        return;
-                                    }
-                                    self->m_stream->async_write(std::move(data), [done](error_code wec) mutable {
-                                        auto callback = std::move(*done);
-                                        std::move(callback)(wec);
-                                    });
-                                });
+                                          if (ec) {
+                                              auto callback = std::move(*done);
+                                              std::move(callback)(ec);
+                                              return;
+                                          }
+                                          self->m_stream->async_write(std::move(data), [done](error_code wec) mutable {
+                                              auto callback = std::move(*done);
+                                              std::move(callback)(wec);
+                                          });
+                                      });
             },
             token);
     }
@@ -195,23 +194,23 @@ class MultipartStreamWriter : public std::enable_shared_from_this<MultipartStrea
     auto async_file(std::string name, std::string filename, std::string content_type, std::string path, Token &&token) {
         auto self = shared_from_this();
         return asio::async_initiate<Token, void(error_code)>(
-            [self, name = std::move(name), filename = std::move(filename),
-             content_type = std::move(content_type), path = std::move(path)](auto handler) mutable {
+            [self, name = std::move(name), filename = std::move(filename), content_type = std::move(content_type),
+             path = std::move(path)](auto handler) mutable {
                 auto done = std::make_shared<detail::MultipartDone>(std::move(handler));
                 self->write_part_head(name, filename, content_type,
                                       [self, path = std::move(path), done](error_code ec) mutable {
-                                    if (ec) {
-                                        auto callback = std::move(*done);
-                                        std::move(callback)(ec);
-                                        return;
-                                    }
-                                    auto stream = self->m_stream;
-                                    async_stream_file_body(stream, std::move(path), self->m_chunk_bytes,
-                                                           [done](error_code fec) mutable {
-                                                               auto callback = std::move(*done);
-                                                               std::move(callback)(fec);
-                                                           });
-                                });
+                                          if (ec) {
+                                              auto callback = std::move(*done);
+                                              std::move(callback)(ec);
+                                              return;
+                                          }
+                                          auto stream = self->m_stream;
+                                          async_stream_file_body(stream, std::move(path), self->m_chunk_bytes,
+                                                                 [done](error_code fec) mutable {
+                                                                     auto callback = std::move(*done);
+                                                                     std::move(callback)(fec);
+                                                                 });
+                                      });
             },
             token);
     }

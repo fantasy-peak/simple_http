@@ -80,8 +80,8 @@ class FuzzTransport {
     }
 
     template <typename Token> auto async_shutdown(Token &&token) {
-        return asio::async_initiate<Token, void(error_code)>(
-            [](auto handler) { std::move(handler)(error_code{}); }, token);
+        return asio::async_initiate<Token, void(error_code)>([](auto handler) { std::move(handler)(error_code{}); },
+                                                             token);
     }
 
     auto get_executor() { return m_executor; }

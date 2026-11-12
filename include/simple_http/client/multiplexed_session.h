@@ -70,9 +70,8 @@ class MultiplexedClientSession : public ClientSession, public std::enable_shared
         // entries are erased, so a plain fetch_sub could wrap to SIZE_MAX and
         // report a wildly wrong diagnostic number.
         auto current = m_active_streams.load(std::memory_order_relaxed);
-        while (current != 0 &&
-               !m_active_streams.compare_exchange_weak(current, current - 1, std::memory_order_release,
-                                                       std::memory_order_relaxed)) {
+        while (current != 0 && !m_active_streams.compare_exchange_weak(current, current - 1, std::memory_order_release,
+                                                                       std::memory_order_relaxed)) {
         }
     }
 

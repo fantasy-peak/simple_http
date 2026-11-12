@@ -194,7 +194,7 @@ TEST_CASE("decompress_request: gzip body is decoded and headers are rewritten", 
         r->body().async_read_all([&, r, completion](error_code ec, std::string all) {
             if (!ec)
                 seen = std::move(all);
-            std::move(*completion)();
+            std::move (*completion)();
         });
     };
 
@@ -247,7 +247,7 @@ TEST_CASE("decompress_request: excluded paths stay on the raw representation", "
         r->body().async_read_all([&, r, completion](error_code ec, std::string all) {
             if (!ec)
                 seen = std::move(all);
-            std::move(*completion)();
+            std::move (*completion)();
         });
     };
 

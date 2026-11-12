@@ -31,8 +31,8 @@
 #include <boost/asio/any_completion_handler.hpp>
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/compose.hpp>
-#include <boost/asio/post.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/post.hpp>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -87,9 +87,10 @@ class ResolveOp {
                             // unconditionally: an asio operation must not
                             // complete from its initiating function, and the
                             // answer has to land on the caller's executor.
-                            asio::post(executor, [self = std::move(self), rec, endpoints = std::move(endpoints)]() mutable {
-                                self.complete(rec, std::move(endpoints));
-                            });
+                            asio::post(executor,
+                                       [self = std::move(self), rec, endpoints = std::move(endpoints)]() mutable {
+                                           self.complete(rec, std::move(endpoints));
+                                       });
                         });
                 return;
             }

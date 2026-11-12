@@ -108,14 +108,15 @@ TEST_CASE("router: dispatch without a fallback answers 404", "[router]") {
 TEST_CASE("router: middleware short-circuits and sees the request", "[router]") {
     Router router;
     bool mw_called = false;
-    router.use(coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
-        mw_called = true;
-        if (req->path() == "/blocked") {
-            co_await res->status(status::forbidden).async_send("denied", asio::use_awaitable);
-            co_return; // answered here: the route must not run
-        }
-        co_await next(std::move(req), std::move(res), ssl);
-    }));
+    router.use(coro_middleware(
+        [&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
+            mw_called = true;
+            if (req->path() == "/blocked") {
+                co_await res->status(status::forbidden).async_send("denied", asio::use_awaitable);
+                co_return; // answered here: the route must not run
+            }
+            co_await next(std::move(req), std::move(res), ssl);
+        }));
     router.route(any_methods, "/blocked", body_handler("should not run"));
     router.route(any_methods, "/allowed", body_handler("allowed"));
 
@@ -144,18 +145,20 @@ TEST_CASE("router: middleware wraps the handler — before, after, and ordering"
     // Outermost first: mw1 sees the request before mw2, and its after-phase
     // (the code after next() resumes) runs last. use() runs in registration
     // order.
-    router.use(coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
-        trace.push_back("mw1:before");
-        // A copy keeps this layer's own reference, so the after-phase below can
-        // still touch req/res once next() has returned.
-        co_await next(req, res, ssl);
-        trace.push_back("mw1:after");
-    }));
-    router.use(coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
-        trace.push_back("mw2:before");
-        co_await next(std::move(req), std::move(res), ssl);
-        trace.push_back("mw2:after");
-    }));
+    router.use(coro_middleware(
+        [&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
+            trace.push_back("mw1:before");
+            // A copy keeps this layer's own reference, so the after-phase below can
+            // still touch req/res once next() has returned.
+            co_await next(req, res, ssl);
+            trace.push_back("mw1:after");
+        }));
+    router.use(coro_middleware(
+        [&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
+            trace.push_back("mw2:before");
+            co_await next(std::move(req), std::move(res), ssl);
+            trace.push_back("mw2:after");
+        }));
     router.route(any_methods, "/chain", [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
         trace.push_back("handler");
         co_await res->status(status::ok).async_send("ok", asio::use_awaitable);
@@ -176,19 +179,21 @@ TEST_CASE("router: middleware wraps the handler — before, after, and ordering"
 TEST_CASE("router: middleware short-circuits by not calling next", "[router]") {
     Router router;
     std::vector<std::string> trace;
-    router.use(coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
-        trace.push_back("gate:before");
-        if (req->path() == "/blocked") {
-            co_await res->status(status::forbidden).async_send("denied", asio::use_awaitable);
-            co_return; // answered here: the rest of the chain must not run
-        }
-        co_await next(std::move(req), std::move(res), ssl);
-        trace.push_back("gate:after");
-    }));
-    router.use(coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
-        trace.push_back("inner");
-        co_await next(std::move(req), std::move(res), ssl);
-    }));
+    router.use(coro_middleware(
+        [&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
+            trace.push_back("gate:before");
+            if (req->path() == "/blocked") {
+                co_await res->status(status::forbidden).async_send("denied", asio::use_awaitable);
+                co_return; // answered here: the rest of the chain must not run
+            }
+            co_await next(std::move(req), std::move(res), ssl);
+            trace.push_back("gate:after");
+        }));
+    router.use(coro_middleware(
+        [&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
+            trace.push_back("inner");
+            co_await next(std::move(req), std::move(res), ssl);
+        }));
     router.route(any_methods, "/blocked", body_handler("should not run"));
     router.route(any_methods, "/allowed", body_handler("allowed"));
 
@@ -216,10 +221,11 @@ TEST_CASE("router: middleware short-circuits by not calling next", "[router]") {
 TEST_CASE("router: the after-phase observes the response", "[router]") {
     Router router;
     int seen_status = 0;
-    router.use(coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
-        co_await next(req, res, ssl); // copy: keep our reference for the after-phase
-        seen_status = res->status();
-    }));
+    router.use(coro_middleware(
+        [&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
+            co_await next(req, res, ssl); // copy: keep our reference for the after-phase
+            seen_status = res->status();
+        }));
     router.route(any_methods, "/created", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
         co_await res->status(status::created).async_send("made", asio::use_awaitable);
     });
@@ -254,21 +260,24 @@ TEST_CASE("router: middleware state flows to the handler", "[router]") {
     Router router;
     // Two middlewares set the same type: last set wins, so the handler sees the
     // inner middleware's principal.
-    router.use(coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
-        req->set_state(AuthPrincipal{"outer", false});
-        co_await next(std::move(req), std::move(res), ssl);
-    }));
-    router.use(coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
-        req->set_state(AuthPrincipal{"alice", true});
-        co_await next(std::move(req), std::move(res), ssl);
-    }));
+    router.use(coro_middleware(
+        [&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
+            req->set_state(AuthPrincipal{"outer", false});
+            co_await next(std::move(req), std::move(res), ssl);
+        }));
+    router.use(coro_middleware(
+        [&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
+            req->set_state(AuthPrincipal{"alice", true});
+            co_await next(std::move(req), std::move(res), ssl);
+        }));
     router.route(any_methods, "/who", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
         const AuthPrincipal *user = req->get_state<AuthPrincipal>();
         co_await res->status(status::ok).async_send(user ? user->name : "anonymous", asio::use_awaitable);
     });
     // A different type than the one set is not found.
     router.route(any_methods, "/none", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(status::ok).async_send(req->get_state<std::string>() ? "string" : "no-string", asio::use_awaitable);
+        co_await res->status(status::ok)
+            .async_send(req->get_state<std::string>() ? "string" : "no-string", asio::use_awaitable);
     });
 
     asio::io_context ctx;
@@ -293,10 +302,11 @@ TEST_CASE("router: cors is the outermost middleware whatever the registration or
     bool user_ran = false;
     // Registered first, but cors() below must still end up ahead of it: a
     // preflight is answered before the user middleware ever sees the request.
-    router.use(coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
-        user_ran = true;
-        co_await next(std::move(req), std::move(res), ssl);
-    }));
+    router.use(coro_middleware(
+        [&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
+            user_ran = true;
+            co_await next(std::move(req), std::move(res), ssl);
+        }));
     router.cors(CorsConfig{});
     bool route_ran = false;
     router.route(any_methods, "/api", [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
@@ -334,16 +344,18 @@ TEST_CASE("router: cors is the outermost middleware whatever the registration or
 
 TEST_CASE("router: compose_middleware builds a standalone chain", "[router]") {
     std::vector<std::string> trace;
-    Middleware a = coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
-        trace.push_back("a:before");
-        co_await next(std::move(req), std::move(res), ssl);
-        trace.push_back("a:after");
-    });
-    Middleware b = coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
-        trace.push_back("b:before");
-        co_await next(std::move(req), std::move(res), ssl);
-        trace.push_back("b:after");
-    });
+    Middleware a = coro_middleware(
+        [&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
+            trace.push_back("a:before");
+            co_await next(std::move(req), std::move(res), ssl);
+            trace.push_back("a:after");
+        });
+    Middleware b = coro_middleware(
+        [&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
+            trace.push_back("b:before");
+            co_await next(std::move(req), std::move(res), ssl);
+            trace.push_back("b:after");
+        });
     Next terminal = [&](RequestPtr, ResponsePtr res, SslHandle, HandlerCompletion done) {
         trace.push_back("terminal");
         res->status(status::ok).async_send("ok", finish_with(std::move(done)));
@@ -361,16 +373,18 @@ TEST_CASE("router: compose_middleware builds a standalone chain", "[router]") {
 TEST_CASE("router: per-route middleware wraps only its own handler", "[router]") {
     Router router;
     std::vector<std::string> trace;
-    router.use(coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
-        trace.push_back("global");
-        co_await next(std::move(req), std::move(res), ssl);
-    }));
+    router.use(coro_middleware(
+        [&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
+            trace.push_back("global");
+            co_await next(std::move(req), std::move(res), ssl);
+        }));
     router.route({Method::Get}, "/protected",
-                 {coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
-                     trace.push_back("per-route:before");
-                     co_await next(std::move(req), std::move(res), ssl);
-                     trace.push_back("per-route:after");
-                 })},
+                 {coro_middleware(
+                     [&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
+                         trace.push_back("per-route:before");
+                         co_await next(std::move(req), std::move(res), ssl);
+                         trace.push_back("per-route:after");
+                     })},
                  [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
                      trace.push_back("protected-handler");
                      co_await res->status(status::ok).async_send("secret", asio::use_awaitable);
@@ -407,14 +421,15 @@ TEST_CASE("router: per-route middleware wraps only its own handler", "[router]")
 TEST_CASE("router: per-route middleware short-circuits its route", "[router]") {
     Router router;
     bool handler_ran = false;
-    router.route(any_methods, "/admin",
-                 {coro_middleware([&](RequestPtr, ResponsePtr res, SslHandle, CoroutineNext) -> asio::awaitable<void> {
-                     co_await res->status(status::forbidden).async_send("denied", asio::use_awaitable); // never calls next()
-                 })},
-                 [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-                     handler_ran = true;
-                     co_await res->status(status::ok).async_send("admin", asio::use_awaitable);
-                 });
+    router.route(
+        any_methods, "/admin",
+        {coro_middleware([&](RequestPtr, ResponsePtr res, SslHandle, CoroutineNext) -> asio::awaitable<void> {
+            co_await res->status(status::forbidden).async_send("denied", asio::use_awaitable); // never calls next()
+        })},
+        [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+            handler_ran = true;
+            co_await res->status(status::ok).async_send("admin", asio::use_awaitable);
+        });
     router.route(any_methods, "/public", body_handler("public"));
 
     asio::io_context ctx;
@@ -432,11 +447,13 @@ TEST_CASE("router: per-route middleware short-circuits its route", "[router]") {
 TEST_CASE("router: group applies prefix and group middleware to its routes only", "[router]") {
     Router router;
     std::vector<std::string> trace;
-    router.group("/api", {coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
-                     trace.push_back("group:before");
-                     co_await next(std::move(req), std::move(res), ssl);
-                     trace.push_back("group:after");
-                 })},
+    router.group("/api",
+                 {coro_middleware(
+                     [&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
+                         trace.push_back("group:before");
+                         co_await next(std::move(req), std::move(res), ssl);
+                         trace.push_back("group:after");
+                     })},
                  [&](Router &api) {
                      api.route(any_methods, "/users", [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
                          trace.push_back("users");
@@ -444,19 +461,20 @@ TEST_CASE("router: group applies prefix and group middleware to its routes only"
                      });
                      // A nested group accumulates the prefix and its own
                      // middleware, which runs between the outer group and the handler.
-                     api.group(
-                         "/admin",
-                         {coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
-                             trace.push_back("nested:before");
-                             co_await next(std::move(req), std::move(res), ssl);
-                             trace.push_back("nested:after");
-                         })},
-                         [&](Router &adm) {
-                             adm.route(any_methods, "/kick", [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-                                 trace.push_back("kick");
-                                 co_await res->status(status::ok).async_send("kicked", asio::use_awaitable);
-                             });
-                         });
+                     api.group("/admin",
+                               {coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl,
+                                                    CoroutineNext next) -> asio::awaitable<void> {
+                                   trace.push_back("nested:before");
+                                   co_await next(std::move(req), std::move(res), ssl);
+                                   trace.push_back("nested:after");
+                               })},
+                               [&](Router &adm) {
+                                   adm.route(
+                                       any_methods, "/kick", [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+                                           trace.push_back("kick");
+                                           co_await res->status(status::ok).async_send("kicked", asio::use_awaitable);
+                                       });
+                               });
                  });
     // A route outside the group does not get the prefix or the group middleware.
     router.route(any_methods, "/health", [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
@@ -499,10 +517,11 @@ TEST_CASE("router: use() inside a group scopes to that group", "[router]") {
     Router router;
     std::vector<std::string> trace;
     router.group("/mq", [&](Router &mq) {
-        mq.use(coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
-            trace.push_back("scoped");
-            co_await next(std::move(req), std::move(res), ssl);
-        }));
+        mq.use(coro_middleware(
+            [&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
+                trace.push_back("scoped");
+                co_await next(std::move(req), std::move(res), ssl);
+            }));
         mq.route(any_methods, "/pull", [&](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
             trace.push_back("pull");
             co_await res->status(status::ok).async_send("msg", asio::use_awaitable);
@@ -530,17 +549,21 @@ TEST_CASE("router: use() inside a group scopes to that group", "[router]") {
 TEST_CASE("router: group middleware, global middleware and per-route middleware nest in order", "[router]") {
     Router router;
     std::vector<std::string> trace;
-    router.use(coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
-        trace.push_back("global");
-        co_await next(std::move(req), std::move(res), ssl);
-    }));
-    router.group("/g", {coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
-                     trace.push_back("group");
-                     co_await next(std::move(req), std::move(res), ssl);
-                 })},
+    router.use(coro_middleware(
+        [&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
+            trace.push_back("global");
+            co_await next(std::move(req), std::move(res), ssl);
+        }));
+    router.group("/g",
+                 {coro_middleware(
+                     [&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
+                         trace.push_back("group");
+                         co_await next(std::move(req), std::move(res), ssl);
+                     })},
                  [&](Router &g) {
                      g.route(any_methods, "/x",
-                             {coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
+                             {coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl,
+                                                  CoroutineNext next) -> asio::awaitable<void> {
                                  trace.push_back("per-route");
                                  co_await next(std::move(req), std::move(res), ssl);
                              })},
@@ -588,10 +611,11 @@ TEST_CASE("router: regex routes are scoped to a group prefix", "[router]") {
 TEST_CASE("router: a proxy route in a group keeps the prefix and group middleware", "[router]") {
     Router router;
     std::size_t middleware_runs = 0;
-    Middleware mw = coro_middleware([&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
-        ++middleware_runs;
-        co_await next(std::move(req), std::move(res), ssl);
-    });
+    Middleware mw = coro_middleware(
+        [&](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
+            ++middleware_runs;
+            co_await next(std::move(req), std::move(res), ssl);
+        });
     HttpProxyTarget target;
     target.host = "127.0.0.1";
     target.port = 9;
@@ -630,9 +654,10 @@ TEST_CASE("router: ws_proxy scopes its path, and refuses a group with middleware
         // registering it there is failed closed instead of silently dropping
         // auth middleware.
         Router router;
-        Middleware mw = coro_middleware([](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
-            co_await next(std::move(req), std::move(res), ssl);
-        });
+        Middleware mw = coro_middleware(
+            [](RequestPtr req, ResponsePtr res, SslHandle ssl, CoroutineNext next) -> asio::awaitable<void> {
+                co_await next(std::move(req), std::move(res), ssl);
+            });
         router.group("/api", {mw}, [&](Router &api) { api.ws_proxy("/ws", WsProxyTarget{}); });
         CHECK_FALSE(router.find_ws_proxy("/api/ws").has_value());
         CHECK_FALSE(router.find_ws_proxy("/ws").has_value());

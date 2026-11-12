@@ -107,7 +107,8 @@ TEST_CASE("framework: application state is shared, type-keyed and nullable", "[f
 
     Router without;
     without.route({Method::Get}, "/state", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(status::ok).async_send(req->app_state<AppState>() ? "present" : "missing", asio::use_awaitable);
+        co_await res->status(status::ok)
+            .async_send(req->app_state<AppState>() ? "present" : "missing", asio::use_awaitable);
     });
     CHECK(dispatch(ctx, without, make_request(ctx, "/state"))->last_body == "missing");
 }
@@ -169,13 +170,15 @@ TEST_CASE("framework: Path/Query/State extractors run before the handler", "[fra
     router.route({Method::Get}, "/users/{id}",
                  extract<Path<UserParams>, State<AppState>>([](const UserParams &params, AppState *state, RequestPtr,
                                                                ResponsePtr res) -> asio::awaitable<void> {
-                     co_await res->status(status::ok).async_send(std::to_string(params.id) + ":" + state->name, asio::use_awaitable);
+                     co_await res->status(status::ok)
+                         .async_send(std::to_string(params.id) + ":" + state->name, asio::use_awaitable);
                  }));
 
     router.route(
         {Method::Get}, "/list",
         extract<Query<ListQuery>>([](const ListQuery &query, RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-            co_await res->status(status::ok).async_send(query.q + ":" + std::to_string(query.page), asio::use_awaitable);
+            co_await res->status(status::ok)
+                .async_send(query.q + ":" + std::to_string(query.page), asio::use_awaitable);
         }));
 
     CHECK(dispatch(ctx, router, make_request(ctx, "/users/42"))->last_body == "42:state");
@@ -195,11 +198,12 @@ TEST_CASE("framework: Path/Query/State extractors run before the handler", "[fra
 TEST_CASE("framework: Header and Cookie extractors parse typed values", "[framework][extract]") {
     asio::io_context ctx;
     Router router;
-    router.route({Method::Get}, "/headers",
-                 extract<Header<int, "x-page">, Cookie<std::string, "sid">>(
-                     [](int page, std::string sid, RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-                         co_await res->status(status::ok).async_send(std::to_string(page) + ":" + sid, asio::use_awaitable);
-                     }));
+    router.route(
+        {Method::Get}, "/headers",
+        extract<Header<int, "x-page">, Cookie<std::string, "sid">>(
+            [](int page, std::string sid, RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+                co_await res->status(status::ok).async_send(std::to_string(page) + ":" + sid, asio::use_awaitable);
+            }));
 
     auto req = make_request(ctx, "/headers");
     req->mutable_headers().add("x-page", "3");
@@ -213,7 +217,8 @@ TEST_CASE("framework: extract supports a trailing SslHandle parameter", "[framew
     router.route({Method::Get}, "/users/{id}",
                  extract<Path<UserParams>>(
                      [](const UserParams &params, RequestPtr, ResponsePtr res, SslHandle ssl) -> asio::awaitable<void> {
-                         co_await res->status(status::ok).async_send(std::to_string(params.id) + (ssl ? ":tls" : ":plain"), asio::use_awaitable);
+                         co_await res->status(status::ok)
+                             .async_send(std::to_string(params.id) + (ssl ? ":tls" : ":plain"), asio::use_awaitable);
                      }));
     CHECK(dispatch(ctx, router, make_request(ctx, "/users/7"))->last_body == "7:plain");
 }
@@ -223,11 +228,13 @@ TEST_CASE("framework: Json/Form extractors consume the body once", "[framework][
     Router router;
     router.route({Method::Post}, "/json",
                  extract<Json<CreateUser>>([](CreateUser user, RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-                     co_await res->status(status::created).async_send(user.name + ":" + std::to_string(user.age), asio::use_awaitable);
+                     co_await res->status(status::created)
+                         .async_send(user.name + ":" + std::to_string(user.age), asio::use_awaitable);
                  }));
     router.route({Method::Post}, "/form",
                  extract<Form<CreateUser>>([](CreateUser user, RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-                     co_await res->status(status::created).async_send(user.name + ":" + std::to_string(user.age), asio::use_awaitable);
+                     co_await res->status(status::created)
+                         .async_send(user.name + ":" + std::to_string(user.age), asio::use_awaitable);
                  }));
 
     auto json = make_request(ctx, "/json", Method::Post);
@@ -602,7 +609,8 @@ TEST_CASE("framework: JWT rejects malformed, unsigned and mismatched tokens", "[
     }));
     router.route({Method::Get}, "/me", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
         const Principal *identity = principal(*req);
-        co_await res->status(status::ok).async_send(identity ? identity->subject : std::string{"none"}, asio::use_awaitable);
+        co_await res->status(status::ok)
+            .async_send(identity ? identity->subject : std::string{"none"}, asio::use_awaitable);
     });
     router.route({Method::Get}, "/admin", {middleware::require_role("admin")}, text_handler("admin"));
 
@@ -673,7 +681,8 @@ TEST_CASE("framework: JWT rejects malformed, unsigned and mismatched tokens", "[
     }));
     optional.route({Method::Get}, "/me", [](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
         const Principal *identity = principal(*req);
-        co_await res->status(status::ok).async_send(identity ? identity->subject : std::string{"none"}, asio::use_awaitable);
+        co_await res->status(status::ok)
+            .async_send(identity ? identity->subject : std::string{"none"}, asio::use_awaitable);
     });
     CHECK(dispatch(ctx, optional, make_request(ctx, "/me"))->last_body == "none");
     CHECK(

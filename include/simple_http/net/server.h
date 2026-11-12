@@ -11,8 +11,8 @@
 // io_context from an IoCtxPool (one thread per context), and all of its engine,
 // writer and handler work happens there.
 
-#include <array>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
@@ -600,11 +600,10 @@ class Server {
             std::lock_guard<std::mutex> lock(lifecycle_mutex);
             // Drop entries whose connection is gone; otherwise a long-running
             // server grows this vector by one slot per connection until stop().
-            closers.erase(std::remove_if(closers.begin(), closers.end(),
-                                         [](const std::weak_ptr<std::function<void()>> &entry) {
-                                             return entry.expired();
-                                         }),
-                          closers.end());
+            closers.erase(
+                std::remove_if(closers.begin(), closers.end(),
+                               [](const std::weak_ptr<std::function<void()>> &entry) { return entry.expired(); }),
+                closers.end());
             closers.push_back(closer);
         }
 

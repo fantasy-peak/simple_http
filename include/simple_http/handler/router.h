@@ -181,8 +181,7 @@ class Router {
         }
         const std::string full_pattern = m_scopes.empty() ? pattern : scope_regex(pattern);
         try {
-            m_regex.emplace_back(RegexRoute{simple_http_regex::regex{full_pattern}},
-                                 std::move(*entry));
+            m_regex.emplace_back(RegexRoute{simple_http_regex::regex{full_pattern}}, std::move(*entry));
         } catch (const std::exception &e) {
             SIMPLE_HTTP_ERROR_LOG("invalid route regex [{}]: {}", pattern, e.what());
         }
@@ -257,8 +256,7 @@ class Router {
         }
         const std::string full_pattern = m_scopes.empty() ? pattern : scope_regex(pattern);
         try {
-            m_ws_proxy_regex.emplace_back(
-                RegexRoute{simple_http_regex::regex{full_pattern}}, std::move(target));
+            m_ws_proxy_regex.emplace_back(RegexRoute{simple_http_regex::regex{full_pattern}}, std::move(target));
         } catch (const std::exception &e) {
             SIMPLE_HTTP_ERROR_LOG("invalid ws proxy regex [{}]: {}", pattern, e.what());
         }
@@ -411,8 +409,7 @@ class Router {
         WsRouteEntry entry{std::move(handler), std::move(scoped_registration.second)};
         const std::string full_pattern = m_scopes.empty() ? pattern : scope_regex(pattern);
         try {
-            m_ws_regex.emplace_back(RegexRoute{simple_http_regex::regex{full_pattern}},
-                                    std::move(entry));
+            m_ws_regex.emplace_back(RegexRoute{simple_http_regex::regex{full_pattern}}, std::move(entry));
         } catch (const std::exception &e) {
             SIMPLE_HTTP_ERROR_LOG("invalid ws route regex [{}]: {}", pattern, e.what());
         }
@@ -744,8 +741,6 @@ class Router {
 
         run_static_stage(0, std::move(req), std::move(res), ssl, std::move(done));
     }
-
-
 
     // $0 = whole match, $1..$9 = capture groups, $$ = a literal '$'.
     static std::string expand_rewrite(const std::string &tmpl, const simple_http_regex::smatch &match) {

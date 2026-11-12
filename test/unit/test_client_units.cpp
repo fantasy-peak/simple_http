@@ -365,8 +365,8 @@ TEST_CASE("client/resolve: the hook wins, an empty hook falls back to asio", "[c
         std::move(done)(error_code{}, std::move(endpoints));
     };
 
-    auto hooked = run_on(ctx, as_expected(async_resolve_endpoints(hook, "example.com", 443, ex,
-                                                                 asio::as_tuple(asio::use_awaitable))));
+    auto hooked = run_on(
+        ctx, as_expected(async_resolve_endpoints(hook, "example.com", 443, ex, asio::as_tuple(asio::use_awaitable))));
     REQUIRE(hooked);
     REQUIRE(hooked->has_value());
     REQUIRE((*hooked)->size() == 1);

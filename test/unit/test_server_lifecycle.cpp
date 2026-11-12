@@ -43,8 +43,8 @@ TEST_CASE("server: stop closes idle keep-alive connections promptly", "[server][
 
     const auto begin = std::chrono::steady_clock::now();
     server.stop();
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - begin);
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin);
 
     // An idle connection has no request in flight; shutdown_grace is 200 ms.
     // The generic io-context drain grace is 2 s and must not be paid here.
@@ -77,22 +77,25 @@ TEST_CASE("client: per-request version overrides the default", "[client][server]
         io,
         [&]() -> asio::awaitable<void> {
             {
-                auto [ec, r] = co_await client.get(url).version(HttpVersionPolicy::Http11).send(
-                    asio::as_tuple(asio::use_awaitable));
+                auto [ec, r] = co_await client.get(url)
+                                   .version(HttpVersionPolicy::Http11)
+                                   .send(asio::as_tuple(asio::use_awaitable));
                 e11 = ec;
                 if (!ec)
                     v11 = r.version();
             }
             {
-                auto [ec, r] = co_await client.get(url).version(HttpVersionPolicy::Http2).send(
-                    asio::as_tuple(asio::use_awaitable));
+                auto [ec, r] = co_await client.get(url)
+                                   .version(HttpVersionPolicy::Http2)
+                                   .send(asio::as_tuple(asio::use_awaitable));
                 e2 = ec;
                 if (!ec)
                     v2 = r.version();
             }
             {
-                auto [ec, r] = co_await client.get(url).version(HttpVersionPolicy::Http11).send(
-                    asio::as_tuple(asio::use_awaitable));
+                auto [ec, r] = co_await client.get(url)
+                                   .version(HttpVersionPolicy::Http11)
+                                   .send(asio::as_tuple(asio::use_awaitable));
                 e11_again = ec;
                 if (!ec)
                     v11_again = r.version();

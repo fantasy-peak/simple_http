@@ -199,8 +199,8 @@ inline void StaticFiles::try_serve(const RequestPtr &req, const ResponsePtr &res
     if (entry == nullptr && spa_eligible(*normalized)) {
         // Keys are normalized with a leading '/', so a caller-supplied
         // "/index.html" must not become "//index.html" (which never matches).
-        entry = m_table.find(m_config.spa_fallback.front() == '/' ? m_config.spa_fallback
-                                                                 : "/" + m_config.spa_fallback);
+        entry =
+            m_table.find(m_config.spa_fallback.front() == '/' ? m_config.spa_fallback : "/" + m_config.spa_fallback);
         spa_hit = entry != nullptr;
     }
     if (entry == nullptr) {

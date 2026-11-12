@@ -1702,10 +1702,9 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
                                 // Scheme and host are case-insensitive (RFC 3986
                                 // §3.1/§3.2.2); comparing raw bytes cleared
                                 // credentials on a mere spelling difference.
-                                const bool same_origin =
-                                    iequals_ci(next->scheme, target.scheme) &&
-                                    iequals_ci(next->host, target.host) &&
-                                    next->effective_port() == target.effective_port();
+                                const bool same_origin = iequals_ci(next->scheme, target.scheme) &&
+                                                         iequals_ci(next->host, target.host) &&
+                                                         next->effective_port() == target.effective_port();
                                 // Replay from the saved body: the first hop
                                 // consumed the live Body, and a 307/308 must
                                 // resend the same entity. clone_for_replay keeps
@@ -1782,9 +1781,9 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
                             // gzip/brotli reports a truncated stream and turns a
                             // legitimate empty response into body_decode_failed.
                             if (!body.empty() && self->m_config.auto_decompress &&
-                                request->get_state<detail::AutoDecompressMark>() &&
-                                request->method() != Method::Head && !request->header(field::range) && !head.bodyless &&
-                                head.status != status::no_content && head.status != status::not_modified) {
+                                request->get_state<detail::AutoDecompressMark>() && request->method() != Method::Head &&
+                                !request->header(field::range) && !head.bodyless && head.status != status::no_content &&
+                                head.status != status::not_modified) {
                                 if (const auto encoding = head.header(field::content_encoding)) {
                                     const ContentCoding coding = parse_content_coding(*encoding);
                                     const bool wanted = (coding == ContentCoding::Gzip &&

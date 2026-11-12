@@ -25,7 +25,6 @@
 #include <vector>
 
 #include <boost/asio/any_completion_handler.hpp>
-#include <boost/asio/any_completion_handler.hpp>
 #include <boost/asio/associated_cancellation_slot.hpp>
 #include <boost/asio/async_result.hpp>
 #include <boost/asio/bind_cancellation_slot.hpp>
@@ -58,7 +57,7 @@ struct InjectedAcceptEncoding {
 };
 
 class DecompressingClientStream final : public ClientStream,
-                                         public std::enable_shared_from_this<DecompressingClientStream> {
+                                        public std::enable_shared_from_this<DecompressingClientStream> {
   public:
     DecompressingClientStream(std::shared_ptr<ClientStream> inner, ResponseDecoding policy,
                               std::size_t max_decoded_bytes = 0)
@@ -157,7 +156,8 @@ class DecompressingClientStream final : public ClientStream,
     // Forward to the inner stream while preserving the caller's cancellation
     // slot. A plain lambda would drop it, so Stream's body-idle deadline could
     // never abort a parked inner read.
-    template <typename Handler> void forward_read(const std::shared_ptr<ReadCompletion> &completion, Handler &&handler) {
+    template <typename Handler>
+    void forward_read(const std::shared_ptr<ReadCompletion> &completion, Handler &&handler) {
         auto slot = asio::get_associated_cancellation_slot(*completion);
         if (slot.is_connected()) {
             m_inner->read(asio::bind_cancellation_slot(slot, std::forward<Handler>(handler)));

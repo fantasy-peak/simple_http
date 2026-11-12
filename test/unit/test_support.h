@@ -15,11 +15,10 @@
 #include <expected>
 #include <functional>
 #include <memory>
-#include <expected>
 #include <optional>
-#include <tuple>
 #include <span>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -181,7 +180,6 @@ inline asio::awaitable<void> await_next(const Next &next, RequestPtr req, Respon
         token);
 }
 
-
 // --- expected/value shims for the token API --------------------------------
 //
 // The token port completed with void(error_code[, T]) signatures. The tests
@@ -197,8 +195,7 @@ asio::awaitable<std::expected<T, error_code>> as_expected(asio::awaitable<std::t
     co_return std::move(value);
 }
 
-inline asio::awaitable<std::expected<void, error_code>>
-as_expected_void(asio::awaitable<std::tuple<error_code>> op) {
+inline asio::awaitable<std::expected<void, error_code>> as_expected_void(asio::awaitable<std::tuple<error_code>> op) {
     auto [ec] = co_await std::move(op);
     if (ec)
         co_return std::unexpected{ec};
@@ -247,14 +244,12 @@ asio::awaitable<void> run_engine(Engine &engine, HandlerFn &&fn, std::string ini
         [&](auto handler) {
             // engine.run's on_done is a std::function (copyable); the completion
             // handler is move-only, so keep it behind a shared_ptr.
-            auto completion =
-                std::make_shared<asio::any_completion_handler<void()>>(std::move(handler));
+            auto completion = std::make_shared<asio::any_completion_handler<void()>>(std::move(handler));
             engine.run(std::move(dispatcher), std::move(initial), {}, {}, {},
-                       [completion]() mutable { std::move(*completion)(); });
+                       [completion]() mutable { std::move (*completion)(); });
         },
         token);
 }
-
 
 // Some library seams are type-erased completion handlers rather than token
 // templates (StaticFiles::try_serve, serve_not_found). These bridge them back
@@ -267,10 +262,8 @@ template <typename Start> asio::awaitable<bool> await_bool(Start &&start) {
 
 template <typename Start> asio::awaitable<void> await_void(Start &&start) {
     auto token = asio::use_awaitable;
-    co_await asio::async_initiate<decltype(token), void()>(
-        [&](auto handler) { start(std::move(handler)); }, token);
+    co_await asio::async_initiate<decltype(token), void()>([&](auto handler) { start(std::move(handler)); }, token);
 }
-
 
 template <typename Start> asio::awaitable<bool> await_connected(Start &&start) {
     auto token = asio::use_awaitable;
@@ -285,7 +278,6 @@ template <typename Start> asio::awaitable<error_code> await_error(Start &&start)
     co_return std::get<0>(result);
 }
 
-
 inline asio::awaitable<error_code> ws_ping(WebSocket &ws, std::string payload) {
     return as_ec(ws.async_ping(std::move(payload), asio::as_tuple(asio::use_awaitable)));
 }
@@ -298,7 +290,6 @@ inline asio::awaitable<error_code> ws_close(WebSocket &ws, std::uint16_t code, s
     return as_ec(ws.async_close(code, std::move(reason), asio::as_tuple(asio::use_awaitable)));
 }
 
-
 inline asio::awaitable<error_code> ws_enable_compression(WebSocket &ws, bool enable) {
     return as_ec(ws.async_enable_write_compression(enable, asio::as_tuple(asio::use_awaitable)));
 }
@@ -306,7 +297,6 @@ inline asio::awaitable<error_code> ws_enable_compression(WebSocket &ws, bool ena
 inline asio::awaitable<error_code> ws_set_compression_level(WebSocket &ws, int level) {
     return as_ec(ws.async_set_compression_level(level, asio::as_tuple(asio::use_awaitable)));
 }
-
 
 // --- coroutine middleware ------------------------------------------------
 //
@@ -335,8 +325,7 @@ class CoroutineNext {
 };
 
 template <typename F> Middleware coro_middleware(F fn) {
-    return [fn = std::move(fn)](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next,
-                                HandlerCompletion done) {
+    return [fn = std::move(fn)](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next, HandlerCompletion done) {
         auto executor = req ? req->executor() : asio::any_io_executor{};
         auto req_keep = req;
         auto res_keep = res;
@@ -432,8 +421,7 @@ class MockTransport {
                 }
                 std::move(handler)(r.first, r.second);
             };
-            asio::co_spawn(m_executor, do_read_some(buffer),
-                           asio::bind_cancellation_slot(slot, std::move(completion)));
+            asio::co_spawn(m_executor, do_read_some(buffer), asio::bind_cancellation_slot(slot, std::move(completion)));
         };
         return asio::async_initiate<Token, void(error_code, std::size_t)>(
             ExecInit<decltype(initiation)>{std::move(initiation), m_executor}, token);
@@ -449,8 +437,7 @@ class MockTransport {
                 }
                 std::move(handler)(r.first, r.second);
             };
-            asio::co_spawn(m_executor, do_read(buffer),
-                           asio::bind_cancellation_slot(slot, std::move(completion)));
+            asio::co_spawn(m_executor, do_read(buffer), asio::bind_cancellation_slot(slot, std::move(completion)));
         };
         return asio::async_initiate<Token, void(error_code, std::size_t)>(
             ExecInit<decltype(initiation)>{std::move(initiation), m_executor}, token);
@@ -611,9 +598,7 @@ class FakeResponseSink : public ResponseSink {
 
     bool head_request() const noexcept override { return head; }
 
-    void connected(ConnectedCompletion done) const override {
-        std::move(done)(error_code{}, open);
-    }
+    void connected(ConnectedCompletion done) const override { std::move(done)(error_code{}, open); }
 
     void close(WriteCompletion done) override {
         open = false;

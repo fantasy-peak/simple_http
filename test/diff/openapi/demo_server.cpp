@@ -127,7 +127,9 @@ template <typename TReq> asio::awaitable<std::optional<TReq>> read_body_api(Requ
     openapi::BodyError err;
     auto in = co_await openapi::async_read_body<TReq>(*req, err, asio::use_awaitable);
     if (!in) {
-        co_await res->status(err.status).content_type(mime::app_json).async_send(to_json(ErrorBody{.error = err.message}), asio::use_awaitable);
+        co_await res->status(err.status)
+            .content_type(mime::app_json)
+            .async_send(to_json(ErrorBody{.error = err.message}), asio::use_awaitable);
     }
     co_return in;
 }
@@ -180,7 +182,9 @@ int main() {
         [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
             PetList list;
             list.items.emplace_back(Pet{.id = 10, .name = "rex", .status = "available"});
-            co_await res->status(status::ok).content_type(mime::app_json).async_send(to_json(list), asio::use_awaitable);
+            co_await res->status(status::ok)
+                .content_type(mime::app_json)
+                .async_send(to_json(list), asio::use_awaitable);
         },
         openapi::doc()
             .response<PetList>()
@@ -210,7 +214,8 @@ int main() {
             if (trace) {
                 res->header("x-trace-id", std::string{*trace});
             }
-            co_await res->async_send(to_json(Pet{.id = p->id, .name = "rex", .status = "available"}), asio::use_awaitable);
+            co_await res->async_send(to_json(Pet{.id = p->id, .name = "rex", .status = "available"}),
+                                     asio::use_awaitable);
         },
         // The `id` path parameter comes from PetParams: name from
         // the field, schema from its type, required. Nothing to
@@ -241,7 +246,9 @@ int main() {
             }
             co_await res->status(status::ok)
                 .content_type(mime::app_json)
-                .async_send(to_json(Pet{.id = static_cast<std::int64_t>(p->pet_id), .name = "rex", .status = "available"}), asio::use_awaitable);
+                .async_send(
+                    to_json(Pet{.id = static_cast<std::int64_t>(p->pet_id), .name = "rex", .status = "available"}),
+                    asio::use_awaitable);
         },
         openapi::doc()
             .path_params<OwnerPetParams>()
@@ -269,9 +276,10 @@ int main() {
             co_await res->status(status::ok)
                 .content_type(mime::app_json)
                 .async_send(to_json(Order{.id = static_cast<std::int64_t>(p->item_id),
-                                    .pet_id = static_cast<std::int64_t>(p->order_id),
-                                    .quantity = 1,
-                                    .status = "placed"}), asio::use_awaitable);
+                                          .pet_id = static_cast<std::int64_t>(p->order_id),
+                                          .quantity = 1,
+                                          .status = "placed"}),
+                            asio::use_awaitable);
         },
         openapi::doc()
             .path_params<OrderItemParams>()
@@ -305,7 +313,8 @@ int main() {
             (void)co_await res->status(status::created)
                 .header("x-request-id", "req-42")
                 .content_type(mime::app_json)
-                .async_send(to_json(Pet{.id = 100, .name = in->name, .status = in->status.value_or("available")}), asio::use_awaitable);
+                .async_send(to_json(Pet{.id = 100, .name = in->name, .status = in->status.value_or("available")}),
+                            asio::use_awaitable);
         },
         openapi::doc()
             .request_body<CreatePetReq>()
@@ -357,7 +366,8 @@ int main() {
             }
             co_await res->status(status::created)
                 .content_type(mime::app_json)
-                .async_send(to_json(Order{.id = 7, .pet_id = in->pet_id, .quantity = in->quantity.value_or(1)}), asio::use_awaitable);
+                .async_send(to_json(Order{.id = 7, .pet_id = in->pet_id, .quantity = in->quantity.value_or(1)}),
+                            asio::use_awaitable);
         },
         openapi::doc()
             .request_body<CreateOrderReq>()
@@ -387,7 +397,8 @@ int main() {
             }
             co_await res->status(status::ok)
                 .content_type(mime::app_json)
-                .async_send(to_json(GeoReply{.city = p->city, .lat = p->lat, .lng = p->lng, .precision = p->precision}), asio::use_awaitable);
+                .async_send(to_json(GeoReply{.city = p->city, .lat = p->lat, .lng = p->lng, .precision = p->precision}),
+                            asio::use_awaitable);
         },
         openapi::doc()
             .path_params<GeoParams>()
@@ -414,7 +425,8 @@ int main() {
             }
             co_await res->status(status::ok)
                 .content_type(mime::app_json)
-                .async_send(to_json(LabReply{.experiment = p->experiment, .run = p->run, .fast = p->fast}), asio::use_awaitable);
+                .async_send(to_json(LabReply{.experiment = p->experiment, .run = p->run, .fast = p->fast}),
+                            asio::use_awaitable);
         },
         openapi::doc()
             .path_params<LabParams>()
@@ -433,7 +445,9 @@ int main() {
         [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
             PetList found;
             found.items.emplace_back(Pet{.id = 1, .name = "search-hit", .status = "available"});
-            co_await res->status(status::ok).content_type(mime::app_json).async_send(to_json(found), asio::use_awaitable);
+            co_await res->status(status::ok)
+                .content_type(mime::app_json)
+                .async_send(to_json(found), asio::use_awaitable);
         },
         openapi::doc()
             .response<PetList>()
@@ -477,8 +491,9 @@ int main() {
             co_await res->status(status::created)
                 .content_type(mime::app_json)
                 .async_send(to_json(Pet{.id = static_cast<std::int64_t>(p->owner_id),
-                                  .name = in->name,
-                                  .status = in->status.value_or("available")}), asio::use_awaitable);
+                                        .name = in->name,
+                                        .status = in->status.value_or("available")}),
+                            asio::use_awaitable);
         },
         openapi::doc()
             .path_params<OwnerParams>()

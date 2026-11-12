@@ -687,7 +687,8 @@ asio::awaitable<void> run_body_group() {
         if (!opened) {
             obs.error = classify(opened.error());
         } else {
-            (void)co_await as_ec(async_stream_file_body(*opened, path.string(), 0, asio::as_tuple(asio::use_awaitable)));
+            (void)co_await as_ec(
+                async_stream_file_body(*opened, path.string(), 0, asio::as_tuple(asio::use_awaitable)));
             (void)co_await finish_any(**opened);
             auto head = co_await stream_read_head(**opened);
             if (!head) {
@@ -712,8 +713,8 @@ asio::awaitable<void> run_body_group() {
     {
         Observation obs;
         obs.case_id = "body.expect_ok";
-        auto opened =
-            co_await client_open_stream(client, base + "/expect-ok", {.method = Method::Post, .auto_expect_continue = true});
+        auto opened = co_await client_open_stream(client, base + "/expect-ok",
+                                                  {.method = Method::Post, .auto_expect_continue = true});
         if (!opened) {
             obs.error = classify(opened.error());
         } else {
@@ -948,7 +949,8 @@ asio::awaitable<void> run_policy_group() {
         cfg.default_version = HttpVersionPolicy::Http11;
         cfg.default_h2c = H2cMode::Off;
         Client client{co_await asio::this_coro::executor, cfg};
-        auto response = co_await client_send(client.get(base + path).header("user-agent", "diff-probe").timeout(head, idle));
+        auto response =
+            co_await client_send(client.get(base + path).header("user-agent", "diff-probe").timeout(head, idle));
         Observation obs;
         obs.case_id = case_id;
         obs.mode = "cpp-only";

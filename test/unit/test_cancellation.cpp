@@ -65,8 +65,8 @@ TEST_CASE("request: a slot-bound operation is cancelled from another coroutine",
     REQUIRE(run_on(ctx, [&]() -> asio::awaitable<void> {
         asio::steady_timer slow{co_await asio::this_coro::executor};
         slow.expires_after(std::chrono::seconds(30));
-        auto [ec] = co_await slow.async_wait(asio::bind_cancellation_slot(
-            req->cancellation_slot(), asio::as_tuple(asio::use_awaitable)));
+        auto [ec] = co_await slow.async_wait(
+            asio::bind_cancellation_slot(req->cancellation_slot(), asio::as_tuple(asio::use_awaitable)));
         outcome = ec;
     }()));
     CHECK(outcome == asio::error::operation_aborted);
@@ -168,26 +168,26 @@ TEST_CASE("middleware: timeout fires the token for work the handler left running
     router.use(middleware::timeout(std::chrono::milliseconds(30)));
 
     auto detached_saw_cancel = std::make_shared<bool>(false);
-    router.route({Method::Get}, "/detached",
-                 [detached_saw_cancel](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
-                     auto exec = co_await asio::this_coro::executor;
-                     // A coroutine the handler spawns and does not join is not part of the
-                     // chain `operator||` cancels — the token is how it learns to stop.
-                     asio::co_spawn(
-                         exec,
-                         [req, detached_saw_cancel]() -> asio::awaitable<void> {
-                             asio::steady_timer wait{co_await asio::this_coro::executor};
-                             wait.expires_after(std::chrono::seconds(30));
-                             auto [ec] = co_await wait.async_wait(asio::bind_cancellation_slot(
-                                 req->cancellation_slot(), asio::as_tuple(asio::use_awaitable)));
-                             *detached_saw_cancel = (ec == asio::error::operation_aborted);
-                         },
-                         asio::detached);
-                     asio::steady_timer t{exec};
-                     t.expires_after(std::chrono::seconds(5));
-                     co_await t.async_wait(asio::use_awaitable); // the deadline must cancel this
-                     co_await res->status(status::ok).async_send("too late", asio::use_awaitable);
-                 });
+    router.route(
+        {Method::Get}, "/detached", [detached_saw_cancel](RequestPtr req, ResponsePtr res) -> asio::awaitable<void> {
+            auto exec = co_await asio::this_coro::executor;
+            // A coroutine the handler spawns and does not join is not part of the
+            // chain `operator||` cancels — the token is how it learns to stop.
+            asio::co_spawn(
+                exec,
+                [req, detached_saw_cancel]() -> asio::awaitable<void> {
+                    asio::steady_timer wait{co_await asio::this_coro::executor};
+                    wait.expires_after(std::chrono::seconds(30));
+                    auto [ec] = co_await wait.async_wait(
+                        asio::bind_cancellation_slot(req->cancellation_slot(), asio::as_tuple(asio::use_awaitable)));
+                    *detached_saw_cancel = (ec == asio::error::operation_aborted);
+                },
+                asio::detached);
+            asio::steady_timer t{exec};
+            t.expires_after(std::chrono::seconds(5));
+            co_await t.async_wait(asio::use_awaitable); // the deadline must cancel this
+            co_await res->status(status::ok).async_send("too late", asio::use_awaitable);
+        });
 
     asio::io_context ctx;
     auto writer = run_chain(ctx, router, make_request(ctx, "/detached"));

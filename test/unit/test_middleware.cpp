@@ -85,11 +85,10 @@ TEST_CASE("middleware: recovery turns a throwing middleware into a 500", "[middl
     Router router;
     ScopedLog capture;
     router.use(middleware::recovery());
-    router.use([](RequestPtr, ResponsePtr, SslHandle, Next, HandlerCompletion) {
-        throw std::runtime_error("boom");
-    });
+    router.use([](RequestPtr, ResponsePtr, SslHandle, Next, HandlerCompletion) { throw std::runtime_error("boom"); });
     router.route(any_methods, "/never", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-        co_await res->status(status::ok).async_send("never", asio::use_awaitable); // unreachable: the chain throws first
+        co_await res->status(status::ok)
+            .async_send("never", asio::use_awaitable); // unreachable: the chain throws first
     });
 
     asio::io_context ctx;

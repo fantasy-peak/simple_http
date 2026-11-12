@@ -312,12 +312,9 @@ inline Middleware session(std::shared_ptr<SessionStore> store, SessionConfig con
                                 [finish = std::move(finish)](error_code) mutable { finish(); });
                 };
                 if (!original_id.empty() && current->id() != original_id) {
-                    store->destroy(original_id,
-                                   [exec, save_if_dirty = std::move(save_if_dirty)](error_code) mutable {
-                                       asio::dispatch(exec, [save_if_dirty = std::move(save_if_dirty)]() mutable {
-                                           save_if_dirty();
-                                       });
-                                   });
+                    store->destroy(original_id, [exec, save_if_dirty = std::move(save_if_dirty)](error_code) mutable {
+                        asio::dispatch(exec, [save_if_dirty = std::move(save_if_dirty)]() mutable { save_if_dirty(); });
+                    });
                     return;
                 }
                 save_if_dirty();
@@ -325,8 +322,8 @@ inline Middleware session(std::shared_ptr<SessionStore> store, SessionConfig con
             next(std::move(req), std::move(res), ssl, std::move(after_chain));
         };
 
-        auto hop_after_load = [exec, after_load = std::move(after_load)](
-                                  error_code ec, std::optional<SessionData> loaded) mutable {
+        auto hop_after_load = [exec, after_load = std::move(after_load)](error_code ec,
+                                                                         std::optional<SessionData> loaded) mutable {
             asio::dispatch(exec, [after_load = std::move(after_load), ec, loaded = std::move(loaded)]() mutable {
                 after_load(ec, std::move(loaded));
             });

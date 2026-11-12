@@ -294,7 +294,7 @@ inline void log_with_attrs(LogLevel level, std::string_view category, source_loc
 
 #if SIMPLE_HTTP_ENABLE_LOG
 // `category` is a string_view; use "" when the call site has no module tag.
-#define SIMPLE_HTTP_LOG_AT_IMPL(level, category, ...)                                                                       \
+#define SIMPLE_HTTP_LOG_AT_IMPL(level, category, ...)                                                                  \
     do {                                                                                                               \
         if constexpr (SIMPLE_HTTP_LOG_ACTIVE_LEVEL <= 0) {                                                             \
             ::simple_http::log(level, category, ::simple_http::source_location::current(), __VA_ARGS__);               \

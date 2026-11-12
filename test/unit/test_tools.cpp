@@ -64,7 +64,8 @@ TEST_CASE("conditionals: If-None-Match answers 304 and sets validators", "[tools
         auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
         auto res = std::make_shared<ResponseWriter>(writer);
         auto req = make_request(ctx, "/doc", {{"if-none-match", std::string{etag}}});
-        bool not_modified = run_on(ctx, async_maybe_not_modified(req, res, etag, 1700000000, asio::use_awaitable)).value_or(false);
+        bool not_modified =
+            run_on(ctx, async_maybe_not_modified(req, res, etag, 1700000000, asio::use_awaitable)).value_or(false);
         CHECK(not_modified);
         CHECK(writer->last_status == status::not_modified);
         CHECK(writer->sent_bodyless); // 304 is bodyless, no frame
@@ -77,7 +78,8 @@ TEST_CASE("conditionals: If-None-Match answers 304 and sets validators", "[tools
         auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
         auto res = std::make_shared<ResponseWriter>(writer);
         auto req = make_request(ctx, "/doc", {{"if-none-match", "\"other\""}});
-        bool not_modified = run_on(ctx, async_maybe_not_modified(req, res, etag, 1700000000, asio::use_awaitable)).value_or(false);
+        bool not_modified =
+            run_on(ctx, async_maybe_not_modified(req, res, etag, 1700000000, asio::use_awaitable)).value_or(false);
         CHECK_FALSE(not_modified);
         REQUIRE(run_on(ctx, res->status(status::ok).async_send("body", asio::use_awaitable)));
         CHECK(writer->header(field::etag) == etag);
@@ -88,7 +90,8 @@ TEST_CASE("conditionals: If-None-Match answers 304 and sets validators", "[tools
         auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
         auto res = std::make_shared<ResponseWriter>(writer);
         auto req = make_request(ctx, "/doc", {{"if-none-match", "*"}});
-        bool not_modified = run_on(ctx, async_maybe_not_modified(req, res, etag, 1700000000, asio::use_awaitable)).value_or(false);
+        bool not_modified =
+            run_on(ctx, async_maybe_not_modified(req, res, etag, 1700000000, asio::use_awaitable)).value_or(false);
         CHECK(not_modified);
     }
 }
@@ -102,7 +105,8 @@ TEST_CASE("conditionals: If-Modified-Since and non-GET skip", "[tools]") {
         auto res = std::make_shared<ResponseWriter>(writer);
         auto req = make_request(ctx, "/doc",
                                 {{"if-modified-since", http_date(1700000000 + 5000)}}); // client newer -> not modified
-        bool not_modified = run_on(ctx, async_maybe_not_modified(req, res, etag, 1700000000, asio::use_awaitable)).value_or(false);
+        bool not_modified =
+            run_on(ctx, async_maybe_not_modified(req, res, etag, 1700000000, asio::use_awaitable)).value_or(false);
         CHECK(not_modified);
     }
     {
@@ -111,7 +115,8 @@ TEST_CASE("conditionals: If-Modified-Since and non-GET skip", "[tools]") {
         auto res = std::make_shared<ResponseWriter>(writer);
         auto req =
             make_request(ctx, "/doc", {{"if-modified-since", http_date(1600000000)}}); // resource newer -> modified
-        bool not_modified = run_on(ctx, async_maybe_not_modified(req, res, "", 1700000000, asio::use_awaitable)).value_or(false);
+        bool not_modified =
+            run_on(ctx, async_maybe_not_modified(req, res, "", 1700000000, asio::use_awaitable)).value_or(false);
         CHECK_FALSE(not_modified);
     }
     {
@@ -121,7 +126,8 @@ TEST_CASE("conditionals: If-Modified-Since and non-GET skip", "[tools]") {
         req->mutable_headers().add_lower("if-none-match", std::string{etag});
         auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
         auto res = std::make_shared<ResponseWriter>(writer);
-        bool not_modified = run_on(ctx, async_maybe_not_modified(req, res, etag, 1700000000, asio::use_awaitable)).value_or(false);
+        bool not_modified =
+            run_on(ctx, async_maybe_not_modified(req, res, etag, 1700000000, asio::use_awaitable)).value_or(false);
         CHECK_FALSE(not_modified);
     }
 }

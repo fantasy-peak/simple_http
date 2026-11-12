@@ -44,7 +44,8 @@ TEST_CASE("file: send_file streams content with a derived type and length", "[fi
     asio::io_context ctx;
     auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
     ResponseWriter res{writer};
-    auto ec = run_on(ctx, as_ec(async_send_file(res, fixture.root_string() + "/assets/a.txt", asio::as_tuple(asio::use_awaitable))));
+    auto ec = run_on(
+        ctx, as_ec(async_send_file(res, fixture.root_string() + "/assets/a.txt", asio::as_tuple(asio::use_awaitable))));
     REQUIRE(ec.has_value());
     CHECK_FALSE(*ec);
 
@@ -63,7 +64,9 @@ TEST_CASE("file: send_file honours max_bytes and custom options", "[file]") {
         asio::io_context ctx;
         auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
         ResponseWriter res{writer};
-        auto ec = run_on(ctx, as_ec(async_send_file(res, fixture.root_string() + "/a.txt", SendFileOptions{.max_bytes = 4}, asio::as_tuple(asio::use_awaitable))));
+        auto ec =
+            run_on(ctx, as_ec(async_send_file(res, fixture.root_string() + "/a.txt", SendFileOptions{.max_bytes = 4},
+                                              asio::as_tuple(asio::use_awaitable))));
         REQUIRE(ec.has_value());
         CHECK(*ec == boost::system::errc::make_error_code(boost::system::errc::file_too_large));
         CHECK_FALSE(writer->begun);
@@ -75,7 +78,8 @@ TEST_CASE("file: send_file honours max_bytes and custom options", "[file]") {
         asio::io_context ctx;
         auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
         ResponseWriter res{writer};
-        auto ec = run_on(ctx, as_ec(async_send_file(res, fixture.root_string() + "/missing.txt", asio::as_tuple(asio::use_awaitable))));
+        auto ec = run_on(ctx, as_ec(async_send_file(res, fixture.root_string() + "/missing.txt",
+                                                    asio::as_tuple(asio::use_awaitable))));
         REQUIRE(ec.has_value());
         CHECK(*ec == boost::system::errc::make_error_code(boost::system::errc::no_such_file_or_directory));
         CHECK_FALSE(writer->begun);
@@ -86,9 +90,10 @@ TEST_CASE("file: send_file honours max_bytes and custom options", "[file]") {
         asio::io_context ctx;
         auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
         ResponseWriter res{writer};
-        auto ec =
-            run_on(ctx, as_ec(async_send_file(res, fixture.root_string() + "/a.txt",
-                                  SendFileOptions{.content_type = "application/x-test", .set_content_length = false}, asio::as_tuple(asio::use_awaitable))));
+        auto ec = run_on(ctx, as_ec(async_send_file(
+                                  res, fixture.root_string() + "/a.txt",
+                                  SendFileOptions{.content_type = "application/x-test", .set_content_length = false},
+                                  asio::as_tuple(asio::use_awaitable))));
         REQUIRE(ec.has_value());
         CHECK_FALSE(*ec);
         CHECK(writer->header("content-type") == "application/x-test");
@@ -104,7 +109,8 @@ TEST_CASE("file: send_file answers HEAD without a body", "[file]") {
     auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
     writer->head = true;
     ResponseWriter res{writer};
-    auto ec = run_on(ctx, as_ec(async_send_file(res, fixture.root_string() + "/a.txt", asio::as_tuple(asio::use_awaitable))));
+    auto ec =
+        run_on(ctx, as_ec(async_send_file(res, fixture.root_string() + "/a.txt", asio::as_tuple(asio::use_awaitable))));
     REQUIRE(ec.has_value());
     CHECK_FALSE(*ec);
 
@@ -142,7 +148,8 @@ TEST_CASE("file: read_body_to_file caps the upload before it fills the disk", "[
     REQUIRE(body.feed(std::string{"0123456789"}));
     body.finish();
 
-    auto result = run_on(ctx, as_expected(async_read_body_to_file(body, path, /*max_bytes=*/4, asio::as_tuple(asio::use_awaitable))));
+    auto result = run_on(
+        ctx, as_expected(async_read_body_to_file(body, path, /*max_bytes=*/4, asio::as_tuple(asio::use_awaitable))));
     REQUIRE(result.has_value());
     REQUIRE_FALSE(result->has_value());
     CHECK(result->error() == boost::system::errc::make_error_code(boost::system::errc::file_too_large));

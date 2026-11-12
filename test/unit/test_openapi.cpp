@@ -128,7 +128,9 @@ TEST_CASE("openapi: routes carrying operation descriptors register and collect s
     Router router;
     router.route(
         {Method::Get}, "/users/{id}",
-        [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(status::ok).async_send("user", asio::use_awaitable); },
+        [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+            co_await res->status(status::ok).async_send("user", asio::use_awaitable);
+        },
         openapi::doc().response<UserProfile>());
     router.route(
         {Method::Post}, "/users",
@@ -243,7 +245,9 @@ TEST_CASE("openapi: document and Swagger UI are served", "[openapi]") {
     Router router;
     router.route(
         {Method::Get}, "/users/{id}",
-        [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(status::ok).async_send("user", asio::use_awaitable); },
+        [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+            co_await res->status(status::ok).async_send("user", asio::use_awaitable);
+        },
         openapi::doc().response<UserProfile>());
     router.serve_openapi("/openapi.json");
     router.serve_swagger_ui("/swagger", "/openapi.json");

@@ -65,11 +65,12 @@ template <typename ServerT> void register_routes(ServerT &server) {
     // h1spec sends every case to "/" and requires the body back verbatim.
     // Drain first: an unread request body would desynchronise keep-alive
     // framing on the next request over the same connection.
-    server.route(any_methods, "/",
-                 [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
-                     auto body = co_await body_read_all(req->body());
-                     co_await res->status(status::ok).async_send(body ? std::move(*body) : std::string{}, asio::use_awaitable);
-                 });
+    server.route(
+        any_methods, "/",
+        [](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res) -> asio::awaitable<void> {
+            auto body = co_await body_read_all(req->body());
+            co_await res->status(status::ok).async_send(body ? std::move(*body) : std::string{}, asio::use_awaitable);
+        });
 
     // h2spec targets /world; the stress suite chooses 2k/10k/20k bodies with
     // ?n= and POSTs a 1 KiB body that must be drained.
@@ -80,7 +81,8 @@ template <typename ServerT> void register_routes(ServerT &server) {
                          co_await res->status(status::bad_request).async_send("read error", asio::use_awaitable);
                          co_return;
                      }
-                     co_await res->status(status::ok).async_send(std::string(query_uint(req->query(), "n", 1024), 'a'), asio::use_awaitable);
+                     co_await res->status(status::ok)
+                         .async_send(std::string(query_uint(req->query(), "n", 1024), 'a'), asio::use_awaitable);
                  });
 
     // Autobahn requires an exact echo: same text/binary type, no extra frames.

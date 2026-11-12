@@ -58,8 +58,9 @@ namespace middleware_detail {
 
 template <typename F, typename = void> struct is_callback_middleware : std::false_type {};
 template <typename F>
-struct is_callback_middleware<F, std::void_t<std::invoke_result_t<F &, RequestPtr, ResponsePtr, SslHandle, Next,
-                                                                  HandlerCompletion>>> : std::true_type {};
+struct is_callback_middleware<
+    F, std::void_t<std::invoke_result_t<F &, RequestPtr, ResponsePtr, SslHandle, Next, HandlerCompletion>>>
+    : std::true_type {};
 
 #if defined(BOOST_ASIO_HAS_CO_AWAIT)
 template <typename F, typename = void> struct is_coro_middleware : std::false_type {};
@@ -86,8 +87,7 @@ struct AwaitNextOp {
     }
 };
 
-template <typename Token>
-auto async_next(Next next, RequestPtr req, ResponsePtr res, SslHandle ssl, Token &&token) {
+template <typename Token> auto async_next(Next next, RequestPtr req, ResponsePtr res, SslHandle ssl, Token &&token) {
     return asio::async_compose<Token, void()>(
         AwaitNextOp{std::make_shared<Next>(std::move(next)), std::move(req), std::move(res), ssl},
         std::forward<Token>(token));

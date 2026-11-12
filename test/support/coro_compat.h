@@ -68,8 +68,7 @@ inline asio::awaitable<error_code> ws_write_view(WebSocket &ws, std::string_view
 
 // --- client side -------------------------------------------------------------
 
-template <typename Builder>
-asio::awaitable<std::expected<Response, error_code>> client_send(Builder &&builder) {
+template <typename Builder> asio::awaitable<std::expected<Response, error_code>> client_send(Builder &&builder) {
     auto [ec, response] = co_await builder.send(asio::as_tuple(asio::use_awaitable));
     if (ec)
         co_return std::unexpected{ec};
@@ -106,7 +105,7 @@ inline asio::awaitable<std::expected<ReadResult, error_code>> stream_read(Stream
 }
 
 inline asio::awaitable<std::expected<std::string, error_code>> stream_read_all(Stream &stream,
-                                                                              std::size_t max_bytes = 0) {
+                                                                               std::size_t max_bytes = 0) {
     return as_expected(stream.async_read_all(max_bytes, asio::as_tuple(asio::use_awaitable)));
 }
 
@@ -126,9 +125,9 @@ inline asio::awaitable<error_code> mp_field(MultipartStreamWriter &writer, std::
 }
 
 inline asio::awaitable<error_code> mp_file_data(MultipartStreamWriter &writer, std::string name, std::string filename,
-                                               std::string content_type, std::string data) {
-    return as_ec(writer.async_file_data(std::move(name), std::move(filename), std::move(content_type),
-                                        std::move(data), asio::as_tuple(asio::use_awaitable)));
+                                                std::string content_type, std::string data) {
+    return as_ec(writer.async_file_data(std::move(name), std::move(filename), std::move(content_type), std::move(data),
+                                        asio::as_tuple(asio::use_awaitable)));
 }
 
 inline asio::awaitable<error_code> mp_finish(MultipartStreamWriter &writer) {
@@ -144,8 +143,8 @@ inline asio::awaitable<error_code> finish_any(MultipartStreamWriter &writer) { r
 
 inline asio::awaitable<std::expected<std::shared_ptr<SseStream>, error_code>>
 client_open_sse(Client &client, std::string url, SseOptions options = {}) {
-    auto [ec, sse] = co_await SseStream::async_open(client, std::move(url), std::move(options),
-                                                   asio::as_tuple(asio::use_awaitable));
+    auto [ec, sse] =
+        co_await SseStream::async_open(client, std::move(url), std::move(options), asio::as_tuple(asio::use_awaitable));
     if (ec)
         co_return std::unexpected{ec};
     co_return sse;
@@ -159,8 +158,8 @@ inline asio::awaitable<std::expected<SseEvent, error_code>> sse_next(SseStream &
 
 inline asio::awaitable<std::expected<std::shared_ptr<WebSocket>, error_code>>
 client_open_websocket(Client &client, std::string url, WebSocketSpec spec = {}) {
-    auto [ec, ws] = co_await client.async_open_websocket(std::move(url), std::move(spec),
-                                                        asio::as_tuple(asio::use_awaitable));
+    auto [ec, ws] =
+        co_await client.async_open_websocket(std::move(url), std::move(spec), asio::as_tuple(asio::use_awaitable));
     if (ec)
         co_return std::unexpected{ec};
     co_return ws;

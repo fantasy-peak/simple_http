@@ -158,17 +158,21 @@ int main(int argc, char **argv) {
     });
     server.route(any_methods, "/compress", {middleware::compress(CompressionConfig{.min_bytes = 1})},
                  [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-                     co_await res->status(status::ok).content_type("text/plain").async_send(std::string(4096, 'c'), asio::use_awaitable);
+                     co_await res->status(status::ok)
+                         .content_type("text/plain")
+                         .async_send(std::string(4096, 'c'), asio::use_awaitable);
                  });
-    server.route(
-        any_methods, "/rate", {middleware::rate_limit(limiter)},
-        [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> { co_await res->status(status::ok).async_send("ok", asio::use_awaitable); });
+    server.route(any_methods, "/rate", {middleware::rate_limit(limiter)},
+                 [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+                     co_await res->status(status::ok).async_send("ok", asio::use_awaitable);
+                 });
 
     // The handler starts on the connection executor but the writes happen on a
     // different one. ResponseWriter hops internally; this is the path that
     // catches a missing hop or a lifetime mistake under TSan/ASan.
     server.route(any_methods, "/cross", [&cross_io](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
-        if (auto ec = co_await as_ec(res->status(status::ok).content_type("text/plain").async_begin(asio::as_tuple(asio::use_awaitable)))) {
+        if (auto ec = co_await as_ec(
+                res->status(status::ok).content_type("text/plain").async_begin(asio::as_tuple(asio::use_awaitable)))) {
             co_return;
         }
         asio::co_spawn(

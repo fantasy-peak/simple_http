@@ -12,7 +12,7 @@
 #define SIMPLE_HTTP_STRINGIZE(x) SIMPLE_HTTP_STRINGIZE_IMPL(x)
 
 #define SIMPLE_HTTP_VERSION_STR                                                                                        \
-    SIMPLE_HTTP_STRINGIZE(SIMPLE_HTTP_VERSION_MAJOR)                                                                         \
+    SIMPLE_HTTP_STRINGIZE(SIMPLE_HTTP_VERSION_MAJOR)                                                                   \
     "." SIMPLE_HTTP_STRINGIZE(SIMPLE_HTTP_VERSION_MINOR) "." SIMPLE_HTTP_STRINGIZE(SIMPLE_HTTP_VERSION_PATCH)
 
 #define SIMPLE_HTTP_VERSION_CODE                                                                                       \

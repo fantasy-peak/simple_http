@@ -22,10 +22,10 @@
 #include <nghttp3/nghttp3.h>
 #include <openssl/rand.h>
 
+#include "../../core/compat.h"
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
-#include "../../core/compat.h"
 #include <string_view>
 
 namespace simple_http::h3 {

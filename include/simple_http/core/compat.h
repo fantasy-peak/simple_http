@@ -15,10 +15,10 @@
 
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/core/span.hpp>
-#include <utility>
 #include <cstddef>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 
 namespace simple_http {
 

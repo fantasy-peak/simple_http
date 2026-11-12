@@ -74,7 +74,8 @@ TEST_CASE("proto/response: a second response is refused", "[proto]") {
 
     REQUIRE(run_on(ctx, res.status(status::ok).async_send("one", asio::use_awaitable)));
     CHECK(res.started());
-    auto second = run_on(ctx, as_ec(res.status(status::internal_server_error).async_send("two", asio::as_tuple(asio::use_awaitable))));
+    auto second = run_on(
+        ctx, as_ec(res.status(status::internal_server_error).async_send("two", asio::as_tuple(asio::use_awaitable))));
     REQUIRE(second.has_value());
     CHECK(second->value() == asio::error::invalid_argument);
     CHECK(writer->calls == 1);
@@ -350,7 +351,9 @@ TEST_CASE("h2/engine: a HEAD response with trailers sends headers and reports su
     auto dispatcher = [&send_ec](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res,
                                  SslHandle) -> asio::awaitable<void> {
         res->trailer("x-checksum", "abc123");
-        send_ec = co_await as_ec(res->status(status::ok).content_type("text/plain").async_send("hello", asio::as_tuple(asio::use_awaitable)));
+        send_ec = co_await as_ec(res->status(status::ok)
+                                     .content_type("text/plain")
+                                     .async_send("hello", asio::as_tuple(asio::use_awaitable)));
     };
 
     auto engine = std::make_shared<Http2Engine<MockTransport>>(transport);
@@ -401,7 +404,8 @@ TEST_CASE("h2/engine: a streamed HEAD response ends the stream without an error"
     error_code finish_ec = make_error_code(asio::error::would_block); // sentinel
     auto dispatcher = [&](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res,
                           SslHandle) -> asio::awaitable<void> {
-        begin_ec = co_await as_ec(res->status(status::ok).content_type("text/plain").async_begin(asio::as_tuple(asio::use_awaitable)));
+        begin_ec = co_await as_ec(
+            res->status(status::ok).content_type("text/plain").async_begin(asio::as_tuple(asio::use_awaitable)));
         write_ec = co_await as_ec(res->async_write("dropped", asio::as_tuple(asio::use_awaitable)));
         res->trailer("x-checksum", "abc123");
         finish_ec = co_await as_ec(res->async_finish_trailers(asio::as_tuple(asio::use_awaitable)));

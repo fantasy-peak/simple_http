@@ -189,17 +189,16 @@ template <typename F> CallbackHandler make_callback_handler(F &&fn) {
     } else if constexpr (is_coro_handler_ssl<D>) {
         return CallbackHandler(
             [fn = std::forward<F>(fn)](RequestPtr req, ResponsePtr res, SslHandle ssl, HandlerCompletion done) mutable {
-                execute_coroutine(req, res, std::move(done), [fn, req, res, ssl]() mutable {
-                    return fn(std::move(req), std::move(res), ssl);
-                });
+                execute_coroutine(req, res, std::move(done),
+                                  [fn, req, res, ssl]() mutable { return fn(std::move(req), std::move(res), ssl); });
             });
     } else if constexpr (is_coro_handler<D>) {
-        return CallbackHandler([fn = std::forward<F>(fn)](RequestPtr req, ResponsePtr res, SslHandle ssl,
-                                                          HandlerCompletion done) mutable {
-            (void)ssl;
-            execute_coroutine(req, res, std::move(done),
-                              [fn, req, res]() mutable { return fn(std::move(req), std::move(res)); });
-        });
+        return CallbackHandler(
+            [fn = std::forward<F>(fn)](RequestPtr req, ResponsePtr res, SslHandle ssl, HandlerCompletion done) mutable {
+                (void)ssl;
+                execute_coroutine(req, res, std::move(done),
+                                  [fn, req, res]() mutable { return fn(std::move(req), std::move(res)); });
+            });
 #endif
     } else {
         static_assert(sizeof(F) == 0,
