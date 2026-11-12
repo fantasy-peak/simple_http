@@ -174,7 +174,8 @@ include/
   - `diff/support/harness.py`：归一化、比较与 `known_diffs.json`；
   - `fixtures/`：压力/合规专用简化服务端（`conformance_server.cpp`）；
   - `external/conformance/`、`external/stress/`：外部工具套件（**没有** bench）；
-  - `fuzz/`、`sanitizer/`、`support/`、`tls_certificates/`。
+  - `fuzz/`、`sanitizer/`、`support/`、`tls_certificates/`；
+  - `cpp17/smoke.cpp`：以 C++17 编译并运行当前 `include/` 的公共 API（`cpp17` 套件）。
   报告写到 `.cache/test-run/<timestamp>-<pid>/`（`report.json` + `junit.xml`）。
   `full` 档默认要求外部工具齐全（缺工具即失败），本地可用 `--allow-skip` 放行。
 - `test/tls_certificates/`：测试证书（`./test/tls_certificates/...` 是相对路径契约）。
@@ -685,6 +686,7 @@ test/run.sh unit '[h2]' # Catch2 过滤
 | suite | tier | 内容 |
 |---|---|---|
 | `unit` | fast | 原 Catch2 纯逻辑测试（约 420 用例） |
+| `cpp17` | fast | `test/cpp17/smoke.cpp` 以 `-std=c++17` 编译并运行当前 `include/` 的公共 API |
 | `openapi` | standard | OAS 3.1 元模式 + 文档/路由契约 + Swagger UI |
 | `client-diff` | full | C++ 客户端 ↔ Go 客户端，同一个 Go 服务端 |
 | `server-diff` | full | Go 客户端 → C++ 服务端 ↔ Go 服务端 |

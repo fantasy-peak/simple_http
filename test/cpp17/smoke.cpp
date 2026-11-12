@@ -64,7 +64,7 @@ void test_result() {
 void test_body_tokens() {
     boost::asio::io_context context;
     simple_http::Body body{context.get_executor()};
-    body.feed("abc");
+    (void)body.feed("abc");
     body.finish();
 
     std::string got;
