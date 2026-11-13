@@ -302,7 +302,12 @@ inline Middleware make_cors_middleware(CorsConfig cfg) {
             // "*" is illegal next to credentials, and wrong under an explicit
             // allowlist — the answer would not be origin-independent after all — so
             // those cases mirror the request's own origin instead.
-            const bool any_origin = cfg.allow_origins.empty() || cors_detail::list_contains(cfg.allow_origins, "*");
+            // A predicate-only policy is per-origin by definition: emitting "*"
+            // would turn "ask the predicate" into "allow every origin without
+            // even consulting it", and without Vary: Origin a cache could hand
+            // one origin's answer to another.
+            const bool any_origin = cors_detail::list_contains(cfg.allow_origins, "*") ||
+                                    (cfg.allow_origins.empty() && !cfg.allow_origin_fn);
             const bool mirror = cfg.allow_credentials || !any_origin;
 
             res->header(field::access_control_allow_origin, mirror ? std::string{*origin} : std::string{"*"});

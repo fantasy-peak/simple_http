@@ -67,8 +67,11 @@ class ResponseWriter {
     bool started() const { return m_started; }
     [[nodiscard]] std::uint64_t activity() const noexcept { return m_activity.load(std::memory_order_relaxed); }
     ResponseWriter &header(std::string_view name, std::string value) {
-        if (contains_ctl(name) || contains_ctl(value)) {
-            SIMPLE_HTTP_ERROR_LOG("response field with CR/LF/NUL rejected");
+        // A field name is a token and a value may not contain other control
+        // bytes either (RFC 9110 §5.1/§5.5); otherwise "bad name" or "\x01"
+        // is serialized as-is and the peer sees a malformed field section.
+        if (!is_http_token(name) || contains_invalid_field_value(value)) {
+            SIMPLE_HTTP_ERROR_LOG("response field with invalid name/value rejected");
             m_field_rejected = true;
             return *this;
         }
@@ -77,8 +80,8 @@ class ResponseWriter {
     }
 
     ResponseWriter &replace_header(std::string_view name, std::string value) {
-        if (contains_ctl(name) || contains_ctl(value)) {
-            SIMPLE_HTTP_ERROR_LOG("response field with CR/LF/NUL rejected");
+        if (!is_http_token(name) || contains_invalid_field_value(value)) {
+            SIMPLE_HTTP_ERROR_LOG("response field with invalid name/value rejected");
             m_field_rejected = true;
             return *this;
         }
@@ -163,16 +166,34 @@ class ResponseWriter {
     // Status + headers with no body and no body framing at all (204/304 and
     // every response to HEAD).
     template <typename Token> auto async_send_bodyless(Token &&token) {
-        // A response has exactly one head. Refuse a second one here too: h1 has
-        // no engine-side guard, and two status lines on one connection are the
-        // response-smuggling shape.
-        error_code pre = prepare_one_shot();
+        // Without a body, a response can only be framed by the status (204/304)
+        // or by being the answer to HEAD. A bodyless 200 on a keep-alive h1
+        // connection has no length and no terminator: the peer takes the next
+        // response's bytes as this body (response smuggling).
+        //
+        // Validate before prepare_one_shot(): it marks the response started, and
+        // invoke_handler's 500 fallback only runs while started() is false.
+        error_code pre;
+        if (!m_writer->head_request() && m_status != status::no_content && m_status != status::not_modified) {
+            pre = make_error_code(asio::error::invalid_argument);
+        } else {
+            pre = prepare_one_shot();
+        }
         return compose_send(pre, Mode::Bodyless, std::string{}, std::forward<Token>(token));
     }
 
     // --- streaming ---
     template <typename Token> auto async_begin(Token &&token) {
-        error_code pre = prepare_one_shot();
+        // 204/304 have no body by definition; streaming one emits a chunked
+        // 204 (h1) or DATA frames (h2) that a conforming peer rejects or reads
+        // as the next message. Check before prepare_one_shot() so the failure
+        // leaves started() false and the 500 fallback can still answer.
+        error_code pre;
+        if (m_status == status::no_content || m_status == status::not_modified) {
+            pre = make_error_code(asio::error::invalid_argument);
+        } else {
+            pre = prepare_one_shot();
+        }
         auto sink = m_writer;
         const int code = m_status;
         auto headers = std::move(m_headers);
@@ -220,8 +241,8 @@ class ResponseWriter {
     }
 
     ResponseWriter &trailer(std::string_view name, std::string value) {
-        if (contains_ctl(name) || contains_ctl(value)) {
-            SIMPLE_HTTP_ERROR_LOG("response trailer with CR/LF/NUL rejected");
+        if (!is_http_token(name) || contains_invalid_field_value(value)) {
+            SIMPLE_HTTP_ERROR_LOG("response trailer with invalid name/value rejected");
             m_field_rejected = true;
             return *this;
         }
@@ -269,7 +290,9 @@ class ResponseWriter {
     // --- redirect & SSE helpers ---
 
     ResponseWriter &redirect(std::string location, int code = status::found) {
-        m_status = code;
+        // Go through status() so 0/9999 are rejected like any other bad code
+        // instead of serializing an illegal status line.
+        status(code);
         return header(field::location, std::move(location));
     }
 
@@ -286,7 +309,7 @@ class ResponseWriter {
         return async_sse_event(std::move(data), {}, {}, {}, std::forward<Token>(token));
     }
     template <typename Token> auto async_sse_comment(std::string text, Token &&token) {
-        return async_write(": " + std::move(text) + "\n\n", std::forward<Token>(token));
+        return async_write(render_sse_comment(text), std::forward<Token>(token));
     }
 
     ResponseSink &writer() { return *m_writer; }
@@ -345,6 +368,14 @@ class ResponseWriter {
         if (m_field_rejected) {
             return make_error_code(asio::error::invalid_argument);
         }
+        // 1xx is interim: it never ends the response, so a handler using
+        // send()/begin() with status 103 would leave the client waiting for a
+        // final response. The only interim API is send_continue().
+        if (m_status >= 100 && m_status < 200) {
+            SIMPLE_HTTP_ERROR_LOG("interim status {} cannot be a final response", m_status);
+            m_field_rejected = true;
+            return make_error_code(asio::error::invalid_argument);
+        }
         // A response has exactly one head. Refusing a second one here is what
         // lets invoke_handler's 500 fallback check started() instead of
         // splicing a second status line onto the wire.
@@ -386,35 +417,69 @@ class ResponseWriter {
 
     // Renders one SSE event frame: optional event/id/retry fields, then one
     // "data: " line per line of `data`, closed by a blank line.
+    // event/id/retry are single-line fields: a CR/LF/NUL inside one would end
+    // the line and let the value inject its own "event:"/"id:" fields. Replace
+    // them rather than emitting a frame a conforming parser reads differently
+    // from what the caller wrote.
+    static void append_sse_single_line(std::string &frame, std::string_view name, std::string_view value) {
+        frame += name;
+        frame += ": ";
+        for (unsigned char c : value) {
+            frame += (c == '\r' || c == '\n' || c == '\0') ? ' ' : static_cast<char>(c);
+        }
+        frame += '\n';
+    }
+
     static std::string render_sse(std::string_view data, std::string_view event, std::string_view id,
                                   std::string_view retry) {
         std::string frame;
-        if (!event.empty()) {
-            frame += "event: ";
-            frame += event;
-            frame += '\n';
+        if (!event.empty())
+            append_sse_single_line(frame, "event", event);
+        if (!id.empty())
+            append_sse_single_line(frame, "id", id);
+        if (!retry.empty())
+            append_sse_single_line(frame, "retry", retry);
+        // SSE lines end at CRLF, CR or LF. Splitting only on '\n' left a bare
+        // '\r' inside a data line, which a parser turns into a new line — the
+        // injection point for "data: x\rEvent: evil".
+        if (data.empty()) {
+            frame += "data: \n";
+        } else {
+            std::size_t pos = 0;
+            while (pos < data.size()) {
+                std::size_t end = pos;
+                while (end < data.size() && data[end] != '\n' && data[end] != '\r')
+                    ++end;
+                frame += "data: ";
+                frame.append(data.substr(pos, end - pos));
+                frame += '\n';
+                if (end == data.size())
+                    break;
+                if (data[end] == '\r' && end + 1 < data.size() && data[end + 1] == '\n')
+                    ++end;
+                pos = end + 1;
+            }
         }
-        if (!id.empty()) {
-            frame += "id: ";
-            frame += id;
-            frame += '\n';
-        }
-        if (!retry.empty()) {
-            frame += "retry: ";
-            frame += retry;
-            frame += '\n';
-        }
+        frame += '\n';
+        return frame;
+    }
+
+    static std::string render_sse_comment(std::string_view text) {
+        std::string frame;
         std::size_t pos = 0;
         do {
-            const std::size_t nl = data.find('\n', pos);
-            frame += "data: ";
-            frame.append(data.substr(pos, nl == std::string_view::npos ? std::string_view::npos : nl - pos));
+            std::size_t end = pos;
+            while (end < text.size() && text[end] != '\r' && text[end] != '\n')
+                ++end;
+            frame += ": ";
+            frame.append(text.substr(pos, end - pos));
             frame += '\n';
-            if (nl == std::string_view::npos) {
+            if (end == text.size())
                 break;
-            }
-            pos = nl + 1;
-        } while (pos < data.size());
+            if (text[end] == '\r' && end + 1 < text.size() && text[end + 1] == '\n')
+                ++end;
+            pos = end + 1;
+        } while (pos < text.size());
         frame += '\n';
         return frame;
     }

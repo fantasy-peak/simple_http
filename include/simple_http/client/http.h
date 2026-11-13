@@ -1207,6 +1207,10 @@ inline void read_all_bounded_next(const std::shared_ptr<ReadAllBoundedState> &st
                            }
                            if (state->max_bytes != 0 && state->out.size() + chunk.data.size() > state->max_bytes) {
                                state->finished = true;
+                               // RST_STREAM now rather than leaving the stream
+                               // (and its unread DATA's connection window) in
+                               // the session until the idle watchdog.
+                               state->stream->async_cancel(asio::detached);
                                auto completion = std::move(state->done);
                                std::move(completion)(make_error_code(client_errc::body_too_large), std::string{});
                                return;

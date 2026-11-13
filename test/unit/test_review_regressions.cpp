@@ -861,8 +861,18 @@ TEST_CASE("review: an out-of-range response status is refused", "[review][regres
         CHECK_FALSE(run_on(ctx, res->async_send("x", asio::use_awaitable)));
         CHECK(sink->calls == 0);
     }
+    // 1xx is interim and cannot be a one-shot final response: the client would
+    // keep waiting for the real one. send_continue() is the interim API.
+    {
+        asio::io_context ctx;
+        auto sink = std::make_shared<FakeResponseSink>(ctx.get_executor());
+        auto res = std::make_shared<ResponseWriter>(sink);
+        res->status(status::continue_);
+        CHECK_FALSE(run_on(ctx, res->async_send("", asio::use_awaitable)));
+        CHECK(sink->calls == 0);
+    }
     // The valid boundaries still work.
-    for (const int code : {100, 599}) {
+    for (const int code : {200, 599}) {
         asio::io_context ctx;
         auto sink = std::make_shared<FakeResponseSink>(ctx.get_executor());
         auto res = std::make_shared<ResponseWriter>(sink);
@@ -976,6 +986,87 @@ static_assert(!std::is_move_assignable_v<TlsContext>, "TlsContext registers &m_a
 static_assert(!std::is_copy_constructible_v<TlsContext>, "TlsContext registers &m_alpn_state with OpenSSL");
 static_assert(!std::is_reference_v<decltype(std::declval<IoCtxPool &>().at(0))>,
               "at() must not return a reference into a vector add_main_context() can reallocate");
+
+TEST_CASE("response: bodyless framing is limited to 204/304/HEAD", "[response][review]") {
+    asio::io_context ctx;
+    {
+        auto sink = std::make_shared<FakeResponseSink>(ctx.get_executor());
+        auto res = std::make_shared<ResponseWriter>(sink);
+        res->status(status::ok);
+        CHECK_FALSE(run_on(ctx, res->async_send_bodyless(asio::use_awaitable)));
+        CHECK(sink->calls == 0);
+    }
+    {
+        // A HEAD response may be bodyless with any status; the engine tells the
+        // sink via head_request().
+        auto sink = std::make_shared<FakeResponseSink>(ctx.get_executor());
+        sink->head = true;
+        auto res = std::make_shared<ResponseWriter>(sink);
+        res->status(status::ok);
+        CHECK(run_on(ctx, res->async_send_bodyless(asio::use_awaitable)));
+        CHECK(sink->sent_bodyless);
+    }
+    {
+        auto sink = std::make_shared<FakeResponseSink>(ctx.get_executor());
+        auto res = std::make_shared<ResponseWriter>(sink);
+        res->status(status::no_content);
+        CHECK(run_on(ctx, res->async_send_bodyless(asio::use_awaitable)));
+        CHECK(sink->sent_bodyless);
+    }
+}
+
+TEST_CASE("response: streaming begin rejects 204/304 and interim statuses", "[response][review]") {
+    asio::io_context ctx;
+    for (const int code : {status::no_content, status::not_modified, status::continue_}) {
+        auto sink = std::make_shared<FakeResponseSink>(ctx.get_executor());
+        auto res = std::make_shared<ResponseWriter>(sink);
+        res->status(code);
+        CHECK_FALSE(run_on(ctx, res->async_begin(asio::use_awaitable)));
+        CHECK(sink->calls == 0);
+    }
+}
+
+TEST_CASE("response: redirect and header reject invalid values", "[response][review]") {
+    asio::io_context ctx;
+    {
+        auto sink = std::make_shared<FakeResponseSink>(ctx.get_executor());
+        auto res = std::make_shared<ResponseWriter>(sink);
+        res->redirect("/x", 0);
+        CHECK_FALSE(run_on(ctx, res->async_send("", asio::use_awaitable)));
+        CHECK(sink->calls == 0);
+    }
+    {
+        auto sink = std::make_shared<FakeResponseSink>(ctx.get_executor());
+        auto res = std::make_shared<ResponseWriter>(sink);
+        res->header("bad name", "v");
+        CHECK_FALSE(run_on(ctx, res->async_send("ok", asio::use_awaitable)));
+        CHECK(sink->calls == 0);
+    }
+}
+
+TEST_CASE("response: SSE fields cannot inject a line", "[response][security]") {
+    asio::io_context ctx;
+    auto sink = std::make_shared<FakeResponseSink>(ctx.get_executor());
+    auto res = std::make_shared<ResponseWriter>(sink);
+    res->status(status::ok);
+    CHECK(run_on(ctx, res->async_sse_event("a\rEvent: evil", "ok\nEvent: injected", "", "", asio::use_awaitable)));
+    CHECK(run_on(ctx, res->async_sse_comment("ok\nEvent: from-comment", asio::use_awaitable)));
+    std::string frame;
+    for (const auto &chunk : sink->chunks)
+        frame += chunk;
+    CHECK(frame.find('\r') == std::string::npos);
+    CHECK(frame.find("\nEvent: injected") == std::string::npos);
+    CHECK(frame.find("\nEvent: from-comment") == std::string::npos);
+    CHECK(frame.find("data: a\n") != std::string::npos);
+    CHECK(frame.find("data: Event: evil\n") != std::string::npos);
+    CHECK(frame.find(": Event: from-comment\n") != std::string::npos);
+}
+
+TEST_CASE("real_ip: an empty prefix is not a /0", "[security][review]") {
+    CHECK_FALSE(middleware::real_ip_detail::ip_covered("10.0.0.0/", "10.1.2.3"));
+    CHECK_FALSE(middleware::real_ip_detail::ip_covered("10.0.0.0/999", "10.1.2.3"));
+    CHECK(middleware::real_ip_detail::ip_covered("10.0.0.0/0", "10.1.2.3"));
+}
 
 TEST_CASE("transport: async_error_only keeps the buffer owner alive", "[transport][review]") {
     asio::io_context ctx;

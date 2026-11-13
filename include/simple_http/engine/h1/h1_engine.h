@@ -859,6 +859,42 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
 
     void pull_chunked(PullCompletion done) {
         auto self = this->shared_from_this();
+        // Finish the CRLF that terminates the previous chunk's data.
+        if (m_body_state.chunk_crlf_pending) {
+            read_exact(2, [self, done = std::move(done)](error_code ec, std::string crlf) mutable {
+                if (ec) {
+                    self->body_failed(ec, std::move(done));
+                    return;
+                }
+                if (crlf != "\r\n") {
+                    self->body_failed(make_error_code(asio::error::invalid_argument), std::move(done));
+                    return;
+                }
+                self->m_body_state.chunk_crlf_pending = false;
+                self->pull_chunked(std::move(done));
+            });
+            return;
+        }
+        // Deliver a bounded slice of the current chunk. The chunk length is
+        // attacker-controlled; allocating it whole let one unauthenticated
+        // request reserve up to max_body_bytes (64 MiB by default) without
+        // sending a byte, and with max_body_bytes=0 a ~2^63 length threw
+        // length_error out of the io_context (std::terminate).
+        if (m_body_state.chunk_remaining > 0) {
+            const auto want =
+                static_cast<std::size_t>(std::min<std::uint64_t>(m_body_state.chunk_remaining, kReadChunkBytes));
+            read_exact(want, [self, done = std::move(done)](error_code ec, std::string chunk) mutable {
+                if (ec) {
+                    self->body_failed(ec, std::move(done));
+                    return;
+                }
+                self->m_body_state.chunk_remaining -= chunk.size();
+                if (self->m_body_state.chunk_remaining == 0)
+                    self->m_body_state.chunk_crlf_pending = true;
+                std::move(done)(error_code{}, ReadResult::chunk(std::move(chunk)));
+            });
+            return;
+        }
         read_line([self, done = std::move(done)](error_code ec, std::string size_line) mutable {
             if (ec) {
                 self->body_failed(ec, std::move(done));
@@ -877,30 +913,16 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
                 self->read_trailers(std::move(done));
                 return;
             }
-            self->m_body_state.total += chunk_len;
-            if (self->m_limits.max_body_bytes != 0 && self->m_body_state.total > self->m_limits.max_body_bytes) {
+            // Checked add: with max_body_bytes=0 body_limit() is UINT64_MAX, and
+            // an unchecked total += chunk_len wraps and disables the limit.
+            const auto budget = self->body_limit() - self->m_body_state.total;
+            if (chunk_len > budget) {
                 self->body_failed(make_error_code(asio::error::message_size), std::move(done));
                 return;
             }
-            self->read_exact(static_cast<std::size_t>(chunk_len), [self, done = std::move(done)](
-                                                                      error_code ec2, std::string chunk) mutable {
-                if (ec2) {
-                    self->body_failed(ec2, std::move(done));
-                    return;
-                }
-                self->read_exact(2, [self, chunk = std::move(chunk), done = std::move(done)](error_code ec3,
-                                                                                             std::string crlf) mutable {
-                    if (ec3) {
-                        self->body_failed(ec3, std::move(done));
-                        return;
-                    }
-                    if (crlf != "\r\n") {
-                        self->body_failed(make_error_code(asio::error::invalid_argument), std::move(done));
-                        return;
-                    }
-                    std::move(done)(error_code{}, ReadResult::chunk(std::move(chunk)));
-                });
-            });
+            self->m_body_state.total += chunk_len;
+            self->m_body_state.chunk_remaining = chunk_len;
+            self->pull_chunked(std::move(done));
         });
     }
 
@@ -1408,6 +1430,11 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
         Mode mode{Mode::None};
         std::uint64_t remaining{0};
         std::uint64_t total{0};
+        // Chunked body progress. A chunk is delivered in bounded pieces rather
+        // than allocated whole: a peer may declare a multi-gigabyte chunk and
+        // send nothing, and the old code allocated its full size up front.
+        std::uint64_t chunk_remaining{0};
+        bool chunk_crlf_pending{false};
         bool done{false};
         bool error{false};
         bool line_overflow{false};

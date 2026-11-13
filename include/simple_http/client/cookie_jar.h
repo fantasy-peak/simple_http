@@ -17,6 +17,7 @@
 // checked against the request host, not against the PSL).
 
 #include <algorithm>
+#include <boost/asio/ip/address.hpp>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -145,10 +146,16 @@ class CookieJar {
     // localhost / *.localhost and loopback IP literals are potentially
     // trustworthy origins (Go's cookiejar secureMatch).
     static bool loopback_domain(std::string_view domain) {
-        if (domain == "::1" || domain == "[::1]") {
-            return true;
+        // Parse real IP literals rather than prefix-matching: "127.evil.com"
+        // is a DNS name, not loopback, and must not grant a Secure cookie an
+        // http exception.
+        std::string_view address = domain;
+        if (address.size() >= 2 && address.front() == '[' && address.back() == ']') {
+            address = address.substr(1, address.size() - 2);
         }
-        if (starts_with(domain, "127.")) {
+        error_code ec;
+        const auto parsed = asio::ip::make_address(std::string{address}, ec);
+        if (!ec && parsed.is_loopback()) {
             return true;
         }
         const auto dot = domain.rfind('.');
@@ -238,20 +245,42 @@ class CookieJar {
 
     // Parses one "name=value; Domain=...; ..." header against the request URL
     // that produced it (defaults: host-only, path = the request's directory).
+    // RFC 6265 §4.1.1 cookie-octet, with the optional DQUOTE wrapping.
+    static bool valid_cookie_value(std::string_view value) noexcept {
+        if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
+            value = value.substr(1, value.size() - 2);
+        }
+        for (unsigned char c : value) {
+            if (c == 0x21 || (c >= 0x23 && c <= 0x2B) || (c >= 0x2D && c <= 0x3A) || (c >= 0x3C && c <= 0x5B) ||
+                (c >= 0x5D && c <= 0x7E)) {
+                continue;
+            }
+            return false;
+        }
+        return true;
+    }
+
     static std::optional<Cookie> parse_set_cookie(std::string_view header, const detail::Url &url) {
         const std::size_t semi = header.find(';');
         const std::size_t eq = header.find('=');
-        if (eq == std::string_view::npos) {
+        // The '=' must belong to the first ';'-separated segment. Searching the
+        // whole header let "novalue; Path=/" pair the name with an attribute
+        // and the size_t subtraction below underflow.
+        if (eq == std::string_view::npos || (semi != std::string_view::npos && eq > semi)) {
             return std::nullopt;
         }
         Cookie out;
         out.name = std::string{trim_ows(header.substr(0, eq))};
-        if (out.name.empty()) {
+        if (out.name.empty() || !is_http_token(out.name)) {
             return std::nullopt;
         }
         const std::string_view first_value =
             header.substr(eq + 1, semi == std::string_view::npos ? std::string_view::npos : semi - eq - 1);
-        out.value = std::string{trim_ows(first_value)};
+        const std::string_view trimmed_value = trim_ows(first_value);
+        if (!valid_cookie_value(trimmed_value)) {
+            return std::nullopt;
+        }
+        out.value = std::string{trimmed_value};
         out.domain = url.host; // host-only default
         out.path = request_directory(url.path());
 
@@ -300,6 +329,19 @@ class CookieJar {
                 break;
             }
             pos = next + 1;
+        }
+        // RFC 6265bis §4.1.3 prefix constraints. A non-conforming prefixed
+        // cookie is discarded, not stored without its promise: otherwise a
+        // subdomain could set "__Host-x" with Domain=example.com and replace the
+        // parent's host-locked cookie.
+        if (out.name.rfind("__Host-", 0) == 0) {
+            if (!out.secure || !out.host_only || out.path != "/") {
+                return std::nullopt;
+            }
+        } else if (out.name.rfind("__Secure-", 0) == 0) {
+            if (!out.secure) {
+                return std::nullopt;
+            }
         }
         return out;
     }

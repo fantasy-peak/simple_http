@@ -231,6 +231,12 @@ inline bool ip_covered(std::string_view entry, std::string_view ip) {
         return iequals_ci(entry, ip);
     }
     const std::string address_part{entry.substr(0, slash)};
+    // An empty prefix ("10.0.0.0/") parses no digits and would otherwise keep
+    // the default 0, silently trusting every IPv4 peer. An explicit "/0" is
+    // still honoured.
+    if (slash + 1 == entry.size()) {
+        return false;
+    }
     unsigned prefix = 0;
     for (std::size_t i = slash + 1; i < entry.size(); ++i) {
         if (entry[i] < '0' || entry[i] > '9') {
@@ -243,6 +249,9 @@ inline bool ip_covered(std::string_view entry, std::string_view ip) {
             return false;
         }
         prefix = prefix * 10 + static_cast<unsigned>(entry[i] - '0');
+    }
+    if (prefix > 128) {
+        return false; // the last digit may have pushed it past the bound
     }
     // Separate error codes: reusing one lets a malformed network part stay at
     // its default 0.0.0.0 when the host parses successfully, silently treating

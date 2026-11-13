@@ -16,6 +16,7 @@
 #include <boost/asio.hpp>
 #include <boost/asio/any_completion_handler.hpp>
 #include <boost/asio/async_result.hpp>
+#include <boost/asio/experimental/channel_error.hpp>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -107,6 +108,14 @@ inline error_code outcome_error(const StreamOutcome &outcome) {
 
 using ReadCompletion = asio::any_completion_handler<void(error_code, ReadResult)>;
 using OpenCompletion = asio::any_completion_handler<void(error_code, std::shared_ptr<class ClientStream>)>;
+
+// A concurrent_channel receive cancelled through the caller's cancellation
+// slot completes with the experimental channel category, not
+// operation_aborted. Callers that hold a per-phase deadline need the standard
+// code to map the wait back to response_head_timeout/body_idle_timeout.
+inline bool is_cancellation_error(const error_code &ec) noexcept {
+    return ec == asio::error::operation_aborted || ec == asio::experimental::error::channel_cancelled;
+}
 
 // One request/response exchange. Completion signatures:
 //   async_write / async_finish / async_finish_trailers / async_cancel -> void(error_code)
@@ -265,6 +274,11 @@ class ClientStream {
                 return;
             }
             if (max_bytes != 0 && out.size() + chunk.data.size() > max_bytes) {
+                // Release the stream instead of leaving it (and the unread DATA
+                // it still owes connection-level flow control for) in the
+                // session. A truncated large response used to hold the window
+                // until the idle watchdog.
+                stream.async_cancel(asio::detached);
                 self.complete(make_error_code(client_errc::body_too_large), std::string{});
                 return;
             }

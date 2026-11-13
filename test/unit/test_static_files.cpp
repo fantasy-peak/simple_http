@@ -62,6 +62,9 @@ struct Served {
 
 Served serve(const StaticFiles &site, asio::io_context &ctx, const RequestPtr &req) {
     auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
+    // The engines tell the sink whether this is a HEAD response; a bodyless 200
+    // is only legal in that case (or for 204/304).
+    writer->head = req->method() == Method::Head;
     auto res = std::make_shared<ResponseWriter>(writer);
     auto handled = run_on(ctx, await_bool([&](auto done) { site.try_serve(req, res, std::move(done)); }));
     REQUIRE(handled.has_value());

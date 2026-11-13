@@ -329,8 +329,12 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
             }
             std::string block;
             for (const auto &[name, value] : trailers) {
-                if (name.empty() || name.front() == ':' || is_connection_specific(name) || contains_ctl(name) ||
-                    contains_ctl(value)) {
+                // Same syntax/framing rules as the h1 terminator: a non-token
+                // name or a control byte in the value is not a field this
+                // connection may carry. Framing and connection-specific fields
+                // are forbidden as trailers (RFC 9110 §6.5.1).
+                if (name.empty() || name.front() == ':' || is_connection_specific(name) ||
+                    is_forbidden_trailer_field(name) || !is_http_token(name) || contains_invalid_field_value(value)) {
                     continue;
                 }
                 codec::hpack_append_literal(block, name, value);
@@ -480,13 +484,23 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
         auto notify = st.in_notify;
         auto outcome = st.outcome;
         auto self = this->shared_from_this();
-        notify->async_receive([self, id, notify, outcome, done = std::move(done)](error_code ec) mutable {
-            if (ec) {
-                std::move(done)(outcome_error(*outcome));
-                return;
-            }
-            self->await_head_impl(id, std::move(done));
-        });
+        // The caller's per-phase deadline is bound to `done` by Stream. Wrapping
+        // it in a plain lambda would drop that associator, leaving the read
+        // uncancellable until the connection watchdog. Re-bind it explicitly.
+        auto slot = asio::get_associated_cancellation_slot(done);
+        notify->async_receive(asio::bind_cancellation_slot(
+            slot, [self, id, notify, outcome, done = std::move(done)](error_code ec) mutable {
+                if (is_cancellation_error(ec)) {
+                    // Caller's deadline, not a session error.
+                    std::move(done)(make_error_code(asio::error::operation_aborted));
+                    return;
+                }
+                if (ec) {
+                    std::move(done)(outcome_error(*outcome));
+                    return;
+                }
+                self->await_head_impl(id, std::move(done));
+            }));
     }
 
     void stream_read_impl(std::uint32_t id, ReadCompletion done) {
@@ -556,25 +570,27 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
         auto notify = st.in_notify;
         auto outcome = st.outcome;
         auto self = this->shared_from_this();
-        notify->async_receive([self, id, notify, outcome, done = std::move(done)](error_code ec) mutable {
-            if (ec == asio::error::operation_aborted) {
-                std::move(done)(ec, ReadResult{});
-                return;
-            }
-            if (self->m_streams.find(id) == self->m_streams.end()) {
-                // it_finish() erases the entry before waking the reader. The
-                // wake must still report the terminal state captured at that
-                // moment (stream_reset/refused/eof), not session_closed.
-                auto terminal = outcome_result(*outcome);
-                if (terminal) {
-                    std::move(done)(error_code{}, std::move(*terminal));
-                } else {
-                    std::move(done)(terminal.error(), ReadResult{});
+        auto slot = asio::get_associated_cancellation_slot(done);
+        notify->async_receive(asio::bind_cancellation_slot(
+            slot, [self, id, notify, outcome, done = std::move(done)](error_code ec) mutable {
+                if (is_cancellation_error(ec)) {
+                    std::move(done)(make_error_code(asio::error::operation_aborted), ReadResult{});
+                    return;
                 }
-                return;
-            }
-            self->stream_read_impl(id, std::move(done));
-        });
+                if (self->m_streams.find(id) == self->m_streams.end()) {
+                    // it_finish() erases the entry before waking the reader. The
+                    // wake must still report the terminal state captured at that
+                    // moment (stream_reset/refused/eof), not session_closed.
+                    auto terminal = outcome_result(*outcome);
+                    if (terminal) {
+                        std::move(done)(error_code{}, std::move(*terminal));
+                    } else {
+                        std::move(done)(terminal.error(), ReadResult{});
+                    }
+                    return;
+                }
+                self->stream_read_impl(id, std::move(done));
+            }));
     }
 
   private:
@@ -1696,7 +1712,13 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
         auto space = st.out_space;
         auto outcome = st.outcome;
         auto self = this->shared_from_this();
-        space->async_receive([self, id, space, outcome, done = std::move(done)](error_code ec) mutable {
+        auto slot = asio::get_associated_cancellation_slot(done);
+        space->async_receive(asio::bind_cancellation_slot(slot, [self, id, space, outcome,
+                                                                 done = std::move(done)](error_code ec) mutable {
+            if (is_cancellation_error(ec)) {
+                std::move(done)(make_error_code(asio::error::operation_aborted)); // caller's deadline
+                return;
+            }
             if (ec) {
                 // A reset/failed stream closed the space; report why it died
                 // rather than a generic session_closed.
@@ -1709,7 +1731,7 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
                 return;
             }
             self->await_out_space(id, std::move(done));
-        });
+        }));
     }
 
     // --- send side: turn queued DATA into flow-controlled frames ---

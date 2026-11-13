@@ -608,3 +608,23 @@ TEST_CASE("cors: a refused-origin preflight varies on Origin", "[cors]") {
     const std::string vary{writer->header(field::vary)};
     CHECK(vary.find("Origin") != std::string_view::npos);
 }
+
+TEST_CASE("cors: a predicate-only policy mirrors the origin and adds Vary", "[cors][security]") {
+    Router router;
+    CorsConfig cfg;
+    cfg.allow_origin_fn = [](std::string_view) { return true; };
+    router.cors(cfg);
+    bool ran = false;
+    router.route(any_methods, "/api", flag_handler(ran));
+
+    asio::io_context ctx;
+    auto req = make_request(ctx, "/api");
+    add_origin(req);
+    auto writer = dispatch(ctx, router, req);
+
+    CHECK(ran);
+    // The predicate decides per origin, so the answer is origin-dependent:
+    // "*" (and no Vary) would say "every origin, cacheable for everyone".
+    CHECK(writer->header(field::access_control_allow_origin) == "https://app.example");
+    CHECK(writer->header(field::vary) == "Origin");
+}

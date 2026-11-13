@@ -476,17 +476,26 @@ class Http1ClientSession final : public ClientSession,
             std::move(done)(make_error_code(client_errc::trailers_not_supported));
             return;
         }
-        m_request_finished = true; // the trailer terminator ends the request body
+        // A trailer value is spliced into the chunked terminator verbatim. A
+        // CR/LF (or another control byte) in name/value therefore injects a
+        // field line, or a second request, into the connection — reject the
+        // exchange instead of writing it.
         std::string out = "0\r\n";
         for (const auto &[name, value] : trailers) {
             if (is_forbidden_trailer_field(name))
                 continue;
+            if (!is_http_token(name) || contains_invalid_field_value(value)) {
+                fail_exchange(make_error_code(client_errc::invalid_header));
+                std::move(done)(make_error_code(client_errc::invalid_header));
+                return;
+            }
             out.append(name);
             out.append(": ");
             out.append(value);
             out.append("\r\n");
         }
         out.append("\r\n");
+        m_request_finished = true; // the trailer terminator ends the request body
         auto bytes = std::make_shared<std::string>(std::move(out));
         auto self = this->shared_from_this();
         m_transport->async_write(ConstByteSpan{reinterpret_cast<const std::byte *>(bytes->data()), bytes->size()},

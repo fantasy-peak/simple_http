@@ -604,22 +604,29 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         auto wake = st.in_space;
         auto outcome = st.outcome;
         auto self = this->shared_from_this();
-        wake->async_receive([self, id, outcome, done = std::move(done)](error_code ec) mutable {
-            // A wake (state change) arrives with no error. Anything else is a
-            // cancelled/failed wait -- typically the caller's deadline
-            // cancelling this operation -- and re-waiting would spin under
-            // terminal cancellation, so report it. If the stream retired in the
-            // meantime, its terminal state is more useful than channel_closed.
-            if (ec) {
-                if (outcome->get() != StreamState::Open) {
-                    std::move(done)(outcome_error(*outcome));
-                } else {
-                    std::move(done)(ec);
+        auto slot = asio::get_associated_cancellation_slot(done);
+        wake->async_receive(
+            asio::bind_cancellation_slot(slot, [self, id, outcome, done = std::move(done)](error_code ec) mutable {
+                // A wake (state change) arrives with no error. Anything else is
+                // a cancelled/failed wait -- typically the caller's deadline
+                // cancelling this operation -- and re-waiting would spin under
+                // terminal cancellation, so report it. If the stream retired in
+                // the meantime, its terminal state is more useful than
+                // channel_closed.
+                if (is_cancellation_error(ec)) {
+                    std::move(done)(make_error_code(asio::error::operation_aborted));
+                    return;
                 }
-                return;
-            }
-            self->head_step(id, std::move(done));
-        });
+                if (ec) {
+                    if (outcome->get() != StreamState::Open) {
+                        std::move(done)(outcome_error(*outcome));
+                    } else {
+                        std::move(done)(ec);
+                    }
+                    return;
+                }
+                self->head_step(id, std::move(done));
+            }));
     }
 
   public:
@@ -716,13 +723,19 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
 
         auto wake = st.in_space;
         auto self = this->shared_from_this();
-        wake->async_receive([self, id, done = std::move(done)](error_code ec) mutable {
-            if (ec) {
-                std::move(done)(ec, ReadResult{});
-                return;
-            }
-            self->read_step(id, std::move(done));
-        });
+        auto slot = asio::get_associated_cancellation_slot(done);
+        wake->async_receive(
+            asio::bind_cancellation_slot(slot, [self, id, done = std::move(done)](error_code ec) mutable {
+                if (is_cancellation_error(ec)) {
+                    std::move(done)(make_error_code(asio::error::operation_aborted), ReadResult{});
+                    return;
+                }
+                if (ec) {
+                    std::move(done)(ec, ReadResult{});
+                    return;
+                }
+                self->read_step(id, std::move(done));
+            }));
     }
 
   public:
@@ -1470,21 +1483,27 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         auto space = st.out_space;
         auto outcome = st.outcome;
         auto self = this->shared_from_this();
-        space->async_receive([self, id, space, outcome, done = std::move(done)](error_code ec) mutable {
-            if (ec) {
-                // The wake channel is closed when the stream retires. Report the
-                // stream's terminal state (reset/failed/disconnect), not the
-                // generic channel error; only a still-open stream is a caller
-                // cancellation, which passes through.
-                if (outcome->get() != StreamState::Open) {
-                    std::move(done)(outcome_error(*outcome));
-                } else {
-                    std::move(done)(ec);
+        auto slot = asio::get_associated_cancellation_slot(done);
+        space->async_receive(asio::bind_cancellation_slot(
+            slot, [self, id, space, outcome, done = std::move(done)](error_code ec) mutable {
+                if (is_cancellation_error(ec)) {
+                    std::move(done)(make_error_code(asio::error::operation_aborted));
+                    return;
                 }
-                return;
-            }
-            self->await_out_space(id, std::move(done));
-        });
+                if (ec) {
+                    // The wake channel is closed when the stream retires. Report
+                    // the stream's terminal state (reset/failed/disconnect), not
+                    // the generic channel error; only a still-open stream is a
+                    // caller cancellation, which passes through.
+                    if (outcome->get() != StreamState::Open) {
+                        std::move(done)(outcome_error(*outcome));
+                    } else {
+                        std::move(done)(ec);
+                    }
+                    return;
+                }
+                self->await_out_space(id, std::move(done));
+            }));
     }
 
     void it_finish(std::int64_t id, StreamState state, error_code ec) {

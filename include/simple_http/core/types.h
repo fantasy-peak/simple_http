@@ -28,6 +28,17 @@ inline bool contains_ctl(std::string_view s) noexcept {
     return false;
 }
 
+// RFC 9110 §5.5: a field value is *( HTAB / SP / VCHAR / obs-text ). Other
+// control characters, including DEL, cannot be serialized into an HTTP/1.1
+// field line and are not something HPACK peers expect either.
+inline bool contains_invalid_field_value(std::string_view s) noexcept {
+    for (unsigned char c : s) {
+        if ((c < 0x20 && c != '\t') || c == 0x7f)
+            return true;
+    }
+    return false;
+}
+
 // RFC 9110 §5.6.2's tchar — the bytes an HTTP token (a method name, a field
 // name) may contain. Spelled out here rather than shared with the HTTP/1
 // parser's `is_tchar`: that one lives in engine/, which handler/ must not

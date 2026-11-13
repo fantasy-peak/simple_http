@@ -1475,6 +1475,13 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
             // message that never terminates. `dispatched` is read before
             // finish_header_block, which may erase `st`.
             if (st.dispatched && !hdr.has_flag(codec::H2_FLAG_END_STREAM)) {
+                // The block is complete and its fields are discarded, but the
+                // HPACK encoder on the peer has already updated its dynamic
+                // table: the decoder must too, or every later header block on
+                // this connection is indexed against a different table
+                // (RFC 9113 §4.3.1).
+                if (!decode_discarded_header_block(decoded_block))
+                    return false;
                 SIMPLE_HTTP_ERROR_LOG("h2: trailing HEADERS without END_STREAM (stream={}); resetting", hdr.stream_id);
                 reset_stream(hdr.stream_id, codec::H2_PROTOCOL_ERROR);
                 return true;
@@ -1488,6 +1495,16 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
                 return true;
             if (end_stream) {
                 it->second.half_closed_remote = true;
+                // A trailing HEADERS can end the request too. The declared
+                // content-length must still match the DATA already seen; this
+                // path used to skip the check entirely and hand the handler a
+                // silently truncated body (RFC 9113 §8.1.2.6).
+                if (!remote_content_length_ok(it->second)) {
+                    SIMPLE_HTTP_ERROR_LOG("h2: request body short of content-length at trailer END_STREAM (stream={})",
+                                          hdr.stream_id);
+                    reset_stream(hdr.stream_id, codec::H2_PROTOCOL_ERROR);
+                    return true;
+                }
                 mark_ws_remote_end(it->second);
                 (void)it->second.request->body().finish();
                 // A trailing HEADERS is a third way to end the remote half
@@ -1554,6 +1571,19 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
         }
         it->second.header_block.append(payload);
         if (hdr.has_flag(codec::H2_FLAG_END_HEADERS)) {
+            if (it->second.dispatched && !it->second.half_closed_remote) {
+                // A split trailing block whose HEADERS did not carry
+                // END_STREAM is malformed exactly like the single-frame case:
+                // decode it for HPACK table synchronisation, then reset.
+                const bool decoded = decode_discarded_header_block(it->second.header_block);
+                m_continuation_stream = 0;
+                if (!decoded)
+                    return false;
+                SIMPLE_HTTP_ERROR_LOG("h2: split trailing HEADERS without END_STREAM (stream={}); resetting",
+                                      hdr.stream_id);
+                reset_stream(hdr.stream_id, codec::H2_PROTOCOL_ERROR);
+                return true;
+            }
             m_continuation_stream = 0;
             if (!finish_header_block(hdr.stream_id, it->second, it->second.header_block))
                 return false;
@@ -1561,6 +1591,12 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
             if (it2 == m_streams.end())
                 return true;
             if (it2->second.half_closed_remote) {
+                if (!remote_content_length_ok(it2->second)) {
+                    SIMPLE_HTTP_ERROR_LOG("h2: request body short of content-length at trailer END_STREAM (stream={})",
+                                          hdr.stream_id);
+                    reset_stream(hdr.stream_id, codec::H2_PROTOCOL_ERROR);
+                    return true;
+                }
                 mark_ws_remote_end(it2->second);
                 (void)it2->second.request->body().finish();
                 // Same retirement rule as the single-frame trailer path.
@@ -2298,6 +2334,13 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
     // owed for request-body bytes the handler never consumed. This is the single
     // place a normally-finished stream is retired (avoiding a per-connection leak
     // of stream entries and receive-window credit on long-lived connections).
+    // RFC 9113 §8.1.2.6: when the peer's half closes, a declared content-length
+    // must equal the DATA payload total. Every END_STREAM path uses this.
+    static bool remote_content_length_ok(const Stream &st) {
+        return st.declared_content_length < 0 ||
+               st.body_received == static_cast<std::uint64_t>(st.declared_content_length);
+    }
+
     void maybe_complete_stream(std::uint32_t stream_id) {
         auto it = m_streams.find(stream_id);
         if (it == m_streams.end())
