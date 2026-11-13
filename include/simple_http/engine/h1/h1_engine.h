@@ -5,16 +5,19 @@
 // Http1Engine drives one connection: it reads bytes into an H1Parser until a
 // full head is parsed, frames the request body (chunked / Content-Length /
 // none), hands the request to the dispatcher, and repeats while the connection
-// is keep-alive. Responses go through Http1ResponseSink, which hand-serializes
-// either a Content-Length reply or a chunked stream onto the transport.
+// is keep-alive. Responses go through Http1ResponseSink, which frames either a
+// Content-Length reply or a chunked stream and hands the bytes to the
+// connection's SerializedWriter (one transport write in flight).
 //
 // This first port supports HTTP/1.x and local WebSocket upgrades. The h2c
 // upgrade and the byte-level WebSocket reverse proxy are deferred with the
 // HTTP/2 phase and the proxy phase respectively.
 //
-// Thread safety (model A): every sink write hops onto the connection executor
-// before touching the transport, so a Response captured by a handler is safe
-// from any thread.
+// Thread affinity (model A): the sink and the ResponseWriter built on it belong
+// to the connection thread. Writes are serialized by SerializedWriter (two
+// overlapping async_write calls on one socket are undefined even on the same
+// thread); using either object from another thread aborts via
+// require_owner_thread.
 
 #include <algorithm>
 #include <array>
@@ -24,6 +27,7 @@
 #include <charconv>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -47,6 +51,7 @@
 #include "../../proto/response.h"
 #include "../../proto/response_writer.h"
 #include "../../proto/websocket.h"
+#include "../../transport/serialized_writer.h"
 #include "../../transport/transport.h"
 #include "../dispatcher.h"
 #include "../h2/h2_engine.h"
@@ -62,7 +67,8 @@ namespace asio = boost::asio;
 // writer(s) it creates.
 using SharedDeadline = std::shared_ptr<std::chrono::steady_clock::time_point>;
 
-// ResponseSink for HTTP/1.x. Hand-serializes directly onto the transport.
+// ResponseSink for HTTP/1.x. Owns the response framing; the bytes go through
+// one SerializedWriter so the connection never has two writes in flight.
 template <typename Transport>
 class Http1ResponseSink final : public ResponseSink, public std::enable_shared_from_this<Http1ResponseSink<Transport>> {
   public:
@@ -70,8 +76,8 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
                       std::chrono::steady_clock::duration idle_timeout, std::string alt_svc = {},
                       std::shared_ptr<std::atomic<bool>> continue_sent = {})
         : m_transport(std::move(transport)), m_executor(m_transport->get_executor()), m_version(version),
-          m_deadline(std::move(deadline)), m_idle_timeout(idle_timeout), m_alt_svc(std::move(alt_svc)),
-          m_continue_sent(std::move(continue_sent)) {}
+          m_alt_svc(std::move(alt_svc)), m_continue_sent(std::move(continue_sent)),
+          m_writer(std::make_shared<SerializedWriter<Transport>>(m_transport, std::move(deadline), idle_timeout)) {}
 
     void set_head_request(bool head) { m_head_request = head; }
     void set_keep_alive(bool ka) { m_keep_alive_out = ka; }
@@ -80,66 +86,61 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
     void send(int status, Headers headers, std::string body, WriteCompletion done) override {
         on_executor([self = this->shared_from_this(), status, headers = std::move(headers), body = std::move(body),
                      done = std::move(done)]() mutable {
-            self->do_send(status, std::move(headers), std::move(body), std::move(done));
+            self->enqueue_send(status, std::move(headers), std::move(body), std::move(done));
         });
     }
 
     void send_bodyless(int status, Headers headers, WriteCompletion done) override {
         on_executor(
             [self = this->shared_from_this(), status, headers = std::move(headers), done = std::move(done)]() mutable {
-                self->do_send_bodyless(status, std::move(headers), std::move(done));
+                self->enqueue_bodyless(status, std::move(headers), std::move(done));
             });
     }
 
     void send_continue(WriteCompletion done) override {
         on_executor([self = this->shared_from_this(), done = std::move(done)]() mutable {
-            if (!self->m_open) {
-                std::move(done)(make_error_code(asio::error::not_connected));
-                return;
-            }
-            if (self->m_continue_sent && self->m_continue_sent->exchange(true, std::memory_order_relaxed)) {
-                std::move(done)(error_code{});
-                return;
-            }
-            self->write_raw("HTTP/1.1 100 Continue\r\n\r\n", std::move(done));
+            self->enqueue_continue(std::move(done));
         });
     }
 
     void send_headers(int status, Headers headers, WriteCompletion done) override {
         on_executor(
             [self = this->shared_from_this(), status, headers = std::move(headers), done = std::move(done)]() mutable {
-                self->do_send_headers(status, std::move(headers), std::move(done));
+                self->enqueue_headers(status, std::move(headers), std::move(done));
             });
     }
 
     void send_chunk(std::string data, WriteCompletion done) override {
         on_executor([self = this->shared_from_this(), data = std::move(data), done = std::move(done)]() mutable {
-            self->do_send_chunk(std::move(data), std::move(done));
+            self->enqueue_chunk(std::move(data), std::move(done));
         });
     }
 
     void send_last(std::string data, WriteCompletion done) override {
         on_executor([self = this->shared_from_this(), data = std::move(data), done = std::move(done)]() mutable {
-            self->do_send_last(std::move(data), std::move(done));
+            self->enqueue_last(std::move(data), std::move(done));
         });
     }
 
     void send_trailers(Headers trailers, WriteCompletion done) override {
         on_executor(
             [self = this->shared_from_this(), trailers = std::move(trailers), done = std::move(done)]() mutable {
-                self->do_send_trailers(std::move(trailers), std::move(done));
+                self->enqueue_trailers(std::move(trailers), std::move(done));
             });
     }
 
     void connected(ConnectedCompletion done) const override {
         on_executor([self = this->shared_from_this(), done = std::move(done)]() mutable {
-            std::move(done)(error_code{}, self->m_open);
+            // Pending writes mean the response is not on the wire yet; the
+            // connection must not be reused for another request.
+            std::move(done)(error_code{}, self->m_open && self->m_writer->idle());
         });
     }
 
     void close(WriteCompletion done) override {
         on_executor([self = this->shared_from_this(), done = std::move(done)]() mutable {
             self->m_open = false;
+            self->m_writer->close(make_error_code(asio::error::not_connected));
             self->m_transport->close();
             std::move(done)(error_code{});
         });
@@ -157,6 +158,10 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
     static constexpr std::size_t kResponseOverhead = 96;
     static constexpr std::string_view kCrLf = "\r\n";
     static constexpr std::string_view kLastChunk = "0\r\n\r\n";
+    // CRLF of the last data chunk followed by the terminating chunk, written as
+    // one static tail so the final chunk needs no concatenation.
+    static constexpr std::string_view kChunkEnd = "\r\n0\r\n\r\n";
+    static constexpr std::string_view kContinueResponse = "HTTP/1.1 100 Continue\r\n\r\n";
     static constexpr std::string_view kAltSvcPrefix = "alt-svc: ";
     static constexpr std::string_view kKeepAliveConnection = "connection: keep-alive\r\n";
     static constexpr std::string_view kCloseConnection = "connection: close\r\n";
@@ -229,53 +234,34 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
         }
     }
 
-    void touch_deadline() {
-        if (m_deadline)
-            *m_deadline = std::chrono::steady_clock::now() + m_idle_timeout;
+    // One framed write as it goes to the connection writer. Framing (status
+    // line, headers, chunk prefix, terminator) is decided here; the bytes are
+    // owned by the queue entry until the transport write completes.
+    //
+    // `done` is wrapped so an error also closes this sink. The writer is the
+    // only place that issues transport writes, so "one write in flight per
+    // socket" holds even when several coroutines share the response.
+    WriteCompletion wrap(WriteCompletion done) {
+        // Weak by design: the sink owns the writer and the writer's queue owns
+        // this completion, so a strong capture here would close the loop
+        // (sink -> writer -> entry -> sink) and keep both alive until the
+        // transport happened to complete. The engine (m_active_writer + the
+        // finish/after_handler lambdas) and the ResponseWriter keep the sink
+        // alive for the whole request/response cycle; the lock can only fail
+        // once the connection is already being torn down, and the caller's
+        // completion still has to run.
+        std::weak_ptr<Http1ResponseSink> guard = this->weak_from_this();
+        return WriteCompletion([guard, done = std::move(done)](error_code ec) mutable {
+            if (auto self = guard.lock()) {
+                self->complete_write(ec, std::move(done));
+                return;
+            }
+            if (done)
+                std::move(done)(ec ? ec : make_error_code(asio::error::not_connected));
+        });
     }
 
-    // Writes a buffer sequence with the "error only" completion the sink uses.
-    // The buffers live in a shared string held by the operation.
-    void write_buffers(std::shared_ptr<std::string> bytes, WriteCompletion done) {
-        auto self = this->shared_from_this();
-        auto transport = m_transport;
-        touch_deadline();
-        detail::async_error_only(
-            m_executor, std::move(done),
-            [self, transport, bytes](asio::any_completion_handler<void(error_code, std::size_t)> handler) {
-                const std::array<ConstByteSpan, 1> buffers{as_bytes(*bytes)};
-                transport->async_write_seq(boost::span<const ConstByteSpan>{buffers.data(), buffers.size()},
-                                           std::move(handler));
-            });
-    }
-
-    void write_raw(std::string_view out, WriteCompletion done) {
-        write_buffers(std::make_shared<std::string>(out), std::move(done));
-    }
-
-    void write_pair(std::string head, std::string body, WriteCompletion done) {
-        auto self = this->shared_from_this();
-        auto transport = m_transport;
-        touch_deadline();
-        auto head_keep = std::make_shared<std::string>(std::move(head));
-        auto body_keep = std::make_shared<std::string>(std::move(body));
-        detail::async_error_only(
-            m_executor, std::move(done),
-            [self, transport, head_keep,
-             body_keep](asio::any_completion_handler<void(error_code, std::size_t)> handler) {
-                const std::array<ConstByteSpan, 2> buffers{as_bytes(*head_keep), as_bytes(*body_keep)};
-                transport->async_write_seq(boost::span<const ConstByteSpan>{buffers.data(), buffers.size()},
-                                           std::move(handler));
-            });
-    }
-
-    void complete_write(error_code ec, WriteCompletion done) {
-        if (ec)
-            m_open = false;
-        std::move(done)(ec);
-    }
-
-    void do_send(int status, Headers headers, std::string body, WriteCompletion done) {
+    void enqueue_send(int status, Headers headers, std::string body, WriteCompletion done) {
         if (!m_open) {
             std::move(done)(make_error_code(asio::error::not_connected));
             return;
@@ -284,7 +270,7 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
             if (status == status::no_content) {
                 headers.erase("content-length");
             }
-            do_send_bodyless(status, std::move(headers), std::move(done));
+            enqueue_bodyless(status, std::move(headers), std::move(done));
             return;
         }
         strip_hop_by_hop(headers);
@@ -294,18 +280,13 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
         std::string head;
         build_head(head, status, headers);
         if (m_head_request) {
-            write_raw(head, [self = this->shared_from_this(), done = std::move(done)](error_code ec) mutable {
-                self->complete_write(ec, std::move(done));
-            });
+            m_writer->enqueue(WriteEntry::owned(std::move(head)), wrap(std::move(done)));
             return;
         }
-        write_pair(std::move(head), std::move(body),
-                   [self = this->shared_from_this(), done = std::move(done)](error_code ec) mutable {
-                       self->complete_write(ec, std::move(done));
-                   });
+        m_writer->enqueue(WriteEntry::owned(std::move(head), std::move(body)), wrap(std::move(done)));
     }
 
-    void do_send_bodyless(int status, Headers headers, WriteCompletion done) {
+    void enqueue_bodyless(int status, Headers headers, WriteCompletion done) {
         if (!m_open) {
             std::move(done)(make_error_code(asio::error::not_connected));
             return;
@@ -317,12 +298,24 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
         ensure_date(headers);
         std::string out;
         build_head(out, status, headers);
-        write_raw(out, [self = this->shared_from_this(), done = std::move(done)](error_code ec) mutable {
-            self->complete_write(ec, std::move(done));
-        });
+        m_writer->enqueue(WriteEntry::owned(std::move(out)), wrap(std::move(done)));
     }
 
-    void do_send_headers(int status, Headers headers, WriteCompletion done) {
+    void enqueue_continue(WriteCompletion done) {
+        if (!m_open) {
+            std::move(done)(make_error_code(asio::error::not_connected));
+            return;
+        }
+        // At most one interim response per request, shared with the body
+        // puller through the engine's flag.
+        if (m_continue_sent && m_continue_sent->exchange(true, std::memory_order_relaxed)) {
+            std::move(done)(error_code{});
+            return;
+        }
+        m_writer->enqueue(WriteEntry::owned(std::string{kContinueResponse}), wrap(std::move(done)));
+    }
+
+    void enqueue_headers(int status, Headers headers, WriteCompletion done) {
         if (!m_open) {
             std::move(done)(make_error_code(asio::error::not_connected));
             return;
@@ -338,12 +331,10 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
         }
         std::string out;
         build_head(out, status, headers);
-        write_raw(out, [self = this->shared_from_this(), done = std::move(done)](error_code ec) mutable {
-            self->complete_write(ec, std::move(done));
-        });
+        m_writer->enqueue(WriteEntry::owned(std::move(out)), wrap(std::move(done)));
     }
 
-    void do_send_chunk(std::string data, WriteCompletion done) {
+    void enqueue_chunk(std::string data, WriteCompletion done) {
         if (m_head_request) {
             std::move(done)(error_code{});
             return;
@@ -352,41 +343,19 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
             std::move(done)(make_error_code(asio::error::not_connected));
             return;
         }
-        auto self = this->shared_from_this();
-        auto finish = [self, done = std::move(done)](error_code ec) mutable {
-            self->complete_write(ec, std::move(done));
-        };
         if (!m_chunked) {
             if (data.empty()) {
-                std::move(finish)(error_code{});
+                std::move(done)(error_code{});
                 return;
             }
-            write_raw(data, std::move(finish));
+            m_writer->enqueue(WriteEntry::owned(std::string{}, std::move(data)), wrap(std::move(done)));
             return;
         }
-        // "<hex size>\r\n<data>\r\n" as one write, without concatenating.
-        auto transport = m_transport;
-        touch_deadline();
-        auto payload = std::make_shared<std::string>(std::move(data));
-        // The size prefix is part of the buffer a pending write points into; it
-        // cannot live on this stack frame (that frame is gone as soon as the
-        // initiation returns).
-        auto prefix = std::make_shared<std::string>();
-        char hex[2 * sizeof(std::size_t) + 2];
-        auto [end, ec] = std::to_chars(hex, hex + sizeof(hex) - 2, payload->size(), 16);
-        (void)ec;
-        prefix->assign(hex, static_cast<std::size_t>(end - hex));
-        prefix->append("\r\n");
-        detail::async_error_only(
-            m_executor, std::move(finish),
-            [transport, payload, prefix](asio::any_completion_handler<void(error_code, std::size_t)> handler) {
-                const std::array<ConstByteSpan, 3> buffers{as_bytes(*prefix), as_bytes(*payload), as_bytes(kCrLf)};
-                transport->async_write_seq(boost::span<const ConstByteSpan>{buffers.data(), buffers.size()},
-                                           std::move(handler));
-            });
+        std::string head = chunk_prefix(data.size());
+        m_writer->enqueue(WriteEntry::owned(std::move(head), std::move(data), as_bytes(kCrLf)), wrap(std::move(done)));
     }
 
-    void do_send_last(std::string data, WriteCompletion done) {
+    void enqueue_last(std::string data, WriteCompletion done) {
         if (m_head_request) {
             std::move(done)(error_code{});
             return;
@@ -395,43 +364,24 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
             std::move(done)(make_error_code(asio::error::not_connected));
             return;
         }
-        auto self = this->shared_from_this();
-        auto finish = [self, done = std::move(done)](error_code ec) mutable {
-            self->complete_write(ec, std::move(done));
-        };
         if (!m_chunked) {
             if (data.empty()) {
-                std::move(finish)(error_code{});
+                std::move(done)(error_code{});
                 return;
             }
-            write_raw(data, std::move(finish));
+            m_writer->enqueue(WriteEntry::owned(std::string{}, std::move(data)), wrap(std::move(done)));
             return;
         }
         if (data.empty()) {
-            write_raw(kLastChunk, std::move(finish));
+            m_writer->enqueue(WriteEntry::owned(std::string{kLastChunk}), wrap(std::move(done)));
             return;
         }
-        auto transport = m_transport;
-        touch_deadline();
-        auto payload = std::make_shared<std::string>(std::move(data));
-        // Same as do_send_chunk: the prefix must outlive the initiation.
-        auto prefix = std::make_shared<std::string>();
-        char hex[2 * sizeof(std::size_t) + 2];
-        auto [end, ec] = std::to_chars(hex, hex + sizeof(hex) - 2, payload->size(), 16);
-        (void)ec;
-        prefix->assign(hex, static_cast<std::size_t>(end - hex));
-        prefix->append("\r\n");
-        detail::async_error_only(
-            m_executor, std::move(finish),
-            [transport, payload, prefix](asio::any_completion_handler<void(error_code, std::size_t)> handler) {
-                const std::array<ConstByteSpan, 4> buffers{as_bytes(*prefix), as_bytes(*payload), as_bytes(kCrLf),
-                                                           as_bytes(kLastChunk)};
-                transport->async_write_seq(boost::span<const ConstByteSpan>{buffers.data(), buffers.size()},
-                                           std::move(handler));
-            });
+        std::string head = chunk_prefix(data.size());
+        m_writer->enqueue(WriteEntry::owned(std::move(head), std::move(data), as_bytes(kChunkEnd)),
+                          wrap(std::move(done)));
     }
 
-    void do_send_trailers(Headers trailers, WriteCompletion done) {
+    void enqueue_trailers(Headers trailers, WriteCompletion done) {
         if (m_head_request) {
             std::move(done)(error_code{});
             return;
@@ -456,9 +406,24 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
             out.append("\r\n");
         }
         out.append("\r\n");
-        write_raw(out, [self = this->shared_from_this(), done = std::move(done)](error_code ec) mutable {
-            self->complete_write(ec, std::move(done));
-        });
+        m_writer->enqueue(WriteEntry::owned(std::move(out)), wrap(std::move(done)));
+    }
+
+    // "<hex size>\r\n" for one chunk. The result lives in the queue entry, so
+    // it needs no separate allocation of its own.
+    static std::string chunk_prefix(std::size_t size) {
+        char hex[2 * sizeof(std::size_t) + 2];
+        auto [end, ec] = std::to_chars(hex, hex + sizeof(hex) - 2, size, 16);
+        (void)ec;
+        std::string prefix(hex, static_cast<std::size_t>(end - hex));
+        prefix.append("\r\n");
+        return prefix;
+    }
+
+    void complete_write(error_code ec, WriteCompletion done) {
+        if (ec)
+            m_open = false;
+        std::move(done)(ec);
     }
 
     std::shared_ptr<Transport> m_transport;
@@ -468,10 +433,10 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
     bool m_keep_alive_out{true};
     bool m_head_request{false};
     bool m_chunked{false};
-    SharedDeadline m_deadline;
-    std::chrono::steady_clock::duration m_idle_timeout{};
     std::string m_alt_svc;
     std::shared_ptr<std::atomic<bool>> m_continue_sent;
+    // Sole owner of the transport write direction; see serialized_writer.h.
+    std::shared_ptr<SerializedWriter<Transport>> m_writer;
 };
 
 template <typename Transport> class Http1Engine : public std::enable_shared_from_this<Http1Engine<Transport>> {
@@ -515,6 +480,7 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
         if (m_finished)
             return;
         m_finished = true;
+        m_active_writer.reset();
         m_watchdog->cancel();
         auto self = this->shared_from_this();
         if (m_owner != TransportOwner::Engine) {
@@ -654,6 +620,7 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
 
         auto writer = std::make_shared<Http1ResponseSink<Transport>>(
             m_transport, version, m_deadline, m_limits.idle_timeout, m_limits.alt_svc_value(), m_continue_sent);
+        m_active_writer = writer;
         writer->set_keep_alive(request_keep_alive && !expect_continue);
         const bool head_request = m_parser.head().method == Method::Head;
         writer->set_head_request(head_request);
@@ -692,6 +659,9 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
         auto self = this->shared_from_this();
         auto proceed = [self, writer, request_keep_alive, handler_failed](bool drained) {
             writer->connected([self, writer, request_keep_alive, handler_failed, drained](error_code, bool still_open) {
+                // The request/response cycle is over; the engine no longer needs
+                // the sink alive for the lazy 100-continue path.
+                self->m_active_writer.reset();
                 if (!may_reuse(!handler_failed, request_keep_alive, writer->keep_alive_out(), still_open, drained)) {
                     self->finish();
                     return;
@@ -781,7 +751,39 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
             return;
         }
         auto self = this->shared_from_this();
-        if (m_body_state.expect_continue && !m_continue_sent->exchange(true, std::memory_order_relaxed)) {
+        if (m_body_state.expect_continue) {
+            if (m_active_writer) {
+                // A handler may be writing a response while it reads the body.
+                // Route the interim response through the sink's writer instead
+                // of racing it on the transport; the sink's shared flag keeps
+                // it at-most-once even if the handler also called send_continue.
+                //
+                // Weak on purpose: the completion lives in the writer's queue,
+                // and the engine owns the sink, so a strong capture would form
+                // engine -> sink -> writer -> entry -> engine. The request (and
+                // its body pull provider) keeps the engine alive for the whole
+                // read, so the lock only fails after teardown.
+                std::weak_ptr<Http1Engine> guard = self;
+                WriteCompletion after = [guard, done = std::move(done)](error_code ec) mutable {
+                    auto engine = guard.lock();
+                    if (!engine) {
+                        if (done)
+                            std::move(done)(ec ? ec : make_error_code(asio::error::not_connected), ReadResult{});
+                        return;
+                    }
+                    if (ec) {
+                        engine->body_failed(ec, std::move(done));
+                        return;
+                    }
+                    engine->pull_mode(std::move(done));
+                };
+                m_active_writer->send_continue(std::move(after));
+                return;
+            }
+            if (m_continue_sent->exchange(true, std::memory_order_relaxed)) {
+                pull_mode(std::move(done));
+                return;
+            }
             auto keep = std::make_shared<std::string>(kContinueResponse);
             const std::array<ConstByteSpan, 1> buffers{
                 ConstByteSpan{reinterpret_cast<const std::byte *>(keep->data()), keep->size()}};
@@ -1457,6 +1459,9 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
     H1Parser m_parser;
     BodyState m_body_state;
     std::weak_ptr<Request> m_body_request;
+    // The sink handling the current request, used to serialize the lazy
+    // 100-continue with any response the handler is writing concurrently.
+    std::shared_ptr<Http1ResponseSink<Transport>> m_active_writer;
     std::shared_ptr<std::atomic<bool>> m_continue_sent{std::make_shared<std::atomic<bool>>(false)};
     bool m_pull_active{false};
     std::deque<PullCompletion> m_pending_pulls;

@@ -12,12 +12,15 @@
 // failure is presented (callback value / as_tuple / use_awaitable exception).
 //
 // Concurrency (model A): a connection is pinned to one single-threaded
-// io_context. Every public operation that touches connection state hops onto
-// that executor first, so the handle is safe to use from any thread. is_open()
-// is the single synchronous snapshot (an atomic). Writes are serialized by an
-// internal write pump; an internal reader keeps draining the transport into a
-// bounded inbox so a serialized read/write application cannot deadlock with a
-// peer that stops reading.
+// io_context, and this handle — like every other object owned by the
+// connection — must be used from that thread only. A call from another thread
+// is a contract violation: require_owner_thread logs it and aborts rather than
+// racing the reader/writer pumps. Code that needs to move work across threads
+// should hop explicitly with asio::post(req->executor(), ...). is_open() is the
+// single synchronous snapshot (an atomic). Writes are serialized by an internal
+// write pump; an internal reader keeps draining the transport into a bounded
+// inbox so a serialized read/write application cannot deadlock with a peer that
+// stops reading.
 //
 // Fragmentation and control frames are handled inside the reader: continuation
 // frames are reassembled, Ping is answered with Pong, and a received Close is
@@ -41,10 +44,13 @@
 #include <random>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <type_traits>
 #include <utility>
 
+#include "../core/logging.h"
 #include "../core/types.h"
+#include "../transport/serialized_writer.h"
 #include "../transport/transport.h" // ByteSpan / ConstByteSpan
 #include "response_writer.h"        // WriteCompletion
 #include "ws_deflate.h"             // permessage-deflate (RFC 7692)
@@ -96,24 +102,14 @@ class WsBackend {
 // Concrete backend over a simple_http Transport (TCP plain or TLS).
 template <typename Transport>
 class WsBackendImpl final : public WsBackend, public std::enable_shared_from_this<WsBackendImpl<Transport>> {
-    struct WriteReq {
-        std::string owned;
-        std::string_view borrowed;
-        bool borrowed_payload = false;
-        char header[14]{};
-        std::size_t header_len{0};
-        std::optional<WriteCompletion> done;
-        bool close_after = false;
-
-        std::string_view payload() const { return borrowed_payload ? borrowed : std::string_view{owned}; }
-    };
-    using WriteQueue = std::deque<WriteReq>;
     using Notify = asio::experimental::channel<void(error_code)>;
 
-    static WriteReq make_req(WsOpcode opcode, std::string payload, std::optional<WriteCompletion> done,
-                             bool close_after = false, bool mask = false, bool rsv1 = false) {
-        WriteReq req;
-        req.header_len = ws_encode_header(req.header, opcode, payload.size(), rsv1);
+    // Builds a frame as a write-queue entry. The ≤14-byte frame header fits the
+    // entry's head string on every implementation's SSO buffer, so framing a
+    // frame costs no extra allocation; the payload is moved into the entry.
+    static WriteEntry make_entry(WsOpcode opcode, std::string payload, bool mask, bool rsv1) {
+        char header[14];
+        std::size_t header_len = ws_encode_header(header, opcode, payload.size(), rsv1);
         if (mask) {
             // Set the MASK bit and insert the 4-byte key between the length and
             // the payload; the header is rebuilt rather than patched because the
@@ -125,7 +121,7 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
                     b = static_cast<unsigned char>(rd() & 0xFF);
             }
             char rebuilt[14];
-            rebuilt[0] = req.header[0];
+            rebuilt[0] = header[0];
             std::uint64_t l = payload.size();
             std::size_t n = 1;
             if (l <= 125) {
@@ -141,25 +137,20 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
             }
             for (auto b : mask_key)
                 rebuilt[n++] = static_cast<char>(b);
-            std::memcpy(req.header, rebuilt, n);
-            req.header_len = n;
+            std::memcpy(header, rebuilt, n);
+            header_len = n;
             ws_unmask(payload.data(), payload.size(), mask_key);
         }
-        req.owned = std::move(payload);
-        req.done = std::move(done);
-        req.close_after = close_after;
-        return req;
+        return WriteEntry::owned(std::string(header, header_len), std::move(payload));
     }
 
-    static WriteReq make_borrowed_req(WsOpcode opcode, std::string_view payload, std::optional<WriteCompletion> done,
-                                      bool close_after = false, bool rsv1 = false) {
-        WriteReq req;
-        req.header_len = ws_encode_header(req.header, opcode, payload.size(), rsv1);
-        req.borrowed = payload;
-        req.borrowed_payload = true;
-        req.done = std::move(done);
-        req.close_after = close_after;
-        return req;
+    // write_view(): the payload is borrowed from the caller, who must keep it
+    // alive until the write completes (the documented contract).
+    static WriteEntry make_borrowed_entry(WsOpcode opcode, std::string_view payload, bool rsv1) {
+        char header[14];
+        const std::size_t header_len = ws_encode_header(header, opcode, payload.size(), rsv1);
+        return WriteEntry::borrowed(std::string(header, header_len),
+                                    ConstByteSpan{reinterpret_cast<const std::byte *>(payload.data()), payload.size()});
     }
 
   public:
@@ -169,11 +160,13 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
                            WsDeflateConfig deflate = {})
         : m_transport(std::move(transport)), m_executor(m_transport->get_executor()),
           m_parser(max_payload, expect_masked, deflate.enabled), m_max_payload(max_payload),
-          m_idle_timeout(idle_timeout), m_inbox_limit(inbox_limit != 0 ? inbox_limit : 4u * 1024 * 1024),
-          m_expect_masked(expect_masked), m_deflate(std::move(deflate)),
-          m_watchdog_timer(std::make_shared<asio::steady_timer>(m_executor)), m_notify(m_executor, 1),
+          m_idle_timeout(idle_timeout), m_deadline(std::make_shared<std::chrono::steady_clock::time_point>()),
+          m_inbox_limit(inbox_limit != 0 ? inbox_limit : 4u * 1024 * 1024), m_expect_masked(expect_masked),
+          m_deflate(std::move(deflate)), m_watchdog_timer(std::make_shared<asio::steady_timer>(m_executor)),
           m_inbox_ready(m_executor, 1), m_inbox_space(m_executor, 1) {
-        m_deadline = std::chrono::steady_clock::now() + m_idle_timeout;
+        *m_deadline = std::chrono::steady_clock::now() + m_idle_timeout;
+        // Sole owner of the transport write direction (see serialized_writer.h).
+        m_writer = std::make_shared<SerializedWriter<Transport>>(m_transport, m_deadline, m_idle_timeout);
         if (m_deflate.enabled) {
             m_out = std::make_unique<WsDeflater>(m_deflate.server_window_bits, m_compression_level);
             m_in = std::make_unique<WsInflater>(m_deflate.client_window_bits);
@@ -227,8 +220,7 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
                 std::move(done)(make_error_code(asio::error::not_connected));
                 return;
             }
-            self->m_pending.push_back(make_borrowed_req(opcode, data, std::move(done)));
-            (void)self->m_notify.try_send(error_code{});
+            self->m_writer->enqueue(make_borrowed_entry(opcode, data, false), std::move(done));
         });
     }
 
@@ -244,8 +236,7 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
                 return;
             }
             const bool mask = !self->m_expect_masked;
-            self->m_pending.push_back(make_req(WsOpcode::Ping, std::move(payload), std::move(done), false, mask));
-            (void)self->m_notify.try_send(error_code{});
+            self->m_writer->enqueue(make_entry(WsOpcode::Ping, std::move(payload), mask, false), std::move(done));
         });
     }
 
@@ -299,9 +290,9 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
     // --- pumps -------------------------------------------------------------
 
     void run_writer() override {
-        auto self = this->shared_from_this();
-        start_watchdog(std::weak_ptr<WsBackendImpl>(self));
-        pump(std::move(self));
+        // Writes are pumped by the shared writer as they are enqueued; this
+        // only arms the idle watchdog.
+        start_watchdog(std::weak_ptr<WsBackendImpl>(this->shared_from_this()));
     }
 
     void abort() override {
@@ -655,11 +646,10 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
         }
         const WsOpcode opcode = text ? WsOpcode::Text : WsOpcode::Binary;
         const bool mask = !m_expect_masked;
-        m_pending.push_back(make_req(opcode, std::move(data), std::move(done), false, mask, rsv1));
-        (void)m_notify.try_send(error_code{});
+        m_writer->enqueue(make_entry(opcode, std::move(data), mask, rsv1), std::move(done));
     }
 
-    // Sends a Close payload, waits for the pump to put it on the wire, then
+    // Sends a Close payload, waits for the writer to put it on the wire, then
     // tears the connection down. The wait is load-bearing: the peer decides how
     // the connection failed from the code it receives.
     void close_with(std::string payload, WriteCompletion done) {
@@ -672,21 +662,18 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
             }
             self->m_open = false;
             const bool mask = !self->m_expect_masked;
-            auto handler = [self, done = std::move(done)](error_code) mutable {
+            auto after = WriteCompletion([self, done = std::move(done)](error_code) mutable {
                 self->teardown();
                 std::move(done)(error_code{});
-            };
-            self->m_pending.push_back(
-                make_req(WsOpcode::Close, std::move(payload), WriteCompletion(std::move(handler)), true, mask));
-            (void)self->m_notify.try_send(error_code{});
+            });
+            self->m_writer->enqueue(make_entry(WsOpcode::Close, std::move(payload), mask, false), std::move(after));
         });
     }
 
     void teardown() {
         m_open = false;
-        m_notify.close();
         stop_inbox();
-        fail_pending_writes();
+        m_writer->close(make_error_code(asio::error::operation_aborted));
         if (m_watchdog_timer)
             m_watchdog_timer->cancel();
         m_transport->close();
@@ -694,71 +681,7 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
 
     void do_abort() { teardown(); }
 
-    void fail_pending_writes() {
-        while (!m_pending.empty()) {
-            WriteReq req = std::move(m_pending.front());
-            m_pending.pop_front();
-            if (req.done) {
-                (*req.done)(make_error_code(asio::error::operation_aborted));
-            }
-        }
-    }
-
-    static void pump(std::shared_ptr<WsBackendImpl> self) {
-        if (self->m_pending.empty()) {
-            self->m_notify.async_receive([self](error_code ec) {
-                if (ec) {
-                    self->pump_finished();
-                    return;
-                }
-                pump(std::move(self));
-            });
-            return;
-        }
-        auto req = std::make_shared<WriteReq>(std::move(self->m_pending.front()));
-        self->m_pending.pop_front();
-        self->write_all(req, [self, req](error_code ec) mutable {
-            if (ec) {
-                self->m_open = false;
-            }
-            if (req->done) {
-                (*req->done)(ec);
-            }
-            if (ec || req->close_after) {
-                self->pump_finished();
-                return;
-            }
-            pump(std::move(self));
-        });
-    }
-
-    void pump_finished() {
-        m_open = false;
-        fail_pending_writes();
-        m_notify.close();
-    }
-
-    // The frame lives in a shared_ptr for the duration of the write: the
-    // scatter-gather buffers point into it, so its address must not change.
-    void write_all(const std::shared_ptr<WriteReq> &req, WriteCompletion done) {
-        touch_deadline();
-        const std::string_view payload = req->payload();
-        const std::array<ConstByteSpan, 2> bufs{
-            ConstByteSpan{reinterpret_cast<const std::byte *>(req->header), req->header_len},
-            ConstByteSpan{reinterpret_cast<const std::byte *>(payload.data()), payload.size()},
-        };
-        auto transport = m_transport;
-        // The transport reports void(error_code, size_t); the queued frame's
-        // waiter only cares about success/failure.
-        detail::async_error_only(
-            m_executor, std::move(done),
-            [transport, bufs](asio::any_completion_handler<void(error_code, std::size_t)> handler) {
-                transport->async_write_seq(boost::span<const ConstByteSpan>{bufs.data(), bufs.size()},
-                                           std::move(handler));
-            });
-    }
-
-    void touch_deadline() { m_deadline = std::chrono::steady_clock::now() + m_idle_timeout; }
+    void touch_deadline() { *m_deadline = std::chrono::steady_clock::now() + m_idle_timeout; }
 
     static void start_watchdog(std::weak_ptr<WsBackendImpl> weak) {
         asio::steady_timer *timer = nullptr;
@@ -768,7 +691,7 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
                 return;
             }
             timer = self->m_watchdog_timer.get();
-            timer->expires_at(self->m_deadline);
+            timer->expires_at(*self->m_deadline);
         }
         timer->async_wait([weak](error_code ec) {
             if (ec == asio::error::operation_aborted) {
@@ -778,7 +701,7 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
             if (!self || !self->m_open) {
                 return;
             }
-            if (std::chrono::steady_clock::now() >= self->m_deadline) {
+            if (std::chrono::steady_clock::now() >= *self->m_deadline) {
                 self->teardown();
                 return;
             }
@@ -786,12 +709,11 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
         });
     }
 
-    void enqueue_control(WsOpcode opcode, std::string payload, bool close_after = false) {
-        if (!m_open || m_pending.size() >= kMaxPendingFrames) {
+    void enqueue_control(WsOpcode opcode, std::string payload) {
+        if (!m_open || m_writer->queued() >= kMaxPendingFrames) {
             return;
         }
-        m_pending.push_back(make_req(opcode, std::move(payload), std::nullopt, close_after, !m_expect_masked));
-        (void)m_notify.try_send(error_code{});
+        m_writer->enqueue(make_entry(opcode, std::move(payload), !m_expect_masked, false), WriteCompletion{});
     }
 
     static constexpr std::size_t kMaxPendingFrames = 64;
@@ -802,7 +724,9 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
     WsFrameParser m_parser;
     std::uint64_t m_max_payload;
     std::chrono::steady_clock::duration m_idle_timeout;
-    std::chrono::steady_clock::time_point m_deadline{};
+    // Shared with SerializedWriter, which touches it when a write starts; the
+    // read path updates it in place on activity.
+    std::shared_ptr<std::chrono::steady_clock::time_point> m_deadline;
     std::size_t m_inbox_limit;
     bool m_expect_masked{true};
     WsDeflateConfig m_deflate;
@@ -815,8 +739,8 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
     std::unique_ptr<WsDeflater> m_out;
     std::unique_ptr<WsInflater> m_in;
     std::shared_ptr<asio::steady_timer> m_watchdog_timer;
-    WriteQueue m_pending;
-    Notify m_notify;
+    // Sole owner of the transport write direction; entries own their bytes.
+    std::shared_ptr<SerializedWriter<Transport>> m_writer;
     std::deque<WsMessage> m_inbox;
     std::size_t m_inbox_bytes{0};
     bool m_reader_started{false};
@@ -841,12 +765,18 @@ class WebSocket {
   public:
     explicit WebSocket(std::shared_ptr<WsBackend> backend) : m_backend(std::move(backend)) {}
 
+    // Model A: the handle is used only from the connection thread that owns the
+    // backend. A call from another thread is a contract violation; log and abort
+    // (see require_owner_thread) instead of racing the reader/writer pumps.
+    void require_owner() const noexcept { require_owner_thread(m_owner_thread, "WebSocket"); }
+
     // Dropping the handle without awaiting close() must still stop the detached
     // write pump, otherwise it would keep the backend alive forever.
     ~WebSocket() { m_backend->abort(); }
 
     // Reads one complete message. Completion: void(error_code, WsMessage).
     template <typename Token> auto async_read(Token &&token) {
+        require_owner();
         auto backend = m_backend;
         return asio::async_compose<Token, void(error_code, WsMessage)>(
             ReadOp{[backend](WsReadCompletion done) mutable { backend->read(std::move(done)); },
@@ -861,6 +791,7 @@ class WebSocket {
         return async_write(std::move(data), false, std::forward<Token>(token));
     }
     template <typename Token> auto async_write(std::string data, bool text, Token &&token) {
+        require_owner();
         auto backend = m_backend;
         return asio::async_compose<Token, void(error_code)>(
             WriteOp{[backend, data = std::move(data), text](WriteCompletion done) mutable {
@@ -877,6 +808,7 @@ class WebSocket {
         return async_write_view(data, false, std::forward<Token>(token));
     }
     template <typename Token> auto async_write_view(std::string_view data, bool text, Token &&token) {
+        require_owner();
         auto backend = m_backend;
         return asio::async_compose<Token, void(error_code)>(
             WriteOp{[backend, data, text](WriteCompletion done) mutable {
@@ -887,6 +819,7 @@ class WebSocket {
     }
 
     template <typename Token> auto async_ping(std::string payload, Token &&token) {
+        require_owner();
         auto backend = m_backend;
         return asio::async_compose<Token, void(error_code)>(
             WriteOp{[backend, payload = std::move(payload)](WriteCompletion done) mutable {
@@ -897,6 +830,7 @@ class WebSocket {
     }
 
     template <typename Token> auto async_close(Token &&token) {
+        require_owner();
         auto backend = m_backend;
         return asio::async_compose<Token, void(error_code)>(
             WriteOp{[backend](WriteCompletion done) mutable { backend->close(std::move(done)); },
@@ -905,6 +839,7 @@ class WebSocket {
     }
 
     template <typename Token> auto async_close(std::uint16_t code, std::string reason, Token &&token) {
+        require_owner();
         auto backend = m_backend;
         return asio::async_compose<Token, void(error_code)>(
             WriteOp{[backend, code, reason = std::move(reason)](WriteCompletion done) mutable {
@@ -915,6 +850,7 @@ class WebSocket {
     }
 
     template <typename Token> auto async_enable_write_compression(bool enable, Token &&token) {
+        require_owner();
         auto backend = m_backend;
         return asio::async_compose<Token, void(error_code)>(WriteOp{[backend, enable](WriteCompletion done) mutable {
                                                                         backend->enable_write_compression(
@@ -925,6 +861,7 @@ class WebSocket {
     }
 
     template <typename Token> auto async_set_compression_level(int level, Token &&token) {
+        require_owner();
         auto backend = m_backend;
         return asio::async_compose<Token, void(error_code)>(WriteOp{[backend, level](WriteCompletion done) mutable {
                                                                         backend->set_compression_level(level,
@@ -940,7 +877,10 @@ class WebSocket {
     // Starts the serializing write pump and the idle watchdog (the engine calls
     // this on the connection executor right after the upgrade). The pump holds
     // its own reference to the backend, so it may outlive this handle.
-    void run_writer() { m_backend->run_writer(); }
+    void run_writer() {
+        require_owner();
+        m_backend->run_writer();
+    }
 
   private:
     struct ReadOp {
@@ -983,6 +923,7 @@ class WebSocket {
     };
 
     std::shared_ptr<WsBackend> m_backend;
+    std::thread::id m_owner_thread{std::this_thread::get_id()};
 };
 
 } // namespace simple_http

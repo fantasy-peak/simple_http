@@ -348,7 +348,7 @@ class Server {
         core->limits = m_cfg.limits;
         core->pool = std::make_shared<IoCtxPool>(m_cfg.worker_threads);
         core->pool->add_main_context();
-        m_core = core;
+        store_core(core);
         build_core();
         m_stopping.store(false, std::memory_order_release);
 
@@ -534,7 +534,12 @@ class Server {
                 }
             }
         }
-        if (m_core) {
+        // Hold one reference for the whole teardown. Observability accessors on
+        // other threads take the same mutex to copy the pointer; without it a
+        // concurrent active_connections() would race the reset below (a
+        // shared_ptr read/write race, not merely a stale count).
+        const auto core = core_snapshot();
+        if (core) {
             // Honour shutdown_grace for requests already in a handler, then
             // cancel every remaining connection. Without the cancel, an idle
             // keep-alive read keeps the worker alive until IoCtxPool's generic
@@ -542,12 +547,12 @@ class Server {
             // worker regardless of the configured grace.
             if (m_cfg.shutdown_grace.count() > 0) {
                 const auto deadline = std::chrono::steady_clock::now() + m_cfg.shutdown_grace;
-                while (m_core->requests.load(std::memory_order_acquire) > 0 &&
+                while (core->requests.load(std::memory_order_acquire) > 0 &&
                        std::chrono::steady_clock::now() < deadline) {
                     std::this_thread::sleep_for(std::chrono::milliseconds{5});
                 }
             }
-            m_core->close_all();
+            core->close_all();
         }
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
         for (auto &rt : m_quic_runtimes) {
@@ -557,15 +562,15 @@ class Server {
             }
         }
 #endif
-        if (m_core && m_core->pool) {
-            m_core->pool->stop();
+        if (core && core->pool) {
+            core->pool->stop();
         }
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
         m_quic_runtimes.clear();
         m_quic_port.store(0, std::memory_order_release);
 #endif
         m_listeners.clear();
-        m_core.reset();
+        clear_core();
         m_started = false;
     }
 
@@ -573,8 +578,14 @@ class Server {
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
     std::uint16_t quic_port() const { return m_quic_port.load(std::memory_order_acquire); }
 #endif
-    std::size_t active_connections() const { return m_core ? m_core->connections->load() : 0; }
-    std::size_t active_requests() const { return m_core ? m_core->requests.load() : 0; }
+    std::size_t active_connections() const {
+        const auto core = core_snapshot();
+        return core ? core->connections->load() : 0;
+    }
+    std::size_t active_requests() const {
+        const auto core = core_snapshot();
+        return core ? core->requests.load() : 0;
+    }
 
   private:
     struct Core {
@@ -1023,7 +1034,7 @@ class Server {
 #endif
 
     void build_core() {
-        auto core = m_core;
+        auto core = core_snapshot();
         // dispatch is stored on Core while the lambda runs for every request;
         // a strong capture of Core here is a self-cycle that keeps the pool,
         // every io_context and the router alive after stop(). Requests in
@@ -1062,8 +1073,25 @@ class Server {
         };
     }
 
+    // active_connections()/active_requests() are observability APIs callable
+    // from any thread, while start()/stop() replace/reset the Core. Guarding the
+    // shared_ptr is what makes that safe; the counters themselves are atomic.
+    std::shared_ptr<Core> core_snapshot() const {
+        std::lock_guard<std::mutex> lock(m_core_mutex);
+        return m_core;
+    }
+    void store_core(std::shared_ptr<Core> core) {
+        std::lock_guard<std::mutex> lock(m_core_mutex);
+        m_core = std::move(core);
+    }
+    void clear_core() {
+        std::lock_guard<std::mutex> lock(m_core_mutex);
+        m_core.reset();
+    }
+
     ServerConfig m_cfg;
     std::shared_ptr<Router> m_router;
+    mutable std::mutex m_core_mutex;
     std::shared_ptr<Core> m_core;
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
     std::vector<std::shared_ptr<QuicRuntime>> m_quic_runtimes;

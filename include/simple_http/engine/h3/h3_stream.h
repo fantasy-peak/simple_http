@@ -83,6 +83,11 @@ struct H3Stream {
     std::string scheme;
     bool is_head{false};
     bool seen_authority{false};
+    // Sum of decoded name+value+32 over this header section. The compressed
+    // size is bounded by on_headers_begin; QPACK dynamic references can expand
+    // a small block into a much larger decoded list.
+    std::size_t decoded_field_bytes{0};
+    bool headers_rejected{false};
     bool headers_done{false};
     bool dispatched{false};
     // Waiting in the engine's dispatch queue for a handler slot (Rapid Reset
@@ -132,6 +137,10 @@ struct H3Stream {
     std::uint64_t out_write{0};
     std::uint64_t out_ack{0};
     bool out_eof{false};
+    // The peer stopped wanting this response (STOP_SENDING / RESET_STREAM), or
+    // the engine reset it. Writers must not park on out_space after this: no
+    // ACK or window update is ever going to arrive.
+    bool out_aborted{false};
     // nghttp3 parked this stream because its body was not ready; it has to be
     // resumed when it is, or the stream never sends again.
     bool data_blocked{false};

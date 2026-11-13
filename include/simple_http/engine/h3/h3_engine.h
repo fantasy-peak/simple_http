@@ -97,12 +97,14 @@ inline constexpr std::size_t kH3QpackBlockedStreams = 16;
 
 template <typename Connection> class Http3Engine;
 
-// ResponseSink for one HTTP/3 request stream. Holds a weak_ptr to the engine
-// so it can be used from any thread and after the connection has closed.
+// ResponseSink for one HTTP/3 request stream. Holds a weak_ptr to the engine so
+// an operation issued after the connection closed fails instead of
+// dereferencing it.
 //
-// Every method hops onto the connection executor first: the stream table lives
-// there, and so does every nghttp3 call it makes. The completion runs after the
-// engine-side work for that call is done, so a caller can chain stream writes.
+// Model A: the sink is used only on the connection thread; every method also
+// hops onto the connection executor defensively, so no engine state is touched
+// before the hop. The completion runs after the engine-side work for that call
+// is done, so a caller can chain stream writes.
 template <typename Connection> class Http3ResponseSink : public ResponseSink {
   public:
     using Executor = typename Connection::executor_type;
@@ -385,6 +387,8 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         if (it == m_streams.end() || h3() == nullptr)
             return;
         Stream &stream = *it->second;
+        if (stream.out_aborted)
+            return; // the peer or the engine already closed the write half
 
         // Submitted immediately, even when the request body is still arriving: a
         // full-duplex "stream-one" client only finishes its upload once it has
@@ -449,6 +453,8 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         if (it == m_streams.end())
             return;
         Stream &stream = *it->second;
+        if (stream.out_aborted)
+            return; // no reader will ever ask for this data
 
         stream.out_bytes += data.size();
         stream.out_q.push_back(std::move(data));
@@ -512,6 +518,13 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
             return;
         }
         Stream &stream = *it->second;
+        // STOP_SENDING / RESET_STREAM closed the write half: no ACK or window
+        // update will ever wake this wait, so a parked writer would hang until
+        // the connection died.
+        if (stream.out_aborted) {
+            std::move(done)(make_error_code(asio::error::operation_aborted));
+            return;
+        }
         // The quantity that bounds memory is out_bytes: everything enqueued and
         // not yet acknowledged -- which includes bytes nghttp3 has *not pulled*
         // because the peer's stream or connection window is full. Measuring only
@@ -755,20 +768,32 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
     void on_stream_reset(std::int64_t stream_id, std::uint64_t app_error_code) noexcept override {
         auto it = m_streams.find(stream_id);
         if (it != m_streams.end()) {
-            it->second->reset_by_peer = true;
-            it->second->reset = true; // a queued stream must not be dispatched
-            if (it->second->request) {
-                (void)it->second->request->body().fail(make_error_code(asio::error::connection_reset));
-                it->second->request->cancel(); // peer reset: signal the handler's token
+            Stream &stream = *it->second;
+            stream.out_aborted = true;
+            stream.reset_by_peer = true;
+            stream.reset = true; // a queued stream must not be dispatched
+            if (stream.queued) {
+                m_pending_dispatch.erase(std::remove(m_pending_dispatch.begin(), m_pending_dispatch.end(), stream_id),
+                                         m_pending_dispatch.end());
+                stream.queued = false;
             }
-            h3::wake(it->second->in_space);
-            h3::wake(it->second->out_space);
+            if (stream.request) {
+                (void)stream.request->body().fail(make_error_code(asio::error::connection_reset));
+                stream.request->cancel(); // peer reset: signal the handler's token
+            }
+            h3::wake(stream.in_space);
+            h3::wake(stream.out_space);
         }
+        // The peer aborted its sending half. Our write half must be shut too,
+        // or the QUIC stream never reaches the closed state and nghttp3 never
+        // reports on_stream_close — the stream entry and its MAX_STREAMS quota
+        // would then leak for the connection's lifetime.
+        if (m_conn)
+            m_conn->shutdown_stream_write(stream_id, app_error_code);
         // Tell nghttp3 the peer abandoned the stream, so it stops waiting for the
         // rest of the request.
         if (h3() != nullptr)
             (void)nghttp3_conn_shutdown_stream_read(m_h3, stream_id);
-        (void)app_error_code;
     }
 
     void on_stream_stop_sending(std::int64_t stream_id, std::uint64_t app_error_code) noexcept override {
@@ -777,11 +802,29 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         // earlier wiring called shutdown_stream_read here) and unpark a writer
         // waiting on backpressure.
         auto it = m_streams.find(stream_id);
-        if (it != m_streams.end())
-            h3::wake(it->second->out_space);
+        if (it != m_streams.end()) {
+            Stream &stream = *it->second;
+            stream.out_aborted = true;
+            if (!stream.dispatched) {
+                // Nothing is producing a response; reset instead of leaving a
+                // queued/partial request occupying a concurrency slot.
+                if (stream.queued) {
+                    m_pending_dispatch.erase(
+                        std::remove(m_pending_dispatch.begin(), m_pending_dispatch.end(), stream_id),
+                        m_pending_dispatch.end());
+                    stream.queued = false;
+                }
+                reset_stream(stream_id, app_error_code);
+                return;
+            }
+            h3::wake(stream.out_space);
+        }
         if (h3() != nullptr)
             (void)nghttp3_conn_shutdown_stream_write(m_h3, stream_id);
-        (void)app_error_code;
+        // nghttp3's shutdown only stops offering data; ngtcp2 must still send
+        // RESET_STREAM (the report's Q-04 leak).
+        if (m_conn)
+            m_conn->shutdown_stream_write(stream_id, app_error_code);
     }
 
     void on_extend_max_stream_data(std::int64_t stream_id, std::uint64_t /*max_data*/) noexcept override {
@@ -881,7 +924,8 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         // nghttp3 reports the peer's request streams through this callback and
         // nothing else, and the library looks after its own control streams
         // without telling us.
-        (void)ensure_stream(stream_id);
+        if (auto stream = ensure_stream(stream_id))
+            stream->decoded_field_bytes = 0;
         // The one limit nghttp3 declines to enforce: it will happily buffer a
         // field section of any size, because "how big is too big" is the
         // application's to decide. `get_frame_payload_left2` is a getter, so
@@ -911,6 +955,23 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         if (it == m_streams.end())
             return;
         Stream &stream = *it->second;
+
+        // Bound the *decoded* field list, not just the compressed block:
+        // QPACK dynamic-table references let a small block expand into a large
+        // name/value list, and nghttp3 hands every field to this callback.
+        // `+ 32` matches the h2 accounting (a field's bookkeeping cost).
+        constexpr std::size_t kFieldOverhead = 32;
+        const std::size_t limit = m_limits.max_header_bytes;
+        const std::size_t field_cost = name.size() + value.size() + kFieldOverhead;
+        if (stream.decoded_field_bytes > limit || field_cost > limit - stream.decoded_field_bytes) {
+            if (!stream.headers_done) {
+                // Reset after nghttp3 returns from this read; do not dispatch.
+                stream.headers_rejected = true;
+                m_invalid_stream = stream_id;
+            }
+            return;
+        }
+        stream.decoded_field_bytes += field_cost;
 
         // §4.2 forbids CR, LF and NUL in a field. HTTP/3 has no line folding, so
         // those bytes survive decoding and would let a peer inject a request line
@@ -948,11 +1009,14 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         if (stream.headers_done)
             return; // trailers, which this layer does not surface
         stream.headers_done = true;
-        // A field callback already rejected this request (CR/LF/NUL). Do not
-        // dispatch it: the reset happens after nghttp3 returns from the read,
-        // but the handler would otherwise already have run.
-        if (m_invalid_stream == stream_id)
+        // A field callback already rejected this request (CR/LF/NUL, or a
+        // decoded list past max_header_bytes). Do not dispatch it: the reset
+        // happens after nghttp3 returns from the read, but the handler would
+        // otherwise already have run.
+        if (stream.headers_rejected || m_invalid_stream == stream_id) {
+            m_invalid_stream = stream_id;
             return;
+        }
 
         if (!finish_request(stream)) {
             m_invalid_stream = stream_id;
@@ -1268,21 +1332,17 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         // POST 1 KiB body failed ~800 of 200000 requests, precisely at
         // (1 MiB / 1 KiB) requests x 200 connections.
         //
-        // The hop back onto the connection executor is the same one the h2
-        // engine makes, and for the same reason: the hook fires wherever the
-        // body is *read*, and Request is shared ownership — a handler that was
-        // spawned on this executor may hand the body to another coroutine on
-        // another executor, or read it from a thread of its own. What it must
-        // not do is touch the ngtcp2 connection from there: that connection
-        // belongs to this one thread (model A), and `extend_*` mutates its
-        // window state and pokes its wake-up.
+        // Model A: the hook fires from Body::async_read on the connection
+        // executor (Body rejects a read from another thread). The post below is
+        // kept as a defensive hop; extend_* mutates ngtcp2 window state and
+        // pokes its wake-up, so it must only run on this connection's thread.
         std::weak_ptr<Http3Engine> weak = this->weak_from_this();
         auto exec = m_executor;
         auto consumed = stream->body_consumed;
         stream->request->body().set_on_consumed([weak, exec, stream_id, consumed](std::size_t n) {
-            // Recorded synchronously: the hook may run on any thread, and
-            // erase_stream/release_unread_body on the connection executor must
-            // not double-credit bytes the handler already read.
+            // Recorded synchronously: erase_stream/release_unread_body on the
+            // connection executor must not double-credit bytes the handler
+            // already read.
             consumed->fetch_add(n, std::memory_order_acq_rel);
             asio::post(exec, [weak, stream_id, n]() {
                 if (auto eng = weak.lock()) {

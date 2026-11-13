@@ -65,8 +65,9 @@ concrete `ResponseSink` implementations; `ResponseWriter` only forwards.
 4. **Concurrency model A.** Each connection is pinned to one single-threaded
    `io_context` in the `IoCtxPool`; the engine, writers and handlers for that connection
    run only on that thread, so `engine/` contains no mutexes or atomics.
-   `ResponseWriter` / `WebSocket` may be held across threads; every write first hops back
-   to the connection executor.
+   `ResponseWriter` / `WebSocket` / `Body` must be used on the connection's thread only;
+   a cross-thread call is logged and aborted by `require_owner_thread`. Hop explicitly
+   with `asio::post(req->executor(), ...)` when work has to move between threads.
 5. **Explicit backpressure.** HTTP/2 request bodies are parked per stream, WebSocket has
    a bounded inbound read pump, and streaming responses go through a write pump. No path
    lets the peer push unbounded memory.

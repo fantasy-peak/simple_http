@@ -93,6 +93,7 @@ include/
       websocket.h                  WebSocket 句柄 + WsBackendImpl（读泵/写泵）
     transport/
       transport.h                  Transport concept + SslHandle
+      serialized_writer.h          单连接写队列（条目拥有字节，h1/WebSocket 共用）
       tcp_transport.h              TcpStreamTransport（含零拷贝 scatter-gather）
       tls_context.h                TlsContext / TlsConfig（ALPN）
       tls_transport.h              TlsStreamTransport
@@ -209,9 +210,11 @@ transport（TCP / TLS / QUIC 字节流）
 - 每条连接在 accept 时绑定到 `IoCtxPool` 中一个**单线程** `io_context`。
 - 该连接上的引擎、writer、handler 全部只在这一个线程执行。
 - 因此 `engine/` 下**没有 mutex / atomic**（唯一例外见下）。
-- `ResponseWriter` / `WebSocket` 可以 `shared_ptr` 捕获并跨线程使用；每个操作先
-  `co_await asio::dispatch(asio::bind_executor(executor, asio::use_awaitable))`
-  hop 回连接 executor。各层都有同名 `hop()` 辅助函数。
+- `ResponseWriter` / `WebSocket` / `Body` **只能在连接 executor 所在线程使用**。
+  `require_owner_thread` 检测到跨线程调用会 `SIMPLE_HTTP_ERROR_LOG` 记录并 `abort`，
+  这是刻意的契约检查：库对象没有跨线程同步。需要换线程时调用方显式
+  `asio::post(req->executor(), ...)`，不要依赖库内的 hop——完成处理器可能把调用方
+  协程恢复到工作线程，造成隐式换线程。各层 sink 仍保留防御性的 hop。
 - Handler 都在连接 executor 上 `co_spawn`；请求体消费钩子也 post 回该 executor。
 
 刻意的跨连接共享例外（都在 handler 层，不在 `engine/`）：
@@ -1168,6 +1171,16 @@ test/run.sh server-diff
     完成调用者（不能等内层排空）。内层续延在解引用 `Client` 之前必须检查该标志；
     栈上 `Client` 的 `keep_alive()` 只是别名 `shared_ptr`，不负责保活。ASan 的
     client-diff policy 组覆盖此路径。
+93. **写队列条目在完成前不得移出队列**：`SerializedWriter` 的 scatter-gather 描述符指向
+    deque 队首元素的 `head`/`body`/`tail`；`std::deque` 在两端插入/删除不使其它元素的
+    引用失效，所以写期间不能 `pop_front`、不能 `erase` 中间元素、不能把条目 move 出去。
+    旧实现把条目 move 出队再用 `make_shared<std::string>` 保活（每 chunk 多 2~3 次
+    分配），改回 move 会在 partial write 时读到已释放的缓冲。失败清理只能从队尾
+    `pop_back`，in-flight 队首交给它自己的 transport 回调回收。队列里保存的完成
+    回调不得强引用 writer 的所有者：h1 的 `wrap()` 弱引用 sink、lazy 100-continue
+    弱引用 engine，否则会形成 `sink → writer → entry → sink` /
+    `engine → sink → writer → entry → engine` 环。所有者由请求/响应生命周期保活，
+    锁失败时用 `not_connected` 完成调用方。
 
 ---
 

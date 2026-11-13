@@ -61,7 +61,8 @@
 3. **传输与协议解耦。** 引擎通过 `Transport` 读写字节，不直接依赖具体 socket 类型。
 4. **并发模型 A。** 每条连接绑定到 `IoCtxPool` 中一个单线程 `io_context`；该连接上的
    引擎、writer、handler 都只在这一个线程运行，因此 `engine/` 内没有 mutex / atomic。
-   `ResponseWriter` / `WebSocket` 可以跨线程持有，写操作会先 hop 回连接所属 executor。
+   `ResponseWriter` / `WebSocket` / `Body` 只能在连接所属线程使用；跨线程调用会
+   记录日志并 abort，需要换线程时请显式 `asio::post(req->executor(), ...)`。
 5. **显式反压。** HTTP/2 请求体按流停放，WebSocket 有有界入站读泵，流式响应走写泵；
    没有一处允许对端把内存推成无界。
 6. **日志与后端解耦。** 库只定义 `LogSink`，不依赖任何第三方日志库；适配代码由使用者
@@ -1292,8 +1293,9 @@ socket 字节
 
 - 每条连接在 accept 时绑定到 `IoCtxPool` 中一个单线程 `io_context`。
 - 该连接上的所有引擎/writer/handler 工作都只在这个线程上执行，因此无需加锁。
-- `ResponseWriter` / `WebSocket` 可以 `shared_ptr` 捕获并跨线程使用；每个写操作先
-  `co_await asio::dispatch(asio::bind_executor(executor, ...))` hop 回连接线程。
+- `ResponseWriter` / `WebSocket` / `Body` 只能在连接 executor 所在线程使用；
+  `require_owner_thread` 会记录日志并 abort 跨线程调用。需要换线程时显式
+  `asio::post(req->executor(), ...)`。
 - `engine/` 下没有 mutex / atomic。
 - 刻意的例外都在 handler 层：`RateLimiter` 的按 key 分桶加锁、Router 惰性构建
   中间件链、日志 sink 的原子替换。

@@ -52,6 +52,7 @@ class ResponseWriter {
 
     // --- fluent setters (return *this for chaining) ---
     ResponseWriter &status(int code) {
+        require_owner();
         // RFC 9110 §15: a status code is exactly three digits, 100..599. A
         // handler-set 0/9999 would serialize an illegal status line (and h2
         // clients reset the stream), so refuse it like any other bad field.
@@ -67,6 +68,7 @@ class ResponseWriter {
     bool started() const { return m_started; }
     [[nodiscard]] std::uint64_t activity() const noexcept { return m_activity.load(std::memory_order_relaxed); }
     ResponseWriter &header(std::string_view name, std::string value) {
+        require_owner();
         // A field name is a token and a value may not contain other control
         // bytes either (RFC 9110 §5.1/§5.5); otherwise "bad name" or "\x01"
         // is serialized as-is and the peer sees a malformed field section.
@@ -80,6 +82,7 @@ class ResponseWriter {
     }
 
     ResponseWriter &replace_header(std::string_view name, std::string value) {
+        require_owner();
         if (!is_http_token(name) || contains_invalid_field_value(value)) {
             SIMPLE_HTTP_ERROR_LOG("response field with invalid name/value rejected");
             m_field_rejected = true;
@@ -94,6 +97,7 @@ class ResponseWriter {
     ResponseWriter &set_cookie(std::string name, std::string value, std::chrono::seconds max_age = {},
                                std::string path = {}, std::string domain = {}, bool secure = false,
                                bool http_only = false, std::string same_site = {}) {
+        require_owner();
         // RFC 6265 §4.1.1: cookie-name is a token and cookie-value is
         // *cookie-octet (optionally DQUOTE-wrapped). Quoting is not an escape:
         // an embedded DQUOTE/backslash (or a space/comma/semicolon) would end
@@ -166,6 +170,7 @@ class ResponseWriter {
     // Status + headers with no body and no body framing at all (204/304 and
     // every response to HEAD).
     template <typename Token> auto async_send_bodyless(Token &&token) {
+        require_owner();
         // Without a body, a response can only be framed by the status (204/304)
         // or by being the answer to HEAD. A bodyless 200 on a keep-alive h1
         // connection has no length and no terminator: the peer takes the next
@@ -184,6 +189,7 @@ class ResponseWriter {
 
     // --- streaming ---
     template <typename Token> auto async_begin(Token &&token) {
+        require_owner();
         // 204/304 have no body by definition; streaming one emits a chunked
         // 204 (h1) or DATA frames (h2) that a conforming peer rejects or reads
         // as the next message. Check before prepare_one_shot() so the failure
@@ -205,6 +211,7 @@ class ResponseWriter {
 
     // Sends an interim 1xx response (100 Continue).
     template <typename Token> auto async_send_continue(Token &&token) {
+        require_owner();
         note_activity();
         auto sink = m_writer;
         return compose_one(error_code{}, sink->get_executor(), std::forward<Token>(token),
@@ -212,6 +219,7 @@ class ResponseWriter {
     }
 
     template <typename Token> auto async_write(std::string data, Token &&token) {
+        require_owner();
         note_activity();
         auto sink = m_writer;
         return compose_one(error_code{}, sink->get_executor(), std::forward<Token>(token),
@@ -225,6 +233,7 @@ class ResponseWriter {
     }
 
     template <typename Token> auto async_finish(std::string data, Token &&token) {
+        require_owner();
         note_activity();
         auto sink = m_writer;
         // Trailer fields accumulated with trailer() end the response instead of
@@ -241,6 +250,7 @@ class ResponseWriter {
     }
 
     ResponseWriter &trailer(std::string_view name, std::string value) {
+        require_owner();
         if (!is_http_token(name) || contains_invalid_field_value(value)) {
             SIMPLE_HTTP_ERROR_LOG("response trailer with invalid name/value rejected");
             m_field_rejected = true;
@@ -255,6 +265,7 @@ class ResponseWriter {
     // Ends a streamed response with the given trailing field section, replacing
     // the final finish(). Completion signature: void(error_code).
     template <typename Token> auto async_finish_trailers(Headers trailers, Token &&token) {
+        require_owner();
         for (const auto &[name, value] : trailers) {
             if (contains_ctl(name) || contains_ctl(value)) {
                 SIMPLE_HTTP_ERROR_LOG("response trailer with CR/LF/NUL rejected");
@@ -274,12 +285,14 @@ class ResponseWriter {
 
     // --- connection state ---
     template <typename Token> auto async_connected(Token &&token) const {
+        require_owner();
         auto sink = m_writer;
         return compose_connected(sink->get_executor(), std::forward<Token>(token),
                                  [sink](ConnectedCompletion done) { sink->connected(std::move(done)); });
     }
 
     template <typename Token> auto async_close(Token &&token) {
+        require_owner();
         auto sink = m_writer;
         return compose_one(error_code{}, sink->get_executor(), std::forward<Token>(token),
                            [sink](WriteCompletion done) mutable { sink->close(std::move(done)); });
@@ -290,6 +303,7 @@ class ResponseWriter {
     // --- redirect & SSE helpers ---
 
     ResponseWriter &redirect(std::string location, int code = status::found) {
+        require_owner();
         // Go through status() so 0/9999 are rejected like any other bad code
         // instead of serializing an illegal status line.
         status(code);
@@ -337,6 +351,10 @@ class ResponseWriter {
     }
 
   private:
+    // Model A: the writer is created and used on the connection thread. See
+    // require_owner_thread in core/logging.h.
+    void require_owner() const noexcept { require_owner_thread(m_owner_thread, "ResponseWriter"); }
+
     // cookie-octet = %x21 / %x23-2B / %x2D-3A / %x3C-5B / %x5D-7E
     static bool valid_cookie_value(std::string_view value) noexcept {
         for (unsigned char c : value) {
@@ -365,6 +383,7 @@ class ResponseWriter {
     // Synchronous pre-flight shared by send/send_bodyless/begin: field
     // rejection, single-head rule, defaults and the activity counter.
     error_code prepare_one_shot() {
+        require_owner();
         if (m_field_rejected) {
             return make_error_code(asio::error::invalid_argument);
         }
@@ -659,6 +678,7 @@ class ResponseWriter {
     };
 
     std::shared_ptr<ResponseSink> m_writer;
+    std::thread::id m_owner_thread{std::this_thread::get_id()};
     int m_status{status::ok};
     Headers m_headers;
     Headers m_trailers;
