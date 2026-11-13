@@ -410,8 +410,9 @@ class Server {
             std::uint16_t bound_port = inet->port;
             bool bound_ok = true;
             for (std::size_t ai = 0; ai < acceptor_count; ++ai) {
-                asio::io_context *pinned = cfg.reuse_port ? core->pool->at(ai).get() : nullptr;
-                auto &ctx = pinned != nullptr ? *pinned : *core->pool->main_context();
+                auto ctx_keep = cfg.reuse_port ? core->pool->at(ai) : core->pool->main_context();
+                asio::io_context &ctx = *ctx_keep;
+                asio::io_context *pinned = cfg.reuse_port ? &ctx : nullptr;
                 auto acceptor = std::make_shared<asio::ip::tcp::acceptor>(ctx.get_executor());
                 acceptor->open(endpoint.protocol(), ec);
                 if (!ec) {
@@ -994,7 +995,7 @@ class Server {
         rt->cids = std::make_shared<quic::SharedCidRegistry<QuicConnectionType>>();
         const std::size_t sockets = rt->reuse_port ? (core->pool->size() == 0 ? 1 : core->pool->size()) : 1;
         for (std::size_t i = 0; i < sockets; ++i) {
-            auto &ctx = rt->reuse_port ? core->pool->at(i) : core->pool->main_context();
+            auto ctx = rt->reuse_port ? core->pool->at(i) : core->pool->main_context();
             auto quic = std::make_shared<QuicEndpointType>(ctx->get_executor(), rt->tls->native_handle(),
                                                            endpoint_config, make_h3_serve(rt->limits), rt->cids);
             if (!quic->open(endpoint, rt->reuse_port, ec)) {

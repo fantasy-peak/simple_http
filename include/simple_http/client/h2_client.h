@@ -438,6 +438,23 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
     }
 
   private:
+    // Delivers the head, then retires a bodyless stream (HEAD, 204/304): its
+    // END_STREAM was on the header block, so fill_data_frames() — the normal
+    // retirer — never runs for it. The handle keeps the outcome, so a later
+    // read() still reports end even though the session entry is gone.
+    void complete_head_await(std::uint32_t id, WriteCompletion done) {
+        std::move(done)(error_code{});
+        auto it = m_streams.find(id);
+        if (it == m_streams.end())
+            return;
+        Stream &st = it->second;
+        // Both halves must be done. A bodyless response can also arrive before
+        // a streaming request body has been fully framed (an early 204); that
+        // stream is retired by fill_data_frames() once local_end is set.
+        if (st.head_seen && st.remote_end && st.local_end && st.in_queue.empty())
+            it_finish(it, StreamState::Eof);
+    }
+
     void await_head_impl(std::uint32_t id, WriteCompletion done) {
         auto it = m_streams.find(id);
         if (it == m_streams.end()) {
@@ -446,7 +463,7 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
         }
         Stream &st = it->second;
         if (st.head_seen) {
-            std::move(done)(error_code{});
+            complete_head_await(id, std::move(done));
             return;
         }
         if (st.failed || st.reset) {

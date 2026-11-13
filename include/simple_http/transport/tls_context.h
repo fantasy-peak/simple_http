@@ -95,6 +95,16 @@ class TlsContext {
 
     asio::ssl::context &context() { return m_ctx; }
 
+    // The ALPN select callback registered below holds `&m_alpn_state`. That
+    // address must never change: a move (or vector reallocation of TlsContext
+    // values) would leave OpenSSL pointing at the moved-from member. Callers
+    // hold this type behind shared_ptr (make_shared<TlsContext>), so deleting
+    // the special members costs nothing.
+    TlsContext(const TlsContext &) = delete;
+    TlsContext &operator=(const TlsContext &) = delete;
+    TlsContext(TlsContext &&) = delete;
+    TlsContext &operator=(TlsContext &&) = delete;
+
   private:
     // OpenSSL's lazy tables must be initialized before the first SSL_CTX is
     // built; see transport/openssl_init.h. Keeping it in the initializer keeps

@@ -144,19 +144,28 @@ inline Middleware recovery() {
         const ResponsePtr fallback = res;
         const RequestPtr req_keep = req;
         auto completion = std::make_shared<HandlerCompletion>(std::move(done));
+        auto completed = std::make_shared<bool>(false);
+        // Exactly one completion, whatever the downstream chain does. It may
+        // complete synchronously and then throw; the catch block must then not
+        // invoke the (already moved-from) std::function — that used to escape
+        // as bad_function_call out of the io_context.
+        auto complete_once = [completion, completed]() {
+            if (std::exchange(*completed, true))
+                return;
+            auto finish = std::move(*completion);
+            std::move(finish)();
+        };
         try {
-            next(std::move(req), std::move(res), ssl, [completion]() mutable {
-                auto finish = std::move(*completion);
-                std::move(finish)();
-            });
+            next(std::move(req), std::move(res), ssl, complete_once);
         } catch (const std::exception &e) {
+            if (*completed)
+                return; // downstream already delivered its completion
             if (req_keep && req_keep->cancelled()) {
-                auto finish = std::move(*completion);
-                std::move(finish)();
+                complete_once();
                 return;
             }
             SIMPLE_HTTP_ERROR_LOG("middleware chain threw: {}", e.what());
-            auto finish = finish_with(std::move(*completion));
+            auto finish = finish_with(HandlerCompletion{complete_once});
             if (fallback->started()) {
                 fallback->async_close(std::move(finish));
             } else {
@@ -164,8 +173,10 @@ inline Middleware recovery() {
                 fallback->async_send("", std::move(finish));
             }
         } catch (...) {
+            if (*completed)
+                return;
             SIMPLE_HTTP_ERROR_LOG("middleware chain threw: non-std exception");
-            auto finish = finish_with(std::move(*completion));
+            auto finish = finish_with(HandlerCompletion{complete_once});
             if (fallback->started()) {
                 fallback->async_close(std::move(finish));
             } else {

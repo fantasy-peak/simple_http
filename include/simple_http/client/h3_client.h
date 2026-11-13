@@ -689,7 +689,15 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         }
         if (st.remote_end) {
             st.outcome->set(StreamState::Eof);
-            erase_stream(it->first);
+            // An early response (e.g. 413) FIN can arrive while request-body
+            // bytes are still queued: ngtcp2 retransmits from out_q memory, so
+            // the entry may only be released once every queued byte is ACKed.
+            // Keep it (the stream handle already has the EOF outcome) and let
+            // on_acked() erase it.
+            if (st.out_q.empty())
+                erase_stream(it->first);
+            else
+                st.release_after_ack = true;
             std::move(done)(error_code{}, ReadResult::end());
             return;
         }
@@ -834,6 +842,14 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         it->second->remote_end = true;
         if (it->second->outcome->get() == StreamState::Open && it->second->in_queue.empty())
             it->second->outcome->set(StreamState::Eof);
+        // The QUIC stream is gone: ngtcp2 will not retransmit from out_q any
+        // more, so those buffers can be dropped even though never ACKed.
+        it->second->out_q.clear();
+        it->second->out_bytes = 0;
+        if (it->second->release_after_ack && it->second->in_queue.empty()) {
+            erase_stream(stream_id);
+            return;
+        }
         h3::wake(it->second->in_space);
         h3::wake(it->second->out_space);
     }
@@ -1116,6 +1132,14 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         it->second->remote_end = true;
         if (it->second->in_queue.empty() && it->second->outcome->get() == StreamState::Open)
             it->second->outcome->set(StreamState::Eof);
+        // nghttp3 closed the stream: the transport no longer references the
+        // request-body buffers, ACKed or not.
+        it->second->out_q.clear();
+        it->second->out_bytes = 0;
+        if (it->second->release_after_ack && it->second->in_queue.empty()) {
+            erase_stream(stream_id);
+            return;
+        }
         h3::wake(it->second->in_space);
     }
 
@@ -1131,6 +1155,12 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
             st.out_base += st.out_q.front().size();
             st.out_bytes -= st.out_q.front().size();
             st.out_q.pop_front();
+        }
+        // The application already saw the response end; now that ngtcp2 no
+        // longer needs the request bytes, the entry can be released.
+        if (st.release_after_ack && st.out_q.empty()) {
+            erase_stream(stream_id);
+            return;
         }
         h3::wake(st.out_space);
     }
@@ -1224,6 +1254,10 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         std::uint64_t out_ack{0};
         bool out_eof{false};
         bool data_blocked{false};
+        // The peer ended the response while request bytes were still queued.
+        // The map entry (and its out_q) stays until on_acked drains it — QUIC
+        // may still retransmit from those buffers.
+        bool release_after_ack{false};
 
         // Capacity-1 coalescing wake-ups, created with the session's executor
         // when the stream is opened. `wake()` posts, so they are safe to nudge

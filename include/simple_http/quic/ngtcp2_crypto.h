@@ -86,6 +86,11 @@ class QuicCrypto {
     }
 
     ~QuicCrypto() {
+        // The constructor leaves m_ctx null when ctx_new() failed; querying the
+        // SSL out of a null context is not a valid no-op for every ngtcp2
+        // build.
+        if (m_ctx == nullptr)
+            return;
         if (SSL *ssl = ngtcp2_crypto_ossl_ctx_get_ssl(m_ctx)) {
             // Clear the back-pointer before the SSL dies: a free is not a
             // callback, but leaving a pointer to a destroyed ref inside a

@@ -25,6 +25,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -367,16 +368,19 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
         auto transport = m_transport;
         touch_deadline();
         auto payload = std::make_shared<std::string>(std::move(data));
+        // The size prefix is part of the buffer a pending write points into; it
+        // cannot live on this stack frame (that frame is gone as soon as the
+        // initiation returns).
+        auto prefix = std::make_shared<std::string>();
+        char hex[2 * sizeof(std::size_t) + 2];
+        auto [end, ec] = std::to_chars(hex, hex + sizeof(hex) - 2, payload->size(), 16);
+        (void)ec;
+        prefix->assign(hex, static_cast<std::size_t>(end - hex));
+        prefix->append("\r\n");
         detail::async_error_only(
             m_executor, std::move(finish),
-            [transport, payload](asio::any_completion_handler<void(error_code, std::size_t)> handler) {
-                char hex[2 * sizeof(std::size_t) + 2];
-                auto [end, ec] = std::to_chars(hex, hex + sizeof(hex) - 2, payload->size(), 16);
-                (void)ec;
-                *end++ = '\r';
-                *end++ = '\n';
-                const std::string_view size{hex, static_cast<std::size_t>(end - hex)};
-                const std::array<ConstByteSpan, 3> buffers{as_bytes(size), as_bytes(*payload), as_bytes(kCrLf)};
+            [transport, payload, prefix](asio::any_completion_handler<void(error_code, std::size_t)> handler) {
+                const std::array<ConstByteSpan, 3> buffers{as_bytes(*prefix), as_bytes(*payload), as_bytes(kCrLf)};
                 transport->async_write_seq(boost::span<const ConstByteSpan>{buffers.data(), buffers.size()},
                                            std::move(handler));
             });
@@ -410,16 +414,17 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
         auto transport = m_transport;
         touch_deadline();
         auto payload = std::make_shared<std::string>(std::move(data));
+        // Same as do_send_chunk: the prefix must outlive the initiation.
+        auto prefix = std::make_shared<std::string>();
+        char hex[2 * sizeof(std::size_t) + 2];
+        auto [end, ec] = std::to_chars(hex, hex + sizeof(hex) - 2, payload->size(), 16);
+        (void)ec;
+        prefix->assign(hex, static_cast<std::size_t>(end - hex));
+        prefix->append("\r\n");
         detail::async_error_only(
             m_executor, std::move(finish),
-            [transport, payload](asio::any_completion_handler<void(error_code, std::size_t)> handler) {
-                char hex[2 * sizeof(std::size_t) + 2];
-                auto [end, ec] = std::to_chars(hex, hex + sizeof(hex) - 2, payload->size(), 16);
-                (void)ec;
-                *end++ = '\r';
-                *end++ = '\n';
-                const std::string_view size{hex, static_cast<std::size_t>(end - hex)};
-                const std::array<ConstByteSpan, 4> buffers{as_bytes(size), as_bytes(*payload), as_bytes(kCrLf),
+            [transport, payload, prefix](asio::any_completion_handler<void(error_code, std::size_t)> handler) {
+                const std::array<ConstByteSpan, 4> buffers{as_bytes(*prefix), as_bytes(*payload), as_bytes(kCrLf),
                                                            as_bytes(kLastChunk)};
                 transport->async_write_seq(boost::span<const ConstByteSpan>{buffers.data(), buffers.size()},
                                            std::move(handler));
@@ -734,7 +739,43 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
         m_body_state.done = true;
     }
 
+    // Serializes body pulls. The pull path owns m_in/m_scan/m_body_state, so a
+    // handler that leaves a read outstanding (a callback read or a detached
+    // coroutine) and then returns must not have after_handler() start a second
+    // drain pull over the same state. The second request is queued and starts
+    // when the first completion runs.
     void pull_body_chunk(PullCompletion done) {
+        if (m_pull_active) {
+            m_pending_pulls.push_back(std::move(done));
+            return;
+        }
+        m_pull_active = true;
+        // weak: a pending pull must not keep the engine alive through a
+        // completion it may never deliver.
+        auto weak = this->weak_from_this();
+        auto finished = std::make_shared<bool>(false);
+        auto completion = [weak, done = std::move(done), finished](error_code ec, ReadResult r) mutable {
+            if (std::exchange(*finished, true))
+                return;
+            auto self = weak.lock();
+            if (self)
+                self->m_pull_active = false;
+            std::move(done)(ec, std::move(r));
+            if (self)
+                self->drain_pending_pulls();
+        };
+        pull_body_chunk_impl(PullCompletion{std::move(completion)});
+    }
+
+    void drain_pending_pulls() {
+        if (m_pull_active || m_pending_pulls.empty())
+            return;
+        auto next = std::move(m_pending_pulls.front());
+        m_pending_pulls.pop_front();
+        pull_body_chunk(std::move(next));
+    }
+
+    void pull_body_chunk_impl(PullCompletion done) {
         if (m_body_state.done) {
             std::move(done)(error_code{}, ReadResult::end());
             return;
@@ -1390,6 +1431,8 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
     BodyState m_body_state;
     std::weak_ptr<Request> m_body_request;
     std::shared_ptr<std::atomic<bool>> m_continue_sent{std::make_shared<std::atomic<bool>>(false)};
+    bool m_pull_active{false};
+    std::deque<PullCompletion> m_pending_pulls;
     std::size_t m_trailer_bytes{0};
     Dispatcher m_dispatch;
     WsLookup m_ws_lookup;

@@ -325,7 +325,16 @@ inline bool StaticTable::load(std::string &error) {
         error = "cannot walk static root: " + ec.message();
         return false;
     }
-    for (const auto &dir_entry : it) {
+    // increment(ec), not the throwing operator++: this function has a
+    // bool+error contract and must not let a directory that changes under the
+    // scan raise filesystem_error out of build().
+    std::error_code walk_ec;
+    for (; it != std::filesystem::recursive_directory_iterator(); it.increment(walk_ec)) {
+        if (walk_ec) {
+            error = "cannot walk static root: " + walk_ec.message();
+            return false;
+        }
+        const auto &dir_entry = *it;
         std::error_code se;
         if (dir_entry.is_symlink(se)) {
             ++m_stats.skipped_symlinks;
@@ -342,6 +351,10 @@ inline bool StaticTable::load(std::string &error) {
         if (re)
             continue;
         rels.push_back(rel.generic_string());
+    }
+    if (walk_ec) {
+        error = "cannot walk static root: " + walk_ec.message();
+        return false;
     }
     std::sort(rels.begin(), rels.end()); // deterministic keys and preload order
 

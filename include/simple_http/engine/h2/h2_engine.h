@@ -1046,12 +1046,28 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
         });
     }
 
+    // Bounds the teardown wait for an in-flight write. Deliberately a separate
+    // timer from the idle watchdog: finish_connection() cancels that watchdog
+    // on every call, which would cancel this deadline too.
+    void arm_finish_deadline() {
+        if (m_finish_deadline_armed)
+            return;
+        m_finish_deadline_armed = true;
+        m_finish_timer->expires_after(std::chrono::seconds(2));
+        m_finish_timer->async_wait([self = this->shared_from_this()](error_code ec) {
+            if (!ec)
+                self->m_transport->close();
+        });
+    }
+
     void finish_connection() {
         if (!m_finished) {
             m_finished = true;
             m_alive = false;
             m_watchdog->cancel();
             m_notify.close();
+            // Queued handlers must not start after teardown (see pump_dispatch).
+            m_pending_dispatch.clear();
             for (auto &entry : m_streams) {
                 if (entry.second.request) {
                     (void)entry.second.request->body().fail(make_error_code(asio::error::connection_reset));
@@ -1067,8 +1083,16 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
         // An in-flight write owns the transport; waiting for it avoids two
         // concurrent async_write operations corrupting the byte stream. Its
         // completion calls back here.
-        if (m_write_in_flight)
+        //
+        // The wait is bounded: the idle watchdog was cancelled just above, and
+        // a peer that stops reading (zero window) would otherwise leave the
+        // write — and this engine, its connection slot, and the teardown future
+        // — pending forever. Closing the transport aborts the write, whose
+        // completion re-enters here.
+        if (m_write_in_flight) {
+            arm_finish_deadline();
             return;
+        }
         if (m_finish_started)
             return;
         m_finish_started = true;
@@ -1109,6 +1133,8 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
         if (m_done_called)
             return;
         m_done_called = true;
+        if (m_finish_timer)
+            m_finish_timer->cancel();
         auto on_done = std::move(m_on_done);
         if (on_done) {
             on_done();
@@ -1464,6 +1490,12 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
                 it->second.half_closed_remote = true;
                 mark_ws_remote_end(it->second);
                 (void)it->second.request->body().finish();
+                // A trailing HEADERS is a third way to end the remote half
+                // (DATA END_STREAM and the response's END_STREAM both call
+                // maybe_complete_stream). Without this, a stream whose
+                // response already completed is never retired and holds a
+                // concurrency slot for the connection's lifetime.
+                maybe_complete_stream(hdr.stream_id);
             }
             // Dispatch as soon as the request head is complete. The handler runs
             // concurrently with any DATA frames still arriving, reading the body
@@ -1531,6 +1563,8 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
             if (it2->second.half_closed_remote) {
                 mark_ws_remote_end(it2->second);
                 (void)it2->second.request->body().finish();
+                // Same retirement rule as the single-frame trailer path.
+                maybe_complete_stream(hdr.stream_id);
             }
             return dispatch_stream(hdr.stream_id);
         }
@@ -2555,6 +2589,13 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
     }
 
     void pump_dispatch() {
+        // After teardown the requests were already failed and cancelled
+        // without a cancellation slot; starting them now would run a handler
+        // for a connection that is gone.
+        if (!m_alive || m_finished) {
+            m_pending_dispatch.clear();
+            return;
+        }
         while (m_active_handlers < m_limits.h2_max_concurrent_streams && !m_pending_dispatch.empty()) {
             const std::uint32_t id = m_pending_dispatch.front();
             m_pending_dispatch.pop_front();
@@ -3083,9 +3124,13 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
     EngineLimits m_limits;
     std::chrono::steady_clock::time_point m_deadline{};
     std::shared_ptr<asio::steady_timer> m_watchdog{std::make_shared<asio::steady_timer>(m_executor)};
+    // Separate from m_watchdog: finish_connection() cancels the watchdog but
+    // must keep this deadline armed.
+    std::shared_ptr<asio::steady_timer> m_finish_timer{std::make_shared<asio::steady_timer>(m_executor)};
     std::function<void()> m_on_done;
     bool m_finished{false};
     bool m_finish_started{false};
+    bool m_finish_deadline_armed{false};
     bool m_write_in_flight{false};
     bool m_done_called{false};
     std::array<std::byte, 32 * 1024> m_read_scratch{};

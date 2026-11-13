@@ -18,7 +18,9 @@
 #include <boost/asio.hpp>
 #include <cassert>
 #include <cstddef>
+#include <memory>
 #include <optional>
+#include <type_traits>
 #include <utility>
 
 #include "../core/compat.h"
@@ -99,10 +101,27 @@ template <typename Start> struct ErrorOnlyOp {
     template <typename Self> void operator()(Self &self, error_code ec = {}, std::size_t = 0) {
         if (!started) {
             started = true;
-            // See the note in response.h: the handler construction moves this
-            // operation (and `start`) into the handler.
-            auto action = std::move(start);
-            action(asio::any_completion_handler<void(error_code, std::size_t)>(std::move(self)));
+            // `start` owns whatever the inner operation was handed: the shared
+            // string behind a response, and the framed prefix of a chunk. The
+            // inner operation only receives raw buffer descriptors, so it must
+            // keep that owner alive for as long as it is pending. Moving
+            // `start` into a local and returning released it at initiation
+            // time, which is a use-after-free the moment the first
+            // async_write_some is partial (large body, slow reader, zero
+            // window).
+            //
+            // Hand one copy to the completion handler (it only holds cheap
+            // shared_ptr captures) and invoke the other. The handler's copy is
+            // what keeps the buffers alive; no additional allocation is made
+            // beyond the one `any_completion_handler` already performs.
+            static_assert(std::is_copy_constructible_v<Start>, "async_error_only's Start must be copyable");
+            auto action = start;
+            auto inner = asio::any_completion_handler<void(error_code, std::size_t)>(
+                [keep = std::move(start), self = std::move(self)](error_code inner_ec, std::size_t) mutable {
+                    (void)keep;
+                    self.complete(inner_ec);
+                });
+            action(std::move(inner));
             return;
         }
         self.complete(ec);

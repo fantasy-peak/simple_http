@@ -7,6 +7,7 @@
 #include <memory>
 #include <stdexcept>
 #include <thread>
+#include <type_traits>
 
 #include "simple_http.h"
 #include "test_support.h"
@@ -933,4 +934,61 @@ TEST_CASE("review: h2 connection window is 65535 even with a smaller stream wind
     pump();
 
     CHECK_FALSE(written_has_goaway(transport->written(), codec::H2_FLOW_CONTROL_ERROR));
+}
+
+TEST_CASE("request: state pointers survive later set_state calls", "[request][review]") {
+    asio::io_context ctx;
+    Request req(Version::Http11, ctx.get_executor());
+
+    req.set_state<int>(42);
+    int *value = req.get_state<int>();
+    REQUIRE(value != nullptr);
+
+    // A middleware chain keeps setting more state after an inner layer took a
+    // pointer. Growing the container must not move the existing element.
+    for (int i = 0; i < 64; ++i)
+        req.set_state(std::string(64, 'x'));
+
+    CHECK(*value == 42);
+}
+
+TEST_CASE("request: path parameters survive a target rewrite", "[request][review]") {
+    asio::io_context ctx;
+    Request req(Version::Http11, ctx.get_executor());
+
+    req.set_target("/users/12345678901234567890/profile");
+    const auto path = req.path();
+    const auto pos = path.find("/12345678901234567890");
+    REQUIRE(pos != std::string_view::npos);
+    req.set_param("id", path.substr(pos + 1, 20));
+
+    // A route-level clean_path()/strip_prefix() rewrites the target after the
+    // Router captured the parameter.
+    req.set_target("/users/12345678901234567890/profile/");
+
+    const auto id = req.param("id");
+    REQUIRE(id.has_value());
+    CHECK(*id == "12345678901234567890");
+}
+
+static_assert(!std::is_move_constructible_v<TlsContext>, "TlsContext registers &m_alpn_state with OpenSSL");
+static_assert(!std::is_move_assignable_v<TlsContext>, "TlsContext registers &m_alpn_state with OpenSSL");
+static_assert(!std::is_copy_constructible_v<TlsContext>, "TlsContext registers &m_alpn_state with OpenSSL");
+static_assert(!std::is_reference_v<decltype(std::declval<IoCtxPool &>().at(0))>,
+              "at() must not return a reference into a vector add_main_context() can reallocate");
+
+TEST_CASE("transport: async_error_only keeps the buffer owner alive", "[transport][review]") {
+    asio::io_context ctx;
+    auto buffer = std::make_shared<std::string>("0123456789");
+    asio::any_completion_handler<void(error_code, std::size_t)> pending;
+
+    detail::async_error_only(ctx.get_executor(), asio::detached,
+                             [buffer, &pending](asio::any_completion_handler<void(error_code, std::size_t)> handler) {
+                                 // Mirror an async_write that has not completed yet: it holds only
+                                 // the buffer descriptors, so the owner must be kept by the pending
+                                 // operation.
+                                 pending = std::move(handler);
+                             });
+
+    CHECK(buffer.use_count() >= 2); // caller + pending operation
 }

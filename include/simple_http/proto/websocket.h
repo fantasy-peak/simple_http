@@ -183,7 +183,7 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
                 m_in.reset();
                 m_deflate.enabled = false;
             }
-            m_write_compression = m_compress_active;
+            m_write_compression.store(m_compress_active.load(std::memory_order_relaxed), std::memory_order_relaxed);
         }
     }
 
@@ -806,8 +806,11 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
     std::size_t m_inbox_limit;
     bool m_expect_masked{true};
     WsDeflateConfig m_deflate;
-    bool m_compress_active{false};
-    bool m_write_compression{false};
+    // write_view()/compression_negotiated() read these synchronously from the
+    // caller's thread, before hopping onto the connection executor. They are
+    // written on the executor, so the snapshot must be atomic.
+    std::atomic<bool> m_compress_active{false};
+    std::atomic<bool> m_write_compression{false};
     int m_compression_level{0};
     std::unique_ptr<WsDeflater> m_out;
     std::unique_ptr<WsInflater> m_in;

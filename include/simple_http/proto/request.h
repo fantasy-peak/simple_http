@@ -14,6 +14,8 @@
 #include <boost/asio/cancellation_signal.hpp>
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -270,9 +272,9 @@ class Request {
     // (`/users/{id}`) — nullopt when the route was not a template or the name
     // was not in it. The value is a view into the request path.
     std::optional<std::string_view> param(std::string_view name) const {
-        for (const auto &[n, v] : m_params) {
-            if (n == name)
-                return v;
+        for (const auto &p : m_params) {
+            if (p.name == name)
+                return p.view(m_target);
         }
         return std::nullopt;
     }
@@ -437,9 +439,24 @@ class Request {
     [[nodiscard]] asio::any_io_executor executor() const noexcept { return m_exec; }
 
     // --- population API (engine side) ---
-    // Router side: records one captured template segment. The value must be a
-    // view into the request path (it is, for dispatch's own captures).
-    void set_param(std::string name, std::string_view value) { m_params.emplace_back(std::move(name), value); }
+    // Router side: records one captured template segment. The value is normally
+    // a view into m_target, so it is recorded as an offset (no allocation) and
+    // resolved against the current target by param(). A move of the Request or
+    // a rewrite of the target therefore cannot leave a dangling view.
+    void set_param(std::string name, std::string_view value) {
+        const auto base = reinterpret_cast<std::uintptr_t>(m_target.data());
+        const auto ptr = reinterpret_cast<std::uintptr_t>(value.data());
+        const bool inside = ptr >= base && ptr - base <= m_target.size() &&
+                            value.size() <= m_target.size() - static_cast<std::size_t>(ptr - base);
+        if (inside) {
+            m_params.push_back(
+                ParamRef{std::move(name), static_cast<std::size_t>(ptr - base), value.size(), std::nullopt});
+        } else {
+            // Defensive fallback for a caller that hands in an unrelated view:
+            // keep an owned copy rather than a pointer into unknown storage.
+            m_params.push_back(ParamRef{std::move(name), 0, 0, std::string{value}});
+        }
+    }
 
     // Keeps the wire token in sync with the enum. The client engines write the
     // token (not the enum), so a Request built with set_method(Post) must carry
@@ -487,9 +504,25 @@ class Request {
     Headers m_headers;
     Headers m_trailers;
 
-    // Path parameters from a template route, published by the Router during
-    // dispatch. Values are views into m_target (stable after set_target).
-    std::vector<std::pair<std::string, std::string_view>> m_params;
+    // One captured path parameter. The view is stored as an offset into
+    // m_target: that survives a target rewrite and a Request move without the
+    // per-parameter allocation an owned string would cost on every template
+    // route. `owned` is the defensive path for a value not inside the target.
+    struct ParamRef {
+        std::string name;
+        std::size_t offset{0};
+        std::size_t length{0};
+        std::optional<std::string> owned;
+
+        std::string_view view(const std::string &target) const {
+            if (owned)
+                return *owned;
+            if (offset > target.size() || length > target.size() - offset)
+                return {};
+            return std::string_view{target}.substr(offset, length);
+        }
+    };
+    std::vector<ParamRef> m_params;
 
     // The request URL query, parsed lazily on first query_params() access.
     // Mutable because query_params() is a const observer (like Headers::get).
@@ -498,7 +531,12 @@ class Request {
 
     // Per-request state set by middleware (see set_state/get_state). Stored
     // type-erased; lookups scan from the back so the most recent set wins.
-    std::vector<std::any> m_state;
+    //
+    // A deque, not a vector: get_state<T>()/log_fields() hand out pointers and
+    // references into these elements, and middleware chains keep setting more
+    // state after taking them. `deque::push_back` does not move existing
+    // elements, so those pointers stay valid for the request's lifetime.
+    std::deque<std::any> m_state;
 
     // Request-scoped cancellation (see cancel()/cancellation_slot() above).
     // Shared so a cross-thread cancel can post an emission that outlives the
