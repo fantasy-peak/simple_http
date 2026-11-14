@@ -948,6 +948,14 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         // field section of any size, because "how big is too big" is the
         // application's to decide. `get_frame_payload_left2` is a getter, so
         // calling it here does not re-enter the parser.
+        //
+        // A false return is a nghttp3 callback failure, i.e. a connection
+        // error. That is deliberate: nghttp3 enforces SETTINGS_MAX_FIELD_SECTION_SIZE
+        // itself in QPACK, and that failure is connection-fatal too, so a
+        // "mark the stream and reset it" variant does not buy RFC 9114 §4.2.2's
+        // stream error — it only turns our precise H3_EXCESSIVE_LOAD into
+        // nghttp3's H3_INTERNAL_ERROR. Keeping this check reports the useful
+        // code.
         if (nghttp3_conn_get_frame_payload_left2(m_h3, stream_id) > m_limits.max_header_bytes) {
             m_oversize_stream = stream_id;
             return false;

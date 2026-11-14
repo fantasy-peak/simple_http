@@ -146,6 +146,19 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
         });
     }
 
+    // Raw bytes on the wire (the ws 101 handshake). They go through the same
+    // per-connection writer as any response a route/middleware has already
+    // queued, so a second transport write can never overlap it.
+    void enqueue_raw(std::string bytes, WriteCompletion done) {
+        on_executor([self = this->shared_from_this(), bytes = std::move(bytes), done = std::move(done)]() mutable {
+            if (!self->m_open) {
+                std::move(done)(make_error_code(asio::error::not_connected));
+                return;
+            }
+            self->m_writer->enqueue(WriteEntry::owned(std::move(bytes)), self->wrap(std::move(done)));
+        });
+    }
+
     Version version() const override { return m_version; }
     asio::any_io_executor get_executor() const override { return m_executor; }
     bool head_request() const noexcept override { return m_head_request; }
@@ -1110,11 +1123,14 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
         auto writer = std::make_shared<Http1ResponseSink<Transport>>(m_transport, head.version, m_deadline,
                                                                      m_limits.idle_timeout, m_limits.alt_svc_value());
         auto response = std::make_shared<ResponseWriter>(writer);
+        // Keep the sink (and therefore its writer) alive for the whole 101
+        // exchange; reset once the transport is handed to the WebSocket.
+        m_active_writer = writer;
 
         auto self = this->shared_from_this();
-        WsUpgrade upgrade = [self](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res,
-                                   CallbackWsHandler handler, WsUpgradeCompletion done) mutable {
-            self->try_websocket_upgrade(std::move(req), std::move(res), std::move(handler), std::move(done));
+        WsUpgrade upgrade = [self, writer](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res,
+                                           CallbackWsHandler handler, WsUpgradeCompletion done) mutable {
+            self->try_websocket_upgrade(std::move(req), std::move(res), writer, std::move(handler), std::move(done));
         };
 
         const std::string_view path = request_path(head.target);
@@ -1151,7 +1167,12 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
     }
 
     void try_websocket_upgrade(std::shared_ptr<Request> request, std::shared_ptr<ResponseWriter> res,
-                               CallbackWsHandler handler, WsUpgradeCompletion done) {
+                               std::shared_ptr<Http1ResponseSink<Transport>> sink, CallbackWsHandler handler,
+                               WsUpgradeCompletion done) {
+        if (!sink) {
+            std::move(done)(make_error_code(asio::error::not_connected), false);
+            return;
+        }
         WsDeflateConfig deflate;
         if (m_limits.ws_compression) {
             const auto offered = request->header("sec-websocket-extensions").value_or(std::string_view{});
@@ -1191,11 +1212,11 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
         resp += "\r\n";
 
         auto self = this->shared_from_this();
-        auto keep = std::make_shared<std::string>(std::move(resp));
         touch_deadline();
-        m_transport->async_write(
-            ConstByteSpan{reinterpret_cast<const std::byte *>(keep->data()), keep->size()},
-            [self, keep, request, handler, deflate, done = std::move(done)](error_code ec, std::size_t) mutable {
+        // Serialized with any response bytes the route/middleware wrote before
+        // accepting the upgrade (see enqueue_raw).
+        sink->enqueue_raw(
+            std::move(resp), [self, request, handler, deflate, done = std::move(done)](error_code ec) mutable {
                 if (ec) {
                     std::move(done)(ec, false);
                     return;
@@ -1206,6 +1227,8 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
                     /*expect_masked=*/true, self->m_limits.ws_read_ahead_bytes, deflate);
                 backend->feed(self->m_in.view());
                 self->m_in.clear();
+                // The transport now belongs to the WebSocket backend.
+                self->m_active_writer.reset();
                 auto ws = std::make_shared<WebSocket>(std::move(backend));
                 ws->run_writer();
                 // Run the ws handler; when it finishes, close gracefully.
