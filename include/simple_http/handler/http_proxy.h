@@ -41,6 +41,18 @@ inline bool proxy_drops_response_field(std::string_view name) {
     return is_hop_by_hop_field(name) || name == "content-length" || name == "transfer-encoding";
 }
 
+// The ClientConfig a reverse-proxy hop actually dials with.
+//
+// A server-side upstream hop must not be silently rerouted through an ambient
+// HTTP(S)_PROXY: that sends the inbound Authorization/Cookie to an unrelated
+// proxy and contradicts the documented default (`use_env_proxy` is the opt-in).
+// An explicitly configured ClientConfig::proxy still wins inside select_proxy(),
+// and an explicit proxy_from_env=false is honored even when the route opts in.
+inline ClientConfig proxy_hop_client_config(ClientConfig cfg, const HttpProxyTarget &target) {
+    cfg.proxy_from_env = cfg.proxy_from_env && target.use_env_proxy;
+    return cfg;
+}
+
 } // namespace detail
 
 inline void run_http_proxy(RequestPtr req, ResponsePtr res, bool client_is_tls, HttpProxyTarget target,
@@ -129,7 +141,8 @@ inline void run_http_proxy(RequestPtr req, ResponsePtr res, bool client_is_tls, 
         }
     }
 
-    auto client = std::make_shared<Client>(req->executor(), std::move(client_cfg));
+    auto client =
+        std::make_shared<Client>(req->executor(), detail::proxy_hop_client_config(std::move(client_cfg), target));
     const std::string url = std::string{target.tls ? "https://" : "http://"} + target.host + ":" +
                             std::to_string(target.port == 0 ? (target.tls ? 443 : 80) : target.port) + forwarded_target;
     const std::size_t cap = 64u * 1024 * 1024;

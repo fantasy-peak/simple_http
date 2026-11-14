@@ -173,6 +173,35 @@ TEST_CASE("static: a FIFO is never opened", "[static]") {
     CHECK(site->find("/pipe") == nullptr);
     CHECK(site->stats().skipped_other >= 1);
 }
+
+// S3: the scan skips symlinks, but a file that is too large to preload is
+// re-opened by path on every request. If an attacker can write the document
+// root, replacing that file with a symlink after the scan escapes the root.
+TEST_CASE("static: an on-demand read refuses a file replaced by a symlink", "[static]") {
+    StaticFixture fx;
+    fx.write("victim.txt", "0123456789abcdef"); // 16 bytes
+    const auto outside = fx.root().parent_path() / ("simple_http_secret_" + std::to_string(::getpid()));
+    {
+        std::ofstream out(outside, std::ios::binary);
+        out << "SECRET-SECRET-SECRET-SECRET"; // longer than the scanned size
+    }
+
+    StaticTableConfig cfg;
+    cfg.root = fx.root_string();
+    cfg.preload_max_file_bytes = 0; // force read_body() to hit the filesystem
+    StaticTable table{cfg};
+    std::string error;
+    REQUIRE(table.load(error));
+
+    const StaticEntry *entry = table.find("/victim.txt");
+    REQUIRE(entry != nullptr);
+    std::filesystem::remove(fx.root() / "victim.txt");
+    std::filesystem::create_symlink(outside, fx.root() / "victim.txt");
+
+    const auto body = table.read_body(entry->identity);
+    CHECK_FALSE(body.has_value());
+    std::filesystem::remove(outside);
+}
 #else
 TEST_CASE("static: symlink and FIFO cases are POSIX-only", "[static]") { SUCCEED(); }
 #endif

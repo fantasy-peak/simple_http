@@ -281,3 +281,37 @@ TEST_CASE("client/proxy: error codes carry proxy-specific messages", "[client][p
           "the proxy refused the tunnel or its reply was malformed");
     CHECK(make_error_code(client_errc::proxy_auth_failed).message() == "the proxy rejected the configured credentials");
 }
+
+// S4: Router::http_proxy's default ClientConfig has proxy_from_env=true, so an
+// ambient HTTP_PROXY used to reroute the upstream hop (carrying the inbound
+// Authorization/Cookie) unless HttpProxyTarget::use_env_proxy was wired. The hop
+// config must consult the environment only when the route opted in.
+TEST_CASE("handler/http_proxy: the ambient proxy is off unless use_env_proxy is set", "[handler][proxy][security]") {
+    HttpProxyTarget target_desc;
+    ClientConfig defaults; // what Router::http_proxy passes by default
+    const auto env = env_with("http://env:3128", {}, {});
+
+    // Reproduction of the mechanism: an unmodified default config selects the
+    // ambient proxy for a plaintext upstream.
+    auto before = select_proxy(defaults, target("backend.internal", false), env);
+    REQUIRE(before.has_value());
+    CHECK(before->has_value());
+
+    const ClientConfig hop = proxy_hop_client_config(defaults, target_desc);
+    CHECK_FALSE(hop.proxy_from_env);
+    auto after = select_proxy(hop, target("backend.internal", false), env);
+    REQUIRE(after.has_value());
+    CHECK_FALSE(after->has_value());
+
+    target_desc.use_env_proxy = true;
+    const ClientConfig opted_in = proxy_hop_client_config(defaults, target_desc);
+    CHECK(opted_in.proxy_from_env);
+    auto allowed = select_proxy(opted_in, target("backend.internal", false), env);
+    REQUIRE(allowed.has_value());
+    CHECK(allowed->has_value());
+
+    // An explicit proxy_from_env=false still wins over the route opt-in.
+    ClientConfig explicit_off;
+    explicit_off.proxy_from_env = false;
+    CHECK_FALSE(proxy_hop_client_config(explicit_off, target_desc).proxy_from_env);
+}

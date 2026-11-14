@@ -7,15 +7,18 @@
 
 #include <boost/asio.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
 #include "simple_http.h"
+#include "test_support.h"
 
 using namespace simple_http;
 
@@ -144,4 +147,37 @@ TEST_CASE("h1/ws: the 101 is serialized with a response written before the upgra
     // not start a second transport write of its own.
     CHECK(transport->writes() == 1);
     CHECK_FALSE(transport->overlap());
+}
+
+// S6: a WS route (or one of its middleware) that throws synchronously used to
+// propagate out of handle_websocket() and then out of io_context::run(), which
+// terminates the worker process. It must be turned into a 500 like an ordinary
+// handler exception.
+TEST_CASE("h1/ws: a route that throws synchronously is answered with 500", "[h1][ws]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<test::MockTransport>(ctx.get_executor());
+    transport->push("GET /ws HTTP/1.1\r\n"
+                    "Host: x\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                    "Sec-WebSocket-Version: 13\r\n"
+                    "\r\n");
+
+    WsHandlerFn route = [](RequestPtr, ResponsePtr, SslHandle, WsUpgrade, WsUpgradeCompletion) {
+        throw std::runtime_error("middleware boom");
+    };
+    WsLookup lookup = [route](std::string_view) -> std::optional<WsHandlerFn> { return route; };
+    Dispatcher dispatch = [](RequestPtr, ResponsePtr, SslHandle, HandlerCompletion done) { std::move(done)(); };
+
+    auto engine = std::make_shared<Http1Engine<test::MockTransport>>(transport);
+    bool threw = false;
+    try {
+        engine->run(std::move(dispatch), {}, std::move(lookup), {}, {}, [] {});
+        ctx.run_for(std::chrono::milliseconds(200));
+    } catch (const std::exception &) {
+        threw = true;
+    }
+    CHECK_FALSE(threw);
+    CHECK(transport->written().find("500 Internal Server Error") != std::string::npos);
 }

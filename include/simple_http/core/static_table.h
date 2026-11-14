@@ -40,6 +40,12 @@
 #include <string_view>
 #include <vector>
 
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 #include "accept_encoding.h" // AcceptEncoding, coding_q, identity_q
 #include "compat.h"          // starts_with / ends_with
 #include "logging.h"
@@ -193,9 +199,43 @@ inline std::string_view content_encoding_of(const StaticEntry &entry, const Stat
     return {};
 }
 
-// Reads exactly `size` bytes, or reports failure. Both the preloader and the
-// on-demand path need the same "short read is not a body" rule.
+// Reads exactly `size` bytes from a path recorded by the scan, or reports
+// failure. Both the preloader and the on-demand path need the same "short read
+// is not a body" rule.
+//
+// The path comes from the scan, but the file can be replaced between the scan
+// and this open: a document root that is writable (uploads, a CMS) makes that
+// realistic. On POSIX, O_NOFOLLOW makes a planted symlink fail here instead of
+// leaking its target, and fstat keeps a FIFO/device from being read. Windows has
+// no std::ifstream equivalent of O_NOFOLLOW, so it refuses a symlink before
+// opening (best effort; the same local write access is required).
 inline std::optional<std::string> read_file_exact(const std::string &path, std::uint64_t size) {
+#if !defined(_WIN32)
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0)
+        return std::nullopt;
+    struct stat st{};
+    if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        ::close(fd);
+        return std::nullopt;
+    }
+    std::string out;
+    out.resize(static_cast<std::size_t>(size));
+    std::size_t got = 0;
+    while (got < out.size()) {
+        const ssize_t n = ::read(fd, out.data() + got, out.size() - got);
+        if (n <= 0) {
+            ::close(fd);
+            return std::nullopt;
+        }
+        got += static_cast<std::size_t>(n);
+    }
+    ::close(fd);
+    return out;
+#else
+    std::error_code symlink_ec;
+    if (std::filesystem::is_symlink(std::filesystem::symlink_status(path, symlink_ec)))
+        return std::nullopt;
     std::ifstream in(path, std::ios::binary);
     if (!in)
         return std::nullopt;
@@ -205,6 +245,7 @@ inline std::optional<std::string> read_file_exact(const std::string &path, std::
     if (in.gcount() != static_cast<std::streamsize>(size))
         return std::nullopt;
     return out;
+#endif
 }
 
 } // namespace detail

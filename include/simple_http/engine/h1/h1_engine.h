@@ -1093,6 +1093,22 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
         return target;
     }
 
+    // A WS route (or its middleware) threw synchronously. If the upgrade has
+    // already begun, a 101 write may be queued on the transport and the upgrade
+    // completion owns the connection; splicing a 500 onto it would corrupt the
+    // stream and finish() would abort the handshake. Only answer when nothing
+    // has been handed off yet.
+    void on_ws_route_exception(const std::exception *e, Version version) {
+        if (e) {
+            SIMPLE_HTTP_ERROR_LOG("h1 ws route threw: {}", e->what());
+        } else {
+            SIMPLE_HTTP_ERROR_LOG("h1 ws route threw an unknown exception");
+        }
+        if (m_ws_handoff_started || m_owner != TransportOwner::Engine)
+            return;
+        send_error_response(status::internal_server_error, {}, version);
+    }
+
     void handle_websocket(const ParsedHead &head, Version version) {
         // RFC 6455 §4.1/§4.2.1: the handshake is a GET over HTTP/1.1 with a
         // 16-byte, base64-encoded key. Anything else is a bad handshake, not a
@@ -1136,8 +1152,18 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
         const std::string_view path = request_path(head.target);
         if (m_ws_lookup) {
             if (auto run = m_ws_lookup(path)) {
-                (*run)(request, response, m_transport->tls_handle(), std::move(upgrade),
-                       [self](error_code, bool) { self->finish(); });
+                // A route or middleware that throws synchronously used to unwind
+                // through parse_head_step() and out of io_context::run(), which
+                // terminates the worker. Turn it into the same 500 an ordinary
+                // handler exception gets, unless the upgrade already started.
+                try {
+                    (*run)(request, response, m_transport->tls_handle(), std::move(upgrade),
+                           [self](error_code, bool) { self->finish(); });
+                } catch (const std::exception &e) {
+                    self->on_ws_route_exception(&e, version);
+                } catch (...) {
+                    self->on_ws_route_exception(nullptr, version);
+                }
                 return;
             }
         }
@@ -1149,17 +1175,33 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
                 m_owner = TransportOwner::WebSocket; // stop the watchdog from closing the transport
                 std::string peer_address = address_string_if_specified(m_transport->peer().address());
                 std::string initial{m_in.view()};
-                async_run_ws_proxy(m_transport, head, std::move(initial), std::move(*target), m_limits.idle_timeout,
-                                   m_limits.max_header_bytes, std::move(peer_address),
-                                   m_transport->tls_handle().has_value(), [self](bool) { self->finish(); });
+                try {
+                    async_run_ws_proxy(m_transport, head, std::move(initial), std::move(*target), m_limits.idle_timeout,
+                                       m_limits.max_header_bytes, std::move(peer_address),
+                                       m_transport->tls_handle().has_value(), [self](bool) { self->finish(); });
+                } catch (const std::exception &e) {
+                    SIMPLE_HTTP_ERROR_LOG("h1 ws proxy start failed: {}", e.what());
+                    m_owner = TransportOwner::Engine;
+                    send_error_response(status::bad_gateway, {}, version);
+                } catch (...) {
+                    SIMPLE_HTTP_ERROR_LOG("h1 ws proxy start failed with an unknown exception");
+                    m_owner = TransportOwner::Engine;
+                    send_error_response(status::bad_gateway, {}, version);
+                }
                 return;
             }
         }
 
         if (m_ws_regex_lookup) {
             if (auto run = m_ws_regex_lookup(path)) {
-                (*run)(request, response, m_transport->tls_handle(), std::move(upgrade),
-                       [self](error_code, bool) { self->finish(); });
+                try {
+                    (*run)(request, response, m_transport->tls_handle(), std::move(upgrade),
+                           [self](error_code, bool) { self->finish(); });
+                } catch (const std::exception &e) {
+                    self->on_ws_route_exception(&e, version);
+                } catch (...) {
+                    self->on_ws_route_exception(nullptr, version);
+                }
                 return;
             }
         }
@@ -1169,6 +1211,9 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
     void try_websocket_upgrade(std::shared_ptr<Request> request, std::shared_ptr<ResponseWriter> res,
                                std::shared_ptr<Http1ResponseSink<Transport>> sink, CallbackWsHandler handler,
                                WsUpgradeCompletion done) {
+        // From here on a failed route must not answer with an HTTP error: the
+        // 101 (or the error completion) owns the connection.
+        m_ws_handoff_started = true;
         if (!sink) {
             std::move(done)(make_error_code(asio::error::not_connected), false);
             return;
@@ -1510,6 +1555,9 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
     std::function<void()> m_on_done;
     std::shared_ptr<asio::steady_timer> m_watchdog;
     TransportOwner m_owner{TransportOwner::Engine};
+    // Set once a WS upgrade has taken ownership of the response/transport, so a
+    // late synchronous exception cannot splice a 500 onto the handshake.
+    bool m_ws_handoff_started{false};
     bool m_allow_h2c{true};
     bool m_finished{false};
     bool m_done_called{false};

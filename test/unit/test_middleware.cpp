@@ -207,3 +207,24 @@ TEST_CASE("middleware: real_ip trusts forwarded headers only from a trusted peer
         CHECK(run(std::move(req), trusted) == std::optional<std::string>{"9.9.9.9"});
     }
 }
+
+// S5: `Location: //evil.example` is a scheme-relative URL, so a request target
+// beginning with "//" (or "/\") would turn redirect_slashes() into an open
+// redirect. Such targets must be passed through, not redirected.
+TEST_CASE("middleware: redirect_slashes cannot emit a scheme-relative Location", "[middleware][security]") {
+    Router router;
+    router.use(middleware::redirect_slashes());
+    router.route(any_methods, "//evil.example/", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(status::ok).async_send("handled", asio::use_awaitable);
+    });
+
+    asio::io_context ctx;
+    auto writer = dispatch(ctx, router, make_request(ctx, "//evil.example/"));
+    // The middleware must not have shortened this to "//evil.example".
+    CHECK(writer->header(field::location).empty());
+    CHECK(writer->last_status == status::ok);
+
+    // The sibling spelling that WHATWG parsers treat as "//".
+    auto writer2 = dispatch(ctx, router, make_request(ctx, "/\\evil.example/"));
+    CHECK(writer2->header(field::location).empty());
+}

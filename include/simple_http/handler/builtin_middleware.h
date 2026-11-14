@@ -438,7 +438,11 @@ inline Middleware strip_prefix(std::string prefix) {
 inline Middleware redirect_slashes() {
     return [](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next, HandlerCompletion done) {
         const std::string_view path = req->path();
-        if (path.size() > 1 && path.back() == '/') {
+        // A target beginning with "//" (or "/\", which WHATWG URL parsers treat
+        // as "//" for http/https) would shorten to a scheme-relative Location:
+        // the browser would leave the origin. Never redirect those; let routing
+        // (or the 404 path) handle the target.
+        if (path.size() > 1 && path.back() == '/' && path[1] != '/' && path[1] != '\\') {
             std::string location{path.substr(0, path.size() - 1)};
             if (!req->query().empty()) {
                 location.push_back('?');
