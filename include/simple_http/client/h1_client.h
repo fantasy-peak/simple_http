@@ -548,8 +548,8 @@ class Http1ClientSession final : public ClientSession,
                 // (closing the transport) made the fallback impossible.
                 // Protocol/transport errors remain fatal.
                 if (ec != asio::error::operation_aborted) {
+                    // fail_exchange() already releases the exchange.
                     self->fail_exchange(ec);
-                    self->release_exchange();
                 }
                 std::move(done)(ec);
                 return;
@@ -830,8 +830,7 @@ class Http1ClientSession final : public ClientSession,
         // A failed read ends this exchange: mark the connection unusable and
         // release the busy flag so the next request may replace the session
         // instead of treating a dead exchange as still active.
-        fail_exchange(ec);
-        release_exchange();
+        fail_exchange(ec); // already calls release_exchange()
         std::move(done)(ec, ReadResult{});
     }
 

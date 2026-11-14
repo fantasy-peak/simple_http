@@ -39,6 +39,7 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <random>
@@ -159,7 +160,12 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
                            bool expect_masked = true, std::size_t inbox_limit = 4u * 1024 * 1024,
                            WsDeflateConfig deflate = {})
         : m_transport(std::move(transport)), m_executor(m_transport->get_executor()),
-          m_parser(max_payload, expect_masked, deflate.enabled), m_max_payload(max_payload),
+          // EngineLimits::max_body_bytes == 0 means "no limit"; the frame parser
+          // treats 0 literally (any non-empty frame would be a protocol error),
+          // so normalize here instead of at every call site.
+          m_parser(max_payload == 0 ? std::numeric_limits<std::uint64_t>::max() : max_payload, expect_masked,
+                   deflate.enabled),
+          m_max_payload(max_payload == 0 ? std::numeric_limits<std::uint64_t>::max() : max_payload),
           m_idle_timeout(idle_timeout), m_deadline(std::make_shared<std::chrono::steady_clock::time_point>()),
           m_inbox_limit(inbox_limit != 0 ? inbox_limit : 4u * 1024 * 1024), m_expect_masked(expect_masked),
           m_deflate(std::move(deflate)), m_watchdog_timer(std::make_shared<asio::steady_timer>(m_executor)),
@@ -291,8 +297,11 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
 
     void run_writer() override {
         // Writes are pumped by the shared writer as they are enqueued; this
-        // only arms the idle watchdog.
-        start_watchdog(std::weak_ptr<WsBackendImpl>(this->shared_from_this()));
+        // only arms the idle watchdog. EngineLimits::idle_timeout <= 0 disables
+        // it, so no zero-length watchdog may be started (the h1 engine follows
+        // the same rule).
+        if (m_idle_timeout.count() > 0)
+            start_watchdog(std::weak_ptr<WsBackendImpl>(this->shared_from_this()));
     }
 
     void abort() override {

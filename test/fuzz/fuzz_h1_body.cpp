@@ -36,47 +36,49 @@ class FuzzTransport {
     void push(std::string bytes) { m_in = std::move(bytes); }
 
     template <typename Token> auto async_read_some(ByteSpan buffer, Token &&token) {
+        auto initiation = [this, buffer](auto handler) {
+            asio::co_spawn(m_executor, do_read_some(buffer),
+                           [handler = std::move(handler)](std::exception_ptr, IoResult r) mutable {
+                               std::move(handler)(r.first, r.second);
+                           });
+        };
         return asio::async_initiate<Token, void(error_code, std::size_t)>(
-            [this, buffer](auto handler) {
-                asio::co_spawn(m_executor, do_read_some(buffer),
-                               [handler = std::move(handler)](std::exception_ptr, IoResult r) mutable {
-                                   std::move(handler)(r.first, r.second);
-                               });
-            },
-            token);
+            detail::make_executor_initiation(std::move(initiation), m_executor), token);
     }
 
     template <typename Token> auto async_read(ByteSpan buffer, Token &&token) {
+        auto initiation = [this, buffer](auto handler) {
+            asio::co_spawn(m_executor, do_read(buffer),
+                           [handler = std::move(handler)](std::exception_ptr, IoResult r) mutable {
+                               std::move(handler)(r.first, r.second);
+                           });
+        };
         return asio::async_initiate<Token, void(error_code, std::size_t)>(
-            [this, buffer](auto handler) {
-                asio::co_spawn(m_executor, do_read(buffer),
-                               [handler = std::move(handler)](std::exception_ptr, IoResult r) mutable {
-                                   std::move(handler)(r.first, r.second);
-                               });
-            },
-            token);
+            detail::make_executor_initiation(std::move(initiation), m_executor), token);
     }
 
     template <typename Token> auto async_write(ConstByteSpan buffer, Token &&token) {
+        auto initiation = [this, buffer](auto handler) {
+            asio::co_spawn(m_executor, do_write(buffer),
+                           [handler = std::move(handler)](std::exception_ptr, IoResult r) mutable {
+                               std::move(handler)(r.first, r.second);
+                           });
+        };
+        // cancel_after (used by the h2 teardown path) asks the initiation for
+        // its executor; a bare lambda does not expose one.
         return asio::async_initiate<Token, void(error_code, std::size_t)>(
-            [this, buffer](auto handler) {
-                asio::co_spawn(m_executor, do_write(buffer),
-                               [handler = std::move(handler)](std::exception_ptr, IoResult r) mutable {
-                                   std::move(handler)(r.first, r.second);
-                               });
-            },
-            token);
+            detail::make_executor_initiation(std::move(initiation), m_executor), token);
     }
 
     template <typename Token> auto async_write_seq(boost::span<const ConstByteSpan> buffers, Token &&token) {
+        auto initiation = [this, buffers](auto handler) {
+            asio::co_spawn(m_executor, do_write_seq(buffers),
+                           [handler = std::move(handler)](std::exception_ptr, IoResult r) mutable {
+                               std::move(handler)(r.first, r.second);
+                           });
+        };
         return asio::async_initiate<Token, void(error_code, std::size_t)>(
-            [this, buffers](auto handler) {
-                asio::co_spawn(m_executor, do_write_seq(buffers),
-                               [handler = std::move(handler)](std::exception_ptr, IoResult r) mutable {
-                                   std::move(handler)(r.first, r.second);
-                               });
-            },
-            token);
+            detail::make_executor_initiation(std::move(initiation), m_executor), token);
     }
 
     template <typename Token> auto async_shutdown(Token &&token) {

@@ -88,6 +88,9 @@ struct H3Stream {
     // a small block into a much larger decoded list.
     std::size_t decoded_field_bytes{0};
     bool headers_rejected{false};
+    // H3 error code for the pending per-stream reset (kH3MessageError or
+    // kH3ExcessiveLoad), set with headers_rejected.
+    std::uint64_t reject_code{0};
     bool headers_done{false};
     bool dispatched{false};
     // Waiting in the engine's dispatch queue for a handler slot (Rapid Reset

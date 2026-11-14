@@ -592,12 +592,16 @@ class Client : public std::enable_shared_from_this<Client> {
                   asio::any_completion_handler<void(error_code, Response)> done) const;
     void open_stream_hop(std::string url, StreamSpec spec, std::size_t max_body_bytes,
                          asio::any_completion_handler<void(error_code, std::shared_ptr<Stream>)> done) const;
-    void dial(const detail::Url &url, HttpVersionPolicy version, DialDone done) const;
+    // `cancel` is the overall request_timeout's flag. The dial callbacks may run
+    // after that timeout completed the caller and destroyed a stack Client, so
+    // they must stop before dereferencing `self`.
+    void dial(const detail::Url &url, HttpVersionPolicy version, std::shared_ptr<detail::HopCancel> cancel,
+              DialDone done) const;
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
     void dial_h3(const detail::Url &url, DialDone done) const;
 #endif
     void dial_via_proxy(const detail::Url &url, const ProxyConfig &proxy, HttpVersionPolicy version,
-                        DialDone done) const;
+                        std::shared_ptr<detail::HopCancel> cancel, DialDone done) const;
     // Builds the h1/h2 session for an already-connected byte stream. `version`
     // is the per-request policy (already resolved against the Client default).
     template <typename Transport>
@@ -611,7 +615,8 @@ class Client : public std::enable_shared_from_this<Client> {
     // transport, then starts the negotiated session.
     template <typename Transport>
     void tls_handshake_and_start(std::shared_ptr<Transport> transport, const detail::Url &url,
-                                 HttpVersionPolicy version, DialDone done) const;
+                                 HttpVersionPolicy version, std::shared_ptr<detail::HopCancel> cancel,
+                                 DialDone done) const;
     void open_ws_hop(std::string url, WebSocketSpec spec,
                      asio::any_completion_handler<void(error_code, std::shared_ptr<WebSocket>)> done) const;
     void open_ws_via_proxy(const detail::Url &url, const ProxyConfig &proxy, std::string path, std::string authority,
@@ -858,7 +863,8 @@ inline void Client::start_negotiated_session(std::shared_ptr<Transport> transpor
 
 template <typename Transport>
 inline void Client::tls_handshake_and_start(std::shared_ptr<Transport> transport, const detail::Url &url,
-                                            HttpVersionPolicy version, DialDone done) const {
+                                            HttpVersionPolicy version, std::shared_ptr<detail::HopCancel> cancel,
+                                            DialDone done) const {
     detail::ClientTlsHandshake hs;
     // SNI override first: it is what a VIP/LB deployment needs, and the
     // certificate is verified against the same name.
@@ -873,7 +879,12 @@ inline void Client::tls_handshake_and_start(std::shared_ptr<Transport> transport
     auto self = keep_alive();
     detail::async_tls_client_handshake_bounded(
         transport, hs, m_config.connect_timeout,
-        [self, transport, url, version, done = std::move(done)](error_code hec) mutable {
+        [self, transport, url, version, cancel, done = std::move(done)](error_code hec) mutable {
+            if (cancel && cancel->cancelled) {
+                transport->close();
+                std::move(done)(make_error_code(asio::error::operation_aborted), nullptr);
+                return;
+            }
             if (hec) {
                 transport->close();
                 std::move(done)(hec, nullptr);
@@ -1364,7 +1375,8 @@ inline std::string resolve_redirect(const Url &base, std::string_view location) 
 
 } // namespace detail
 
-inline void Client::dial(const detail::Url &url, HttpVersionPolicy version, DialDone done) const {
+inline void Client::dial(const detail::Url &url, HttpVersionPolicy version, std::shared_ptr<detail::HopCancel> cancel,
+                         DialDone done) const {
     if (version == HttpVersionPolicy::Http3) {
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
         dial_h3(url, std::move(done));
@@ -1380,15 +1392,19 @@ inline void Client::dial(const detail::Url &url, HttpVersionPolicy version, Dial
         return;
     }
     if (*selection) {
-        dial_via_proxy(url, **selection, version, std::move(done));
+        dial_via_proxy(url, **selection, version, std::move(cancel), std::move(done));
         return;
     }
 
     auto self = keep_alive();
     detail::async_resolve_bounded(
         m_config.resolve, url.host, url.effective_port(), m_executor, m_config.connect_timeout,
-        [self, url, version, done = std::move(done)](error_code ec,
-                                                     std::vector<asio::ip::tcp::endpoint> endpoints) mutable {
+        [self, url, version, cancel, done = std::move(done)](error_code ec,
+                                                             std::vector<asio::ip::tcp::endpoint> endpoints) mutable {
+            if (cancel && cancel->cancelled) {
+                std::move(done)(make_error_code(asio::error::operation_aborted), nullptr);
+                return;
+            }
             if (ec) {
                 std::move(done)(ec, nullptr);
                 return;
@@ -1414,8 +1430,12 @@ inline void Client::dial(const detail::Url &url, HttpVersionPolicy version, Dial
             detail::async_connect_bounded(
                 socket, std::make_shared<std::vector<asio::ip::tcp::endpoint>>(std::move(endpoints)),
                 self->m_config.connect_timeout, self->m_executor,
-                [self, url, socket, version, done = std::move(done)](error_code cec,
-                                                                     asio::ip::tcp::endpoint peer) mutable {
+                [self, url, socket, version, cancel, done = std::move(done)](error_code cec,
+                                                                             asio::ip::tcp::endpoint peer) mutable {
+                    if (cancel && cancel->cancelled) {
+                        std::move(done)(make_error_code(asio::error::operation_aborted), nullptr);
+                        return;
+                    }
                     if (cec) {
                         std::move(done)(cec, nullptr);
                         return;
@@ -1437,7 +1457,7 @@ inline void Client::dial(const detail::Url &url, HttpVersionPolicy version, Dial
                     auto stream =
                         std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(std::move(*socket), *context);
                     self->tls_handshake_and_start(std::make_shared<TlsStreamTransport>(stream, peer), url, version,
-                                                  std::move(done));
+                                                  cancel, std::move(done));
                 });
         });
 }
@@ -1486,12 +1506,16 @@ inline void Client::dial_h3(const detail::Url &url, DialDone done) const {
 #endif
 
 inline void Client::dial_via_proxy(const detail::Url &url, const ProxyConfig &proxy, HttpVersionPolicy version,
-                                   DialDone done) const {
+                                   std::shared_ptr<detail::HopCancel> cancel, DialDone done) const {
     auto self = keep_alive();
     detail::async_resolve_bounded(
         m_config.resolve, proxy.host, proxy.effective_port(), m_executor, m_config.connect_timeout,
-        [self, url, proxy, version, done = std::move(done)](error_code ec,
-                                                            std::vector<asio::ip::tcp::endpoint> endpoints) mutable {
+        [self, url, proxy, version, cancel,
+         done = std::move(done)](error_code ec, std::vector<asio::ip::tcp::endpoint> endpoints) mutable {
+            if (cancel && cancel->cancelled) {
+                std::move(done)(make_error_code(asio::error::operation_aborted), nullptr);
+                return;
+            }
             if (ec) {
                 std::move(done)(ec, nullptr);
                 return;
@@ -1504,8 +1528,12 @@ inline void Client::dial_via_proxy(const detail::Url &url, const ProxyConfig &pr
             detail::async_connect_bounded(
                 socket, std::make_shared<std::vector<asio::ip::tcp::endpoint>>(std::move(endpoints)),
                 self->m_config.connect_timeout, self->m_executor,
-                [self, url, proxy, socket, version, done = std::move(done)](error_code cec,
-                                                                            asio::ip::tcp::endpoint peer) mutable {
+                [self, url, proxy, socket, version, cancel,
+                 done = std::move(done)](error_code cec, asio::ip::tcp::endpoint peer) mutable {
+                    if (cancel && cancel->cancelled) {
+                        std::move(done)(make_error_code(asio::error::operation_aborted), nullptr);
+                        return;
+                    }
                     if (cec) {
                         std::move(done)(cec, nullptr);
                         return;
@@ -1514,8 +1542,12 @@ inline void Client::dial_via_proxy(const detail::Url &url, const ProxyConfig &pr
                     if (proxy.kind != ProxyKind::Https) {
                         // Plaintext proxy leg: CONNECT/SOCKS5 on the socket, then
                         // either the transport itself or the origin TLS inside it.
-                        auto after_tunnel = [self, url, socket, peer, version,
+                        auto after_tunnel = [self, url, socket, peer, version, cancel,
                                              done = std::move(done)](error_code tec) mutable {
+                            if (cancel && cancel->cancelled) {
+                                std::move(done)(make_error_code(asio::error::operation_aborted), nullptr);
+                                return;
+                            }
                             if (tec) {
                                 error_code ignored;
                                 socket->close(ignored);
@@ -1539,7 +1571,7 @@ inline void Client::dial_via_proxy(const detail::Url &url, const ProxyConfig &pr
                             auto stream = std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(std::move(*socket),
                                                                                                      *context);
                             self->tls_handshake_and_start(std::make_shared<TlsStreamTransport>(stream, peer), url,
-                                                          version, std::move(done));
+                                                          version, cancel, std::move(done));
                         };
                         detail::async_proxy_tunnel_bounded(
                             self->m_executor, self->m_config.connect_timeout,
@@ -1580,15 +1612,23 @@ inline void Client::dial_via_proxy(const detail::Url &url, const ProxyConfig &pr
                     hs.alpn_wire = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
                     detail::async_tls_client_handshake_bounded(
                         proxy_transport, hs, self->m_config.connect_timeout,
-                        [self, url, proxy, proxy_transport, inner, peer, version,
+                        [self, url, proxy, proxy_transport, inner, peer, version, cancel,
                          done = std::move(done)](error_code hec) mutable {
+                            if (cancel && cancel->cancelled) {
+                                std::move(done)(make_error_code(asio::error::operation_aborted), nullptr);
+                                return;
+                            }
                             if (hec) {
                                 proxy_transport->close();
                                 std::move(done)(hec, nullptr);
                                 return;
                             }
-                            auto after_tunnel = [self, url, inner, peer, version,
+                            auto after_tunnel = [self, url, inner, peer, version, cancel,
                                                  done = std::move(done)](error_code tec) mutable {
+                                if (cancel && cancel->cancelled) {
+                                    std::move(done)(make_error_code(asio::error::operation_aborted), nullptr);
+                                    return;
+                                }
                                 if (tec) {
                                     error_code ignored;
                                     inner->lowest_layer().close(ignored);
@@ -1616,7 +1656,7 @@ inline void Client::dial_via_proxy(const detail::Url &url, const ProxyConfig &pr
                                     std::make_shared<asio::ssl::stream<asio::ssl::stream<asio::ip::tcp::socket>>>(
                                         std::move(*inner), *context);
                                 self->tls_handshake_and_start(std::make_shared<NestedTlsTransport>(outer, peer), url,
-                                                              version, std::move(done));
+                                                              version, cancel, std::move(done));
                             };
                             detail::async_proxy_tunnel_bounded(
                                 self->m_executor, self->m_config.connect_timeout,
@@ -1899,7 +1939,7 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
             ready->open_stream(request, std::move(open_done));
             return;
         }
-        self->dial(target, version,
+        self->dial(target, version, cancel,
                    [self, request, origin, cancel, open_done = std::move(open_done)](
                        error_code dec, std::shared_ptr<detail::ClientSession> session) mutable {
                        if (cancel && cancel->cancelled) {
@@ -1957,7 +1997,7 @@ Client::open_stream_hop(std::string url, StreamSpec spec, std::size_t max_body_b
     const std::chrono::milliseconds continue_timeout = spec.continue_timeout;
     const HttpVersionPolicy version = spec.version ? *spec.version : m_config.default_version;
     auto self = keep_alive();
-    dial(target, version,
+    dial(target, version, nullptr,
          [self, request, max_body_bytes, decoding, head_timeout, idle_timeout, auto_continue, continue_timeout,
           done = std::move(done)](error_code ec, std::shared_ptr<detail::ClientSession> session) mutable {
              if (ec) {

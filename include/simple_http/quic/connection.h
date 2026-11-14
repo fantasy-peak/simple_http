@@ -846,6 +846,17 @@ void QuicConnection<Executor>::on_datagram(boost::span<const std::uint8_t> datag
             // datagram and keep the connection.
             return;
         }
+        if (rv == NGTCP2_ERR_DROP_CONN) {
+            // ngtcp2 asks the endpoint to discard the connection without
+            // sending anything (for example an Initial that cannot complete the
+            // handshake). RFC 9000 requires a silent drop here; emitting
+            // CONNECTION_CLOSE would be an amplification vector. Suppress the
+            // terminal packet (`finish_close` checks m_close_sent) but still
+            // release the engine and its waiters.
+            m_close_sent = true;
+            close_now();
+            return;
+        }
         fail(rv);
         return;
     }

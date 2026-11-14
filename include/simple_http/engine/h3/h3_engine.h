@@ -347,8 +347,13 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
                     (void)stream->request->body().fail(make_error_code(asio::error::connection_reset));
                     stream->request->cancel(); // connection gone: signal every handler
                 }
-                h3::wake(stream->in_space);
-                h3::wake(stream->out_space);
+                // close(), not just wake(): a capacity-1 channel releases only
+                // one waiter, and a stream can have several writers parked on
+                // out_space (ResponseWriter does not serialize its writes).
+                if (stream->in_space)
+                    stream->in_space->close();
+                if (stream->out_space)
+                    stream->out_space->close();
             }
             self->m_streams.clear();
             std::move(done)();
@@ -721,14 +726,24 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         m_conn->extend_stream_offset(stream_id, static_cast<std::uint64_t>(nconsumed));
         m_conn->extend_connection_offset(static_cast<std::uint64_t>(nconsumed));
 
-        // A callback decided this request was malformed for a reason nghttp3
-        // does not police — a control character inside a field, or an authority
-        // that disagrees with Host. Those are this layer's rules, so this layer
-        // answers for them, and per-stream is the proportionate response: the
-        // connection is still perfectly usable for every other stream on it.
-        if (m_invalid_stream == stream_id) {
-            m_invalid_stream = -1;
-            reset_stream(stream_id, kH3MessageError);
+        // A callback decided one or more requests were malformed for a reason
+        // nghttp3 does not police — a control character inside a field, an
+        // authority that disagrees with Host, or a decoded field list past the
+        // limit. Those are this layer's rules, so this layer answers for them,
+        // per stream: the connection is still usable for every other stream.
+        //
+        // The rejected ids are collected by the header callbacks rather than
+        // compared with this call's stream_id: nghttp3 invokes those callbacks
+        // for a QPACK-blocked request while the engine is reading the QPACK
+        // encoder stream, so the enclosing stream id is a different one.
+        if (!m_rejected_streams.empty()) {
+            auto rejected = std::move(m_rejected_streams);
+            m_rejected_streams.clear();
+            for (std::int64_t id : rejected) {
+                auto sit = m_streams.find(id);
+                if (sit != m_streams.end())
+                    reset_stream(id, sit->second->reject_code);
+            }
         }
     }
 
@@ -910,8 +925,11 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
                 (void)stream->request->body().fail(make_error_code(asio::error::connection_reset));
                 stream->request->cancel(); // connection gone: signal every handler
             }
-            h3::wake(stream->in_space);
-            h3::wake(stream->out_space);
+            // See run()'s completion: close releases every parked waiter.
+            if (stream->in_space)
+                stream->in_space->close();
+            if (stream->out_space)
+                stream->out_space->close();
         }
     }
 
@@ -955,6 +973,8 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         if (it == m_streams.end())
             return;
         Stream &stream = *it->second;
+        if (stream.headers_rejected)
+            return;
 
         // Bound the *decoded* field list, not just the compressed block:
         // QPACK dynamic-table references let a small block expand into a large
@@ -966,8 +986,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         if (stream.decoded_field_bytes > limit || field_cost > limit - stream.decoded_field_bytes) {
             if (!stream.headers_done) {
                 // Reset after nghttp3 returns from this read; do not dispatch.
-                stream.headers_rejected = true;
-                m_invalid_stream = stream_id;
+                reject_stream(stream_id, stream, kH3ExcessiveLoad);
             }
             return;
         }
@@ -977,7 +996,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         // those bytes survive decoding and would let a peer inject a request line
         // into whatever HTTP/1.1 message is built downstream.
         if (contains_ctl(name) || contains_ctl(value)) {
-            m_invalid_stream = stream_id;
+            reject_stream(stream_id, stream, kH3MessageError);
             return;
         }
 
@@ -1013,13 +1032,12 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         // decoded list past max_header_bytes). Do not dispatch it: the reset
         // happens after nghttp3 returns from the read, but the handler would
         // otherwise already have run.
-        if (stream.headers_rejected || m_invalid_stream == stream_id) {
-            m_invalid_stream = stream_id;
+        if (stream.headers_rejected) {
             return;
         }
 
         if (!finish_request(stream)) {
-            m_invalid_stream = stream_id;
+            reject_stream(stream_id, stream, kH3MessageError);
             return;
         }
         // A request with no body is complete as soon as its headers are: a client
@@ -1076,6 +1094,10 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         if (it == m_streams.end())
             return;
         Stream &stream = *it->second;
+        // A request rejected by the header callbacks must not be dispatched
+        // just because nghttp3 follows END_HEADERS(fin) with end_stream.
+        if (stream.headers_rejected)
+            return;
         stream.request_complete = true;
         if (stream.paused_frames.empty())
             (void)stream.request->body().finish();
@@ -1346,6 +1368,11 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
             consumed->fetch_add(n, std::memory_order_acq_rel);
             asio::post(exec, [weak, stream_id, n]() {
                 if (auto eng = weak.lock()) {
+                    // erase_stream/release_unread_body already credited every
+                    // byte the handler had not read when the stream closed; a
+                    // read that races that teardown must not credit them twice.
+                    if (eng->m_streams.find(stream_id) == eng->m_streams.end())
+                        return;
                     eng->m_conn->extend_stream_offset(stream_id, n);
                     eng->m_conn->extend_connection_offset(n);
                     eng->drain_paused(stream_id);
@@ -1356,12 +1383,24 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         return inserted->second;
     }
 
+    // Marks the current field section as rejected by the application layer and
+    // queues a per-stream reset. The reset itself must run after nghttp3
+    // returns from the parse (no re-entry from a callback), which is why the id
+    // is collected here and drained by on_stream_data.
+    void reject_stream(std::int64_t stream_id, Stream &stream, std::uint64_t code) noexcept {
+        if (stream.headers_rejected)
+            return;
+        stream.headers_rejected = true;
+        stream.reject_code = code;
+        m_rejected_streams.push_back(stream_id);
+    }
+
     void spawn_handler(std::int64_t stream_id) {
         auto it = m_streams.find(stream_id);
         if (it == m_streams.end())
             return;
         Stream &stream = *it->second;
-        if (stream.dispatched || stream.queued || stream.reset)
+        if (stream.dispatched || stream.queued || stream.reset || stream.headers_rejected)
             return;
 
         // Rapid Reset (CVE-2023-44487) defense, the same shape the h2 engine
@@ -1549,10 +1588,12 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
     std::size_t m_vec_count{0};
 
     std::uint64_t m_peer_max_field_section{0};
-    // Set by a callback that has decided the stream is bad, read by the parse
-    // that is still running. A member rather than a return value because the
-    // callback cannot return one.
-    std::int64_t m_invalid_stream{-1};
+    // Set by a callback that has decided a stream is bad, drained by the parse
+    // that is still running (nghttp3 must not be re-entered from a callback).
+    // A list rather than a single id: QPACK can deliver a blocked request's
+    // fields while the engine is parsing the encoder stream, and several
+    // streams can be rejected in the same read.
+    std::vector<std::int64_t> m_rejected_streams;
     std::int64_t m_oversize_stream{-1};
     // A stream whose body just ended with a trailer section pending. The
     // deferred nghttp3_conn_submit_trailers runs at the top of the next write

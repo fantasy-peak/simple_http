@@ -958,3 +958,41 @@ TEST_CASE("ws: client mask keys come from the CSPRNG", "[ws]") {
     // std::rand() with a seeded/global sequence can repeat; RAND_bytes must not.
     CHECK(std::memcmp(a, b, sizeof a) != 0);
 }
+
+TEST_CASE("ws/backend: max_payload 0 means unlimited, like max_body_bytes", "[ws][ws-backend]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    // EngineLimits::max_body_bytes == 0 is documented as "no limit"; the
+    // backend must not turn it into "reject every non-empty frame".
+    auto backend =
+        std::make_shared<WsBackendImpl<MockTransport>>(transport, /*max_payload=*/0, std::chrono::seconds(5));
+    auto ws = std::make_shared<WebSocket>(backend);
+    ws->run_writer();
+    drain(ctx);
+
+    const unsigned char mask[4] = {0x37, 0xfa, 0x21, 0x3d};
+    transport->push(ws_client_frame(WsOpcode::Text, "unbounded", /*fin=*/true, mask));
+    auto message = run_until(ctx, ws_read(*ws));
+    REQUIRE(message.has_value());
+    REQUIRE(message->has_value());
+    CHECK((*message)->data == "unbounded");
+}
+
+TEST_CASE("ws/backend: idle_timeout 0 does not tear the connection down", "[ws][ws-backend]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    auto backend =
+        std::make_shared<WsBackendImpl<MockTransport>>(transport, /*max_payload=*/65536, std::chrono::seconds(0));
+    auto ws = std::make_shared<WebSocket>(backend);
+    ws->run_writer();
+    // A zero-length watchdog (if armed) would fire here and call teardown.
+    drain(ctx, std::chrono::milliseconds(20));
+    CHECK(ws->is_open());
+
+    const unsigned char mask[4] = {0x37, 0xfa, 0x21, 0x3d};
+    transport->push(ws_client_frame(WsOpcode::Text, "still open", /*fin=*/true, mask));
+    auto message = run_until(ctx, ws_read(*ws));
+    REQUIRE(message.has_value());
+    REQUIRE(message->has_value());
+    CHECK((*message)->data == "still open");
+}

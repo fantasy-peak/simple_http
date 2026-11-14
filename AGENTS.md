@@ -802,7 +802,9 @@ test/run.sh sanitize ubsan  [suite...]   # 仅 UBSan
 - 默认在 `.cache/sanitize/worktree-<san>` 建独立 worktree，日常 `build/` 不受影响；
   `--build-dir build-asan` 可复用已有目录，结束时恢复 `xmake f -c -o build`。
 - `concurrency`（`test/sanitizer/concurrency.cpp`）覆盖多客户端、多线程、
-  跨 executor `ResponseWriter` 写和日志 sink 替换；Go 参考实现不插桩。
+  "工作从别的 executor 启动、显式 hop 回连接 executor 后再写"以及日志 sink 替换；
+  Go 参考实现不插桩。注意 `ResponseWriter`/`Body`/`WebSocket` 只能在连接 executor
+  线程使用，跨线程直接调用会被 `require_owner_thread` abort。
 - 报告扫描 ASan/LSan/TSan/UBSan 关键字；强制 `SIGKILL` 记为
   `STOP_TIMEOUT`（泄漏检查被跳过），不当作通过。
 - 抑制规则保持最小：`test/sanitizer/{lsan,tsan,ubsan}.supp`。

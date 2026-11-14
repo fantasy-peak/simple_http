@@ -357,6 +357,7 @@ class Server {
         for (auto &cfg : listeners) {
             auto listener = std::make_shared<ListenerState>();
             listener->cfg = cfg;
+            listener->name = cfg.name;
             listener->core = core;
             listener->stopping = &m_stopping;
 
@@ -527,11 +528,19 @@ class Server {
         }
         m_stopping.store(true, std::memory_order_release);
         for (auto &listener : m_listeners) {
-            if (listener) {
-                for (auto &slot : listener->acceptors) {
+            if (!listener)
+                continue;
+            for (auto &slot : listener->acceptors) {
+                // Asio objects are not safe to touch from two threads: the
+                // acceptor's async_accept lives on a worker (or the main)
+                // context, while stop() runs on the caller's thread. Post the
+                // close; the captured shared_ptr keeps the acceptor alive until
+                // the handler runs (or is destroyed with the context).
+                auto acceptor = slot.acceptor;
+                asio::post(acceptor->get_executor(), [acceptor] {
                     error_code ignored;
-                    slot.acceptor->close(ignored);
-                }
+                    acceptor->close(ignored);
+                });
             }
         }
         // Hold one reference for the whole teardown. Observability accessors on
@@ -745,7 +754,22 @@ class Server {
         error_code ec;
         socket.set_option(asio::ip::tcp::no_delay{listener->cfg.tcp_nodelay}, ec);
         if (listener->cfg.socket_setup) {
-            listener->cfg.socket_setup(socket);
+            // A user callback MUST NOT be allowed to throw out of the accept
+            // handler: the exception would escape io_context::run() and call
+            // std::terminate on the worker.
+            try {
+                listener->cfg.socket_setup(socket);
+            } catch (const std::exception &e) {
+                SIMPLE_HTTP_ERROR_LOG("server: socket_setup threw: {}", e.what());
+                error_code ignored;
+                socket.close(ignored);
+                return;
+            } catch (...) {
+                SIMPLE_HTTP_ERROR_LOG("server: socket_setup threw unknown exception");
+                error_code ignored;
+                socket.close(ignored);
+                return;
+            }
         }
         auto core = listener->core;
         core->connections->fetch_add(1, std::memory_order_acq_rel);
@@ -796,7 +820,7 @@ class Server {
             // this phase; closing the transport unwinds the pending handshake.
             auto handshake_timer = std::make_shared<asio::steady_timer>(transport->get_executor());
             auto handshake_done = std::make_shared<std::atomic<bool>>(false);
-            const auto handshake_timeout = core->limits.idle_timeout;
+            const auto handshake_timeout = listener_limits(listener).idle_timeout;
             if (handshake_timeout.count() > 0) {
                 handshake_timer->expires_after(handshake_timeout);
                 handshake_timer->async_wait([transport, handshake_done](error_code tec) {
@@ -891,13 +915,19 @@ class Server {
             }
             run_h1(alive, std::move(transport), std::string{bytes}, alive->h2c_upgrade, closer);
         };
-        const auto idle = listener->core->limits.idle_timeout;
+        const auto idle = listener_limits(listener).idle_timeout;
         if (idle.count() > 0) {
             transport->async_read(ByteSpan{buffer->data(), buffer->size()},
                                   asio::cancel_after(idle, std::move(on_read)));
         } else {
             transport->async_read(ByteSpan{buffer->data(), buffer->size()}, std::move(on_read));
         }
+    }
+
+    // TCP listener config carries an optional EngineLimits override; without
+    // this every listener silently used ServerConfig::limits.
+    static EngineLimits listener_limits(const std::shared_ptr<ListenerState> &listener) {
+        return listener->cfg.limits.value_or(listener->core->limits);
     }
 
     template <typename Transport>
@@ -908,7 +938,7 @@ class Server {
         auto ws_exact = core->ws_exact;
         auto ws_proxy = core->ws_proxy;
         auto ws_regex = core->ws_regex;
-        auto engine = std::make_shared<Http1Engine<Transport>>(transport, core->limits);
+        auto engine = std::make_shared<Http1Engine<Transport>>(transport, listener_limits(listener));
         engine->allow_h2c_upgrade(allow_h2c);
         std::weak_ptr<Core> weak_core = core;
         // Keep the closer alive for the whole connection: the registry only
@@ -928,7 +958,7 @@ class Server {
         auto ws_exact = core->ws_exact;
         auto ws_proxy = core->ws_proxy;
         auto ws_regex = core->ws_regex;
-        auto engine = std::make_shared<Http2Engine<Transport>>(transport, core->limits);
+        auto engine = std::make_shared<Http2Engine<Transport>>(transport, listener_limits(listener));
         std::weak_ptr<Core> weak_core = core;
         engine->run(std::move(dispatch), std::move(initial), std::move(ws_exact), std::move(ws_proxy),
                     std::move(ws_regex), [weak_core, closer] {

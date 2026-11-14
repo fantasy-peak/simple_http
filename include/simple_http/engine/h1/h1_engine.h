@@ -482,6 +482,14 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
         m_finished = true;
         m_active_writer.reset();
         m_watchdog->cancel();
+        // Body reads queued behind the active pull will never be satisfied now.
+        // Invoke them with a connection error; destroying the type-erased
+        // handlers uninvoked would drop the callers' co_await frames silently.
+        while (!m_pending_pulls.empty()) {
+            PullCompletion pending = std::move(m_pending_pulls.front());
+            m_pending_pulls.pop_front();
+            body_failed(make_error_code(asio::error::connection_reset), std::move(pending));
+        }
         auto self = this->shared_from_this();
         if (m_owner != TransportOwner::Engine) {
             complete_done();
@@ -1202,8 +1210,14 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
                 ws->run_writer();
                 // Run the ws handler; when it finishes, close gracefully.
                 invoke_ws_handler(simple_http::WsHandler(handler), request, ws, [ws, done = std::move(done)]() mutable {
-                    ws->async_close(
-                        [done = std::move(done)](error_code) mutable { std::move(done)(error_code{}, true); });
+                    // Keep the handle alive until the Close frame has actually
+                    // been written. Otherwise this lambda is the last owner,
+                    // ~WebSocket aborts the backend, and the just-queued Close
+                    // is torn down with the transport.
+                    ws->async_close([ws, done = std::move(done)](error_code) mutable {
+                        (void)ws; // lifetime only: keep the handle alive until Close is written
+                        std::move(done)(error_code{}, true);
+                    });
                 });
             });
     }

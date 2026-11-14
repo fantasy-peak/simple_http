@@ -1009,28 +1009,35 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
             return;
         fill_data_frames();
         if (!m_out.empty()) {
-            auto chunk = std::make_shared<std::string>(std::move(m_out));
-            m_out.clear();
+            // Reuse the previous pass's buffer instead of moving the string
+            // into a shared_ptr: the move dropped the capacity, so every pass
+            // allocated again. m_writing is a member and stays valid until the
+            // transport write completes; m_out gets the old (written) buffer
+            // back and keeps its capacity.
+            m_writing.clear();
+            m_writing.swap(m_out);
             m_deadline = std::chrono::steady_clock::now() + m_limits.idle_timeout;
             auto self = this->shared_from_this();
             m_write_in_flight = true;
-            m_transport->async_write(ConstByteSpan{reinterpret_cast<const std::byte *>(chunk->data()), chunk->size()},
-                                     [self, chunk](error_code ec, std::size_t) {
-                                         self->m_write_in_flight = false;
-                                         if (self->m_finished) {
-                                             self->finish_connection();
-                                             return;
-                                         }
-                                         if (ec) {
-                                             self->finish_connection();
-                                             return;
-                                         }
-                                         self->write_loop();
-                                     });
+            m_transport->async_write(
+                ConstByteSpan{reinterpret_cast<const std::byte *>(m_writing.data()), m_writing.size()},
+                [self](error_code ec, std::size_t) {
+                    self->m_write_in_flight = false;
+                    if (self->m_finished) {
+                        self->finish_connection();
+                        return;
+                    }
+                    if (ec) {
+                        self->finish_connection();
+                        return;
+                    }
+                    self->write_loop();
+                });
             return;
         }
         if (m_streams.empty()) {
             std::string().swap(m_out);
+            std::string().swap(m_writing);
         }
         if (m_goaway_sent && streams_all_done()) {
             finish_connection();
@@ -1118,15 +1125,14 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
             shutdown();
             return;
         }
-        auto chunk = std::make_shared<std::string>(std::move(m_out));
-        m_out.clear();
+        m_writing.clear();
+        m_writing.swap(m_out);
         m_write_in_flight = true;
-        m_transport->async_write(
-            ConstByteSpan{reinterpret_cast<const std::byte *>(chunk->data()), chunk->size()},
-            asio::cancel_after(std::chrono::seconds(2), [self, chunk, shutdown](error_code, std::size_t) {
-                self->m_write_in_flight = false;
-                shutdown();
-            }));
+        m_transport->async_write(ConstByteSpan{reinterpret_cast<const std::byte *>(m_writing.data()), m_writing.size()},
+                                 asio::cancel_after(std::chrono::seconds(2), [self, shutdown](error_code, std::size_t) {
+                                     self->m_write_in_flight = false;
+                                     shutdown();
+                                 }));
     }
 
     void complete_on_done() {
@@ -1164,10 +1170,13 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
         // frames for its siblings are still handled. The bound is the connection
         // receive window, which is not replenished for parked bytes until they are
         // consumed; on_body_consumed() hands the parked frames back as room frees.
+        // m_recv_pos is a consumed-prefix offset: erasing from the front of the
+        // string on every read moved the whole remaining buffer (a hot memmove
+        // under load). Compaction happens in bulk below.
         std::size_t pos = 0;
-        while (m_recv_buf.size() - pos >= codec::kH2FrameHeaderSize) {
+        while (m_recv_buf.size() - m_recv_pos - pos >= codec::kH2FrameHeaderSize) {
             codec::H2FrameHeader hdr;
-            codec::parse_frame_header(std::string_view{m_recv_buf}.substr(pos), hdr);
+            codec::parse_frame_header(std::string_view{m_recv_buf}.substr(m_recv_pos + pos), hdr);
             // RFC 9113 §4.2: a frame larger than our advertised
             // SETTINGS_MAX_FRAME_SIZE is a connection error, for every frame type (a
             // compliant peer never sends one). Bounding it here also bounds how much
@@ -1177,17 +1186,25 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
                 return false;
             }
             std::size_t frame_end = pos + codec::kH2FrameHeaderSize + hdr.length;
-            if (frame_end > m_recv_buf.size())
+            if (frame_end > m_recv_buf.size() - m_recv_pos)
                 break; // wait for the rest of this frame
 
-            std::string_view payload = std::string_view{m_recv_buf}.substr(pos + codec::kH2FrameHeaderSize, hdr.length);
+            std::string_view payload =
+                std::string_view{m_recv_buf}.substr(m_recv_pos + pos + codec::kH2FrameHeaderSize, hdr.length);
             if (!handle_frame(hdr, payload)) {
                 return false; // fatal; GOAWAY already queued by handler
             }
             pos = frame_end;
         }
-        if (pos > 0)
-            m_recv_buf.erase(0, pos);
+        if (pos > 0) {
+            m_recv_pos += pos;
+            // Compact in bulk rather than per read; same thresholds as the h1
+            // ReadBuf (amortized O(1) instead of O(buffered) per read).
+            if (m_recv_pos >= 4096 && m_recv_pos * 2 >= m_recv_buf.size()) {
+                m_recv_buf.erase(0, m_recv_pos);
+                m_recv_pos = 0;
+            }
+        }
         return true;
     }
 
@@ -1976,6 +1993,21 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
             // client treats it as an error). The stream retires when the peer
             // ends it.
             if (st.body_discarded) {
+                // Keep the declared-content-length accounting current even
+                // though the bytes are dropped: a trailing HEADERS+END_STREAM
+                // checks it, and a valid request must not be reset after its
+                // response already completed.
+                st.body_received += static_cast<std::int64_t>(data.size());
+                if (st.declared_content_length >= 0 && st.body_received > st.declared_content_length) {
+                    SIMPLE_HTTP_ERROR_LOG("h2: request body overruns content-length (stream={}, declared={}, "
+                                          "seen={})",
+                                          hdr.stream_id, st.declared_content_length, st.body_received);
+                    // Padding was not credited separately on this path; return
+                    // the whole frame's connection credit before resetting.
+                    credit_consumed(st, frame_len);
+                    reset_stream(hdr.stream_id, codec::H2_PROTOCOL_ERROR);
+                    return true;
+                }
                 credit_consumed(st, frame_len);
                 if (hdr.has_flag(codec::H2_FLAG_END_STREAM)) {
                     st.half_closed_remote = true;
@@ -2317,7 +2349,7 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
             it->second.finish_pending = false;
             it->second.request->body().finish();
         }
-        if (!m_recv_buf.empty()) {
+        if (m_recv_pos < m_recv_buf.size()) {
             (void)parse_available();
         }
         // Now that the parked tail has actually been handed over (and the body
@@ -2626,6 +2658,19 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
                 // arriving. Keep answering, drop the tail as it arrives, and
                 // return its connection credit (see on_data).
                 it->second.body_discarded = true;
+            } else if (it->second.finish_pending) {
+                // END_STREAM arrived while DATA was still parked, and the
+                // handler has now returned without draining it. Nothing will
+                // ever call on_body_consumed() again, so the stream would keep
+                // its concurrency slot and withhold the parked bytes from the
+                // connection window for the connection's lifetime. Drop the
+                // parked tail, end the body, and let the queued response retire
+                // the stream (erase_stream returns the owed credit).
+                it->second.finish_pending = false;
+                it->second.paused_frames.clear();
+                it->second.paused_head = 0;
+                it->second.request->body().finish();
+                maybe_complete_stream(stream_id);
             }
         }
         pump_dispatch();
@@ -2769,8 +2814,12 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
                 auto ws = std::make_shared<WebSocket>(std::move(backend));
                 ws->run_writer();
                 invoke_ws_handler(WsHandler(handler), request, ws, [ws, done = std::move(done)]() mutable {
-                    ws->async_close(
-                        [done = std::move(done)](error_code) mutable { std::move(done)(error_code{}, true); });
+                    // Keep the handle alive until the Close frame is written
+                    // (see the h1 engine for the same reason).
+                    ws->async_close([ws, done = std::move(done)](error_code) mutable {
+                        (void)ws; // lifetime only: keep the handle alive until Close is written
+                        std::move(done)(error_code{}, true);
+                    });
                 });
             });
     }
@@ -3198,8 +3247,10 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
     std::size_t m_active_handlers{0};
     std::deque<std::uint32_t> m_pending_dispatch;
 
-    std::string m_recv_buf; // received bytes awaiting frame parsing
-    std::string m_out;      // serialized frames awaiting transport write
+    std::string m_recv_buf;    // received bytes awaiting frame parsing
+    std::size_t m_recv_pos{0}; // consumed prefix of m_recv_buf (compacted in bulk)
+    std::string m_writing;     // bytes of the in-flight transport write (reused)
+    std::string m_out;         // serialized frames awaiting transport write
 
     std::uint32_t m_goaway_error{0};                       // code for the GOAWAY re-emitted on teardown
     std::int64_t m_conn_send_window = kH2InitialWindow;    // peer's connection-level window for us (send side)

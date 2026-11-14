@@ -167,21 +167,20 @@ int main(int argc, char **argv) {
                      co_await res->status(status::ok).async_send("ok", asio::use_awaitable);
                  });
 
-    // The handler starts on the connection executor but the writes happen on a
-    // different one. ResponseWriter hops internally; this is the path that
-    // catches a missing hop or a lifetime mistake under TSan/ASan.
+    // The handler runs on the connection executor but moves one step of work to
+    // a different io_context and awaits it. Model A requires ResponseWriter to
+    // be touched only on the connection executor, so the hop is explicit and
+    // awaited; the handler then resumes on its own executor. This still
+    // exercises cross-executor work under TSan/ASan without violating the
+    // ownership contract.
     server.route(any_methods, "/cross", [&cross_io](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
         if (auto ec = co_await as_ec(
                 res->status(status::ok).content_type("text/plain").async_begin(asio::as_tuple(asio::use_awaitable)))) {
             co_return;
         }
-        asio::co_spawn(
-            cross_io,
-            [res]() -> asio::awaitable<void> {
-                (void)co_await res->async_write("cross ", asio::use_awaitable);
-                (void)co_await res->async_finish("done\n", asio::use_awaitable);
-            },
-            asio::detached);
+        co_await asio::co_spawn(cross_io, []() -> asio::awaitable<void> { co_return; }, asio::use_awaitable);
+        (void)co_await res->async_write("cross ", asio::use_awaitable);
+        (void)co_await res->async_finish("done\n", asio::use_awaitable);
     });
     server.ws_route("/ws", [](RequestPtr, std::shared_ptr<WebSocket> ws) -> asio::awaitable<void> {
         for (;;) {
