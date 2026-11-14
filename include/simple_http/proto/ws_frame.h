@@ -224,6 +224,13 @@ class WsFrameParser {
             pos += 8;
         }
 
+        // RFC 6455 §5.2: the most significant bit of a 64-bit payload length
+        // MUST be 0. Without this check `size - pos` is compared against a value
+        // that can never be satisfied but, worse, the old `pos + payload_len`
+        // wrapped and the assign below built a string of UINT64_MAX bytes
+        // (std::length_error escaping an io_context handler).
+        if (len7 == 127 && (payload_len & (std::uint64_t{1} << 63)) != 0)
+            return Status::Error;
         if (payload_len > m_max_payload)
             return Status::Error;
 
@@ -267,7 +274,10 @@ class WsFrameParser {
         m_partial_opcode = static_cast<WsOpcode>(opcode);
         std::memcpy(m_partial_key, mask_key, sizeof(m_partial_key));
 
-        if (size < pos + payload_len)
+        // Compare the other way round: `pos + payload_len` would wrap for a huge
+        // declared length and look satisfiable. `pos <= size` holds here (the
+        // header and mask key are complete), so the subtraction is safe.
+        if (payload_len > static_cast<std::uint64_t>(size - pos))
             return Status::NeedMore;
 
         out.fin = fin;

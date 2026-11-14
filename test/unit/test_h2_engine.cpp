@@ -135,6 +135,24 @@ bool has_rst_stream(std::string_view written, std::uint32_t stream_id, std::uint
     return false;
 }
 
+// Whether the server's recorded output contains a non-zero WINDOW_UPDATE for
+// `stream_id` (0 = the connection window).
+bool has_window_update(std::string_view written, std::uint32_t stream_id) {
+    for (std::size_t i = 0; i + kH2FrameHeaderSize <= written.size();) {
+        H2FrameHeader hdr;
+        if (!parse_frame_header(written.substr(i), hdr))
+            return false;
+        const std::size_t end = i + kH2FrameHeaderSize + hdr.length;
+        if (end > written.size())
+            return false;
+        if (hdr.type == static_cast<std::uint8_t>(H2FrameType::WindowUpdate) && hdr.stream_id == stream_id &&
+            hdr.length == 4 && read_u32(written, i + kH2FrameHeaderSize) != 0)
+            return true;
+        i = end;
+    }
+    return false;
+}
+
 // A handler that stays alive long enough for the read loop to process the rest
 // of a pre-pushed frame burst. A handler that returns immediately now releases
 // its stream (and its concurrency slot) — see handler_finished(stream_id).
@@ -689,4 +707,48 @@ TEST_CASE("h2/engine: Host must agree with :authority and appear at most once", 
         REQUIRE(out.completed);
         CHECK(out.dispatched);
     }
+}
+
+// S2: an early response must return the flow-control credit for a body the
+// handler never read. The peer spends its whole receive window on the body; if
+// the engine keeps that credit until END_STREAM, the peer can never send
+// END_STREAM (its window is zero) and every stream on the connection stalls
+// until the idle timeout.
+TEST_CASE("h2/engine: an early response returns the unread body's flow-control credit", "[h2]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    // Keep the peer open until the handler has answered; otherwise the read loop
+    // observes EOF and tears the connection down before the handler runs.
+    transport->hold_open();
+
+    std::string in{codec::kH2ClientPreface};
+    append_frame(in, H2FrameType::Settings, 0, 0, "");
+    in += post_headers_frame(1, /*end_stream=*/false, "early");
+    // Exactly the protocol's initial window: 3 full DATA frames + one short one.
+    std::size_t left = 65535;
+    while (left > 0) {
+        const std::size_t n = std::min<std::size_t>(left, 16384);
+        in += data_frame(1, std::string(n, 'x'));
+        left -= n;
+    }
+    transport->push(std::move(in));
+
+    auto dispatcher = [&](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res,
+                          SslHandle) -> asio::awaitable<void> {
+        // Let the read loop deliver the whole body into the Body channel before
+        // answering: the bytes are then "delivered but unconsumed" when
+        // handler_finished runs, which is the deadlock shape.
+        co_await park_briefly();
+        co_await res->status(status::unauthorized).async_send("denied", asio::use_awaitable);
+        transport->release(); // let the engine observe EOF and finish
+    };
+    auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, EngineLimits{});
+    REQUIRE(run_on(ctx, run_engine(*engine, dispatcher)));
+
+    // Both windows were exhausted; the engine must hand the credit back. The
+    // stream credit is needed for the peer to finish this request, the
+    // connection credit for every other stream on the connection.
+    CHECK(has_window_update(transport->written(), 0));
+    CHECK(has_window_update(transport->written(), 1));
+    CHECK_FALSE(has_goaway(transport->written(), codec::H2_FLOW_CONTROL_ERROR));
 }

@@ -4,6 +4,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 
@@ -995,4 +996,33 @@ TEST_CASE("ws/backend: idle_timeout 0 does not tear the connection down", "[ws][
     REQUIRE(message.has_value());
     REQUIRE(message->has_value());
     CHECK((*message)->data == "still open");
+}
+
+// S1: RFC 6455 §5.2 requires the most significant bit of a 64-bit payload
+// length to be zero. Without that check, `pos + payload_len` wraps and the
+// parser assigns UINT64_MAX bytes, throwing std::length_error out of an
+// io_context handler (a remote crash when max_body_bytes == 0 makes the parser
+// limit UINT64_MAX).
+TEST_CASE("ws/codec: a 64-bit payload length with the high bit set is rejected", "[ws][ws-codec]") {
+    WsFrameParser parser(std::numeric_limits<std::uint64_t>::max(), /*expect_masked=*/true,
+                         /*allow_rsv1=*/false);
+    std::string bytes;
+    bytes.push_back(static_cast<char>(0x82));       // FIN + binary
+    bytes.push_back(static_cast<char>(0x80 | 127)); // masked, 64-bit length
+    for (int i = 0; i < 8; ++i) {
+        bytes.push_back(static_cast<char>(0xFF));
+    }
+    bytes.append("\x01\x02\x03\x04", 4); // mask key
+    parser.append(bytes);
+
+    WsFrame frame;
+    WsFrameParser::Status status = WsFrameParser::Status::NeedMore;
+    bool threw = false;
+    try {
+        status = parser.next(frame);
+    } catch (const std::exception &) {
+        threw = true;
+    }
+    CHECK_FALSE(threw);
+    CHECK(status == WsFrameParser::Status::Error);
 }

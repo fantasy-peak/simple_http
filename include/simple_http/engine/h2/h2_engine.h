@@ -716,6 +716,10 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
         std::int64_t recv_window = kH2InitialWindow; // our window advertised to the peer (recv side)
         std::int64_t recv_pending = 0;               // consumed bytes awaiting a batched stream WINDOW_UPDATE
         std::int64_t recv_owed_conn = 0; // delivered-but-unconsumed body bytes still owing connection credit
+        // Set when handler_finished() returned that credit early because the
+        // handler answered without reading the body. A late read (a detached
+        // consumer) must not return the same credit a second time.
+        bool body_credit_prepaid = false;
         bool dispatched = false;
         // Whether this stream's handler has actually started. `dispatched` is set
         // the moment the request head is accepted — so a later HEADERS is still
@@ -2325,10 +2329,15 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
             // the stream was released (release_stream_credit), so nothing to do.
             return;
         }
-        it->second.recv_owed_conn -= static_cast<std::int64_t>(n);
-        if (it->second.recv_owed_conn < 0)
-            it->second.recv_owed_conn = 0; // defensive
-        credit_consumed(it->second, static_cast<std::int64_t>(n));
+        // handler_finished() may already have returned this stream's outstanding
+        // body credit early (the handler answered without reading). A detached
+        // reader that keeps consuming afterwards must not return it twice.
+        if (!it->second.body_credit_prepaid) {
+            it->second.recv_owed_conn -= static_cast<std::int64_t>(n);
+            if (it->second.recv_owed_conn < 0)
+                it->second.recv_owed_conn = 0; // defensive
+            credit_consumed(it->second, static_cast<std::int64_t>(n));
+        }
         flush();
 
         // The handler made room: hand over the frames this stream parked, oldest
@@ -2656,7 +2665,20 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
             } else if (!it->second.half_closed_remote) {
                 // The response is complete but the request body is still
                 // arriving. Keep answering, drop the tail as it arrives, and
-                // return its connection credit (see on_data).
+                // return the credit for bytes already delivered but never read.
+                //
+                // Waiting for END_STREAM to return that credit is a deadlock:
+                // the peer cannot send the tail while our windows are exhausted
+                // (it just spent them on the unread prefix), and the connection
+                // window it is blocked on is shared with every other stream.
+                // Credit now and mark it, so a detached reader cannot return the
+                // same bytes twice.
+                if (it->second.recv_owed_conn > 0) {
+                    credit_consumed(it->second, it->second.recv_owed_conn);
+                    it->second.recv_owed_conn = 0;
+                    it->second.body_credit_prepaid = true;
+                    flush();
+                }
                 it->second.body_discarded = true;
             } else if (it->second.finish_pending) {
                 // END_STREAM arrived while DATA was still parked, and the
@@ -2847,10 +2869,14 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
             const std::size_t n = std::min<std::size_t>(out.size(), st.ws_inbox.size());
             std::memcpy(out.data(), st.ws_inbox.data(), n);
             st.ws_inbox.erase(0, n);
-            st.recv_owed_conn -= static_cast<std::int64_t>(n);
-            if (st.recv_owed_conn < 0)
-                st.recv_owed_conn = 0;
-            credit_consumed(st, static_cast<std::int64_t>(n));
+            // Same guard as on_body_consumed(): the credit may already have been
+            // prepaid when the tunnel handler finished (see handler_finished).
+            if (!st.body_credit_prepaid) {
+                st.recv_owed_conn -= static_cast<std::int64_t>(n);
+                if (st.recv_owed_conn < 0)
+                    st.recv_owed_conn = 0;
+                credit_consumed(st, static_cast<std::int64_t>(n));
+            }
             flush();
             std::move(done)(error_code{}, n);
             return;
