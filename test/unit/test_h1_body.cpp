@@ -25,6 +25,7 @@ struct BodyOutcome {
     error_code ec;
     std::string body;
     std::string trailer;
+    std::string response;
 
     bool had_trailer{false};
 };
@@ -53,6 +54,7 @@ BodyOutcome run_chunked(std::string request, EngineLimits limits = {}) {
 
     auto engine = std::make_shared<Http1Engine<MockTransport>>(transport, limits);
     out.completed = run_on(ctx, run_engine(*engine, dispatcher));
+    out.response = transport->written();
     return out;
 }
 
@@ -211,4 +213,26 @@ TEST_CASE("h1/body: the trailer budget is per message, not per connection", "[h1
     REQUIRE(bodies.size() == 2);
     CHECK(bodies[0] == "a");
     CHECK(bodies[1] == "a");
+}
+
+// RFC 9112 §6.1: Transfer-Encoding is one comma-separated coding list, and
+// chunked must be the final coding. Reading only the first field (or only
+// "does chunked appear") lets two readers disagree about the body boundary.
+TEST_CASE("h1/body: Transfer-Encoding must be a single final chunked coding", "[h1]") {
+    auto frames = [](const std::string &fields, int expected) {
+        auto out = run_chunked("POST / HTTP/1.1\r\nHost: x\r\n" + fields + "\r\n");
+        CHECK(out.completed);
+        CHECK_FALSE(out.ok);
+        CHECK(out.response.rfind("HTTP/1.1 " + std::to_string(expected), 0) == 0);
+    };
+
+    // chunked is present but not last (two fields, then one field).
+    frames("Transfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\n", 400);
+    frames("Transfer-Encoding: chunked, gzip\r\n", 400);
+    // chunked last but preceded by an unsupported coding.
+    frames("Transfer-Encoding: gzip, chunked\r\n", 501);
+    // No chunked at all.
+    frames("Transfer-Encoding: gzip\r\n", 501);
+    // Repeated chunked.
+    frames("Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n", 400);
 }

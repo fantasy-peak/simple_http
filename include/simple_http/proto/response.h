@@ -66,6 +66,20 @@ class ResponseWriter {
     }
     int status() const { return m_status; }
     bool started() const { return m_started; }
+
+    // Drops every field the handler set — including ones rejected for syntax —
+    // so the dispatcher's exception fallback can still write a clean 500. Only
+    // valid before the response starts; returns false otherwise.
+    bool reset_for_error() {
+        require_owner();
+        if (m_started)
+            return false;
+        m_headers.clear();
+        m_trailers.clear();
+        m_field_rejected = false;
+        m_status = status::internal_server_error;
+        return true;
+    }
     [[nodiscard]] std::uint64_t activity() const noexcept { return m_activity.load(std::memory_order_relaxed); }
     ResponseWriter &header(std::string_view name, std::string value) {
         require_owner();

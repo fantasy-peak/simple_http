@@ -57,6 +57,14 @@ inline bool valid_multipart_param(std::string_view value) {
 
 using MultipartDone = asio::any_completion_handler<void(error_code)>;
 
+// Classifies a completed read. A short read at end-of-file sets failbit *and*
+// eofbit, which is exactly how a chunk loop reaches the end of the file; only
+// badbit means the stream itself failed. Using fail() here made every upload
+// finish with io_error after writing all its bytes.
+inline error_code file_read_error(const std::istream &in) noexcept {
+    return in.bad() ? make_error_code(boost::system::errc::io_error) : error_code{};
+}
+
 // Reads `path` in chunks and writes each as a Stream chunk.
 inline void stream_file_step(std::shared_ptr<Stream> stream, std::shared_ptr<std::ifstream> in,
                              std::shared_ptr<std::string> buffer, std::size_t chunk_bytes,
@@ -77,11 +85,9 @@ inline void stream_file_step(std::shared_ptr<Stream> stream, std::shared_ptr<std
                             });
         return;
     }
-    // A clean EOF sets only eofbit; fail() covers failbit too, so a read that
-    // stopped for any other reason is an error rather than a silent success.
-    error_code result;
-    if (in->fail())
-        result = make_error_code(boost::system::errc::io_error);
+    // A clean EOF leaves badbit clear; that is success. Only a stream failure
+    // (badbit) is an error.
+    error_code result = file_read_error(*in);
     auto callback = std::move(*done);
     std::move(callback)(result);
 }

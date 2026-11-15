@@ -194,6 +194,11 @@ class ClientStream {
 
     virtual void clear_head_cache() { reset_head(); }
 
+    // True when a head has been published to this handle. Sessions use it to
+    // deliver an interim 100 that arrived while a head read was parked, without
+    // waiting for the final header block.
+    bool head_ready() const { return m_head_ready; }
+
     // Token-level virtuals implemented by the session-specific stream.
     virtual void write(std::string data, WriteCompletion done) = 0;
     virtual void finish(std::string data, WriteCompletion done) = 0;
@@ -219,7 +224,6 @@ class ClientStream {
     void reset_head() { m_head_ready = false; }
     void set_trailers(Headers trailers) { m_trailers = std::move(trailers); }
 
-    bool head_ready() const { return m_head_ready; }
     const std::shared_ptr<ResponseHead> &head_ptr() const { return m_head; }
 
   private:

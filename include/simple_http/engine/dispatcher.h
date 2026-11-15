@@ -255,6 +255,10 @@ void execute_coroutine(const RequestPtr &req, const ResponsePtr &res, HandlerCom
             if (fallback->started()) {
                 fallback->async_close([done = std::move(done)](error_code) mutable { std::move(done)(); });
             } else {
+                // A handler may have set an illegal field (often from request
+                // input) before throwing; the old writer would then refuse to
+                // send anything, leaving the client without a response.
+                fallback->reset_for_error();
                 fallback->status(status::internal_server_error);
                 fallback->async_send("", [done = std::move(done)](error_code) mutable { std::move(done)(); });
             }
@@ -346,6 +350,9 @@ inline void invoke_handler(const Handler &handler, RequestPtr req, ResponsePtr r
         if (fallback->started()) {
             fallback->async_close([finish](error_code) mutable { finish(); });
         } else {
+            // A synchronously thrown handler may already have poisoned the
+            // writer with an illegal field; clear it so the 500 is writable.
+            fallback->reset_for_error();
             fallback->status(status::internal_server_error);
             fallback->async_send("", [finish](error_code) mutable { finish(); });
         }

@@ -843,6 +843,27 @@ TEST_CASE("static: SPA fallback never swallows a reserved prefix", "[static]") {
     CHECK(get(*site, ctx, "/elsewhere").handled);
 }
 
+TEST_CASE("static: SPA fallback does not answer a non-GET method", "[static]") {
+    StaticFixture fx;
+    fx.make_standard_tree();
+
+    StaticFilesConfig cfg = standard_config(fx);
+    cfg.spa_fallback = "index.html";
+    auto site = load_standard(fx, cfg);
+
+    asio::io_context ctx;
+
+    // The fallback used to be resolved before the method check, so a POST to a
+    // path that does not exist became a 405 (or served the index) instead of
+    // letting the router render its 404.
+    auto post = serve(*site, ctx, make_request(ctx, "/spa/deep/link", Method::Post));
+    CHECK_FALSE(post.handled);
+    CHECK(post.writer->last_status == 0);
+
+    // GET on the same path still takes the fallback.
+    CHECK(get(*site, ctx, "/spa/deep/link").handled);
+}
+
 TEST_CASE("static: the index file is matched as a path component, not a suffix", "[static]") {
     StaticFixture fx;
     fx.write("index.html", "root");

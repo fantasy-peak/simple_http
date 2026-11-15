@@ -487,4 +487,72 @@ TEST_CASE("h2/engine: a 204 response never carries a DATA frame", "[h2]") {
     CHECK(data_frames == 0);
 }
 
+// --- h1 response framing edge cases -----------------------------------------
+
+TEST_CASE("h1/engine: an empty write does not terminate a chunked body", "[h1]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    transport->push("GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+
+    auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res,
+                         SslHandle) -> asio::awaitable<void> {
+        co_await res->status(status::ok).async_begin(asio::use_awaitable);
+        co_await res->async_write("", asio::use_awaitable); // SSE heartbeat
+        co_await res->async_write("tail", asio::use_awaitable);
+        co_await res->async_finish(asio::use_awaitable);
+    };
+
+    auto engine = std::make_shared<Http1Engine<MockTransport>>(transport);
+    REQUIRE(run_on(ctx, run_engine(*engine, dispatcher)));
+
+    const std::string &out = transport->written();
+    CHECK(out.find("4\r\ntail\r\n") != std::string::npos);
+    // The only "0\r\n\r\n" is the one finish() writes, at the very end.
+    REQUIRE(out.rfind("0\r\n\r\n") != std::string::npos);
+    CHECK(out.find("0\r\n\r\n") == out.rfind("0\r\n\r\n"));
+    CHECK(out.size() == out.rfind("0\r\n\r\n") + 5);
+}
+
+TEST_CASE("h1/engine: an unfinished streamed response is not reused", "[h1]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    transport->push("GET /a HTTP/1.1\r\nHost: x\r\n\r\n"
+                    "GET /b HTTP/1.1\r\nHost: x\r\n\r\n");
+
+    int dispatched = 0;
+    auto dispatcher = [&dispatched](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res,
+                                    SslHandle) -> asio::awaitable<void> {
+        ++dispatched;
+        // begin() without finish(): the chunked body has no terminator, so the
+        // connection cannot carry another response.
+        co_await res->status(status::ok).async_begin(asio::use_awaitable);
+    };
+
+    auto engine = std::make_shared<Http1Engine<MockTransport>>(transport);
+    REQUIRE(run_on(ctx, run_engine(*engine, dispatcher)));
+
+    CHECK(dispatched == 1);
+    CHECK(transport->closed());
+}
+
+TEST_CASE("h1/engine: a HEAD error response has no body", "[h1]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    transport->push("HEAD / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n");
+
+    auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res,
+                         SslHandle) -> asio::awaitable<void> {
+        co_await res->status(status::ok).async_send("unexpected", asio::use_awaitable);
+    };
+
+    auto engine = std::make_shared<Http1Engine<MockTransport>>(transport);
+    REQUIRE(run_on(ctx, run_engine(*engine, dispatcher)));
+
+    const std::string &out = transport->written();
+    CHECK(out.rfind("HTTP/1.1 400", 0) == 0);
+    // Header section only: no "Bad Request" body after the blank line.
+    REQUIRE(out.rfind("\r\n\r\n") != std::string::npos);
+    CHECK(out.size() == out.rfind("\r\n\r\n") + 4);
+}
+
 } // namespace

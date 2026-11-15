@@ -163,6 +163,12 @@ class Stream {
         return start_write_op(std::move(data), true, {}, std::forward<Token>(token));
     }
     template <typename Token> auto async_finish_trailers(Headers trailers, Token &&token) {
+        // An empty trailer section still ends the body. Handing it to
+        // finish_trailers() would degrade to async_write("", last=false), and
+        // the request would never be terminated on h1/h2/h3.
+        if (trailers.empty()) {
+            return start_write_op(std::string{}, true, {}, std::forward<Token>(token));
+        }
         return start_write_op(std::string{}, false, std::move(trailers), std::forward<Token>(token));
     }
 

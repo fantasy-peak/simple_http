@@ -441,6 +441,9 @@ void invoke_extracted(std::shared_ptr<F> fn, Tuple values, RequestPtr req, Respo
         if (res_keep->started()) {
             res_keep->async_close([finish](error_code) mutable { finish(); });
         } else {
+            // Clear any field the handler rejected before throwing, or the
+            // shared writer refuses the 500 and the client gets nothing.
+            res_keep->reset_for_error();
             res_keep->status(status::internal_server_error);
             res_keep->async_send("", [finish](error_code) mutable { finish(); });
         }

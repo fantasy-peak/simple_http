@@ -194,9 +194,14 @@ inline void StaticFiles::try_serve(const RequestPtr &req, const ResponsePtr &res
         return;
     }
 
+    const auto method = req->method();
+    const bool method_ok = method == Method::Get || method == Method::Head;
     const StaticEntry *entry = m_table.find(*normalized);
     bool spa_hit = false;
-    if (entry == nullptr && spa_eligible(*normalized)) {
+    // SPA fallback only answers GET/HEAD. Applying it before the method check
+    // turned a POST to a path that does not exist into 405 (or, worse, would
+    // serve index.html) instead of letting the router produce its 404.
+    if (entry == nullptr && method_ok && spa_eligible(*normalized)) {
         // Keys are normalized with a leading '/', so a caller-supplied
         // "/index.html" must not become "//index.html" (which never matches).
         entry =
@@ -208,8 +213,7 @@ inline void StaticFiles::try_serve(const RequestPtr &req, const ResponsePtr &res
         return;
     }
 
-    const auto method = req->method();
-    if (method != Method::Get && method != Method::Head) {
+    if (!method_ok) {
         // Resolved first, then rejected: a POST to a path that does not exist is
         // a 404, not a 405, which is what a static file server does. Without this
         // ordering a POST to "/" would be answered with the whole index page.

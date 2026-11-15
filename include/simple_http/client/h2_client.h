@@ -470,6 +470,17 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
             complete_head_await(id, std::move(done));
             return;
         }
+        // An interim 100 was published while this await was parked. Deliver it
+        // once so the automatic Expect flow can send the body; the caller
+        // clears the cache before reading the final head. `head_ready()`
+        // distinguishes a still-published interim from one the caller already
+        // consumed (or cleared) — otherwise a body read would see the same 100
+        // forever.
+        if (auto handle = st.handle.lock(); st.interim_pending && handle && handle->head_ready()) {
+            st.interim_pending = false;
+            std::move(done)(error_code{});
+            return;
+        }
         if (st.failed || st.reset) {
             std::move(done)(outcome_error(*st.outcome));
             return;
@@ -608,6 +619,7 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
         bool block_end_stream{false}; // the HEADERS frame that started the block carried END_STREAM
         bool expect_continue{false};  // request carried Expect: 100-continue
         bool interim_100_sent{false}; // the interim 100 was published to the handle
+        bool interim_pending{false};  // published but not yet delivered to a parked await
         bool is_head{false};          // the request method was HEAD (bodyless response)
         // §8.1.2.6: a declared content-length must equal the DATA payload total.
         // -1 means no declaration; bodyless responses skip the check.
@@ -1300,6 +1312,7 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
                 interim.bodyless = true;
                 if (auto handle = st.handle.lock())
                     handle->set_head(std::move(interim));
+                st.interim_pending = true;
                 wake(st);
             }
             return true;

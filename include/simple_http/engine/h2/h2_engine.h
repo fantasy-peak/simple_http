@@ -140,6 +140,7 @@ class Http2ResponseSink final : public ResponseSink, public std::enable_shared_f
                 std::move(done)(make_error_code(asio::error::not_connected));
                 return;
             }
+            self->m_head_started = true;
             ensure_date(headers);
             const bool head = eng->method_is_head(self->m_stream_id);
             if (head) {
@@ -149,6 +150,10 @@ class Http2ResponseSink final : public ResponseSink, public std::enable_shared_f
             eng->submit_headers(self->m_stream_id, status, headers, /*end_stream=*/head);
             if (!head)
                 eng->enqueue_body(self->m_stream_id, std::move(body), /*last=*/true);
+            // A HEAD/one-shot response has nothing in the body queue to nudge
+            // the write loop; without this the client sees it only after the
+            // handler returns.
+            eng->flush();
             std::move(done)(error_code{});
         });
     }
@@ -167,8 +172,10 @@ class Http2ResponseSink final : public ResponseSink, public std::enable_shared_f
                 if (status == status::no_content || (status >= 100 && status < 200)) {
                     headers.erase("content-length");
                 }
+                self->m_head_started = true;
                 ensure_date(headers);
                 eng->submit_headers(self->m_stream_id, status, headers, /*end_stream=*/true);
+                eng->flush();
                 std::move(done)(error_code{});
             });
     }
@@ -180,7 +187,10 @@ class Http2ResponseSink final : public ResponseSink, public std::enable_shared_f
                 std::move(done)(make_error_code(asio::error::not_connected));
                 return;
             }
-            if (!self->m_continue_sent) {
+            // An interim response must precede the final one (RFC 9110 §15.2):
+            // a handler that answers before reading the body must not cause a
+            // 100 to be emitted after the final HEADERS.
+            if (!self->m_continue_sent && !self->m_head_started) {
                 self->m_continue_sent = true;
                 eng->submit_headers(self->m_stream_id, status::continue_, Headers{}, /*end_stream=*/false);
                 eng->flush();
@@ -197,6 +207,7 @@ class Http2ResponseSink final : public ResponseSink, public std::enable_shared_f
                     std::move(done)(make_error_code(asio::error::not_connected));
                     return;
                 }
+                self->m_head_started = true;
                 ensure_date(headers);
                 headers.erase("content-length");
                 eng->submit_headers(self->m_stream_id, status, headers,
@@ -315,6 +326,8 @@ class Http2ResponseSink final : public ResponseSink, public std::enable_shared_f
     asio::any_io_executor m_executor;
     bool m_head_request{false};
     bool m_continue_sent{false};
+    // A final response HEADERS block has been submitted; no interim may follow.
+    bool m_head_started{false};
 };
 
 template <typename Transport> class Http2Engine : public std::enable_shared_from_this<Http2Engine<Transport>> {

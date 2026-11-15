@@ -37,6 +37,39 @@ class FinishedClientStream final : public detail::ClientStream {
     asio::any_io_executor m_executor;
 };
 
+// Records which request-side terminator the Stream facade chose.
+class TerminatorRecordingStream final : public detail::ClientStream {
+  public:
+    explicit TerminatorRecordingStream(asio::any_io_executor ex) : m_executor(std::move(ex)) {}
+
+    void write(std::string, WriteCompletion done) override {
+        ++writes;
+        std::move(done)(error_code{});
+    }
+    void finish(std::string, WriteCompletion done) override {
+        ++finishes;
+        std::move(done)(error_code{});
+    }
+    void finish_trailers(Headers, WriteCompletion done) override {
+        ++trailer_finishes;
+        std::move(done)(error_code{});
+    }
+    void read(detail::ReadCompletion done) override { std::move(done)(error_code{}, ReadResult::end()); }
+    void cancel(WriteCompletion done) override { std::move(done)(error_code{}); }
+    void await_head(WriteCompletion done) override { std::move(done)(error_code{}); }
+    bool finished() const override { return false; }
+    Version version() const override { return Version::Http11; }
+    std::uint32_t id() const override { return 0; }
+    asio::any_io_executor head_executor() const override { return m_executor; }
+
+    int writes{0};
+    int finishes{0};
+    int trailer_finishes{0};
+
+  private:
+    asio::any_io_executor m_executor;
+};
+
 } // namespace
 
 // A compress decorator is installed whenever the client's Accept-Encoding is
@@ -805,6 +838,28 @@ TEST_CASE("review: extract handler exceptions become 500", "[review][regression]
     CHECK(sink->last_body.empty());
 }
 
+// A handler may set an illegal field (often from request input) and then throw.
+// The shared ResponseWriter used to refuse to send anything, so the client got
+// no response at all; the fallback now clears the rejected fields first.
+TEST_CASE("review: a rejected field does not block the exception 500", "[review][regression][framework]") {
+    asio::io_context ctx;
+    auto req = std::make_shared<Request>(Version::Http11, ctx.get_executor());
+    auto sink = std::make_shared<FakeResponseSink>(ctx.get_executor());
+    auto res = std::make_shared<ResponseWriter>(sink);
+
+    auto fn = std::make_shared<std::function<void(int, RequestPtr, ResponsePtr)>>([](int, RequestPtr, ResponsePtr r) {
+        r->header("bad name", "x"); // poisons the writer
+        throw std::runtime_error("handler boom");
+    });
+    bool done = false;
+    detail::invoke_extracted(fn, std::tuple<int>{1}, req, res, SslHandle{},
+                             HandlerCompletion([&done]() { done = true; }));
+    ctx.run_for(std::chrono::milliseconds(200));
+
+    CHECK(done);
+    CHECK(sink->last_status == status::internal_server_error);
+}
+
 // Per-request state carries meaning, not just decoration: the buffered send()
 // path marks a request it may decode with AutoDecompressMark. A replay that
 // dropped the mark would return a gzip body the client itself advertised.
@@ -1082,4 +1137,125 @@ TEST_CASE("transport: async_error_only keeps the buffer owner alive", "[transpor
                              });
 
     CHECK(buffer.use_count() >= 2); // caller + pending operation
+}
+
+// `finish_trailers({})` means "end the body, there are no trailer fields". It
+// used to degrade to async_write("", last=false), leaving h1 without its
+// terminator and h2/h3 without END_STREAM.
+TEST_CASE("review: finish_trailers with no fields still ends the request body", "[review][regression][client]") {
+    asio::io_context ctx;
+    auto inner = std::make_shared<TerminatorRecordingStream>(ctx.get_executor());
+    Stream stream{inner};
+
+    REQUIRE(run_on(ctx, [&]() -> asio::awaitable<void> {
+        co_await stream.async_finish_trailers(Headers{}, asio::use_awaitable);
+    }()));
+
+    CHECK(inner->finishes == 1);
+    CHECK(inner->writes == 0);
+    CHECK(inner->trailer_finishes == 0);
+}
+
+// RFC 9112 §9.3: an HTTP/1.0 response is close-delimited unless it explicitly
+// asks for keep-alive. Caching it as a reusable connection sent the next
+// request into a socket the peer was closing.
+TEST_CASE("review: an HTTP/1.0 response without keep-alive is not reused", "[review][regression][client]") {
+    using Session = detail::Http1ClientSession<MockTransport>;
+    asio::io_context ctx;
+    auto pump = [&ctx] {
+        ctx.restart();
+        ctx.run_for(std::chrono::milliseconds(500));
+    };
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    auto session = std::make_shared<Session>(transport, "example.com", EngineLimits{});
+
+    auto request = std::make_shared<Request>(Version::Http11, ctx.get_executor());
+    request->set_method(Method::Get);
+    request->set_target("/x");
+    std::shared_ptr<detail::ClientStream> stream;
+    session->open_stream(request, [&stream](error_code ec, std::shared_ptr<detail::ClientStream> s) {
+        if (!ec)
+            stream = std::move(s);
+    });
+    pump();
+    REQUIRE(stream);
+
+    transport->push("HTTP/1.0 200 OK\r\ncontent-length: 0\r\n\r\n");
+    bool head_ok = false;
+    stream->async_read_head([&head_ok](error_code ec, detail::ResponseHead) { head_ok = !ec; });
+    pump();
+    REQUIRE(head_ok);
+
+    bool body_done = false;
+    stream->async_read([&body_done](error_code ec, ReadResult r) { body_done = !ec && r.eof; });
+    pump();
+    REQUIRE(body_done);
+
+    CHECK_FALSE(session->reusable());
+}
+
+// h2 client: an interim 100 must complete a parked head read. It used to be
+// published to the caller's handle and then ignored, so the automatic
+// Expect flow waited for the 1s timeout and explicit Expect deadlocked when
+// the server waited for the body.
+TEST_CASE("review: an h2 interim 100 wakes a parked head read", "[review][regression][client]") {
+    using Session = detail::Http2ClientSession<MockTransport>;
+    asio::io_context ctx;
+    auto pump = [&ctx] {
+        ctx.restart();
+        ctx.run_for(std::chrono::milliseconds(200));
+    };
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    transport->hold_open();
+
+    std::string settings;
+    append_h2_frame(settings, codec::H2FrameType::Settings, 0, 0, {});
+    transport->push(std::move(settings));
+
+    detail::ClientTarget target;
+    target.host = "example.com";
+    target.port = 80;
+    auto session = std::make_shared<Session>(transport, target, EngineLimits{}, std::chrono::milliseconds{0});
+    bool started = false;
+    session->start([&started](error_code ec) { started = !ec; });
+    pump();
+    REQUIRE(started);
+
+    auto request = std::make_shared<Request>(Version::Http11, ctx.get_executor());
+    request->set_method(Method::Post);
+    request->set_target("/x");
+    request->mutable_headers().add("expect", "100-continue");
+    request->set_stream_body(true);
+    std::shared_ptr<detail::ClientStream> stream;
+    session->open_stream(request, [&stream](error_code ec, std::shared_ptr<detail::ClientStream> s) {
+        if (!ec)
+            stream = std::move(s);
+    });
+    pump();
+    REQUIRE(stream);
+
+    // Park the head read first, so the interim has to wake it (a head already
+    // cached before read_head() would be returned without the session's help).
+    std::optional<detail::ResponseHead> head;
+    std::optional<error_code> read_ec;
+    stream->async_read_head([&](error_code ec, detail::ResponseHead h) {
+        read_ec = ec;
+        head = std::move(h);
+    });
+    pump();
+    REQUIRE_FALSE(read_ec.has_value()); // still waiting for a head
+
+    std::string interim;
+    {
+        std::string block;
+        codec::hpack_append_literal(block, ":status", "100");
+        append_h2_frame(interim, codec::H2FrameType::Headers, codec::H2_FLAG_END_HEADERS, 1, block);
+    }
+    transport->push(std::move(interim));
+    pump();
+
+    REQUIRE(read_ec.has_value());
+    CHECK_FALSE(*read_ec);
+    REQUIRE(head.has_value());
+    CHECK(head->status == status::continue_);
 }

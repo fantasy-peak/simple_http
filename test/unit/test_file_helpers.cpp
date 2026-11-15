@@ -157,6 +157,32 @@ TEST_CASE("file: read_body_to_file caps the upload before it fills the disk", "[
     CHECK(read_file(path).empty());
 }
 
+// client/multipart_stream.h: a short read at end-of-file sets both eofbit and
+// failbit. The chunk loop treats gcount()==0 as the end, so only badbit is a
+// real error; classifying fail() as io_error made every upload end with one.
+TEST_CASE("file: reaching EOF is not a read error", "[file]") {
+    StaticFixture fixture;
+    fixture.write("ten.bin", "0123456789");
+    std::ifstream in{fixture.root() / "ten.bin", std::ios::binary};
+    REQUIRE(in);
+
+    std::string buffer(4, '\0');
+    std::size_t total = 0;
+    for (;;) {
+        in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const auto n = static_cast<std::size_t>(in.gcount());
+        total += n;
+        if (n == 0)
+            break;
+    }
+
+    CHECK(total == 10);
+    // The final zero-byte read is a clean EOF; the old `fail()` test reported
+    // io_error here.
+    CHECK(in.eof());
+    CHECK_FALSE(detail::file_read_error(in));
+}
+
 TEST_CASE("file: an empty body still creates the destination file", "[file]") {
     StaticFixture fixture;
     const std::string path = fixture.root_string() + "/empty.bin";

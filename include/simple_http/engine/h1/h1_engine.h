@@ -132,8 +132,11 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
     void connected(ConnectedCompletion done) const override {
         on_executor([self = this->shared_from_this(), done = std::move(done)]() mutable {
             // Pending writes mean the response is not on the wire yet; the
-            // connection must not be reused for another request.
-            std::move(done)(error_code{}, self->m_open && self->m_writer->idle());
+            // connection must not be reused for another request. A response
+            // that was begun but never finished has no terminator either, so
+            // reusing the connection would splice the next response into this
+            // body (or leave the client waiting forever).
+            std::move(done)(error_code{}, self->m_open && self->m_writer->idle() && self->m_response_complete);
         });
     }
 
@@ -279,6 +282,8 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
             std::move(done)(make_error_code(asio::error::not_connected));
             return;
         }
+        m_final_started = true;
+        m_response_complete = true;
         if (status == status::no_content || status == status::not_modified) {
             if (status == status::no_content) {
                 headers.erase("content-length");
@@ -304,6 +309,8 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
             std::move(done)(make_error_code(asio::error::not_connected));
             return;
         }
+        m_final_started = true;
+        m_response_complete = true;
         strip_hop_by_hop(headers);
         if (status == status::no_content || (status >= 100 && status < 200)) {
             headers.erase("content-length");
@@ -317,6 +324,13 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
     void enqueue_continue(WriteCompletion done) {
         if (!m_open) {
             std::move(done)(make_error_code(asio::error::not_connected));
+            return;
+        }
+        // RFC 9110 §15.2: an interim response must precede the final one. A
+        // handler that sends the final response before reading the body must
+        // not cause "200 ... 100 Continue" to appear on the wire.
+        if (m_final_started) {
+            std::move(done)(error_code{});
             return;
         }
         // At most one interim response per request, shared with the body
@@ -333,6 +347,7 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
             std::move(done)(make_error_code(asio::error::not_connected));
             return;
         }
+        m_final_started = true;
         strip_hop_by_hop(headers);
         ensure_date(headers);
         headers.erase("content-length");
@@ -356,11 +371,14 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
             std::move(done)(make_error_code(asio::error::not_connected));
             return;
         }
+        // An empty chunk is not a chunk: serialized on a chunked stream it would
+        // be "0\r\n\r\n", the terminator, ending the body before finish().
+        // Streaming APIs write "" as a no-op (SSE heartbeats do this).
+        if (data.empty()) {
+            std::move(done)(error_code{});
+            return;
+        }
         if (!m_chunked) {
-            if (data.empty()) {
-                std::move(done)(error_code{});
-                return;
-            }
             m_writer->enqueue(WriteEntry::owned(std::string{}, std::move(data)), wrap(std::move(done)));
             return;
         }
@@ -370,6 +388,9 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
 
     void enqueue_last(std::string data, WriteCompletion done) {
         if (m_head_request) {
+            // The body is suppressed for HEAD, but finish() is still the end of
+            // the response.
+            m_response_complete = true;
             std::move(done)(error_code{});
             return;
         }
@@ -377,6 +398,7 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
             std::move(done)(make_error_code(asio::error::not_connected));
             return;
         }
+        m_response_complete = true;
         if (!m_chunked) {
             if (data.empty()) {
                 std::move(done)(error_code{});
@@ -396,6 +418,7 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
 
     void enqueue_trailers(Headers trailers, WriteCompletion done) {
         if (m_head_request) {
+            m_response_complete = true;
             std::move(done)(error_code{});
             return;
         }
@@ -403,6 +426,8 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
             std::move(done)(make_error_code(asio::error::not_connected));
             return;
         }
+        // A trailer section is the last thing a response carries.
+        m_response_complete = true;
         if (!m_chunked) {
             std::move(done)(error_code{});
             return;
@@ -446,6 +471,12 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
     bool m_keep_alive_out{true};
     bool m_head_request{false};
     bool m_chunked{false};
+    // A final response head has been queued. Interim 1xx must not follow it.
+    bool m_final_started{false};
+    // The response has been terminated (one-shot, bodyless, finish, trailers).
+    // Keep-alive reuse requires this: an unfinished chunked body would absorb
+    // the next response.
+    bool m_response_complete{false};
     std::string m_alt_svc;
     std::shared_ptr<std::atomic<bool>> m_continue_sent;
     // Sole owner of the transport write direction; see serialized_writer.h.
@@ -591,16 +622,17 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
             head.headers.erase("host");
             head.headers.add_lower("host", head.authority);
         }
+        const bool error_head_request = head.method == Method::Head;
         {
             const std::size_t hosts = head.headers.count("host");
             if (hosts > 1 || (hosts == 0 && version == Version::Http11)) {
-                send_error_response(status::bad_request, {}, version);
+                send_error_response(status::bad_request, {}, version, error_head_request);
                 return;
             }
         }
         const auto framing = parse_body_framing(head);
         if (framing.error_status != 0) {
-            send_error_response(framing.error_status, {}, version);
+            send_error_response(framing.error_status, {}, version, error_head_request);
             return;
         }
         const bool request_keep_alive = connection_keep_alive(head, version);
@@ -1067,10 +1099,14 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
 
     // --- errors and upgrades -------------------------------------------------
 
-    void send_error_response(int status, Headers extra = {}, Version version = Version::Http11) {
+    void send_error_response(int status, Headers extra = {}, Version version = Version::Http11,
+                             bool head_request = false) {
         auto writer = std::make_shared<Http1ResponseSink<Transport>>(m_transport, version, m_deadline,
                                                                      m_limits.idle_timeout, m_limits.alt_svc_value());
         writer->set_keep_alive(false);
+        // A HEAD request gets the same status and fields but no body (RFC 9110
+        // §9.3.2), including on every engine-generated error path.
+        writer->set_head_request(head_request);
         std::string body{reason_phrase(status)};
         auto self = this->shared_from_this();
         writer->send(status, std::move(extra), std::move(body), [self](error_code) { self->finish(); });
@@ -1343,22 +1379,59 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
 
     BodyFraming parse_body_framing(const ParsedHead &head) const {
         BodyFraming out;
-        const auto te = head.headers.get("transfer-encoding");
+        const auto te_values = head.headers.get_all("transfer-encoding");
         const auto cl = head.headers.get("content-length");
         // RFC 9112 §6.1: Transfer-Encoding is an HTTP/1.1 frame; a 1.0 request
         // carrying it must be rejected rather than decoded as chunked (a front
         // end that ignores TE for 1.0 would otherwise disagree about framing).
-        if (head.version == Version::Http1 && te) {
+        if (head.version == Version::Http1 && !te_values.empty()) {
             out.error_status = status::bad_request;
             return out;
         }
-        if (te) {
-            if (!value_has_token(*te, "chunked")) {
-                out.error_status = status::not_implemented;
-                return out;
-            }
+        if (!te_values.empty()) {
             if (cl) {
                 out.error_status = status::bad_request; // CL + TE: smuggling shape
+                return out;
+            }
+            // The values form one comma-separated list. `chunked` must be the
+            // final coding and appear exactly once; when it is absent or not
+            // final, this server cannot frame the body (400 for the smuggling
+            // shape, 501 for a coding it does not implement). Looking at only
+            // the first field (or only "does chunked appear") lets a second
+            // reader of the same request disagree about the body boundary.
+            std::vector<std::string_view> codings;
+            bool chunked_seen = false;
+            for (const auto value : te_values) {
+                std::size_t pos = 0;
+                for (;;) {
+                    const std::size_t comma = value.find(',', pos);
+                    const std::string_view item = trim_ows(
+                        value.substr(pos, comma == std::string_view::npos ? std::string_view::npos : comma - pos));
+                    if (!item.empty()) {
+                        if (iequals_ci(item, "chunked")) {
+                            if (chunked_seen) {
+                                out.error_status = status::bad_request;
+                                return out;
+                            }
+                            chunked_seen = true;
+                        }
+                        codings.push_back(item);
+                    }
+                    if (comma == std::string_view::npos)
+                        break;
+                    pos = comma + 1;
+                }
+            }
+            if (codings.empty()) {
+                out.error_status = status::bad_request;
+                return out;
+            }
+            if (!chunked_seen || !iequals_ci(codings.back(), "chunked")) {
+                out.error_status = chunked_seen ? status::bad_request : status::not_implemented;
+                return out;
+            }
+            if (codings.size() > 1) {
+                out.error_status = status::not_implemented; // unsupported transfer coding
                 return out;
             }
             out.chunked = true;
@@ -1430,7 +1503,8 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
                 return;
             }
             if (self->m_limits.max_body_bytes != 0 && body->size() + r.data.size() > self->m_limits.max_body_bytes) {
-                self->send_error_response(status::payload_too_large, {}, head.version);
+                const bool head_request = head.method == Method::Head;
+                self->send_error_response(status::payload_too_large, {}, head.version, head_request);
                 return;
             }
             body->append(r.data);

@@ -773,7 +773,12 @@ class Http1ClientSession final : public ClientSession,
 
         m_status = status;
         m_head_parsed = true;
-        m_close_after = m_close_after || header_has_token(head.headers, "connection", "close");
+        // RFC 9112 §9.3: an HTTP/1.0 response is close-delimited unless it says
+        // "Connection: keep-alive". Caching it as reusable sends the next request
+        // into a socket the peer is already closing.
+        const bool keep_alive_header = header_has_token(head.headers, "connection", "keep-alive");
+        m_close_after = m_close_after || header_has_token(head.headers, "connection", "close") ||
+                        (head.version == Version::Http1 && !keep_alive_header);
         if (auto current = m_current.lock()) {
             current->set_head(std::move(head));
         }

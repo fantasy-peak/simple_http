@@ -968,7 +968,11 @@ class Router {
         if (!body.empty() && body.front() == '^') {
             body.erase(0, 1);
         }
-        return escape_literal(m_scopes.back().prefix) + body;
+        // The scope prefix must bind to the whole pattern: with plain text
+        // concatenation a top-level alternation escapes the group
+        // (`/v1` + `^/a|^/b` also matches `/b`). Wrapping the body keeps every
+        // alternative behind the prefix.
+        return escape_literal(m_scopes.back().prefix) + "(?:" + body + ")";
     }
 
     static std::string escape_literal(std::string_view s) {

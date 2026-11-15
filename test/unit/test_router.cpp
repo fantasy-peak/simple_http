@@ -1032,3 +1032,18 @@ TEST_CASE("router: an optional trailing slash regex is not pruned", "[router]") 
     CHECK(method_dispatch(router, ctx, "/files", Method::Get)->last_body == "files");
     CHECK(method_dispatch(router, ctx, "/files/", Method::Get)->last_body == "files");
 }
+
+TEST_CASE("router: a group prefix binds a regex alternation", "[router]") {
+    // Scoping is textual: "prefix + ^/a|^/b" left the second alternative
+    // outside the group, so "/b" was routed by a "/v1" route (and an
+    // http_proxy_regex could forward an out-of-scope path to its upstream).
+    Router router;
+    router.group("/v1", [](Router &v1) { v1.route_regex({Method::Get}, "^/a|^/b", body_handler("scoped")); });
+
+    asio::io_context ctx;
+    CHECK(method_dispatch(router, ctx, "/v1/a", Method::Get)->last_body == "scoped");
+    {
+        auto w = method_dispatch(router, ctx, "/b", Method::Get);
+        CHECK(w->last_status == status::not_found);
+    }
+}

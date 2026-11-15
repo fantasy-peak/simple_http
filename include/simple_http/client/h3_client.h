@@ -1429,7 +1429,8 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
 
         bool saw_agent = false;
         for (const auto &[name, value] : request.headers()) {
-            if (name.empty() || name.front() == ':' || is_connection_specific_field(name) || name == "host")
+            if (name.empty() || name.front() == ':' || is_connection_specific_field(name) || name == "host" ||
+                name == "content-length")
                 continue;
             if (!is_http_token(name) || contains_ctl(name) || contains_ctl(value)) {
                 SIMPLE_HTTP_ERROR_LOG("h3 client: invalid header '{}'", name);
