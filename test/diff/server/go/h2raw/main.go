@@ -447,16 +447,19 @@ func checkWSRouteMiss(addr string) error {
 }
 
 func checkWSUnknownProtocol(addr string) error {
-	// A non-websocket :protocol falls through to normal routing: the path is a
-	// registered ws route, so a plain CONNECT sees the method mismatch (405)
-	// rather than a redirect or an upgrade.
+	// A non-websocket :protocol falls through to normal dispatch. The path only
+	// has a WebSocket route, so no HTTP route serves it: 404. (It used to answer
+	// 405 because the static stage resolved the extensionless path through the
+	// SPA fallback to index.html and then rejected the CONNECT method — the
+	// fallback-before-method bug, not a route. SPA fallback now applies to
+	// GET/HEAD only.)
 	status, c, err := extendedConnect(addr, "/ws/echo", "ftp", true, true)
 	if err != nil {
 		return err
 	}
 	defer c.conn.Close()
-	if status != "405" {
-		return fmt.Errorf("status %q, want 405", status)
+	if status != "404" {
+		return fmt.Errorf("status %q, want 404", status)
 	}
 	return nil
 }

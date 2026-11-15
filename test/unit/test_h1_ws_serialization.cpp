@@ -96,7 +96,18 @@ class OverlapTransport {
     auto get_executor() { return m_ex; }
     asio::ip::tcp::endpoint peer() const { return {}; }
     SslHandle tls_handle() const { return std::nullopt; }
-    void close() {}
+    // Writes are parked to observe overlap. Complete them with an error on
+    // close: a real transport never holds a completion forever, and leaving
+    // them parked makes the engine (which owns this transport) unreachable —
+    // LSan reports the whole engine as leaked.
+    void close() {
+        auto pending = std::move(m_pending);
+        m_pending.clear();
+        for (auto &handler : pending) {
+            if (handler)
+                std::move(handler)(make_error_code(asio::error::operation_aborted), 0);
+        }
+    }
 
   private:
     asio::any_io_executor m_ex;
@@ -147,6 +158,12 @@ TEST_CASE("h1/ws: the 101 is serialized with a response written before the upgra
     // not start a second transport write of its own.
     CHECK(transport->writes() == 1);
     CHECK_FALSE(transport->overlap());
+
+    // Release the parked writes (and with them the engine's references) before
+    // the test ends.
+    transport->close();
+    ctx.restart();
+    ctx.run_for(std::chrono::milliseconds(50));
 }
 
 // S6: a WS route (or one of its middleware) that throws synchronously used to

@@ -286,6 +286,18 @@ template <typename F> Handler make_handler(F &&fn) {
         return std::forward<F>(fn);
     } else if constexpr (std::is_same_v<D, CoroHandler>) {
         return Handler{std::forward<F>(fn)};
+    } else if constexpr (detail::is_coro_handler_ssl<D>) {
+        return Handler{CoroHandler(std::forward<F>(fn))};
+    } else if constexpr (detail::is_coro_handler<D>) {
+        // Store a two-argument coroutine as a CoroHandler directly. Wrapping it
+        // in a CallbackHandler (the previous path) made invoke_handler allocate
+        // a shared_ptr<HandlerCompletion> + shared_ptr<bool> and build an
+        // any_completion_handler for every request; the CoroHandler path runs
+        // the same execute_coroutine without those per-request allocations.
+        // The adapter is a plain function returning the inner awaitable, so it
+        // adds no coroutine frame of its own.
+        return Handler{CoroHandler([fn = std::forward<F>(fn)](RequestPtr req, ResponsePtr res, SslHandle) mutable
+                                       -> asio::awaitable<void> { return fn(std::move(req), std::move(res)); })};
     } else {
         return Handler{detail::make_callback_handler(std::forward<F>(fn))};
     }
@@ -302,8 +314,6 @@ template <typename F> Handler make_handler(F &&fn) {
 // callback handler).
 inline void invoke_handler(const Handler &handler, RequestPtr req, ResponsePtr res, SslHandle ssl,
                            HandlerCompletion done) {
-    const RequestPtr req_keep = req;
-    const ResponsePtr fallback = res;
 #if defined(BOOST_ASIO_HAS_CO_AWAIT)
     if (std::holds_alternative<CoroHandler>(handler)) {
         const CoroHandler &fn = std::get<CoroHandler>(handler);
@@ -312,6 +322,11 @@ inline void invoke_handler(const Handler &handler, RequestPtr req, ResponsePtr r
         return;
     }
 #endif
+    // Only the callback path below needs to keep the objects alive after the
+    // handler has consumed its (moved) copies; the coroutine path above is
+    // wholly owned by execute_coroutine.
+    const RequestPtr req_keep = req;
+    const ResponsePtr fallback = res;
 #if defined(BOOST_ASIO_HAS_CO_AWAIT)
     const CallbackHandler &fn = std::get<0>(handler);
 #else
