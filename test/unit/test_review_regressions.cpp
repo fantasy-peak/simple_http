@@ -665,6 +665,70 @@ TEST_CASE("review: async ResolveFn completion is marshalled to the caller execut
     CHECK(&hook_ctx == static_cast<asio::execution_context *>(&ctx));
 }
 
+// open_websocket() used a bare asio::ip::tcp::resolver and an unbounded
+// async_connect: a custom ResolveFn, connect_timeout and the socket options
+// were silently ignored. A hook that completes synchronously proves the path
+// now goes through the shared dialing helper (the old code would never call
+// it and would instead try the system resolver for ws.example.com).
+TEST_CASE("review: open_websocket uses the configured ResolveFn", "[review][regression][client]") {
+    asio::io_context ctx;
+    ClientConfig cfg;
+    // Force the direct path: an ambient HTTP(S)_PROXY would resolve the proxy
+    // host instead (and this environment has one).
+    cfg.proxy_from_env = false;
+    bool resolved = false;
+    cfg.resolve = [&resolved](std::string host, std::uint16_t, asio::any_io_executor ex, ResolveCompletion done) {
+        resolved = true;
+        CHECK(host == "ws.example.com");
+        asio::post(ex, [done = std::move(done)]() mutable {
+            std::move(done)(make_error_code(asio::error::host_not_found), std::vector<asio::ip::tcp::endpoint>{});
+        });
+    };
+
+    Client client{ctx.get_executor(), cfg};
+    std::optional<error_code> out;
+    client.async_open_websocket("ws://ws.example.com/chat", WebSocketSpec{},
+                                [&out](error_code ec, std::shared_ptr<WebSocket>) { out = ec; });
+    ctx.run_for(std::chrono::milliseconds(500));
+
+    CHECK(resolved);
+    REQUIRE(out.has_value());
+    CHECK(*out == make_error_code(asio::error::host_not_found));
+}
+
+// The proxy leg is a separate dial: it must resolve the proxy host through the
+// same hook and honor the same connect budget.
+TEST_CASE("review: open_websocket via a proxy uses the configured ResolveFn", "[review][regression][client]") {
+    asio::io_context ctx;
+    ClientConfig cfg;
+    cfg.proxy_from_env = false;
+    ProxyConfig proxy;
+    proxy.kind = ProxyKind::Http;
+    proxy.host = "proxy.example.com";
+    proxy.port = 3128;
+    cfg.proxy = proxy;
+
+    bool resolved = false;
+    cfg.resolve = [&resolved](std::string host, std::uint16_t port, asio::any_io_executor ex, ResolveCompletion done) {
+        resolved = true;
+        CHECK(host == "proxy.example.com");
+        CHECK(port == 3128);
+        asio::post(ex, [done = std::move(done)]() mutable {
+            std::move(done)(make_error_code(asio::error::host_not_found), std::vector<asio::ip::tcp::endpoint>{});
+        });
+    };
+
+    Client client{ctx.get_executor(), cfg};
+    std::optional<error_code> out;
+    client.async_open_websocket("ws://ws.example.com/chat", WebSocketSpec{},
+                                [&out](error_code ec, std::shared_ptr<WebSocket>) { out = ec; });
+    ctx.run_for(std::chrono::milliseconds(500));
+
+    CHECK(resolved);
+    REQUIRE(out.has_value());
+    CHECK(*out == make_error_code(asio::error::host_not_found));
+}
+
 // A chunk size that overflows uint64 used to wrap (and reach std::string with
 // an out-of-range position). It must be a protocol error, not a crash.
 TEST_CASE("review: h1 client rejects a chunk size that overflows uint64", "[review][regression][client]") {

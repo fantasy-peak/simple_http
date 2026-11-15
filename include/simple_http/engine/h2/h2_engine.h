@@ -613,6 +613,9 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
         // §5.1: frames still in flight on this stream must be minimally
         // processed and discarded, not answered.
         remember_closed_stream(stream_id, /*local_reset=*/true);
+        // Keep a half-received header block alive for the HPACK decoder; the
+        // stream (and its st.header_block) is about to be destroyed.
+        preserve_split_header_block(stream_id);
         erase_stream(stream_id);
         flush();
     }
@@ -1367,6 +1370,30 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
         m_continuation_discard = true;
         m_continuation_discard_bytes = block.size();
         m_continuation_discard_block.assign(block);
+    }
+
+    // The stream is being reset while a split header block is still in flight.
+    // reset_stream() erases the stream and its st.header_block, but the remaining
+    // CONTINUATION frames must still reach the HPACK decoder (the peer's dynamic
+    // table was already updated when it encoded them). Move the accumulated
+    // prefix into the discard path so on_continuation keeps decoding — and
+    // dropping — the block instead of treating the next CONTINUATION as one for
+    // an unknown stream and answering with GOAWAY(PROTOCOL_ERROR).
+    //
+    // A block already in discard mode (refuse_stream / half_closed_remote) is
+    // left untouched, and a reset that happens after END_HEADERS sees
+    // m_continuation_stream == 0, so this is a no-op in both cases.
+    void preserve_split_header_block(std::uint32_t stream_id) {
+        if (m_continuation_stream != stream_id || m_continuation_discard)
+            return;
+        m_continuation_discard = true;
+        if (auto it = m_streams.find(stream_id); it != m_streams.end()) {
+            m_continuation_discard_bytes = it->second.header_block.size();
+            m_continuation_discard_block = std::move(it->second.header_block);
+        } else {
+            m_continuation_discard_bytes = 0;
+            m_continuation_discard_block.clear();
+        }
     }
 
     bool refuse_stream(const codec::H2FrameHeader &hdr, std::string_view block, std::uint32_t error_code_value) {

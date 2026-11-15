@@ -2061,21 +2061,42 @@ inline void
 Client::open_ws_via_proxy(const detail::Url &url, const ProxyConfig &proxy, std::string path, std::string authority,
                           WebSocketSpec spec,
                           asio::any_completion_handler<void(error_code, std::shared_ptr<WebSocket>)> done) const {
-    auto resolver = std::make_shared<asio::ip::tcp::resolver>(m_executor);
     auto self = keep_alive();
-    resolver->async_resolve(
-        proxy.host, std::to_string(proxy.effective_port()),
-        [self, url, proxy, path, authority, spec, resolver, done = std::move(done)](error_code ec,
-                                                                                    auto results) mutable {
+    // Resolving and connecting to the proxy goes through the same bounded
+    // helpers and socket options as a direct dial: otherwise a custom
+    // ResolveFn, connect_timeout, tcp_nodelay and socket_setup are all
+    // silently ignored for wss:// over a proxy.
+    detail::async_resolve_bounded(
+        m_config.resolve, proxy.host, proxy.effective_port(), m_executor, m_config.connect_timeout,
+        [self, url, proxy, path, authority, spec,
+         done = std::move(done)](error_code ec, std::vector<asio::ip::tcp::endpoint> endpoints) mutable {
             if (ec) {
                 std::move(done)(ec, nullptr);
                 return;
             }
+            if (endpoints.empty()) {
+                std::move(done)(make_error_code(asio::error::host_not_found), nullptr);
+                return;
+            }
             auto socket = std::make_shared<asio::ip::tcp::socket>(self->m_executor);
-            asio::async_connect(
-                *socket, results,
+            error_code option_ec;
+            if (self->m_config.tcp_nodelay) {
+                socket->set_option(asio::ip::tcp::no_delay(true), option_ec);
+            }
+            if (self->m_config.tcp_keepalive) {
+                socket->set_option(asio::socket_base::keep_alive(true), option_ec);
+            }
+            if (self->m_config.socket_setup) {
+                try {
+                    self->m_config.socket_setup(*socket);
+                } catch (const std::exception &) {
+                }
+            }
+            detail::async_connect_bounded(
+                socket, std::make_shared<std::vector<asio::ip::tcp::endpoint>>(std::move(endpoints)),
+                self->m_config.connect_timeout, self->m_executor,
                 [self, url, proxy, path, authority, spec, socket,
-                 done = std::move(done)](error_code cec, const asio::ip::tcp::endpoint &peer) mutable {
+                 done = std::move(done)](error_code cec, asio::ip::tcp::endpoint peer) mutable {
                     if (cec) {
                         std::move(done)(cec, nullptr);
                         return;
@@ -2232,20 +2253,43 @@ inline void Client::open_ws_hop(std::string url, WebSocketSpec spec,
         return;
     }
 
-    auto resolver = std::make_shared<asio::ip::tcp::resolver>(m_executor);
     auto self = keep_alive();
-    resolver->async_resolve(
-        target.host, std::to_string(target.effective_port()),
-        [self, target, resolver, path, authority, spec, done = std::move(done)](error_code ec, auto results) mutable {
+    // The same dialing path as Client::dial(): a custom ResolveFn, the
+    // connect budget that covers DNS + TCP, and the socket options must all
+    // apply to a WebSocket too. A black-holed DNS server or a dropped SYN used
+    // to hang open_websocket() forever, and tcp_nodelay/socket_setup were
+    // silently ignored on this path.
+    detail::async_resolve_bounded(
+        m_config.resolve, target.host, target.effective_port(), m_executor, m_config.connect_timeout,
+        [self, target, path, authority, spec,
+         done = std::move(done)](error_code ec, std::vector<asio::ip::tcp::endpoint> endpoints) mutable {
             if (ec) {
                 std::move(done)(ec, nullptr);
                 return;
             }
+            if (endpoints.empty()) {
+                std::move(done)(make_error_code(asio::error::host_not_found), nullptr);
+                return;
+            }
             auto socket = std::make_shared<asio::ip::tcp::socket>(self->m_executor);
-            asio::async_connect(
-                *socket, results,
+            error_code option_ec;
+            if (self->m_config.tcp_nodelay) {
+                socket->set_option(asio::ip::tcp::no_delay(true), option_ec);
+            }
+            if (self->m_config.tcp_keepalive) {
+                socket->set_option(asio::socket_base::keep_alive(true), option_ec);
+            }
+            if (self->m_config.socket_setup) {
+                try {
+                    self->m_config.socket_setup(*socket);
+                } catch (const std::exception &) {
+                }
+            }
+            detail::async_connect_bounded(
+                socket, std::make_shared<std::vector<asio::ip::tcp::endpoint>>(std::move(endpoints)),
+                self->m_config.connect_timeout, self->m_executor,
                 [self, target, path, authority, spec, socket,
-                 done = std::move(done)](error_code cec, const asio::ip::tcp::endpoint &peer) mutable {
+                 done = std::move(done)](error_code cec, asio::ip::tcp::endpoint peer) mutable {
                     if (cec) {
                         std::move(done)(cec, nullptr);
                         return;

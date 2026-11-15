@@ -31,6 +31,25 @@ void append_frame(std::string &out, H2FrameType type, std::uint8_t flags, std::u
     out.append(payload);
 }
 
+// Whether the recorded client->server stream contains a GOAWAY.
+bool written_has_goaway(const std::string &written) {
+    std::string_view w{written};
+    if (w.substr(0, kH2ClientPreface.size()) == kH2ClientPreface)
+        w.remove_prefix(kH2ClientPreface.size());
+    for (std::size_t i = 0; i + kH2FrameHeaderSize <= w.size();) {
+        H2FrameHeader hdr;
+        if (!parse_frame_header(w.substr(i), hdr))
+            return false;
+        const std::size_t end = i + kH2FrameHeaderSize + hdr.length;
+        if (end > w.size())
+            return false;
+        if (hdr.type == static_cast<std::uint8_t>(H2FrameType::Goaway))
+            return true;
+        i = end;
+    }
+    return false;
+}
+
 // --- exercised through FakeResponseSink (no connection) ---------------------
 
 TEST_CASE("proto/response: trailer() is emitted by finish_trailers()", "[proto]") {
@@ -553,6 +572,58 @@ TEST_CASE("h1/engine: a HEAD error response has no body", "[h1]") {
     // Header section only: no "Bad Request" body after the blank line.
     REQUIRE(out.rfind("\r\n\r\n") != std::string::npos);
     CHECK(out.size() == out.rfind("\r\n\r\n") + 4);
+}
+
+// A stream can be reset while its split trailing HEADERS is still arriving (the
+// handler returns, times out or calls close()). Its st.header_block is erased
+// with the stream, but the remaining CONTINUATION frames still have to reach
+// the HPACK decoder: the peer's dynamic table was already updated when it
+// encoded them. Treating them as frames for an unknown stream turned a legal
+// sequence into GOAWAY(PROTOCOL_ERROR) for the whole connection.
+TEST_CASE("h2/engine: a reset stream still drains a split header block", "[h2]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    transport->hold_open();
+
+    std::string in{kH2ClientPreface};
+    append_frame(in, H2FrameType::Settings, 0, 0, "");
+    {
+        std::string block;
+        hpack_append_indexed(block, 2); // :method GET
+        hpack_append_indexed(block, 7); // :scheme https
+        hpack_append_literal(block, ":path", "/x");
+        hpack_append_literal(block, ":authority", "example.com");
+        // Complete request head, but no END_STREAM: a body follows.
+        append_frame(in, H2FrameType::Headers, H2_FLAG_END_HEADERS, 1, block);
+    }
+    append_frame(in, H2FrameType::Data, 0, 1, "x");
+
+    std::string trailer_block;
+    hpack_append_literal(trailer_block, "x-check", "1");
+    const std::size_t half = trailer_block.size() / 2;
+    append_frame(in, H2FrameType::Headers, 0, 1, trailer_block.substr(0, half));
+    transport->push(std::move(in));
+
+    auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter>,
+                         SslHandle) -> asio::awaitable<void> { co_return; };
+
+    auto engine = std::make_shared<Http2Engine<MockTransport>>(transport);
+    asio::co_spawn(ctx, run_engine(*engine, dispatcher), asio::detached);
+    auto pump = [&ctx] {
+        ctx.restart();
+        ctx.run_for(std::chrono::milliseconds(100));
+    };
+    pump(); // head + DATA + first trailer fragment; the handler returns (reset)
+
+    std::string rest;
+    append_frame(rest, H2FrameType::Continuation, H2_FLAG_END_HEADERS, 1, trailer_block.substr(half));
+    transport->push(std::move(rest));
+    pump();
+
+    CHECK_FALSE(written_has_goaway(transport->written()));
+
+    transport->release();
+    pump(); // EOF: the engine finishes and releases the coroutine
 }
 
 } // namespace
