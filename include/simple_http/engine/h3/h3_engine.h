@@ -197,15 +197,19 @@ template <typename Connection> class Http3ResponseSink : public ResponseSink {
             // are over the high mark, so a fast producer (a reverse proxy
             // streaming an upstream body) is paced by the peer rather than
             // by memory.
+            // Preserve the caller's cancellation slot across this adapter; see
+            // the h2 sink for the same boundary and the per-op timer test.
+            const auto slot = asio::get_associated_cancellation_slot(done);
             eng->async_await_out_space(
-                id, [eng, id, data = std::move(data), done = std::move(done)](error_code ec) mutable {
-                    if (ec) {
-                        std::move(done)(ec);
-                        return;
-                    }
-                    eng->enqueue_body(id, std::move(data), /*last=*/false);
-                    std::move(done)(error_code{});
-                });
+                id, asio::bind_cancellation_slot(
+                        slot, [eng, id, data = std::move(data), done = std::move(done)](error_code ec) mutable {
+                            if (ec) {
+                                std::move(done)(ec);
+                                return;
+                            }
+                            eng->enqueue_body(id, std::move(data), /*last=*/false);
+                            std::move(done)(error_code{});
+                        }));
         }));
     }
 
@@ -226,15 +230,17 @@ template <typename Connection> class Http3ResponseSink : public ResponseSink {
                 std::move(done)(make_error_code(asio::error::not_connected));
                 return;
             }
+            const auto slot = asio::get_associated_cancellation_slot(done);
             eng->async_await_out_space(
-                id, [eng, id, data = std::move(data), done = std::move(done)](error_code ec) mutable {
-                    if (ec) {
-                        std::move(done)(ec);
-                        return;
-                    }
-                    eng->enqueue_body(id, std::move(data), /*last=*/true);
-                    std::move(done)(error_code{});
-                });
+                id, asio::bind_cancellation_slot(
+                        slot, [eng, id, data = std::move(data), done = std::move(done)](error_code ec) mutable {
+                            if (ec) {
+                                std::move(done)(ec);
+                                return;
+                            }
+                            eng->enqueue_body(id, std::move(data), /*last=*/true);
+                            std::move(done)(error_code{});
+                        }));
         }));
     }
 

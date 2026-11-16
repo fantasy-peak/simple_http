@@ -234,15 +234,21 @@ class Http2ResponseSink final : public ResponseSink, public std::enable_shared_f
                 return;
             }
             auto self_keep = self;
-            eng->await_out_space(self->m_stream_id, [self_keep, eng, data = std::move(data),
-                                                     done = std::move(done)](error_code ec) mutable {
-                if (ec) {
-                    std::move(done)(ec);
-                    return;
-                }
-                eng->enqueue_body(self_keep->m_stream_id, std::move(data), /*last=*/false);
-                std::move(done)(error_code{});
-            });
+            // Keep the caller's cancellation slot on the wait: wrapping the
+            // completion in a plain lambda would drop its associators, and a
+            // per-operation timer could then never release a parked writer.
+            const auto slot = asio::get_associated_cancellation_slot(done);
+            eng->await_out_space(
+                self->m_stream_id,
+                asio::bind_cancellation_slot(
+                    slot, [self_keep, eng, data = std::move(data), done = std::move(done)](error_code ec) mutable {
+                        if (ec) {
+                            std::move(done)(ec);
+                            return;
+                        }
+                        eng->enqueue_body(self_keep->m_stream_id, std::move(data), /*last=*/false);
+                        std::move(done)(error_code{});
+                    }));
         });
     }
 
@@ -262,15 +268,18 @@ class Http2ResponseSink final : public ResponseSink, public std::enable_shared_f
                 return;
             }
             auto self_keep = self;
-            eng->await_out_space(self->m_stream_id, [self_keep, eng, data = std::move(data),
-                                                     done = std::move(done)](error_code ec) mutable {
-                if (ec) {
-                    std::move(done)(ec);
-                    return;
-                }
-                eng->enqueue_body(self_keep->m_stream_id, std::move(data), /*last=*/true);
-                std::move(done)(error_code{});
-            });
+            const auto slot = asio::get_associated_cancellation_slot(done);
+            eng->await_out_space(
+                self->m_stream_id,
+                asio::bind_cancellation_slot(
+                    slot, [self_keep, eng, data = std::move(data), done = std::move(done)](error_code ec) mutable {
+                        if (ec) {
+                            std::move(done)(ec);
+                            return;
+                        }
+                        eng->enqueue_body(self_keep->m_stream_id, std::move(data), /*last=*/true);
+                        std::move(done)(error_code{});
+                    }));
         });
     }
 

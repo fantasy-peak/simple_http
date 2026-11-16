@@ -9,6 +9,8 @@
 #include <boost/asio.hpp>
 #include <boost/asio/associated_cancellation_slot.hpp>
 #include <boost/asio/cancel_after.hpp>
+#include <boost/asio/cancel_at.hpp>
+#include <boost/asio/experimental/awaitable_operators.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
 #include <cstring>
@@ -162,7 +164,19 @@ class ParkedWriteTransport {
         return asio::async_initiate<Token, void(error_code)>(
             ExecInit<decltype(initiation)>{std::move(initiation), m_executor}, token);
     }
-    void close() { m_closed = true; }
+    void close() {
+        if (m_closed) {
+            return;
+        }
+        m_closed = true;
+        // A real socket close aborts the in-flight write. Complete it so the
+        // SerializedWriter releases its entry and no test-only reference cycle
+        // survives teardown.
+        if (m_pending_write) {
+            auto done = std::move(m_pending_write);
+            done(make_error_code(asio::error::operation_aborted), m_pending_bytes);
+        }
+    }
 
   private:
     asio::awaitable<IoResult> do_read_some(ByteSpan buffer) {
@@ -578,4 +592,171 @@ TEST_CASE("cancel-verify: request cancel aborts an h2 writer parked on backpress
 
     CHECK(write_done);
     CHECK(write_ec == asio::error::operation_aborted);
+}
+
+TEST_CASE("cancel-verify: asio::cancel_at aborts an h1 body read without cancelling the request", "[cancel-verify]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    transport->push("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n");
+    transport->hold_open();
+
+    bool read_done = false;
+    bool request_cancelled = true;
+    error_code read_ec = make_error_code(asio::error::would_block);
+
+    auto dispatcher = [&](RequestPtr req, ResponsePtr, SslHandle) -> asio::awaitable<void> {
+        const auto deadline = std::chrono::steady_clock::now() + 30ms;
+        auto [ec, result] =
+            co_await req->body().async_read(asio::cancel_at(deadline, asio::as_tuple(asio::use_awaitable)));
+        read_ec = ec;
+        read_done = true;
+        request_cancelled = req->cancelled();
+        transport->release();
+    };
+
+    auto engine = std::make_shared<Http1Engine<MockTransport>>(transport);
+    REQUIRE(run_on(ctx, run_engine(*engine, dispatcher)));
+
+    CHECK(read_done);
+    CHECK(read_ec == asio::error::operation_aborted);
+    CHECK_FALSE(request_cancelled);
+}
+
+TEST_CASE("cancel-verify: asio::cancel_after aborts an h1 parked response write", "[cancel-verify]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<ParkedWriteTransport>(ctx.get_executor());
+    transport->push("GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    transport->hold_open();
+
+    bool begin_done = false;
+    bool write_done = false;
+    bool request_cancelled = true;
+    error_code write_ec = make_error_code(asio::error::would_block);
+
+    auto dispatcher = [&](RequestPtr req, ResponsePtr res, SslHandle) -> asio::awaitable<void> {
+        auto ex = co_await asio::this_coro::executor;
+        asio::co_spawn(
+            ex,
+            [&]() -> asio::awaitable<void> {
+                asio::steady_timer t{co_await asio::this_coro::executor};
+                t.expires_after(10ms);
+                co_await t.async_wait(asio::as_tuple(asio::use_awaitable));
+                transport->complete_current_write(error_code{});
+            },
+            asio::detached);
+
+        auto [ec] = co_await res->status(status::ok).async_begin(asio::as_tuple(asio::use_awaitable));
+        if (ec) {
+            write_ec = ec;
+        } else {
+            begin_done = true;
+            auto [wec] =
+                co_await res->async_write("chunk", asio::cancel_after(40ms, asio::as_tuple(asio::use_awaitable)));
+            write_ec = wec;
+        }
+        write_done = true;
+        request_cancelled = req->cancelled();
+        asio::steady_timer hold{ex};
+        hold.expires_after(100ms);
+        co_await hold.async_wait(asio::as_tuple(asio::use_awaitable));
+    };
+
+    auto engine = std::make_shared<Http1Engine<ParkedWriteTransport>>(transport);
+    REQUIRE(run_on(ctx, run_engine(*engine, dispatcher)));
+
+    CHECK(begin_done);
+    CHECK(write_done);
+    CHECK(write_ec == asio::error::operation_aborted);
+    CHECK_FALSE(request_cancelled);
+    // An HTTP/1.x write cancellation is terminal for the connection.
+    CHECK(transport->closed());
+}
+
+TEST_CASE("cancel-verify: asio::cancel_after aborts an h2 writer parked on backpressure", "[cancel-verify]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    transport->hold_open();
+    std::string in{codec::kH2ClientPreface};
+    append_frame(in, H2FrameType::Settings, 0, 0, "");
+    in += post_headers_frame(1);
+    transport->push(std::move(in));
+
+    bool write_done = false;
+    bool request_cancelled = true;
+    error_code write_ec = make_error_code(asio::error::would_block);
+
+    auto dispatcher = [&](RequestPtr req, ResponsePtr res, SslHandle) -> asio::awaitable<void> {
+        auto ex = co_await asio::this_coro::executor;
+        asio::co_spawn(
+            ex,
+            [&]() -> asio::awaitable<void> {
+                asio::steady_timer t{co_await asio::this_coro::executor};
+                t.expires_after(700ms);
+                co_await t.async_wait(asio::as_tuple(asio::use_awaitable));
+                transport->release();
+            },
+            asio::detached);
+
+        co_await res->status(status::ok).async_begin(asio::as_tuple(asio::use_awaitable));
+        const std::string chunk(64 * 1024, 'x');
+        for (int i = 0; i < 40; ++i) {
+            auto [ec] =
+                co_await res->async_write(chunk, asio::cancel_after(150ms, asio::as_tuple(asio::use_awaitable)));
+            if (ec) {
+                write_ec = ec;
+                write_done = true;
+                request_cancelled = req->cancelled();
+                co_return;
+            }
+        }
+        write_ec = error_code{};
+        write_done = true;
+        request_cancelled = req->cancelled();
+    };
+
+    auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, EngineLimits{});
+    REQUIRE(run_on(ctx, run_engine(*engine, dispatcher)));
+
+    CHECK(write_done);
+    CHECK(write_ec == asio::error::operation_aborted);
+    CHECK_FALSE(request_cancelled);
+}
+
+TEST_CASE("cancel-verify: co_await (read || deadline) cancels the read without req->cancel()", "[cancel-verify]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    transport->push("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n");
+    transport->hold_open();
+
+    bool read_done = false;
+    bool timed_out = false;
+    bool request_cancelled = true;
+    error_code read_ec = make_error_code(asio::error::would_block);
+
+    auto dispatcher = [&](RequestPtr req, ResponsePtr, SslHandle) -> asio::awaitable<void> {
+        using namespace asio::experimental::awaitable_operators;
+        auto work = [&]() -> asio::awaitable<void> {
+            auto [ec, result] = co_await req->body().async_read(asio::as_tuple(asio::use_awaitable));
+            read_ec = ec;
+            read_done = true;
+        };
+        auto deadline = [&]() -> asio::awaitable<void> {
+            asio::steady_timer t{co_await asio::this_coro::executor};
+            t.expires_after(30ms);
+            auto [ec] = co_await t.async_wait(asio::as_tuple(asio::use_awaitable));
+            timed_out = !ec;
+        };
+        // parallel_group cancels the losing branch; no req->cancel() involved.
+        (void)co_await (work() || deadline());
+        request_cancelled = req->cancelled();
+        transport->release();
+    };
+
+    auto engine = std::make_shared<Http1Engine<MockTransport>>(transport);
+    REQUIRE(run_on(ctx, run_engine(*engine, dispatcher)));
+
+    CHECK(timed_out);
+    CHECK(read_done);
+    CHECK(read_ec == asio::error::operation_aborted);
+    CHECK_FALSE(request_cancelled);
 }
