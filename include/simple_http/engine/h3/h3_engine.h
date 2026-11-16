@@ -48,6 +48,7 @@
 #include <algorithm>
 #include <array>
 #include <boost/asio.hpp>
+#include <boost/asio/bind_cancellation_slot.hpp>
 #include <boost/asio/experimental/channel.hpp>
 #include <chrono>
 #include <cstddef>
@@ -544,13 +545,17 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
             stream.out_space = std::make_shared<Channel>(m_executor, 1);
         auto space = stream.out_space;
         auto self = this->shared_from_this();
-        space->async_receive([self, stream_id, space, done = std::move(done)](error_code ec) mutable {
-            if (ec) {
-                std::move(done)(make_error_code(asio::error::operation_aborted));
-                return;
-            }
-            self->await_out_step(stream_id, std::move(done));
-        });
+        // Same contract as the h2 sink: a per-operation cancellation releases
+        // the wait and surfaces as operation_aborted.
+        const auto slot = asio::get_associated_cancellation_slot(done);
+        space->async_receive(asio::bind_cancellation_slot(
+            slot, [self, stream_id, space, done = std::move(done)](error_code ec) mutable {
+                if (ec) {
+                    std::move(done)(make_error_code(asio::error::operation_aborted));
+                    return;
+                }
+                self->await_out_step(stream_id, std::move(done));
+            }));
     }
 
   public:

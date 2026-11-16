@@ -380,6 +380,14 @@ class Request {
     // that state inside the parent slot, so the overwritten coroutine would
     // later clear a dangling impl (SIGSEGV). Handing out one signal per call and
     // fanning cancel() out over all of them keeps every consumer independent.
+    //
+    // Library-provided operations implement Asio's per-operation cancellation
+    // contract: Body::async_read(), HTTP/1.x response writes and the h2/h3
+    // outbound-space waits complete with asio::error::operation_aborted. An
+    // HTTP/1.x write may already have bytes on the wire, so cancelling it also
+    // closes the connection (a chunked stream without its terminator cannot be
+    // reused). A custom ResponseSink receives the caller's associated
+    // cancellation slot through WriteCompletion and must honour it itself.
 
     struct CancelState {
         std::mutex mutex; // guards signals; slot() may be called before dispatch

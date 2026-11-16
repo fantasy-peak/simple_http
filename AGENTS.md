@@ -441,6 +441,18 @@ req->cancel(); req->cancelled();
 req->set_state<T>(...); req->get_state<T>(); req->app_state<T>();
 ```
 
+取消：
+
+```cpp
+req->cancel();              // 幂等、任意线程安全；只发出 terminal cancellation
+req->cancelled();           // 原子读取
+req->cancellation_slot();   // 绑给独立工作（detached coroutine / timer）
+```
+
+绑定了请求槽的库内操作遵循 Asio per-operation cancellation：挂起的读、写和
+h2/h3 反压等待都以 `asio::error::operation_aborted` 完成。HTTP/1.x 的写一旦可能
+有字节上线就无法撤回，取消它会关闭连接（该连接不会复用）。
+
 读体：
 
 ```cpp
@@ -1131,6 +1143,18 @@ test/run.sh server-diff
 50. **h1 客户端响应头要和请求侧一样严格**：只接受 CRLF，拒绝裸 LF/CR、obs-fold、
     值内 CTL、重复/溢出 Content-Length、TE+CL；状态码 3 位 100..599；接受
     HTTP/1.0 并设置 `bodyless`。`client/h1_client.h`。
+51. **服务端取消遵循 Asio per-operation cancellation**：`Body::async_read()` 把
+    channel 的 `channel_cancelled` 归一为 `operation_aborted`；h1 pull 的 transport
+    读写、h2/h3 的 `await_out_space` 都透传调用方 cancellation slot；h1 排队 pull
+    在启动前被取消时以 `operation_aborted` 完成，且一个 slot 同时只有一个消费者。
+    `core/cancel.h`、`proto/body.h`、`engine/h1/h1_engine.h`、`h2_engine.h`、
+    `h3_engine.h`；`test/unit/test_server_cancellation_verify.cpp`。
+52. **h1 写取消即关闭连接**：`Http1ResponseSink::wrap()` 在关联槽上安装处理器；
+    未开始的写以 `operation_aborted` 完成，已经上线的 chunked 帧无法撤回，因此
+    必须关闭 transport 且不得复用连接。
+53. **h1 body 失败码要保持**：`BodyState::failure` 记录首个失败（取消/断开），
+    失败后的读返回同一个错误而不是干净 `eof`；排队读不能把取消当成正常结束。
+    `h1_engine.h` 的 `body_failed` / `pull_body_chunk_impl`。
 
 ---
 

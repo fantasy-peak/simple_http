@@ -25,6 +25,7 @@
 
 #include <array>
 #include <boost/asio.hpp>
+#include <boost/asio/bind_cancellation_slot.hpp>
 #include <boost/asio/experimental/channel.hpp>
 #include <charconv>
 #include <chrono>
@@ -580,13 +581,18 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
         }
         auto space = it->second.out_space;
         auto self = this->shared_from_this();
-        space->async_receive([self, stream_id, space, done = std::move(done)](error_code ec) mutable {
-            if (ec) {
-                std::move(done)(make_error_code(asio::error::operation_aborted));
-                return;
-            }
-            self->await_out_space(stream_id, std::move(done));
-        });
+        // A per-operation cancellation (asio::cancel_after) must release this
+        // wait too; the channel reports channel_cancelled, which maps onto the
+        // standard operation_aborted at this boundary.
+        const auto slot = asio::get_associated_cancellation_slot(done);
+        space->async_receive(asio::bind_cancellation_slot(
+            slot, [self, stream_id, space, done = std::move(done)](error_code ec) mutable {
+                if (ec) {
+                    std::move(done)(make_error_code(asio::error::operation_aborted));
+                    return;
+                }
+                self->await_out_space(stream_id, std::move(done));
+            }));
     }
 
     // Abort a stream with the given error code (RST_STREAM).

@@ -39,6 +39,11 @@
 #include <utility>
 #include <vector>
 
+#include <boost/asio/bind_cancellation_slot.hpp>
+#include <boost/asio/cancellation_signal.hpp>
+#include <boost/asio/post.hpp>
+
+#include "../../core/cancel.h"
 #include "../../core/http_field.h"
 #include "../../core/http_method.h"
 #include "../../core/http_status.h"
@@ -257,6 +262,47 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
     // `done` is wrapped so an error also closes this sink. The writer is the
     // only place that issues transport writes, so "one write in flight per
     // socket" holds even when several coroutines share the response.
+    // One queued write's completion plus the cancellation slot handed to it by
+    // the caller. HTTP/1.x cannot retract bytes that are already on the wire, so
+    // a cancelled write is terminal for the connection: the caller completes
+    // with operation_aborted, the transport is closed, and the connection is
+    // never reused (the engine's keep-alive check already refuses it).
+    struct WriteWait {
+        WriteCompletion done;
+        asio::cancellation_slot slot;
+        bool finished{false};
+    };
+
+    struct CancelWrite {
+        std::shared_ptr<WriteWait> wait;
+        std::weak_ptr<Http1ResponseSink> sink;
+
+        void operator()(asio::cancellation_type type) {
+            if (!is_terminal_cancel(type) || wait->finished) {
+                return;
+            }
+            wait->finished = true;
+            if (auto self = sink.lock()) {
+                self->cancel_write(wait);
+            }
+        }
+    };
+
+    void cancel_write(const std::shared_ptr<WriteWait> &wait) {
+        auto self = this->shared_from_this();
+        // Post: completing the composed operation destroys its cancellation
+        // state, which must not happen while its signal is still emitting.
+        asio::post(m_executor, [self, wait]() mutable {
+            wait->slot.clear();
+            if (wait->done) {
+                std::move(wait->done)(make_error_code(asio::error::operation_aborted));
+            }
+            self->m_open = false;
+            self->m_writer->close(make_error_code(asio::error::operation_aborted));
+            self->m_transport->close();
+        });
+    }
+
     WriteCompletion wrap(WriteCompletion done) {
         // Weak by design: the sink owns the writer and the writer's queue owns
         // this completion, so a strong capture here would close the loop
@@ -266,14 +312,25 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
         // alive for the whole request/response cycle; the lock can only fail
         // once the connection is already being torn down, and the caller's
         // completion still has to run.
+        auto wait = std::make_shared<WriteWait>();
+        wait->slot = asio::get_associated_cancellation_slot(done);
+        wait->done = std::move(done);
         std::weak_ptr<Http1ResponseSink> guard = this->weak_from_this();
-        return WriteCompletion([guard, done = std::move(done)](error_code ec) mutable {
-            if (auto self = guard.lock()) {
-                self->complete_write(ec, std::move(done));
+        if (wait->slot.is_connected()) {
+            wait->slot.template emplace<CancelWrite>(CancelWrite{wait, guard});
+        }
+        return WriteCompletion([wait, guard](error_code ec) mutable {
+            if (wait->finished) {
                 return;
             }
-            if (done)
-                std::move(done)(ec ? ec : make_error_code(asio::error::not_connected));
+            wait->finished = true;
+            wait->slot.clear();
+            if (auto self = guard.lock()) {
+                self->complete_write(ec, std::move(wait->done));
+                return;
+            }
+            if (wait->done)
+                std::move(wait->done)(ec ? ec : make_error_code(asio::error::not_connected));
         });
     }
 
@@ -517,6 +574,32 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
     using LineCompletion = asio::any_completion_handler<void(error_code, std::string)>;
     using PullCompletion = Body::ReadCompletion;
     using PullAttention = std::function<void(bool)>;
+    using CancelSlot = asio::cancellation_slot;
+
+    // A body pull waiting behind the active one. If the caller's cancellation
+    // fires before this pull starts, it is removed from the queue and completed
+    // with operation_aborted; the slot is cleared before the active read reuses
+    // it, so exactly one consumer is ever installed in that slot.
+    struct PendingPull {
+        PullCompletion done;
+        asio::cancellation_slot slot;
+        bool cancelled{false};
+    };
+
+    struct QueuedPullCancel {
+        std::shared_ptr<PendingPull> entry;
+        std::weak_ptr<Http1Engine> engine;
+
+        void operator()(asio::cancellation_type type) {
+            if (!is_terminal_cancel(type) || entry->cancelled) {
+                return;
+            }
+            entry->cancelled = true;
+            if (auto self = engine.lock()) {
+                self->cancel_pending_pull(entry);
+            }
+        }
+    };
 
     // --- connection lifetime -------------------------------------------------
 
@@ -530,9 +613,12 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
         // Invoke them with a connection error; destroying the type-erased
         // handlers uninvoked would drop the callers' co_await frames silently.
         while (!m_pending_pulls.empty()) {
-            PullCompletion pending = std::move(m_pending_pulls.front());
+            auto pending = std::move(m_pending_pulls.front());
             m_pending_pulls.pop_front();
-            body_failed(make_error_code(asio::error::connection_reset), std::move(pending));
+            pending->slot.clear();
+            if (pending->done) {
+                body_failed(make_error_code(asio::error::connection_reset), std::move(pending->done));
+            }
         }
         auto self = this->shared_from_this();
         if (m_owner != TransportOwner::Engine) {
@@ -576,9 +662,10 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
     void touch_deadline() { *m_deadline = std::chrono::steady_clock::now() + m_limits.idle_timeout; }
 
     // One transport read into the scan buffer, refreshing the shared deadline.
-    template <typename Handler> void read_scan(Handler &&handler) {
+    template <typename Handler> void read_scan(Handler &&handler, CancelSlot slot = {}) {
         touch_deadline();
-        m_transport->async_read_some(ByteSpan{m_scan.data(), m_scan.size()}, std::forward<Handler>(handler));
+        m_transport->async_read_some(ByteSpan{m_scan.data(), m_scan.size()},
+                                     asio::bind_cancellation_slot(slot, std::forward<Handler>(handler)));
     }
 
     // --- head parsing --------------------------------------------------------
@@ -768,8 +855,15 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
     // drain pull over the same state. The second request is queued and starts
     // when the first completion runs.
     void pull_body_chunk(PullCompletion done) {
+        CancelSlot slot = asio::get_associated_cancellation_slot(done);
         if (m_pull_active) {
-            m_pending_pulls.push_back(std::move(done));
+            auto entry = std::make_shared<PendingPull>();
+            entry->done = std::move(done);
+            entry->slot = slot;
+            if (slot.is_connected()) {
+                slot.template emplace<QueuedPullCancel>(QueuedPullCancel{entry, this->weak_from_this()});
+            }
+            m_pending_pulls.push_back(std::move(entry));
             return;
         }
         m_pull_active = true;
@@ -787,7 +881,24 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
             if (self)
                 self->drain_pending_pulls();
         };
-        pull_body_chunk_impl(PullCompletion{std::move(completion)});
+        pull_body_chunk_impl(PullCompletion{std::move(completion)}, slot);
+    }
+
+    // Cancels a pull that is still queued behind the active one. The entry is
+    // removed synchronously (single-threaded connection executor) and the
+    // completion is posted so the caller's composed operation is not destroyed
+    // from inside its own cancellation signal.
+    void cancel_pending_pull(const std::shared_ptr<PendingPull> &entry) {
+        auto it = std::find(m_pending_pulls.begin(), m_pending_pulls.end(), entry);
+        if (it != m_pending_pulls.end()) {
+            m_pending_pulls.erase(it);
+        }
+        asio::post(m_executor, [entry]() mutable {
+            entry->slot.clear();
+            if (entry->done) {
+                std::move(entry->done)(make_error_code(asio::error::operation_aborted), ReadResult{});
+            }
+        });
     }
 
     void drain_pending_pulls() {
@@ -795,12 +906,29 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
             return;
         auto next = std::move(m_pending_pulls.front());
         m_pending_pulls.pop_front();
-        pull_body_chunk(std::move(next));
+        if (next->cancelled) {
+            // cancel_pending_pull() normally erased this entry already; keep a
+            // defensive completion path for a cancellation observed mid-drain.
+            next->slot.clear();
+            if (next->done) {
+                std::move(next->done)(make_error_code(asio::error::operation_aborted), ReadResult{});
+            }
+            drain_pending_pulls();
+            return;
+        }
+        // The active read installs its own handler in this slot; the queued
+        // cancel handler must be gone by then (one consumer per slot).
+        next->slot.clear();
+        pull_body_chunk(std::move(next->done));
     }
 
-    void pull_body_chunk_impl(PullCompletion done) {
+    void pull_body_chunk_impl(PullCompletion done, CancelSlot slot) {
         if (m_body_state.done) {
-            std::move(done)(error_code{}, ReadResult::end());
+            if (m_body_state.failure) {
+                std::move(done)(m_body_state.failure, ReadResult{});
+            } else {
+                std::move(done)(error_code{}, ReadResult::end());
+            }
             return;
         }
         auto self = this->shared_from_this();
@@ -817,54 +945,57 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
                 // its body pull provider) keeps the engine alive for the whole
                 // read, so the lock only fails after teardown.
                 std::weak_ptr<Http1Engine> guard = self;
-                WriteCompletion after = [guard, done = std::move(done)](error_code ec) mutable {
-                    auto engine = guard.lock();
-                    if (!engine) {
-                        if (done)
-                            std::move(done)(ec ? ec : make_error_code(asio::error::not_connected), ReadResult{});
-                        return;
-                    }
-                    if (ec) {
-                        engine->body_failed(ec, std::move(done));
-                        return;
-                    }
-                    engine->pull_mode(std::move(done));
-                };
+                WriteCompletion after = asio::bind_cancellation_slot(
+                    slot, [guard, done = std::move(done), slot](error_code ec) mutable {
+                        auto engine = guard.lock();
+                        if (!engine) {
+                            if (done)
+                                std::move(done)(ec ? ec : make_error_code(asio::error::not_connected), ReadResult{});
+                            return;
+                        }
+                        if (ec) {
+                            engine->body_failed(ec, std::move(done));
+                            return;
+                        }
+                        engine->pull_mode(std::move(done), slot);
+                    });
                 m_active_writer->send_continue(std::move(after));
                 return;
             }
             if (m_continue_sent->exchange(true, std::memory_order_relaxed)) {
-                pull_mode(std::move(done));
+                pull_mode(std::move(done), slot);
                 return;
             }
             auto keep = std::make_shared<std::string>(kContinueResponse);
             const std::array<ConstByteSpan, 1> buffers{
                 ConstByteSpan{reinterpret_cast<const std::byte *>(keep->data()), keep->size()}};
             touch_deadline();
-            m_transport->async_write_seq(boost::span<const ConstByteSpan>{buffers.data(), buffers.size()},
-                                         [self, keep, done = std::move(done)](error_code ec, std::size_t) mutable {
-                                             if (ec) {
-                                                 self->body_failed(ec, std::move(done));
-                                                 return;
-                                             }
-                                             self->pull_mode(std::move(done));
-                                         });
+            m_transport->async_write_seq(
+                boost::span<const ConstByteSpan>{buffers.data(), buffers.size()},
+                asio::bind_cancellation_slot(
+                    slot, [self, keep, done = std::move(done), slot](error_code ec, std::size_t) mutable {
+                        if (ec) {
+                            self->body_failed(ec, std::move(done));
+                            return;
+                        }
+                        self->pull_mode(std::move(done), slot);
+                    }));
             return;
         }
-        pull_mode(std::move(done));
+        pull_mode(std::move(done), slot);
     }
 
-    void pull_mode(PullCompletion done) {
+    void pull_mode(PullCompletion done, CancelSlot slot) {
         switch (m_body_state.mode) {
         case BodyState::Mode::None:
             m_body_state.done = true;
             std::move(done)(error_code{}, ReadResult::end());
             return;
         case BodyState::Mode::Fixed:
-            pull_fixed(std::move(done));
+            pull_fixed(std::move(done), slot);
             return;
         case BodyState::Mode::Chunked:
-            pull_chunked(std::move(done));
+            pull_chunked(std::move(done), slot);
             return;
         }
         std::move(done)(error_code{}, ReadResult::end());
@@ -873,10 +1004,11 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
     void body_failed(error_code ec, PullCompletion done) {
         m_body_state.error = true;
         m_body_state.done = true;
+        m_body_state.failure = ec;
         std::move(done)(ec, ReadResult{});
     }
 
-    void pull_fixed(PullCompletion done) {
+    void pull_fixed(PullCompletion done, CancelSlot slot) {
         if (m_body_state.remaining == 0) {
             m_body_state.done = true;
             std::move(done)(error_code{}, ReadResult::end());
@@ -898,36 +1030,41 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
         auto chunk = std::make_shared<std::string>(want, '\0');
         touch_deadline();
         auto self = this->shared_from_this();
-        m_transport->async_read_some(ByteSpan{reinterpret_cast<std::byte *>(chunk->data()), chunk->size()},
-                                     [self, chunk, done = std::move(done)](error_code ec, std::size_t n) mutable {
-                                         if (ec) {
-                                             self->body_failed(ec, std::move(done));
-                                             return;
-                                         }
-                                         chunk->resize(n);
-                                         self->m_body_state.remaining -= n;
-                                         if (self->m_body_state.remaining == 0)
-                                             self->m_body_state.done = true;
-                                         std::move(done)(error_code{}, ReadResult::chunk(std::move(*chunk)));
-                                     });
+        m_transport->async_read_some(
+            ByteSpan{reinterpret_cast<std::byte *>(chunk->data()), chunk->size()},
+            asio::bind_cancellation_slot(
+                slot, [self, chunk, done = std::move(done)](error_code ec, std::size_t n) mutable {
+                    if (ec) {
+                        self->body_failed(ec, std::move(done));
+                        return;
+                    }
+                    chunk->resize(n);
+                    self->m_body_state.remaining -= n;
+                    if (self->m_body_state.remaining == 0)
+                        self->m_body_state.done = true;
+                    std::move(done)(error_code{}, ReadResult::chunk(std::move(*chunk)));
+                }));
     }
 
-    void pull_chunked(PullCompletion done) {
+    void pull_chunked(PullCompletion done, CancelSlot slot) {
         auto self = this->shared_from_this();
         // Finish the CRLF that terminates the previous chunk's data.
         if (m_body_state.chunk_crlf_pending) {
-            read_exact(2, [self, done = std::move(done)](error_code ec, std::string crlf) mutable {
-                if (ec) {
-                    self->body_failed(ec, std::move(done));
-                    return;
-                }
-                if (crlf != "\r\n") {
-                    self->body_failed(make_error_code(asio::error::invalid_argument), std::move(done));
-                    return;
-                }
-                self->m_body_state.chunk_crlf_pending = false;
-                self->pull_chunked(std::move(done));
-            });
+            read_exact(
+                2,
+                [self, done = std::move(done), slot](error_code ec, std::string crlf) mutable {
+                    if (ec) {
+                        self->body_failed(ec, std::move(done));
+                        return;
+                    }
+                    if (crlf != "\r\n") {
+                        self->body_failed(make_error_code(asio::error::invalid_argument), std::move(done));
+                        return;
+                    }
+                    self->m_body_state.chunk_crlf_pending = false;
+                    self->pull_chunked(std::move(done), slot);
+                },
+                slot);
             return;
         }
         // Deliver a bounded slice of the current chunk. The chunk length is
@@ -938,52 +1075,57 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
         if (m_body_state.chunk_remaining > 0) {
             const auto want =
                 static_cast<std::size_t>(std::min<std::uint64_t>(m_body_state.chunk_remaining, kReadChunkBytes));
-            read_exact(want, [self, done = std::move(done)](error_code ec, std::string chunk) mutable {
+            read_exact(
+                want,
+                [self, done = std::move(done)](error_code ec, std::string chunk) mutable {
+                    if (ec) {
+                        self->body_failed(ec, std::move(done));
+                        return;
+                    }
+                    self->m_body_state.chunk_remaining -= chunk.size();
+                    if (self->m_body_state.chunk_remaining == 0)
+                        self->m_body_state.chunk_crlf_pending = true;
+                    std::move(done)(error_code{}, ReadResult::chunk(std::move(chunk)));
+                },
+                slot);
+            return;
+        }
+        read_line(
+            [self, done = std::move(done), slot](error_code ec, std::string size_line) mutable {
                 if (ec) {
                     self->body_failed(ec, std::move(done));
                     return;
                 }
-                self->m_body_state.chunk_remaining -= chunk.size();
-                if (self->m_body_state.chunk_remaining == 0)
-                    self->m_body_state.chunk_crlf_pending = true;
-                std::move(done)(error_code{}, ReadResult::chunk(std::move(chunk)));
-            });
-            return;
-        }
-        read_line([self, done = std::move(done)](error_code ec, std::string size_line) mutable {
-            if (ec) {
-                self->body_failed(ec, std::move(done));
-                return;
-            }
-            std::string_view size_tok{size_line};
-            if (auto semi = size_tok.find(';'); semi != std::string_view::npos) {
-                size_tok = size_tok.substr(0, semi);
-            }
-            std::uint64_t chunk_len = 0;
-            if (parse_uint(size_tok, 16, self->body_limit(), chunk_len) != NumParse::Ok) {
-                self->body_failed(make_error_code(asio::error::invalid_argument), std::move(done));
-                return;
-            }
-            if (chunk_len == 0) {
-                self->read_trailers(std::move(done));
-                return;
-            }
-            // Checked add: with max_body_bytes=0 body_limit() is UINT64_MAX, and
-            // an unchecked total += chunk_len wraps and disables the limit.
-            const auto budget = self->body_limit() - self->m_body_state.total;
-            if (chunk_len > budget) {
-                self->body_failed(make_error_code(asio::error::message_size), std::move(done));
-                return;
-            }
-            self->m_body_state.total += chunk_len;
-            self->m_body_state.chunk_remaining = chunk_len;
-            self->pull_chunked(std::move(done));
-        });
+                std::string_view size_tok{size_line};
+                if (auto semi = size_tok.find(';'); semi != std::string_view::npos) {
+                    size_tok = size_tok.substr(0, semi);
+                }
+                std::uint64_t chunk_len = 0;
+                if (parse_uint(size_tok, 16, self->body_limit(), chunk_len) != NumParse::Ok) {
+                    self->body_failed(make_error_code(asio::error::invalid_argument), std::move(done));
+                    return;
+                }
+                if (chunk_len == 0) {
+                    self->read_trailers(std::move(done), slot);
+                    return;
+                }
+                // Checked add: with max_body_bytes=0 body_limit() is UINT64_MAX, and
+                // an unchecked total += chunk_len wraps and disables the limit.
+                const auto budget = self->body_limit() - self->m_body_state.total;
+                if (chunk_len > budget) {
+                    self->body_failed(make_error_code(asio::error::message_size), std::move(done));
+                    return;
+                }
+                self->m_body_state.total += chunk_len;
+                self->m_body_state.chunk_remaining = chunk_len;
+                self->pull_chunked(std::move(done), slot);
+            },
+            slot);
     }
 
-    void read_trailers(PullCompletion done) {
+    void read_trailers(PullCompletion done, CancelSlot slot) {
         auto self = this->shared_from_this();
-        read_line([self, done = std::move(done)](error_code ec, std::string trailer) mutable {
+        read_line([self, done = std::move(done), slot](error_code ec, std::string trailer) mutable {
             if (ec) {
                 self->body_failed(ec, std::move(done));
                 return;
@@ -1009,8 +1151,8 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
                     }
                 }
             }
-            self->read_trailers(std::move(done));
-        });
+            self->read_trailers(std::move(done), slot);
+        }, slot);
     }
 
     void drain_body(std::function<void(bool)> done) {
@@ -1035,13 +1177,13 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
     // --- framed reads --------------------------------------------------------
 
     // Reads one CRLF- or LF-terminated line, topping up from the transport.
-    void read_line(LineCompletion done) {
+    void read_line(LineCompletion done, CancelSlot slot = {}) {
         auto state = std::make_shared<std::string>();
         m_body_state.line_overflow = false;
-        loop_read_line(std::move(state), std::move(done));
+        loop_read_line(std::move(state), std::move(done), slot);
     }
 
-    void loop_read_line(std::shared_ptr<std::string> out, LineCompletion done) {
+    void loop_read_line(std::shared_ptr<std::string> out, LineCompletion done, CancelSlot slot) {
         const std::string_view buffered = m_in.view();
         const std::size_t nl = buffered.find('\n');
         if (nl != std::string_view::npos) {
@@ -1057,29 +1199,32 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
             return;
         }
         auto self = this->shared_from_this();
-        read_scan([self, out, done = std::move(done)](error_code ec, std::size_t n) mutable {
-            if (ec) {
-                std::move(done)(ec, std::string{});
-                return;
-            }
-            self->m_in.append(self->m_scan.data(), n);
-            self->loop_read_line(std::move(out), std::move(done));
-        });
+        read_scan(
+            [self, out, done = std::move(done), slot](error_code ec, std::size_t n) mutable {
+                if (ec) {
+                    std::move(done)(ec, std::string{});
+                    return;
+                }
+                self->m_in.append(self->m_scan.data(), n);
+                self->loop_read_line(std::move(out), std::move(done), slot);
+            },
+            slot);
     }
 
     // Reads exactly `len` bytes, copying whatever is buffered first and then
     // reading the rest straight into the output string.
-    void read_exact(std::size_t len, LineCompletion done) {
+    void read_exact(std::size_t len, LineCompletion done, CancelSlot slot = {}) {
         auto out = std::make_shared<std::string>(len, '\0');
         const std::size_t have = std::min<std::size_t>(len, m_in.size());
         if (have != 0) {
             std::memcpy(out->data(), m_in.view().data(), have);
             m_in.consume(have);
         }
-        loop_read_exact(std::move(out), have, len, std::move(done));
+        loop_read_exact(std::move(out), have, len, std::move(done), slot);
     }
 
-    void loop_read_exact(std::shared_ptr<std::string> out, std::size_t have, std::size_t len, LineCompletion done) {
+    void loop_read_exact(std::shared_ptr<std::string> out, std::size_t have, std::size_t len, LineCompletion done,
+                         CancelSlot slot) {
         if (have == len) {
             std::move(done)(error_code{}, std::move(*out));
             return;
@@ -1088,13 +1233,14 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
         touch_deadline();
         m_transport->async_read_some(
             ByteSpan{reinterpret_cast<std::byte *>(out->data() + have), len - have},
-            [self, out, have, len, done = std::move(done)](error_code ec, std::size_t n) mutable {
-                if (ec) {
-                    std::move(done)(ec, std::string{});
-                    return;
-                }
-                self->loop_read_exact(std::move(out), have + n, len, std::move(done));
-            });
+            asio::bind_cancellation_slot(
+                slot, [self, out, have, len, done = std::move(done), slot](error_code ec, std::size_t n) mutable {
+                    if (ec) {
+                        std::move(done)(ec, std::string{});
+                        return;
+                    }
+                    self->loop_read_exact(std::move(out), have + n, len, std::move(done), slot);
+                }));
     }
 
     // --- errors and upgrades -------------------------------------------------
@@ -1595,6 +1741,10 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
         bool chunk_crlf_pending{false};
         bool done{false};
         bool error{false};
+        // The failure that ended the body. Reads that start after it must see
+        // the same error instead of a clean eof (a cancelled request must not
+        // look like a completed body to a queued reader).
+        error_code failure{};
         bool line_overflow{false};
         bool expect_continue{false};
         void reset() { *this = BodyState{}; }
@@ -1620,7 +1770,7 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
     std::shared_ptr<Http1ResponseSink<Transport>> m_active_writer;
     std::shared_ptr<std::atomic<bool>> m_continue_sent{std::make_shared<std::atomic<bool>>(false)};
     bool m_pull_active{false};
-    std::deque<PullCompletion> m_pending_pulls;
+    std::deque<std::shared_ptr<PendingPull>> m_pending_pulls;
     std::size_t m_trailer_bytes{0};
     Dispatcher m_dispatch;
     WsLookup m_ws_lookup;

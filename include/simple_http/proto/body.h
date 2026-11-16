@@ -32,6 +32,7 @@
 #include <utility>
 #include <variant>
 
+#include "../core/cancel.h"
 #include "../core/content_encoding.h"
 #include "../core/logging.h"
 #include "../core/result.h"
@@ -71,6 +72,12 @@ class Body {
     // --- consumer API (handler side) ---
 
     // Reads the next body chunk (data or end-of-body), or an error_code.
+    //
+    // The operation honours Asio per-operation cancellation: binding the
+    // request's cancellation slot (directly or through co_spawn) makes a parked
+    // read complete with asio::error::operation_aborted. The internal channel's
+    // channel_cancelled is normalized at this boundary so callers only see the
+    // standard code.
     template <typename Token> auto async_read(Token &&token) {
         require_owner();
         return asio::async_compose<Token, void(error_code, ReadResult)>(ReadOp{*this}, token, m_exec);
@@ -281,7 +288,10 @@ class Body {
         template <typename Self> void operator()(Self &self, error_code ec, Frame frame) {
             if (ec) {
                 body.m_eof = true;
-                self.complete(ec, ReadResult{});
+                // A per-operation cancellation of the channel arrives as
+                // channel_cancelled; the public contract (and every other Asio
+                // operation) uses operation_aborted.
+                self.complete(normalize_cancellation(ec), ReadResult{});
                 return;
             }
             if (std::holds_alternative<Eof>(frame)) {
@@ -325,8 +335,20 @@ class Body {
             after_hook(self);
         }
 
+        // A cancellation that arrived between two steps is latched in the
+        // composed operation's cancellation state; do not start another inner
+        // operation on top of it.
+        template <typename Self> bool cancel_requested(Self &self) const {
+            return self.cancelled() != asio::cancellation_type::none;
+        }
+
         template <typename Self> void after_hook(Self &self) {
             body.m_read_started = true;
+            if (cancel_requested(self)) {
+                body.m_eof = true;
+                self.complete(make_error_code(asio::error::operation_aborted), ReadResult{});
+                return;
+            }
             if (body.m_pull) {
                 state = State::Pull;
                 body.m_pull(std::move(self));
@@ -370,6 +392,11 @@ class Body {
             }
             if (body.m_pending_eof) {
                 finish_for_end(self);
+                return;
+            }
+            if (cancel_requested(self)) {
+                body.m_eof = true;
+                self.complete(make_error_code(asio::error::operation_aborted), ReadResult{});
                 return;
             }
             ch.async_receive(std::move(self));
