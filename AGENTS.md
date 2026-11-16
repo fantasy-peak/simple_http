@@ -1,47 +1,66 @@
 # AGENTS.md — simple_http
 
-面向参与本工程的 AI / 协作者的工程说明。内容以当前源码、构建脚本和测试为准；
-与 `README.md`（英文默认）和 `README.zh-CN.md`（完整中文版）的分工是：README 面向
-使用者，本文件面向**修改代码的人**，重点记录分层边界、并发契约、测试门线和已固化的
-回归点。
-
-如果文档与代码冲突，以代码为准，并顺手修正文档。
+面向参与本工程的 AI / 协作者的工程说明。内容以**当前源码、构建脚本和测试**为准。
+本工程当前的 `include/` 就是 **C++17 token-only 实现**：不要按旧的 C++23 协程主实现
+来理解 API，也不要假设不存在的主分支结构。头文件注释与代码冲突时以代码为准，并顺手
+修正注释。
 
 ---
 
-## 1. 这是什么
-
-`simple_http` 是一个 **header-only 的 C++ HTTP 服务器 + 客户端库**，基于
-`boost.asio` C++23 协程实现。
+## 1. 工程真实形态
 
 | 项 | 当前值 |
 |---|---|
 | 版本 | `0.9.0`（`include/simple_http/core/version.h`） |
 | 形态 | 纯头文件；`include/` 下没有 `.cpp` |
 | 入口头 | `#include <simple_http.h>` |
-| 标准 | C++23（CMake 接口与仓库自带 `xmake.lua` 一致） |
+| 最低标准 | C++17 |
+| 异步模型 | Asio initiating function + 显式 completion token |
+| 协程 | 仅在 `BOOST_ASIO_HAS_CO_AWAIT`（C++20+）下作为可选适配层 |
+| JSON/typed params/OpenAPI/JWT | 由 `SIMPLE_HTTP_HAS_GLAZE` 门控，需 C++23 + glaze |
+| 依赖 | Boost（Asio/System/Regex/Core）、OpenSSL、zlib、brotli；glaze 可选；HTTP/3 需 ngtcp2 + nghttp3 |
 | 许可 | MIT |
-| 依赖 | Boost（asio、regex）、OpenSSL、glaze、zlib、brotli；HTTP/3 额外 ngtcp2 + nghttp3；测试用 Catch2 |
-| 构建 | xmake（主）；CMake 只安装 INTERFACE 目标供下游 `find_package` |
 
-### 协议矩阵
+### 1.1 异步 API 的核心约定
+
+- 每个异步操作都是 Asio initiating function，**没有默认 completion token**：
+  调用方必须显式传 callback、`asio::deferred`、`asio::detached`、
+  `asio::as_tuple(asio::use_awaitable)` 等。
+- 完成签名遵循 Asio 约定：`void(error_code)`、
+  `void(error_code, T)`、`void(error_code, T1, T2)`。
+- 虚拟边界（`ResponseSink`、`SessionStore`、`ResolveFn` 等）使用
+  `asio::any_completion_handler` 做类型擦除，因此 associated executor /
+  allocator / cancellation slot 不会在转发时丢失。
+- 组合操作使用 `asio::async_compose` 状态机；不要引入自定义协程桥接。
+- 库内部不以异常做控制流；同步可失败 API 返回 `error_code` 或
+  `boost::system::result<T>`（别名 `simple_http::result<T>`）。
+
+### 1.2 协议矩阵
 
 | 能力 | 服务端 | 客户端 |
 |---|---|---|
-| HTTP/1.0 | 支持 | — |
+| HTTP/1.0 | 支持 | —（客户端只发 1.1） |
 | HTTP/1.1 | 支持 | 支持 |
-| HTTP/2 over TLS（ALPN） | 支持 | 支持 |
-| h2c Upgrade | 支持 | 支持（`H2cMode::Upgrade`） |
-| h2c prior-knowledge | 支持 | 支持（`H2cMode::PriorKnowledge`） |
-| HTTP/3 over QUIC | 可选（`SIMPLE_HTTP_ENABLE_HTTP3`） | 可选，且只显式指定 |
+| HTTP/2 over TLS | 支持（ALPN） | 支持（ALPN） |
+| h2c Upgrade | 支持 | **未接线** |
+| h2c prior knowledge | 支持 | 支持（明文 `HttpVersionPolicy::Http2`） |
+| HTTP/3 over QUIC | 可选（`SIMPLE_HTTP_ENABLE_HTTP3`） | 可选，且仅显式 `HttpVersionPolicy::Http3` |
 | WebSocket over HTTP/1.1 | 支持 | 支持 |
 | WebSocket over HTTP/2（RFC 8441） | 支持 | 未实现 |
 | WebSocket over HTTP/3 | 未实现 | 未实现 |
-| SSE | 响应侧 helper | `SseStream` |
+| SSE | 响应 helper | `SseStream` |
+| UNIX domain socket | **未实现**（配置类型保留） | — |
 
-服务端还支持 UNIX domain socket、多监听器、TLS/mTLS、HTTP 反代、WebSocket 反代、
-静态文件、OpenAPI 3.1 文档；客户端支持重定向、Cookie、出站代理（CONNECT / HTTPS /
-SOCKS5）、自动解压、分层超时与可配置重试。
+### 1.3 当前不存在的能力
+
+- 没有名为 `HttpClient` 的类，没有 `client/http_client.h`。
+- 没有 `Client::async_get/async_post/.../async_send_stream`；客户端入口是
+  `client.get(url).send(token)` 或 `Client::async_send(...)`。
+- 没有 C++23 协程主实现；协程只是可选 handler/middleware 适配。
+- 没有服务端 UNIX-domain listener；`UnixAddress` 在 `start()` 中会被拒绝。
+- 没有 HTTP/2 / HTTP/3 server push。
+- HTTP/3 没有 WebSocket、请求 trailers、`Expect: 100-continue`、0-RTT。
+- 客户端没有传统连接池；每个 `Client` 只缓存一条到某个 origin 的连接。
 
 ---
 
@@ -49,140 +68,121 @@ SOCKS5）、自动解压、分层超时与可配置重试。
 
 ```
 include/
-  simple_http.h                    伞形头，聚合全部公共 API
+  simple_http.h                     伞形头（聚合全部公共 API）
   simple_http/
-    core/                          协议无关基础设施
-      version.h                    版本与 Server/User-Agent 产品串
-      types.h                      error_code、Version、WriteMode、StreamStatus、Eof/Rst/Disconnect
-      tls_version.h                TlsMinVersion
-      http_method.h                Method 枚举 + is_idempotent
-      http_status.h                状态码常量
-      http_field.h                 字段名常量 + hop-by-hop 判定
-      logging.h                    LogSink / set_log_sink / make_stdout_sink / SIMPLE_HTTP_*_LOG
-      logging_json.h               make_json_sink（glaze）
-      mime.h                       MIME 常量与扩展名映射
-      http_date.h                  IMF-fixdate 格式化/解析、now_unix
-      url_path.h                   路径解码与规范化（查找键）
-      url_encoding.h               百分号编码 query_escape / path_escape
-      accept_encoding.h            Accept-Encoding qvalue 解析
-      validators.h                 ETag / 弱比较 / Range
-      static_table.h               文档根 → 不可变查找表
-      base64.h                     base64
-      io_pool.h                    IoCtxPool（单线程 io_context 池）
-      limits.h                     EngineLimits
-      compression.h                CompressionConfig
-      content_encoding.h           gzip/brotli 编解码
-      address.h                    Unix/Inet 地址辅助
-      resolve.h                    ResolveFn（客户端与 WS 反代 DNS 钩子）
-    proto/                         版本无关 HTTP 模型
-      headers.h                    Headers（get / get_all / add）
-      body.h                       Body：推模式 channel / 拉模式 provider
-      query.h                      QueryParams
-      multipart.h                  multipart/form-data 解析 + MultipartForm 编码
-      multipart_stream.h           增量 multipart 解析
-      form.h                       read_urlencoded_body / read_multipart_body
-      params.h                     path_params<T> / query_params<T> / parse_params<T>
-      json.h                       read_json_body<T> / write_json（glaze）
-      request.h                    Request（两端共用；含 AppStateView / app_state<T>()）
-      response.h                   ResponseWriter（fluent 门面）
-      response_writer.h            ResponseSink 抽象（引擎实现）
-      compressing_writer.h         响应压缩装饰
-      error_body.h                 JsonError / ProblemDetails + write_error / write_problem
-      ws_frame.h                   WebSocket 帧编解码 + 握手 key
-      ws_deflate.h                 permessage-deflate（RFC 7692）
-      websocket.h                  WebSocket 句柄 + WsBackendImpl（读泵/写泵）
+    core/                           协议无关基础设施
+      accept_encoding.h             Accept-Encoding qvalue
+      address.h                     peer 地址展示（IPv4-mapped 处理）
+      base64.h
+      compat.h                      C++17 兼容：ByteSpan、starts_with、executor_initiation
+      compression.h                 CompressionConfig / RequestDecompressionConfig
+      content_encoding.h            gzip/br 编解码、协商
+      format.h                      `{}` 子集格式化（替代 std::format）
+      glaze_support.h               SIMPLE_HTTP_HAS_GLAZE 门控
+      http_date.h                   IMF-fixdate
+      http_field.h                  字段名常量、hop-by-hop
+      http_method.h                 Method + is_idempotent
+      http_status.h                 状态码常量
+      io_pool.h                     IoCtxPool（单线程 io_context 池）
+      limits.h                      EngineLimits
+      logging.h                     LogSink / LogLevel / LogRecord / 宏
+      mime.h
+      resolve.h                     ResolveFn（客户端与 WS 反代 DNS 钩子）
+      result.h                      boost::system::result 别名
+      source_location.h             C++17 source_location 替身
+      static_table.h                静态文件查找表
+      tls_version.h                 TlsMinVersion
+      types.h                       error_code、Version、Method 辅助、tcl 校验
+      url_encoding.h                query_escape / path_escape
+      url_path.h                    decode_and_normalize
+      validators.h                  ETag / 弱比较 / Range
+      version.h                     版本与 Server/User-Agent 产品串
+    proto/                          版本无关 HTTP 模型
+      body.h                        Body：推/拉双模式、透明解码
+      compressing_writer.h          响应压缩装饰器
+      error_body.h                  JsonError / ProblemDetails
+      form.h                        urlencoded / multipart body 读取
+      headers.h                     Headers
+      json.h                        glaze JSON 读写（门控）
+      multipart.h                   整块 multipart 解析 + MultipartForm 编码
+      multipart_stream.h            增量 multipart
+      params.h                      path_params / query_params（门控）
+      query.h                       QueryParams
+      request.h                     Request（两端共用）
+      response.h                    ResponseWriter（fluent 门面）
+      response_writer.h             ResponseSink 抽象
+      websocket.h                   WebSocket + WsBackendImpl
+      ws_deflate.h                  permessage-deflate
+      ws_frame.h                    WebSocket 帧编解码
     transport/
-      transport.h                  Transport concept + SslHandle
-      serialized_writer.h          单连接写队列（条目拥有字节，h1/WebSocket 共用）
-      tcp_transport.h              TcpStreamTransport（含零拷贝 scatter-gather）
-      tls_context.h                TlsContext / TlsConfig（ALPN）
-      tls_transport.h              TlsStreamTransport
+      transport.h                   Transport 鸭子接口 + SslHandle
+      serialized_writer.h           单连接串行写队列（h1/WS）
+      tcp_transport.h               TcpTransport
+      tls_context.h                 TlsContext / TlsConfig（ALPN）
+      tls_transport.h               TlsTransport / NestedTlsTransport
+      openssl_init.h                OpenSSL 进程级一次性初始化
     engine/
-      dispatcher.h                 Dispatcher / WsLookup / WsHandlerFn / 反代目标类型
-      ws_proxy_common.h            h1 Upgrade 与 h2 extended CONNECT 共用的 WS 上游握手
-      h1/
-        h1_parser.h                请求/响应头解析器
-        h1_engine.h                HTTP/1.x 引擎
-        ws_proxy.h                 WebSocket 字节隧道
-      h2/
-        h2_frame.h                 帧层
-        hpack_*.h                  HPACK 静态表 / Huffman / 解码 / 编码
-        h2_engine.h                HTTP/2 引擎
-        h2_ws_transport.h          单条 h2 流 → WsBackendImpl Transport
-      h3/
-        h3_callbacks.h             nghttp3 回调适配
-        h3_stream.h                请求流适配
-        h3_engine.h                HTTP/3 引擎（ngtcp2 + nghttp3）
+      dispatcher.h                  Handler/Middleware 适配、代理 seam
+      ws_proxy_common.h             h1 Upgrade 与 h2 extended CONNECT 共用握手
+      h1/ h1_parser.h h1_engine.h ws_proxy.h
+      h2/ h2_frame.h hpack_*.h h2_engine.h h2_ws_transport.h
+      h3/ h3_callbacks.h h3_stream.h h3_engine.h（宏门控）
     handler/
-      handler.h                    Handler / Next / Middleware / make_handler / invoke_handler
-      validation.h                 Validator<T> / FieldError / 约束辅助函数
-      extract.h                    Path/Query/Json/Form/State/Header/Cookie 提取器 + extract<...>()
-      session.h                    SessionStore / MemorySessionStore / Session + session() 中间件
-      csrf.h                       double-submit CSRF 中间件
-      jwt.h                        JWT 验证（HS256/RS256/ES256/JWKS）+ require_scope/require_role
-      jwks.h                       JWKS 解析（RSA/EC/oct）+ fetch_jwks_json
-      builtin_middleware.h         request_id / access_log / recovery / basic_auth / real_ip /
-                                   clean_path / strip_prefix / redirect_slashes / ws_origin /
-                                   timeout / compress
-      secure_headers.h             SecureHeadersConfig + secure_headers
-      rate_limit.h                 TokenBucket / RateLimiter / rate_limit
-      cors.h                       CorsConfig / make_cors_middleware
-      conditionals.h               maybe_not_modified（handler 级 304）
-      router.h                     Router（精确路由 + 段 trie + {*rest} + Host + 正则 + 反代 + 静态）
-      http_proxy.h                 请求级 HTTP 反代
-      static_files.h               静态文件服务
-      file_response.h              send_file
-      upload.h                     read_body_to_file
+      handler.h                     Next/Middleware/make_middleware
+      validation.h                  Validator<T> / FieldError / 约束辅助
+      extract.h                     Path/Query/Json/Form/State/Header/Cookie + extract
+      session.h                     SessionStore / MemorySessionStore / Session
+      csrf.h                        double-submit CSRF
+      jwt.h / jwks.h                JWT 验证与 JWKS
+      builtin_middleware.h          内置中间件
+      secure_headers.h
+      rate_limit.h
+      cors.h
+      conditionals.h
+      router.h
+      http_proxy.h
+      static_files.h
+      file_response.h               async_send_file
+      upload.h                      async_read_body_to_file
     net/
-      connection.h                 serve_plaintext / serve_tls（协议嗅探）
-      server.h                     Server / ServerConfig / Listener 配置 / 生命周期
+      connection.h                  PlaintextProtocols
+      server.h                      Server / ServerConfig / 监听生命周期
     client/
-      http.h                       公共客户端 API（平铺在 simple_http::）
-      multipart_stream.h           MultipartStreamWriter / stream_file_body（流式上传）
-      client_config.h              ClientConfig / TlsClientConfig / ProxyConfig / RetryPolicy /
-                                   HttpVersionPolicy / H2cMode / client_errc
-      client_stream.h              ResponseHead / ClientStream / ClientSession
-      multiplexed_session.h        h2/h3 共用的多路复用骨架
-      http_client.h                内部 ClientEngine（单连接模型核心）
-      h1_client.h                  HTTP/1.1 会话
-      h2_client.h                  HTTP/2 会话
-      h3_client.h                  HTTP/3 会话（宏门控）
-      tls_client.h                 客户端 TLS/ALPN/SNI/mTLS
-      proxy.h                      出站代理（CONNECT / HTTPS / SOCKS5 / NO_PROXY）
-      url.h                        绝对 URL 解析
-      cookie_jar.h                 CookieJar
-      decompressing_stream.h       响应解压装饰器
-      sse.h                        SseParser / SseStream
-      ws_client.h                  WebSocket 客户端（H1 Upgrade）
-    quic/                          ngtcp2 封装（#ifdef SIMPLE_HTTP_ENABLE_HTTP3）
-      protocol.h / connection.h / endpoint.h / ngtcp2_config.h /
-      ngtcp2_crypto.h / tls.h
+      http.h                        Client / RequestBuilder / Response / Stream
+      client_config.h               ClientConfig / client_errc / RetryPolicy / ProxyConfig
+      client_stream.h               ClientStream / ResponseHead
+      h1_client.h / h2_client.h / h3_client.h
+      multiplexed_session.h         h2/h3 共用骨架
+      tls_client.h                  客户端 TLS/ALPN/SNI
+      proxy.h                       出站代理（CONNECT / HTTPS / SOCKS5 / NO_PROXY）
+      url.h                         绝对 URL 解析
+      cookie_jar.h
+      decompressing_stream.h
+      sse.h                         SseParser / SseStream
+      ws_client.h                   WebSocket 客户端（H1 Upgrade）
+      multipart_stream.h            MultipartStreamWriter / async_stream_file_body
     openapi/
-      openapi_doc.h                OAS 3.1 文档模型 + 手写 JSON 渲染
-      openapi.h                    glaze 反射 schema、openapi::doc() 路由描述
+      openapi_doc.h                 OAS 3.1 模型 + JSON 渲染
+      openapi.h                     glaze 反射 schema / doc()（门控）
+    quic/                           ngtcp2 封装（宏门控）
+test/
+  unit/                             Catch2 单测（约 511 个 TEST_CASE）
+  cpp17/smoke.cpp                   以 C++17 编译并运行公共 API
+  diff/client/                      C++ 客户端 ↔ Go net/http 客户端
+  diff/server/                      Go 探针 → C++ server ↔ Go server + h2raw
+  diff/openapi/                     OAS 3.1 契约 + Swagger UI
+  diff/support/harness.py           归一化、比较、known_diffs
+  fixtures/conformance_server.cpp   外部合规/压力专用 server
+  external/conformance/             h2spec / h1spec / h3spec / Autobahn
+  external/stress/                  h2load / k6
+  sanitizer/                        concurrency harness + suppressions
+  fuzz/                             fuzz_* 目标 + corpus
+  tls_certificates/                 测试证书（相对仓库根路径是契约）
+  coverage.sh / sanitize.py / run.py / run.sh
 ```
 
-其它目录：
-
-- `test/`：统一入口 `test/run.sh`（`test/run.py`，分层 fast / standard / full）。
-  实际分层：
-  - `unit/`：Catch2 纯逻辑测试，单个 `test_unit` 可执行程序；
-  - `diff/client/`：C++ 客户端 ↔ Go `net/http` 客户端（`cases/*.json` +
-    `cpp/driver.cpp` + `go/driver` + `go/refserver`）；
-  - `diff/server/`：Go 探针 → C++ 服务端 ↔ Go 参考服务端（`go/probes`、
-    `go/h2raw`、`go/server`）；
-  - `diff/openapi/`：OAS 3.1 元模式、文档 ↔ 路由一致性、Swagger UI；
-  - `diff/support/harness.py`：归一化、比较与 `known_diffs.json`；
-  - `fixtures/`：压力/合规专用简化服务端（`conformance_server.cpp`）；
-  - `external/conformance/`、`external/stress/`：外部工具套件（**没有** bench）；
-  - `fuzz/`、`sanitizer/`、`support/`、`tls_certificates/`；
-  - `cpp17/smoke.cpp`：以 C++17 编译并运行当前 `include/` 的公共 API（`cpp17` 套件）。
-  报告写到 `.cache/test-run/<timestamp>-<pid>/`（`report.json` + `junit.xml`）。
-  `full` 档默认要求外部工具齐全（缺工具即失败），本地可用 `--allow-skip` 放行。
-- `test/tls_certificates/`：测试证书（`./test/tls_certificates/...` 是相对路径契约）。
-- `cmake/`：`simple_httpConfig.cmake.in`。
-- **没有 `docs/`，也没有 `ROADMAP.md`**（已删除）；文档为 `README.md`（英文默认）、
-  `README.zh-CN.md`（完整中文）与本文件。
+`include.old/`、`build-*`、`v2ray-cpp/`、`review/`、`REVIEW-*.md`、`bin/` 不是
+库的公共接口，不要据此写文档或改代码。
 
 ---
 
@@ -195,74 +195,76 @@ handler / net / client 门面
         ↓ 只用 Request / ResponseWriter / Router / Body
 proto（版本无关模型）
         ↓ ResponseSink
-engine（h1 / h2 / h3，版本相关）
+engine（h1 / h2 / h3）
         ↓ Transport
 transport（TCP / TLS / QUIC 字节流）
 ```
 
-- **上层不得出现协议版本分支。** 需要版本差异时，把它放进 `engine/` 或对应的
-  `ResponseSink` 实现；`ResponseWriter` 只是转发门面。
-- 引擎通过 `Transport` 读写字节，不直接依赖 socket 类型。
-- `Request` / `ResponseWriter` / `Router` / handler 对 HTTP 版本完全透明。
+- 上层不得出现协议版本分支。版本差异放在 `engine/` 或对应的
+  `ResponseSink` 实现里；`ResponseWriter` 只是转发门面。
+- 引擎只通过 `Transport` 读写字节，不直接依赖 socket 类型。
+- `Request` / `ResponseWriter` / `Router` / handler 对 HTTP 版本透明。
 
 ### 3.2 并发模型 A（必须遵守）
 
 - 每条连接在 accept 时绑定到 `IoCtxPool` 中一个**单线程** `io_context`。
-- 该连接上的引擎、writer、handler 全部只在这一个线程执行。
-- 因此 `engine/` 下**没有 mutex / atomic**（唯一例外见下）。
-- `ResponseWriter` / `WebSocket` / `Body` **只能在连接 executor 所在线程使用**。
-  `require_owner_thread` 检测到跨线程调用会 `SIMPLE_HTTP_ERROR_LOG` 记录并 `abort`，
-  这是刻意的契约检查：库对象没有跨线程同步。需要换线程时调用方显式
-  `asio::post(req->executor(), ...)`，不要依赖库内的 hop——完成处理器可能把调用方
-  协程恢复到工作线程，造成隐式换线程。各层 sink 仍保留防御性的 hop。
-- Handler 都在连接 executor 上 `co_spawn`；请求体消费钩子也 post 回该 executor。
-
-刻意的跨连接共享例外（都在 handler 层，不在 `engine/`）：
-
-- `RateLimiter` 的按 key 分桶加锁。
-- `Router` 惰性构建中间件链的 atomic + mutex。
-- 日志 sink 的 `atomic<shared_ptr<LogSink>>` 安装。
-- `WebSocket::is_open()` 是唯一不 hop 的状态读取，因此 `m_open` 是 `atomic<bool>`。
-- QUIC 路径的 `quic/endpoint.h` 中 `m_send_wake` 使用 `concurrent_channel`（与 h3
-  其他无锁 channel 的约定不一致，修改时注意）。
-- h3 的连接 executor 就是 endpoint 的 executor；`reuse_port` 默认开启，否则一个
-  QUIC 监听的所有连接会挤在一条线程上。
+- 该连接上的引擎、writer、handler、`Body`、`WebSocket` 全部只在这一个线程执行。
+- 因此 `engine/` 下没有 mutex/atomic 保护连接状态。
+- `ResponseWriter` / `Body` / `WebSocket` 的 `require_owner_thread` 检测到跨线程
+  调用会记录 error 并 `abort`。需要换线程时调用方显式
+  `asio::post(req->executor(), ...)`；不要依赖库内 hop 把调用方协程恢复回来。
+- 刻意的跨连接共享例外（都在 handler 层，不在 `engine/`）：
+  - `RateLimiter` 按 key 分桶加锁；
+  - `Router` 惰性构建链的 atomic + mutex；
+  - 日志 sink 的原子替换；
+  - `WebSocket::is_open()` 的 atomic 状态；
+  - `Server` 的连接计数、lifecycle registry、core 指针快照；
+  - `MemorySessionStore` / `CookieJar` 的内部 mutex。
 
 ### 3.3 反压
 
-- HTTP/2 请求体**按流停放**：某条流消费不过来时只暂停该流，不能暂停整条连接。
-- `END_STREAM` 在停放期间到达时记 `finish_pending`，排空后再 `body().finish()`。
-- WebSocket 有**有界入站读泵**：应用在写被零窗口挡住时，socket 仍被读取进有界队列；
-  队列满则停止读取，`read()` 腾出空间后恢复。
-- 流式响应走写泵；写操作本身提供反压。
-- 所有大小入口都有上限：`max_header_bytes`、`max_body_bytes`、
-  `h2_max_header_list_size`、`ws_read_ahead_bytes`。
+- HTTP/2 请求体**按流停放**：某条流 channel 满时只暂停该流，其他流继续。
+- 停放期间到达的 `END_STREAM` 记 `finish_pending`，排空后再 `body().finish()`。
+- HTTP/2 响应输出高/低水位：1 MiB / 256 KiB；写循环每轮最多 framed 256 KiB。
+- HTTP/3 用 **`out_bytes`（未 ACK 的 enqueued 字节）** 做反压，不是
+  `out_write - out_ack`。
+- WebSocket 有**有界入站读泵**：`m_inbox` 上限来自
+  `EngineLimits::ws_read_ahead_bytes`（默认 4 MiB）。
+- h1 请求体是 pull 模式：handler 不读，socket 就不读。
+- 所有入口都有上限：`max_header_bytes`、`max_body_bytes`、
+  `h2_max_header_list_size`、`ws_read_ahead_bytes`、SSE 行长、multipart part 大小。
 
 ### 3.4 生命周期与所有权
 
-- Engine 由 `shared_ptr` 持有，handler 协程捕获它，确保 handler 存活期间引擎不被销毁。
+- 引擎用 `shared_ptr` 持有；handler 捕获它，保证 handler 存活期间引擎不析构。
 - h2 sink 持 `weak_ptr` 到引擎，每次操作 `lock()`；引擎销毁后返回错误而不是 UAF。
-- WebSocket 写泵持 `shared_ptr` 到 backend；只要还有写在飞，transport/TLS 流就不会
-  析构。watchdog 只持 `weak_ptr`。
-- WebSocket 读泵 likewise 持 backend 引用，终止统一走 `stop_inbox()`；
-  `~WebSocket` / `abort()` 会关闭 transport，解开卡在 `async_read_some` 的 reader。
+- WebSocket 写泵持 `shared_ptr` 到 backend；`~WebSocket` 调 `abort()`，
+  防止 detached 写泵永久持有 backend。
+- WebSocket reader 持有 backend 引用，终止统一走关闭逻辑；`abort()` 关闭 transport
+  以解开卡在 `async_read_some` 的 reader。
 - `Server::stop()` 有界等待已进入 handler 的请求（`shutdown_grace`），然后关闭剩余
   连接并停止 I/O 池。不要从信号处理函数里直接调用 `stop()`。
+- 异步回调不得持裸 `this`；`Client` 用 `keep_alive()` 捕获（堆对象共享所有权，
+  栈对象是非拥有别名，依赖 awaitable 契约）。
 
-### 3.5 错误处理约定
+### 3.5 错误处理
 
-- 可失败操作返回 `std::expected<T, error_code>`；客户端失败从不抛异常。
-- 服务端 handler 抛出 `std::exception` 时由调用层转成 500；若响应头已发出则关闭连接。
-- `ResponseSink` 的写操作返回 `[[nodiscard]] awaitable<error_code>`。
-- 解析错误要区分：请求头过大 431、请求体过大 413、协议错误按版本返回 400 /
-  RST_STREAM / GOAWAY。
+- 同步可失败 API 返回 `result<T>` / `error_code`；异步失败通过 completion 的
+  `error_code`。
+- 客户端失败从不抛异常；TLS 配置等启动期错误可能抛 `std::runtime_error`。
+- 服务端 handler 抛 `std::exception`：未开始响应 → `reset_for_error()` + 500；
+  已开始 → `async_close()`。
+- 协议错误要区分：请求头过大 431、请求体过大 413、协议错误按版本返回 400 /
+  RST_STREAM / GOAWAY / h3 reset。
 
 ### 3.6 日志
 
 - 库只定义 `LogSink`（`enabled(level)` + `log(record)`），不依赖第三方日志库。
-- `set_log_sink` 使用原子替换，运行中安全；`enabled()` 在格式化之前询问。
+- `LogRecord` 有 `level/category/source_location/message/attrs`；`Attr` 的字符串
+  只在 sink 调用期间有效，`LogFields` 的值由调用方拥有。
+- `set_log_sink` 原子替换；`enabled()` 在格式化之前询问。
 - 编译开关：`SIMPLE_HTTP_ENABLE_LOG`（默认 1）、`SIMPLE_HTTP_LOG_ACTIVE_LEVEL`。
-- `access_log()` 输出结构化字段；`make_json_sink` 是内置 JSON lines sink。
+- `middleware::access_log()` 输出结构化字段；`LogFields` 会合并进 access 记录。
 
 ---
 
@@ -272,174 +274,211 @@ transport（TCP / TLS / QUIC 字节流）
 
 ```cpp
 ServerConfig cfg;
-cfg.listen = InetAddress{"0.0.0.0", 7788, false}; // 或 UnixAddress{"/run/app.sock"}
+cfg.listen = InetAddress{"0.0.0.0", 7788};
 cfg.worker_threads = 4;
-cfg.max_connections = 0;      // 0 = 不限；到上限用内核 backlog 背压
-cfg.reuse_port = true;        // 每个 worker 一个 acceptor
+cfg.max_connections = 0;          // 0 = 不限；到上限留在内核 backlog
+cfg.reuse_port = true;
 cfg.tcp_nodelay = true;
-cfg.plaintext_protocols = PlaintextProtocols::Both; // Http1 / Http2 / Both
+cfg.plaintext_protocols = PlaintextProtocols::Both;
 cfg.shutdown_grace = std::chrono::milliseconds{5000};
 cfg.limits = EngineLimits{};
 
 Server server{cfg};
 server.route(...);
 server.use(...);
-auto started = server.start(); // expected<StartReport, StartupError>
+auto started = server.start();    // result<StartReport, StartupError>
 server.stop();
 ```
 
 - `start(StartPolicy)`：`AllOrNothing`（默认）或 `BestEffort`。
-- `run()` 是 `start()` 的 awaitable 包装，不驱动事件循环。
-- 多监听：`cfg.listeners`，或
-  `server.listen(InetAddress{...}).plaintext(...).tls(...).alpn(...)`。
-- `Server::router()` 可共享给多个 `Server`。
-- 观测：`port()`、`quic_port()`、`active_connections()`、`active_requests()`。
+- 多监听：`cfg.listeners`，或 `server.listen(TcpListenerConfig{...})`。
+- 每个 listener 可带自己的 `EngineLimits`、`max_connections`、`tls`、
+  `plaintext`、`alpn`、`socket_setup`、`listener_setup`。
+- `Server::start()` 自己启动线程；没有 `run()` / `join()`。
+- 观测：`port()`、`quic_port()`（h3）、`active_connections()`、`active_requests()`。
+- `UnixAddress` 会被拒绝（`server_errc::invalid_config`）。
+
+`PlaintextProtocols` 与内部 listener 策略的映射：
+
+| 公开值 | 内部行为 |
+|---|---|
+| `Http1` | 纯 HTTP/1.x |
+| `Http2` | h2 prior knowledge |
+| `Both` | 嗅探 preface；非 h2 走 h1，并允许 `Upgrade: h2c` |
+| `TcpListenerConfig::plaintext = Http1WithH2cUpgrade` | 纯 h1 + h2c Upgrade |
+
+TLS 监听永远不允许 h2c Upgrade；协议由 ALPN 决定。`TlsHttp::Http2Only` 在没有
+h2 ALPN 时关闭连接，不回退 h1。
 
 ### 4.2 Handler / Middleware / Router
 
 ```cpp
 using RequestPtr  = std::shared_ptr<Request>;
 using ResponsePtr = std::shared_ptr<ResponseWriter>;
+using HandlerCompletion = asio::any_completion_handler<void()>;
+using CallbackHandler =
+    std::function<void(RequestPtr, ResponsePtr, SslHandle, HandlerCompletion)>;
 
-// awaitable<void>(RequestPtr, ResponsePtr)
-// awaitable<void>(RequestPtr, ResponsePtr, SslHandle)
-// awaitable<void>(RequestPtr, shared_ptr<WebSocket>)
+#if defined(BOOST_ASIO_HAS_CO_AWAIT)
+using CoroHandler = std::function<asio::awaitable<void>(RequestPtr, ResponsePtr, SslHandle)>;
+using Handler = std::variant<CallbackHandler, CoroHandler>;
+#else
+using Handler = CallbackHandler;
+#endif
 ```
 
-中间件（C++20 构建两种形状都可用；C++17 只有回调式）：
+`make_handler` 接受：
+
+- 已构造的 `Handler`；
+- `(RequestPtr, ResponsePtr[, SslHandle]) -> void`；
+- `(RequestPtr, ResponsePtr[, SslHandle], HandlerCompletion) -> void`；
+- C++20：`(RequestPtr, ResponsePtr[, SslHandle]) -> asio::awaitable<void>`。
+
+中间件：
 
 ```cpp
-using Next = CallbackHandler; // void(RequestPtr, ResponsePtr, SslHandle, HandlerCompletion)
+using Next = CallbackHandler;
 using Middleware =
     std::function<void(RequestPtr, ResponsePtr, SslHandle, Next, HandlerCompletion)>;
 #if defined(BOOST_ASIO_HAS_CO_AWAIT)
 using CoroNext = std::function<asio::awaitable<void>(RequestPtr, ResponsePtr, SslHandle)>;
+using CoroMiddleware =
+    std::function<asio::awaitable<void>(RequestPtr, ResponsePtr, SslHandle, CoroNext)>;
 #endif
 ```
 
 - `use()` / `make_middleware()` 接受回调式或协程式；`make_middlewares(...)`
-  用于 `group()` / `route()` / `ws_route()` 的 `std::vector<Middleware>` 参数混合两种形状。
-- 协程式内部用 `asio::async_initiate` 把 `Next` 适配成 awaitable，保留 associated
-  executor / allocator / cancellation slot。
-- Router 仍然是运行时注册表，内部统一为 type-erased `Middleware`；不要把链模板化。
-
+  用于 `group()` / `route()` / `ws_route()` 的 `std::vector<Middleware>` 参数。
 - `use()` 按注册顺序嵌套，最外层先跑；CORS 始终最外层。
 - `group(prefix, mws, registrar)`：前缀 + 组中间件，可嵌套。
 - per-route middleware 只包该路由。
 - `req->set_state<T>()` / `get_state<T>()`：按类型键，last-set-wins。
 
-内置中间件（除注明外均在 `simple_http::middleware`）：
+内置中间件（`simple_http::middleware`）：
 
 `request_id()`、`access_log()`、`recovery()`、`basic_auth(user, pass)`、
-`real_ip(trusted)`、`clean_path()`、`strip_prefix(prefix)`、`redirect_slashes()`、
-`ws_origin(allowed, allow_missing=false)`、`timeout(d)`、`compress(cfg)`、
-`decompress_request(cfg)`（opt-in 请求体解压）、`secure_headers(cfg)`、
-`rate_limit(bucket)`、`rate_limit(limiter, key_fn)`；
-`simple_http::make_cors_middleware(cfg)` 在顶层命名空间。
+`real_ip(trusted)`、`clean_path()`、`strip_prefix(prefix)`、
+`redirect_slashes()`、`ws_origin(allowed, allow_missing=false)`、
+`timeout(d)`、`compress(cfg)`、`decompress_request(cfg)`、
+`secure_headers(cfg)`、`rate_limit(bucket)`、`rate_limit(limiter, key_fn)`、
+`session(store, cfg)`、`csrf(cfg)`、`jwt(cfg)`、`require_scope(scope)`、
+`require_role(role)`；CORS 用 `simple_http::make_cors_middleware(cfg)` 或
+`Server::cors(cfg)`。
 
-路由匹配顺序：
+路由匹配顺序（`Router::dispatch_impl`）：
 
-1. 精确路径（方法感知）
-2. `{param}` 模板 trie
-3. 本地正则
-4. HTTP 反代路由
-5. 静态文件
-6. fallback
-7. 内建 404
+1. Host 子 Router（命中后父 Router 的其余阶段都不参与）
+2. 精确路径（方法感知）
+3. `{param}` 模板 trie（含末尾 `{*rest}`）
+4. 本地正则（第一个匹配）
+5. HTTP 反代（精确后正则）
+6. 静态文件阶段
+7. fallback
+8. 内建 404
 
 隐式规则：
 
-- `any_methods`（空列表）= 任意方法，含扩展方法 token。
-- GET 隐含 HEAD；GET 响应体由 writer 抑制。
-- 路径存在、方法不符 → 405 + `Allow`；OPTIONS 自动 204 + `Allow`。
-- 路径不存在 → 404 / fallback。
-- 405 / 自动 OPTIONS 是普通 keep-alive 响应，引擎会 drain 未读请求体。
-- WebSocket 查找：本地精确 ws → ws 反代 → 本地正则 ws。
-- CORS 不覆盖 WebSocket 升级，使用 `ws_origin()`。
-- 空 `allow_origins` + `allow_credentials=true` 是 fail-closed（不发 CORS 头）；
-  需要携带凭据的跨域必须显式 allowlist（或 `"*"`，表示仍镜像 Origin）。
+- 路径被 exact/template/regex 认领但方法不符：立即 405 + `Allow`，`OPTIONS`
+  自动 204 + `Allow`；不会继续落到 proxy/static/fallback。
+- GET 隐含 HEAD；注册 GET 不占用 HEAD 槽，显式 HEAD 可以后注册并优先。
+- 空 methods = 任意方法，含扩展 token；显式注册 `Method::Unknown` 被拒绝。
+- `Allow` 始终包含 `OPTIONS`。
+- WebSocket 查找顺序：本地 ws exact → ws 反代 → 本地 ws regex。
+- `static_files` 不能在 group 内注册；带 middleware 的 group 拒绝 `ws_proxy`；
+  `http_proxy` 会继承 group middleware。
+- Host 只作用于 HTTP dispatch；WebSocket 查找仍 host-agnostic。
 
-### 4.3 框架层（State / Extractor / Validation / Auth）
+### 4.3 框架层
 
 ```cpp
-// 共享应用状态：按类型键，shared_ptr 共享，不按请求复制；start() 前注册。
 server.state(std::make_shared<AppState>(...));
 const AppState *st = req->app_state<AppState>();
 
-// 类型化提取器：失败自动 400/422/500，不进入 handler。
 server.route({Method::Post}, "/users/{id}",
     extract<Path<UserParams>, Valid<Json<CreateUser>>>(
         [](const UserParams &p, CreateUser in, RequestPtr req, ResponsePtr res)
             -> asio::awaitable<void> { ... }));
-
-// 校验：为类型特化 Validator<T>；失败 422，details 是字段错误数组。
-template <> struct simple_http::Validator<CreateUser> { ... };
-
-// Session / CSRF / JWT（均在 simple_http::middleware）。
-server.use(middleware::session(store, SessionConfig{...}));
-server.use(middleware::csrf(CsrfConfig{...}));
-server.use(middleware::jwt(JwtConfig{.algorithms = {"RS256"}, .public_key_pem = pem, ...}));
-server.use(middleware::require_scope("users:write"));
-
-auto *s = session(*req);       // Session*（middleware 未挂载时为 nullptr）
-const Principal *p = principal(*req);
 ```
 
 - `extract<...>` 返回普通 `Handler`，不影响 route/group/middleware/OpenAPI。
-- 同一次提取最多一个 body 提取器（`Json`/`Form`）。
-- `SessionStore` 使用 `any_completion_handler` 完成回调；`load` 返回 `optional<SessionData>`，
-  `save` 按值接收 `SessionData`（异步存储可安全保留），`MemorySessionStore` 带锁，Redis/DB
-  适配器放消费侧。
-- JWT 强制算法 allowlist，拒绝 `none`；`exp` 默认必填；JWKS 支持静态/手动拉取文档
-  （RSA/EC/oct，按 `kid` 选），不做签发/OAuth2/OIDC。
-- Host 路由：`server.host(pattern, registrar)`；`*.example.com` 不匹配裸域或
-  `evil-example.com`。Host 子 Router 共享 state，但 WebSocket 查找仍 host-agnostic，
-  OpenAPI 文档也各自独立。
-- 通配路径：`/files/{*rest}` 只能作为最后一段，捕获剩余路径（含 `/`）。
+- 提取值按模板参数顺序放在 handler 参数最前面，然后才是 `RequestPtr`、
+  `ResponsePtr`、可选 `SslHandle`、可选 `HandlerCompletion`。
+- 同一次提取最多一个 body extractor（`Json` / `Form`）。
+- `Validator<T>` 的实际形状是
+  `static ValidationResult validate(const T&)`，**不是** `std::expected`。
+  `ValidationResult` 有 `.errors`、`has_value()`、`operator bool`、`error()`。
+- 校验辅助：`required_field`、`min_length`、`max_length`、`range`、`one_of`、
+  `push_if`、`field_errors_json`。
+
+glaze 门控：
+
+- `Path` / `Query` / `Json` / `Form` 的 `Extractor` 特化在
+  `SIMPLE_HTTP_HAS_GLAZE` 内；plain C++17 下这些类型不能实际使用。
+- `State<T>`、`Valid<E>` 不受门控。
+- `Header<T, "name">` / `Cookie<T, "name">` 需要 C++20 class-type NTTP。
+- JWT/JWKS 与 OpenAPI 整体在门控内。
+
+Session / CSRF / JWT：
+
+- `SessionStore::load/save/destroy` 使用 `any_completion_handler`，`save` 按值
+  接收 `SessionData`；`MemorySessionStore` 加锁，达到上限时删除
+  `unordered_map::begin()`（不是严格 LRU）。
+- `SessionConfig` 默认：`cookie_name="sid"`、`path="/"`、`same_site="Lax"`、
+  `secure=true`、`http_only=true`、`rolling=true`、`max_age=86400s`；没有 domain 字段。
+- CSRF 是 header 型 double-submit（默认 `x-csrf-token`），只检查 header，
+  不读取表单字段；safe 方法：GET/HEAD/OPTIONS/TRACE。
+- JWT 只支持 HS256/RS256/ES256，拒绝 `alg: none`，默认 `require_exp=true`；
+  `aud` 是单字符串；不做签发、OIDC discovery 或后台 JWKS 刷新。
 
 ### 4.4 Request / ResponseWriter / Body
 
 ```cpp
 req->method(); method_token(); version(); target(); path(); query();
 req->query_params(); req->param("id"); req->header("host"); req->headers();
-req->cookie("session"); req->peer_address(); req->body();
-req->set_state<T>(...); req->get_state<T>();
-req->cancel(); req->cancelled(); req->wait_cancelled();
+req->trailers(); req->cookie("session"); req->peer_address();
+req->body(); req->executor(); req->cancellation_slot();
+req->cancel(); req->cancelled();
+req->set_state<T>(...); req->get_state<T>(); req->app_state<T>();
 ```
-
-`path()` 是 target 的原始 path 部分；需要解码/规范化时用 `clean_path()`。
 
 读体：
 
 ```cpp
-auto all = co_await req->body().read_all();  // expected<string, error_code>
-for (;;) {
-    auto frame = co_await req->body().read();
-    if (!frame || frame->eof) break;
-    use(frame->data);
-}
+req->body().async_read(token);      // void(error_code, ReadResult)
+req->body().async_read_all(token);  // void(error_code, std::string)
 ```
+
+`ReadResult{data, eof}` 显式区分 EOF 与空 chunk。`Body::feed(std::string&&)`
+返回 false 时参数保持原样，调用方可重试；`finish()` / `fail()` 不可丢，
+channel 满时用 out-of-band pending 状态。
 
 响应：
 
 ```cpp
-co_await res->status(status::ok).content_type("text/plain").send("hello"); // 一次性
-co_await res->status(status::ok).begin();                                 // 流式
-co_await res->write("chunk");
-co_await res->finish();
+res->status(200).content_type("text/plain");
+res->async_send("hello", token);        // one-shot
+res->async_begin(token);                // streaming
+res->async_write("chunk", token);
+res->async_finish("last", token);
 ```
 
-其它：`header` / `replace_header`、`redirect`、`set_cookie`、`sse_begin` /
-`sse_event` / `sse_comment`、`trailer` + `finish_trailers`、`send_continue`、
-`send_bodyless`、`connected()`、`close()`、`version()`。
+其它：`header` / `replace_header` / `redirect` / `set_cookie` /
+`async_sse_begin` / `async_sse_event` / `async_sse_comment` /
+`trailer` + `async_finish_trailers` / `async_send_continue` /
+`async_send_bodyless` / `async_connected` / `async_close` / `version()`。
 
-`send()` 自动补 `Date`、`Server`、`Content-Type`（204/304 不补 Content-Type）；
-引擎会剥离 handler 设置的 hop-by-hop 字段（connection / keep-alive /
-transfer-encoding / proxy-connection / upgrade）。
+规则：
 
-一个 `ResponseWriter` 只发送一个响应头：`send()` / `send_bodyless()` / `begin()`
-共享 `m_started` 检查，第二次调用返回 `invalid_argument`。`set_cookie()` 按
-RFC 6265 校验 name/value/属性，非法时与 `header()` 一样置 `m_field_rejected`。
+- 一个 `ResponseWriter` 只发送一个响应头；`send` / `send_bodyless` / `begin`
+  共享 `m_started` 检查，第二次返回 `invalid_argument`。
+- `status()` 拒绝 100..599 之外的值。
+- `header()` / `set_cookie()` / `trailer()` 做 token、控制字节、cookie-octet
+  校验；非法字段置 `m_field_rejected`，最终写失败。
+- `async_send_bodyless` 只允许 HEAD / 204 / 304。
+- `async_begin` 拒绝 204 / 304 和 1xx。
+- `async_send` 自动补 `Date`、`Server`、`Content-Type`（204/304 不补
+  Content-Type）；引擎剥离 handler 设置的 hop-by-hop 字段。
+- SSE helper 会对 event/id/retry 中的 CR/LF/NUL 做替换，防止注入。
 
 ### 4.5 WebSocket
 
@@ -447,71 +486,78 @@ RFC 6265 校验 name/value/属性，非法时与 `header()` 一样置 `m_field_r
 server.ws_route("/chat",
     [](RequestPtr, std::shared_ptr<WebSocket> ws) -> asio::awaitable<void> {
         for (;;) {
-            auto msg = co_await ws->read();
+            auto msg = co_await ws->async_read(asio::use_awaitable);
             if (!msg) break;
-            if (co_await ws->write(msg->data, msg->text)) break;
+            co_await ws->async_write(msg->data, msg->text, asio::use_awaitable);
         }
     });
 ```
 
-- `read()` 返回 `expected<WsMessage, error_code>`，自动重组分片、Ping→Pong、
-  收到 Close 回 Close。
-- `write` / `write_text` / `write_binary` 按值收 payload；
-  `write_view` / `*_view` 借用调用方缓冲，必须在 co_await 完成前保持有效。
-- 写操作经内部写泵串行化。
-- 读泵懒启动于首次 `read()`，socket 读取由独立 reader 持续排空进有界 `m_inbox`；
-  队列上限来自 `EngineLimits::ws_read_ahead_bytes`（默认 4 MiB）。
+- `async_read` → `void(error_code, WsMessage)`，自动重组分片、Ping→Pong、
+  收到 Close 回 Close、文本增量 UTF-8 校验。
+- `async_write_text` / `async_write_binary` 按值收 payload；
+  `async_write_text_view` / `async_write_binary_view` / `async_write_view`
+  借用调用方缓冲，必须在操作完成前保持有效。
+- 写操作经内部写泵串行化；读泵在首次 `read()` 时懒启动，socket 读取由独立
+  reader 持续排空进有界 `m_inbox`。
 - 协议错误 / Close / 非法 UTF-8 由 reader 记下关闭码，但 Close 帧要等应用下次
   `read()` 排空缓存后才发出（`flush_deferred_close`）。
+- 服务端支持 h1 Upgrade 与 h2 extended CONNECT；h3 不支持。
+- `EngineLimits::ws_compression` 默认 false；客户端不协商 permessage-deflate。
+- 客户端只用 HTTP/1.1 Upgrade（`Client::async_open_websocket`）。
 
 ### 4.6 Client
 
 ```cpp
-Client http{executor, ClientConfig{}};
+Client client{executor, ClientConfig{}};
 
-auto r = co_await http.get(url).send();
-auto r2 = co_await http.post(url).json(obj).bearer_auth(token).send();
-auto up = co_await http.open_stream(url, {.method = Method::Post});
-auto ws = co_await http.open_websocket("wss://host/chat");
+auto r = co_await client.get(url).send(asio::use_awaitable);
+auto r2 = co_await client.post(url).content_type("application/json")
+                       .body(json).bearer_auth(token)
+                       .send(asio::use_awaitable);
+
+auto s = co_await client.async_open_stream(url, StreamSpec{.method = Method::Post}, 0,
+                                           asio::use_awaitable);
+auto ws = co_await client.async_open_websocket("wss://host/chat", WebSocketSpec{},
+                                               asio::use_awaitable);
 ```
 
 - `get` / `post` / `put` / `del` / `head` / `patch` / `request`。
-- `RequestBuilder`：`query`、`header(s)`、`content_type`、`body`、`json<T>`、
-  `multipart`、`basic_auth`、`bearer_auth`、`max_body_bytes`、`timeout`、`version`。
-- `send()` 返回缓冲 `Response`，应用重定向 / Cookie / 重试 / 自动解压。
-- `open_stream()` / `send_stream()` 是显式流，**不**自动跟随重定向、不应用 Cookie、
-  不跑便捷层重试；自动解压仍生效（与 Go 的 `Response.Body` 一致）。
-- 自动解压对齐 Go `Transport`：`auto_decompress` 默认 true，默认只广告/解码 gzip；
-  调用方显式设置 `Accept-Encoding`、HEAD、带 Range 时不注入也不解码。br 需显式
-  `accept_encodings = {"br","gzip"}`。解压后删除 `Content-Encoding`/`Content-Length`
-  并置 `Response::uncompressed()`；解压装饰器会把请求 `finish_trailers()` 转发给内层。
-- `Response`：`status`、`version`、`headers`、`header` / `header_owned`、`ok`、
-  `bodyless`、`uncompressed`、`error_for_status`、`text` / `bytes` / `json<T>`、
-  `read` / `read_all`。
-- `Stream`：`write` / `finish`、`read_head`、`read` / `read_all`、`trailers`、
-  `abort`；`read()` 受 body-idle 预算约束，`read_all()` 不套该 deadline。
+- `RequestBuilder`：`query`、`header(s)`、`content_type`、`basic_auth`、
+  `bearer_auth`、`body`、`max_body_bytes`、`timeout`、`version`、`send`。
+  **没有** `.json(...)` 便捷方法。
+- `send()` 返回缓冲 `Response`，应用重定向 / Cookie / 状态码重试 / 自动解压。
+- `async_open_stream()` 是显式流：**不**跟随重定向、不应用 Cookie、不重试；
+  自动解压仍生效。
+- `Response`：`status`、`version`、`headers`、`header` / `header_owned`、
+  `ok`、`bodyless`、`uncompressed`、`error_for_status`、`text` / `bytes`、
+  `async_read_all`。`text()` 与 `bytes()` 是同一个字符串。
+- `Stream`：`async_write` / `async_finish` / `async_finish_trailers` /
+  `async_read_head` / `async_read` / `async_read_all` / `async_ensure_continue` /
+  `head()` / `trailers()` / `finished()` / `abort()`。
 - 客户端绑定单线程 executor（模型 A）；`io_context` 必须活过会话。
-- 单连接模型：对第一个 origin 保持一条连接（h1 FIFO 门 / h2 多路复用），其他
-  origin 使用一次性连接。
-- 免费透明重拨：打开阶段与读响应阶段各一次；策略重试由 `ClientConfig::retry` 控制。
-  状态码重试默认关闭（`retry_statuses` 为空，与 Go/reqwest 一致）；显式设 `{429, 503}` 后支持 `Retry-After`。
-- 流式上传：`MultipartStreamWriter`（field/file/file_data）与 `stream_file_body`。
-- 自动 100-continue：`StreamSpec::auto_expect_continue`；h1/h2 等待 interim，h3 直接
-  发 body。最终拒绝返回 `client_errc::expectation_failed`。
-- 请求 trailers：`Stream::finish_trailers()`，h1 chunked 终止符 / h2 trailing HEADERS；
-  h3 返回 `trailers_not_supported`。服务端 `req->trailers()` 在 h1/h2 暴露。
+- 单连接模型：对第一个 origin 保持一条连接（h1 FIFO / h2 多路复用），其他
+  origin 使用一次性连接。`Client::close()` 关闭缓存会话。
+- 自动解压对齐 Go：`auto_decompress=true` 且只广告 gzip；调用方显式设置
+  `Accept-Encoding`、HEAD、带 Range 时不注入也不解码。br 需显式
+  `accept_encodings={"br","gzip"}`。
+- 状态码重试默认关闭（`retry_statuses` 为空）；显式设置后按 429/503 +
+  `Retry-After` 重试。`RetryPolicy::condition` / `require_replayable` 当前**未使用**。
+- 明文 + `HttpVersionPolicy::Http2` 走 prior knowledge；`H2cMode::Upgrade`
+  当前**未接线**。
+- HTTP/3 只在 `SIMPLE_HTTP_ENABLE_HTTP3` 下可用，且必须显式
+  `HttpVersionPolicy::Http3` + `https://`；不支持代理、请求 trailers、1xx。
 
 ### 4.7 数据与 OpenAPI
 
 ```cpp
-read_urlencoded_body(req)         // expected<QueryParams, error_code>
-read_multipart_body(req)          // expected<vector<MultipartPart>, error_code>
-read_multipart_stream(body, boundary, cb)
-read_json_body<T>(req)            // expected<T, error_code>
-write_json(res, value, status)
-path_params<T>(req) / query_params<T>(req) / parse_params<T>(q)
-write_error(res, status, JsonError{...})
-write_problem(res, status, ProblemDetails{...})
+async_read_json_body<T>(req, token);                 // void(error_code, result<T>)
+async_write_json(res, value, status, token);         // void(error_code)
+read_urlencoded_body(req, token);                    // void(error_code, QueryParams)
+read_multipart_body(req, token);                     // void(error_code, vector<MultipartPart>)
+read_multipart_stream(body, boundary, cb, token);    // void(error_code)
+async_write_error(res, status, JsonError, token);    // void(error_code)
+async_write_problem(res, status, ProblemDetails, token);
 ```
 
 OpenAPI：
@@ -520,19 +566,22 @@ OpenAPI：
 server.route({Method::Get}, "/pets/{id}", handler,
     openapi::doc()
         .path_params<PetParams>()
-        .response<Pet>()
+        .response<Pet>(200)
         .summary("get a pet")
         .operation_id("getPet")
-        .error<ErrorBody>(status::not_found, "no such pet"));
+        .error<ErrorBody>(404, "no such pet"));
 
 server.openapi().title("petshop").version("1.0.0");
 server.serve_openapi("/openapi.json");
 server.serve_swagger_ui("/swagger", "/openapi.json");
 ```
 
-- 文档按路由级 `openapi::doc()` 元数据收集；没写描述的路由不进文档。
+- 文档按路由级 `openapi::doc()` 元数据收集；没有描述的路由不进文档
+  （`NoDoc`）。
 - 路径模板 `{name}` 必须等于 `path_params<T>` 的字段名，注册时校验。
-- 无开关宏；glaze 是主库常规依赖。
+- `route_regex` 没有 `Doc` 参数，正则路由不能附 OpenAPI descriptor。
+- `verify_openapi()` 只检查 exact/template，不检查 regex/proxy/static。
+- Swagger UI 使用 CDN，不打包本地资源。
 
 ---
 
@@ -542,67 +591,80 @@ server.serve_swagger_ui("/swagger", "/openapi.json");
 
 - 手写解析器（`engine/h1/h1_parser.h`），不依赖 beast。
 - 只接受 `HTTP/1.0` / `HTTP/1.1` 请求行。
-- 请求体 framing：chunked / Content-Length / 无。
-- 响应 framing：一次性 Content-Length；流式在 HTTP/1.1 用 chunked，
+- 请求 framing：chunked / Content-Length / 无；HTTP/1.0 不接受 chunked。
+- 响应 framing：一次性 Content-Length；流式 HTTP/1.1 用 chunked，
   HTTP/1.0（以及 HEAD）用 close-delimited。
-- HTTP/1.1 默认 keep-alive，HTTP/1.0 默认 close；`Connection` 头可覆盖。
-- 请求目标按 RFC 9112 规范化：absolute-form 归约为 origin-form，CONNECT 保留
-  authority-form；普通请求目标不是 origin-form 时 400。
-- 严格拒绝 CL + TE、重复/非法 Content-Length 等双 framing。
-- `Expect: 100-continue` 懒发或显式发，最多一次。
-- 升级：WebSocket、h2c Upgrade（101 后重放 stream 1）。
+- 严格拒绝 CL + TE、重复/非法 Content-Length、HTTP/1.0 + TE、
+  不支持的 transfer coding（501）、重复 chunked。
+- `Expect: 100-continue` 仅 HTTP/1.1；惰性发、最多一次；最终响应已开始时不再发 100。
+- 请求 trailers：chunked 终止符 `0\r\n<fields>\r\n`；每个消息重置 trailer 字节预算。
+- body 用 pull provider；handler 返回后 drain 未读 body 以复用连接。
+- 升级：WebSocket、h2c Upgrade（101 后把原请求重放为 stream 1）。
+- h1 的响应字节和 WebSocket 101 都经每连接一个 `SerializedWriter`。
 
 ### 5.2 HTTP/2
 
-- 帧层、HPACK（静态表 / Huffman / 解码 / 编码）全部手写，不依赖 nghttp2。
+- 帧层、HPACK 全部手写，不依赖 nghttp2。
 - `read_loop || write_loop || watchdog`，连接状态只在单连接 executor 上。
-- 支持 SETTINGS、PING、RST_STREAM、GOAWAY、WINDOW_UPDATE、CONTINUATION、padding；
+- SETTINGS、PING、RST_STREAM、GOAWAY、WINDOW_UPDATE、CONTINUATION、padding；
   PRIORITY 只作建议；客户端发 PUSH_PROMISE 是 PROTOCOL_ERROR。
-- 响应 trailers 用带 END_STREAM 的尾部 HEADERS。
-- 一次性响应**不发 Content-Length**（END_STREAM 界定），HEAD 例外。
-- RFC 8441 extended CONNECT（`:protocol: websocket`）默认开启，服务端支持。
-- 请求字段校验（§8.2.1/§8.3.1）：普通字段名必须是 token；`:method` 必须是 token；
-  `:path` 必须是 origin-form 或 `*` 且不含 `#`/SP；`host` 重复或与 `:authority`
-  不一致是流级 PROTOCOL_ERROR，一致时以 `:authority` 为准。
-- 响应 `send_bodyless` 对 204/1xx 剥离 handler 设置的 `content-length`（304 保留）。
+- 请求在 END_HEADERS 后即 dispatch，handler 与后续 DATA 并发。
+- 请求字段校验（§8.2.1/§8.3.1）：普通字段名必须是 token；`:method` 必须是
+  token；`:path` 必须是 origin-form 或 `*` 且不含 `#`/SP；`host` 重复或与
+  `:authority` 不一致是流级 PROTOCOL_ERROR。
+- 响应 trailers：trailing HEADERS + END_STREAM；最后 DATA 不带 END_STREAM。
+- 一次性响应不发 Content-Length（END_STREAM 界定），HEAD 例外。
+- RFC 8441 extended CONNECT 默认开启（`h2_enable_connect_protocol`）。
 - Rapid Reset 防护：同时执行的 handler 上限 = `h2_max_concurrent_streams`；
   超出进 `h2_max_queued_streams` 队列；队列溢出 → `GOAWAY(ENHANCE_YOUR_CALM)`。
+- 关闭流按 RFC 9113 §5.1 三分法处理；固定 256 项 ring 记录关闭原因。
+- 不实现 server push。
 
 ### 5.3 HTTP/3
 
 - `#ifdef SIMPLE_HTTP_ENABLE_HTTP3` 整体门控。
-- 帧层、SETTINGS、GOAWAY、QPACK、blocked field sections、请求校验由 nghttp3 负责；
-  QUIC 由 ngtcp2 负责。本库只保留适配层。
-- 引擎实现 `quic::Protocol`，**没有写循环**；QUIC 连接负责拉数据。
+- 帧层、SETTINGS、GOAWAY、QPACK、blocked field sections、请求校验由 nghttp3
+  负责；QUIC 由 ngtcp2 负责。本库只保留适配层。
+- 引擎实现 `quic::Protocol`，没有自己的写循环；QUIC 连接负责拉数据。
 - 没有自己的 idle watchdog；使用 QUIC 协商的 idle timeout。
-- 服务端可 Alt-Svc 通告；支持连接迁移；0-RTT 可配置（默认关）。
-- 服务端 HTTP/3 不支持 WebSocket；`Expect: 100-continue` 是 no-op（nghttp3 无 1xx API）。
-- 缺少 `quic_transport_parameters` 的 ClientHello 按 RFC 9001 §8.2 关闭：
-  `CONNECTION_CLOSE 0x016d`（missing_extension）。OpenSSL 4 的 QUIC-TLS 与
-  `ngtcp2_crypto_ossl` 都不校验这个扩展，检查在本库的 `quic/connection.h`。
+- 请求在 headers 完成时 dispatch，不等 END_STREAM；每 stream 一个 handler。
+- Body channel 满时停放该流；END_STREAM 记 `finish_pending`。
+- 消费式流控：读走字节后回补 stream/connection offset；handler 提前返回时归还
+  未读 credit。
+- 服务端不支持 WebSocket；`Expect: 100-continue` 是 no-op；请求 trailers 不暴露。
+- 响应 trailers 支持。
+- 客户端不支持代理、请求 trailers、1xx；0-RTT 未启用。
+- 服务端可 Alt-Svc 通告；QUIC 缺 `quic_transport_parameters` 时按 RFC 9001
+  §8.2 关闭（`CONNECTION_CLOSE 0x016d`）。
 
 ### 5.4 WebSocket
 
 - 帧编解码手写（`proto/ws_frame.h`），transport 无关。
 - 服务端支持 h1 Upgrade 与 h2 extended CONNECT；h3 不支持。
-- permessage-deflate（RFC 7692）服务端可协商，`EngineLimits::ws_compression`
-  默认 false；客户端不协商。
+- permessage-deflate（RFC 7692）服务端可协商，默认 false。
 - 读泵 / 写泵 / 有界入站队列是防止「串行 read→write + 对端不读」死锁的关键。
+- 压缩帧在解压前不做 UTF-8 增量校验；空消息不压缩；mask key 必须来自 CSPRNG。
+- 64 位 payload 长度最高位必须为 0；部分帧 payload 只交付一次。
 
 ### 5.5 TLS / ALPN
 
 - 服务端 `TlsConfig::min_version` 默认 TLS 1.3；设 `Tls12` 同时接受 1.2；
   1.0/1.1 永不允许。
 - 服务端 TCP TLS ALPN 默认 `h2` + `http/1.1`；`h3` 只用于 QUIC。
+- `TlsHttp::Http2Only` 必须要求 ALPN 匹配（`require_alpn_match`），否则
+  握手成功但回退 h1；服务端在握手完成后发现没有 h2 会关闭连接。
 - 客户端 `TlsClientConfig::min_version` 默认 TLS 1.2。
 - mTLS：`mutual = true` + `ca_file`；handler 第三参数 `SslHandle` 可读对端证书。
 - HTTP/3 的 QUIC 自带 TLS 1.3，ALPN 固定 `h3`。
+- 所有 `ssl::context` 构造入口都必须先经过
+  `transport/openssl_init.h` 的 `ensure_openssl_initialized()`，避免多线程首次
+  并发 `SSL_CTX_new` 的 TSan race。
 
 ### 5.6 EngineLimits 默认值
 
 | 字段 | 默认 |
 |---|---|
-| `idle_timeout` | 120 s |
+| `idle_timeout` | 120 s（≤ 0 禁用） |
 | `max_header_bytes` | 64 KiB（431） |
 | `max_body_bytes` | 64 MiB（413）；0 = 不限制，h1/h2/h3 一致 |
 | `ws_read_ahead_bytes` | 4 MiB |
@@ -617,6 +679,8 @@ server.serve_swagger_ui("/swagger", "/openapi.json");
 | `h3_alt_svc` | true（仅 HTTP/3 构建） |
 | `h3_alt_svc_max_age` | 86400 |
 
+客户端 `ClientConfig::limits` 把 `h2_initial_window` 覆盖为 1 MiB。
+
 ---
 
 ## 6. 构建与运行
@@ -624,40 +688,49 @@ server.serve_swagger_ui("/swagger", "/openapi.json");
 ### 6.1 xmake（主构建）
 
 ```sh
+xmake f -m release
 xmake build -j 12
+
+xmake build -j 12 test_unit
+xmake build -j 12 fixture_conformance_server
+xmake build -j 12 diff_server_cpp
+xmake build -j 12 diff_openapi_server
 xmake run test_unit
-xmake run diff_openapi_server
-xmake run fixture_conformance_server
 ```
 
-- `xmake.lua`：`set_languages("c++23")`，与 CMake 接口一致；不要写成 `c++26`
-  （部分 xmake 版本不识别该值，会静默退回编译器默认标准，glaze 等 C++20 头直接编译失败）。
-- 全局 `-O2 -Wextra`，关闭少量 GCC 误报；目前没有把 warning 当 error。
-- 全局定义 `SIMPLE_HTTP_USE_BOOST_REGEX`。
-- `SIMPLE_HTTP_ENABLE_HTTP3` 只加在需要它的目标（`fixture_conformance_server`、
-  `diff_client_h3`、`diff_server_cpp`、`test_unit`）。
-- 包来自私有仓库 `fantasy-peak/xmake-repo`：上游 ngtcp2 包不产 OpenSSL crypto
-  helper，HTTP/3 需要私有仓库里的 `ENABLE_OPENSSL=ON` 构建。
-- 依赖锁：`package.requires_lock`、`package.librarydeps.strict_compatibility`。
-- `simple_http` 目标是 `set_kind("static")` 的空壳，只导出 include 和依赖。
+- `set_languages("c++23")`：库与测试默认按 C++23 编译；glaze 辅助因此可用。
+- `test_cpp17_smoke` 单独 `set_languages("c++17")`，验证 C++17 公共 API。
+- 全局 `-O2 -Wextra`，关闭少量 GCC 误报；全局定义
+  `SIMPLE_HTTP_USE_BOOST_REGEX`。
+- `SIMPLE_HTTP_ENABLE_HTTP3` 只加在需要它的目标
+  （`test_unit`、`fixture_conformance_server`、`diff_client_h3`、
+  `diff_server_cpp`）。
+- 依赖来自私有 xmake 仓库 `fantasy-peak/xmake-repo`；ngtcp2 必须是
+  `ENABLE_OPENSSL=ON` 构建。
+- 测试目标都是 `set_default(false)`，裸 `xmake build` 不会构建它们。
+- 测试目标 `set_rundir(".")`，因为 TLS 证书路径是
+  `./test/tls_certificates/...`。
 
-### 6.2 CMake
+### 6.2 CMake 的真实状态
 
 ```cmake
 find_package(simple_http CONFIG REQUIRED)
 target_link_libraries(app PRIVATE simple_http::simple_http)
 ```
 
-当前真实状态：
+当前 `CMakeLists.txt`：
 
-- `add_library(simple_http INTERFACE)`，`cxx_std_23`。
-- 版本从 `core/version.h` 读取，避免包版本漂移。
-- 链接 Boost、OpenSSL、ZLIB、Brotli、glaze。
-- **没有**链接 ngtcp2/nghttp3，所以 CMake 下游不会自动启用 HTTP/3。
-- `cmake/simple_httpConfig.cmake.in` 没有 `find_dependency(glaze)`，下游可能需要
-  自己 `find_package(glaze CONFIG REQUIRED)`。
-- 根目录的 `compile_commands.json` 可能是旧文件（曾显示 `-std=c++23`）；
-  以 `build/` 下 xmake 生成的文件与 `.deps` 里的实际 flags 为准。
+- `simple_http` 是 `INTERFACE` 目标，`cxx_std_23`；
+- 链接 Boost、OpenSSL、ZLIB、Brotli、glaze；
+- **没有** ngtcp2/nghttp3，也没有 `SIMPLE_HTTP_ENABLE_HTTP3`；
+- 另有一个 `simple_http_cpp17` INTERFACE 目标，指向
+  `${CMAKE_CURRENT_SOURCE_DIR}/cpp17/include`，但该目录**不存在**；
+  它也未被安装/导出；
+- `cmake/simple_httpConfig.cmake.in` 没有 `find_dependency(glaze)`，
+  尽管导出的 target 公开链接 `glaze::glaze`；
+- 没有 `enable_testing()` / `add_test()`。
+
+改 CMake 时要么把这些修好，要么在文档里明确标注，不要假装它们已经可用。
 
 ### 6.3 编译宏
 
@@ -665,10 +738,12 @@ target_link_libraries(app PRIVATE simple_http::simple_http)
 |---|---|---|
 | `SIMPLE_HTTP_ENABLE_HTTP3` | 未定义 | 编入 HTTP/3 与 QUIC 监听 |
 | `SIMPLE_HTTP_USE_BOOST_REGEX` | 本仓库定义 | 路由正则使用 Boost.Regex |
+| `SIMPLE_HTTP_HAS_GLAZE` | 自动检测 | glaze 辅助（C++23 + glaze） |
 | `SIMPLE_HTTP_ENABLE_LOG` | 1 | 日志总开关 |
 | `SIMPLE_HTTP_LOG_ACTIVE_LEVEL` | 0 | 编译期最低日志级别 |
+| `BOOST_ASIO_HAS_CO_AWAIT` | Boost 决定 | 协程 handler/middleware 适配 |
 
-压缩、WebSocket、OpenAPI、UNIX socket 都没有开关宏。
+压缩、WebSocket、OpenAPI、UNIX socket 都没有独立开关宏。
 
 ---
 
@@ -677,113 +752,101 @@ target_link_libraries(app PRIVATE simple_http::simple_http)
 ### 7.1 唯一入口与分层
 
 ```sh
-test/run.sh fast        # unit
-test/run.sh standard    # + openapi
-test/run.sh full        # + client-diff / server-diff / conformance / stress
+test/run.sh fast        # unit + cpp17
+test/run.sh standard    # fast + openapi
+test/run.sh full        # 全部 8 个 suite
 test/run.sh list
 test/run.sh doctor
-test/run.sh <suite>     # 单套件，例如 unit / client-diff / server-diff
-test/run.sh unit '[h2]' # Catch2 过滤
+test/run.sh <suite>
+test/run.sh unit '[h2]'
 ```
 
 | suite | tier | 内容 |
 |---|---|---|
-| `unit` | fast | 原 Catch2 纯逻辑测试（约 420 用例） |
-| `cpp17` | fast | `test/cpp17/smoke.cpp` 以 `-std=c++17` 编译并运行当前 `include/` 的公共 API |
+| `unit` | fast | Catch2 单测/回归（约 511 个 `TEST_CASE`） |
+| `cpp17` | fast | `test/cpp17/smoke.cpp` 以 `-std=c++17` 编译并运行 |
 | `openapi` | standard | OAS 3.1 元模式 + 文档/路由契约 + Swagger UI |
-| `client-diff` | full | C++ 客户端 ↔ Go 客户端，同一个 Go 服务端 |
-| `server-diff` | full | Go 客户端 → C++ 服务端 ↔ Go 服务端 |
-| `conformance` | full | h2spec / h1spec / Autobahn / h3spec |
-| `stress` | full | h2load / k6，失败数必须为 0 |
+| `client-diff` | full | C++ client ↔ Go `net/http` client |
+| `server-diff` | full | Go 探针 → C++ server ↔ Go server；含 `h2raw` |
+| `concurrency` | full | 多客户端/多线程/teardown harness |
+| `conformance` | full | h2spec / h1spec / h3spec / Autobahn |
+| `stress` | full | h2load / k6 |
 
-`test/run.sh` 默认 `--parallel 3`：`conformance`/`stress` 共用 7788–7792，固定为
-同一条串行 lane；其余套件端口互不重叠（`concurrency` 用临时端口），可并行。
-`--parallel 1` 完全串行。编译并行度用 `--jobs`（sanitizer 默认 7）。
+`fast = unit + cpp17`；`standard = fast + openapi`；`full = 全部`。
 
-C++ 二进制由 xmake 构建；Go 参考服务端与探针由各 runner 用 `go build` 构建
-（`test/diff/go.mod` 固定 `x/net`、`gorilla/websocket`、`quic-go`）。
-CI（`.github/workflows/ci.yml`）在 push/PR 上跑 `standard`（unit + openapi）、
-`client-diff`、`server-diff` 与 `concurrency`；conformance/stress 需要外部工具和
-更长的时间，仍按 §7.3 手动执行。
-Python 侧只需要 `httpx`、`jsonschema`、`brotli`（`test/requirements.txt`）。
+运行器行为：
+
+- 默认位置参数是 `fast`；也可以直接给 suite 名或 `list`/`doctor`。
+- `--suites a,b,c` 直接指定 suite；`--jobs` 默认 12；`--parallel` 默认 3。
+- `conformance` 与 `stress` 共用 7788–7792，固定同一条串行 lane。
+- `full` 默认严格依赖：缺外部工具 → 退出码 3；`--allow-skip` 放宽。
+- 缺测试二进制是 suite FAIL，不是 SKIP。
+- 退出码：0 通过；1 失败；2 用法错误；3 环境/构建错误。
+- 报告写到 `.cache/test-run/<timestamp>-<pid>/`；每个 suite 一个 `.log` 和
+  `build.log`。统一 runner **不**产出聚合 JSON。
+- suite 环境变量：`SIMPLE_HTTP_TEST_BIN_DIR`、`SIMPLE_HTTP_TEST_WORKDIR`、
+  `SIMPLE_HTTP_TEST_SUITE`。
 
 ### 7.2 差分测试
 
-`test/diff/` 分两个方向，二者都把 Go 标准库当作参考实现：
-
-- **client**（`test/diff/client/`）：C++ 客户端与 Go `net/http` 客户端读同一份
-  `cases/*.json`，请求同一个 Go 参考服务端（h1 `7810` / TLS h2 `7811` /
-  h2c `7812` / h3 `7813` / WS `7810`；mTLS `7814`、第二 origin `7815`、
-  HTTP CONNECT `7816`、SOCKS5 `7817`）。服务端回显收到的 method/header/body，
-  因此差异只能来自客户端。组：`basic`、`body`、`policy`、`ws`、`h3`。
-- **server**（`test/diff/server/`）：同一个 Go 探针把请求分别发给 C++ 参考服务端
-  （`7820`–`7824`，`7824` 是纯 h1；`7825` 是要求客户端证书的 mTLS）与 Go 参考
-  服务端（`7830`–`7834`），每个案例输出
-  `target=cpp` / `target=go` 两行。组：`routing`、`body`、`semantics`、
+- **client-diff**（`test/diff/client/`）：C++ 与 Go 客户端请求同一个 Go 参考
+  服务端；服务端回显 method/header/body，因此差异只能来自客户端。组：
+  `basic`、`body`、`policy`、`ws`、`h3`。端口 7810–7817。
+- **server-diff**（`test/diff/server/`）：同一个 Go 探针分别打 C++ 与 Go 参考
+  服务端（7820–7825 / 7830–7834）。组：`routing`、`body`、`semantics`、
   `middleware`、`framework`、`static`、`ws`、`raw`、`h2raw`。
-  `h2raw` 是 C++ 单侧原始 HTTP/2 断言（`test/diff/server/go/h2raw/`）：RFC 8441
-  extended CONNECT 矩阵（文本/二进制/分片/Ping/Pong/Close、非法 UTF-8、未掩码帧、
-  路由未命中、非 websocket `:protocol`、缺 `:scheme`），h2c Upgrade（101 后
-  stream 1 重放），以及「重置已开流后再开新流」的 Rapid Reset 队列溢出
-  `GOAWAY(ENHANCE_YOUR_CALM)`。Go `net/http` 无对应能力，因此输出 PASS/FAIL
-  而不是双 target。h2c 夹具（`:7821`）把 `h2_max_queued_streams` 调小，否则
-  RFC 9113 §5.1.2 的 `REFUSED_STREAM` 会先于队列溢出触发；upgrade 检查走
-  `:7820` 嗅探监听器。该夹具的 `/delay` 等待显式脱离请求的取消槽（与 Go 参考
-  服务端的 `time.Sleep` 一致）：Rapid Reset 门线只在 handler 被 reset 后仍继续
-  占用执行槽位时才可达，绑定取消槽会让 handler 提前退出、队列永不溢出。
-
-每个组是独立可执行程序（C++ 用 `DIFF_GROUP_*`，Go 用 `-ldflags -X main.defaultGroup`）。
-观测是 JSONL，字段为 `case/target/status/version/headers/body/body_encoding/framing/error/notes`。
-
-归一化与门禁都在 `test/diff/support/harness.py`：
-
-- header 名小写，`allow`/`vary`/`cache-control` 按集合比较；
-- 默认忽略 Date/Server/Content-Length/Transfer-Encoding/Connection/ETag/
-  Last-Modified/Set-Cookie 等传输细节；
-- body 支持 `exact` / `json` / `none`，可配置 `scrub` 正则；
-- 客户端差分默认比较 `version` 与 `framing`（双方观察同一个参考服务端；合法差异在
-  case 的 `expect` 里显式关闭）；版本串 `HTTP/2.0`/`HTTP/3.0` 归一为
-  `HTTP/2`/`HTTP/3`；
-- 客户端错误按稳定 slug 比较（`bad_url`、`body_decode_failed`、`goaway` 等），
-  只有未映射的传输错误落到 `other`；四种超时合并为 `timeout` 以对齐 Go；
-- 未登记差异失败；`test/diff/known_diffs.json` 登记双方都合法的差异并写明理由；
-- 每次运行写 `diff-report.md`（逐字段 cpp/go/verdict/reason）。
-
-新增功能时：在 C++/Go 参考实现同步加行为 → 在对应组加用例 → 跑 diff → 只把
-确属合法差异的项登记到 `known_diffs.json`。Go 无对应能力的功能标 `cpp-only`
-并写单侧期望，不要伪造 Go 行为。
+  `h2raw` 是 C++ 单侧原始 HTTP/2 / h2c / WebSocket 断言，输出 PASS/FAIL。
+- **归一化**（`test/diff/support/harness.py`）：header 名小写；
+  `allow`/`vary`/`accept-encoding`/`cache-control` 按集合比较；默认忽略
+  Date/Server/Content-Length/Transfer-Encoding/Connection/ETag/Last-Modified/
+  Set-Cookie 等；body 支持 `exact`/`json`/`none` + `scrub`。
+- 客户端差分默认比较 `version` 与 `framing`；错误按稳定 slug 比较。
+- 未登记差异失败；`test/diff/known_diffs.json` 当前登记：
+  - client：`policy.redirect_referer`（body）、`policy.redirect_cross_origin`
+    （body）、`h3.status_204`（framing）；
+  - server：`raw.cl_te`、`raw.duplicate_cl`、`raw.obs_fold`（status）、
+    `body.request_trailers_h3`（body）。
+- 新增功能时：C++ 与 Go 参考实现同步加行为 → 加用例 → 跑 diff → 只登记确属
+  合法差异的项，并写清 RFC 依据。Go 无对应能力时标 `cpp-only`。
 
 ### 7.3 外部一致性与压力
 
-被测 server 是 `test/fixtures/conformance_server.cpp`（目标
-`fixture_conformance_server`），只保留外部套件需要的四个路由：
+被测 server 是 `test/fixtures/conformance_server.cpp`，监听：
 
-- `any /`：回显请求体（h1spec）
-- `any /world`：回显 `?n=` 字节（h2spec、压力）
-- `ws /echo`：逐字节回显（Autobahn）
-- `ws /echo1k`：固定 1024 字节（压力）
+- `7788`：嗅探 h1+h2c，WebSocket `/echo`、`/echo1k`，启用 permessage-deflate；
+- `7790`：纯 h2c；
+- `7791`：纯 h1；
+- `7792`：TCP + UDP HTTP/3。
 
-监听 `7788`（嗅探+ws）、`7790`（纯 h2c）、`7791`（纯 h1）、`7792`（TCP+UDP h3）。
-单协议端口是必需的：嗅探端口上「畸形 HTTP/2 前导」与「畸形 HTTP/1.x 请求行」
-是同一批字节，h2spec 要 GOAWAY、h1spec 要 400。
+单协议端口是必需的：嗅探端口上「畸形 h2 前导」与「畸形 h1 请求行」是同一批
+字节，h2spec 要 GOAWAY、h1spec 要 400。
 
 ```sh
 test/external/conformance/run.sh
 test/external/conformance/run.sh h2spec
 test/external/stress/run.sh cpp h3 --no-conformance
+test/external/stress/run.sh both
 ```
 
-压力门线与参数不变：POST 1 KiB、响应 2k/10k/20k、每档 300000 请求、4 线程、
-200 客户端、20 流；WS 100 VUs × 600 iterations × 2000 消息。**唯一门线是失败数 0**。
-脚本会先清理遗留服务并确认端口释放，否则 SO_REUSEPORT 会把 QUIC 连接表劈开。
+门线：
+
+- h2spec：`failed == 0` 且 `passed >= 146`；
+- h1spec：总用例 33，必须全部通过；
+- h3spec：总用例 49，`passed >= 47`；
+- Autobahn：`FAILED == 0` 且 `NON-STRICT == 0`；
+- 压力：连接复用 200/200；每个响应档位 `failed == 0` 且 `errored == 0`；
+  h1 k6 `errors == 0`；WebSocket `recv == ITERS × WANT`（默认 1,200,000）。
+
+`CONFORMANCE_HTTP3=0` 跳过 7792/h3spec；`STRESS_HTTP3=0` 跳过 h3 档。
+脚本会先清理遗留服务和确认端口释放，否则 SO_REUSEPORT 会把 QUIC 连接表劈开。
 
 ### 7.4 OpenAPI
 
-`test/diff/openapi/` 的 petshop 夹具（`:7795`）同时验证：
+`test/diff/openapi/` 的 petshop 夹具（`:7795`）验证：
 
-1. `/openapi.json` 通过官方 OAS 3.1 元模式（`schema/openapi-3.1.json`）；
+1. 文档通过本地 OAS 3.1 元模式；
 2. 结构不变量：operationId 唯一、path 参数与模板一致且 required、每个声明响应
-   有 description、`$ref` 全部可解析且无 `$defs` 泄漏；
+   有 description、`$ref` 可解析且无 `$defs` 泄漏；
 3. 文档 ↔ 实际路由：每个 operation 的每个声明状态都有真实请求覆盖，校验状态码、
    Content-Type、响应 JSON Schema、声明响应头与 401 challenge；
 4. `/swagger` 可访问、引用正确 spec、文档两次获取字节一致。
@@ -791,49 +854,68 @@ test/external/stress/run.sh cpp h3 --no-conformance
 ### 7.5 Sanitizer
 
 ```sh
-test/run.sh sanitize asan   [suite...]   # ASan + LSan + UBSan
-test/run.sh sanitize tsan   [suite...]   # TSan
-test/run.sh sanitize ubsan  [suite...]   # 仅 UBSan
+test/run.sh sanitize asan [suite...]   # ASan + LSan + UBSan
+test/run.sh sanitize tsan [suite...]   # TSan
+test/run.sh sanitize ubsan [suite...]  # 仅 UBSan
 ```
 
-- 默认 suite：asan = unit/openapi/client-diff/server-diff/concurrency；
-  tsan = unit/concurrency/server-diff；ubsan = unit/client-diff/server-diff。
-- 默认 `--jobs 7`。unit 用 ASan 时 `-j14` 会 OOM；不要把它调回 12/14。
-- 默认在 `.cache/sanitize/worktree-<san>` 建独立 worktree，日常 `build/` 不受影响；
-  `--build-dir build-asan` 可复用已有目录，结束时恢复 `xmake f -c -o build`。
-- `concurrency`（`test/sanitizer/concurrency.cpp`）覆盖多客户端、多线程、
-  "工作从别的 executor 启动、显式 hop 回连接 executor 后再写"以及日志 sink 替换；
-  Go 参考实现不插桩。注意 `ResponseWriter`/`Body`/`WebSocket` 只能在连接 executor
-  线程使用，跨线程直接调用会被 `require_owner_thread` abort。
-- 报告扫描 ASan/LSan/TSan/UBSan 关键字；强制 `SIGKILL` 记为
-  `STOP_TIMEOUT`（泄漏检查被跳过），不当作通过。
-- 抑制规则保持最小：`test/sanitizer/{lsan,tsan,ubsan}.supp`。
+默认 suite：
+
+| sanitizer | 默认 suites |
+|---|---|
+| asan | `unit openapi client-diff server-diff concurrency` |
+| tsan | `unit concurrency server-diff` |
+| ubsan | `unit client-diff server-diff` |
+
+- 默认 `--jobs 7`；ASan 编译 unit 时 `-j14` 会 OOM。
+- 默认在 `.cache/sanitize/worktree-<san>` 建独立 worktree；
+  `--build-dir build-asan` 可复用已有目录，结束时恢复默认 xmake 配置。
+- 报告：`.cache/sanitize/<san>/<timestamp>/sanitize-report.{md,json}`。
+- 强制 `SIGKILL` 记为 `STOP_TIMEOUT`，不当作通过。
+- 抑制文件 `test/sanitizer/{lsan,tsan,ubsan}.supp` 目前只有注释。
 
 ### 7.6 Fuzzing
 
 ```sh
-test/fuzz/run.sh                         # GCC + ASan/UBSan，确定性变异
-test/fuzz/run.sh --libfuzzer --time 60   # clang-24 + libFuzzer
+test/fuzz/run.sh
+test/fuzz/run.sh --libfuzzer --time 60
 ```
 
-- 六个目标：`fuzz_h1`（请求头）/ `fuzz_h1_body`（chunked 请求体）/ `fuzz_h2`
-  （帧头/HPACK）/ `fuzz_ws`（帧解析）/ `fuzz_ws_deflate`（permessage-deflate
-  解压）/ `fuzz_multipart`（增量 multipart），统一 `LLVMFuzzerTestOneInput`
-  入口；语料在 `test/fuzz/corpus/`。
-- 默认工具链是 GCC（无 libFuzzer），由 `standalone_main.cpp` 做有界变异驱动；
-  装 clang 后 `--libfuzzer` 使用 `/usr/lib/llvm-24`（或 PATH 上的 `clang++`），
-  以 `-fsanitize=fuzzer,address,undefined` 构建。
-- 目标必须确定性、无 I/O/网络，所有循环和分配都要受输入大小约束。
-- 发现 crash 先最小化、加入 corpus，再修解析器；不要把 crash 放到抑制列表。
+- 六个目标：`fuzz_h1`、`fuzz_h1_body`、`fuzz_h2`、`fuzz_ws`、
+  `fuzz_ws_deflate`、`fuzz_multipart`。
+- 默认 GCC + ASan/UBSan，由 `standalone_main.cpp` 做确定性变异；
+  `--libfuzzer` 使用 clang（优先 `/usr/lib/llvm-24`）。
+- 目标必须确定性、无 I/O/网络；所有循环和分配受输入大小约束。
+- 发现 crash 先最小化、加入 corpus，再修解析器；不要把它放进抑制列表。
 
-### 7.7 差分比对原则
+### 7.7 Coverage
 
-- 以 RFC 为准，不以「和 Go/nginx 不一样」判定为本库 bug。
-- 已知合理差异：CL+TE 与 obs-fold 上更严格；h2 一次性响应省略 content-length；
-  `Allow` 包含自动支持的 OPTIONS；br 压缩 Go 无对应。
-- 真正要修的是双方都违反 RFC，或与独立实现互操作失败。
-- 测试发现真实 bug 时优先修库（例如重定向丢 header、SSE 请求体未 finish、
-  CookieJar 未把 loopback 视为安全源），而不是把它登记成已知差异。
+```sh
+test/coverage.sh
+COVERAGE_SUITES="unit server-diff" test/coverage.sh
+COVERAGE_FAIL_UNDER=70 test/coverage.sh
+```
+
+- 独立构建 `build-cov`（`--coverage -O0 -g`），默认 suites：
+  `unit openapi server-diff client-diff concurrency`。
+- 输出 `.cache/coverage/coverage.{txt,html}`；只有设置 `COVERAGE_FAIL_UNDER`
+  才有门线。
+- 默认不包含 conformance/stress；结束时恢复默认 xmake 配置。
+
+### 7.8 CI
+
+`.github/workflows/ci.yml` 在 push/PR 上：
+
+```sh
+xmake f -y -m release
+test/run.sh standard --jobs 4
+test/run.sh client-diff --jobs 4
+test/run.sh server-diff --jobs 4
+test/run.sh concurrency --jobs 4
+```
+
+CI **不**跑：conformance/stress、sanitizer、coverage、fuzz、format check、
+clang-tidy、CMake 构建。
 
 ---
 
@@ -857,8 +939,6 @@ test/run.sh server-diff
 
 ### 8.2 改客户端
 
-必跑：
-
 ```sh
 test/run.sh client-diff
 ```
@@ -875,351 +955,240 @@ test/run.sh server-diff
 ### 8.4 加新 API / 行为
 
 - 同步更新 `README.md`、`README.zh-CN.md` 与本文件。
-- 在 `test/unit/` 加纯逻辑覆盖；跨实现行为加到 `test/diff/` 对应功能组
-  （客户端加 `client/cases/*.json` 与驱动，服务端加两侧路由与 Go 探针）。
-- 新增差异必须登记到 `test/diff/known_diffs.json` 并写清 RFC 依据，否则 suite 失败。
+- 在 `test/unit/` 加纯逻辑覆盖；跨实现行为加到 `test/diff/` 对应功能组。
+- 新增差异必须登记到 `test/diff/known_diffs.json` 并写清 RFC 依据。
 - 不要引入协议版本分支到 `handler/` / `proto/` / `net/` / 客户端门面。
+- 新异步操作必须是 Asio initiating function；不要在库内部引入协程。
+- 头文件注释与代码不一致时，以代码为准并修正注释。
 
 ### 8.5 代码风格
 
 - `.clang-format`：LLVM + `IndentWidth: 4`、`ColumnLimit: 120`。
-- 提交前 `./format.sh`；CI 用 `./format.sh --check`。
-- RAII、无裸 `new` / `delete`，所有权显式。
-- 可失败操作返回 `expected` / `error_code`，不要用异常做控制流。
-- 新代码尽量沿用现有命名与注释密度；协议行为要写清「为什么」。
+- `./format.sh` 就地格式化 `include/` 与 `test/`；`./format.sh --check` 检查。
+  CI 不调用它。
+- RAII、无裸 `new`/`delete`，所有权显式。
+- 可失败操作返回 `result` / `error_code`；不要用异常做控制流。
+- 新代码沿用现有命名与注释密度；协议行为要写清「为什么」。
 
 ---
 
-## 9. 已固化的回归点（不要重犯）
+## 9. 已固化回归点（改动相关代码时必须保持）
 
-这些是曾经踩过并已修复的坑，改动相关代码时必须保持：
+以下均来自当前 `include/` 与 `test/` 的代码/断言；编号只为引用方便。
 
-1. **WebSocket 入站死锁**：串行 `read→write` 的 handler 在写被对端零窗口挡住时不再读，
-   会与「猛发不读」的客户端互相压死。修法是内部有界读泵 + `m_inbox`。
-2. **HTTP/2 全局暂停**：请求体 channel 满时曾暂停整条连接；现在是每流
-   `paused_frames`，其他流继续。
-3. **`END_STREAM` 与停放**：停放期间到达的 END_STREAM 必须记 `finish_pending`，
+1. **`Body::finish()` / `fail()` 不可丢**：channel 满时记录 out-of-band
+   `m_pending_eof` / `m_pending_error`，排空后再交付。否则 reader 永久挂起，
+   h2 还会泄漏 connection window。`proto/body.h:110-133,338-375`；
+   `test/unit/test_proto.cpp:166-208`。
+2. **h2 END_STREAM 与停放**：停放期间到达的 END_STREAM 记 `finish_pending`，
    排空后再 `body().finish()`，否则 `Body::read()` 提前 EOF 截断 body。
-4. **`Body::feed` 语义**：收 `std::string&&` 并直接转发 `try_send`；asio 失败时参数
-   原样保留，调用方可重试。不要提前包成 `Frame` 无条件 move。
-5. **连接数上限**：到上限时 accept 循环不发起 `async_accept`，把连接留在内核 backlog；
-   计数跨 acceptor 共享，释放发生在连接协程完成回调。资源类错误（EMFILE/ENOBUFS/
-   ENOMEM）有指数退避，避免空转烧核。
-6. **H1 响应 framing**：handler 设置的 `transfer-encoding` / `connection` 等
-   hop-by-hop 字段必须剥离，framing 只由引擎决定；否则 CL + TE 双 framing。
-7. **per-key 限流 Retry-After**：按该 key 的桶计算，和共享桶版本一致。
-8. **204/304 默认 Content-Type**：只在有内容的状态上补 `text/plain`。
-9. **HTTP/2 Rapid Reset**：并发 handler 上限 = `h2_max_concurrent_streams`；
-   reset 的排队流要从队列移除；队列溢出 → ENHANCE_YOUR_CALM。
-10. **h2 一次性响应**：不发 `content-length`（END_STREAM 界定），HEAD 例外。
-11. **h3 响应队列**：按「已排队字节」封顶，不是按 in-flight 字节。
-12. **解压流**：`DecompressingClientStream` 必须把响应 trailers 继续向上转发。
-13. **CONNECT origin-form**：H1 解析器按 RFC 9112 直接 400；到达 handler 的 CONNECT
-    由反代回 405。
-14. **QUIC 发送上限**：`ClientConfig::quic_max_udp_payload_size` 默认 1200；
-    VPN/隧道/WSL2 上调到 1472 会被截断，握手超时。
-15. **TLS 默认值**：服务端默认 1.3-only，客户端默认 1.2；不要无声改回去。
-16. **WebSocket Close 顺序**：协议错误/Close/非法 UTF-8 先记关闭码，Close 帧要等
-    应用下次 `read()` 排空缓存后才发出，保证「先回显、后失败」。
-17. **h2 `100-continue`**：handler 首次读 body 时懒发；h3 侧 no-op。
-18. **客户端自动 100-continue**：h1/h2 先把 interim 100 交给 `write()`；h2 必须
-    `clear_head_cache()`，否则后续 `read_head()` 会一直返回 100。h1 的
-    `exchange_read` 半双工检查必须放行「Expect 已收到最终响应」的情况。
-19. **h2 请求 trailers**：带 trailer 的最后一个 DATA **不能**带 END_STREAM；trailing
-    HEADERS 同时带 END_STREAM + END_HEADERS，并在 body 队列排空后发送。
-20. **h1 请求 trailers**：chunked 终止符是 `0\r\n<fields>\r\n`；服务端在 body EOF 前
-    把字段写进 `Request::trailers()`。
-21. **状态码重试**：`retry_statuses` 默认空（与 Go/reqwest 一致），显式开启后才按
-    429/503 + `Retry-After` 重试；重试前响应体已消费。
-22. **请求解压是 opt-in 且默认 Go 语义**：服务端只有挂载
-    `middleware::decompress_request` 才解码；反代路由不挂载时原样转发压缩体与头。
-    解码在 `Body::read()` 消费侧进行（h2/h3 可在 middleware 运行前已排队原始帧），
-    `on_consumed` 必须按线上压缩字节归还流控；解码后超限 413、畸形/截断 400、
-    不支持的 coding 415。`Body::enable_decoding` 只拒绝“已开始 read”的 body。
-23. **客户端解压只在“自己请求的编码”上生效**：默认 `auto_decompress=true` + 仅 gzip；
-    调用方显式设置 `Accept-Encoding`、HEAD、Range 时不注入也不解码。解压装饰器必须
-    转发 `clear_head_cache()`（否则 100-continue 的 interim head 会循环）和
-    `finish_trailers()`。
-24. **重定向保留请求头**：`follow_redirects` 曾把 method token 与 headers `std::move`
-    进当前 hop，递归的下一跳拿到空值；结果是 User-Agent/自定义头/Authorization
-    在 3xx 后静默丢失。两处都必须是拷贝（跨 origin 的 auth/cookie 清除仍按规则做）。
-25. **SSE 请求体必须 finish**：`SseStream::open` 走显式 Stream，请求体在
-    `finish()` 前一直开着；不 finish 时等待响应头的服务端永远不返回。GET 的 SSE
-    请求要在 `read_head()` 前 `finish()`。
-26. **CookieJar 的 Secure 与 loopback**：RFC 6265bis / Go 把 localhost 与
-    `127.0.0.0/8`/`::1` 视为可信源，Secure cookie 在 http 下也会发送；不要把它
-    简化成「仅 https」。
-27. **OpenSSL 惰性初始化**：所有 `ssl::context` 构造入口（`TlsContext`、
-    `QuicTlsContext`、`make_client_ssl_context`）都必须先经过
-    `transport/openssl_init.h` 的 `detail::ensure_openssl_initialized()`。
-    多个线程首次并发 `SSL_CTX_new` 会在 OpenSSL 4 的 `ossl_ht_get` 里产生
-    TSan race；这个 `std::call_once` 预热是进程级的，不是 SSL_CTX 单例。
-    需要跨 Client 共享 context 时用 `make_client_tls_context()` +
+   `engine/h2/h2_engine.h:787-791,2145-2156`；`test/unit/test_h2_engine.cpp:559-597`。
+3. **h2 只暂停单条流**：某条流 body channel 满时，DATA 进该流
+   `paused_frames`，不暂停整条连接；connection window 不回补形成总内存上界。
+   `h2_engine.h:763-791,2121-2131`；`test_h2_engine.cpp:527-557`。
+4. **h2 连接接收窗口固定从 65535 起**：`SETTINGS_INITIAL_WINDOW_SIZE` 只影响
+   stream window；配置更小时也不能把 connection window 收缩到 65535 以下。
+   `h2_engine.h:340-345,837-845`；`test/unit/test_review_regressions.cpp:1004-1066`。
+5. **h2 关闭流三分法**（RFC 9113 §5.1）：本端 RST 后最小处理并丢弃；对端 RST /
+   双方 END_STREAM 后可 `STREAM_CLOSED`；从未打开的 skipped id 是
+   `GOAWAY(PROTOCOL_ERROR)`。固定 256 项 ring 记录关闭原因。
+   `h2_engine.h:652-682,2160-2185`；`test_h2_engine.cpp:260-327`。
+6. **h2 split header block 穿过 reset**：stream 被 reset/erase 后，尚未收完的
+   HEADERS/CONTINUATION 仍必须喂给 HPACK decoder，否则动态表失步。
+   `h2_engine.h:615-619,1600-1669`；`test/unit/test_trailers.cpp:577+`。
+7. **h2 响应 trailers**：trailing HEADERS 携带 END_STREAM，最后 DATA 不携带；
+   必须在 body 队列排空后发送。`h2_engine.h:504-523,716-720,2498-2563`；
+   `test_trailers.cpp:178-250`。
+8. **h2 早响应归还流控 credit**：401/429/405 等提前结束时，必须归还未读 body 的
+   stream + connection credit，不能等 END_STREAM。`h2_engine.h:2686-2739`；
+   `test_h2_engine.cpp:717-754`。
+9. **h2 half-closed(remote) 上的 DATA 先归还 connection credit 再 reset**，否则
+   每帧泄漏一个 frame_len，最终 `GOAWAY(FLOW_CONTROL_ERROR)`。
+   `h2_engine.h:2004-2021`。
+10. **h2 Rapid Reset**：并发 handler 上限 = `h2_max_concurrent_streams`；
+    reset 的排队流从队列移除；队列溢出 → `GOAWAY(ENHANCE_YOUR_CALM)`。
+    `h2_engine.h:2592-2631`；`core/limits.h:80-103`；`test_h2_engine.cpp:165-210`。
+11. **h2 写前检查 `stream_writable()`**：peer reset 或已发 END_STREAM 后再写是
+    连接级协议错误；HEADERS+END_STREAM 也必须记录 `end_stream_sent`。
+    `h2_engine.h:431-476,545-553`。
+12. **h1 framing 严格性**：TE 是 coding list；chunked 必须唯一且最后；TE+CL、
+    重复 CL、HTTP/1.0 + TE 都是 400；不支持的 coding 是 501。
+    `h1_engine.h:1380-1459`；`test/unit/test_h1_body.cpp:218-238`。
+13. **h1 trailer 字节预算按消息复位**：`m_trailer_bytes` 在
+    `setup_body_framing` 归零；不能连接级累计。`h1_engine.h:742-747`；
+    `test_h1_body.cpp:176-216`。
+14. **h1 空 chunk 是 no-op**：不能下传成 `0\r\n\r\n`，否则提前终止 chunked body。
+    `h1_engine.h:365-387`；`test_trailers.cpp:511-533`。
+15. **h1 的 101 必须串行化**：WebSocket 101 与普通响应字节共用每连接
+    `SerializedWriter`，不能另起第二个 transport write。
+    `h1_engine.h:152-165,253-279,1295-1326`；
+    `test/unit/test_h1_ws_serialization.cpp:124-167`。
+16. **SerializedWriter 队列条目在完成前不移出**：scatter-gather 描述符指向
+    deque 元素；写期间不能 `pop_front`、不能 erase 中间元素、不能 move 出去。
+    失败清理只能从队尾 `pop_back`。回调不得强引用 writer owner。
+    `transport/serialized_writer.h:5-19,168-176,219-234`；
+    `test/unit/test_serialized_writer.cpp:103-233`。
+17. **`async_error_only` 复制 buffer owner**：只 move 进局部会在 partial write
+    时 UAF；必须把 `Start` 复制进 pending completion。
+    `transport/transport.h:89-139`；`test_review_regressions.cpp:1190-1204`。
+18. **scatter-gather 传 `std::array` 本身，不传 span**：Asio 只复制序列对象；
+    传 span 会在第二次 `async_write_some` 读取已销毁栈帧。
+    `transport/transport.h:43-87`；`test/cpp17/smoke.cpp` 的 `test_scatter_write`。
+19. **取消 signal 必须 fan-out**：`Request::cancellation_slot()` 每次返回独立
+    `cancellation_signal`，`cancel()` 向全部广播。共享单 signal 会被内层 bind
+    覆盖外层 `cancellation_state`，清理时写悬空 impl → SIGSEGV。
+    `proto/request.h:354-435`；`test/unit/test_cancellation.cpp:49-89`。
+20. **WebSocket 有界读泵**：`m_inbox` 上限来自 `ws_read_ahead_bytes`；串行
+    read→write 的 handler 不会与「猛发不读」的对端互相压死。
+    `proto/websocket.h:19-27,370-397,739`；`test/unit/test_ws_codec.cpp:914-952`。
+21. **WebSocket Close 顺序**：协议错误/Close/非法 UTF-8 先记关闭码，Close 帧要等
+    应用下次 `read()` 排空缓存后才发出；h1/h2 升级路径必须让 WebSocket handle
+    活到 Close 写完。`websocket.h:661-680`；`h1_engine.h:1315-1325`。
+22. **WebSocket 64 位长度最高位必须为 0**：否则 `pos + payload_len` 回绕，
+    `std::string` 分配 UINT64_MAX 并抛 `length_error`。
+    `proto/ws_frame.h:227-234`；`test_ws_codec.cpp:1001-1020`。
+23. **WebSocket 部分帧 payload 只交付一次**：不能每次 reread 重置
+    `m_partial_off`；否则 UTF-8 校验重复喂入且大帧 O(n²)。
+    `ws_frame.h:256-272,303-325`；`test_ws_codec.cpp:210-234`。
+24. **压缩帧在解压前不做 UTF-8 增量校验**：否则会把 deflate 字节判成非法 UTF-8
+    并 1007。`websocket.h:431-451`；`ws_frame.h:335-340`；`test_ws_codec.cpp:781-800`。
+25. **空 WebSocket 消息不压缩**：RFC 7692 §7.2.3.5；避免空消息 marker 差异。
+    `ws_deflate.h:308-325`；`test_ws_codec.cpp:667-696`。
+26. **WebSocket mask key 必须来自 CSPRNG**（RAND_bytes），不能用可预测序列。
+    `ws_frame.h:49-56`；`test_ws_codec.cpp:954-961`。
+27. **一个响应只有一个头**：`send` / `send_bodyless` / `begin` 共享
+    `m_started`；`status()` 拒绝 100..599 之外的值；`send_bodyless` 只允许
+    HEAD/204/304；`async_begin` 拒绝 204/304 和 1xx。
+    `proto/response.h:54-66,186-224,399-422`；
+    `test_review_regressions.cpp:944-1002,1109-1146`。
+28. **handler 同步 throw 必须完成**：未开始响应 → `reset_for_error()` + 500；
+    已开始 → close。completion 必须恰一次，否则 h1 stall、h2/h3 泄漏并发槽。
+    `engine/dispatcher.h:230-267,315-375`；
+    `test_review_regressions.cpp:105-123,887-925`。
+29. **Request state 用 deque**：`get_state<T>()` 返回指针后，后续 `set_state()`
+    不得使已有元素失效；路径参数用 offset+length，target 重写/Request 移动后仍有效。
+    `proto/request.h:441-459,532-539`；`test_review_regressions.cpp:1068-1101`。
+30. **`CompressingResponseSink` 持 weak Request**：强引用会在 session middleware
+    把 `ResponseWriter` 存进 request state 时形成 request/response/sink 环。
+    `proto/compressing_writer.h:223-232,351-357`；
+    `test_review_regressions.cpp:75-103`。
+31. **未完成的流式 h1 响应不得复用连接**：begin 后无 finish 时
+    `m_response_complete` 为 false，关闭连接，否则下一个响应会被当成上一个
+    chunked body。`h1_engine.h:476-478,531`；`test_trailers.cpp:535-555`。
+32. **h2 响应输出反压与 compaction**：高/低水位 1 MiB / 256 KiB；队列必须
+    compaction，否则持续 refill 的 streaming 响应保留所有历史 chunk。
+    `h2_engine.h:84-123,556-590,684-713,773-786`。
+33. **h3 反压用 `out_bytes`**：`out_write - out_ack` 只表示“已交出但未 ACK”；
+    对端流控关闭时它接近 0，`out_q` 会无界增长。`h3_stream.h:64-71`。
+34. **h3 请求体通道满必须停放，不能 reset**：`Body::feed()` 返回 false 只表示
+    通道满且参数可重试；DATA 进该流 `paused_frames`，排空后回灌；END_STREAM
+    期间有停放帧时记 `finish_pending`。`h3_engine.h:1088-1114,1503-1524`。
+35. **h3 单向流阻塞也必须通知 nghttp3**：control / QPACK encoder/decoder 流
+    不在 `m_streams` 里；`on_stream_blocked` 必须对所有流调用
+    `nghttp3_conn_block_stream()`，否则 `next_stream_data()` 反复返回同一段字节。
+    `h3_engine.h:679-686`。
+36. **h3 非法请求头不得先派发 handler**；handler 提前返回时归还未读 body 的
+    connection/stream credit。`h3_engine.h:1105-1114,1349-1394,1526-1537`。
+37. **OpenSSL 惰性初始化**：所有 `ssl::context` 构造入口必须经过
+    `ensure_openssl_initialized()`；多线程首次并发 `SSL_CTX_new` 会在 OpenSSL 4
+    的 `ossl_ht_get` 里产生 TSan race。需要共享 context 时用
     `TlsClientConfig::shared_context`，不要做全局单例。
-28. **h1 431 与完整 head**：`max_header_bytes` 不能只在 `NeedMore` 循环里检查；
-    超大头如果在最后一次读取中完整到达，`parse_head` 会直接 Done 并绕过 431。
-    解析 Done 后必须再比较 `parser.consumed() > max_header_bytes`。
-29. **重定向的 origin 边界**：清除 Authorization/Cookie 时必须比较
-    scheme + host + port，而不是只比较 host。只比 host 会在端口变化时把凭据
-    带到另一个 origin；Go 只比较 hostname，是已知差异，本库更严格。
-30. **QUIC 缺少 quic_transport_parameters**：OpenSSL 4 的 QUIC-TLS 与
-    ngtcp2_crypto_ossl 都不检查这个必需扩展（ossl 的
-    `set_remote_transport_params` 是 no-op，扩展缺失时回调根本不会触发）。
-    服务端必须在 ClientHello 处理完后发现 remote params 仍为空时，
-    用 `ngtcp2_ccerr_set_tls_alert(SSL_AD_MISSING_EXTENSION)` 关闭
-    （线上是 `CONNECTION_CLOSE 0x016d`）。判断要在 TLS 状态已离开
-    `TLS_ST_SR_CLNT_HELLO` 之后做，否则会把分片到达的 ClientHello 误杀。
-31. **请求取消 signal 必须 fan-out**：`Request::cancellation_slot()` 每次返回
-    独立 `cancellation_signal`，`cancel()` 向全部 signal 广播。asio 把
-    `cancellation_state` 的 impl 存放在父 slot 的 handler 存储里，若同一
-    `Request` slot 同时被外层协程（`co_spawn` 的 bind）和内层操作（如
-    detached 协程的定时器）绑定，后者会覆盖前者；外层协程随后
-    `clear_cancellation_slot()` 会写到已释放的 impl（SIGSEGV）。
-32. **h1 读超时必须传到 socket**：`read_more` 一类包装 lambda 不携带
-    associators，会把 cancellation slot 丢掉，导致
-    `Stream::read_head_with/read_with` 的 deadline 无法中止挂起的读。
-    在 `do_ensure_head`/`do_exchange_read` 入口记录 `m_read_slot`，并由
-    `read_more` 显式 `bind_cancellation_slot` 到 socket 操作。
-33. **h1 `Expect: 100-continue` 上抛**：interim 100 必须作为 head 交给调用方
-    （`m_expect_continue` / `m_awaiting_final`），由 `Stream` 的自动流清缓存后
-    再发请求体；在 h1 内部吞掉 100 并直接等最终响应会与等待请求体的服务端
-    互锁。最终响应（拒绝）也要原样上抛为 `expectation_failed`。
-34. **客户端拨号必须实现 `ResolveFn` + `connect_timeout`**：直接路径和代理
-    路径都要接线；连接失败/超时映射为 `client_errc::connect_timeout`。部分
-    环境（WSL2）对 `127.0.0.1:1` 会 drop 而不是 refuse，没有超时会挂死。
-35. **h3 客户端 SSL_CTX 生命周期**：`ConnectState` 只保存裸 `SSL_CTX*`。
-    当 `Client` 自己没缓存 context 时，`dial_h3` 里的局部 shared_ptr 必须被
-    完成回调捕获，活到连接建立（`SSL_new`）之后，否则连接层拿到悬空指针，
-    表现为 `SSL_new failed` 并误报 protocol_error。
-36. **错误码类别统一**：库内比较/映射一律用
-    `make_error_code(asio::error::X)`（system 类别）。`boost::system::errc::`
-    `make_error_code`（generic 类别）与 `asio::error::X` 不相等，曾导致请求
-    解压超限映射成 400 而不是 413、trailer 校验错误比较失败。
-37. **h2c Upgrade 服务端**：h1 检测 `Upgrade: h2c` + `Connection: Upgrade` +
-    `HTTP2-Settings`，排空升级请求体、回 101，把已读到的剩余字节（客户端
-    preface）交给 `Http2Engine::run_h2c`，并把原请求重放为 stream 1，同时置
-    `half_closed_remote`（否则 stream 1 永不 retire，泄漏并发槽位）。TLS 监听
-    必须禁用 h2c（协议由 ALPN 决定）。
-38. **重定向降级为 GET**：303/301/302 丢弃实体时同时
-    `set_stream_body(false)` + `set_content_length(-1)`，否则 h1 会写出
-    `content-length: 0`，与 Go 的跟随行为不一致。
-39. **状态码重试**：`retry_statuses` 默认空；显式开启后按 `Retry-After` 或
-    退避重放，重放前响应体必须已经消费。`send_hop` 的重试计数与重定向计数
-    相互独立，重试时重定向计数归零。
-40. **请求解压超限是 413**：`Body` 解码超限返回
-    `asio::error::message_size`（`extract.h` 据此映射
-    `payload_too_large`）；畸形/截断仍是 400。
-41. **错误体省略空 details**：`JsonError::details` 为空时不输出
-    `"details":null`，而是整个字段省略（与 Go 的 `omitempty` 参考实现一致），
-    否则差分端口径不一致。
-42. **`Client` 异步回调不能持裸 `this`**：`Client` 继承
-    `enable_shared_from_this`，异步入口用 `keep_alive()` 捕获。堆上的
-    `Client`（如 HTTP 反代里的 `make_shared<Client>`）由回调保活；栈上对象
-    返回不拥有控制块的别名 `shared_ptr`，依赖 awaitable 契约。此前
-    `dial_via_proxy` 的 DNS 完成回调在 `Client` 析构后访问 `m_executor`，
-    ASan 报 heap-use-after-free。
-43. **h1 客户端 session ↔ stream 方向**：session 用 `weak_ptr` 持有当前
-    stream（`m_current`），stream 强引用 session 并缓存 executor。反过来
-    （session 强持 stream、stream 强持 session）是每次 exchange 一个环；
-    LeakSanitizer 会报 `Request`/`Http1ClientSession` 间接泄漏。
-44. **自递归 `shared_ptr<std::function>` 必须弱自引用**：
-    `middleware::timeout` 的 `poll` 与 `client/ws_client.h` 的 `step` 都靠
-    挂起的 timer/read handler 持有强引用保活，函数对象自身只捕获
-    `weak_ptr`。直接捕获自身会让每次安装都永久泄漏 request/response/
-    completion/timer（曾在 ASan unit 中报 10 KB / 99 allocations）。
-45. **`Server::Core::dispatch` 不能强捕获 `core`**：`dispatch` 是 `Core`
-    的成员，强捕获形成 `Core → dispatch → Core` 自环，`stop()` 后整个
-    `Core → IoCtxPool → io_context → pending handlers` 链都泄漏。dispatch
-    捕获 `weak_ptr<Core>`（过期后直接完成）和 router。
-46. **accept/serve/sniff 回调弱引用 listener/core**：挂起的 accept、
-    TLS 握手、嗅探读取和 posted serve 不能强持 `ListenerState`/`Core`，
-    否则 `listener → acceptor → handler → listener` 或
-    `core → pool → io_context → handler → core` 在 teardown 时成环。
-    连接计数在弱引用过期时跳过（此时 Server 已销毁，计数无意义）。
-47. **H1 客户端 chunk 大小必须溢出检查并流式交付**：`size = size*16+d` 要比较
-    `(max-d)/16`；不能等整个 chunk 进入 `m_in` 再返回（单个巨大 chunk 会无界分配，
-    `size+2` 回绕还会让 `std::string::compare` 抛 `out_of_range`）。
-48. **H1 客户端响应头要和请求侧一样严格**：只接受 CRLF（拒绝裸 LF/裸 CR 与混用）、
-    字段名必须是 token、拒绝 obs-fold、拒绝值内 CTL、拒绝重复/溢出 `Content-Length`
-    以及 TE+CL；状态码必须是 3 位 100..599，并接受 HTTP/1.0 且设置
-    `ResponseHead::bodyless`。
-49. **客户端请求头在序列化处做最后校验**：h1/h2/h3 的请求头编码统一拒绝非法字段名
-    与含 CTL 的值，返回 `client_errc::invalid_header`；不能只依赖调用方自觉。
-50. **`Client::take_cached()` 不得关闭仍在使用的会话**：H1 busy / H2 draining
-    （有在飞流）时返回 `nullptr` 拨一次性连接；关闭会让正在进行的请求以
-    `connection_reset` 失败。失败的读/头操作要 `release_exchange()`，否则死会话会
-    一直显示为 “active”。
-51. **客户端解压与重定向 body 必须有界**：缓冲 `send()` 用 `write_bounded` /
-    `finish_bounded`；3xx body 用有界丢弃（超过阈值就 cancel 后换新连接），
-    不能 `read_all(..., 0, ...)`。
-52. **服务端 TLS 握手受 `idle_timeout` 约束**：只完成 TCP、不发 ClientHello 的连接
-    必须被定时器关闭，否则可长期占用 `max_connections` 槽位。
-53. **CookieJar 拒绝单标签 Domain**：`Domain=com` 这种公共后缀会让 cookie 泄漏到
-    所有同后缀站点；默认拒绝单标签与 IP，完整 PSL 通过
-    `CookieJar(PublicSuffixFn)` 注入。
-54. **HTTP/1.0 不接受 chunked，也不发送 100 Continue**：`parse_body_framing` 按版本
-    拒绝 TE；`expect_continue` 只对 1.1 生效；h2c Upgrade 同样要求 1.1。
-55. **H2 的 content-length 在 END_STREAM 时必须核对**：HEADERS/CONTINUATION 直接带
-    END_STREAM 时也要比较 `declared_content_length == body_received`；重复 CL、
-    超过 INT64_MAX 的 CL、trailer 里的 framing/hop-by-hop 字段都要拒绝。
-56. **h3 单向流阻塞也必须通知 nghttp3**：control / QPACK encoder/decoder 流不在
-    `m_streams` 里；`on_stream_blocked()` 必须先对所有流调用
-    `nghttp3_conn_block_stream()`，否则 `next_stream_data()` 反复返回同一段字节，
-    连接写循环自旋，整条 I/O 线程被一个 `initial_max_stream_data_uni=0` 的对端挂死。
-57. **h3 客户端上传水位用 `out_bytes`**：`out_write - out_ack` 只表示“已交出但未
-    ACK”，对端流控关闭时 nghttp3 不再拉取，这个差值接近 0，`out_q` 会无界增长。
-    与服务端 `await_out_step` 一致，用 `out_bytes > kOutHighWatermark` 停车。
-58. **h3 请求体通道满必须停放，不能 reset**：`Body::feed()` 返回 false 只表示
-    通道满且参数可重试；把 DATA 放进 `H3Stream::paused_frames`，在
-    `on_consumed` 回到连接 executor 后 `drain_paused()` 回灌；END_STREAM 期间有
-    停放帧时记 `finish_pending`，排空后再 `body().finish()`。
-59. **反代必须无条件读完请求体**：HTTP/2/3 用 END_STREAM 定界，不保证有
-    `content-length`。`http_proxy` 曾据此判断“无 body”，静默丢弃 DATA；
-    `req->body().async_read_all()` 对空体立即 EOF，直接调用即可。
-60. **h2 客户端 content-length 由会话独占**：请求头编码必须跳过调用方的
-    `content-length`（否则反代 h2→h2 出现两条）；响应侧解析一次，重复/超
-    INT64_MAX 拒绝，并在 DATA 到达与 END_STREAM 时核对总数；HEAD/204/304 跳过。
-61. **重定向 Location 按 RFC 3986 §5.2 解析**：绝对、`//host`、根相对、仅 query、
-    相对路径（合并目录 + 去点段）都要覆盖，不能 `url + "/" + location`；3xx 的
-    `Set-Cookie` 必须先入 jar 并为下一跳重新生成 Cookie；https→http 返回
-    `redirect_to_insecure`。
-62. **缓冲 `send()` 必须跳过 interim 1xx**：h1/h2 会话会把 100 作为 head 上抛；
-    `send_hop` 要 `clear_head_cache()` 后重读，否则返回 status=100 + 最终 body。
-63. **extract 的异步阶段异常也要转 500**：`invoke_extracted` 运行在 Json/Form
-    读完成回调里，必须自带 try/catch 和一次性 completion，不能逃出 io_context。
-64. **ALPN 策略要真正强制**：`Http2Only` 在无交集时返回
-    `SSL_TLSEXT_ERR_ALERT_FATAL`；客户端完全不带 ALPN 时 OpenSSL 不会调用选择
-    回调，服务端握手完成后发现没有 h2 必须关闭而不是 `run_h1`。直连 TLS 的
-    `sni_override` 与 `tls.alpn` 必须生效。
-65. **拨号预算覆盖 DNS/TLS/代理隧道**：`connect_timeout` 不只包 TCP connect；
-    DNS 结果、TLS 握手、CONNECT/SOCKS5 回复都要有 deadline，统一映射
-    `client_errc::connect_timeout`。
-66. **h3 中等项**：UDP 接收循环只对 operation_aborted/关闭停止；注册
-    `recv_stop_sending`（对端 STOP_SENDING），`stream_stop_sending` 是本端读关闭
-    通知，不能混用；非法请求头不得先派发 handler；响应头/trailer 用
-    `nghttp3_conn_get_frame_payload_left2` 限长；erase 流时把未读 `in_bytes`
-    的连接级流控额度归还。
-67. **代理与 TCP 选项**：`tcp_nodelay` 要按 listener 生效；HTTP 反代除固定
-    hop-by-hop 集合外，还要剥离 `Connection` 指名的字段（请求与响应两侧）。
-68. **h1 trailer 预算按消息复位**：`m_trailer_bytes` 必须在 `setup_body_framing`
-    归零；连接级累计会让长 keep-alive 连接上的后续正常请求被误判 `message_size`。
-    客户端侧同理：响应 trailer 段也要有 `max_header_bytes` 预算（L-16）。
-69. **h2 字段语法**：普通字段名必须是 token，值不得含 CR/LF/NUL 之外的其它 CTL
-    （`contains_ctl` 只覆盖三种）；`:method` 必须是 token，`:path` 必须是
-    origin-form 或 `*` 且无 `#`/SP。否则反代会把非法内容拼进 HTTP/1.1 上游。
-70. **h2 Host 与 `:authority`**：`host` 出现多次、或与 `:authority` 不一致都是
-    malformed（流级 PROTOCOL_ERROR）；一致时以 `:authority` 为准并删除 Host 字段。
-    不要再让 Host 静默覆盖 `:authority`。
-71. **响应只有一个头**：`send`/`send_bodyless`/`begin` 共用 `prepare_one_shot()`
-    的 `m_started` 检查；h1 没有引擎侧保护，重复发送就是响应走私。`status()`
-    拒绝 100..599 之外的值（0/9999 会生成非法状态行）。
-72. **`max_body_bytes == 0` = 不限制**：h1 的 `parse_uint` 上限、chunked 累计检查、
-    h2c body 检查都要用 `body_limit()`；h2/h3 本来就是该语义。
-73. **`parse_uint` 溢出守卫不能写成 `v > (max - d) / base`**：`max < d` 时会无符号
-    下溢并把超限值判为 Ok；用 `v > max / base || (v == max / base && d > max % base)`。
-74. **`set_cookie` 按 RFC 6265 拒绝而不是引号转义**：name 必须是 token，value 必须是
-    cookie-octet，Path/Domain/SameSite 不得含 `;`/`,`/CTL；引号不是转义。非法字段
-    与 `header()` 一样置 `m_field_rejected`，让响应失败而不是发出畸形 Set-Cookie。
-75. **CORS 空 allowlist + credentials 必须 fail-closed**：空 `allow_origins` 加
-    `allow_credentials` 无法表达安全策略，直接不发 CORS 头；显式 `"*"` 才走镜像逻辑。
-76. **`parse_http_date` 只接受 29 字节 IMF-fixdate**：必须校验 `GMT` 后缀并拒绝
-    尾随字节；不要把 `UTC`/`GMTX`/尾随垃圾当作 GMT。
-77. **`MultipartForm` / `MultipartStreamWriter` 的 part 参数校验**：name、filename、
-    content_type、boundary 中的 CR/LF/NUL 会注入 part 头，入口直接拒绝
-    （`MultipartForm` 抛 `invalid_argument`，流式写入返回 `invalid_argument`）。
-78. **h1 客户端流式请求的 body 边界**：`finish`/trailer 之后再写必须拒绝；已知
-    `Content-Length` 时累计写入量，超写/欠写都 `fail_exchange`（否则多余字节会变成
-    同连接上的下一个请求）。
-79. **`clone_for_replay` 必须复制 `m_state`**：`AutoDecompressMark` 等按类型存的
-    标记属于请求语义，丢掉会让重定向/重试后的响应不再解压。
-80. **`send_file` 先 open 再写头**：`prepare()` 只做 stat/上限检查；open 失败不得
-    在响应对象上留下 `content-type`/`content-length`。
-81. **WebSocket 握手校验**：服务端要求 GET + HTTP/1.1 + base64 解码后 16 字节的
-    `Sec-WebSocket-Key`，否则 400；客户端 origin/request-target 与 headers 一样
-    拒绝 CR/LF/NUL。SSE 行缓冲与响应 trailer 一样必须有上限。
-82. **GET 隐含 HEAD 不在注册时占槽**：`insert_entry` 不能把 GET entry 写进 HEAD
-    槽，否则后注册的显式 HEAD 永远被“已注册”挡住；改由 `lookup()` 在 HEAD 槽为空
-    时回退到 GET。Allow 位仍来自 GET entry 的 `method_bits`（含 HEAD）。
-83. **正则路由不能按字面前缀剪枝**：`/api|/admin` 的字面前缀是 `/api` 但匹配
-    `/admin`，`/files/?` 也不蕴含 `/files/`。匹配所有候选，不做 starts_with 预筛。
-84. **`etag_matches` 按引号感知切分列表**：opaque-tag 内允许逗号，`"a,b"` 不能被
-    当成两个条目。
-85. **静态 `spa_fallback` 的 key 以 `/` 开头**：`"/" + "/index.html"` 永不命中；
-    已有前导斜杠时不要再拼。
-86. **`real_ip` 只接受可解析地址**：`X-Real-IP`/选中的 `X-Forwarded-For` hop 必须
-    通过 `make_address`，否则不写入 `ClientIp`；`ip_covered` 的前缀解析要在
-    `prefix > 128` 时提前失败，避免累加回绕成 `/0`。
-87. **SSE 行与事件缓冲有界**：超过 `SseParser::max_line_bytes`（1 MiB）返回
-    `message_size`，不能无限追加 `m_buf`。
-88. **`send_file` / `multipart_stream` 的失败路径**：`send_file` 先 open 再写头；
-    `stream_file_step` 用 `fail()` 而不是 `bad()` 判定读失败（clean EOF 只置
-    eofbit）。
-89. **h2 客户端 `te` 响应头大小写不敏感**；`MultiplexedClientSession::stream_closed`
-    对计数做饱和递减，`finish_session()` 清零后不再下溢。
-90. **h2 关闭流上的帧按关闭原因处理**（RFC 9113 §5.1）：引擎用定长环记录最近
-    256 条已关闭流的 id 与原因。从未打开（跳号、隐式关闭）是 §5.1.1 的
-    unexpected stream identifier → `GOAWAY(PROTOCOL_ERROR)`；本端发过
-    RST_STREAM 的流，后续帧最小处理（HEADERS 走 HPACK 解码）后丢弃、不回应；
-    对端 RST_STREAM 或双方 END_STREAM 关闭的流 → `GOAWAY(STREAM_CLOSED)`。
-    关闭流上不得再发非 PRIORITY 帧，所以不要用 RST_STREAM 回应。偶数 id 仍是
-    连接级 PROTOCOL_ERROR。
-91. **h2 客户端连接级接收窗口固定从 65535 起**：`SETTINGS_INITIAL_WINDOW_SIZE`
-    只影响每条流；`m_conn_recv_window` 初始化为
-    `max(h2_initial_window, 65535)`，且只有大于 65535 时才发连接级
-    WINDOW_UPDATE。把配置的更小值当成连接窗口会把合规流量误判为
-    `FLOW_CONTROL_ERROR`；`replenish_conn` 的批量阈值同理。
-92. **`request_timeout` 立即回调且不得 UAF**：整体预算到点时先置共享
-    `HopCancel::cancelled`、best-effort `async_cancel` 当前 stream，然后**立即**
-    完成调用者（不能等内层排空）。内层续延在解引用 `Client` 之前必须检查该标志；
-    栈上 `Client` 的 `keep_alive()` 只是别名 `shared_ptr`，不负责保活。ASan 的
-    client-diff policy 组覆盖此路径。
-93. **写队列条目在完成前不得移出队列**：`SerializedWriter` 的 scatter-gather 描述符指向
-    deque 队首元素的 `head`/`body`/`tail`；`std::deque` 在两端插入/删除不使其它元素的
-    引用失效，所以写期间不能 `pop_front`、不能 `erase` 中间元素、不能把条目 move 出去。
-    旧实现把条目 move 出队再用 `make_shared<std::string>` 保活（每 chunk 多 2~3 次
-    分配），改回 move 会在 partial write 时读到已释放的缓冲。失败清理只能从队尾
-    `pop_back`，in-flight 队首交给它自己的 transport 回调回收。队列里保存的完成
-    回调不得强引用 writer 的所有者：h1 的 `wrap()` 弱引用 sink、lazy 100-continue
-    弱引用 engine，否则会形成 `sink → writer → entry → sink` /
-    `engine → sink → writer → entry → engine` 环。所有者由请求/响应生命周期保活，
-    锁失败时用 `not_connected` 完成调用方。
+    `transport/openssl_init.h`；`tls_context.h:118-124`。
+38. **`IoCtxPool::at()` 返回 shared_ptr**：`add_main_context()` 会使 vector
+    reallocate，引用会失效；index==pool_size 曾会误返回 main context。
+    `core/io_pool.h:102-127`；`test_review_regressions.cpp:1103-1107`。
+39. **`TlsContext` 不可移动**：OpenSSL ALPN callback 持有 `&m_alpn_state`；
+    移动会让指针悬空。`transport/tls_context.h:98-106`。
+40. **异步 `ResolveFn` completion 必须 marshal 回调用方 executor**：hook 可能
+    同步或从其他线程完成。`core/resolve.h:82-94`；
+    `test_review_regressions.cpp:624-666`。
+41. **h1 WS route 同步 throw 不能逃出 `io_context::run()`**：未 handoff → 500；
+    已 handoff → 不再写 HTTP 错误。`h1_engine.h:1132-1146,1195-1203`；
+    `test_h1_ws_serialization.cpp:169-200`。
+42. **`async_send_file` 先 open 再写头**：`prepare()` 只做 stat/上限检查；
+    open 失败不得在响应对象上留下 content-type/content-length。
+    `handler/file_response.h:161-170`。
+43. **multipart part 参数拒绝 CR/LF/NUL**：name/filename/content_type/boundary
+    会注入 part 头。`proto/multipart.h`；`client/multipart_stream.h`。
+44. **CookieJar 拒绝单标签 Domain 与 IP 字面量**：否则 cookie 会泄漏到所有同后缀
+    站点；完整 PSL 通过 `CookieJar(PublicSuffixFn)` 注入。loopback 视为安全源。
+    `client/cookie_jar.h`。
+45. **CORS 空 allowlist + credentials 必须 fail-closed**：空 `allow_origins` 加
+    `allow_credentials` 不发 CORS 头；显式 `"*"` 才走镜像逻辑。
+    `handler/cors.h:179-203,285-370`。
+46. **h2 字段语法与 Host/:authority**：普通字段名必须是 token；值不得含 CTL；
+    `:method` 必须是 token；`:path` 必须是 origin-form 或 `*`；`host` 重复或与
+    `:authority` 不一致是流级 PROTOCOL_ERROR。`h2_engine.h:1698-1935`；
+    `test_h2_engine.cpp:643-713`。
+47. **错误码类别统一**：客户端自决错误在 `"simple_http.client"` category；
+    server 配置错误在 `"simple_http.server"`；transport 错误保持 asio
+    `error_code`。不要混用 generic 与 system 类别。
+48. **客户端请求头在序列化处最后校验**：h1/h2/h3 的请求头编码统一拒绝非法字段名
+    与含 CTL 的值，返回 `client_errc::invalid_header`。
+49. **h1 客户端 chunk 大小必须溢出检查并流式交付**：`size = size*16+d` 要比较
+    `(max-d)/16`；不能等整个 chunk 进入 `m_in` 再返回。
+    `client/h1_client.h`；`test_review_regressions.cpp` 的 h1 client 用例。
+50. **h1 客户端响应头要和请求侧一样严格**：只接受 CRLF，拒绝裸 LF/CR、obs-fold、
+    值内 CTL、重复/溢出 Content-Length、TE+CL；状态码 3 位 100..599；接受
+    HTTP/1.0 并设置 `bodyless`。`client/h1_client.h`。
 
 ---
 
-## 10. 已知限制
+## 10. 已知限制与「注释过时」清单
 
-- 客户端 `open_websocket` 只走 HTTP/1.1 Upgrade；不支持 h2/h3 WebSocket。
-- 服务端 HTTP/3 不支持 WebSocket（RFC 9220 未实现）。
-- 服务端 HTTP/3 的 `Expect: 100-continue` 是 no-op。
-- 客户端不暴露 103 等其他 1xx；100-continue 在 h1/h2 暴露给自动流。
-- HTTP/3 客户端只显式启用；不做 Alt-Svc / HTTPS RR 发现；不支持 0-RTT。
-- 出站代理不覆盖 HTTP/3。
+### 10.1 已知限制
+
+- 客户端 `H2cMode::Upgrade` 未接线；`ClientConfig::default_h2c` 未被读取。
+  明文 `HttpVersionPolicy::Http2` 走 prior knowledge。
+- `RetryPolicy::condition` / `require_replayable` 未使用；只有状态码重试。
+- 重定向默认关闭（`max_redirects = 0`）。
+- 客户端没有传统连接池；只缓存一个 origin 的连接。
+- 客户端 `Response::text()` 与 `bytes()` 相同。
+- h1 客户端没有独立 idle timeout；h2 用 `ClientConfig::idle_timeout`。
+- HTTP/3 客户端不支持代理、请求 trailers、1xx；服务端不支持 WS、request
+  trailers、100-continue、push、0-RTT。
+- 不支持 UNIX-domain 服务端监听。
 - `NO_PROXY` 不支持 CIDR / 通配。
-- 客户端单连接模型：每个 origin 一条连接，其他 origin 一次性连接；没有传统连接池。
-- `CookieJar` 默认只拒绝单标签 Domain 与 IP 字面量；完整的公共后缀判断需要构造时注入
-  `CookieJar::PublicSuffixFn`，库不内置 PSL 数据。
-- 客户端 WebSocket 不协商 permessage-deflate。
-- CORS 不处理 WebSocket 升级。
-- Host 路由只作用于 HTTP dispatch；WebSocket 查找仍 host-agnostic，Host 子 Router 有独立
-  OpenAPI 文档。
-- JWT 只是验证器：不做令牌签发、OAuth2/OIDC 发现或 refresh-token 流程。JWKS 支持
-  静态/手动拉取文档（`fetch_jwks_json`），不内置后台自动刷新；`aud`/`scope` 按字符串
-  claim 解析，不支持 audience 数组。
-- 请求 trailers 只支持 h1/h2；h3 返回 `trailers_not_supported`。
-- 服务端请求解压只支持单个 `gzip`/`br` coding；`deflate`、多 coding 列表返回 415。
-  默认不启用，需挂载 `middleware::decompress_request`。
-- 客户端自动解压默认仅 gzip（对齐 Go）；br 需显式 `accept_encodings={"br","gzip"}`。
-- 自动 100-continue 在 h1/h2 等待 interim；h3 直接发送 body（服务端无 1xx API）。
-- Session 只内置进程内存储；Redis/DB 适配器由消费侧实现 `SessionStore`。CSRF 是
-  header 型 double-submit，无法设置 header 的表单需 handler 自行校验字段。
-- 校验通过 `Validator<T>` 按类型 opt-in，没有 tag/DSL 校验器。
-- CMake 接口未接入 ngtcp2/nghttp3；HTTP/3 目前只由 xmake 构建提供。
-- `simple_httpConfig.cmake.in` 缺 `find_dependency(glaze)`。
-- 根目录 `compile_commands.json` 可能过期；以 `build/` 下的为准。
-- 客户端 `ClientConfig::request_timeout` 到点只会让调用方拿到
-  `client_errc::request_timeout`；被包装的底层交换可能继续跑到对端响应或连接
-  空闲超时。逐阶段预算（`response_head_timeout` / `body_idle_timeout`）会真正
-  取消挂起读，整体预算目前不做跨层取消。
+- `CookieJar` 不内置 PSL 数据。
+- CORS 不覆盖 WebSocket 升级；WebSocket 用 `ws_origin`。
+- Host 路由只作用于 HTTP dispatch；WebSocket 查找仍 host-agnostic。
+- JWT 只是验证器；`aud` 单字符串；无自动 JWKS 刷新。
+- 请求解压默认关闭，需挂 `middleware::decompress_request`；只支持单个
+  gzip/br coding。
+- 客户端自动解压默认只 gzip；br 需显式 `accept_encodings`。
+- `async_send_file` / `async_read_body_to_file` / streaming multipart 文件读取
+  是同步 I/O。
+- HTTP 反代缓冲完整请求/响应（响应 cap 64 MiB）；`HttpProxyTarget::h2c`、
+  `h2c_prior_knowledge`、`max_attempts` 当前未使用。
+- CMake 未接入 ngtcp2/nghttp3；`simple_http_cpp17` 指向不存在的目录；
+  config 缺 `find_dependency(glaze)`。
+- 统一测试 runner 不产出聚合 JSON。
+- CI 不跑格式检查、clang-tidy、CMake 构建、conformance/stress。
+
+### 10.2 当前代码中已过时的注释（改到相关位置时顺手修正）
+
+- `include/simple_http.h` 说 “HTTP/3/QUIC is not part of this port”，但 h3 引擎
+  与 QUIC 监听实际存在（宏门控）。
+- `net/connection.h` 说 “HTTP/2 尚未 port，所有 plaintext 都走 HTTP/1.x”；
+  实际 `Server` 支持 h2 prior knowledge 与 h2c Upgrade。
+- `net/server.h` 顶部说 h2/h3/UNIX socket/代理/静态/OpenAPI 都是 deferred；
+  除 UNIX listener 外均已实现。
+- `engine/h2/h2_engine.h` 某处注释说 dispatch 等 END_STREAM；实际在
+  END_HEADERS 后即 dispatch。
+- `client/http.h` 顶部说 h2/代理/自动解压/WebSocket 是下一阶段；实际已实现。
+- `client/sse.h` 注释写 `client.async_open_sse(...)`；实际是
+  `SseStream::async_open(client, ...)`。
+- `client/multipart_stream.h` 注释写 `client.async_open_multipart(...)`；
+  实际是 `MultipartStreamWriter::async_open(client, ...)`。
+- `client/h3_client.h` 注释指向不存在的 `client/http_client.h`。
+- `handler/validation.h` 顶部示例用 `std::expected<void, vector<FieldError>>`；
+  实际接口是 `static ValidationResult validate(const T&)`。
+- `openapi/openapi.h` 说 “There is no compile-time on/off switch”；实际整文件在
+  `SIMPLE_HTTP_HAS_GLAZE` 内。
+- `core/compression.h` 说 `EngineLimits` 可以携带 `CompressionConfig`；实际
+  没有该成员。
+- `handler/session.h` 说 save 失败会记录日志；实际代码忽略 error_code。
+- `CMakeLists.txt` 的 `simple_http_cpp17` 目标指向不存在的 `cpp17/include`。
 
 ---
 
@@ -1227,7 +1196,9 @@ test/run.sh server-diff
 
 ```sh
 # 构建
+xmake f -m release
 xmake build -j 12
+xmake build -j 12 test_unit
 xmake build -j 12 fixture_conformance_server
 xmake build -j 12 diff_server_cpp
 xmake build -j 12 diff_openapi_server
@@ -1242,9 +1213,11 @@ test/run.sh doctor
 # 单套件
 test/run.sh unit
 test/run.sh unit '[h2]'
+test/run.sh cpp17
 test/run.sh openapi
 test/run.sh client-diff
 test/run.sh server-diff
+test/run.sh concurrency
 test/run.sh conformance
 test/run.sh stress
 
@@ -1253,7 +1226,7 @@ test/.venv/bin/python test/diff/client/run.py --groups basic,body,policy,ws,h3
 test/.venv/bin/python test/diff/server/run.py --groups routing,body,semantics,middleware,framework,static,ws,raw,h2raw
 test/.venv/bin/python test/diff/openapi/run.py
 
-# 覆盖率（--coverage + gcovr）
+# 覆盖率
 test/coverage.sh
 COVERAGE_SUITES="unit server-diff" test/coverage.sh
 
