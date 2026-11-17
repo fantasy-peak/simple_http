@@ -834,7 +834,11 @@ class WebSocket : public std::enable_shared_from_this<WebSocket> {
                 }
                 if (auto acquired = owner.lock()) {
                     guard = Guard<WebSocket>{std::move(acquired)};
-                } else if (raw) {
+                } else if (!managed && raw) {
+                    // Unbound (stack-constructed) handles have no control block;
+                    // the caller keeps them alive as before. A managed handle
+                    // that reached here was destroyed while the operation was
+                    // queued on the cross-thread hop, so `raw` is dangling.
                     guard = Guard<WebSocket>{std::shared_ptr<WebSocket>(raw, [](WebSocket *) {})};
                 } else {
                     self.complete(make_error_code(asio::error::not_connected));
@@ -889,7 +893,9 @@ class WebSocket : public std::enable_shared_from_this<WebSocket> {
                 }
                 if (auto acquired = owner.lock()) {
                     guard = Guard<WebSocket>{std::move(acquired)};
-                } else if (raw) {
+                } else if (!managed && raw) {
+                    // See StartWriteOp: a managed handle whose weak_ptr expired
+                    // was destroyed while this read was queued.
                     guard = Guard<WebSocket>{std::shared_ptr<WebSocket>(raw, [](WebSocket *) {})};
                 } else {
                     self.complete(make_error_code(asio::error::not_connected), WsMessage{});

@@ -28,6 +28,7 @@
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/compose.hpp>
 #include <boost/asio/experimental/channel.hpp>
+#include <boost/asio/post.hpp>
 #include <boost/system/result.hpp>
 #include <cstddef>
 #include <functional>
@@ -439,6 +440,7 @@ struct BodyReadAllOp {
     asio::any_io_executor exec;
     bool hopped{false};
     bool started{false};
+    bool continuing{false};
     Guard<BodyState> state;
     std::string out;
     bool first{true};
@@ -463,6 +465,11 @@ struct BodyReadAllOp {
             state->async_read(std::move(self));
             return;
         }
+        if (continuing) {
+            continuing = false;
+            state->async_read(std::move(self));
+            return;
+        }
         if (ec) {
             self.complete(ec, std::string{});
             return;
@@ -480,7 +487,13 @@ struct BodyReadAllOp {
         } else {
             out.append(result.data);
         }
-        state->async_read(std::move(self));
+        // Break the synchronous chain. A body that is already buffered (the
+        // h2 paused-body path queues ~1300 chunks) would otherwise recurse one
+        // frame per chunk; ASan's larger frames overflow the stack. Posting
+        // between chunks keeps the stack bounded and is also fairer to other
+        // handlers on the connection.
+        continuing = true;
+        asio::post(self.get_executor(), std::move(self));
     }
 };
 

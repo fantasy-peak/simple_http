@@ -112,7 +112,13 @@ class ResponseWriter : public std::enable_shared_from_this<ResponseWriter> {
                 }
                 if (auto acquired = owner.lock()) {
                     guard = Guard<ResponseWriter>{std::move(acquired)};
-                } else if (raw) {
+                } else if (!managed && raw) {
+                    // Only an unbound (stack-constructed) writer may be borrowed
+                    // through `raw`: it has no control block by construction, and
+                    // the historical "caller keeps it alive" contract applies.
+                    // A managed writer reached here means its last strong
+                    // reference was dropped while the operation was queued on a
+                    // cross-thread hop, so `raw` is dangling -- not a borrow.
                     guard = Guard<ResponseWriter>{std::shared_ptr<ResponseWriter>(raw, [](ResponseWriter *) {})};
                 } else {
                     self.complete(make_error_code(asio::error::not_connected));
@@ -164,7 +170,10 @@ class ResponseWriter : public std::enable_shared_from_this<ResponseWriter> {
                 // lifecycle gate is needed.
                 if (auto acquired = owner.lock()) {
                     guard = Guard<const ResponseWriter>{std::move(acquired)};
-                } else if (raw) {
+                } else if (!managed && raw) {
+                    // See StartWriteOp: `raw` is only a valid borrow for an
+                    // unbound stack writer; a managed one whose weak_ptr expired
+                    // was destroyed while this operation was queued.
                     guard =
                         Guard<const ResponseWriter>{std::shared_ptr<const ResponseWriter>(raw, [](const ResponseWriter *) {})};
                 } else {
