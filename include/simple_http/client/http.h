@@ -15,8 +15,11 @@
 #include <boost/asio.hpp>
 #include <boost/asio/any_completion_handler.hpp>
 #include <boost/asio/any_io_executor.hpp>
+#include <boost/asio/associated_cancellation_slot.hpp>
 #include <boost/asio/async_result.hpp>
+#include <boost/asio/bind_cancellation_slot.hpp>
 #include <boost/asio/cancel_after.hpp>
+#include <boost/asio/cancellation_signal.hpp>
 #include <boost/asio/ssl.hpp>
 #include <chrono>
 #include <cstdio>
@@ -70,6 +73,23 @@ struct AutoDecompressMark {};
 struct HopCancel {
     bool cancelled{false};
     std::shared_ptr<ClientStream> stream;
+    // Set while a dial/handshake/upgrade owns a transport but no ClientStream
+    // exists yet; an external cancel closes it to abort the pending I/O.
+    std::function<void()> abort_transport;
+};
+
+// Forwards a caller's cancellation emission into a signal owned by an
+// operation that also has its own deadline. The proxy stays installed in the
+// caller's slot until the caller's token is destroyed; emitting after the
+// operation completed is a harmless no-op.
+struct ForwardCancellation {
+    std::shared_ptr<asio::cancellation_signal> signal;
+
+    void operator()(asio::cancellation_type_t type) {
+        if (is_terminal_cancel(type)) {
+            signal->emit(type);
+        }
+    }
 };
 } // namespace detail
 
@@ -216,13 +236,13 @@ class Stream {
     template <typename Token> auto read_head_with(std::chrono::milliseconds timeout, Token &&token) {
         auto stream = m_stream;
         return asio::async_initiate<Token, void(error_code, detail::ResponseHead)>(
-            [stream, timeout](auto handler) {
+            detail::make_executor_initiation([stream, timeout](auto handler) {
                 struct State {
                     std::shared_ptr<detail::ClientStream> stream;
                     std::chrono::milliseconds timeout;
                     asio::any_completion_handler<void(error_code, detail::ResponseHead)> done;
                     asio::steady_timer timer;
-                    asio::cancellation_signal signal;
+                    std::shared_ptr<asio::cancellation_signal> signal{std::make_shared<asio::cancellation_signal>()};
                     bool finished{false};
                     bool timed_out{false};
 
@@ -230,7 +250,14 @@ class Stream {
                         : stream(std::move(s)), timeout(t), timer(stream->head_executor()) {}
                 };
                 auto state = std::make_shared<State>(stream, timeout);
+                auto caller_slot = asio::get_associated_cancellation_slot(handler);
                 state->done = std::move(handler);
+                // A caller-supplied timer (asio::cancel_after) must reach the
+                // inner read too, not just this helper's own deadline.
+                if (caller_slot.is_connected()) {
+                    caller_slot.template emplace<detail::ForwardCancellation>(
+                        detail::ForwardCancellation{state->signal});
+                }
                 auto finish = [state](error_code ec, detail::ResponseHead head) mutable {
                     if (state->finished)
                         return;
@@ -244,11 +271,11 @@ class Stream {
                         if (ec || state->finished)
                             return;
                         state->timed_out = true;
-                        state->signal.emit(asio::cancellation_type::terminal);
+                        state->signal->emit(asio::cancellation_type::terminal);
                     });
                 }
                 state->stream->async_read_head(asio::bind_cancellation_slot(
-                    state->signal.slot(), [state, finish](error_code ec, detail::ResponseHead head) mutable {
+                    state->signal->slot(), [state, finish](error_code ec, detail::ResponseHead head) mutable {
                         if (ec == asio::error::operation_aborted && state->timed_out) {
                             std::move(finish)(make_error_code(client_errc::response_head_timeout),
                                               detail::ResponseHead{});
@@ -256,20 +283,20 @@ class Stream {
                         }
                         std::move(finish)(ec, std::move(head));
                     }));
-            },
+            }, stream->head_executor()),
             token);
     }
 
     template <typename Token> auto read_with(std::chrono::milliseconds timeout, Token &&token) {
         auto stream = m_stream;
         return asio::async_initiate<Token, void(error_code, ReadResult)>(
-            [stream, timeout](auto handler) {
+            detail::make_executor_initiation([stream, timeout](auto handler) {
                 struct State {
                     std::shared_ptr<detail::ClientStream> stream;
                     std::chrono::milliseconds timeout;
                     asio::any_completion_handler<void(error_code, ReadResult)> done;
                     asio::steady_timer timer;
-                    asio::cancellation_signal signal;
+                    std::shared_ptr<asio::cancellation_signal> signal{std::make_shared<asio::cancellation_signal>()};
                     bool finished{false};
                     bool timed_out{false};
 
@@ -277,7 +304,12 @@ class Stream {
                         : stream(std::move(s)), timeout(t), timer(stream->head_executor()) {}
                 };
                 auto state = std::make_shared<State>(stream, timeout);
+                auto caller_slot = asio::get_associated_cancellation_slot(handler);
                 state->done = std::move(handler);
+                if (caller_slot.is_connected()) {
+                    caller_slot.template emplace<detail::ForwardCancellation>(
+                        detail::ForwardCancellation{state->signal});
+                }
                 auto finish = [state](error_code ec, ReadResult result) mutable {
                     if (state->finished)
                         return;
@@ -291,18 +323,18 @@ class Stream {
                         if (ec || state->finished)
                             return;
                         state->timed_out = true;
-                        state->signal.emit(asio::cancellation_type::terminal);
+                        state->signal->emit(asio::cancellation_type::terminal);
                     });
                 }
                 state->stream->async_read(asio::bind_cancellation_slot(
-                    state->signal.slot(), [state, finish](error_code ec, ReadResult result) mutable {
+                    state->signal->slot(), [state, finish](error_code ec, ReadResult result) mutable {
                         if (ec == asio::error::operation_aborted && state->timed_out) {
                             std::move(finish)(make_error_code(client_errc::body_idle_timeout), ReadResult{});
                             return;
                         }
                         std::move(finish)(ec, std::move(result));
                     }));
-            },
+            }, stream->head_executor()),
             token);
     }
 
@@ -513,55 +545,102 @@ class Client : public std::enable_shared_from_this<Client> {
         const HttpVersionPolicy effective = version ? *version : m_config.default_version;
         auto keep = keep_alive();
         return asio::async_initiate<Token, void(error_code, Response)>(
-            [keep, request = std::move(request), url = std::move(url), max_body_bytes, response_head_timeout,
-             body_idle_timeout, effective](auto handler) mutable {
+            detail::make_executor_initiation(
+                [keep, request = std::move(request), url = std::move(url), max_body_bytes, response_head_timeout,
+                 body_idle_timeout, effective](auto handler) mutable {
                 const std::chrono::milliseconds overall = keep->m_config.request_timeout;
-                if (overall.count() <= 0) {
-                    keep->send_hop(std::move(request), std::move(url), max_body_bytes, 0, 0, response_head_timeout,
-                                   body_idle_timeout, effective, nullptr, std::move(handler));
-                    return;
-                }
-                // Overall budget: the per-phase deadlines are a subset, but a
-                // server that dribbles bytes forever must still be cut off.
-                // The caller is notified immediately. The still-running inner
-                // hop must not touch this Client afterwards (a stack Client
-                // dies with the awaitable frame), so it observes `cancelled`
-                // through a shared flag before every use of `self`; the stream
-                // handle lets the timer abort the pending read as well.
+                // The overall budget and a caller-supplied deadline (for
+                // example asio::cancel_after) share one one-shot completion.
+                // The still-running inner hop must not touch this Client after
+                // either fires (a stack Client dies with the awaitable frame),
+                // so it observes `cancelled` through the shared flag before
+                // every use of `self`; the stream handle lets the canceller
+                // abort the pending read as well.
                 struct State {
                     asio::any_completion_handler<void(error_code, Response)> done;
                     std::shared_ptr<asio::steady_timer> timer;
                     std::shared_ptr<detail::HopCancel> cancel{std::make_shared<detail::HopCancel>()};
+                    asio::any_io_executor exec;
                     bool finished{false};
+
+                    void finish(error_code ec, Response response) {
+                        if (finished) {
+                            return;
+                        }
+                        finished = true;
+                        if (timer) {
+                            timer->cancel();
+                        }
+                        auto completion = std::move(done);
+                        std::move(completion)(ec, std::move(response));
+                    }
+                };
+                struct CallerCancel {
+                    std::shared_ptr<State> state;
+
+                    void operator()(asio::cancellation_type_t type) {
+                        if (!is_terminal_cancel(type) || state->finished) {
+                            return;
+                        }
+                        state->finished = true;
+                        state->cancel->cancelled = true;
+                        if (state->cancel->stream) {
+                            state->cancel->stream->async_cancel(asio::detached);
+                            state->cancel->stream.reset();
+                        } else if (state->cancel->abort_transport) {
+                            auto abort = std::move(state->cancel->abort_transport);
+                            abort();
+                        }
+                        if (state->timer) {
+                            state->timer->cancel();
+                        }
+                        // Post: completing the caller from inside its own
+                        // cancellation signal would destroy its cancellation
+                        // state while the signal is still emitting.
+                        auto keep_state = state;
+                        asio::post(keep_state->exec, [keep_state]() mutable {
+                            auto completion = std::move(keep_state->done);
+                            if (completion) {
+                                std::move(completion)(make_error_code(asio::error::operation_aborted), Response{});
+                            }
+                        });
+                    }
                 };
                 auto state = std::make_shared<State>();
+                state->exec = keep->m_executor;
+                auto caller_slot = asio::get_associated_cancellation_slot(handler);
                 state->done = std::move(handler);
-                state->timer = std::make_shared<asio::steady_timer>(keep->m_executor);
-                state->timer->expires_after(overall);
-                auto finish = [state](error_code ec, Response response) {
-                    if (state->finished) {
-                        return;
-                    }
-                    state->finished = true;
-                    state->timer->cancel();
-                    auto completion = std::move(state->done);
-                    std::move(completion)(ec, std::move(response));
+                if (caller_slot.is_connected()) {
+                    caller_slot.template emplace<CallerCancel>(CallerCancel{state});
+                }
+                if (overall.count() > 0) {
+                    state->timer = std::make_shared<asio::steady_timer>(keep->m_executor);
+                    state->timer->expires_after(overall);
+                    state->timer->async_wait([state](error_code ec) {
+                        if (ec || state->finished) {
+                            return;
+                        }
+                        state->cancel->cancelled = true;
+                        if (state->cancel->stream) {
+                            state->cancel->stream->async_cancel(asio::detached);
+                            state->cancel->stream.reset();
+                        } else if (state->cancel->abort_transport) {
+                            auto abort = std::move(state->cancel->abort_transport);
+                            abort();
+                        }
+                        state->finish(make_error_code(client_errc::request_timeout), Response{});
+                    });
+                }
+                auto finish = [state](error_code ec, Response response) mutable {
+                    state->finish(ec, std::move(response));
                 };
-                state->timer->async_wait([state, finish](error_code ec) mutable {
-                    if (ec || state->finished) {
-                        return;
-                    }
-                    state->cancel->cancelled = true;
-                    if (state->cancel->stream) {
-                        state->cancel->stream->async_cancel(asio::detached);
-                        state->cancel->stream.reset();
-                    }
-                    finish(make_error_code(client_errc::request_timeout), Response{});
-                });
-                keep->send_hop(std::move(request), std::move(url), max_body_bytes, 0, 0, response_head_timeout,
-                               body_idle_timeout, effective, state->cancel,
-                               [finish](error_code ec, Response response) mutable { finish(ec, std::move(response)); });
-            },
+                    keep->send_hop(std::move(request), std::move(url), max_body_bytes, 0, 0, response_head_timeout,
+                                   body_idle_timeout, effective, state->cancel,
+                                   [finish](error_code ec, Response response) mutable {
+                                       finish(ec, std::move(response));
+                                   });
+                },
+                keep->m_executor),
             token);
     }
 
@@ -569,9 +648,59 @@ class Client : public std::enable_shared_from_this<Client> {
     template <typename Token> auto async_open_websocket(std::string url, WebSocketSpec spec, Token &&token) {
         auto keep = keep_alive();
         return asio::async_initiate<Token, void(error_code, std::shared_ptr<WebSocket>)>(
-            [keep, url = std::move(url), spec = std::move(spec)](auto handler) mutable {
-                keep->open_ws_hop(std::move(url), std::move(spec), std::move(handler));
-            },
+            detail::make_executor_initiation(
+                [keep, url = std::move(url), spec = std::move(spec)](auto handler) mutable {
+                using Done = asio::any_completion_handler<void(error_code, std::shared_ptr<WebSocket>)>;
+                struct State {
+                    Done done;
+                    std::shared_ptr<detail::HopCancel> cancel{std::make_shared<detail::HopCancel>()};
+                    asio::any_io_executor exec;
+                    bool finished{false};
+
+                    void finish(error_code ec, std::shared_ptr<WebSocket> ws) {
+                        if (finished) {
+                            return;
+                        }
+                        finished = true;
+                        auto completion = std::move(done);
+                        std::move(completion)(ec, std::move(ws));
+                    }
+                };
+                struct CallerCancel {
+                    std::shared_ptr<State> state;
+
+                    void operator()(asio::cancellation_type_t type) {
+                        if (!is_terminal_cancel(type) || state->finished) {
+                            return;
+                        }
+                        state->finished = true;
+                        state->cancel->cancelled = true;
+                        if (state->cancel->abort_transport) {
+                            auto abort = std::move(state->cancel->abort_transport);
+                            abort();
+                        }
+                        auto keep_state = state;
+                        asio::post(keep_state->exec, [keep_state]() mutable {
+                            auto completion = std::move(keep_state->done);
+                            if (completion) {
+                                std::move(completion)(make_error_code(asio::error::operation_aborted), nullptr);
+                            }
+                        });
+                    }
+                };
+                auto state = std::make_shared<State>();
+                state->exec = keep->m_executor;
+                auto caller_slot = asio::get_associated_cancellation_slot(handler);
+                state->done = std::move(handler);
+                if (caller_slot.is_connected()) {
+                    caller_slot.template emplace<CallerCancel>(CallerCancel{state});
+                }
+                    keep->open_ws_hop(std::move(url), std::move(spec), state->cancel,
+                                      [state](error_code ec, std::shared_ptr<WebSocket> ws) mutable {
+                                          state->finish(ec, std::move(ws));
+                                      });
+                },
+                keep->m_executor),
             token);
     }
 
@@ -581,9 +710,62 @@ class Client : public std::enable_shared_from_this<Client> {
     auto async_open_stream(std::string url, StreamSpec spec, std::size_t max_body_bytes, Token &&token) const {
         auto keep = keep_alive();
         return asio::async_initiate<Token, void(error_code, std::shared_ptr<Stream>)>(
-            [keep, url = std::move(url), spec = std::move(spec), max_body_bytes](auto handler) mutable {
-                keep->open_stream_hop(std::move(url), std::move(spec), max_body_bytes, std::move(handler));
-            },
+            detail::make_executor_initiation(
+                [keep, url = std::move(url), spec = std::move(spec), max_body_bytes](auto handler) mutable {
+                using Done = asio::any_completion_handler<void(error_code, std::shared_ptr<Stream>)>;
+                struct State {
+                    Done done;
+                    std::shared_ptr<detail::HopCancel> cancel{std::make_shared<detail::HopCancel>()};
+                    asio::any_io_executor exec;
+                    bool finished{false};
+
+                    void finish(error_code ec, std::shared_ptr<Stream> stream) {
+                        if (finished) {
+                            return;
+                        }
+                        finished = true;
+                        auto completion = std::move(done);
+                        std::move(completion)(ec, std::move(stream));
+                    }
+                };
+                struct CallerCancel {
+                    std::shared_ptr<State> state;
+
+                    void operator()(asio::cancellation_type_t type) {
+                        if (!is_terminal_cancel(type) || state->finished) {
+                            return;
+                        }
+                        state->finished = true;
+                        state->cancel->cancelled = true;
+                        if (state->cancel->stream) {
+                            state->cancel->stream->async_cancel(asio::detached);
+                            state->cancel->stream.reset();
+                        } else if (state->cancel->abort_transport) {
+                            auto abort = std::move(state->cancel->abort_transport);
+                            abort();
+                        }
+                        auto keep_state = state;
+                        asio::post(keep_state->exec, [keep_state]() mutable {
+                            auto completion = std::move(keep_state->done);
+                            if (completion) {
+                                std::move(completion)(make_error_code(asio::error::operation_aborted), nullptr);
+                            }
+                        });
+                    }
+                };
+                auto state = std::make_shared<State>();
+                state->exec = keep->m_executor;
+                auto caller_slot = asio::get_associated_cancellation_slot(handler);
+                state->done = std::move(handler);
+                if (caller_slot.is_connected()) {
+                    caller_slot.template emplace<CallerCancel>(CallerCancel{state});
+                }
+                    keep->open_stream_hop(std::move(url), std::move(spec), max_body_bytes, state->cancel,
+                                          [state](error_code ec, std::shared_ptr<Stream> stream) mutable {
+                                              state->finish(ec, std::move(stream));
+                                          });
+                },
+                keep->m_executor),
             token);
     }
 
@@ -597,6 +779,7 @@ class Client : public std::enable_shared_from_this<Client> {
                   std::shared_ptr<detail::HopCancel> cancel,
                   asio::any_completion_handler<void(error_code, Response)> done) const;
     void open_stream_hop(std::string url, StreamSpec spec, std::size_t max_body_bytes,
+                         std::shared_ptr<detail::HopCancel> cancel,
                          asio::any_completion_handler<void(error_code, std::shared_ptr<Stream>)> done) const;
     // `cancel` is the overall request_timeout's flag. The dial callbacks may run
     // after that timeout completed the caller and destroyed a stack Client, so
@@ -604,7 +787,7 @@ class Client : public std::enable_shared_from_this<Client> {
     void dial(const detail::Url &url, HttpVersionPolicy version, std::shared_ptr<detail::HopCancel> cancel,
               DialDone done) const;
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
-    void dial_h3(const detail::Url &url, DialDone done) const;
+    void dial_h3(const detail::Url &url, std::shared_ptr<detail::HopCancel> cancel, DialDone done) const;
 #endif
     void dial_via_proxy(const detail::Url &url, const ProxyConfig &proxy, HttpVersionPolicy version,
                         std::shared_ptr<detail::HopCancel> cancel, DialDone done) const;
@@ -623,19 +806,19 @@ class Client : public std::enable_shared_from_this<Client> {
     void tls_handshake_and_start(std::shared_ptr<Transport> transport, const detail::Url &url,
                                  HttpVersionPolicy version, std::shared_ptr<detail::HopCancel> cancel,
                                  DialDone done) const;
-    void open_ws_hop(std::string url, WebSocketSpec spec,
+    void open_ws_hop(std::string url, WebSocketSpec spec, std::shared_ptr<detail::HopCancel> cancel,
                      asio::any_completion_handler<void(error_code, std::shared_ptr<WebSocket>)> done) const;
     void open_ws_via_proxy(const detail::Url &url, const ProxyConfig &proxy, std::string path, std::string authority,
-                           WebSocketSpec spec,
+                           WebSocketSpec spec, std::shared_ptr<detail::HopCancel> cancel,
                            asio::any_completion_handler<void(error_code, std::shared_ptr<WebSocket>)> done) const;
     template <typename Transport>
     void begin_ws_upgrade(std::shared_ptr<Transport> transport, std::string authority, std::string path,
-                          WebSocketSpec spec,
+                          WebSocketSpec spec, std::shared_ptr<detail::HopCancel> cancel,
                           asio::any_completion_handler<void(error_code, std::shared_ptr<WebSocket>)> done) const;
     template <typename Transport>
     void
     ws_tls_handshake_and_start(std::shared_ptr<Transport> transport, std::string authority, std::string path,
-                               WebSocketSpec spec, std::string sni,
+                               WebSocketSpec spec, std::string sni, std::shared_ptr<detail::HopCancel> cancel,
                                asio::any_completion_handler<void(error_code, std::shared_ptr<WebSocket>)> done) const;
     // An owning reference to this Client when it is owned by a shared_ptr, or a
     // non-owning alias when it lives on the stack. Every asynchronous callback
@@ -883,6 +1066,9 @@ inline void Client::tls_handshake_and_start(std::shared_ptr<Transport> transport
     alpn_target.version = version;
     hs.alpn_wire = detail::alpn_wire_list(alpn_target, m_config.tls);
     auto self = keep_alive();
+    if (cancel) {
+        cancel->abort_transport = [transport] { transport->close(); };
+    }
     detail::async_tls_client_handshake_bounded(
         transport, hs, m_config.connect_timeout,
         [self, transport, url, version, cancel, done = std::move(done)](error_code hec) mutable {
@@ -1385,7 +1571,7 @@ inline void Client::dial(const detail::Url &url, HttpVersionPolicy version, std:
                          DialDone done) const {
     if (version == HttpVersionPolicy::Http3) {
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
-        dial_h3(url, std::move(done));
+        dial_h3(url, std::move(cancel), std::move(done));
         return;
 #else
         std::move(done)(make_error_code(client_errc::version_not_negotiated), nullptr);
@@ -1420,6 +1606,12 @@ inline void Client::dial(const detail::Url &url, HttpVersionPolicy version, std:
                 return;
             }
             auto socket = std::make_shared<asio::ip::tcp::socket>(self->m_executor);
+            if (cancel) {
+                cancel->abort_transport = [socket] {
+                    error_code ignored;
+                    socket->close(ignored);
+                };
+            }
             error_code option_ec;
             if (self->m_config.tcp_nodelay) {
                 socket->set_option(asio::ip::tcp::no_delay(true), option_ec);
@@ -1469,7 +1661,12 @@ inline void Client::dial(const detail::Url &url, HttpVersionPolicy version, std:
 }
 
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
-inline void Client::dial_h3(const detail::Url &url, DialDone done) const {
+inline void Client::dial_h3(const detail::Url &url, std::shared_ptr<detail::HopCancel> cancel,
+                            DialDone done) const {
+    if (cancel && cancel->cancelled) {
+        std::move(done)(make_error_code(asio::error::operation_aborted), nullptr);
+        return;
+    }
     if (!url.use_tls()) {
         // QUIC carries TLS 1.3 itself; there is no plain http:// form.
         std::move(done)(make_error_code(client_errc::version_not_negotiated), nullptr);
@@ -1500,8 +1697,13 @@ inline void Client::dial_h3(const detail::Url &url, DialDone done) const {
         // which takes its own reference) has been created. When the Client had
         // no context of its own, `context` above is a local that would otherwise
         // die as soon as dial_h3 returns; ConnectState only stores a raw pointer.
-        [context, done = std::move(done)](
+        [context, cancel, done = std::move(done)](
             error_code ec, std::shared_ptr<detail::Http3ClientSession<asio::any_io_executor>> session) mutable {
+            if (cancel && cancel->cancelled) {
+                // Dropping the completed session closes the QUIC connection.
+                std::move(done)(make_error_code(asio::error::operation_aborted), nullptr);
+                return;
+            }
             if (ec) {
                 std::move(done)(ec, nullptr);
                 return;
@@ -1531,6 +1733,12 @@ inline void Client::dial_via_proxy(const detail::Url &url, const ProxyConfig &pr
                 return;
             }
             auto socket = std::make_shared<asio::ip::tcp::socket>(self->m_executor);
+            if (cancel) {
+                cancel->abort_transport = [socket] {
+                    error_code ignored;
+                    socket->close(ignored);
+                };
+            }
             detail::async_connect_bounded(
                 socket, std::make_shared<std::vector<asio::ip::tcp::endpoint>>(std::move(endpoints)),
                 self->m_config.connect_timeout, self->m_executor,
@@ -1735,6 +1943,7 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
                     return;
                 }
                 cancel->stream = stream;
+                cancel->abort_transport = {};
             }
             detail::async_read_final_head_bounded(
                 stream, head_budget, client_errc::response_head_timeout,
@@ -1969,7 +2178,12 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
 
 inline void
 Client::open_stream_hop(std::string url, StreamSpec spec, std::size_t max_body_bytes,
+                        std::shared_ptr<detail::HopCancel> cancel,
                         asio::any_completion_handler<void(error_code, std::shared_ptr<Stream>)> done) const {
+    if (cancel && cancel->cancelled) {
+        std::move(done)(make_error_code(asio::error::operation_aborted), nullptr);
+        return;
+    }
     auto parsed = detail::parse_url(url);
     if (!parsed) {
         std::move(done)(parsed.error(), nullptr);
@@ -2003,19 +2217,32 @@ Client::open_stream_hop(std::string url, StreamSpec spec, std::size_t max_body_b
     const std::chrono::milliseconds continue_timeout = spec.continue_timeout;
     const HttpVersionPolicy version = spec.version ? *spec.version : m_config.default_version;
     auto self = keep_alive();
-    dial(target, version, nullptr,
+    dial(target, version, cancel,
          [self, request, max_body_bytes, decoding, head_timeout, idle_timeout, auto_continue, continue_timeout,
-          done = std::move(done)](error_code ec, std::shared_ptr<detail::ClientSession> session) mutable {
+          cancel, done = std::move(done)](error_code ec, std::shared_ptr<detail::ClientSession> session) mutable {
+             if (cancel && cancel->cancelled) {
+                 std::move(done)(make_error_code(asio::error::operation_aborted), nullptr);
+                 return;
+             }
              if (ec) {
                  std::move(done)(ec, nullptr);
                  return;
              }
              session->open_stream(request, [max_body_bytes, decoding, head_timeout, idle_timeout, auto_continue,
-                                            continue_timeout, done = std::move(done)](
+                                            continue_timeout, cancel, done = std::move(done)](
                                                error_code oec, std::shared_ptr<detail::ClientStream> stream) mutable {
                  if (oec) {
                      std::move(done)(oec, nullptr);
                      return;
+                 }
+                 if (cancel && cancel->cancelled) {
+                     stream->async_cancel(asio::detached);
+                     std::move(done)(make_error_code(asio::error::operation_aborted), nullptr);
+                     return;
+                 }
+                 if (cancel) {
+                     cancel->stream = stream;
+                     cancel->abort_transport = {};
                  }
                  auto wrapped = detail::maybe_decompressing_stream(std::move(stream), decoding, max_body_bytes);
                  std::move(done)(error_code{}, std::make_shared<Stream>(std::move(wrapped), head_timeout, idle_timeout,
@@ -2027,16 +2254,40 @@ Client::open_stream_hop(std::string url, StreamSpec spec, std::size_t max_body_b
 template <typename Transport>
 inline void
 Client::begin_ws_upgrade(std::shared_ptr<Transport> transport, std::string authority, std::string path,
-                         WebSocketSpec spec,
+                         WebSocketSpec spec, std::shared_ptr<detail::HopCancel> cancel,
                          asio::any_completion_handler<void(error_code, std::shared_ptr<WebSocket>)> done) const {
+    if (cancel && cancel->cancelled) {
+        transport->close();
+        std::move(done)(make_error_code(asio::error::operation_aborted), nullptr);
+        return;
+    }
+    if (cancel) {
+        cancel->abort_transport = [transport] { transport->close(); };
+    }
     detail::async_ws_upgrade(std::move(transport), std::move(authority), std::move(path), std::move(spec),
-                             m_config.idle_timeout, m_config.response_head_timeout, std::move(done));
+                             m_config.idle_timeout, m_config.response_head_timeout,
+                             [cancel, done = std::move(done)](error_code ec,
+                                                              std::shared_ptr<WebSocket> ws) mutable {
+                                 if (cancel) {
+                                     cancel->abort_transport = {};
+                                 }
+                                 std::move(done)(ec, std::move(ws));
+                             });
 }
 
 template <typename Transport>
 inline void Client::ws_tls_handshake_and_start(
     std::shared_ptr<Transport> transport, std::string authority, std::string path, WebSocketSpec spec, std::string sni,
+    std::shared_ptr<detail::HopCancel> cancel,
     asio::any_completion_handler<void(error_code, std::shared_ptr<WebSocket>)> done) const {
+    if (cancel && cancel->cancelled) {
+        transport->close();
+        std::move(done)(make_error_code(asio::error::operation_aborted), nullptr);
+        return;
+    }
+    if (cancel) {
+        cancel->abort_transport = [transport] { transport->close(); };
+    }
     detail::ClientTlsHandshake hs;
     hs.sni = std::move(sni);
     hs.verify_host = m_config.tls.verify_host;
@@ -2045,22 +2296,31 @@ inline void Client::ws_tls_handshake_and_start(
     auto self = keep_alive();
     detail::async_tls_client_handshake_bounded(
         transport, hs, m_config.connect_timeout,
-        [self, transport, authority = std::move(authority), path = std::move(path), spec = std::move(spec),
+        [self, transport, authority = std::move(authority), path = std::move(path), spec = std::move(spec), cancel,
          done = std::move(done)](error_code hec) mutable {
+            if (cancel && cancel->cancelled) {
+                transport->close();
+                std::move(done)(make_error_code(asio::error::operation_aborted), nullptr);
+                return;
+            }
             if (hec) {
                 transport->close();
                 std::move(done)(hec, nullptr);
                 return;
             }
-            self->begin_ws_upgrade(std::move(transport), std::move(authority), std::move(path), std::move(spec),
+            self->begin_ws_upgrade(std::move(transport), std::move(authority), std::move(path), std::move(spec), cancel,
                                    std::move(done));
         });
 }
 
 inline void
 Client::open_ws_via_proxy(const detail::Url &url, const ProxyConfig &proxy, std::string path, std::string authority,
-                          WebSocketSpec spec,
+                          WebSocketSpec spec, std::shared_ptr<detail::HopCancel> cancel,
                           asio::any_completion_handler<void(error_code, std::shared_ptr<WebSocket>)> done) const {
+    if (cancel && cancel->cancelled) {
+        std::move(done)(make_error_code(asio::error::operation_aborted), nullptr);
+        return;
+    }
     auto self = keep_alive();
     // Resolving and connecting to the proxy goes through the same bounded
     // helpers and socket options as a direct dial: otherwise a custom
@@ -2068,8 +2328,12 @@ Client::open_ws_via_proxy(const detail::Url &url, const ProxyConfig &proxy, std:
     // silently ignored for wss:// over a proxy.
     detail::async_resolve_bounded(
         m_config.resolve, proxy.host, proxy.effective_port(), m_executor, m_config.connect_timeout,
-        [self, url, proxy, path, authority, spec,
+        [self, url, proxy, path, authority, spec, cancel,
          done = std::move(done)](error_code ec, std::vector<asio::ip::tcp::endpoint> endpoints) mutable {
+            if (cancel && cancel->cancelled) {
+                std::move(done)(make_error_code(asio::error::operation_aborted), nullptr);
+                return;
+            }
             if (ec) {
                 std::move(done)(ec, nullptr);
                 return;
@@ -2079,6 +2343,12 @@ Client::open_ws_via_proxy(const detail::Url &url, const ProxyConfig &proxy, std:
                 return;
             }
             auto socket = std::make_shared<asio::ip::tcp::socket>(self->m_executor);
+            if (cancel) {
+                cancel->abort_transport = [socket] {
+                    error_code ignored;
+                    socket->close(ignored);
+                };
+            }
             error_code option_ec;
             if (self->m_config.tcp_nodelay) {
                 socket->set_option(asio::ip::tcp::no_delay(true), option_ec);
@@ -2095,15 +2365,25 @@ Client::open_ws_via_proxy(const detail::Url &url, const ProxyConfig &proxy, std:
             detail::async_connect_bounded(
                 socket, std::make_shared<std::vector<asio::ip::tcp::endpoint>>(std::move(endpoints)),
                 self->m_config.connect_timeout, self->m_executor,
-                [self, url, proxy, path, authority, spec, socket,
+                [self, url, proxy, path, authority, spec, socket, cancel,
                  done = std::move(done)](error_code cec, asio::ip::tcp::endpoint peer) mutable {
+                    if (cancel && cancel->cancelled) {
+                        std::move(done)(make_error_code(asio::error::operation_aborted), nullptr);
+                        return;
+                    }
                     if (cec) {
                         std::move(done)(cec, nullptr);
                         return;
                     }
                     if (proxy.kind != ProxyKind::Https) {
-                        auto after_tunnel = [self, url, socket, peer, path, authority, spec,
+                        auto after_tunnel = [self, url, socket, peer, path, authority, spec, cancel,
                                              done = std::move(done)](error_code tec) mutable {
+                            if (cancel && cancel->cancelled) {
+                                error_code ignored;
+                                socket->close(ignored);
+                                std::move(done)(make_error_code(asio::error::operation_aborted), nullptr);
+                                return;
+                            }
                             if (tec) {
                                 error_code ignored;
                                 socket->close(ignored);
@@ -2112,7 +2392,7 @@ Client::open_ws_via_proxy(const detail::Url &url, const ProxyConfig &proxy, std:
                             }
                             if (!url.use_tls()) {
                                 self->begin_ws_upgrade(std::make_shared<TcpStreamTransport>(socket, peer),
-                                                       std::move(authority), std::move(path), std::move(spec),
+                                                       std::move(authority), std::move(path), std::move(spec), cancel,
                                                        std::move(done));
                                 return;
                             }
@@ -2129,7 +2409,7 @@ Client::open_ws_via_proxy(const detail::Url &url, const ProxyConfig &proxy, std:
                                                                                                      *context);
                             self->ws_tls_handshake_and_start(std::make_shared<TlsStreamTransport>(stream, peer),
                                                              std::move(authority), std::move(path), std::move(spec),
-                                                             url.host, std::move(done));
+                                                             url.host, cancel, std::move(done));
                         };
                         detail::async_proxy_tunnel_bounded(
                             self->m_executor, self->m_config.connect_timeout,
@@ -2167,15 +2447,26 @@ Client::open_ws_via_proxy(const detail::Url &url, const ProxyConfig &proxy, std:
                     hs.alpn_wire = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
                     detail::async_tls_client_handshake_bounded(
                         proxy_transport, hs, self->m_config.connect_timeout,
-                        [self, url, proxy, proxy_transport, inner, peer, path, authority, spec,
+                        [self, url, proxy, proxy_transport, inner, peer, path, authority, spec, cancel,
                          done = std::move(done)](error_code hec) mutable {
+                            if (cancel && cancel->cancelled) {
+                                proxy_transport->close();
+                                std::move(done)(make_error_code(asio::error::operation_aborted), nullptr);
+                                return;
+                            }
                             if (hec) {
                                 proxy_transport->close();
                                 std::move(done)(hec, nullptr);
                                 return;
                             }
-                            auto after_tunnel = [self, url, inner, peer, path, authority, spec,
+                            auto after_tunnel = [self, url, inner, peer, path, authority, spec, cancel,
                                                  done = std::move(done)](error_code tec) mutable {
+                                if (cancel && cancel->cancelled) {
+                                    error_code ignored;
+                                    inner->lowest_layer().close(ignored);
+                                    std::move(done)(make_error_code(asio::error::operation_aborted), nullptr);
+                                    return;
+                                }
                                 if (tec) {
                                     error_code ignored;
                                     inner->lowest_layer().close(ignored);
@@ -2184,7 +2475,7 @@ Client::open_ws_via_proxy(const detail::Url &url, const ProxyConfig &proxy, std:
                                 }
                                 if (!url.use_tls()) {
                                     self->begin_ws_upgrade(std::make_shared<TlsStreamTransport>(inner, peer),
-                                                           std::move(authority), std::move(path), std::move(spec),
+                                                           std::move(authority), std::move(path), std::move(spec), cancel,
                                                            std::move(done));
                                     return;
                                 }
@@ -2202,7 +2493,7 @@ Client::open_ws_via_proxy(const detail::Url &url, const ProxyConfig &proxy, std:
                                         std::move(*inner), *context);
                                 self->ws_tls_handshake_and_start(std::make_shared<NestedTlsTransport>(outer, peer),
                                                                  std::move(authority), std::move(path), std::move(spec),
-                                                                 url.host, std::move(done));
+                                                                 url.host, cancel, std::move(done));
                             };
                             detail::async_proxy_tunnel_bounded(
                                 self->m_executor, self->m_config.connect_timeout,
@@ -2223,8 +2514,12 @@ Client::open_ws_via_proxy(const detail::Url &url, const ProxyConfig &proxy, std:
         });
 }
 
-inline void Client::open_ws_hop(std::string url, WebSocketSpec spec,
+inline void Client::open_ws_hop(std::string url, WebSocketSpec spec, std::shared_ptr<detail::HopCancel> cancel,
                                 asio::any_completion_handler<void(error_code, std::shared_ptr<WebSocket>)> done) const {
+    if (cancel && cancel->cancelled) {
+        std::move(done)(make_error_code(asio::error::operation_aborted), nullptr);
+        return;
+    }
     std::string http_url = url;
     if (starts_with(url, "wss://")) {
         http_url = "https://" + url.substr(6);
@@ -2249,7 +2544,8 @@ inline void Client::open_ws_hop(std::string url, WebSocketSpec spec,
         return;
     }
     if (*selection) {
-        open_ws_via_proxy(target, **selection, path, authority, std::move(spec), std::move(done));
+        open_ws_via_proxy(target, **selection, path, authority, std::move(spec), std::move(cancel),
+                          std::move(done));
         return;
     }
 
@@ -2261,8 +2557,12 @@ inline void Client::open_ws_hop(std::string url, WebSocketSpec spec,
     // silently ignored on this path.
     detail::async_resolve_bounded(
         m_config.resolve, target.host, target.effective_port(), m_executor, m_config.connect_timeout,
-        [self, target, path, authority, spec,
+        [self, target, path, authority, spec, cancel,
          done = std::move(done)](error_code ec, std::vector<asio::ip::tcp::endpoint> endpoints) mutable {
+            if (cancel && cancel->cancelled) {
+                std::move(done)(make_error_code(asio::error::operation_aborted), nullptr);
+                return;
+            }
             if (ec) {
                 std::move(done)(ec, nullptr);
                 return;
@@ -2272,6 +2572,12 @@ inline void Client::open_ws_hop(std::string url, WebSocketSpec spec,
                 return;
             }
             auto socket = std::make_shared<asio::ip::tcp::socket>(self->m_executor);
+            if (cancel) {
+                cancel->abort_transport = [socket] {
+                    error_code ignored;
+                    socket->close(ignored);
+                };
+            }
             error_code option_ec;
             if (self->m_config.tcp_nodelay) {
                 socket->set_option(asio::ip::tcp::no_delay(true), option_ec);
@@ -2288,15 +2594,19 @@ inline void Client::open_ws_hop(std::string url, WebSocketSpec spec,
             detail::async_connect_bounded(
                 socket, std::make_shared<std::vector<asio::ip::tcp::endpoint>>(std::move(endpoints)),
                 self->m_config.connect_timeout, self->m_executor,
-                [self, target, path, authority, spec, socket,
+                [self, target, path, authority, spec, socket, cancel,
                  done = std::move(done)](error_code cec, asio::ip::tcp::endpoint peer) mutable {
+                    if (cancel && cancel->cancelled) {
+                        std::move(done)(make_error_code(asio::error::operation_aborted), nullptr);
+                        return;
+                    }
                     if (cec) {
                         std::move(done)(cec, nullptr);
                         return;
                     }
                     if (!target.use_tls()) {
                         self->begin_ws_upgrade(std::make_shared<TcpStreamTransport>(socket, peer), std::move(authority),
-                                               std::move(path), std::move(spec), std::move(done));
+                                               std::move(path), std::move(spec), cancel, std::move(done));
                         return;
                     }
                     auto context = self->m_tls_context;
@@ -2314,7 +2624,7 @@ inline void Client::open_ws_hop(std::string url, WebSocketSpec spec,
                     const auto endpoint = stream->lowest_layer().remote_endpoint(ep_ec);
                     auto transport = std::make_shared<TlsStreamTransport>(stream, endpoint);
                     self->ws_tls_handshake_and_start(std::move(transport), std::move(authority), std::move(path),
-                                                     std::move(spec), target.host, std::move(done));
+                                                     std::move(spec), target.host, cancel, std::move(done));
                 });
         });
 }

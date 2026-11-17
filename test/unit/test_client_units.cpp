@@ -1,8 +1,11 @@
 // client/: the pure parts — URL parsing, targets and policy, the TLS knobs that
 // can be checked without a handshake, the h2c settings payload, error codes.
 
+#include <boost/asio/cancel_after.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
+#include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -12,6 +15,7 @@
 using namespace simple_http;
 using namespace simple_http::detail;
 using namespace simple_http::test;
+using namespace std::chrono_literals;
 
 // --- URL parsing -------------------------------------------------------------
 
@@ -393,4 +397,323 @@ TEST_CASE("client/retry: Retry-After parses seconds and HTTP dates", "[client][r
     const auto parsed = retry_after_delay(http_date(in_five));
     CHECK(parsed >= std::chrono::seconds{4});
     CHECK(parsed <= std::chrono::seconds{5});
+}
+
+// --- cancellation (caller-supplied slots) ------------------------------------
+
+namespace {
+
+// A stream whose read/head waits until the handler's cancellation slot fires.
+// This models the h1/h2/h3 streams, which all complete a pending op with
+// operation_aborted when the caller cancels it.
+class ParkingClientStream final : public ClientStream {
+  public:
+    explicit ParkingClientStream(asio::any_io_executor ex) : m_executor(std::move(ex)) {}
+
+    void write(std::string, WriteCompletion done) override {
+        std::move(done)(make_error_code(client_errc::body_not_streaming));
+    }
+    void finish(std::string, WriteCompletion done) override {
+        std::move(done)(make_error_code(client_errc::body_not_streaming));
+    }
+    void read(ReadCompletion done) override { park(std::move(done)); }
+    void cancel(WriteCompletion done) override { std::move(done)(error_code{}); }
+    void await_head(WriteCompletion done) override { park_head(std::move(done)); }
+    bool finished() const override { return false; }
+    Version version() const override { return Version::Http11; }
+    std::uint32_t id() const override { return 1; }
+    asio::any_io_executor head_executor() const override { return m_executor; }
+
+  private:
+    struct CancelRead {
+        ReadCompletion done;
+        asio::any_io_executor exec;
+        void operator()(asio::cancellation_type_t type) {
+            if (!is_terminal_cancel(type)) {
+                return;
+            }
+            auto ex = exec;
+            asio::post(ex, [done = std::move(done)]() mutable {
+                if (done) {
+                    std::move(done)(make_error_code(asio::error::operation_aborted), ReadResult{});
+                }
+            });
+        }
+    };
+    struct CancelHead {
+        WriteCompletion done;
+        asio::any_io_executor exec;
+        void operator()(asio::cancellation_type_t type) {
+            if (!is_terminal_cancel(type)) {
+                return;
+            }
+            auto ex = exec;
+            asio::post(ex, [done = std::move(done)]() mutable {
+                if (done) {
+                    std::move(done)(make_error_code(asio::error::operation_aborted));
+                }
+            });
+        }
+    };
+
+    void park(ReadCompletion done) {
+        auto slot = asio::get_associated_cancellation_slot(done);
+        if (slot.is_connected()) {
+            slot.template emplace<CancelRead>(CancelRead{std::move(done), m_executor});
+        }
+    }
+    void park_head(WriteCompletion done) {
+        auto slot = asio::get_associated_cancellation_slot(done);
+        if (slot.is_connected()) {
+            slot.template emplace<CancelHead>(CancelHead{std::move(done), m_executor});
+        }
+    }
+
+    asio::any_io_executor m_executor;
+};
+
+// A transport whose writes park until completed or cancelled, so a handler can
+// be observed while inside the real h1 client session.
+class ParkedWriteClientTransport {
+  public:
+    explicit ParkedWriteClientTransport(asio::any_io_executor ex) : m_executor(std::move(ex)) {}
+
+    template <typename Token> auto async_read_some(ByteSpan, Token &&token) {
+        auto initiation = [](auto handler) { std::move(handler)(make_error_code(asio::error::eof), 0); };
+        return asio::async_initiate<Token, void(error_code, std::size_t)>(
+            ExecInit<decltype(initiation)>{std::move(initiation), m_executor}, token);
+    }
+
+    template <typename Token> auto async_write(ConstByteSpan buffer, Token &&token) {
+        auto size = buffer.size();
+        auto initiation = [this, size](auto handler) {
+            auto state = std::make_shared<WriteState>();
+            state->exec = m_executor;
+            state->done = asio::any_completion_handler<void(error_code, std::size_t)>(std::move(handler));
+            auto slot = asio::get_associated_cancellation_slot(state->done);
+            if (slot.is_connected()) {
+                slot.template emplace<CancelWrite>(CancelWrite{state});
+            }
+            m_pending = std::move(state);
+            (void)size;
+        };
+        return asio::async_initiate<Token, void(error_code, std::size_t)>(
+            ExecInit<decltype(initiation)>{std::move(initiation), m_executor}, token);
+    }
+
+    template <typename Token> auto async_write_seq(boost::span<const ConstByteSpan> buffers, Token &&token) {
+        std::size_t total = 0;
+        for (const auto &buffer : buffers) {
+            total += buffer.size();
+        }
+        auto initiation = [this, total](auto handler) {
+            auto state = std::make_shared<WriteState>();
+            state->exec = m_executor;
+            state->done = asio::any_completion_handler<void(error_code, std::size_t)>(std::move(handler));
+            auto slot = asio::get_associated_cancellation_slot(state->done);
+            if (slot.is_connected()) {
+                slot.template emplace<CancelWrite>(CancelWrite{state});
+            }
+            m_pending = std::move(state);
+            (void)total;
+        };
+        return asio::async_initiate<Token, void(error_code, std::size_t)>(
+            ExecInit<decltype(initiation)>{std::move(initiation), m_executor}, token);
+    }
+
+    auto get_executor() const { return m_executor; }
+    asio::ip::tcp::endpoint peer() const { return {}; }
+    SslHandle tls_handle() const { return std::nullopt; }
+    bool closed() const { return m_closed; }
+    bool has_pending() const { return m_pending && !m_pending->finished; }
+
+    void complete_current(error_code ec) {
+        if (m_pending) {
+            auto state = std::move(m_pending);
+            state->finish(ec, 0);
+        }
+    }
+
+    template <typename Token> auto async_shutdown(Token &&token) {
+        auto initiation = [](auto handler) { std::move(handler)(error_code{}); };
+        return asio::async_initiate<Token, void(error_code)>(
+            ExecInit<decltype(initiation)>{std::move(initiation), m_executor}, token);
+    }
+
+    void close() {
+        if (m_closed) {
+            return;
+        }
+        m_closed = true;
+        complete_current(make_error_code(asio::error::operation_aborted));
+    }
+
+  private:
+    struct WriteState {
+        asio::any_completion_handler<void(error_code, std::size_t)> done;
+        asio::any_io_executor exec;
+        bool finished{false};
+
+        void finish(error_code ec, std::size_t n) {
+            if (finished) {
+                return;
+            }
+            finished = true;
+            auto completion = std::move(done);
+            if (completion) {
+                std::move(completion)(ec, n);
+            }
+        }
+    };
+    struct CancelWrite {
+        std::shared_ptr<WriteState> state;
+        void operator()(asio::cancellation_type_t type) {
+            if (!is_terminal_cancel(type)) {
+                return;
+            }
+            auto state_keep = state;
+            asio::post(state_keep->exec, [state_keep]() mutable {
+                state_keep->finish(make_error_code(asio::error::operation_aborted), 0);
+            });
+        }
+    };
+
+    asio::any_io_executor m_executor;
+    std::shared_ptr<WriteState> m_pending;
+    bool m_closed{false};
+};
+
+// Resolves only after a delay, giving a caller deadline time to win first.
+ResolveFn delayed_resolve(std::chrono::milliseconds delay) {
+    return [delay](std::string, std::uint16_t, asio::any_io_executor ex, ResolveCompletion done) {
+        auto timer = std::make_shared<asio::steady_timer>(ex);
+        timer->expires_after(delay);
+        timer->async_wait([timer, done = std::move(done)](error_code ec) mutable {
+            if (!ec) {
+                std::move(done)(error_code{}, std::vector<asio::ip::tcp::endpoint>{});
+            }
+        });
+    };
+}
+
+} // namespace
+
+TEST_CASE("client cancel: Stream::async_read honours the caller's slot", "[client][cancel]") {
+    asio::io_context ctx;
+    auto inner = std::make_shared<ParkingClientStream>(ctx.get_executor());
+    Stream stream{inner};
+
+    std::optional<error_code> out;
+    REQUIRE(run_on(ctx, [&]() -> asio::awaitable<void> {
+        auto [ec, result] = co_await stream.async_read(asio::cancel_after(30ms, asio::as_tuple(asio::use_awaitable)));
+        out = ec;
+    }()));
+    REQUIRE(out.has_value());
+    CHECK(*out == asio::error::operation_aborted);
+}
+
+TEST_CASE("client cancel: Stream::async_read_head honours the caller's slot", "[client][cancel]") {
+    asio::io_context ctx;
+    auto inner = std::make_shared<ParkingClientStream>(ctx.get_executor());
+    Stream stream{inner};
+
+    std::optional<error_code> out;
+    REQUIRE(run_on(ctx, [&]() -> asio::awaitable<void> {
+        auto [ec, head] =
+            co_await stream.async_read_head(asio::cancel_after(30ms, asio::as_tuple(asio::use_awaitable)));
+        out = ec;
+    }()));
+    REQUIRE(out.has_value());
+    CHECK(*out == asio::error::operation_aborted);
+}
+
+TEST_CASE("client cancel: h1 stream write aborts with the caller's deadline", "[client][cancel]") {
+    asio::io_context ctx;
+    using Session = Http1ClientSession<ParkedWriteClientTransport>;
+    auto transport = std::make_shared<ParkedWriteClientTransport>(ctx.get_executor());
+    auto session = std::make_shared<Session>(transport, "example.com", EngineLimits{});
+
+    auto request = std::make_shared<Request>(Version::Http11, ctx.get_executor());
+    request->set_method(Method::Post);
+    request->set_target("/upload");
+    request->set_stream_body(true);
+
+    std::shared_ptr<ClientStream> inner;
+    session->open_stream(request, [&inner](error_code ec, std::shared_ptr<ClientStream> s) {
+        if (!ec) {
+            inner = std::move(s);
+        }
+    });
+    ctx.run_for(50ms);
+    REQUIRE(transport->has_pending()); // the request head is parked
+    transport->complete_current(error_code{});
+    ctx.restart();
+    ctx.run_for(50ms);
+    REQUIRE(inner);
+
+    Stream stream{inner};
+    std::optional<error_code> out;
+    REQUIRE(run_on(ctx, [&]() -> asio::awaitable<void> {
+        auto [ec] = co_await stream.async_write("chunk", asio::cancel_after(30ms, asio::as_tuple(asio::use_awaitable)));
+        out = ec;
+    }()));
+    REQUIRE(out.has_value());
+    CHECK(*out == asio::error::operation_aborted);
+    CHECK(transport->closed());
+}
+
+TEST_CASE("client cancel: send(cancel_after) aborts during dial", "[client][cancel]") {
+    asio::io_context ctx;
+    ClientConfig cfg;
+    cfg.proxy_from_env = false;
+    cfg.request_timeout = std::chrono::seconds(30);
+    cfg.connect_timeout = std::chrono::seconds(30);
+    cfg.response_head_timeout = std::chrono::seconds(30);
+    cfg.resolve = delayed_resolve(200ms);
+
+    Client client{ctx.get_executor(), cfg};
+    std::optional<error_code> out;
+    REQUIRE(run_on(ctx, [&]() -> asio::awaitable<void> {
+        auto [ec, response] = co_await client.get("http://example.com/")
+                                  .send(asio::cancel_after(50ms, asio::as_tuple(asio::use_awaitable)));
+        out = ec;
+    }()));
+    REQUIRE(out.has_value());
+    CHECK(*out == asio::error::operation_aborted);
+}
+
+TEST_CASE("client cancel: open_stream(cancel_after) aborts during dial", "[client][cancel]") {
+    asio::io_context ctx;
+    ClientConfig cfg;
+    cfg.proxy_from_env = false;
+    cfg.connect_timeout = std::chrono::seconds(30);
+    cfg.resolve = delayed_resolve(200ms);
+
+    Client client{ctx.get_executor(), cfg};
+    std::optional<error_code> out;
+    REQUIRE(run_on(ctx, [&]() -> asio::awaitable<void> {
+        auto [ec, stream] = co_await client.async_open_stream(
+            "http://example.com/", StreamSpec{}, 0, asio::cancel_after(50ms, asio::as_tuple(asio::use_awaitable)));
+        out = ec;
+    }()));
+    REQUIRE(out.has_value());
+    CHECK(*out == asio::error::operation_aborted);
+}
+
+TEST_CASE("client cancel: open_websocket(cancel_after) aborts during dial", "[client][cancel]") {
+    asio::io_context ctx;
+    ClientConfig cfg;
+    cfg.proxy_from_env = false;
+    cfg.connect_timeout = std::chrono::seconds(30);
+    cfg.resolve = delayed_resolve(200ms);
+
+    Client client{ctx.get_executor(), cfg};
+    std::optional<error_code> out;
+    REQUIRE(run_on(ctx, [&]() -> asio::awaitable<void> {
+        auto [ec, ws] = co_await client.async_open_websocket(
+            "ws://example.com/chat", WebSocketSpec{}, asio::cancel_after(50ms, asio::as_tuple(asio::use_awaitable)));
+        out = ec;
+    }()));
+    REQUIRE(out.has_value());
+    CHECK(*out == asio::error::operation_aborted);
 }

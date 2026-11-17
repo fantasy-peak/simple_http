@@ -559,6 +559,10 @@ auto ws = co_await client.async_open_websocket("wss://host/chat", WebSocketSpec{
   当前**未接线**。
 - HTTP/3 只在 `SIMPLE_HTTP_ENABLE_HTTP3` 下可用，且必须显式
   `HttpVersionPolicy::Http3` + `https://`；不支持代理、请求 trailers、1xx。
+- 取消：`send` / `async_open_stream` / `async_open_websocket` 以及
+  `Stream::async_read` / `async_read_head` / `async_write` 都绑定调用方的
+  cancellation slot。`asio::cancel_after` 可以在 DNS/dial/TLS/读/写任一阶段中止，
+  返回 `operation_aborted`。客户端取消不复用被中止的交换：写取消会关闭 transport。
 
 ### 4.7 数据与 OpenAPI
 
@@ -1155,6 +1159,12 @@ test/run.sh server-diff
 53. **h1 body 失败码要保持**：`BodyState::failure` 记录首个失败（取消/断开），
     失败后的读返回同一个错误而不是干净 `eof`；排队读不能把取消当成正常结束。
     `h1_engine.h` 的 `body_failed` / `pull_body_chunk_impl`。
+54. **客户端取消透传调用方槽**：`Client::async_send` / `async_open_stream` /
+    `async_open_websocket` 和 `Stream::read_head_with` / `read_with` 把 caller slot
+    转发给内层 dial/read；`HopCancel::abort_transport` 让 DNS/dial/TLS 阶段可被
+    timer 中止。完成必须 post 回调用方 executor，不能在 emit 内销毁
+    cancellation_state。`client/http.h`、`client/h1_client.h`；
+    `test/unit/test_client_units.cpp` 的 `[client][cancel]`。
 
 ---
 

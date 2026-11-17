@@ -261,64 +261,73 @@ class Http1ClientSession final : public ClientSession,
         m_current = stream;
 
         const bool has_upfront_body = m_spec->stream_body() || m_spec->content_length() >= 0;
+        auto caller_slot = asio::get_associated_cancellation_slot(done);
         if (!m_spec->stream_body() && !has_upfront_body) {
             auto bytes = std::make_shared<std::string>(std::move(head));
             auto self = this->shared_from_this();
-            m_transport->async_write(ConstByteSpan{reinterpret_cast<const std::byte *>(bytes->data()), bytes->size()},
-                                     [self, stream, bytes, done = std::move(done)](error_code ec, std::size_t) mutable {
-                                         if (ec) {
-                                             self->fail_exchange(ec);
-                                             std::move(done)(ec, nullptr);
-                                             return;
-                                         }
-                                         std::move(done)(error_code{}, stream);
-                                     });
+            m_transport->async_write(
+                ConstByteSpan{reinterpret_cast<const std::byte *>(bytes->data()), bytes->size()},
+                asio::bind_cancellation_slot(
+                    caller_slot,
+                    [self, stream, bytes, done = std::move(done)](error_code ec, std::size_t) mutable {
+                        if (ec) {
+                            self->fail_exchange(ec);
+                            std::move(done)(ec, nullptr);
+                            return;
+                        }
+                        std::move(done)(error_code{}, stream);
+                    }));
             return;
         }
         if (!m_spec->stream_body()) {
             auto self = this->shared_from_this();
-            m_spec->body().async_read_all([self, stream, head = std::move(head),
-                                           done = std::move(done)](error_code ec, std::string body) mutable {
-                if (ec) {
-                    self->release_exchange();
-                    std::move(done)(ec, nullptr);
-                    return;
-                }
-                std::string out = head;
-                if (!body.empty()) {
-                    if (self->m_request_chunked) {
-                        out += encode_chunk(body);
-                        out += "0\r\n\r\n";
-                    } else {
-                        out += body;
+            m_spec->body().async_read_all(asio::bind_cancellation_slot(
+                caller_slot, [self, stream, head = std::move(head), caller_slot,
+                              done = std::move(done)](error_code ec, std::string body) mutable {
+                    if (ec) {
+                        self->release_exchange();
+                        std::move(done)(ec, nullptr);
+                        return;
                     }
-                }
-                auto bytes = std::make_shared<std::string>(std::move(out));
-                self->m_transport->async_write(
-                    ConstByteSpan{reinterpret_cast<const std::byte *>(bytes->data()), bytes->size()},
-                    [self, stream, bytes, done = std::move(done)](error_code wec, std::size_t) mutable {
-                        if (wec) {
-                            self->fail_exchange(wec);
-                            std::move(done)(wec, nullptr);
-                            return;
+                    std::string out = head;
+                    if (!body.empty()) {
+                        if (self->m_request_chunked) {
+                            out += encode_chunk(body);
+                            out += "0\r\n\r\n";
+                        } else {
+                            out += body;
                         }
-                        std::move(done)(error_code{}, stream);
-                    });
-            });
+                    }
+                    auto bytes = std::make_shared<std::string>(std::move(out));
+                    self->m_transport->async_write(
+                        ConstByteSpan{reinterpret_cast<const std::byte *>(bytes->data()), bytes->size()},
+                        asio::bind_cancellation_slot(
+                            caller_slot,
+                            [self, stream, bytes, done = std::move(done)](error_code wec, std::size_t) mutable {
+                                if (wec) {
+                                    self->fail_exchange(wec);
+                                    std::move(done)(wec, nullptr);
+                                    return;
+                                }
+                                std::move(done)(error_code{}, stream);
+                            }));
+                }));
             return;
         }
 
         auto bytes = std::make_shared<std::string>(std::move(head));
         auto self = this->shared_from_this();
-        m_transport->async_write(ConstByteSpan{reinterpret_cast<const std::byte *>(bytes->data()), bytes->size()},
-                                 [self, stream, bytes, done = std::move(done)](error_code ec, std::size_t) mutable {
-                                     if (ec) {
-                                         self->fail_exchange(ec);
-                                         std::move(done)(ec, nullptr);
-                                         return;
-                                     }
-                                     std::move(done)(error_code{}, stream);
-                                 });
+        m_transport->async_write(
+            ConstByteSpan{reinterpret_cast<const std::byte *>(bytes->data()), bytes->size()},
+            asio::bind_cancellation_slot(
+                caller_slot, [self, stream, bytes, done = std::move(done)](error_code ec, std::size_t) mutable {
+                    if (ec) {
+                        self->fail_exchange(ec);
+                        std::move(done)(ec, nullptr);
+                        return;
+                    }
+                    std::move(done)(error_code{}, stream);
+                }));
     }
 
     // A field name must re-parse as the same token and a value must not carry a
@@ -458,13 +467,18 @@ class Http1ClientSession final : public ClientSession,
         }
         auto bytes = std::make_shared<std::string>(std::move(out));
         auto self = this->shared_from_this();
-        m_transport->async_write(ConstByteSpan{reinterpret_cast<const std::byte *>(bytes->data()), bytes->size()},
-                                 [self, bytes, done = std::move(done)](error_code ec, std::size_t) mutable {
-                                     if (ec) {
-                                         self->fail_exchange(ec);
-                                     }
-                                     std::move(done)(ec);
-                                 });
+        // A caller deadline must abort the socket write; the lambda would
+        // otherwise drop the completion's associated cancellation slot.
+        auto slot = asio::get_associated_cancellation_slot(done);
+        m_transport->async_write(
+            ConstByteSpan{reinterpret_cast<const std::byte *>(bytes->data()), bytes->size()},
+            asio::bind_cancellation_slot(slot, [self, bytes, done = std::move(done)](error_code ec,
+                                                                                    std::size_t) mutable {
+                if (ec) {
+                    self->fail_exchange(ec);
+                }
+                std::move(done)(ec);
+            }));
     }
 
     void do_exchange_write_trailers(Headers trailers, WriteCompletion done) {
@@ -498,13 +512,16 @@ class Http1ClientSession final : public ClientSession,
         m_request_finished = true; // the trailer terminator ends the request body
         auto bytes = std::make_shared<std::string>(std::move(out));
         auto self = this->shared_from_this();
-        m_transport->async_write(ConstByteSpan{reinterpret_cast<const std::byte *>(bytes->data()), bytes->size()},
-                                 [self, bytes, done = std::move(done)](error_code ec, std::size_t) mutable {
-                                     if (ec) {
-                                         self->fail_exchange(ec);
-                                     }
-                                     std::move(done)(ec);
-                                 });
+        auto slot = asio::get_associated_cancellation_slot(done);
+        m_transport->async_write(
+            ConstByteSpan{reinterpret_cast<const std::byte *>(bytes->data()), bytes->size()},
+            asio::bind_cancellation_slot(slot, [self, bytes, done = std::move(done)](error_code ec,
+                                                                                    std::size_t) mutable {
+                if (ec) {
+                    self->fail_exchange(ec);
+                }
+                std::move(done)(ec);
+            }));
     }
 
     // --- reading ---
