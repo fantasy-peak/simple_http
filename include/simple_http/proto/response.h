@@ -20,6 +20,7 @@
 #include <atomic>
 #include <boost/asio/any_completion_handler.hpp>
 #include <boost/asio/any_io_executor.hpp>
+#include <boost/asio/bind_executor.hpp>
 #include <boost/asio/compose.hpp>
 #include <chrono>
 #include <cstdint>
@@ -96,7 +97,7 @@ class ResponseWriter : public std::enable_shared_from_this<ResponseWriter> {
                 // Unbound writers (standalone tests) keep the historical
                 // same-thread initiation; a server-bound writer is reposted
                 // onto the connection executor.
-                if (managed && hop_to_owner(self, hopped)) {
+                if (managed && hop_to_owner(self, ex, hopped)) {
                     return;
                 }
                 if (self.cancelled() != asio::cancellation_type::none) {
@@ -158,7 +159,7 @@ class ResponseWriter : public std::enable_shared_from_this<ResponseWriter> {
 
         template <typename Self> void operator()(Self &self, error_code ec = {}, bool value = false) {
             if (!started) {
-                if (managed && hop_to_owner(self, hopped)) {
+                if (managed && hop_to_owner(self, ex, hopped)) {
                     return;
                 }
                 if (self.cancelled() != asio::cancellation_type::none) {
@@ -208,21 +209,27 @@ class ResponseWriter : public std::enable_shared_from_this<ResponseWriter> {
         return start_io(Lifecycle::Access::Any, std::forward<Fn>(fn), std::forward<Token>(token));
     }
 
+    // The sink's executor (the connection's owner executor for a server-bound
+    // writer) is bound to the token before composition, so the composed
+    // operation's associated executor -- used by every inner step and by the
+    // hop -- is the owner even if the caller bound something else to the token.
     template <typename Fn, typename Token>
     auto start_io(Lifecycle::Access access, Fn &&fn, Token &&token) {
         auto ex = m_writer->get_executor();
-        return asio::async_compose<Token, void(error_code)>(
+        auto bound = asio::bind_executor(ex, std::forward<Token>(token));
+        return asio::async_compose<decltype(bound), void(error_code)>(
             StartWriteOp<std::decay_t<Fn>>{weak_from_this(), this, m_life, m_life_managed, access, ex,
                                           std::forward<Fn>(fn)},
-            token, ex);
+            bound, ex);
     }
 
     template <typename Fn, typename Token> auto start_connected(Fn &&fn, Token &&token) const {
         auto ex = m_writer->get_executor();
-        return asio::async_compose<Token, void(error_code, bool)>(
+        auto bound = asio::bind_executor(ex, std::forward<Token>(token));
+        return asio::async_compose<decltype(bound), void(error_code, bool)>(
             StartConnectedOp<std::decay_t<Fn>>{weak_from_this(), this, m_life, m_life_managed, ex,
                                               std::forward<Fn>(fn)},
-            token, ex);
+            bound, ex);
     }
 
   public:

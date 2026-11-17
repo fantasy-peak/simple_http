@@ -1083,7 +1083,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         // open for the life of the session -- it only ends when the handler
         // closes the response -- so waiting here would deadlock instead of
         // merely serialising the body.
-        spawn_handler(stream_id);
+        post_spawn_handler(stream_id);
     }
 
     void on_data(std::int64_t stream_id, boost::span<const std::uint8_t> data) noexcept override {
@@ -1133,7 +1133,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
             (void)stream.request->body().finish();
         else
             stream.finish_pending = true; // drained by drain_paused()
-        spawn_handler(stream_id);
+        post_spawn_handler(stream_id);
     }
 
     void on_stream_closed(std::int64_t stream_id, std::uint64_t /*app_error_code*/) noexcept override {
@@ -1425,6 +1425,26 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         stream.headers_rejected = true;
         stream.reject_code = code;
         m_rejected_streams.push_back(stream_id);
+    }
+
+    // Dispatches the handler from an executor turn instead of from inside the
+    // nghttp3 callback that discovered the request head/END_STREAM.
+    //
+    // h3_callbacks.h states the invariant: a callback runs synchronously inside
+    // an nghttp3 call and must not call back into nghttp3. A handler that
+    // answers immediately (`co_await res->status(...).async_send(...)`) would,
+    // with inline dispatch, reach nghttp3_conn_submit_response while
+    // nghttp3_conn_read_stream2 is still on the stack. One turn of latency
+    // keeps "dispatch at HEADERS" (the body pump and END_STREAM handling do not
+    // depend on the handler running inside the callback).
+    void post_spawn_handler(std::int64_t stream_id) noexcept {
+        try {
+            auto self = this->shared_from_this();
+            asio::post(m_executor, [self, stream_id] { self->spawn_handler(stream_id); });
+        } catch (...) {
+            // Allocation failure: leave the stream to the connection's idle
+            // timeout rather than calling into nghttp3 from the callback.
+        }
     }
 
     void spawn_handler(std::int64_t stream_id) {

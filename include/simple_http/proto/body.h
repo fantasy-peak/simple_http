@@ -26,6 +26,7 @@
 
 #include <boost/asio/any_completion_handler.hpp>
 #include <boost/asio/any_io_executor.hpp>
+#include <boost/asio/bind_executor.hpp>
 #include <boost/asio/compose.hpp>
 #include <boost/asio/experimental/channel.hpp>
 #include <boost/asio/post.hpp>
@@ -236,7 +237,7 @@ struct BodyReadOp {
             // Unmanaged bodies (client requests and standalone tests) keep the
             // historical same-thread initiation; only a body bound to a server
             // lifecycle is reposted onto its owner executor.
-            if (managed && hop_to_owner(self, hopped)) {
+            if (managed && hop_to_owner(self, exec, hopped)) {
                 return;
             }
             if (self.cancelled() != asio::cancellation_type::none) {
@@ -449,7 +450,7 @@ struct BodyReadAllOp {
 
     template <typename Self> void operator()(Self &self, error_code ec = {}, ReadResult result = {}) {
         if (!started) {
-            if (managed && hop_to_owner(self, hopped)) {
+            if (managed && hop_to_owner(self, exec, hopped)) {
                 return;
             }
             if (self.cancelled() != asio::cancellation_type::none) {
@@ -506,14 +507,21 @@ struct BodyReadAllOp {
     }
 };
 
+// The object's executor is bound to the caller's token before composition.
+// composed_op::get_executor() (and therefore every inner step and the
+// hop_to_owner dispatch) resolves the token's associated executor; without this
+// binding a caller that bound a different executor to the token would run the
+// BodyState state machine off the connection thread (model A violation).
 template <typename Token> auto BodyState::async_read(Token &&token) {
-    return asio::async_compose<Token, void(error_code, ReadResult)>(
-        BodyReadOp{weak_from_this(), m_life, m_life_managed, m_exec}, token, m_exec);
+    auto bound = asio::bind_executor(m_exec, std::forward<Token>(token));
+    return asio::async_compose<decltype(bound), void(error_code, ReadResult)>(
+        BodyReadOp{weak_from_this(), m_life, m_life_managed, m_exec}, bound, m_exec);
 }
 
 template <typename Token> auto BodyState::async_read_all(Token &&token) {
-    return asio::async_compose<Token, void(error_code, std::string)>(
-        BodyReadAllOp{weak_from_this(), m_life, m_life_managed, m_exec}, token, m_exec);
+    auto bound = asio::bind_executor(m_exec, std::forward<Token>(token));
+    return asio::async_compose<decltype(bound), void(error_code, std::string)>(
+        BodyReadAllOp{weak_from_this(), m_life, m_life_managed, m_exec}, bound, m_exec);
 }
 
 } // namespace detail

@@ -85,6 +85,30 @@ TEST_CASE("response: managed writer dropped before a queued cross-thread connect
     CHECK_FALSE(reusable);
 }
 
+TEST_CASE("response: a token bound to another executor still runs on the owner", "[lifecycle][review]") {
+    asio::io_context owner_ctx;
+    asio::io_context other_ctx;
+    auto life = std::make_shared<Lifecycle>(asio::any_io_executor{owner_ctx.get_executor()});
+    auto sink = std::make_shared<FakeResponseSink>(owner_ctx.get_executor());
+    auto writer = std::make_shared<ResponseWriter>(sink);
+    writer->bind_lifecycle(life);
+
+    bool done = false;
+    // The caller says "complete on other_ctx". The state machine (and the sink
+    // call) must still be posted to the owner context, so running other_ctx
+    // alone must not touch the sink.
+    writer->async_write("x",
+                        asio::bind_executor(other_ctx.get_executor(), [&](error_code) { done = true; }));
+
+    other_ctx.run();
+    CHECK_FALSE(done);
+    CHECK(sink->chunks.empty());
+
+    owner_ctx.run();
+    CHECK(done);
+    CHECK_FALSE(sink->chunks.empty());
+}
+
 TEST_CASE("body: cancellation delivered while the read_all continuation is posted", "[lifecycle][review]") {
     asio::io_context ctx;
     Body body{ctx.get_executor()};

@@ -31,6 +31,7 @@
 #include <boost/asio.hpp>
 #include <boost/asio/any_completion_handler.hpp>
 #include <boost/asio/async_result.hpp>
+#include <boost/asio/bind_executor.hpp>
 #include <boost/asio/compose.hpp>
 #include <boost/asio/experimental/channel.hpp>
 #include <chrono>
@@ -818,7 +819,7 @@ class WebSocket : public std::enable_shared_from_this<WebSocket> {
             if (!started) {
                 // Unbound handles (client WebSockets and standalone tests) keep
                 // the historical same-thread initiation.
-                if (managed && hop_to_owner(self, hopped)) {
+                if (managed && hop_to_owner(self, ex, hopped)) {
                     return;
                 }
                 if (self.cancelled() != asio::cancellation_type::none) {
@@ -877,7 +878,7 @@ class WebSocket : public std::enable_shared_from_this<WebSocket> {
 
         template <typename Self> void operator()(Self &self, error_code ec = {}, WsMessage msg = {}) {
             if (!started) {
-                if (managed && hop_to_owner(self, hopped)) {
+                if (managed && hop_to_owner(self, ex, hopped)) {
                     return;
                 }
                 if (self.cancelled() != asio::cancellation_type::none) {
@@ -912,18 +913,25 @@ class WebSocket : public std::enable_shared_from_this<WebSocket> {
         }
     };
 
+    // Bind the backend's executor (the connection's owner executor for a
+    // server-bound handle) to the token: composed_op resolves the token's
+    // associated executor for every inner step and for the hop, so a caller
+    // that bound a different executor must not drag the state machine off the
+    // owning thread.
     template <typename Fn, typename Token> auto start_write(Fn &&fn, Token &&token) {
         auto ex = m_backend->get_executor();
-        return asio::async_compose<Token, void(error_code)>(
+        auto bound = asio::bind_executor(ex, std::forward<Token>(token));
+        return asio::async_compose<decltype(bound), void(error_code)>(
             StartWriteOp<std::decay_t<Fn>>{weak_from_this(), this, m_life, m_life_managed, ex, std::forward<Fn>(fn)},
-            token, ex);
+            bound, ex);
     }
 
     template <typename Fn, typename Token> auto start_read(Fn &&fn, Token &&token) {
         auto ex = m_backend->get_executor();
-        return asio::async_compose<Token, void(error_code, WsMessage)>(
+        auto bound = asio::bind_executor(ex, std::forward<Token>(token));
+        return asio::async_compose<decltype(bound), void(error_code, WsMessage)>(
             StartReadOp<std::decay_t<Fn>>{weak_from_this(), this, m_life, m_life_managed, ex, std::forward<Fn>(fn)},
-            token, ex);
+            bound, ex);
     }
 
   public:

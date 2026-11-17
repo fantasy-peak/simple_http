@@ -141,16 +141,22 @@ template <typename State>
     return Guard<State>{std::move(acquired)};
 }
 
-// Reposts a composed operation onto its own executor. Returns true when the
-// caller must return immediately (the operation was moved into the dispatch).
-// The composed operation's cancellation state travels with `self`, so a
-// cancellation delivered while it is queued is observed after re-entry.
-template <typename Self> bool hop_to_owner(Self &self, bool &hopped) {
+// Reposts a composed operation onto the object's owner executor. Returns true
+// when the caller must return immediately (the operation was moved into the
+// dispatch). The composed operation's cancellation state travels with `self`,
+// so a cancellation delivered while it is queued is observed after re-entry.
+//
+// `owner` is passed explicitly rather than taken from self.get_executor():
+// composed_op::get_executor() resolves the *completion handler's* associated
+// executor, which a caller may have bound to a different context. The entry
+// points also bind `owner` to their token so that every inner step completes
+// there; this argument keeps the initial hop correct on its own.
+template <typename Self> bool hop_to_owner(Self &self, asio::any_io_executor owner, bool &hopped) {
     if (hopped) {
         return false;
     }
     hopped = true;
-    asio::dispatch(self.get_executor(), std::move(self));
+    asio::dispatch(std::move(owner), std::move(self));
     return true;
 }
 
