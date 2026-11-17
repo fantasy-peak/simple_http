@@ -779,7 +779,13 @@ class Server {
         // it the Core/pool/io_context) alive.
         std::weak_ptr<ListenerState> weak_listener = listener;
         std::weak_ptr<Core> weak_core = core;
-        asio::post(socket.get_executor(), [weak_listener, weak_core, socket = std::move(socket)]() mutable {
+        // Sample the executor before constructing the handler: argument
+        // evaluation order is unspecified, and the capture list moves `socket`.
+        // Relying on the moved-from socket to still hand back its executor is
+        // exactly the kind of order-dependent code that breaks on another
+        // compiler or optimization level.
+        auto socket_executor = socket.get_executor();
+        asio::post(socket_executor, [weak_listener, weak_core, socket = std::move(socket)]() mutable {
             if (auto alive = weak_listener.lock()) {
                 serve_on_worker(alive, std::move(socket));
                 return;
