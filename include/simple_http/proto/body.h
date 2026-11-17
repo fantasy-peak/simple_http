@@ -467,6 +467,15 @@ struct BodyReadAllOp {
         }
         if (continuing) {
             continuing = false;
+            // A cancellation emitted while this continuation was posted has no
+            // inner operation to land on: the previous composed op is gone and
+            // the next one creates a fresh cancellation_state, and Asio does
+            // not replay an already-emitted signal. Latch it here, or the new
+            // read parks on the channel with the request already cancelled.
+            if (self.cancelled() != asio::cancellation_type::none) {
+                self.complete(make_error_code(asio::error::operation_aborted), std::string{});
+                return;
+            }
             state->async_read(std::move(self));
             return;
         }
