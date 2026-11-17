@@ -119,12 +119,17 @@ template <typename... Args> class HopState : public std::enable_shared_from_this
         }
         m_aborted = true;
         cancel->cancelled = true;
-        if (cancel->stream) {
+        // Prefer the current hop's transport. After a redirect/retry the
+        // previous hop's stream is retired but the member still points at it,
+        // so consulting `stream` first would cancel a dead exchange and leave
+        // the socket that is actually dialing untouched.
+        if (cancel->abort_transport) {
+            auto abort = std::move(cancel->abort_transport);
+            cancel->stream.reset();
+            abort();
+        } else if (cancel->stream) {
             cancel->stream->async_cancel(asio::detached);
             cancel->stream.reset();
-        } else if (cancel->abort_transport) {
-            auto abort = std::move(cancel->abort_transport);
-            abort();
         }
         stop_timer();
     }
@@ -1069,8 +1074,12 @@ inline void async_connect_bounded(std::shared_ptr<asio::ip::tcp::socket> socket,
         state->timer = std::make_shared<asio::steady_timer>(ex);
         state->timer->expires_after(limit);
         state->timer->async_wait([state, finish](error_code ec) mutable {
-            if (ec) {
-                return; // the connect finished first and cancelled the timer
+            // `ec` alone is not enough: cancel() does not withdraw a completion
+            // that is already queued. If the connect won the race, finish() set
+            // this flag and the socket is now owned by the live session; closing
+            // it here would kill a connection that just succeeded.
+            if (ec || state->finished) {
+                return;
             }
             error_code ignored;
             state->socket->cancel(ignored);

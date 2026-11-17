@@ -423,6 +423,15 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
             std::move(done)(error_code{});
             return;
         }
+        // ResponseWriter treats write/finish/trailers as a no-op after the
+        // response ended (Lifecycle::Access::Any). Honour that here: this sink
+        // shares the connection with the next exchange once keep-alive reuses
+        // it, and framing another chunk (or a second terminator) after the
+        // current response's would corrupt that next response on the wire.
+        if (m_response_complete) {
+            std::move(done)(make_error_code(asio::error::not_connected));
+            return;
+        }
         if (!m_open) {
             std::move(done)(make_error_code(asio::error::not_connected));
             return;
@@ -448,6 +457,12 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
             // the response.
             m_response_complete = true;
             std::move(done)(error_code{});
+            return;
+        }
+        // A second terminator would be read as the next response's prefix on a
+        // reused keep-alive connection (see enqueue_chunk).
+        if (m_response_complete) {
+            std::move(done)(make_error_code(asio::error::not_connected));
             return;
         }
         if (!m_open) {
@@ -476,6 +491,12 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
         if (m_head_request) {
             m_response_complete = true;
             std::move(done)(error_code{});
+            return;
+        }
+        // The trailer section is the response's last bytes; a second one (or
+        // one after a completed body) must not be framed onto the connection.
+        if (m_response_complete) {
+            std::move(done)(make_error_code(asio::error::not_connected));
             return;
         }
         if (!m_open) {

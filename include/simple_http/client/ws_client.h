@@ -99,16 +99,22 @@ void async_ws_upgrade_impl(std::shared_ptr<Transport> transport, std::string aut
     auto completion = std::make_shared<WsOpenCompletion>(std::move(done));
     auto timer = std::make_shared<asio::steady_timer>(transport->get_executor());
     auto timed_out = std::make_shared<bool>(false);
+    // timer->cancel() cannot withdraw a completion that is already queued. The
+    // one-shot flag makes a timeout that lost the race against the successful
+    // upgrade a no-op instead of closing the transport now owned by the
+    // returned WebSocket.
+    auto finished = std::make_shared<bool>(false);
     if (handshake_timeout.count() > 0) {
         timer->expires_after(handshake_timeout);
-        timer->async_wait([transport, timed_out](error_code ec) {
-            if (!ec) {
+        timer->async_wait([transport, timed_out, finished](error_code ec) {
+            if (!ec && !*finished) {
                 *timed_out = true;
                 transport->close();
             }
         });
     }
-    auto finish = [completion, timer, timed_out](error_code ec, std::shared_ptr<WebSocket> ws) mutable {
+    auto finish = [completion, timer, timed_out, finished](error_code ec, std::shared_ptr<WebSocket> ws) mutable {
+        *finished = true;
         timer->cancel();
         if (ec && *timed_out)
             ec = make_error_code(client_errc::response_head_timeout);

@@ -1309,8 +1309,12 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
             });
         };
         if (timer) {
-            timer->async_wait([self, timer, complete](error_code ec) mutable {
-                if (ec)
+            timer->async_wait([self, timer, complete, finished](error_code ec) mutable {
+                // Cancelled is not enough: an already-queued timer completion
+                // still runs. If wait_ready won the race, `finished` is set and
+                // the caller already holds this session -- shutting it down here
+                // would hand back a live-handle-to-dead-session.
+                if (ec || finished->load())
                     return;
                 self->shutdown_now();
                 std::move(complete)(make_error_code(client_errc::connect_timeout));
