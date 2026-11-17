@@ -53,6 +53,12 @@ The library is header-only: `include/` contains no `.cpp` files.
 - **Single-threaded connection affinity.** Each accepted connection is pinned
   to one single-threaded `io_context`. Engines, writers and handlers for that
   connection run on one thread, so the protocol paths need no mutexes.
+- **Async entry points may be started from any thread.** On a server-bound
+  `Body` / `ResponseWriter` / `WebSocket`, the operation first dispatches to the
+  connection's owner executor and then checks the connection/stream `Lifecycle`.
+  Synchronous calls (`feed`/`finish`/`fail`, fluent setters) still require the
+  owner thread. After teardown, an operation that has not started completes with
+  `not_connected`; one already in flight completes through cancellation.
 - **No exceptions for control flow.** Fallible operations return
   `error_code` or `boost::system::result`. Client failures are never thrown.
 - **Pluggable edges.** DNS resolution, logging, TLS context construction,

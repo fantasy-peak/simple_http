@@ -26,11 +26,13 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <type_traits>
 #include <utility>
 
 #include "../core/http_field.h"
 #include "../core/http_status.h"
+#include "../core/lifecycle.h"
 #include "../core/logging.h"
 #include "../core/types.h"
 #include "../core/version.h"
@@ -41,7 +43,7 @@ namespace simple_http {
 
 namespace asio = boost::asio;
 
-class ResponseWriter {
+class ResponseWriter : public std::enable_shared_from_this<ResponseWriter> {
   public:
     explicit ResponseWriter(std::shared_ptr<ResponseSink> writer) : m_writer(std::move(writer)) {
         // Date + Content-Type + Server are filled in by apply_defaults; a
@@ -50,6 +52,171 @@ class ResponseWriter {
         m_headers.reserve(4);
     }
 
+    ResponseWriter(const ResponseWriter &) = delete;
+    ResponseWriter &operator=(const ResponseWriter &) = delete;
+
+    // The engine binds the exchange/stream lifecycle immediately after
+    // creating the writer. Writers created without one (none in-tree today)
+    // keep working; only the lifecycle gate is skipped.
+    void bind_lifecycle(std::weak_ptr<Lifecycle> life) {
+        require_owner();
+        m_life = std::move(life);
+        m_life_managed = true;
+    }
+
+  private:
+    // Public async entry gate. It reposts the operation onto the connection
+    // executor, then acquires the writer (and, through the lifecycle, the
+    // stream/connection). `Fn` runs on the owner thread with a Guard that keeps
+    // the writer alive until the inner operation completes.
+    template <typename Fn> struct StartWriteOp {
+        StartWriteOp(std::weak_ptr<ResponseWriter> owner, ResponseWriter *raw, std::weak_ptr<Lifecycle> life,
+                     bool managed, Lifecycle::Access access, asio::any_io_executor ex, Fn fn)
+            : owner(std::move(owner)), raw(raw), life(std::move(life)), managed(managed), access(access),
+              ex(std::move(ex)), fn(std::move(fn)) {}
+
+        std::weak_ptr<ResponseWriter> owner;
+        // Stack-constructed writers have no shared control block. The historical
+        // contract (the caller keeps the writer alive until completion) still
+        // applies to them, so the operation borrows a non-owning handle.
+        ResponseWriter *raw{nullptr};
+        std::weak_ptr<Lifecycle> life;
+        bool managed{false};
+        Lifecycle::Access access{Lifecycle::Access::Write};
+        asio::any_io_executor ex;
+        bool hopped{false};
+        bool started{false};
+        Guard<ResponseWriter> guard;
+        Fn fn;
+
+        asio::any_io_executor get_executor() const noexcept { return ex; }
+
+        template <typename Self> void operator()(Self &self, error_code ec = {}) {
+            if (!started) {
+                // Unbound writers (standalone tests) keep the historical
+                // same-thread initiation; a server-bound writer is reposted
+                // onto the connection executor.
+                if (managed && hop_to_owner(self, hopped)) {
+                    return;
+                }
+                if (self.cancelled() != asio::cancellation_type::none) {
+                    self.complete(make_error_code(asio::error::operation_aborted));
+                    return;
+                }
+                if (managed && access != Lifecycle::Access::Any) {
+                    auto l = life.lock();
+                    if (!l || !l->can(access)) {
+                        self.complete(make_error_code(asio::error::not_connected));
+                        return;
+                    }
+                }
+                if (auto acquired = owner.lock()) {
+                    guard = Guard<ResponseWriter>{std::move(acquired)};
+                } else if (raw) {
+                    guard = Guard<ResponseWriter>{std::shared_ptr<ResponseWriter>(raw, [](ResponseWriter *) {})};
+                } else {
+                    self.complete(make_error_code(asio::error::not_connected));
+                    return;
+                }
+                started = true;
+                auto action = std::move(fn);
+                // Evaluate the guard's target before moving `self`: the op and
+                // with it `guard` are moved into WriteCompletion, and argument
+                // evaluation order is unspecified.
+                auto *writer = &*guard;
+                action(*writer, WriteCompletion(std::move(self)));
+                return;
+            }
+            guard = {};
+            self.complete(ec);
+        }
+    };
+
+    template <typename Fn> struct StartConnectedOp {
+        StartConnectedOp(std::weak_ptr<const ResponseWriter> owner, const ResponseWriter *raw,
+                         std::weak_ptr<Lifecycle> life, bool managed, asio::any_io_executor ex, Fn fn)
+            : owner(std::move(owner)), raw(raw), life(std::move(life)), managed(managed), ex(std::move(ex)),
+              fn(std::move(fn)) {}
+
+        std::weak_ptr<const ResponseWriter> owner;
+        const ResponseWriter *raw{nullptr};
+        std::weak_ptr<Lifecycle> life;
+        bool managed{false};
+        asio::any_io_executor ex;
+        bool hopped{false};
+        bool started{false};
+        Guard<const ResponseWriter> guard;
+        Fn fn;
+
+        asio::any_io_executor get_executor() const noexcept { return ex; }
+
+        template <typename Self> void operator()(Self &self, error_code ec = {}, bool value = false) {
+            if (!started) {
+                if (managed && hop_to_owner(self, hopped)) {
+                    return;
+                }
+                if (self.cancelled() != asio::cancellation_type::none) {
+                    self.complete(make_error_code(asio::error::operation_aborted), false);
+                    return;
+                }
+                // The sink reports whether the connection is reusable; it is
+                // safe on a dead stream (returns success + false), so no
+                // lifecycle gate is needed.
+                if (auto acquired = owner.lock()) {
+                    guard = Guard<const ResponseWriter>{std::move(acquired)};
+                } else if (raw) {
+                    guard =
+                        Guard<const ResponseWriter>{std::shared_ptr<const ResponseWriter>(raw, [](const ResponseWriter *) {})};
+                } else {
+                    self.complete(make_error_code(asio::error::not_connected), false);
+                    return;
+                }
+                started = true;
+                auto action = std::move(fn);
+                auto *writer = &*guard;
+                action(*writer, ConnectedCompletion(std::move(self)));
+                return;
+            }
+            guard = {};
+            self.complete(ec, value);
+        }
+    };
+
+    template <typename Fn, typename Token> auto start_write(Fn &&fn, Token &&token) {
+        return start_io(Lifecycle::Access::Write, std::forward<Fn>(fn), std::forward<Token>(token));
+    }
+
+    // Close/connected-style operations must still run after the direction has
+    // closed; they only require the lifecycle itself to be open.
+    template <typename Fn, typename Token> auto start_control(Fn &&fn, Token &&token) {
+        return start_io(Lifecycle::Access::Control, std::forward<Fn>(fn), std::forward<Token>(token));
+    }
+
+    // Operations whose sink is safe on a dead stream and whose historical
+    // contract is "no-op after the response ended" use Any: the guard still
+    // keeps the writer alive, but the lifecycle does not reject the call.
+    template <typename Fn, typename Token> auto start_any(Fn &&fn, Token &&token) {
+        return start_io(Lifecycle::Access::Any, std::forward<Fn>(fn), std::forward<Token>(token));
+    }
+
+    template <typename Fn, typename Token>
+    auto start_io(Lifecycle::Access access, Fn &&fn, Token &&token) {
+        auto ex = m_writer->get_executor();
+        return asio::async_compose<Token, void(error_code)>(
+            StartWriteOp<std::decay_t<Fn>>{weak_from_this(), this, m_life, m_life_managed, access, ex,
+                                          std::forward<Fn>(fn)},
+            token, ex);
+    }
+
+    template <typename Fn, typename Token> auto start_connected(Fn &&fn, Token &&token) const {
+        auto ex = m_writer->get_executor();
+        return asio::async_compose<Token, void(error_code, bool)>(
+            StartConnectedOp<std::decay_t<Fn>>{weak_from_this(), this, m_life, m_life_managed, ex,
+                                              std::forward<Fn>(fn)},
+            token, ex);
+    }
+
+  public:
     // --- fluent setters (return *this for chaining) ---
     ResponseWriter &status(int code) {
         require_owner();
@@ -164,82 +331,100 @@ class ResponseWriter {
     }
 
     template <typename Token> auto async_send(std::string body, Token &&token) {
-        error_code pre = prepare_one_shot();
-        Mode mode = Mode::Direct;
-        if (!pre) {
-            if (m_status == status::no_content || m_status == status::not_modified) {
-                mode = Mode::Bodyless;
-            } else if (!m_trailers.empty() && !m_writer->head_request() && m_writer->version() != Version::Http1) {
-                // A response carrying trailers cannot be one-shot: the fields
-                // follow the body, so it is framed as a stream (chunked on
-                // HTTP/1.x) and closed by the trailer section. A HEAD response
-                // or an HTTP/1.0 peer keeps the one-shot framing and drops the
-                // fields instead.
-                mode = Mode::Stream;
-            }
-        }
-        return compose_send(pre, mode, std::move(body), std::forward<Token>(token));
+        return start_write(
+            [body = std::move(body)](ResponseWriter &w, WriteCompletion done) mutable {
+                error_code pre = w.prepare_one_shot();
+                Mode mode = Mode::Direct;
+                if (!pre) {
+                    if (w.m_status == status::no_content || w.m_status == status::not_modified) {
+                        mode = Mode::Bodyless;
+                    } else if (!w.m_trailers.empty() && !w.m_writer->head_request() &&
+                               w.m_writer->version() != Version::Http1) {
+                        // A response carrying trailers cannot be one-shot: the fields
+                        // follow the body, so it is framed as a stream (chunked on
+                        // HTTP/1.x) and closed by the trailer section. A HEAD response
+                        // or an HTTP/1.0 peer keeps the one-shot framing and drops the
+                        // fields instead.
+                        mode = Mode::Stream;
+                    }
+                }
+                (void)w.compose_send(pre, mode, std::move(body), std::move(done));
+            },
+            std::forward<Token>(token));
     }
 
     // Status + headers with no body and no body framing at all (204/304 and
     // every response to HEAD).
     template <typename Token> auto async_send_bodyless(Token &&token) {
-        require_owner();
-        // Without a body, a response can only be framed by the status (204/304)
-        // or by being the answer to HEAD. A bodyless 200 on a keep-alive h1
-        // connection has no length and no terminator: the peer takes the next
-        // response's bytes as this body (response smuggling).
-        //
-        // Validate before prepare_one_shot(): it marks the response started, and
-        // invoke_handler's 500 fallback only runs while started() is false.
-        error_code pre;
-        if (!m_writer->head_request() && m_status != status::no_content && m_status != status::not_modified) {
-            pre = make_error_code(asio::error::invalid_argument);
-        } else {
-            pre = prepare_one_shot();
-        }
-        return compose_send(pre, Mode::Bodyless, std::string{}, std::forward<Token>(token));
+        return start_write(
+            [](ResponseWriter &w, WriteCompletion done) {
+                // Without a body, a response can only be framed by the status (204/304)
+                // or by being the answer to HEAD. A bodyless 200 on a keep-alive h1
+                // connection has no length and no terminator: the peer takes the next
+                // response's bytes as this body (response smuggling).
+                //
+                // Validate before prepare_one_shot(): it marks the response started, and
+                // invoke_handler's 500 fallback only runs while started() is false.
+                error_code pre;
+                if (!w.m_writer->head_request() && w.m_status != status::no_content &&
+                    w.m_status != status::not_modified) {
+                    pre = make_error_code(asio::error::invalid_argument);
+                } else {
+                    pre = w.prepare_one_shot();
+                }
+                (void)w.compose_send(pre, Mode::Bodyless, std::string{}, std::move(done));
+            },
+            std::forward<Token>(token));
     }
 
     // --- streaming ---
     template <typename Token> auto async_begin(Token &&token) {
-        require_owner();
-        // 204/304 have no body by definition; streaming one emits a chunked
-        // 204 (h1) or DATA frames (h2) that a conforming peer rejects or reads
-        // as the next message. Check before prepare_one_shot() so the failure
-        // leaves started() false and the 500 fallback can still answer.
-        error_code pre;
-        if (m_status == status::no_content || m_status == status::not_modified) {
-            pre = make_error_code(asio::error::invalid_argument);
-        } else {
-            pre = prepare_one_shot();
-        }
-        auto sink = m_writer;
-        const int code = m_status;
-        auto headers = std::move(m_headers);
-        return compose_one(pre, sink->get_executor(), std::forward<Token>(token),
-                           [sink, code, headers = std::move(headers)](WriteCompletion done) mutable {
-                               sink->send_headers(code, std::move(headers), std::move(done));
-                           });
+        return start_write(
+            [](ResponseWriter &w, WriteCompletion done) {
+                // 204/304 have no body by definition; streaming one emits a chunked
+                // 204 (h1) or DATA frames (h2) that a conforming peer rejects or reads
+                // as the next message. Check before prepare_one_shot() so the failure
+                // leaves started() false and the 500 fallback can still answer.
+                error_code pre;
+                if (w.m_status == status::no_content || w.m_status == status::not_modified) {
+                    pre = make_error_code(asio::error::invalid_argument);
+                } else {
+                    pre = w.prepare_one_shot();
+                }
+                auto sink = w.m_writer;
+                const int code = w.m_status;
+                auto headers = std::move(w.m_headers);
+                compose_one(pre, sink->get_executor(), std::move(done),
+                            [sink, code, headers = std::move(headers)](WriteCompletion d) mutable {
+                                sink->send_headers(code, std::move(headers), std::move(d));
+                            });
+            },
+            std::forward<Token>(token));
     }
 
     // Sends an interim 1xx response (100 Continue).
     template <typename Token> auto async_send_continue(Token &&token) {
-        require_owner();
-        note_activity();
-        auto sink = m_writer;
-        return compose_one(error_code{}, sink->get_executor(), std::forward<Token>(token),
-                           [sink](WriteCompletion done) mutable { sink->send_continue(std::move(done)); });
+        return start_any(
+            [](ResponseWriter &w, WriteCompletion done) {
+                w.note_activity();
+                auto sink = w.m_writer;
+                sink->send_continue(std::move(done));
+            },
+            std::forward<Token>(token));
     }
 
     template <typename Token> auto async_write(std::string data, Token &&token) {
-        require_owner();
-        note_activity();
-        auto sink = m_writer;
-        return compose_one(error_code{}, sink->get_executor(), std::forward<Token>(token),
-                           [sink, data = std::move(data)](WriteCompletion done) mutable {
-                               sink->send_chunk(std::move(data), std::move(done));
-                           });
+        // Any, not Write: after a HEAD response the stream's write side is
+        // already closed, but the sink accepts these as no-ops (the same
+        // contract as before the lifecycle gate). The sink also reports
+        // not_connected when a non-HEAD stream is already gone.
+        return start_any(
+            [data = std::move(data)](ResponseWriter &w, WriteCompletion done) mutable {
+                w.note_activity();
+                auto sink = w.m_writer;
+                sink->send_chunk(std::move(data), std::move(done));
+            },
+            std::forward<Token>(token));
     }
 
     template <typename Token> auto async_finish(Token &&token) {
@@ -247,20 +432,22 @@ class ResponseWriter {
     }
 
     template <typename Token> auto async_finish(std::string data, Token &&token) {
-        require_owner();
-        note_activity();
-        auto sink = m_writer;
-        // Trailer fields accumulated with trailer() end the response instead of
-        // the final body chunk, so a finish() after them still emits them.
-        if (!m_trailers.empty()) {
-            const error_code pre = m_field_rejected ? make_error_code(asio::error::invalid_argument) : error_code{};
-            auto trailers = std::move(m_trailers);
-            return compose_finish_trailers(pre, std::move(data), std::move(trailers), sink, std::forward<Token>(token));
-        }
-        return compose_one(error_code{}, sink->get_executor(), std::forward<Token>(token),
-                           [sink, data = std::move(data)](WriteCompletion done) mutable {
-                               sink->send_last(std::move(data), std::move(done));
-                           });
+        return start_any(
+            [data = std::move(data)](ResponseWriter &w, WriteCompletion done) mutable {
+                w.note_activity();
+                auto sink = w.m_writer;
+                // Trailer fields accumulated with trailer() end the response instead of
+                // the final body chunk, so a finish() after them still emits them.
+                if (!w.m_trailers.empty()) {
+                    const error_code pre =
+                        w.m_field_rejected ? make_error_code(asio::error::invalid_argument) : error_code{};
+                    auto trailers = std::move(w.m_trailers);
+                    w.compose_finish_trailers(pre, std::move(data), std::move(trailers), sink, std::move(done));
+                    return;
+                }
+                sink->send_last(std::move(data), std::move(done));
+            },
+            std::forward<Token>(token));
     }
 
     ResponseWriter &trailer(std::string_view name, std::string value) {
@@ -279,37 +466,39 @@ class ResponseWriter {
     // Ends a streamed response with the given trailing field section, replacing
     // the final finish(). Completion signature: void(error_code).
     template <typename Token> auto async_finish_trailers(Headers trailers, Token &&token) {
-        require_owner();
-        for (const auto &[name, value] : trailers) {
-            if (contains_ctl(name) || contains_ctl(value)) {
-                SIMPLE_HTTP_ERROR_LOG("response trailer with CR/LF/NUL rejected");
-                m_field_rejected = true;
-                break;
-            }
-        }
-        note_activity();
-        auto sink = m_writer;
-        const error_code pre = m_field_rejected ? make_error_code(asio::error::invalid_argument) : error_code{};
-        return compose_finish_trailers(pre, std::string{}, std::move(trailers), sink, std::forward<Token>(token));
+        return start_any(
+            [trailers = std::move(trailers)](ResponseWriter &w, WriteCompletion done) mutable {
+                w.finish_trailers_now(std::move(trailers), std::move(done));
+            },
+            std::forward<Token>(token));
     }
 
     template <typename Token> auto async_finish_trailers(Token &&token) {
-        return async_finish_trailers(std::move(m_trailers), std::forward<Token>(token));
+        return start_any(
+            [](ResponseWriter &w, WriteCompletion done) {
+                auto trailers = std::move(w.m_trailers);
+                w.finish_trailers_now(std::move(trailers), std::move(done));
+            },
+            std::forward<Token>(token));
     }
 
     // --- connection state ---
     template <typename Token> auto async_connected(Token &&token) const {
-        require_owner();
-        auto sink = m_writer;
-        return compose_connected(sink->get_executor(), std::forward<Token>(token),
-                                 [sink](ConnectedCompletion done) { sink->connected(std::move(done)); });
+        return start_connected(
+            [](const ResponseWriter &w, ConnectedCompletion done) {
+                auto sink = w.m_writer;
+                sink->connected(std::move(done));
+            },
+            std::forward<Token>(token));
     }
 
     template <typename Token> auto async_close(Token &&token) {
-        require_owner();
-        auto sink = m_writer;
-        return compose_one(error_code{}, sink->get_executor(), std::forward<Token>(token),
-                           [sink](WriteCompletion done) mutable { sink->close(std::move(done)); });
+        return start_any(
+            [](ResponseWriter &w, WriteCompletion done) {
+                auto sink = w.m_writer;
+                sink->close(std::move(done));
+            },
+            std::forward<Token>(token));
     }
 
     Version version() const { return m_writer->version(); }
@@ -325,9 +514,13 @@ class ResponseWriter {
     }
 
     template <typename Token> auto async_sse_begin(Token &&token) {
-        header(field::content_type, "text/event-stream; charset=utf-8");
-        header("cache-control", "no-cache");
-        return async_begin(std::forward<Token>(token));
+        return start_write(
+            [](ResponseWriter &w, WriteCompletion done) {
+                w.header(field::content_type, "text/event-stream; charset=utf-8");
+                w.header("cache-control", "no-cache");
+                (void)w.async_begin(std::move(done));
+            },
+            std::forward<Token>(token));
     }
     template <typename Token>
     auto async_sse_event(std::string data, std::string event, std::string id, std::string retry, Token &&token) {
@@ -347,7 +540,7 @@ class ResponseWriter {
     // token's associated properties are carried by `composed` (the async_compose
     // handler), which is wrapped into any_completion_handler at the sink edge.
     template <typename Token, typename Fn>
-    static auto compose_one(error_code pre, asio::any_io_executor ex, Token &&token, Fn &&fn) {
+    static void compose_one(error_code pre, asio::any_io_executor ex, Token &&token, Fn &&fn) {
         // Keep a copy for async_compose's I/O object: moving `ex` into the
         // composed operation would leave this argument empty, and the two
         // arguments are evaluated in an unspecified order (a moved-from
@@ -358,7 +551,7 @@ class ResponseWriter {
     }
 
     template <typename Token, typename Fn>
-    static auto compose_connected(asio::any_io_executor ex, Token &&token, Fn &&fn) {
+    static void compose_connected(asio::any_io_executor ex, Token &&token, Fn &&fn) {
         auto executor = ex;
         return asio::async_compose<Token, void(error_code, bool)>(
             ConnectedOp<std::decay_t<Fn>>{std::forward<Fn>(fn), std::move(ex)}, token, executor);
@@ -394,6 +587,23 @@ class ResponseWriter {
     enum class Mode { Direct, Bodyless, Stream };
     enum class Phase { Start, Headers, Chunk, Trailers, Final };
 
+    // Validates the trailer fields (CR/LF/NUL would inject a field line) and
+    // starts the terminal chunk+trailer sequence. Runs on the owner executor,
+    // after the operation has acquired the writer.
+    void finish_trailers_now(Headers trailers, WriteCompletion done) {
+        for (const auto &[name, value] : trailers) {
+            if (contains_ctl(name) || contains_ctl(value)) {
+                SIMPLE_HTTP_ERROR_LOG("response trailer with CR/LF/NUL rejected");
+                m_field_rejected = true;
+                break;
+            }
+        }
+        note_activity();
+        auto sink = m_writer;
+        const error_code pre = m_field_rejected ? make_error_code(asio::error::invalid_argument) : error_code{};
+        compose_finish_trailers(pre, std::string{}, std::move(trailers), std::move(sink), std::move(done));
+    }
+
     // Synchronous pre-flight shared by send/send_bodyless/begin: field
     // rejection, single-head rule, defaults and the activity counter.
     error_code prepare_one_shot() {
@@ -421,7 +631,7 @@ class ResponseWriter {
         return {};
     }
 
-    template <typename Token> auto compose_send(error_code pre, Mode mode, std::string body, Token &&token) {
+    template <typename Token> void compose_send(error_code pre, Mode mode, std::string body, Token &&token) {
         auto state = std::make_shared<SendState>();
         state->pre = pre;
         state->mode = mode;
@@ -437,7 +647,7 @@ class ResponseWriter {
     }
 
     template <typename Token>
-    auto compose_finish_trailers(error_code pre, std::string data, Headers trailers, std::shared_ptr<ResponseSink> sink,
+    void compose_finish_trailers(error_code pre, std::string data, Headers trailers, std::shared_ptr<ResponseSink> sink,
                                  Token &&token) {
         auto state = std::make_shared<FinishTrailersState>();
         state->pre = pre;
@@ -692,6 +902,8 @@ class ResponseWriter {
     };
 
     std::shared_ptr<ResponseSink> m_writer;
+    std::weak_ptr<Lifecycle> m_life;
+    bool m_life_managed{false};
     std::thread::id m_owner_thread{std::this_thread::get_id()};
     int m_status{status::ok};
     Headers m_headers;

@@ -50,6 +50,11 @@ token。C++17 下可以使用回调、`asio::deferred`、`asio::detached` 和
 - **单线程连接亲和。** 每条被接受的连接固定到一个单线程 `io_context`。
   该连接的引擎、writer 和 handler 都在同一个线程上运行，因此协议路径内部不需要
   mutex。
+- **异步入口可跨线程发起。** 绑定到服务端连接的 `Body` / `ResponseWriter` /
+  `WebSocket` 异步操作会先 `dispatch` 到连接的 owner executor，再通过
+  `Lifecycle` 检查连接/流是否仍可用；同步入口（`feed`/`finish`/`fail`、
+  fluent setter）仍要求 owner 线程。连接关闭后，未开始的异步操作以
+  `not_connected` 完成，已开始的通过取消完成。
 - **不用异常做控制流。** 可失败操作返回 `error_code` 或
   `boost::system::result`。客户端失败从不抛出异常。
 - **边缘可插拔。** DNS 解析、日志、TLS context 构造、会话存储与路由查找都可以注入。

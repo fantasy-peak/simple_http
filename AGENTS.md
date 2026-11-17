@@ -84,6 +84,7 @@ include/
       http_method.h                 Method + is_idempotent
       http_status.h                 状态码常量
       io_pool.h                     IoCtxPool（单线程 io_context 池）
+      lifecycle.h                   Lifecycle（连接/交换可用性）、Guard、hop_to_owner
       limits.h                      EngineLimits
       logging.h                     LogSink / LogLevel / LogRecord / 宏
       mime.h
@@ -210,9 +211,20 @@ transport（TCP / TLS / QUIC 字节流）
 - 每条连接在 accept 时绑定到 `IoCtxPool` 中一个**单线程** `io_context`。
 - 该连接上的引擎、writer、handler、`Body`、`WebSocket` 全部只在这一个线程执行。
 - 因此 `engine/` 下没有 mutex/atomic 保护连接状态。
-- `ResponseWriter` / `Body` / `WebSocket` 的 `require_owner_thread` 检测到跨线程
-  调用会记录 error 并 `abort`。需要换线程时调用方显式
-  `asio::post(req->executor(), ...)`；不要依赖库内 hop 把调用方协程恢复回来。
+- **同步入口**（`Body::feed/finish/fail` 及其 setup hook、`ResponseWriter` 的
+  setter、`WebSocket::run_writer`）仍要求 owner 线程，
+  `require_owner_thread` 检测到跨线程调用会记录 error 并 `abort`。
+- **异步入口**（`Body::async_read/async_read_all`、`ResponseWriter::async_*`、
+  `WebSocket::async_*`）可以从任意线程发起：composed op 第一次进入时通过
+  `hop_to_owner` 用 `asio::dispatch` 把自己投递到对象自己的 executor，再用
+  `try_acquire` 检查 `Lifecycle` 与对象状态。失败（连接/流已关闭）必须以
+  `not_connected` / `operation_aborted` 完成且恰好一次。
+- `Lifecycle` 是连接/交换可用性的唯一真相源：连接 root 由 engine 独占持有，
+  每个 h1 请求或 h2/h3 stream 是一个 child；teardown 先 `close()` 再清容器，
+  子节点的 `can()` 会沿父链看到关闭。异步操作只持 weak，成功 acquire 后持有
+  对象状态的 strong（`Guard`）直到 completion。
+- 没有绑定 `Lifecycle` 的对象（客户端、独立测试、栈上构造的 writer）保持旧的
+  同线程行为；异步入口不做 hop，调用方仍负责在 completion 前保活对象。
 - 刻意的跨连接共享例外（都在 handler 层，不在 `engine/`）：
   - `RateLimiter` 按 key 分桶加锁；
   - `Router` 惰性构建链的 atomic + mutex；
@@ -1178,6 +1190,18 @@ test/run.sh server-diff
     请求子槽优先用 `cancellation_registration()` 并在完成时释放，
     `active_cancellation_slots()` 必须回到 0。`core/cancel.h`；
     `test/unit/test_cancellation.cpp` 的 registration 用例。
+56. **Lifecycle acquire 失败必须完成**：异步入口 hop 到 owner executor 后，
+    `try_acquire` 失败（连接关闭、stream erase、lifecycle 未绑定但对象已销毁）
+    必须以 `not_connected` 或 `operation_aborted` 恰一次完成，不能静默 return；
+    否则 h1 handler 永久挂起、h2/h3 泄漏并发槽。成功 acquire 返回的 `Guard`
+    必须持有到 completion，且完成前先释放，避免把对象寿命延长到用户回调之后。
+    `core/lifecycle.h`、`proto/body.h`、`proto/response.h`、`proto/websocket.h`。
+57. **栈上构造的 ResponseWriter/WebSocket 保持旧契约**：它们没有
+    `weak_from_this()`，`StartWriteOp` 用非拥有 `shared_ptr`（no-op deleter）
+    回退；调用方仍必须在 completion 前保活对象。不要把这类对象改成必须
+    `make_shared`，现有单测大量栈构造。
+    `proto/response.h`、`proto/websocket.h`；`test/unit/test_proto.cpp`、
+    `test/unit/test_trailers.cpp`。
 
 ---
 

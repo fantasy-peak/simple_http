@@ -320,7 +320,8 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
     using Signal = h3::Signal;
 
     explicit Http3Engine(std::shared_ptr<Connection> conn, EngineLimits limits = {})
-        : m_conn(std::move(conn)), m_executor(m_conn->get_executor()), m_limits(limits) {}
+        : m_conn(std::move(conn)), m_executor(m_conn->get_executor()),
+          m_conn_life(std::make_shared<Lifecycle>(asio::any_io_executor{m_executor})), m_limits(limits) {}
 
     Http3Engine(const Http3Engine &) = delete;
     Http3Engine &operator=(const Http3Engine &) = delete;
@@ -348,7 +349,11 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
             // a body or a response write observes the end instead of waiting
             // forever.
             self->m_alive = false;
+            if (self->m_conn_life)
+                self->m_conn_life->close();
             for (auto &[id, stream] : self->m_streams) {
+                if (stream->life)
+                    stream->life->close();
                 if (stream->request) {
                     (void)stream->request->body().fail(make_error_code(asio::error::connection_reset));
                     stream->request->cancel(); // connection gone: signal every handler
@@ -567,6 +572,9 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
     [[nodiscard]] bool stream_writable(std::int64_t stream_id) const {
         auto it = m_streams.find(stream_id);
         if (it == m_streams.end()) {
+            return false;
+        }
+        if (!it->second->life || !it->second->life->can(Lifecycle::Access::Write)) {
             return false;
         }
         if (it->second->reset_by_peer) {
@@ -930,7 +938,11 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
 
     void on_connection_closed() noexcept override {
         m_alive = false;
+        if (m_conn_life)
+            m_conn_life->close();
         for (auto &[id, stream] : m_streams) {
+            if (stream->life)
+                stream->life->close();
             if (stream->request) {
                 (void)stream->request->body().fail(make_error_code(asio::error::connection_reset));
                 stream->request->cancel(); // connection gone: signal every handler
@@ -1362,6 +1374,8 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         auto stream = std::make_shared<Stream>();
         stream->id = stream_id;
         stream->request = std::make_shared<Request>(Version::Http3, m_executor, m_conn->peer());
+        stream->life = std::make_shared<Lifecycle>(asio::any_io_executor{m_executor}, m_conn_life);
+        stream->request->body().bind_lifecycle(stream->life);
         // Credit inbound request-body bytes back to QUIC flow control as the
         // handler consumes them. nghttp3's recv_data contract requires the app
         // to do this ("increase flow control credit by datalen"), and
@@ -1446,6 +1460,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         writer->set_head_request(stream.is_head); // cached before the response can retire the stream entry
         stream.response =
             std::make_shared<ResponseWriter>(maybe_compress_writer(writer, m_executor, stream.request, stream.is_head));
+        stream.response->bind_lifecycle(stream.life);
 
         auto self = this->shared_from_this();
         auto request = stream.request;
@@ -1556,6 +1571,8 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         m_pending_dispatch.erase(std::remove(m_pending_dispatch.begin(), m_pending_dispatch.end(), stream_id),
                                  m_pending_dispatch.end());
         StreamPtr stream = std::move(it->second);
+        if (stream->life)
+            stream->life->close();
         m_streams.erase(it);
         // Nobody will read the remaining request body. Return its connection
         // -level credit (the handler may have been reset before it started).
@@ -1577,6 +1594,9 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
     // --- members (touched only on the connection executor) ---
     std::shared_ptr<Connection> m_conn;
     Executor m_executor;
+    // Connection lifecycle; the stream table owns the children. Only this
+    // engine holds the strong reference to the root.
+    std::shared_ptr<Lifecycle> m_conn_life;
     EngineLimits m_limits;
     Dispatcher m_dispatch;
 

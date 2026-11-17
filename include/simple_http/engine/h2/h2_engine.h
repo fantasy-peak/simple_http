@@ -48,6 +48,7 @@
 #include "../../core/base64.h"
 #include "../../core/http_field.h" // is_connection_specific_field / is_hop_by_hop_field
 #include "../../core/http_method.h"
+#include "../../core/lifecycle.h"
 #include "../../core/limits.h"
 #include "../../core/logging.h"
 #include "../../core/types.h"
@@ -344,7 +345,8 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
     using Executor = decltype(std::declval<Transport &>().get_executor());
 
     explicit Http2Engine(std::shared_ptr<Transport> transport, EngineLimits limits = {})
-        : m_transport(std::move(transport)), m_executor(m_transport->get_executor()), m_notify(m_executor, 1),
+        : m_transport(std::move(transport)), m_executor(m_transport->get_executor()),
+          m_conn_life(std::make_shared<Lifecycle>(asio::any_io_executor{m_executor})), m_notify(m_executor, 1),
           m_limits(limits) {
         // Our advertised (receive) windows start at the configured initial size.
         // SETTINGS_INITIAL_WINDOW_SIZE only governs *stream* windows, though: the
@@ -480,6 +482,9 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
             auto it = m_streams.find(stream_id);
             if (it != m_streams.end()) {
                 it->second.end_stream_sent = true;
+                if (it->second.life) {
+                    it->second.life->close_write();
+                }
                 maybe_complete_stream(stream_id);
             }
         }
@@ -559,7 +564,8 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
     // superseded fetches - so this must be checked, not assumed.
     bool stream_writable(std::uint32_t stream_id) const {
         auto it = m_streams.find(stream_id);
-        return it != m_streams.end() && !it->second.end_stream_sent;
+        return it != m_streams.end() && it->second.life &&
+               it->second.life->can(Lifecycle::Access::Write);
     }
 
     // Parks the calling producer until this stream's outbound queue has drained
@@ -698,6 +704,10 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
     struct Stream {
         std::shared_ptr<Request> request;
         std::shared_ptr<Http2ResponseSink<Transport>> writer;
+        // Per-stream lifecycle. Parented to the connection lifecycle; the
+        // engine's stream table holds the only strong reference, and the Body /
+        // ResponseWriter hold weak ones.
+        std::shared_ptr<Lifecycle> life;
         std::string header_block; // accumulates HEADERS + CONTINUATION
 
         // Outbound response body: a queue of chunks the write loop drains into
@@ -936,6 +946,8 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
             Stream &st = it->second;
             st.id = stream_id;
             st.request = std::make_shared<Request>(Version::Http2, m_executor, m_transport->peer());
+            st.life = std::make_shared<Lifecycle>(asio::any_io_executor{m_executor}, m_conn_life);
+            st.request->body().bind_lifecycle(st.life);
             st.writer = std::make_shared<Http2ResponseSink<Transport>>(this->weak_from_this(), stream_id, m_executor);
             st.send_window = m_peer_initial_window;
             st.recv_window = m_limits.h2_initial_window; // our advertised per-stream window
@@ -1105,11 +1117,15 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
         if (!m_finished) {
             m_finished = true;
             m_alive = false;
+            if (m_conn_life)
+                m_conn_life->close();
             m_watchdog->cancel();
             m_notify.close();
             // Queued handlers must not start after teardown (see pump_dispatch).
             m_pending_dispatch.clear();
             for (auto &entry : m_streams) {
+                if (entry.second.life)
+                    entry.second.life->close();
                 if (entry.second.request) {
                     (void)entry.second.request->body().fail(make_error_code(asio::error::connection_reset));
                     entry.second.request->cancel();
@@ -2319,6 +2335,8 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
         // releases it via handler_finished().
         m_pending_dispatch.erase(std::remove(m_pending_dispatch.begin(), m_pending_dispatch.end(), stream_id),
                                  m_pending_dispatch.end());
+        if (it->second.life)
+            it->second.life->close();
         m_streams.erase(it);
     }
 
@@ -2519,6 +2537,8 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
                             append_frame(codec::H2FrameType::Data, codec::H2_FLAG_END_STREAM, stream_id, {});
                         }
                         st.end_stream_sent = true;
+                        if (st.life)
+                            st.life->close_write();
                         finished.push_back(stream_id);
                     }
                     break;
@@ -2574,6 +2594,8 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
                 }
                 if (last) {
                     st.end_stream_sent = true;
+                    if (st.life)
+                        st.life->close_write();
                     finished.push_back(stream_id);
                     break;
                 }
@@ -2672,6 +2694,7 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
         auto self = this->shared_from_this();
         auto response = std::make_shared<ResponseWriter>(
             maybe_compress_writer(writer, self->m_executor, request, request->method() == Method::Head));
+        response->bind_lifecycle(it->second.life);
         auto completed = std::make_shared<bool>(false);
         // Keep the request and response alive until the handler signals
         // completion: a callback handler that starts an async body read and
@@ -2843,6 +2866,7 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
             return;
         }
         auto response = std::make_shared<ResponseWriter>(writer);
+        response->bind_lifecycle(it->second.life);
         auto upgrade = [self, stream_id](RequestPtr req, ResponsePtr res, CallbackWsHandler h,
                                          WsUpgradeCompletion done) mutable {
             self->do_ws_upgrade(stream_id, std::move(req), std::move(res), std::move(h), std::move(done));
@@ -2888,6 +2912,9 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
                     transport, self->m_limits.max_body_bytes, self->m_limits.idle_timeout, /*expect_masked=*/true,
                     self->m_limits.ws_read_ahead_bytes, deflate);
                 auto ws = std::make_shared<WebSocket>(std::move(backend));
+                if (auto sit = self->m_streams.find(stream_id); sit != self->m_streams.end()) {
+                    ws->bind_lifecycle(sit->second.life);
+                }
                 ws->run_writer();
                 invoke_ws_handler(WsHandler(handler), request, ws, [ws, done = std::move(done)]() mutable {
                     // Keep the handle alive until the Close frame is written
@@ -3292,6 +3319,10 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
     std::shared_ptr<Transport> m_transport;
     Executor m_executor;
     const std::thread::id m_thread_id{std::this_thread::get_id()};
+    // The connection lifecycle: the single source of truth for whether this
+    // connection (and, through the parent chain, every stream on it) may still
+    // be operated on. Only this engine holds the strong reference.
+    std::shared_ptr<Lifecycle> m_conn_life;
     asio::experimental::channel<void(error_code)> m_notify;
     EngineLimits m_limits;
     std::chrono::steady_clock::time_point m_deadline{};

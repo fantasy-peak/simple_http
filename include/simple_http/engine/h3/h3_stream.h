@@ -35,6 +35,7 @@
 #include <utility>
 #include <vector>
 
+#include "../../core/lifecycle.h"
 #include "../../core/types.h"
 #include "../../proto/request.h"
 #include "../../proto/response.h"
@@ -72,6 +73,10 @@ inline constexpr std::uint64_t kOutLowWatermark = 256u << 10; // 256 KiB: wake i
 
 struct H3Stream {
     std::int64_t id{-1};
+
+    // Per-stream lifecycle, parented to the connection lifecycle. The engine's
+    // stream table holds the only strong reference.
+    std::shared_ptr<Lifecycle> life;
 
     // --- request ------------------------------------------------------------
     std::shared_ptr<Request> request;

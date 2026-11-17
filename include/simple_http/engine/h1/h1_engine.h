@@ -46,6 +46,7 @@
 #include "../../core/http_field.h"
 #include "../../core/http_method.h"
 #include "../../core/http_status.h"
+#include "../../core/lifecycle.h"
 #include "../../core/limits.h"
 #include "../../core/logging.h"
 #include "../../core/types.h"
@@ -541,7 +542,8 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
 template <typename Transport> class Http1Engine : public std::enable_shared_from_this<Http1Engine<Transport>> {
   public:
     explicit Http1Engine(std::shared_ptr<Transport> transport, EngineLimits limits = {})
-        : m_transport(std::move(transport)), m_executor(m_transport->get_executor()), m_limits(limits),
+        : m_transport(std::move(transport)), m_executor(m_transport->get_executor()),
+          m_conn_life(std::make_shared<Lifecycle>(asio::any_io_executor{m_executor})), m_limits(limits),
           m_watchdog(std::make_shared<asio::steady_timer>(m_executor)) {}
 
     // Whether an Upgrade: h2c request may switch this connection to HTTP/2.
@@ -607,6 +609,12 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
         if (m_finished)
             return;
         m_finished = true;
+        if (m_conn_life) {
+            m_conn_life->close();
+        }
+        if (m_exchange_life) {
+            m_exchange_life->close();
+        }
         m_active_writer.reset();
         m_watchdog->cancel();
         // Body reads queued behind the active pull will never be satisfied now.
@@ -743,6 +751,11 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
         auto request = std::make_shared<Request>(version, m_executor, m_transport->peer());
         request->set_method_token(std::move(head.method_token));
         request->set_target(std::move(head.target));
+        if (m_exchange_life) {
+            m_exchange_life->close();
+        }
+        m_exchange_life = std::make_shared<Lifecycle>(asio::any_io_executor{m_executor}, m_conn_life);
+        request->body().bind_lifecycle(m_exchange_life);
 
         // RFC 9110 §10.1.1: a server MUST NOT send 100 Continue to an HTTP/1.0
         // client; ignoring the expectation makes the peer send the body
@@ -766,6 +779,7 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
         writer->set_head_request(head_request);
         auto response =
             std::make_shared<ResponseWriter>(maybe_compress_writer(writer, m_executor, request, head_request));
+        response->bind_lifecycle(m_exchange_life);
 
         // A handler that signals completion twice must not drive after_handler
         // twice: the second pass would start a competing head read on the same
@@ -802,6 +816,13 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
                 // The request/response cycle is over; the engine no longer needs
                 // the sink alive for the lazy 100-continue path.
                 self->m_active_writer.reset();
+                // The exchange is over whether or not the connection is reused.
+                // Closing it before may_reuse() is safe: that decision only
+                // consults the writer and the drain result.
+                if (self->m_exchange_life) {
+                    self->m_exchange_life->close();
+                    self->m_exchange_life.reset();
+                }
                 if (!may_reuse(!handler_failed, request_keep_alive, writer->keep_alive_out(), still_open, drained)) {
                     self->finish();
                     return;
@@ -1314,9 +1335,17 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
         request->set_method_token(head.method_token);
         request->set_target(head.target);
         request->mutable_headers() = head.headers;
+        // The exchange stays open for the whole WebSocket lifetime; finish()
+        // closes it with the connection.
+        if (m_exchange_life) {
+            m_exchange_life->close();
+        }
+        m_exchange_life = std::make_shared<Lifecycle>(asio::any_io_executor{m_executor}, m_conn_life);
+        request->body().bind_lifecycle(m_exchange_life);
         auto writer = std::make_shared<Http1ResponseSink<Transport>>(m_transport, head.version, m_deadline,
                                                                      m_limits.idle_timeout, m_limits.alt_svc_value());
         auto response = std::make_shared<ResponseWriter>(writer);
+        response->bind_lifecycle(m_exchange_life);
         // Keep the sink (and therefore its writer) alive for the whole 101
         // exchange; reset once the transport is handed to the WebSocket.
         m_active_writer = writer;
@@ -1453,6 +1482,7 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
                 // The transport now belongs to the WebSocket backend.
                 self->m_active_writer.reset();
                 auto ws = std::make_shared<WebSocket>(std::move(backend));
+                ws->bind_lifecycle(self->m_exchange_life);
                 ws->run_writer();
                 // Run the ws handler; when it finishes, close gracefully.
                 invoke_ws_handler(simple_http::WsHandler(handler), request, ws, [ws, done = std::move(done)]() mutable {
@@ -1754,6 +1784,11 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
 
     std::shared_ptr<Transport> m_transport;
     asio::any_io_executor m_executor;
+    // Connection lifecycle and the lifecycle of the request currently being
+    // served. Keep-alive closes the exchange after each response and keeps the
+    // connection open; finish() closes both.
+    std::shared_ptr<Lifecycle> m_conn_life;
+    std::shared_ptr<Lifecycle> m_exchange_life;
     EngineLimits m_limits;
     SharedDeadline m_deadline{std::make_shared<std::chrono::steady_clock::time_point>()};
     ReadBuf m_in;

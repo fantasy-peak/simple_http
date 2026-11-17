@@ -49,6 +49,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "../core/lifecycle.h"
 #include "../core/logging.h"
 #include "../core/types.h"
 #include "../transport/serialized_writer.h"
@@ -770,27 +771,164 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
 };
 
 // User-facing WebSocket handle. Forwards to the type-erased backend.
-class WebSocket {
+class WebSocket : public std::enable_shared_from_this<WebSocket> {
   public:
     explicit WebSocket(std::shared_ptr<WsBackend> backend) : m_backend(std::move(backend)) {}
 
-    // Model A: the handle is used only from the connection thread that owns the
-    // backend. A call from another thread is a contract violation; log and abort
-    // (see require_owner_thread) instead of racing the reader/writer pumps.
+    // Model A: synchronous calls (run_writer) are still owner-only. Asynchronous
+    // calls may be started from any thread; they repost themselves onto the
+    // backend's executor and acquire the stream/connection lifecycle first.
     void require_owner() const noexcept { require_owner_thread(m_owner_thread, "WebSocket"); }
+
+    // The server engine binds the exchange/stream lifecycle right after the
+    // upgrade. Client-side handles and standalone tests do not bind one; only
+    // the lifecycle gate is skipped.
+    void bind_lifecycle(std::weak_ptr<Lifecycle> life) {
+        require_owner();
+        m_life = std::move(life);
+        m_life_managed = true;
+    }
 
     // Dropping the handle without awaiting close() must still stop the detached
     // write pump, otherwise it would keep the backend alive forever.
     ~WebSocket() { m_backend->abort(); }
 
+  private:
+    template <typename Fn> struct StartWriteOp {
+        StartWriteOp(std::weak_ptr<WebSocket> owner, WebSocket *raw, std::weak_ptr<Lifecycle> life, bool managed,
+                     asio::any_io_executor ex, Fn fn)
+            : owner(std::move(owner)), raw(raw), life(std::move(life)), managed(managed), ex(std::move(ex)),
+              fn(std::move(fn)) {}
+
+        std::weak_ptr<WebSocket> owner;
+        // Stack-constructed handles have no shared control block; the caller
+        // keeps them alive until completion, as before.
+        WebSocket *raw{nullptr};
+        std::weak_ptr<Lifecycle> life;
+        bool managed{false};
+        asio::any_io_executor ex;
+        bool hopped{false};
+        bool started{false};
+        Guard<WebSocket> guard;
+        Fn fn;
+
+        asio::any_io_executor get_executor() const noexcept { return ex; }
+
+        template <typename Self> void operator()(Self &self, error_code ec = {}) {
+            if (!started) {
+                // Unbound handles (client WebSockets and standalone tests) keep
+                // the historical same-thread initiation.
+                if (managed && hop_to_owner(self, hopped)) {
+                    return;
+                }
+                if (self.cancelled() != asio::cancellation_type::none) {
+                    self.complete(make_error_code(asio::error::operation_aborted));
+                    return;
+                }
+                if (managed) {
+                    auto l = life.lock();
+                    if (!l || !l->can(Lifecycle::Access::Write)) {
+                        self.complete(make_error_code(asio::error::not_connected));
+                        return;
+                    }
+                }
+                if (auto acquired = owner.lock()) {
+                    guard = Guard<WebSocket>{std::move(acquired)};
+                } else if (raw) {
+                    guard = Guard<WebSocket>{std::shared_ptr<WebSocket>(raw, [](WebSocket *) {})};
+                } else {
+                    self.complete(make_error_code(asio::error::not_connected));
+                    return;
+                }
+                started = true;
+                auto action = std::move(fn);
+                // Evaluate the guard's target before moving `self`: the op and
+                // with it `guard` are moved into WriteCompletion.
+                auto *socket = &*guard;
+                action(*socket, WriteCompletion(std::move(self)));
+                return;
+            }
+            guard = {};
+            self.complete(ec);
+        }
+    };
+
+    template <typename Fn> struct StartReadOp {
+        StartReadOp(std::weak_ptr<WebSocket> owner, WebSocket *raw, std::weak_ptr<Lifecycle> life, bool managed,
+                    asio::any_io_executor ex, Fn fn)
+            : owner(std::move(owner)), raw(raw), life(std::move(life)), managed(managed), ex(std::move(ex)),
+              fn(std::move(fn)) {}
+
+        std::weak_ptr<WebSocket> owner;
+        WebSocket *raw{nullptr};
+        std::weak_ptr<Lifecycle> life;
+        bool managed{false};
+        asio::any_io_executor ex;
+        bool hopped{false};
+        bool started{false};
+        Guard<WebSocket> guard;
+        Fn fn;
+
+        asio::any_io_executor get_executor() const noexcept { return ex; }
+
+        template <typename Self> void operator()(Self &self, error_code ec = {}, WsMessage msg = {}) {
+            if (!started) {
+                if (managed && hop_to_owner(self, hopped)) {
+                    return;
+                }
+                if (self.cancelled() != asio::cancellation_type::none) {
+                    self.complete(make_error_code(asio::error::operation_aborted), WsMessage{});
+                    return;
+                }
+                if (managed) {
+                    auto l = life.lock();
+                    if (!l || !l->can(Lifecycle::Access::Read)) {
+                        self.complete(make_error_code(asio::error::not_connected), WsMessage{});
+                        return;
+                    }
+                }
+                if (auto acquired = owner.lock()) {
+                    guard = Guard<WebSocket>{std::move(acquired)};
+                } else if (raw) {
+                    guard = Guard<WebSocket>{std::shared_ptr<WebSocket>(raw, [](WebSocket *) {})};
+                } else {
+                    self.complete(make_error_code(asio::error::not_connected), WsMessage{});
+                    return;
+                }
+                started = true;
+                auto action = std::move(fn);
+                auto *socket = &*guard;
+                action(*socket, WsReadCompletion(std::move(self)));
+                return;
+            }
+            guard = {};
+            self.complete(ec, std::move(msg));
+        }
+    };
+
+    template <typename Fn, typename Token> auto start_write(Fn &&fn, Token &&token) {
+        auto ex = m_backend->get_executor();
+        return asio::async_compose<Token, void(error_code)>(
+            StartWriteOp<std::decay_t<Fn>>{weak_from_this(), this, m_life, m_life_managed, ex, std::forward<Fn>(fn)},
+            token, ex);
+    }
+
+    template <typename Fn, typename Token> auto start_read(Fn &&fn, Token &&token) {
+        auto ex = m_backend->get_executor();
+        return asio::async_compose<Token, void(error_code, WsMessage)>(
+            StartReadOp<std::decay_t<Fn>>{weak_from_this(), this, m_life, m_life_managed, ex, std::forward<Fn>(fn)},
+            token, ex);
+    }
+
+  public:
     // Reads one complete message. Completion: void(error_code, WsMessage).
     template <typename Token> auto async_read(Token &&token) {
-        require_owner();
-        auto backend = m_backend;
-        return asio::async_compose<Token, void(error_code, WsMessage)>(
-            ReadOp{[backend](WsReadCompletion done) mutable { backend->read(std::move(done)); },
-                   backend->get_executor()},
-            token, backend->get_executor());
+        return start_read(
+            [](WebSocket &w, WsReadCompletion done) {
+                auto backend = w.m_backend;
+                backend->read(std::move(done));
+            },
+            std::forward<Token>(token));
     }
 
     template <typename Token> auto async_write_text(std::string data, Token &&token) {
@@ -800,14 +938,12 @@ class WebSocket {
         return async_write(std::move(data), false, std::forward<Token>(token));
     }
     template <typename Token> auto async_write(std::string data, bool text, Token &&token) {
-        require_owner();
-        auto backend = m_backend;
-        return asio::async_compose<Token, void(error_code)>(
-            WriteOp{[backend, data = std::move(data), text](WriteCompletion done) mutable {
-                        backend->write(std::move(data), text, std::move(done));
-                    },
-                    backend->get_executor()},
-            token, backend->get_executor());
+        return start_write(
+            [data = std::move(data), text](WebSocket &w, WriteCompletion done) mutable {
+                auto backend = w.m_backend;
+                backend->write(std::move(data), text, std::move(done));
+            },
+            std::forward<Token>(token));
     }
 
     template <typename Token> auto async_write_text_view(std::string_view data, Token &&token) {
@@ -817,67 +953,57 @@ class WebSocket {
         return async_write_view(data, false, std::forward<Token>(token));
     }
     template <typename Token> auto async_write_view(std::string_view data, bool text, Token &&token) {
-        require_owner();
-        auto backend = m_backend;
-        return asio::async_compose<Token, void(error_code)>(
-            WriteOp{[backend, data, text](WriteCompletion done) mutable {
-                        backend->write_view(data, text, std::move(done));
-                    },
-                    backend->get_executor()},
-            token, backend->get_executor());
+        return start_write(
+            [data, text](WebSocket &w, WriteCompletion done) mutable {
+                auto backend = w.m_backend;
+                backend->write_view(data, text, std::move(done));
+            },
+            std::forward<Token>(token));
     }
 
     template <typename Token> auto async_ping(std::string payload, Token &&token) {
-        require_owner();
-        auto backend = m_backend;
-        return asio::async_compose<Token, void(error_code)>(
-            WriteOp{[backend, payload = std::move(payload)](WriteCompletion done) mutable {
-                        backend->ping(std::move(payload), std::move(done));
-                    },
-                    backend->get_executor()},
-            token, backend->get_executor());
+        return start_write(
+            [payload = std::move(payload)](WebSocket &w, WriteCompletion done) mutable {
+                auto backend = w.m_backend;
+                backend->ping(std::move(payload), std::move(done));
+            },
+            std::forward<Token>(token));
     }
 
     template <typename Token> auto async_close(Token &&token) {
-        require_owner();
-        auto backend = m_backend;
-        return asio::async_compose<Token, void(error_code)>(
-            WriteOp{[backend](WriteCompletion done) mutable { backend->close(std::move(done)); },
-                    backend->get_executor()},
-            token, backend->get_executor());
+        return start_write(
+            [](WebSocket &w, WriteCompletion done) {
+                auto backend = w.m_backend;
+                backend->close(std::move(done));
+            },
+            std::forward<Token>(token));
     }
 
     template <typename Token> auto async_close(std::uint16_t code, std::string reason, Token &&token) {
-        require_owner();
-        auto backend = m_backend;
-        return asio::async_compose<Token, void(error_code)>(
-            WriteOp{[backend, code, reason = std::move(reason)](WriteCompletion done) mutable {
-                        backend->close(code, std::move(reason), std::move(done));
-                    },
-                    backend->get_executor()},
-            token, backend->get_executor());
+        return start_write(
+            [code, reason = std::move(reason)](WebSocket &w, WriteCompletion done) mutable {
+                auto backend = w.m_backend;
+                backend->close(code, std::move(reason), std::move(done));
+            },
+            std::forward<Token>(token));
     }
 
     template <typename Token> auto async_enable_write_compression(bool enable, Token &&token) {
-        require_owner();
-        auto backend = m_backend;
-        return asio::async_compose<Token, void(error_code)>(WriteOp{[backend, enable](WriteCompletion done) mutable {
-                                                                        backend->enable_write_compression(
-                                                                            enable, std::move(done));
-                                                                    },
-                                                                    backend->get_executor()},
-                                                            token, backend->get_executor());
+        return start_write(
+            [enable](WebSocket &w, WriteCompletion done) {
+                auto backend = w.m_backend;
+                backend->enable_write_compression(enable, std::move(done));
+            },
+            std::forward<Token>(token));
     }
 
     template <typename Token> auto async_set_compression_level(int level, Token &&token) {
-        require_owner();
-        auto backend = m_backend;
-        return asio::async_compose<Token, void(error_code)>(WriteOp{[backend, level](WriteCompletion done) mutable {
-                                                                        backend->set_compression_level(level,
-                                                                                                       std::move(done));
-                                                                    },
-                                                                    backend->get_executor()},
-                                                            token, backend->get_executor());
+        return start_write(
+            [level](WebSocket &w, WriteCompletion done) {
+                auto backend = w.m_backend;
+                backend->set_compression_level(level, std::move(done));
+            },
+            std::forward<Token>(token));
     }
 
     bool compression_negotiated() const { return m_backend->compression_negotiated(); }
@@ -932,6 +1058,8 @@ class WebSocket {
     };
 
     std::shared_ptr<WsBackend> m_backend;
+    std::weak_ptr<Lifecycle> m_life;
+    bool m_life_managed{false};
     std::thread::id m_owner_thread{std::this_thread::get_id()};
 };
 
