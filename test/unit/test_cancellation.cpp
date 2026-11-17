@@ -195,6 +195,40 @@ TEST_CASE("middleware: timeout fires the token for work the handler left running
     CHECK(*detached_saw_cancel);
 }
 
+TEST_CASE("request: cancellation registrations are released", "[cancellation]") {
+    asio::io_context ctx;
+    auto req = make_request(ctx);
+    CHECK(req->active_cancellation_slots() == 0);
+    {
+        auto registration = req->cancellation_registration();
+        CHECK(registration.slot().is_connected());
+        CHECK(req->active_cancellation_slots() == 1);
+        auto moved = std::move(registration);
+        CHECK(req->active_cancellation_slots() == 1);
+    }
+    CHECK(req->active_cancellation_slots() == 0);
+
+    // The legacy accessor intentionally keeps its signal until the Request is
+    // destroyed; new code should use a registration.
+    auto legacy = req->cancellation_slot();
+    CHECK(legacy.is_connected());
+    CHECK(req->active_cancellation_slots() == 1);
+}
+
+TEST_CASE("request: a coroutine handler releases its registration", "[cancellation]") {
+    Router router;
+    router.route({Method::Get}, "/reg", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->status(status::ok).async_send("ok", asio::use_awaitable);
+    });
+
+    asio::io_context ctx;
+    auto req = make_request(ctx, "/reg");
+    CHECK(req->active_cancellation_slots() == 0);
+    auto writer = run_chain(ctx, router, req);
+    CHECK(writer->last_status == status::ok);
+    CHECK(req->active_cancellation_slots() == 0);
+}
+
 TEST_CASE("response: started() flips once the head goes out", "[cancellation]") {
     asio::io_context ctx;
     auto sink = std::make_shared<FakeResponseSink>(ctx.get_executor());

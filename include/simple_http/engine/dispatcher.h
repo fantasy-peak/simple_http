@@ -236,9 +236,11 @@ void execute_coroutine(const RequestPtr &req, const ResponsePtr &res, HandlerCom
     const RequestPtr req_keep = req;
     const ResponsePtr fallback = res;
     auto executor = req_keep ? req_keep->executor() : asio::any_io_executor{};
-    auto token = asio::bind_cancellation_slot(
-        req_keep ? req_keep->cancellation_slot() : asio::cancellation_slot{},
-        [done = std::move(done), req_keep, fallback](std::exception_ptr ep) mutable {
+    auto registration = req_keep ? req_keep->cancellation_registration() : Request::CancellationRegistration{};
+    auto slot = registration.slot();
+    auto token =
+        asio::bind_cancellation_slot(slot, [done = std::move(done), req_keep, fallback,
+                                            registration = std::move(registration)](std::exception_ptr ep) mutable {
             if (!ep) {
                 std::move(done)();
                 return;
@@ -402,10 +404,12 @@ inline void invoke_ws_handler(const WsHandler &handler, RequestPtr req, std::sha
     if (std::holds_alternative<CoroWsHandler>(handler)) {
         const CoroWsHandler &fn = std::get<CoroWsHandler>(handler);
         auto executor = req ? req->executor() : asio::any_io_executor{};
+        auto registration = req ? req->cancellation_registration() : Request::CancellationRegistration{};
+        auto slot = registration.slot();
         asio::co_spawn(
             executor, [fn, req, ws]() mutable { return fn(std::move(req), std::move(ws)); },
-            asio::bind_cancellation_slot(req ? req->cancellation_slot() : asio::cancellation_slot{},
-                                         [done = std::move(done)](std::exception_ptr) mutable { std::move(done)(); }));
+            asio::bind_cancellation_slot(slot, [done = std::move(done), registration = std::move(registration)](
+                                                   std::exception_ptr) mutable { std::move(done)(); }));
         return;
     }
 #endif
@@ -452,11 +456,12 @@ inline CallbackWsHandler to_callback_ws_handler(WsHandler handler) {
         CoroWsHandler fn = std::get<CoroWsHandler>(std::move(handler));
         return [fn = std::move(fn)](RequestPtr req, std::shared_ptr<WebSocket> ws, HandlerCompletion done) mutable {
             auto executor = req ? req->executor() : asio::any_io_executor{};
+            auto registration = req ? req->cancellation_registration() : Request::CancellationRegistration{};
+            auto slot = registration.slot();
             asio::co_spawn(
                 executor, [fn, req, ws]() mutable { return fn(std::move(req), std::move(ws)); },
-                asio::bind_cancellation_slot(
-                    req ? req->cancellation_slot() : asio::cancellation_slot{},
-                    [done = std::move(done)](std::exception_ptr) mutable { std::move(done)(); }));
+                asio::bind_cancellation_slot(slot, [done = std::move(done), registration = std::move(registration)](
+                                                       std::exception_ptr) mutable { std::move(done)(); }));
         };
     }
     return std::get<0>(handler);

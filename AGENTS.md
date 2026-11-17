@@ -444,10 +444,16 @@ req->set_state<T>(...); req->get_state<T>(); req->app_state<T>();
 取消：
 
 ```cpp
-req->cancel();              // 幂等、任意线程安全；只发出 terminal cancellation
-req->cancelled();           // 原子读取
-req->cancellation_slot();   // 绑给独立工作（detached coroutine / timer）
+req->cancel();                    // 幂等、任意线程安全；只发出 terminal cancellation
+req->cancelled();                 // 原子读取
+auto reg = req->cancellation_registration(); // 首选：完成后自动注销
+auto slot = reg.slot();
+req->cancellation_slot();         // 兼容入口；signal 保留到 Request 析构
 ```
+
+`cancellation_registration()` 返回的对象必须活到绑定操作完成（通常 move 进
+completion handler）；它析构时把子 signal 从请求的 fan-out 列表移除，避免
+反复取槽导致列表无界增长。
 
 绑定了请求槽的库内操作遵循 Asio per-operation cancellation：挂起的读、写和
 h2/h3 反压等待都以 `asio::error::operation_aborted` 完成。HTTP/1.x 的写一旦可能
@@ -1161,10 +1167,17 @@ test/run.sh server-diff
     `h1_engine.h` 的 `body_failed` / `pull_body_chunk_impl`。
 54. **客户端取消透传调用方槽**：`Client::async_send` / `async_open_stream` /
     `async_open_websocket` 和 `Stream::read_head_with` / `read_with` 把 caller slot
-    转发给内层 dial/read；`HopCancel::abort_transport` 让 DNS/dial/TLS 阶段可被
-    timer 中止。完成必须 post 回调用方 executor，不能在 emit 内销毁
-    cancellation_state。`client/http.h`、`client/h1_client.h`；
+    转发给内层 dial/read；`HopState`/`HopCancel::abort_transport` 让
+    DNS/dial/TLS 阶段可被 timer 中止。完成必须 post 回调用方 executor，不能在
+    emit 内销毁 cancellation_state。`client/http.h`、`client/h1_client.h`；
     `test/unit/test_client_units.cpp` 的 `[client][cancel]`。
+55. **取消适配器统一入口**：改变 completion handler 形状只能用
+    `forward_cancel_slot()`；自定义槽处理器用 `install_cancel_handler()` /
+    `SlotGuard`；从取消处理器完成调用方用 `post_cancelled()`。禁止把
+    `any_completion_handler` 包进普通 lambda（会丢 executor/allocator/slot）。
+    请求子槽优先用 `cancellation_registration()` 并在完成时释放，
+    `active_cancellation_slots()` 必须回到 0。`core/cancel.h`；
+    `test/unit/test_cancellation.cpp` 的 registration 用例。
 
 ---
 

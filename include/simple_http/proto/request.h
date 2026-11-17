@@ -8,6 +8,7 @@
 // headers/body (or streams the body via body().feed()), and the engine reads it
 // to send. Go's http.Request is the same single type for both roles; so is this.
 
+#include <algorithm>
 #include <any>
 #include <atomic>
 #include <boost/asio/any_io_executor.hpp>
@@ -395,6 +396,55 @@ class Request {
         std::atomic<bool> cancelled{false};
     };
 
+    // Owning child-slot registration. Destroying it removes the signal from the
+    // request's fan-out list, so a handler that takes a slot per read does not
+    // grow the list until the Request dies. The registration must outlive every
+    // operation using `slot()`; bind it into the completion handler.
+    class CancellationRegistration {
+      public:
+        CancellationRegistration() = default;
+        CancellationRegistration(const CancellationRegistration &) = delete;
+        CancellationRegistration &operator=(const CancellationRegistration &) = delete;
+        CancellationRegistration(CancellationRegistration &&other) noexcept
+            : m_state(std::move(other.m_state)), m_signal(std::move(other.m_signal)) {}
+        CancellationRegistration &operator=(CancellationRegistration &&other) noexcept {
+            if (this != &other) {
+                reset();
+                m_state = std::move(other.m_state);
+                m_signal = std::move(other.m_signal);
+            }
+            return *this;
+        }
+        ~CancellationRegistration() { reset(); }
+
+        [[nodiscard]] asio::cancellation_slot slot() const noexcept {
+            return m_signal ? m_signal->slot() : asio::cancellation_slot{};
+        }
+
+        void reset() noexcept {
+            if (!m_signal) {
+                return;
+            }
+            if (auto state = m_state) {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                const auto it = std::find(state->signals.begin(), state->signals.end(), m_signal);
+                if (it != state->signals.end()) {
+                    state->signals.erase(it);
+                }
+            }
+            m_signal.reset();
+            m_state.reset();
+        }
+
+      private:
+        friend class Request;
+        CancellationRegistration(std::shared_ptr<CancelState> state, std::shared_ptr<asio::cancellation_signal> signal)
+            : m_state(std::move(state)), m_signal(std::move(signal)) {}
+
+        std::shared_ptr<CancelState> m_state;
+        std::shared_ptr<asio::cancellation_signal> m_signal;
+    };
+
     ~Request() = default;
 
     // Fires every cancellation signal handed out so far. Idempotent; safe from
@@ -425,14 +475,33 @@ class Request {
     // loop-shaped handler instead of awaiting when that reads better.
     [[nodiscard]] bool cancelled() const noexcept { return m_cancel->cancelled.load(std::memory_order_acquire); }
 
-    // The slot to bind to a pending operation:
-    // asio::bind_cancellation_slot(req->cancellation_slot(), token_or_handler).
+    // The preferred way to get a child slot:
+    //
+    //     auto reg = req->cancellation_registration();
+    //     auto slot = reg.slot();
+    //     op(asio::bind_cancellation_slot(slot, [reg = std::move(reg)] { ... }));
+    //
+    // The registration owns the backing signal and removes it from the request's
+    // fan-out list when the operation completes, so a handler that takes a slot
+    // per read does not grow the list until the Request dies. Keep the
+    // registration alive for at least as long as the bound operation.
+    [[nodiscard]] CancellationRegistration cancellation_registration() const {
+        auto signal = std::make_shared<asio::cancellation_signal>();
+        {
+            std::lock_guard<std::mutex> lock(m_cancel->mutex);
+            m_cancel->signals.push_back(signal);
+        }
+        return CancellationRegistration{m_cancel, std::move(signal)};
+    }
+
+    // Legacy convenience: asio::bind_cancellation_slot(req->cancellation_slot(),
+    // token_or_handler). The signal is retained until the Request is destroyed;
+    // prefer cancellation_registration() for repeated or long-lived operations.
     //
     // Each call returns a slot backed by its own signal, so independent
     // operations (and nested coroutines) can all observe the same request
-    // cancellation without clobbering each other. The slot stays valid as long
-    // as the Request does; a slot handed out after cancel() does not replay the
-    // emission (asio semantics).
+    // cancellation without clobbering each other. A slot handed out after
+    // cancel() does not replay the emission (asio semantics).
     [[nodiscard]] asio::cancellation_slot cancellation_slot() const {
         auto signal = std::make_shared<asio::cancellation_signal>();
         {
@@ -440,6 +509,13 @@ class Request {
             m_cancel->signals.push_back(signal);
         }
         return signal->slot();
+    }
+
+    // Number of live child signals. Exposed for tests and diagnostics; a
+    // completed handler must leave it back at zero.
+    [[nodiscard]] std::size_t active_cancellation_slots() const {
+        std::lock_guard<std::mutex> lock(m_cancel->mutex);
+        return m_cancel->signals.size();
     }
 
     // The connection/session executor this request belongs to. C++20 callers

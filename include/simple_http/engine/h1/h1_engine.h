@@ -39,7 +39,6 @@
 #include <utility>
 #include <vector>
 
-#include <boost/asio/bind_cancellation_slot.hpp>
 #include <boost/asio/cancellation_signal.hpp>
 #include <boost/asio/post.hpp>
 
@@ -268,8 +267,10 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
     // with operation_aborted, the transport is closed, and the connection is
     // never reused (the engine's keep-alive check already refuses it).
     struct WriteWait {
+        explicit WriteWait(asio::cancellation_slot slot) : guard(std::move(slot)) {}
+
         WriteCompletion done;
-        asio::cancellation_slot slot;
+        SlotGuard guard;
         bool finished{false};
     };
 
@@ -293,12 +294,12 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
         // Post: completing the composed operation destroys its cancellation
         // state, which must not happen while its signal is still emitting.
         asio::post(m_executor, [self, wait]() mutable {
-            wait->slot.clear();
+            wait->guard.clear();
             if (wait->done) {
-                std::move(wait->done)(make_error_code(asio::error::operation_aborted));
+                std::move(wait->done)(cancelled_error());
             }
             self->m_open = false;
-            self->m_writer->close(make_error_code(asio::error::operation_aborted));
+            self->m_writer->close(cancelled_error());
             self->m_transport->close();
         });
     }
@@ -312,19 +313,16 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
         // alive for the whole request/response cycle; the lock can only fail
         // once the connection is already being torn down, and the caller's
         // completion still has to run.
-        auto wait = std::make_shared<WriteWait>();
-        wait->slot = asio::get_associated_cancellation_slot(done);
+        auto wait = std::make_shared<WriteWait>(cancel_slot_of(done));
         wait->done = std::move(done);
         std::weak_ptr<Http1ResponseSink> guard = this->weak_from_this();
-        if (wait->slot.is_connected()) {
-            wait->slot.template emplace<CancelWrite>(CancelWrite{wait, guard});
-        }
+        wait->guard.install(CancelWrite{wait, guard});
         return WriteCompletion([wait, guard](error_code ec) mutable {
             if (wait->finished) {
                 return;
             }
             wait->finished = true;
-            wait->slot.clear();
+            wait->guard.clear();
             if (auto self = guard.lock()) {
                 self->complete_write(ec, std::move(wait->done));
                 return;
@@ -581,8 +579,10 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
     // with operation_aborted; the slot is cleared before the active read reuses
     // it, so exactly one consumer is ever installed in that slot.
     struct PendingPull {
+        explicit PendingPull(asio::cancellation_slot slot) : guard(std::move(slot)) {}
+
         PullCompletion done;
-        asio::cancellation_slot slot;
+        SlotGuard guard;
         bool cancelled{false};
     };
 
@@ -615,7 +615,7 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
         while (!m_pending_pulls.empty()) {
             auto pending = std::move(m_pending_pulls.front());
             m_pending_pulls.pop_front();
-            pending->slot.clear();
+            pending->guard.clear();
             if (pending->done) {
                 body_failed(make_error_code(asio::error::connection_reset), std::move(pending->done));
             }
@@ -665,7 +665,7 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
     template <typename Handler> void read_scan(Handler &&handler, CancelSlot slot = {}) {
         touch_deadline();
         m_transport->async_read_some(ByteSpan{m_scan.data(), m_scan.size()},
-                                     asio::bind_cancellation_slot(slot, std::forward<Handler>(handler)));
+                                     forward_cancel_slot(slot, std::forward<Handler>(handler)));
     }
 
     // --- head parsing --------------------------------------------------------
@@ -857,12 +857,9 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
     void pull_body_chunk(PullCompletion done) {
         CancelSlot slot = asio::get_associated_cancellation_slot(done);
         if (m_pull_active) {
-            auto entry = std::make_shared<PendingPull>();
+            auto entry = std::make_shared<PendingPull>(slot);
             entry->done = std::move(done);
-            entry->slot = slot;
-            if (slot.is_connected()) {
-                slot.template emplace<QueuedPullCancel>(QueuedPullCancel{entry, this->weak_from_this()});
-            }
+            entry->guard.install(QueuedPullCancel{entry, this->weak_from_this()});
             m_pending_pulls.push_back(std::move(entry));
             return;
         }
@@ -894,9 +891,9 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
             m_pending_pulls.erase(it);
         }
         asio::post(m_executor, [entry]() mutable {
-            entry->slot.clear();
+            entry->guard.clear();
             if (entry->done) {
-                std::move(entry->done)(make_error_code(asio::error::operation_aborted), ReadResult{});
+                std::move(entry->done)(cancelled_error(), ReadResult{});
             }
         });
     }
@@ -909,16 +906,16 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
         if (next->cancelled) {
             // cancel_pending_pull() normally erased this entry already; keep a
             // defensive completion path for a cancellation observed mid-drain.
-            next->slot.clear();
+            next->guard.clear();
             if (next->done) {
-                std::move(next->done)(make_error_code(asio::error::operation_aborted), ReadResult{});
+                std::move(next->done)(cancelled_error(), ReadResult{});
             }
             drain_pending_pulls();
             return;
         }
         // The active read installs its own handler in this slot; the queued
         // cancel handler must be gone by then (one consumer per slot).
-        next->slot.clear();
+        next->guard.clear();
         pull_body_chunk(std::move(next->done));
     }
 
@@ -945,8 +942,8 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
                 // its body pull provider) keeps the engine alive for the whole
                 // read, so the lock only fails after teardown.
                 std::weak_ptr<Http1Engine> guard = self;
-                WriteCompletion after = asio::bind_cancellation_slot(
-                    slot, [guard, done = std::move(done), slot](error_code ec) mutable {
+                WriteCompletion after =
+                    forward_cancel_slot(slot, [guard, done = std::move(done), slot](error_code ec) mutable {
                         auto engine = guard.lock();
                         if (!engine) {
                             if (done)
@@ -970,16 +967,15 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
             const std::array<ConstByteSpan, 1> buffers{
                 ConstByteSpan{reinterpret_cast<const std::byte *>(keep->data()), keep->size()}};
             touch_deadline();
-            m_transport->async_write_seq(
-                boost::span<const ConstByteSpan>{buffers.data(), buffers.size()},
-                asio::bind_cancellation_slot(
-                    slot, [self, keep, done = std::move(done), slot](error_code ec, std::size_t) mutable {
-                        if (ec) {
-                            self->body_failed(ec, std::move(done));
-                            return;
-                        }
-                        self->pull_mode(std::move(done), slot);
-                    }));
+            m_transport->async_write_seq(boost::span<const ConstByteSpan>{buffers.data(), buffers.size()},
+                                         forward_cancel_slot(slot, [self, keep, done = std::move(done),
+                                                                    slot](error_code ec, std::size_t) mutable {
+                                             if (ec) {
+                                                 self->body_failed(ec, std::move(done));
+                                                 return;
+                                             }
+                                             self->pull_mode(std::move(done), slot);
+                                         }));
             return;
         }
         pull_mode(std::move(done), slot);
@@ -1032,18 +1028,17 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
         auto self = this->shared_from_this();
         m_transport->async_read_some(
             ByteSpan{reinterpret_cast<std::byte *>(chunk->data()), chunk->size()},
-            asio::bind_cancellation_slot(
-                slot, [self, chunk, done = std::move(done)](error_code ec, std::size_t n) mutable {
-                    if (ec) {
-                        self->body_failed(ec, std::move(done));
-                        return;
-                    }
-                    chunk->resize(n);
-                    self->m_body_state.remaining -= n;
-                    if (self->m_body_state.remaining == 0)
-                        self->m_body_state.done = true;
-                    std::move(done)(error_code{}, ReadResult::chunk(std::move(*chunk)));
-                }));
+            forward_cancel_slot(slot, [self, chunk, done = std::move(done)](error_code ec, std::size_t n) mutable {
+                if (ec) {
+                    self->body_failed(ec, std::move(done));
+                    return;
+                }
+                chunk->resize(n);
+                self->m_body_state.remaining -= n;
+                if (self->m_body_state.remaining == 0)
+                    self->m_body_state.done = true;
+                std::move(done)(error_code{}, ReadResult::chunk(std::move(*chunk)));
+            }));
     }
 
     void pull_chunked(PullCompletion done, CancelSlot slot) {
@@ -1125,34 +1120,36 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
 
     void read_trailers(PullCompletion done, CancelSlot slot) {
         auto self = this->shared_from_this();
-        read_line([self, done = std::move(done), slot](error_code ec, std::string trailer) mutable {
-            if (ec) {
-                self->body_failed(ec, std::move(done));
-                return;
-            }
-            if (trailer.empty()) {
-                self->m_body_state.done = true;
-                std::move(done)(error_code{}, ReadResult::end());
-                return;
-            }
-            self->m_trailer_bytes += trailer.size() + 2;
-            if (self->m_trailer_bytes > self->m_limits.max_header_bytes) {
-                self->body_failed(make_error_code(asio::error::message_size), std::move(done));
-                return;
-            }
-            if (auto request = self->m_body_request.lock()) {
-                const auto colon = trailer.find(':');
-                if (colon != std::string::npos) {
-                    const std::string_view name = trim_ows(std::string_view{trailer}.substr(0, colon));
-                    const std::string_view value = trim_ows(std::string_view{trailer}.substr(colon + 1));
-                    const std::string lower_name = ascii_lower_copy(name);
-                    if (is_http_token(name) && !contains_ctl(value) && !is_forbidden_trailer_field(lower_name)) {
-                        request->mutable_trailers().add_lower(lower_name, std::string{value});
+        read_line(
+            [self, done = std::move(done), slot](error_code ec, std::string trailer) mutable {
+                if (ec) {
+                    self->body_failed(ec, std::move(done));
+                    return;
+                }
+                if (trailer.empty()) {
+                    self->m_body_state.done = true;
+                    std::move(done)(error_code{}, ReadResult::end());
+                    return;
+                }
+                self->m_trailer_bytes += trailer.size() + 2;
+                if (self->m_trailer_bytes > self->m_limits.max_header_bytes) {
+                    self->body_failed(make_error_code(asio::error::message_size), std::move(done));
+                    return;
+                }
+                if (auto request = self->m_body_request.lock()) {
+                    const auto colon = trailer.find(':');
+                    if (colon != std::string::npos) {
+                        const std::string_view name = trim_ows(std::string_view{trailer}.substr(0, colon));
+                        const std::string_view value = trim_ows(std::string_view{trailer}.substr(colon + 1));
+                        const std::string lower_name = ascii_lower_copy(name);
+                        if (is_http_token(name) && !contains_ctl(value) && !is_forbidden_trailer_field(lower_name)) {
+                            request->mutable_trailers().add_lower(lower_name, std::string{value});
+                        }
                     }
                 }
-            }
-            self->read_trailers(std::move(done), slot);
-        }, slot);
+                self->read_trailers(std::move(done), slot);
+            },
+            slot);
     }
 
     void drain_body(std::function<void(bool)> done) {
@@ -1231,16 +1228,15 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
         }
         auto self = this->shared_from_this();
         touch_deadline();
-        m_transport->async_read_some(
-            ByteSpan{reinterpret_cast<std::byte *>(out->data() + have), len - have},
-            asio::bind_cancellation_slot(
-                slot, [self, out, have, len, done = std::move(done), slot](error_code ec, std::size_t n) mutable {
-                    if (ec) {
-                        std::move(done)(ec, std::string{});
-                        return;
-                    }
-                    self->loop_read_exact(std::move(out), have + n, len, std::move(done), slot);
-                }));
+        m_transport->async_read_some(ByteSpan{reinterpret_cast<std::byte *>(out->data() + have), len - have},
+                                     forward_cancel_slot(slot, [self, out, have, len, done = std::move(done),
+                                                                slot](error_code ec, std::size_t n) mutable {
+                                         if (ec) {
+                                             std::move(done)(ec, std::string{});
+                                             return;
+                                         }
+                                         self->loop_read_exact(std::move(out), have + n, len, std::move(done), slot);
+                                     }));
     }
 
     // --- errors and upgrades -------------------------------------------------

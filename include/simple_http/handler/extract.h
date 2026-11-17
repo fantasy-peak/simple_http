@@ -188,20 +188,22 @@ template <typename T> struct Extractor<Json<T>> {
     using value_type = T;
 
     static void async_run(Request &req, std::function<void(HttpError, T)> done) {
+        auto registration = req.cancellation_registration();
+        auto slot = registration.slot();
         async_read_json_body<T>(
-            req, asio::bind_cancellation_slot(req.cancellation_slot(),
-                                              [done = std::move(done)](error_code ec, result<T> value) mutable {
-                                                  if (!value) {
-                                                      const error_code inner = value ? error_code{} : value.error();
-                                                      (void)ec;
-                                                      done(HttpError{body_error_status(inner), "invalid_json",
-                                                                     "malformed JSON request body", inner.message()},
-                                                           T{});
-                                                      return;
-                                                  }
-                                                  (void)ec;
-                                                  done(detail::extract_ok(), std::move(*value));
-                                              }));
+            req, asio::bind_cancellation_slot(slot, [done = std::move(done), registration = std::move(registration)](
+                                                        error_code ec, result<T> value) mutable {
+                if (!value) {
+                    const error_code inner = value ? error_code{} : value.error();
+                    (void)ec;
+                    done(HttpError{body_error_status(inner), "invalid_json", "malformed JSON request body",
+                                   inner.message()},
+                         T{});
+                    return;
+                }
+                (void)ec;
+                done(detail::extract_ok(), std::move(*value));
+            }));
     }
 };
 
@@ -209,22 +211,24 @@ template <typename T> struct Extractor<Form<T>> {
     using value_type = T;
 
     static void async_run(Request &req, std::function<void(HttpError, T)> done) {
+        auto registration = req.cancellation_registration();
+        auto slot = registration.slot();
         read_urlencoded_body(
-            req, asio::bind_cancellation_slot(
-                     req.cancellation_slot(), [done = std::move(done)](error_code ec, QueryParams form) mutable {
-                         if (ec) {
-                             done(HttpError{body_error_status(ec), "invalid_form", "malformed URL-encoded request body",
-                                            ec.message()},
-                                  T{});
-                             return;
-                         }
-                         auto value = parse_params<T>(form);
-                         if (!value) {
-                             done(HttpError{status::bad_request, "invalid_form", "invalid form field types", {}}, T{});
-                             return;
-                         }
-                         done(detail::extract_ok(), std::move(*value));
-                     }));
+            req, asio::bind_cancellation_slot(slot, [done = std::move(done), registration = std::move(registration)](
+                                                        error_code ec, QueryParams form) mutable {
+                if (ec) {
+                    done(HttpError{body_error_status(ec), "invalid_form", "malformed URL-encoded request body",
+                                   ec.message()},
+                         T{});
+                    return;
+                }
+                auto value = parse_params<T>(form);
+                if (!value) {
+                    done(HttpError{status::bad_request, "invalid_form", "invalid form field types", {}}, T{});
+                    return;
+                }
+                done(detail::extract_ok(), std::move(*value));
+            }));
     }
 };
 #endif // SIMPLE_HTTP_HAS_GLAZE

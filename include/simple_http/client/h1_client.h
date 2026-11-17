@@ -268,8 +268,7 @@ class Http1ClientSession final : public ClientSession,
             m_transport->async_write(
                 ConstByteSpan{reinterpret_cast<const std::byte *>(bytes->data()), bytes->size()},
                 asio::bind_cancellation_slot(
-                    caller_slot,
-                    [self, stream, bytes, done = std::move(done)](error_code ec, std::size_t) mutable {
+                    caller_slot, [self, stream, bytes, done = std::move(done)](error_code ec, std::size_t) mutable {
                         if (ec) {
                             self->fail_exchange(ec);
                             std::move(done)(ec, nullptr);
@@ -301,16 +300,15 @@ class Http1ClientSession final : public ClientSession,
                     auto bytes = std::make_shared<std::string>(std::move(out));
                     self->m_transport->async_write(
                         ConstByteSpan{reinterpret_cast<const std::byte *>(bytes->data()), bytes->size()},
-                        asio::bind_cancellation_slot(
-                            caller_slot,
-                            [self, stream, bytes, done = std::move(done)](error_code wec, std::size_t) mutable {
-                                if (wec) {
-                                    self->fail_exchange(wec);
-                                    std::move(done)(wec, nullptr);
-                                    return;
-                                }
-                                std::move(done)(error_code{}, stream);
-                            }));
+                        asio::bind_cancellation_slot(caller_slot, [self, stream, bytes, done = std::move(done)](
+                                                                      error_code wec, std::size_t) mutable {
+                            if (wec) {
+                                self->fail_exchange(wec);
+                                std::move(done)(wec, nullptr);
+                                return;
+                            }
+                            std::move(done)(error_code{}, stream);
+                        }));
                 }));
             return;
         }
@@ -470,15 +468,14 @@ class Http1ClientSession final : public ClientSession,
         // A caller deadline must abort the socket write; the lambda would
         // otherwise drop the completion's associated cancellation slot.
         auto slot = asio::get_associated_cancellation_slot(done);
-        m_transport->async_write(
-            ConstByteSpan{reinterpret_cast<const std::byte *>(bytes->data()), bytes->size()},
-            asio::bind_cancellation_slot(slot, [self, bytes, done = std::move(done)](error_code ec,
-                                                                                    std::size_t) mutable {
-                if (ec) {
-                    self->fail_exchange(ec);
-                }
-                std::move(done)(ec);
-            }));
+        m_transport->async_write(ConstByteSpan{reinterpret_cast<const std::byte *>(bytes->data()), bytes->size()},
+                                 asio::bind_cancellation_slot(
+                                     slot, [self, bytes, done = std::move(done)](error_code ec, std::size_t) mutable {
+                                         if (ec) {
+                                             self->fail_exchange(ec);
+                                         }
+                                         std::move(done)(ec);
+                                     }));
     }
 
     void do_exchange_write_trailers(Headers trailers, WriteCompletion done) {
@@ -513,15 +510,14 @@ class Http1ClientSession final : public ClientSession,
         auto bytes = std::make_shared<std::string>(std::move(out));
         auto self = this->shared_from_this();
         auto slot = asio::get_associated_cancellation_slot(done);
-        m_transport->async_write(
-            ConstByteSpan{reinterpret_cast<const std::byte *>(bytes->data()), bytes->size()},
-            asio::bind_cancellation_slot(slot, [self, bytes, done = std::move(done)](error_code ec,
-                                                                                    std::size_t) mutable {
-                if (ec) {
-                    self->fail_exchange(ec);
-                }
-                std::move(done)(ec);
-            }));
+        m_transport->async_write(ConstByteSpan{reinterpret_cast<const std::byte *>(bytes->data()), bytes->size()},
+                                 asio::bind_cancellation_slot(
+                                     slot, [self, bytes, done = std::move(done)](error_code ec, std::size_t) mutable {
+                                         if (ec) {
+                                             self->fail_exchange(ec);
+                                         }
+                                         std::move(done)(ec);
+                                     }));
     }
 
     // --- reading ---

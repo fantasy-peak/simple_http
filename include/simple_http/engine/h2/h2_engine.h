@@ -25,8 +25,9 @@
 
 #include <array>
 #include <boost/asio.hpp>
-#include <boost/asio/bind_cancellation_slot.hpp>
 #include <boost/asio/experimental/channel.hpp>
+
+#include "../../core/cancel.h"
 #include <charconv>
 #include <chrono>
 #include <cstdint>
@@ -238,17 +239,16 @@ class Http2ResponseSink final : public ResponseSink, public std::enable_shared_f
             // completion in a plain lambda would drop its associators, and a
             // per-operation timer could then never release a parked writer.
             const auto slot = asio::get_associated_cancellation_slot(done);
-            eng->await_out_space(
-                self->m_stream_id,
-                asio::bind_cancellation_slot(
-                    slot, [self_keep, eng, data = std::move(data), done = std::move(done)](error_code ec) mutable {
-                        if (ec) {
-                            std::move(done)(ec);
-                            return;
-                        }
-                        eng->enqueue_body(self_keep->m_stream_id, std::move(data), /*last=*/false);
-                        std::move(done)(error_code{});
-                    }));
+            eng->await_out_space(self->m_stream_id,
+                                 forward_cancel_slot(slot, [self_keep, eng, data = std::move(data),
+                                                            done = std::move(done)](error_code ec) mutable {
+                                     if (ec) {
+                                         std::move(done)(ec);
+                                         return;
+                                     }
+                                     eng->enqueue_body(self_keep->m_stream_id, std::move(data), /*last=*/false);
+                                     std::move(done)(error_code{});
+                                 }));
         });
     }
 
@@ -269,17 +269,16 @@ class Http2ResponseSink final : public ResponseSink, public std::enable_shared_f
             }
             auto self_keep = self;
             const auto slot = asio::get_associated_cancellation_slot(done);
-            eng->await_out_space(
-                self->m_stream_id,
-                asio::bind_cancellation_slot(
-                    slot, [self_keep, eng, data = std::move(data), done = std::move(done)](error_code ec) mutable {
-                        if (ec) {
-                            std::move(done)(ec);
-                            return;
-                        }
-                        eng->enqueue_body(self_keep->m_stream_id, std::move(data), /*last=*/true);
-                        std::move(done)(error_code{});
-                    }));
+            eng->await_out_space(self->m_stream_id,
+                                 forward_cancel_slot(slot, [self_keep, eng, data = std::move(data),
+                                                            done = std::move(done)](error_code ec) mutable {
+                                     if (ec) {
+                                         std::move(done)(ec);
+                                         return;
+                                     }
+                                     eng->enqueue_body(self_keep->m_stream_id, std::move(data), /*last=*/true);
+                                     std::move(done)(error_code{});
+                                 }));
         });
     }
 
@@ -594,8 +593,8 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
         // wait too; the channel reports channel_cancelled, which maps onto the
         // standard operation_aborted at this boundary.
         const auto slot = asio::get_associated_cancellation_slot(done);
-        space->async_receive(asio::bind_cancellation_slot(
-            slot, [self, stream_id, space, done = std::move(done)](error_code ec) mutable {
+        space->async_receive(
+            forward_cancel_slot(slot, [self, stream_id, space, done = std::move(done)](error_code ec) mutable {
                 if (ec) {
                     std::move(done)(make_error_code(asio::error::operation_aborted));
                     return;
