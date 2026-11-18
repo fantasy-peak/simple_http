@@ -2449,8 +2449,12 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
     // RFC 9113 §8.1.2.6: when the peer's half closes, a declared content-length
     // must equal the DATA payload total. Every END_STREAM path uses this.
     static bool remote_content_length_ok(const Stream &st) {
-        return st.declared_content_length < 0 ||
-               st.body_received == static_cast<std::uint64_t>(st.declared_content_length);
+        // Both members are int64_t and the first clause guarantees the declared
+        // length is non-negative here, so compare them directly. (The old
+        // static_cast<uint64_t> on the right operand made this a signed vs
+        // unsigned comparison and tripped -Wsign-compare in every TU that
+        // instantiated the engine.)
+        return st.declared_content_length < 0 || st.body_received == st.declared_content_length;
     }
 
     void maybe_complete_stream(std::uint32_t stream_id) {
