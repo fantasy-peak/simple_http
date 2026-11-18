@@ -72,17 +72,21 @@ class ResponseWriter : public std::enable_shared_from_this<ResponseWriter> {
     // the writer alive until the inner operation completes.
     template <typename Fn> struct StartWriteOp {
         StartWriteOp(std::weak_ptr<ResponseWriter> owner, ResponseWriter *raw, std::weak_ptr<Lifecycle> life,
-                     bool managed, Lifecycle::Access access, asio::any_io_executor ex, Fn fn)
-            : owner(std::move(owner)), raw(raw), life(std::move(life)), managed(managed), access(access),
-              ex(std::move(ex)), fn(std::move(fn)) {}
+                     bool managed, bool stack_borrow, Lifecycle::Access access, asio::any_io_executor ex, Fn fn)
+            : owner(std::move(owner)), raw(raw), life(std::move(life)), managed(managed), stack_borrow(stack_borrow),
+              access(access), ex(std::move(ex)), fn(std::move(fn)) {}
 
         std::weak_ptr<ResponseWriter> owner;
-        // Stack-constructed writers have no shared control block. The historical
-        // contract (the caller keeps the writer alive until completion) still
-        // applies to them, so the operation borrows a non-owning handle.
+        // Whether `raw` is a stack writer. Decided at initiation time (when the
+        // object is necessarily alive): an empty weak_from_this() then can only
+        // mean "no control block". Deciding later, from an expired weak_ptr,
+        // would misclassify a destroyed shared writer as a stack object and
+        // wrap its dangling pointer (with a deferred token the operation may
+        // start long after the caller dropped the handle).
         ResponseWriter *raw{nullptr};
         std::weak_ptr<Lifecycle> life;
         bool managed{false};
+        bool stack_borrow{false};
         Lifecycle::Access access{Lifecycle::Access::Write};
         asio::any_io_executor ex;
         bool hopped{false};
@@ -113,13 +117,13 @@ class ResponseWriter : public std::enable_shared_from_this<ResponseWriter> {
                 }
                 if (auto acquired = owner.lock()) {
                     guard = Guard<ResponseWriter>{std::move(acquired)};
-                } else if (!managed && raw) {
-                    // Only an unbound (stack-constructed) writer may be borrowed
-                    // through `raw`: it has no control block by construction, and
-                    // the historical "caller keeps it alive" contract applies.
-                    // A managed writer reached here means its last strong
-                    // reference was dropped while the operation was queued on a
-                    // cross-thread hop, so `raw` is dangling -- not a borrow.
+                } else if (stack_borrow && raw) {
+                    // Only a writer that had no control block when the operation
+                    // was initiated may be borrowed through `raw`: it is a stack
+                    // object, and the historical "caller keeps it alive"
+                    // contract applies. A shared writer that reached here was
+                    // destroyed while the operation was queued (cross-thread
+                    // hop or deferred token), so `raw` is dangling.
                     guard = Guard<ResponseWriter>{std::shared_ptr<ResponseWriter>(raw, [](ResponseWriter *) {})};
                 } else {
                     self.complete(make_error_code(asio::error::not_connected));
@@ -141,14 +145,16 @@ class ResponseWriter : public std::enable_shared_from_this<ResponseWriter> {
 
     template <typename Fn> struct StartConnectedOp {
         StartConnectedOp(std::weak_ptr<const ResponseWriter> owner, const ResponseWriter *raw,
-                         std::weak_ptr<Lifecycle> life, bool managed, asio::any_io_executor ex, Fn fn)
-            : owner(std::move(owner)), raw(raw), life(std::move(life)), managed(managed), ex(std::move(ex)),
-              fn(std::move(fn)) {}
+                         std::weak_ptr<Lifecycle> life, bool managed, bool stack_borrow, asio::any_io_executor ex,
+                         Fn fn)
+            : owner(std::move(owner)), raw(raw), life(std::move(life)), managed(managed), stack_borrow(stack_borrow),
+              ex(std::move(ex)), fn(std::move(fn)) {}
 
         std::weak_ptr<const ResponseWriter> owner;
         const ResponseWriter *raw{nullptr};
         std::weak_ptr<Lifecycle> life;
         bool managed{false};
+        bool stack_borrow{false};
         asio::any_io_executor ex;
         bool hopped{false};
         bool started{false};
@@ -171,10 +177,9 @@ class ResponseWriter : public std::enable_shared_from_this<ResponseWriter> {
                 // lifecycle gate is needed.
                 if (auto acquired = owner.lock()) {
                     guard = Guard<const ResponseWriter>{std::move(acquired)};
-                } else if (!managed && raw) {
-                    // See StartWriteOp: `raw` is only a valid borrow for an
-                    // unbound stack writer; a managed one whose weak_ptr expired
-                    // was destroyed while this operation was queued.
+                } else if (stack_borrow && raw) {
+                    // See StartWriteOp: `raw` is only a valid borrow when the
+                    // writer had no control block at initiation time.
                     guard = Guard<const ResponseWriter>{
                         std::shared_ptr<const ResponseWriter>(raw, [](const ResponseWriter *) {})};
                 } else {
@@ -216,8 +221,11 @@ class ResponseWriter : public std::enable_shared_from_this<ResponseWriter> {
     template <typename Fn, typename Token> auto start_io(Lifecycle::Access access, Fn &&fn, Token &&token) {
         auto ex = m_writer->get_executor();
         auto bound = asio::bind_executor(ex, std::forward<Token>(token));
+        // Sampled while `this` is alive: an empty weak can then only mean a
+        // stack object (see StartWriteOp).
+        const bool stack_borrow = !m_life_managed && weak_from_this().expired();
         return asio::async_compose<decltype(bound), void(error_code)>(
-            StartWriteOp<std::decay_t<Fn>>{weak_from_this(), this, m_life, m_life_managed, access, ex,
+            StartWriteOp<std::decay_t<Fn>>{weak_from_this(), this, m_life, m_life_managed, stack_borrow, access, ex,
                                            std::forward<Fn>(fn)},
             bound, ex);
     }
@@ -225,8 +233,9 @@ class ResponseWriter : public std::enable_shared_from_this<ResponseWriter> {
     template <typename Fn, typename Token> auto start_connected(Fn &&fn, Token &&token) const {
         auto ex = m_writer->get_executor();
         auto bound = asio::bind_executor(ex, std::forward<Token>(token));
+        const bool stack_borrow = !m_life_managed && weak_from_this().expired();
         return asio::async_compose<decltype(bound), void(error_code, bool)>(
-            StartConnectedOp<std::decay_t<Fn>>{weak_from_this(), this, m_life, m_life_managed, ex,
+            StartConnectedOp<std::decay_t<Fn>>{weak_from_this(), this, m_life, m_life_managed, stack_borrow, ex,
                                                std::forward<Fn>(fn)},
             bound, ex);
     }

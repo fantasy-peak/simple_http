@@ -375,6 +375,8 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
             return;
         }
         if (self->m_inbox_bytes >= self->m_inbox_limit) {
+            // A wait naturally breaks the chain; start the next burst fresh.
+            self->m_reader_yield = 0;
             auto &ch = self->m_inbox_space;
             ch.async_receive([self](error_code ec) {
                 if (ec) {
@@ -394,6 +396,15 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
             self->m_inbox_bytes += kInboxMsgOverhead + msg.data.size();
             self->m_inbox.push_back(std::move(msg));
             (void)self->m_inbox_ready.try_send(error_code{});
+            // A transport whose reads complete synchronously (the h2
+            // extended-CONNECT adapter can) turns this into one nested frame
+            // per buffered message. Yield periodically so a small burst of
+            // tiny frames cannot exhaust the stack.
+            if (++self->m_reader_yield >= kReaderYieldAfter) {
+                self->m_reader_yield = 0;
+                asio::post(self->m_executor, [self]() mutable { reader_loop(std::move(self)); });
+                return;
+            }
             reader_loop(std::move(self));
         });
     }
@@ -729,6 +740,9 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
 
     static constexpr std::size_t kMaxPendingFrames = 64;
     static constexpr std::size_t kInboxMsgOverhead = 128;
+    // How many messages the reader may deliver in one synchronous chain
+    // before yielding to its executor (see reader_loop).
+    static constexpr std::size_t kReaderYieldAfter = 32;
 
     std::shared_ptr<Transport> m_transport;
     asio::any_io_executor m_executor;
@@ -756,6 +770,7 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
     std::size_t m_inbox_bytes{0};
     bool m_reader_started{false};
     bool m_reader_done{false};
+    std::size_t m_reader_yield{0};
     error_code m_reader_ec;
     std::uint16_t m_close_code{0};
     Notify m_inbox_ready;
@@ -797,16 +812,19 @@ class WebSocket : public std::enable_shared_from_this<WebSocket> {
   private:
     template <typename Fn> struct StartWriteOp {
         StartWriteOp(std::weak_ptr<WebSocket> owner, WebSocket *raw, std::weak_ptr<Lifecycle> life, bool managed,
-                     asio::any_io_executor ex, Fn fn)
-            : owner(std::move(owner)), raw(raw), life(std::move(life)), managed(managed), ex(std::move(ex)),
-              fn(std::move(fn)) {}
+                     bool stack_borrow, asio::any_io_executor ex, Fn fn)
+            : owner(std::move(owner)), raw(raw), life(std::move(life)), managed(managed), stack_borrow(stack_borrow),
+              ex(std::move(ex)), fn(std::move(fn)) {}
 
         std::weak_ptr<WebSocket> owner;
-        // Stack-constructed handles have no shared control block; the caller
-        // keeps them alive until completion, as before.
+        // Whether `raw` had no control block when the operation was initiated
+        // (i.e. is a stack handle). See ResponseWriter::StartWriteOp: deciding
+        // this later from an expired weak_ptr misclassifies a destroyed shared
+        // handle as a stack object under a deferred token.
         WebSocket *raw{nullptr};
         std::weak_ptr<Lifecycle> life;
         bool managed{false};
+        bool stack_borrow{false};
         asio::any_io_executor ex;
         bool hopped{false};
         bool started{false};
@@ -835,11 +853,10 @@ class WebSocket : public std::enable_shared_from_this<WebSocket> {
                 }
                 if (auto acquired = owner.lock()) {
                     guard = Guard<WebSocket>{std::move(acquired)};
-                } else if (!managed && raw) {
-                    // Unbound (stack-constructed) handles have no control block;
-                    // the caller keeps them alive as before. A managed handle
-                    // that reached here was destroyed while the operation was
-                    // queued on the cross-thread hop, so `raw` is dangling.
+                } else if (stack_borrow && raw) {
+                    // Only a handle that had no control block at initiation time
+                    // is a stack object. A shared handle that reached here was
+                    // destroyed while the operation was queued, so `raw` dangles.
                     guard = Guard<WebSocket>{std::shared_ptr<WebSocket>(raw, [](WebSocket *) {})};
                 } else {
                     self.complete(make_error_code(asio::error::not_connected));
@@ -860,14 +877,15 @@ class WebSocket : public std::enable_shared_from_this<WebSocket> {
 
     template <typename Fn> struct StartReadOp {
         StartReadOp(std::weak_ptr<WebSocket> owner, WebSocket *raw, std::weak_ptr<Lifecycle> life, bool managed,
-                    asio::any_io_executor ex, Fn fn)
-            : owner(std::move(owner)), raw(raw), life(std::move(life)), managed(managed), ex(std::move(ex)),
-              fn(std::move(fn)) {}
+                    bool stack_borrow, asio::any_io_executor ex, Fn fn)
+            : owner(std::move(owner)), raw(raw), life(std::move(life)), managed(managed), stack_borrow(stack_borrow),
+              ex(std::move(ex)), fn(std::move(fn)) {}
 
         std::weak_ptr<WebSocket> owner;
         WebSocket *raw{nullptr};
         std::weak_ptr<Lifecycle> life;
         bool managed{false};
+        bool stack_borrow{false};
         asio::any_io_executor ex;
         bool hopped{false};
         bool started{false};
@@ -894,9 +912,9 @@ class WebSocket : public std::enable_shared_from_this<WebSocket> {
                 }
                 if (auto acquired = owner.lock()) {
                     guard = Guard<WebSocket>{std::move(acquired)};
-                } else if (!managed && raw) {
-                    // See StartWriteOp: a managed handle whose weak_ptr expired
-                    // was destroyed while this read was queued.
+                } else if (stack_borrow && raw) {
+                    // See StartWriteOp: only a handle with no control block at
+                    // initiation time may be borrowed through `raw`.
                     guard = Guard<WebSocket>{std::shared_ptr<WebSocket>(raw, [](WebSocket *) {})};
                 } else {
                     self.complete(make_error_code(asio::error::not_connected), WsMessage{});
@@ -921,16 +939,20 @@ class WebSocket : public std::enable_shared_from_this<WebSocket> {
     template <typename Fn, typename Token> auto start_write(Fn &&fn, Token &&token) {
         auto ex = m_backend->get_executor();
         auto bound = asio::bind_executor(ex, std::forward<Token>(token));
+        const bool stack_borrow = !m_life_managed && weak_from_this().expired();
         return asio::async_compose<decltype(bound), void(error_code)>(
-            StartWriteOp<std::decay_t<Fn>>{weak_from_this(), this, m_life, m_life_managed, ex, std::forward<Fn>(fn)},
+            StartWriteOp<std::decay_t<Fn>>{weak_from_this(), this, m_life, m_life_managed, stack_borrow, ex,
+                                           std::forward<Fn>(fn)},
             bound, ex);
     }
 
     template <typename Fn, typename Token> auto start_read(Fn &&fn, Token &&token) {
         auto ex = m_backend->get_executor();
         auto bound = asio::bind_executor(ex, std::forward<Token>(token));
+        const bool stack_borrow = !m_life_managed && weak_from_this().expired();
         return asio::async_compose<decltype(bound), void(error_code, WsMessage)>(
-            StartReadOp<std::decay_t<Fn>>{weak_from_this(), this, m_life, m_life_managed, ex, std::forward<Fn>(fn)},
+            StartReadOp<std::decay_t<Fn>>{weak_from_this(), this, m_life, m_life_managed, stack_borrow, ex,
+                                          std::forward<Fn>(fn)},
             bound, ex);
     }
 

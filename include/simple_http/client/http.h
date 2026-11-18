@@ -279,7 +279,7 @@ class Stream {
     // tears the session down, or when abort()/a timeout cancels the exchange.
     // Nothing here stores an operation or a completion handler back into the
     // Exchange, so no permanent cycle is possible.
-    struct Exchange {
+    struct Exchange : std::enable_shared_from_this<Exchange> {
         std::shared_ptr<detail::ClientStream> stream;
         std::chrono::milliseconds head_timeout{};
         std::chrono::milliseconds idle_timeout{};
@@ -401,8 +401,15 @@ class Stream {
 
         template <typename Token> auto read_all(std::size_t max_bytes, Token &&token) {
             auto stream = this->stream;
+            // Hand the exchange state to the composed operation: a parked read
+            // must keep the ClientStream alive after the caller drops its
+            // Stream handle (the same guarantee read_head_with/read_with give
+            // through their State::stream).
+            auto self = shared_from_this();
             return asio::async_initiate<Token, void(error_code, std::string)>(
-                [stream, max_bytes](auto handler) mutable { stream->async_read_all(max_bytes, std::move(handler)); },
+                [stream, self = std::move(self), max_bytes](auto handler) mutable {
+                    stream->async_read_all(max_bytes, std::shared_ptr<void>{std::move(self)}, std::move(handler));
+                },
                 token);
         }
     };

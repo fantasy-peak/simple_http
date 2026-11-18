@@ -1189,7 +1189,11 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
                         }
                     }
                 }
-                self->read_trailers(std::move(done), slot);
+                // Same reason as drain_body(): buffered trailer lines complete
+                // synchronously, and recursing per line is a stack overflow.
+                asio::post(self->m_executor, [self, done = std::move(done), slot]() mutable {
+                    self->read_trailers(std::move(done), slot);
+                });
             },
             slot);
     }
@@ -1209,7 +1213,12 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
                 done(!self->m_body_state.error);
                 return;
             }
-            self->drain_body(std::move(done));
+            // Do not recurse: every chunk already buffered in m_in completes
+            // synchronously, so one nested frame per chunk lets a peer send a
+            // few KiB of tiny chunks and exhaust the stack. Yield to the
+            // connection executor between chunks.
+            asio::post(self->m_executor,
+                       [self, done = std::move(done)]() mutable { self->drain_body(std::move(done)); });
         });
     }
 

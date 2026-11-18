@@ -36,7 +36,13 @@ class DeferredClientStream final : public detail::ClientStream {
 
     void write(std::string, WriteCompletion done) override { pending_write = std::move(done); }
     void finish(std::string, WriteCompletion done) override { pending_write = std::move(done); }
-    void read(detail::ReadCompletion done) override { std::move(done)(error_code{}, ReadResult::end()); }
+    void read(detail::ReadCompletion done) override {
+        if (park_reads) {
+            pending_read = std::move(done);
+            return;
+        }
+        std::move(done)(error_code{}, ReadResult::end());
+    }
     void cancel(WriteCompletion done) override { std::move(done)(error_code{}); }
     void await_head(WriteCompletion done) override { pending_head = std::move(done); }
     asio::any_io_executor head_executor() const override { return m_ex; }
@@ -52,6 +58,8 @@ class DeferredClientStream final : public detail::ClientStream {
 
     WriteCompletion pending_head;
     WriteCompletion pending_write;
+    detail::ReadCompletion pending_read;
+    bool park_reads{false};
 
   private:
     asio::any_io_executor m_ex;
@@ -236,4 +244,76 @@ TEST_CASE("stream: a write keeps the exchange alive after the handle is dropped"
     // The operation released the exchange when it finished: no
     // operation<->transport cycle remains.
     CHECK(weak_inner.expired());
+}
+
+TEST_CASE("stream: read_all keeps the exchange alive after the handle is dropped", "[lifecycle][review]") {
+    asio::io_context ctx;
+    std::weak_ptr<DeferredClientStream> weak_inner;
+    std::optional<error_code> result;
+    std::string body;
+
+    auto inner = std::make_shared<DeferredClientStream>(ctx.get_executor());
+    inner->park_reads = true;
+    weak_inner = inner;
+    auto stream = std::make_shared<Stream>(inner);
+    inner.reset();
+
+    stream->async_read_all(0, [&](error_code ec, std::string b) {
+        result = ec;
+        body = std::move(b);
+    });
+
+    auto first_owner = weak_inner.lock();
+    REQUIRE(first_owner);
+    REQUIRE(first_owner->pending_read);
+
+    // Drop the caller's handle. The parked read must hold the exchange (and
+    // therefore the ClientStream) on its own.
+    stream.reset();
+    CHECK_FALSE(weak_inner.expired());
+
+    {
+        auto first = std::move(first_owner->pending_read);
+        first_owner.reset();
+        std::move(first)(error_code{}, ReadResult::chunk("hello"));
+    }
+
+    {
+        auto second_owner = weak_inner.lock();
+        REQUIRE(second_owner);
+        REQUIRE(second_owner->pending_read); // read_all asked for the next chunk
+        auto last = std::move(second_owner->pending_read);
+        second_owner.reset();
+        std::move(last)(error_code{}, ReadResult::end());
+    }
+
+    (void)ctx.run_for(std::chrono::milliseconds{100});
+
+    REQUIRE(result.has_value());
+    CHECK_FALSE(*result);
+    CHECK(body == "hello");
+    // Released once the operation completed.
+    CHECK(weak_inner.expired());
+}
+
+TEST_CASE("response: a deferred send on a dropped shared unmanaged writer", "[lifecycle][review]") {
+    // asio::deferred postpones the composed operation's first step. A shared
+    // writer that is not lifecycle-bound must not be mistaken for a stack
+    // object when the handle is gone by then (that fallback wrapped the
+    // dangling pointer and wrote through it).
+    asio::io_context ctx;
+    auto sink = std::make_shared<FakeResponseSink>(ctx.get_executor());
+    auto writer = std::make_shared<ResponseWriter>(sink); // deliberately unbound
+
+    auto op = writer->async_send("body", asio::deferred);
+    writer.reset();
+
+    std::optional<error_code> result;
+    std::move(op)([&](error_code ec) { result = ec; });
+    ctx.restart();
+    ctx.run();
+
+    REQUIRE(result.has_value());
+    CHECK(*result == asio::error::not_connected);
+    CHECK(sink->calls == 0);
 }

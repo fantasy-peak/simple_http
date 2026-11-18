@@ -19,6 +19,8 @@
 #include <thread>
 #include <vector>
 
+#include "logging.h"
+
 namespace simple_http {
 
 namespace asio = boost::asio;
@@ -56,6 +58,7 @@ class IoCtxPool final {
                 }
                 m_idle_cv.notify_all();
             });
+            m_thread_ids.push_back(m_threads.back().get_id());
         }
     }
 
@@ -81,6 +84,15 @@ class IoCtxPool final {
     // is stopped the hard way, which is what makes a stuck handler a delayed
     // shutdown rather than a hung process.
     void stop() {
+        // A worker thread cannot join itself: std::thread::join() throws
+        // std::system_error(resource_deadlock_would_occur), and that exception
+        // would escape io_context::run() and terminate the process. Refuse
+        // instead of leaving a half-torn-down pool; the caller must stop the
+        // pool from a thread that is not one of its workers.
+        if (on_worker_thread()) {
+            SIMPLE_HTTP_ERROR_LOG("IoCtxPool::stop() called from one of its worker threads; ignoring");
+            return;
+        }
         m_work.clear();
         if (!m_threads.empty()) {
             std::unique_lock lock(m_idle_mutex);
@@ -97,6 +109,17 @@ class IoCtxPool final {
                 thread.join();
             }
         }
+    }
+
+    // Whether the calling thread is one of this pool's worker threads. Used to
+    // reject stop() (self-join is impossible) from inside a handler.
+    [[nodiscard]] bool on_worker_thread() const noexcept {
+        const auto self = std::this_thread::get_id();
+        for (const auto &id : m_thread_ids) {
+            if (id == self)
+                return true;
+        }
+        return false;
     }
 
     // Round-robin selection of the next worker io_context.
@@ -149,6 +172,8 @@ class IoCtxPool final {
     std::size_t m_running{0};
     std::atomic_uint64_t m_cursor{0};
     std::vector<std::thread> m_threads;
+    // Written once in start(), before any thread can call on_worker_thread().
+    std::vector<std::thread::id> m_thread_ids;
     std::size_t m_pool_size;
     bool m_started{false};
 };

@@ -526,6 +526,15 @@ class Server {
         if (!m_started) {
             return;
         }
+        // Tear down from a thread outside the pool. A worker cannot join
+        // itself: IoCtxPool::stop() would throw resource_deadlock_would_occur
+        // out of io_context::run() and terminate the process. Refusing leaves
+        // the server untouched and running, which is recoverable.
+        const auto core = core_snapshot();
+        if (core && core->pool && core->pool->on_worker_thread()) {
+            SIMPLE_HTTP_ERROR_LOG("Server::stop() called from a worker thread; ignoring (call it from another thread)");
+            return;
+        }
         m_stopping.store(true, std::memory_order_release);
         for (auto &listener : m_listeners) {
             if (!listener)
@@ -543,11 +552,11 @@ class Server {
                 });
             }
         }
-        // Hold one reference for the whole teardown. Observability accessors on
-        // other threads take the same mutex to copy the pointer; without it a
-        // concurrent active_connections() would race the reset below (a
-        // shared_ptr read/write race, not merely a stale count).
-        const auto core = core_snapshot();
+        // Hold one reference for the whole teardown (taken at the top so the
+        // worker-thread check and the teardown see the same Core). Observability
+        // accessors on other threads take the same mutex to copy the pointer;
+        // without it a concurrent active_connections() would race the reset
+        // below (a shared_ptr read/write race, not merely a stale count).
         if (core) {
             // Honour shutdown_grace for requests already in a handler, then
             // cancel every remaining connection. Without the cancel, an idle

@@ -29,6 +29,7 @@
 #include <atomic>
 #include <boost/unordered_map.hpp>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <initializer_list>
 #include <iterator>
@@ -1045,7 +1046,7 @@ class Router {
         insert_entry(term.tbl, entry, methods);
     }
 
-    bool match_template(const std::vector<TrieNode> &trie, std::string_view path, const TrieTerminal *&term,
+    bool match_template(const std::deque<TrieNode> &trie, std::string_view path, const TrieTerminal *&term,
                         std::vector<std::string_view> &values) const {
         if (trie.empty()) {
             return false;
@@ -1061,7 +1062,7 @@ class Router {
     // One DFS step: literal edge first, then the anonymous {param} edge, then
     // the catch-all. A literal subtree that cannot finish the path falls back to
     // the param sibling rather than shadowing it.
-    bool walk_template(const std::vector<TrieNode> &trie, std::size_t node, std::string_view path, std::size_t pos,
+    bool walk_template(const std::deque<TrieNode> &trie, std::size_t node, std::string_view path, std::size_t pos,
                        std::vector<std::string_view> &found, const TrieTerminal *&term) const {
         if (node >= trie.size())
             return false;
@@ -1098,7 +1099,7 @@ class Router {
         return false;
     }
 
-    static bool terminal_ready(const std::vector<TrieNode> &trie, std::size_t node, const TrieTerminal *&term) {
+    static bool terminal_ready(const std::deque<TrieNode> &trie, std::size_t node, const TrieTerminal *&term) {
         if (node >= trie.size())
             return false;
         const TrieTerminal &candidate = trie[node].terminal;
@@ -1186,12 +1187,19 @@ class Router {
     // Transparent hashing/equality would be enough on C++20; boost::unordered_map
     // provides the heterogeneous find under C++17.
     boost::unordered_map<std::string, MethodTable, StringHash, std::equal_to<>> m_exact;
-    std::vector<TrieNode> m_trie;
+    // A deque, not a vector: a callback handler may register another route
+    // while it is running, and push_back on a vector would relocate every
+    // existing node -- including the std::function target currently executing
+    // (its small-object buffer lives inside the node). deque insertion at the
+    // back keeps references to existing nodes valid.
+    std::deque<TrieNode> m_trie;
     // The collected OpenAPI document. Always present so serve_openapi() works
     // even when no route carries a descriptor; routes record into it only when
     // glaze is enabled (openapi::doc() exists only in that build).
     std::shared_ptr<openapi::OpenApiSpec> m_openapi{std::make_shared<openapi::OpenApiSpec>()};
-    std::vector<std::pair<RegexRoute, RouteEntry>> m_regex;
+    // Same stability requirement as m_trie: route_regex() may be called from a
+    // handler that is itself a regex route being dispatched.
+    std::deque<std::pair<RegexRoute, RouteEntry>> m_regex;
     std::optional<Handler> m_fallback;
     std::vector<std::shared_ptr<StaticFiles>> m_static;
     std::vector<Middleware> m_middleware;

@@ -1047,3 +1047,25 @@ TEST_CASE("router: a group prefix binds a regex alternation", "[router]") {
         CHECK(w->last_status == status::not_found);
     }
 }
+
+TEST_CASE("router: reentrant registration does not free the running handler", "[router][review]") {
+    // A callback handler with small captures is stored in the trie's
+    // std::function small-object buffer. Registering more routes from inside
+    // it used to reallocate the trie vector, relocating (and freeing the old
+    // storage of) the target that was still executing -- an ASan
+    // heap-use-after-free. The trie is a deque now, so existing nodes stay put.
+    asio::io_context ctx;
+    Router router;
+    int marker = 0;
+
+    router.route({Method::Get}, "/a/{x}", [&router, marker](RequestPtr, ResponsePtr res) {
+        for (int i = 0; i < 32; ++i) {
+            router.route({Method::Get}, "/extra" + std::to_string(i) + "/{y}", [](RequestPtr, ResponsePtr) {});
+        }
+        // Reading a capture through the (formerly dangling) callable.
+        CHECK(marker == 0);
+        res->async_send("ok", [](error_code) {});
+    });
+
+    CHECK(dispatch(ctx, router, make_request(ctx, "/a/1"))->last_body == "ok");
+}

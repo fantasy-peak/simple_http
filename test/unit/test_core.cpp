@@ -1,7 +1,10 @@
 // core/: the protocol-agnostic primitives every other layer builds on.
 
+#include <atomic>
 #include <catch2/catch_test_macros.hpp>
+#include <chrono>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "simple_http.h"
@@ -200,4 +203,27 @@ TEST_CASE("core/io_pool: round-robin, main context and clean shutdown", "[core]"
     CHECK(main_ctx != first);
     for (int i = 0; i < 6; ++i)
         CHECK(pool.next_ptr().get() != main_ctx);
+}
+
+TEST_CASE("core/io_pool: a worker cannot stop its own pool", "[core][review]") {
+    // stop() joins every worker. Called from one of those workers it would
+    // join itself: std::thread::join throws resource_deadlock_would_occur and
+    // the exception escapes io_context::run(), terminating the process.
+    // The pool must refuse instead of starting a teardown it cannot finish.
+    IoCtxPool pool(1);
+    pool.start();
+
+    std::atomic<bool> returned{false};
+    asio::post(pool.at(0)->get_executor(), [&] {
+        pool.stop();
+        returned.store(true, std::memory_order_release);
+    });
+    for (int i = 0; i < 2000 && !returned.load(std::memory_order_acquire); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    REQUIRE(returned.load(std::memory_order_acquire));
+
+    // The refusal left the pool intact, so a thread outside the pool can do
+    // the real teardown.
+    pool.stop();
 }

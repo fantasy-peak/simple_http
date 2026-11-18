@@ -236,3 +236,28 @@ TEST_CASE("h1/body: Transfer-Encoding must be a single final chunked coding", "[
     // Repeated chunked.
     frames("Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n", 400);
 }
+
+TEST_CASE("h1/body: draining thousands of tiny chunks does not recurse", "[h1][review]") {
+    // A handler that does not read its body makes after_handler() drain it.
+    // Each already-buffered chunk completes the pull synchronously; before the
+    // fix, drain_body() recursed once per chunk and a small request could
+    // exhaust the stack.
+    std::string request = "POST /nope HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
+    for (int i = 0; i < 4000; ++i) {
+        request += "1\r\nA\r\n";
+    }
+    request += "0\r\n\r\n";
+
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    transport->push(std::move(request));
+
+    auto dispatcher = [](std::shared_ptr<Request>, std::shared_ptr<ResponseWriter> res,
+                         SslHandle) -> asio::awaitable<void> {
+        co_await res->status(status::ok).async_send("ok", asio::use_awaitable);
+    };
+
+    auto engine = std::make_shared<Http1Engine<MockTransport>>(transport);
+    REQUIRE(run_on(ctx, run_engine(*engine, dispatcher)));
+    CHECK(transport->written().find("200") != std::string::npos);
+}

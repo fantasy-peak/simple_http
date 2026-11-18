@@ -2962,7 +2962,12 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
                 credit_consumed(st, static_cast<std::int64_t>(n));
             }
             flush();
-            std::move(done)(error_code{}, n);
+            // The WebSocket read pump consumes this completion synchronously.
+            // A peer can have thousands of tiny frames buffered in ws_inbox,
+            // and completing inline would make that pump recurse once per
+            // message until the stack is exhausted. The bytes are already in
+            // the caller's buffer, so only the notification is deferred.
+            asio::post(m_executor, [done = std::move(done), n]() mutable { std::move(done)(error_code{}, n); });
             return;
         }
         if (st.ws_closed) {

@@ -6,6 +6,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "simple_http.h"
@@ -1025,4 +1026,88 @@ TEST_CASE("ws/codec: a 64-bit payload length with the high bit set is rejected",
     }
     CHECK_FALSE(threw);
     CHECK(status == WsFrameParser::Status::Error);
+}
+
+namespace {
+
+// A transport whose reads complete inline, like the HTTP/2 extended-CONNECT
+// adapter does when its stream already has buffered DATA. The WebSocket reader
+// must not turn that into one nested stack frame per buffered message.
+class InlineReadTransport {
+  public:
+    InlineReadTransport(asio::any_io_executor ex, std::string bytes) : m_ex(std::move(ex)), m_in(std::move(bytes)) {}
+
+    asio::any_io_executor get_executor() { return m_ex; }
+
+    template <typename Token> auto async_read_some(ByteSpan out, Token &&token) {
+        return asio::async_initiate<Token, void(error_code, std::size_t)>(
+            [this, out](auto handler) mutable {
+                if (m_in.empty()) {
+                    std::move(handler)(asio::error::eof, 0);
+                    return;
+                }
+                const std::size_t n = std::min<std::size_t>(out.size(), m_in.size());
+                std::memcpy(out.data(), m_in.data(), n);
+                m_in.erase(0, n);
+                std::move(handler)(error_code{}, n);
+            },
+            token);
+    }
+
+    template <typename Token> auto async_write_seq(boost::span<const ConstByteSpan>, Token &&token) {
+        return asio::async_initiate<Token, void(error_code, std::size_t)>(
+            [](auto handler) { std::move(handler)(error_code{}, 0); }, token);
+    }
+
+    template <typename Token> auto async_write(ConstByteSpan, Token &&token) {
+        return async_write_seq(boost::span<const ConstByteSpan>{}, std::forward<Token>(token));
+    }
+
+    template <typename Token> auto async_shutdown(Token &&token) {
+        return asio::async_initiate<Token, void(error_code)>([](auto handler) { std::move(handler)(error_code{}); },
+                                                             token);
+    }
+
+    void close() { m_closed = true; }
+    asio::ip::tcp::endpoint peer() const { return {}; }
+    SslHandle tls_handle() const { return std::nullopt; }
+    bool closed() const { return m_closed; }
+
+  private:
+    asio::any_io_executor m_ex;
+    std::string m_in;
+    bool m_closed{false};
+};
+
+} // namespace
+
+TEST_CASE("ws/backend: a burst on an inline-completing transport does not recurse", "[ws][review]") {
+    // Pre-fix, every completed message recursed into reader_loop(); with an
+    // inline transport a few KiB of 6-byte empty frames exhausted an 8 MiB
+    // stack. 20000 frames are ~120 KiB of input and only queue ~2.5 MiB in the
+    // inbox, so the reader never parks.
+    std::string frames;
+    frames.reserve(6 * 20000);
+    for (int i = 0; i < 20000; ++i) {
+        frames.append("\x82\x80\x00\x00\x00\x00", 6); // masked empty binary frame
+    }
+
+    asio::io_context ctx;
+    auto transport = std::make_shared<InlineReadTransport>(ctx.get_executor(), std::move(frames));
+    auto backend = std::make_shared<WsBackendImpl<InlineReadTransport>>(transport, /*max_payload=*/65536,
+                                                                        std::chrono::seconds(5), /*expect_masked=*/true,
+                                                                        /*inbox_limit=*/4u * 1024 * 1024);
+
+    std::optional<error_code> ec;
+    WsMessage first;
+    backend->read([&](error_code e, WsMessage msg) {
+        ec = e;
+        first = std::move(msg);
+    });
+    ctx.run();
+
+    REQUIRE(ec.has_value());
+    CHECK_FALSE(*ec);
+    CHECK_FALSE(first.text);
+    CHECK(first.data.empty());
 }

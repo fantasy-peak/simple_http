@@ -25,6 +25,7 @@
 #include <utility>
 
 #include "../core/base64.h"
+#include "../core/compat.h"
 #include "../core/http_field.h"
 #include "../core/http_method.h"
 #include "../core/result.h"
@@ -177,8 +178,16 @@ class ClientStream {
     }
 
     template <typename Token> auto async_read_all(std::size_t max_bytes, Token &&token) {
-        return asio::async_compose<Token, void(error_code, std::string)>(ReadAllOp{*this, max_bytes}, token,
-                                                                         head_executor());
+        return async_read_all(max_bytes, std::shared_ptr<void>{}, std::forward<Token>(token));
+    }
+
+    // `owner` is an opaque strong reference (normally the caller's exchange
+    // state) held for the whole operation. Without it the composed operation
+    // keeps only a reference to this ClientStream, and a handle dropped while
+    // the read is parked would destroy it underneath the pending completion.
+    template <typename Token> auto async_read_all(std::size_t max_bytes, std::shared_ptr<void> owner, Token &&token) {
+        return asio::async_compose<Token, void(error_code, std::string)>(
+            ReadAllOp{*this, max_bytes, std::move(owner), {}, false}, token, head_executor());
     }
 
     // --- state ---
@@ -258,6 +267,9 @@ class ClientStream {
     struct ReadAllOp {
         ClientStream &stream;
         std::size_t max_bytes;
+        // Keeps the owning exchange (and therefore `stream`) alive until the
+        // operation completes; see async_read_all().
+        std::shared_ptr<void> owner;
         std::string out;
         bool started{false};
 
