@@ -144,7 +144,7 @@ include/
       http_proxy.h
       static_files.h
       file_response.h               async_send_file
-      upload.h                      async_read_body_to_file
+      upload.h                      async_read_body_to_file、sanitize_filename
     net/
       connection.h                  PlaintextProtocols
       server.h                      Server / ServerConfig / 监听生命周期
@@ -592,7 +592,14 @@ read_multipart_body(req, token);                     // void(error_code, vector<
 read_multipart_stream(body, boundary, cb, token);    // void(error_code)
 async_write_error(res, status, JsonError, token);    // void(error_code)
 async_write_problem(res, status, ProblemDetails, token);
+
+sanitize_filename(untrusted_multipart_filename);     // -> safe single component
 ```
+
+- `sanitize_filename` 剥离目录/盘符分量、拒绝 `.`/`..` 和控制字节，返回空表示应自行生成文件名；
+  服务端把 multipart 的 `filename` 直接拼到磁盘路径前应先经过它。
+- `async_send_file` 在 POSIX 上先 `open(O_NOFOLLOW)` 再 `fstat(S_ISREG)`，用同一个 fd 分块读取，
+  避免 stat/open 之间的 TOCTOU 与符号链接跟随（Windows 仍是最佳努力）。
 
 OpenAPI：
 

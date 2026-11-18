@@ -1398,6 +1398,16 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
             // connection executor must not double-credit bytes the handler
             // already read.
             consumed->fetch_add(n, std::memory_order_acq_rel);
+            // Connection-level credit is returned synchronously. The hook runs
+            // on this connection's executor, and deferring it opens a window in
+            // which erase_stream()/release_unread_body() sees `consumed`
+            // already advanced, decides there is nothing left to credit, and
+            // the posted work then finds the stream gone — leaking MAX_DATA
+            // forever. Only the stream-level offset (which needs a stream that
+            // still exists) stays posted.
+            if (auto eng = weak.lock()) {
+                eng->m_conn->extend_connection_offset(n);
+            }
             asio::post(exec, [weak, stream_id, n]() {
                 if (auto eng = weak.lock()) {
                     // erase_stream/release_unread_body already credited every
@@ -1406,7 +1416,6 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
                     if (eng->m_streams.find(stream_id) == eng->m_streams.end())
                         return;
                     eng->m_conn->extend_stream_offset(stream_id, n);
-                    eng->m_conn->extend_connection_offset(n);
                     eng->drain_paused(stream_id);
                 }
             });

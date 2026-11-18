@@ -26,6 +26,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -159,13 +160,22 @@ template <typename... Args> class HopState : public std::enable_shared_from_this
     };
 
     void cancel_from_caller(asio::cancellation_type_t type) {
-        if (!is_terminal_cancel(type) || m_finished) {
+        if (!is_terminal_cancel(type)) {
             return;
         }
-        m_finished = true;
-        abort_hop();
+        // A cancellation signal may be emitted from any thread, but m_finished,
+        // abort_hop() and the HopCancel state belong to the owner executor.
+        // Touching them inline races finish() there (torn shared_ptr /
+        // std::function, double completion). Serialize through the executor.
         auto self = this->shared_from_this();
-        asio::post(m_exec, [self]() mutable { self->deliver_cancelled(); });
+        asio::post(m_exec, [self]() mutable {
+            if (self->m_finished) {
+                return;
+            }
+            self->m_finished = true;
+            self->abort_hop();
+            self->deliver_cancelled();
+        });
     }
 
     void stop_timer() {
@@ -620,9 +630,15 @@ class Client : public std::enable_shared_from_this<Client> {
     // io_context: a multiplexed session keeps a read pending for keep-alive, so
     // the context would not otherwise run out of work.
     void close() const {
+        // close() may be called from a thread that is not the bound executor
+        // (a common shutdown shape), while a dial completion on the executor
+        // may be replacing the cached session. The cache pointer needs the
+        // same lock as take_cached()/cache().
+        std::lock_guard<std::mutex> lock(m_cache_mutex);
         if (m_cached_session) {
-            m_cached_session->close();
+            auto session = std::move(m_cached_session);
             m_cached_session.reset();
+            session->close();
         }
     }
 
@@ -655,15 +671,19 @@ class Client : public std::enable_shared_from_this<Client> {
             detail::make_executor_initiation(
                 [keep, request = std::move(request), url = std::move(url), max_body_bytes, response_head_timeout,
                  body_idle_timeout, effective](auto handler) mutable {
-                    const std::chrono::milliseconds overall = keep->m_config.request_timeout;
                     // The overall budget and a caller-supplied deadline (for
                     // example asio::cancel_after) share one one-shot completion.
                     // The still-running dial/read must not touch this Client after
                     // either fires (a stack Client dies with the awaitable frame).
                     using State = detail::HopState<Response>;
+                    // Register the caller's cancellation before leaving the
+                    // calling thread: a signal emitted immediately after this
+                    // initiation returns must not find an empty slot. None of
+                    // this touches the Client's cache.
                     auto caller_slot = asio::get_associated_cancellation_slot(handler);
                     auto state = std::make_shared<State>(keep->m_executor, std::move(handler));
                     state->attach(caller_slot);
+                    const std::chrono::milliseconds overall = keep->m_config.request_timeout;
                     if (overall.count() > 0) {
                         state->timer = std::make_shared<asio::steady_timer>(keep->m_executor);
                         state->timer->expires_after(overall);
@@ -678,10 +698,19 @@ class Client : public std::enable_shared_from_this<Client> {
                             }
                         });
                     }
-                    keep->send_hop(
-                        std::move(request), std::move(url), max_body_bytes, 0, 0, response_head_timeout,
-                        body_idle_timeout, effective, state->cancel,
-                        [state](error_code ec, Response response) mutable { state->finish(ec, std::move(response)); });
+                    // send_hop() reads and writes the Client's connection cache
+                    // and the sessions' non-atomic state, so it must run on the
+                    // bound executor. On a same-thread call this still runs
+                    // inline.
+                    asio::dispatch(keep->m_executor,
+                                   [keep, request = std::move(request), url = std::move(url), max_body_bytes,
+                                    response_head_timeout, body_idle_timeout, effective, state]() mutable {
+                                       keep->send_hop(std::move(request), std::move(url), max_body_bytes, 0, 0,
+                                                      response_head_timeout, body_idle_timeout, effective,
+                                                      state->cancel, [state](error_code ec, Response response) mutable {
+                                                          state->finish(ec, std::move(response));
+                                                      });
+                                   });
                 },
                 keep->m_executor),
             token);
@@ -694,13 +723,17 @@ class Client : public std::enable_shared_from_this<Client> {
             detail::make_executor_initiation(
                 [keep, url = std::move(url), spec = std::move(spec)](auto handler) mutable {
                     using State = detail::HopState<std::shared_ptr<WebSocket>>;
+                    // Register cancellation on the calling thread; see async_send.
                     auto caller_slot = asio::get_associated_cancellation_slot(handler);
                     auto state = std::make_shared<State>(keep->m_executor, std::move(handler));
                     state->attach(caller_slot);
-                    keep->open_ws_hop(std::move(url), std::move(spec), state->cancel,
-                                      [state](error_code ec, std::shared_ptr<WebSocket> ws) mutable {
-                                          state->finish(ec, std::move(ws));
-                                      });
+                    asio::dispatch(keep->m_executor,
+                                   [keep, url = std::move(url), spec = std::move(spec), state]() mutable {
+                                       keep->open_ws_hop(std::move(url), std::move(spec), state->cancel,
+                                                         [state](error_code ec, std::shared_ptr<WebSocket> ws) mutable {
+                                                             state->finish(ec, std::move(ws));
+                                                         });
+                                   });
                 },
                 keep->m_executor),
             token);
@@ -715,13 +748,17 @@ class Client : public std::enable_shared_from_this<Client> {
             detail::make_executor_initiation(
                 [keep, url = std::move(url), spec = std::move(spec), max_body_bytes](auto handler) mutable {
                     using State = detail::HopState<std::shared_ptr<Stream>>;
+                    // Register cancellation on the calling thread; see async_send.
                     auto caller_slot = asio::get_associated_cancellation_slot(handler);
                     auto state = std::make_shared<State>(keep->m_executor, std::move(handler));
                     state->attach(caller_slot);
-                    keep->open_stream_hop(std::move(url), std::move(spec), max_body_bytes, state->cancel,
-                                          [state](error_code ec, std::shared_ptr<Stream> stream) mutable {
-                                              state->finish(ec, std::move(stream));
-                                          });
+                    asio::dispatch(keep->m_executor, [keep, url = std::move(url), spec = std::move(spec),
+                                                      max_body_bytes, state]() mutable {
+                        keep->open_stream_hop(std::move(url), std::move(spec), max_body_bytes, state->cancel,
+                                              [state](error_code ec, std::shared_ptr<Stream> stream) mutable {
+                                                  state->finish(ec, std::move(stream));
+                                              });
+                    });
                 },
                 keep->m_executor),
             token);
@@ -800,6 +837,9 @@ class Client : public std::enable_shared_from_this<Client> {
     asio::any_io_executor m_executor;
     ClientConfig m_config;
     std::shared_ptr<asio::ssl::context> m_tls_context;
+    // Guards the one-entry connection cache. Everything else on Client is
+    // executor-affine, but close() is allowed from another thread.
+    mutable std::mutex m_cache_mutex;
     mutable std::string m_cached_origin;
     mutable std::shared_ptr<detail::ClientSession> m_cached_session;
 };
@@ -910,6 +950,7 @@ inline RequestBuilder Client::request(Method method, std::string url) const {
 
 inline std::shared_ptr<detail::ClientSession> Client::take_cached(std::string_view origin,
                                                                   HttpVersionPolicy version) const {
+    std::lock_guard<std::mutex> lock(m_cache_mutex);
     if (m_cached_session && m_cached_origin == origin && m_cached_session->alive()) {
         auto session = m_cached_session;
         if (version != HttpVersionPolicy::Auto) {
@@ -948,6 +989,7 @@ inline std::shared_ptr<detail::ClientSession> Client::take_cached(std::string_vi
 }
 
 inline void Client::cache(std::string origin, std::shared_ptr<detail::ClientSession> session) const {
+    std::lock_guard<std::mutex> lock(m_cache_mutex);
     m_cached_origin = std::move(origin);
     m_cached_session = std::move(session);
 }

@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <fstream>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <utility>
 
@@ -31,6 +32,33 @@
 namespace simple_http {
 
 namespace asio = boost::asio;
+
+// Derives a safe single path component from an untrusted multipart filename.
+// The filename in a multipart body is attacker-controlled and may contain
+// directory separators, a drive prefix, "." / "..", or control bytes. Returns
+// an empty string when nothing safe remains; callers must then invent a name
+// (for example a generated id) rather than joining the raw value to a root.
+inline std::string sanitize_filename(std::string_view name) {
+    // Strip every directory component (POSIX and Windows separators).
+    if (const auto last = name.find_last_of("/\\"); last != std::string_view::npos) {
+        name.remove_prefix(last + 1);
+    }
+    if (name.empty() || name == "." || name == "..") {
+        return {};
+    }
+    std::string out;
+    out.reserve(name.size());
+    for (const char ch : name) {
+        const auto byte = static_cast<unsigned char>(ch);
+        // C0, DEL and NUL: not a valid filename byte and a log/header injection
+        // vector. Reject the whole name rather than silently altering it.
+        if (byte < 0x20 || byte == 0x7f) {
+            return {};
+        }
+        out.push_back(ch);
+    }
+    return out;
+}
 
 namespace detail {
 

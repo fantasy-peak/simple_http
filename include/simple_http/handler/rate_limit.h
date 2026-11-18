@@ -251,6 +251,12 @@ inline std::string request_key(const RequestPtr &req) {
 inline Middleware rate_limit(std::shared_ptr<TokenBucket> bucket) {
     return [bucket = std::move(bucket)](RequestPtr req, ResponsePtr res, SslHandle ssl, Next next,
                                         HandlerCompletion done) {
+        // A null bucket is a configuration mistake, not a reason to crash the
+        // worker: fail open and let the rest of the chain decide.
+        if (!bucket) {
+            next(std::move(req), std::move(res), ssl, std::move(done));
+            return;
+        }
         if (!bucket->try_acquire()) {
             res->header(field::retry_after, std::to_string(bucket->seconds_until_token()));
             res->status(status::too_many_requests);
@@ -268,7 +274,11 @@ inline Middleware rate_limit(std::shared_ptr<RateLimiter> limiter,
                              std::function<std::string(const RequestPtr &)> key_from = detail::request_key) {
     return [limiter = std::move(limiter), key_from = std::move(key_from)](
                RequestPtr req, ResponsePtr res, SslHandle ssl, Next next, HandlerCompletion done) {
-        auto key = key_from(req);
+        if (!limiter) {
+            next(std::move(req), std::move(res), ssl, std::move(done));
+            return;
+        }
+        auto key = key_from ? key_from(req) : detail::request_key(req);
         if (!limiter->try_acquire(key)) {
             // The per-key bucket knows when it refills, so the response carries
             // the same Retry-After as the shared-bucket limiter.

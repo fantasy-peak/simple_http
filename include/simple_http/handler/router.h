@@ -882,7 +882,15 @@ class Router {
             if (m == Method::Unknown) {
                 continue;
             }
-            auto &slot = tbl.by_method[static_cast<std::size_t>(m)];
+            // Method is a uint8_t enum: a value produced by a cast can be past
+            // the table, and indexing by_model with it corrupts the router.
+            const auto index = static_cast<std::size_t>(m);
+            if (index >= MethodTable::kSlots) {
+                SIMPLE_HTTP_ERROR_LOG("route: method value {} is out of range; registration skipped",
+                                      static_cast<unsigned>(m));
+                continue;
+            }
+            auto &slot = tbl.by_method[index];
             if (slot) {
                 SIMPLE_HTTP_INFO_LOG("route already registered for this method; the first handler stays");
             } else {
@@ -1124,6 +1132,11 @@ class Router {
         for (Method m : methods) {
             if (m == Method::Unknown) {
                 SIMPLE_HTTP_ERROR_LOG("route: Method::Unknown is not routable; registration skipped");
+                return std::nullopt;
+            }
+            if (static_cast<std::size_t>(m) >= MethodTable::kSlots) {
+                SIMPLE_HTTP_ERROR_LOG("route: method value {} is out of range; registration skipped",
+                                      static_cast<unsigned>(m));
                 return std::nullopt;
             }
             bits |= method_bit(m);

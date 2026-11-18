@@ -735,6 +735,10 @@ co_await writer->async_file("upload", "notes.txt", "./notes.txt",
 co_await writer->async_finish(boost::asio::use_awaitable);
 ```
 
+服务端的 multipart `filename` 是不可信输入。把它拼到目录之前，先用
+`simple_http::sanitize_filename()` 归约为单一路径分量；返回空字符串时应自行生成
+文件名。
+
 ### 客户端配置
 
 | 字段 | 默认值 |

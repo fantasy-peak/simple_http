@@ -349,26 +349,39 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
     // --- datagram in -------------------------------------------------------
 
     struct RecvState {
+        // The peer may send datagrams up to the payload size we advertise, so
+        // the scratch buffers must be that large (a fixed 1500 would truncate
+        // larger configured values).
+        explicit RecvState(std::size_t mtu) : datagram_size(mtu) {
 #if defined(__linux__)
-        // One large scratch the batch reads into (reused across calls: every
-        // datagram is consumed synchronously and copied where it needs to live,
-        // so nothing references it after the batch is processed).
-        std::vector<std::uint8_t> scratch = std::vector<std::uint8_t>(static_cast<std::size_t>(kRecvScratch));
+            // One large scratch the batch reads into (reused across calls:
+            // every datagram is consumed synchronously and copied where it
+            // needs to live, so nothing references it after the batch).
+            scratch.resize(datagram_size * kRecvBatch);
+#else
+            buffer.resize(datagram_size);
+#endif
+        }
+
+        std::size_t datagram_size;
+#if defined(__linux__)
+        std::vector<std::uint8_t> scratch;
         std::array<asio::ip::udp::endpoint, kRecvBatch> from{};
         std::array<iovec, kRecvBatch> iov{};
         std::array<mmsghdr, kRecvBatch> msgs{};
 #else
-        std::vector<std::uint8_t> buffer = std::vector<std::uint8_t>(static_cast<std::size_t>(kMaxDatagram));
+        std::vector<std::uint8_t> buffer;
         asio::ip::udp::endpoint remote{};
 #endif
     };
 
     void receive_loop() {
-        auto state = std::make_shared<RecvState>();
+        auto state =
+            std::make_shared<RecvState>(effective_max_udp_payload_size(m_config.connection.max_udp_payload_size));
 #if defined(__linux__)
         for (std::size_t i = 0; i < kRecvBatch; ++i) {
-            state->iov[i].iov_base = state->scratch.data() + i * kMaxDatagram;
-            state->iov[i].iov_len = kMaxDatagram;
+            state->iov[i].iov_base = state->scratch.data() + i * state->datagram_size;
+            state->iov[i].iov_len = state->datagram_size;
             state->msgs[i].msg_hdr.msg_iov = &state->iov[i];
             state->msgs[i].msg_hdr.msg_iovlen = 1;
             state->msgs[i].msg_hdr.msg_name = state->from[i].data();
@@ -406,7 +419,7 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
                     state->from[i].resize(state->msgs[i].msg_hdr.msg_namelen);
                     self->handle_datagram(
                         boost::span<const std::uint8_t>{state->scratch.data() +
-                                                            static_cast<std::size_t>(i) * kMaxDatagram,
+                                                            static_cast<std::size_t>(i) * state->datagram_size,
                                                         static_cast<std::size_t>(state->msgs[i].msg_len)},
                         state->from[i]);
                 }
@@ -435,7 +448,10 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
 
     void handle_datagram(boost::span<const std::uint8_t> data, const asio::ip::udp::endpoint &remote) {
         ngtcp2_version_cid vc{};
-        const std::size_t scid_len = m_config.connection.connection_id_length;
+        // ngtcp2_cid::data is NGTCP2_MAX_CIDLEN octets. A larger configured
+        // length would make decode fill vc.dcidlen beyond that, and the
+        // stateless-reset path then memcpy's past the stack CID.
+        const std::size_t scid_len = effective_connection_id_length(m_config.connection.connection_id_length);
         switch (const int rv = ngtcp2_pkt_decode_version_cid(&vc, data.data(), data.size(), scid_len)) {
         case 0:
             break;
@@ -782,6 +798,10 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
         constexpr std::size_t kTokenLen = NGTCP2_STATELESS_RESET_TOKENLEN;
         constexpr std::size_t kMinTotal = kTokenLen + NGTCP2_MIN_STATELESS_RESET_RANDLEN;
         if (packet_len <= kMinTotal)
+            return;
+        // A decoded CID longer than ngtcp2's storage is a malformed or
+        // misconfigured shape; ngtcp2_cid_init would copy past its array.
+        if (vc.dcid == nullptr || vc.dcidlen > NGTCP2_MAX_CIDLEN)
             return;
         std::array<std::uint8_t, kMaxDatagram> buf{};
         std::array<std::uint8_t, NGTCP2_STATELESS_RESET_TOKENLEN> token{};

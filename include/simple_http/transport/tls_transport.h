@@ -45,7 +45,9 @@ template <typename Socket> class TlsTransport {
         const unsigned char *proto = nullptr;
         unsigned int len = 0;
         SSL_get0_alpn_selected(m_stream->native_handle(), &proto, &len);
-        return std::string_view{reinterpret_cast<const char *>(proto), len};
+        // proto is null when the handshake selected no protocol; constructing
+        // a string_view over null (even with length zero) is undefined.
+        return proto ? std::string_view{reinterpret_cast<const char *>(proto), len} : std::string_view{};
     }
 
     template <typename Token> auto async_read_some(ByteSpan buffer, Token &&token) {

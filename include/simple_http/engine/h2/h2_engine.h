@@ -418,6 +418,11 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
         st.request->set_target(std::move(target));
         st.request->mutable_headers() = std::move(headers);
         if (!body.empty()) {
+            // These bytes arrived as an HTTP/1.1 body before the upgrade, so
+            // they were never charged against this connection's HTTP/2 receive
+            // windows. Crediting them back when the handler consumes them would
+            // mint window the peer never spent.
+            st.body_credit_prepaid = true;
             (void)st.request->body().feed(std::move(body));
         }
         (void)st.request->body().finish();
@@ -1038,6 +1043,11 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
                     self->finish_connection();
                     return;
                 }
+                // Teardown may have begun while this read was in flight (a
+                // write error or a watchdog can call finish_connection). No
+                // frame received after that may dispatch a handler.
+                if (self->m_finished)
+                    return;
                 self->m_deadline = std::chrono::steady_clock::now() + self->m_limits.idle_timeout;
                 self->m_recv_buf.append(reinterpret_cast<const char *>(self->m_read_scratch.data()), n);
                 if (!self->parse_available()) {
@@ -1750,7 +1760,15 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
         auto &fields = m_decode_fields;
         fields.clear();
         if (!m_decoder.decode(block, fields)) {
-            if (m_decoder.header_list_too_large()) {
+            // A block that outgrew the advertised list bound is a stream error
+            // (RFC 9113 §6.5.2) *if that is the only thing wrong with it*. The
+            // decoder keeps going after crossing the bound so the dynamic table
+            // stays in sync; if it then hits a malformed representation, the
+            // block was never fully decodable and the table state is unknown.
+            // Resetting one stream would leave the connection decoding later
+            // blocks against a desynchronized table, so that is a compression
+            // error (GOAWAY), not list-too-large.
+            if (m_decoder.list_too_large_only()) {
                 // The decoded list exceeded the bound advertised as
                 // SETTINGS_MAX_HEADER_LIST_SIZE. RFC 9113 §6.5.2 makes that a
                 // *stream* error (the connection and every other stream survive),
@@ -1786,7 +1804,13 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
         // The decoder already knows how many fields the block held. Reserving
         // once keeps the request's header vector from growing 1 -> 2 -> 4 -> 8
         // (each growth reallocating and moving every stored string) per request.
-        st.request->mutable_headers().reserve(fields.size());
+        //
+        // Only for the request head. A trailing block is appended to
+        // `mutable_trailers()`, so reserving the *request* vector here would
+        // reallocate it while a dispatched handler may still hold a string_view
+        // into it (`req->header(...)`), which is a use-after-free read.
+        if (!trailers)
+            st.request->mutable_headers().reserve(fields.size());
 
         // Every rejection below is a *stream* error (§8.1.1): the connection stays
         // usable and only the offending stream is reset. Returning true then means
@@ -2854,8 +2878,17 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
         // local regex ws route.
         if (!handler_fn && m_ws_proxy_lookup) {
             if (auto target = m_ws_proxy_lookup(path)) {
-                auto run = std::make_shared<H2WsProxyRun>(self, stream_id, request, writer, std::move(*target));
-                run->start();
+                try {
+                    auto run = std::make_shared<H2WsProxyRun>(self, stream_id, request, writer, std::move(*target));
+                    run->start();
+                    return;
+                } catch (const std::exception &e) {
+                    SIMPLE_HTTP_ERROR_LOG("h2 ws proxy(stream={}) threw: {}", stream_id, e.what());
+                } catch (...) {
+                    SIMPLE_HTTP_ERROR_LOG("h2 ws proxy(stream={}) threw an unknown exception", stream_id);
+                }
+                self->reset_stream(stream_id, codec::H2_INTERNAL_ERROR);
+                self->handler_finished(stream_id);
                 return;
             }
         }
@@ -2870,12 +2903,35 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
         }
         auto response = std::make_shared<ResponseWriter>(writer);
         response->bind_lifecycle(it->second.life);
-        auto upgrade = [self, stream_id](RequestPtr req, ResponsePtr res, CallbackWsHandler h,
-                                         WsUpgradeCompletion done) mutable {
+        // Set before the upgrade starts. A handler that upgrades and then
+        // throws must not have its tunnel reset underneath it, and must not be
+        // completed twice: do_ws_upgrade's completion owns handler_finished.
+        auto upgraded = std::make_shared<bool>(false);
+        auto upgrade = [self, stream_id, upgraded](RequestPtr req, ResponsePtr res, CallbackWsHandler h,
+                                                   WsUpgradeCompletion done) mutable {
+            *upgraded = true;
             self->do_ws_upgrade(stream_id, std::move(req), std::move(res), std::move(h), std::move(done));
         };
-        (*handler_fn)(request, response, m_transport->tls_handle(), upgrade,
-                      [self, stream_id](error_code, bool) { self->handler_finished(stream_id); });
+        // A WebSocket route or its middleware may throw synchronously. This
+        // call is reached from the read loop, so an escaping exception would
+        // leave io_context::run() and terminate the worker (the h1 engine has
+        // the same guard).
+        try {
+            (*handler_fn)(request, response, m_transport->tls_handle(), upgrade,
+                          [self, stream_id](error_code, bool) { self->handler_finished(stream_id); });
+        } catch (const std::exception &e) {
+            SIMPLE_HTTP_ERROR_LOG("h2 ws handler(stream={}) threw: {}", stream_id, e.what());
+            if (!*upgraded) {
+                self->reset_stream(stream_id, codec::H2_INTERNAL_ERROR);
+                self->handler_finished(stream_id);
+            }
+        } catch (...) {
+            SIMPLE_HTTP_ERROR_LOG("h2 ws handler(stream={}) threw an unknown exception", stream_id);
+            if (!*upgraded) {
+                self->reset_stream(stream_id, codec::H2_INTERNAL_ERROR);
+                self->handler_finished(stream_id);
+            }
+        }
     }
 
     // The ws middleware chain's terminal: accept the tunnel with a 200 head and

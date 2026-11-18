@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <boost/asio.hpp>
+#include <boost/container/small_vector.hpp>
 #include <cassert>
 #include <cstddef>
 #include <memory>
@@ -23,6 +24,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "../core/cancel.h"
 #include "../core/compat.h"
 #include "../core/types.h"
 
@@ -67,23 +69,20 @@ auto async_stream_write_all(Stream &stream, ConstByteSpan buffer, Token &&token)
 // frame header and its payload need not be concatenated first.
 template <typename Stream, typename Token>
 auto async_stream_write_seq(Stream &stream, boost::span<const ConstByteSpan> buffers, Token &&token) {
-    // Bounded by the iovec this builds. Callers pass a handful at most, so the
-    // cap is a backstop rather than a real limit — dropping buffers past it
-    // would write a *shorter* message and still report success, which is silent
-    // truncation.
-    assert(buffers.size() <= kMaxWriteBuffers);
-    const std::size_t count = std::min<std::size_t>(buffers.size(), kMaxWriteBuffers);
-    std::array<asio::const_buffer, kMaxWriteBuffers> bufs{};
-    for (std::size_t i = 0; i < count; ++i)
-        bufs[i] = asio::buffer(buffers[i].data(), buffers[i].size());
-    // Pass the array itself, not a span over it: asio copies the *sequence
-    // object* into the composed operation, and a span copy is only a view.
+    // kMaxWriteBuffers is inline capacity, not a limit: a small_vector grows
+    // past it. Truncating (or asserting) at eight would silently write a
+    // shorter message and still report success.
+    //
+    // Pass the sequence object itself, not a span over it: asio copies the
+    // sequence into the composed operation, and a span copy is only a view.
     // With a span, a write large enough to need a second async_write_some
     // would read the buffer descriptors out of the dead stack frame (observed
-    // as a WebSocket echo stalling after exactly 128 KiB). The trailing
-    // zero-length entries are valid buffers and are skipped by the
-    // scatter-gather machinery.
-    return asio::async_write(stream, bufs, std::forward<Token>(token));
+    // as a WebSocket echo stalling after exactly 128 KiB).
+    boost::container::small_vector<asio::const_buffer, kMaxWriteBuffers> bufs;
+    bufs.reserve(buffers.size());
+    for (const ConstByteSpan buffer : buffers)
+        bufs.emplace_back(buffer.data(), buffer.size());
+    return asio::async_write(stream, std::move(bufs), std::forward<Token>(token));
 }
 
 // Adapts a void(error_code, size_t) I/O operation to a void(error_code)
@@ -116,11 +115,16 @@ template <typename Start> struct ErrorOnlyOp {
             // beyond the one `any_completion_handler` already performs.
             static_assert(std::is_copy_constructible_v<Start>, "async_error_only's Start must be copyable");
             auto action = start;
+            // Forward the caller's cancellation slot (the composed operation
+            // captured it from the original handler) to the wrapped operation.
+            // Without this the inner read/write cannot be cancelled.
+            auto slot = self.get_cancellation_state().slot();
+            auto wrapped = [keep = std::move(start), self = std::move(self)](error_code inner_ec, std::size_t) mutable {
+                (void)keep;
+                self.complete(inner_ec);
+            };
             auto inner = asio::any_completion_handler<void(error_code, std::size_t)>(
-                [keep = std::move(start), self = std::move(self)](error_code inner_ec, std::size_t) mutable {
-                    (void)keep;
-                    self.complete(inner_ec);
-                });
+                forward_cancel_slot(slot, std::move(wrapped)));
             action(std::move(inner));
             return;
         }

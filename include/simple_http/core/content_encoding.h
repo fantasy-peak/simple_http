@@ -224,10 +224,13 @@ class GzipEncoder final : public ContentEncoder {
     explicit GzipEncoder(int level) {
         // windowBits 15 + 16 selects the gzip container (RFC 1952) over a raw
         // deflate stream, which is what `Content-Encoding: gzip` promises.
-        m_ok = ::deflateInit2(&m_zs, level, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) == Z_OK;
+        m_initialized = ::deflateInit2(&m_zs, level, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) == Z_OK;
+        m_ok = m_initialized;
     }
     ~GzipEncoder() override {
-        if (m_ok) {
+        // "Initialized" and "currently error-free" are different states: a
+        // runtime deflate error clears m_ok but must not skip deflateEnd().
+        if (m_initialized) {
             ::deflateEnd(&m_zs);
         }
     }
@@ -247,6 +250,7 @@ class GzipEncoder final : public ContentEncoder {
 
   private:
     z_stream m_zs{};
+    bool m_initialized{false};
     bool m_ok{false};
 };
 
@@ -468,6 +472,13 @@ class BrotliDecoderImpl final : public ContentDecoder {
 [[nodiscard]] inline std::unique_ptr<ContentEncoder> make_encoder(std::string_view encoding,
                                                                   const CompressionConfig &config) {
     if (encoding == kEncodingGzip) {
+        // Reject an out-of-range level before constructing the encoder:
+        // deflateInit2 fails for it, and returning a non-null encoder that can
+        // only produce an empty stream turns every compressed response into
+        // `Content-Encoding: gzip` with an empty body.
+        if (config.gzip_level < -1 || config.gzip_level > 9) {
+            return nullptr;
+        }
         return std::make_unique<detail::GzipEncoder>(config.gzip_level);
     }
     if (encoding == kEncodingBrotli) {

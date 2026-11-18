@@ -211,7 +211,11 @@ inline std::string_view content_encoding_of(const StaticEntry &entry, const Stat
 // opening (best effort; the same local write access is required).
 inline std::optional<std::string> read_file_exact(const std::string &path, std::uint64_t size) {
 #if !defined(_WIN32)
-    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    // O_NONBLOCK makes the open() itself non-blocking too: with a plain
+    // O_RDONLY a FIFO that replaced a scanned regular file blocks until a
+    // writer appears, so fstat (which would reject it) is never reached and
+    // the worker thread is wedged forever. It has no effect on regular files.
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0)
         return std::nullopt;
     struct stat st{};

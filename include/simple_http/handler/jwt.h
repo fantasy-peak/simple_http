@@ -390,11 +390,11 @@ inline Middleware jwt(JwtConfig config = {}) {
             jwt_reject(res, status::unauthorized, "JWT has no exp claim", std::move(done));
             return;
         }
-        if (payload.exp != 0 && now > payload.exp + leeway) {
+        if (payload.exp != 0 && now > saturating_add(payload.exp, leeway)) {
             jwt_reject(res, status::unauthorized, "JWT has expired", std::move(done));
             return;
         }
-        if (payload.nbf != 0 && now + leeway < payload.nbf) {
+        if (payload.nbf != 0 && saturating_add(now, leeway) < payload.nbf) {
             jwt_reject(res, status::unauthorized, "JWT is not valid yet", std::move(done));
             return;
         }

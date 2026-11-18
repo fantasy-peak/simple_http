@@ -31,6 +31,12 @@
 #include <system_error>
 #include <utility>
 
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 #include "../core/http_field.h"
 #include "../core/mime.h"
 #include "../core/types.h"
@@ -58,7 +64,37 @@ struct SendFileOp {
     std::string path;
     SendFileOptions options;
 
+#if !defined(_WIN32)
+    // An fd opened exactly once, then fstat'ed. Opening first closes the
+    // stat-then-open TOCTOU window (and O_NOFOLLOW keeps a planted symlink
+    // from being followed). The handle is movable so async_compose can move
+    // the operation into its state machine.
+    struct Fd {
+        int value{-1};
+        Fd() = default;
+        explicit Fd(int v) : value(v) {}
+        Fd(const Fd &) = delete;
+        Fd &operator=(const Fd &) = delete;
+        Fd(Fd &&other) noexcept : value(std::exchange(other.value, -1)) {}
+        Fd &operator=(Fd &&other) noexcept {
+            if (this != &other) {
+                reset();
+                value = std::exchange(other.value, -1);
+            }
+            return *this;
+        }
+        ~Fd() { reset(); }
+        void reset() noexcept {
+            if (value >= 0) {
+                ::close(value);
+                value = -1;
+            }
+        }
+    };
+    Fd file_fd;
+#else
     std::ifstream file;
+#endif
     std::array<char, 64 * 1024> buffer{};
     error_code pre;
     std::uintmax_t size{0};
@@ -70,11 +106,29 @@ struct SendFileOp {
     // would survive a later open() failure and describe a body the caller is
     // about to replace with a 404/500.
     error_code prepare() {
+#if !defined(_WIN32)
+        // Open first, then fstat the opened descriptor: a path-based size probe
+        // followed by a second open lets the file be swapped in between, and a
+        // FIFO would block the worker inside open(). O_NOFOLLOW refuses a
+        // symlink planted after the caller chose the path.
+        const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (fd < 0) {
+            return boost::system::errc::make_error_code(boost::system::errc::no_such_file_or_directory);
+        }
+        struct stat st{};
+        if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+            ::close(fd);
+            return boost::system::errc::make_error_code(boost::system::errc::no_such_file_or_directory);
+        }
+        file_fd = Fd{fd};
+        size = static_cast<std::uintmax_t>(st.st_size);
+#else
         std::error_code stat_ec;
         size = std::filesystem::file_size(path, stat_ec);
         if (stat_ec) {
             return boost::system::errc::make_error_code(boost::system::errc::no_such_file_or_directory);
         }
+#endif
         if (options.max_bytes != 0 && size > options.max_bytes) {
             return boost::system::errc::make_error_code(boost::system::errc::file_too_large);
         }
@@ -91,6 +145,21 @@ struct SendFileOp {
     }
 
     template <typename Self> void read_and_write(Self &self) {
+#if !defined(_WIN32)
+        const auto n = ::read(file_fd.value, buffer.data(), buffer.size());
+        if (n < 0) {
+            self.complete(boost::system::errc::make_error_code(boost::system::errc::io_error));
+            return;
+        }
+        if (n == 0) {
+            file_fd.reset();
+            stage = 3;
+            response.async_finish(std::move(self));
+            return;
+        }
+        stage = 2;
+        response.async_write(std::string(buffer.data(), static_cast<std::size_t>(n)), std::move(self));
+#else
         file.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
         const auto n = file.gcount();
         if (n <= 0) {
@@ -104,6 +173,7 @@ struct SendFileOp {
         }
         stage = 2;
         response.async_write(std::string(buffer.data(), static_cast<std::size_t>(n)), std::move(self));
+#endif
     }
 
     template <typename Self> void operator()(Self &self, error_code ec = {}) {
@@ -114,6 +184,7 @@ struct SendFileOp {
                 self.complete(pre);
                 return;
             }
+#if defined(_WIN32)
             // Open before writing any head field: a failure here must leave the
             // response untouched so the caller can still send its own 404/500.
             file.open(path, std::ios::binary);
@@ -121,6 +192,8 @@ struct SendFileOp {
                 self.complete(boost::system::errc::make_error_code(boost::system::errc::no_such_file_or_directory));
                 return;
             }
+#endif
+            // On POSIX prepare() already opened and validated the descriptor.
             apply_headers();
             if (response.writer().head_request()) {
                 stage = 4;

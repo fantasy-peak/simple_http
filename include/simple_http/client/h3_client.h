@@ -453,6 +453,15 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
             std::move(done)(make_error_code(client_errc::session_closed), nullptr);
             return;
         }
+        // `m_streams` can still hold this entry while the nghttp3 connection
+        // has died: the body read that led here went through at least one
+        // executor hop, during which the QUIC read loop may have set
+        // m_h3_dead. Passing the resulting null pointer to nghttp3 crashes.
+        if (h3() == nullptr || !m_alive) {
+            erase_stream(it->first);
+            std::move(done)(make_error_code(client_errc::session_closed), nullptr);
+            return;
+        }
         if (!request->stream_body()) {
             if (!up_front.empty()) {
                 st->out_bytes = up_front.size();

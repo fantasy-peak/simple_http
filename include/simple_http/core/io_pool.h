@@ -145,7 +145,12 @@ class IoCtxPool final {
     // past the end — or, for index == pool_size, hand back the main context,
     // which is precisely the one this accessor exists to keep away from workers.
     std::shared_ptr<asio::io_context> at(std::size_t index) {
-        assert(index < m_pool_size);
+        // A release build must not read past the worker contexts (or hand back
+        // the main context, which this accessor exists to keep away from
+        // workers). This is programmer error, so fail loudly.
+        if (index >= m_pool_size) {
+            throw std::out_of_range("IoCtxPool::at: worker index out of range");
+        }
         return m_io_contexts[index];
     }
 

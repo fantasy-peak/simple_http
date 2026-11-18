@@ -77,9 +77,19 @@ class HpackDecoder {
     // effectively unbounded for callers that never advertise a limit.
     void set_max_list_size(std::size_t bytes) { m_max_list_size = bytes; }
 
+    // The decoder's error code for "decoded list over the configured bound".
+    static constexpr unsigned kListTooLargeError = 40170;
+
     // True when the last decode() stopped because the decoded list exceeded the
     // cap (a stream error, not a compression error). Reset at each decode().
     bool header_list_too_large() const { return m_list_too_large; }
+
+    // True only when the list bound was the *sole* problem: decoding reached the
+    // end of the block with nothing else wrong. If a malformed representation
+    // was hit after the bound was crossed, last_error() is that late error and
+    // the dynamic table may be out of sync — the caller must treat it as a
+    // connection-level compression error.
+    bool list_too_large_only() const { return m_list_too_large && m_error == kListTooLargeError; }
 
     // Dynamic-table entry cap, a belt-and-braces bound on top of the RFC byte
     // accounting (an entry can never be smaller than 32 bytes, so a legitimate
@@ -272,7 +282,7 @@ inline bool HpackDecoder::decode(std::string_view block, std::vector<HpackHeader
             return;
         m_list_size += name.size() + value.size() + 32;
         if (m_list_size > m_max_list_size) {
-            m_error = 40170;
+            m_error = kListTooLargeError;
             m_list_too_large = true;
             return;
         }

@@ -1156,7 +1156,12 @@ template <typename Executor> bool QuicConnection<Executor>::flush_writes() {
         // (see the PADDING note in write_pkt), so a batch would be sent as one
         // malformed datagram.
         const std::size_t packets_per_flush = m_client ? 1 : kPacketsPerFlush;
-        std::vector<std::uint8_t> buf(static_cast<std::size_t>(kMaxDatagram) * packets_per_flush);
+        // ngtcp2 sizes each packet to the path MTU it was configured with. The
+        // buffer must be that large, not the stock 1500: a larger configured
+        // max_udp_payload_size would otherwise make ngtcp2 write past the end
+        // of this vector (its assert is compiled out in release builds).
+        const std::size_t mtu = effective_max_udp_payload_size(m_config.max_udp_payload_size);
+        std::vector<std::uint8_t> buf(mtu * packets_per_flush);
         ngtcp2_path_storage ps;
         ngtcp2_path_storage_zero(&ps);
         ngtcp2_pkt_info pi{};

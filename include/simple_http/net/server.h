@@ -311,6 +311,9 @@ class Server {
     Server &add_listener(TcpListenerConfig cfg) { return listen(std::move(cfg)); }
 
     result<StartReport, StartupError> start(StartPolicy policy = StartPolicy::AllOrNothing) {
+        // Serialize start/stop. They both replace m_core and m_listeners, and
+        // two concurrent stop() calls used to join the same std::thread twice.
+        std::lock_guard<std::mutex> lifecycle_lock(m_lifecycle_mutex);
         if (m_started) {
             return StartupError{{ListenerFailure{"server", make_error_code(server_errc::invalid_config)}}};
         }
@@ -523,16 +526,27 @@ class Server {
     }
 
     void stop() {
-        if (!m_started) {
+        if (!m_started.load(std::memory_order_acquire)) {
             return;
         }
         // Tear down from a thread outside the pool. A worker cannot join
         // itself: IoCtxPool::stop() would throw resource_deadlock_would_occur
         // out of io_context::run() and terminate the process. Refusing leaves
         // the server untouched and running, which is recoverable.
+        //
+        // This check must run before taking m_lifecycle_mutex: a concurrent
+        // stop() on another thread holds that mutex while joining this very
+        // worker, so blocking here would deadlock instead of refusing.
         const auto core = core_snapshot();
         if (core && core->pool && core->pool->on_worker_thread()) {
             SIMPLE_HTTP_ERROR_LOG("Server::stop() called from a worker thread; ignoring (call it from another thread)");
+            return;
+        }
+        // One winner. Everything below replaces the listener list, the Core and
+        // the pool; concurrent stop() calls must not do that twice (join() on
+        // the same thread is undefined, and m_started was a check-then-act).
+        std::lock_guard<std::mutex> lifecycle_lock(m_lifecycle_mutex);
+        if (!m_started.exchange(false, std::memory_order_acq_rel)) {
             return;
         }
         m_stopping.store(true, std::memory_order_release);
@@ -589,7 +603,6 @@ class Server {
 #endif
         m_listeners.clear();
         clear_core();
-        m_started = false;
     }
 
     std::uint16_t port() const { return m_port.load(std::memory_order_acquire); }
@@ -1137,6 +1150,10 @@ class Server {
     ServerConfig m_cfg;
     std::shared_ptr<Router> m_router;
     mutable std::mutex m_core_mutex;
+    // Serializes start() and stop() (including the reset of m_core and the
+    // listener vector); the counters and lifecycle registry keep their own
+    // finer-grained synchronization.
+    mutable std::mutex m_lifecycle_mutex;
     std::shared_ptr<Core> m_core;
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
     std::vector<std::shared_ptr<QuicRuntime>> m_quic_runtimes;

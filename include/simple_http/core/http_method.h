@@ -73,7 +73,12 @@ inline constexpr bool is_idempotent(Method m) noexcept {
 // The routing mask bit for a method. Method::Unknown is not routable — a route
 // registration rejects it — but the mask is wide enough to include it so that
 // an "any method" route can match an extension method token such as PROPFIND.
-inline constexpr std::uint16_t method_bit(Method m) noexcept { return std::uint16_t{1} << static_cast<unsigned>(m); }
+inline constexpr std::uint16_t method_bit(Method m) noexcept {
+    const auto index = static_cast<unsigned>(m);
+    // Method is a uint8_t enum, so a value from a cast may be far outside the
+    // 16 bits this mask covers; shifting it would be undefined behaviour.
+    return index < 16 ? std::uint16_t{1} << index : std::uint16_t{0};
+}
 
 inline constexpr std::string_view to_string(Method m) noexcept {
     switch (m) {

@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstring>
 #include <ctime>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -82,6 +83,19 @@ inline constexpr std::int64_t kMaxHttpDate = 253402300799LL; // 9999-12-31T23:59
 inline std::int64_t now_unix() {
     return static_cast<std::int64_t>(
         std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+// Signed addition that saturates instead of overflowing. Time arithmetic on
+// attacker-supplied claims (`exp + leeway`, `now + max_age`) must not invoke
+// UB when a value sits near INT64_MAX.
+inline std::int64_t saturating_add(std::int64_t a, std::int64_t b) noexcept {
+    if (b > 0 && a > std::numeric_limits<std::int64_t>::max() - b) {
+        return std::numeric_limits<std::int64_t>::max();
+    }
+    if (b < 0 && a < std::numeric_limits<std::int64_t>::min() - b) {
+        return std::numeric_limits<std::int64_t>::min();
+    }
+    return a + b;
 }
 
 // Writes exactly 29 bytes ("Sun, 06 Nov 1994 08:49:37 GMT") to `out`; no

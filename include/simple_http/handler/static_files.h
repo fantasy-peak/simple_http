@@ -335,6 +335,24 @@ inline void StaticFiles::try_serve(const RequestPtr &req, const ResponsePtr &res
         // through and send the full representation, which RFC 9110 permits.
     }
 
+    // A HEAD response is exactly the GET headers with no body. Everything it
+    // needs is already in the scanned representation, so do not read (and throw
+    // away) the whole file: N concurrent HEADs on a large file would otherwise
+    // hold N copies of it in memory and occupy the worker with synchronous I/O.
+    if (is_head) {
+        res->status(range ? status::partial_content : status::ok);
+        apply_headers();
+        if (range) {
+            res->header(field::content_range, "bytes " + std::to_string(range->first) + "-" +
+                                                  std::to_string(range->last) + "/" + std::to_string(rep->size));
+            res->header(field::content_length, std::to_string(range->length()));
+        } else {
+            res->header(field::content_length, std::to_string(rep->size));
+        }
+        res->async_send_bodyless([done = std::move(done)](error_code) mutable { std::move(done)(true); });
+        return;
+    }
+
     auto body = m_table.read_body(*rep);
     if (!body) {
         // The file disappeared between startup and now. Treat it as a miss so the
@@ -367,21 +385,11 @@ inline void StaticFiles::try_serve(const RequestPtr &req, const ResponsePtr &res
         // content-length is framed by END_STREAM there and by chunked transfer
         // coding in HTTP/1.1 -- two different shapes for one file.
         res->header(field::content_length, "0");
-    } else if (is_head) {
-        // HEAD carries the headers a GET would produce, and no body. Its length
-        // must be set by hand: the engine writes headers only, and the one-shot
-        // send() would compute the length of the empty body instead.
-        res->header(field::content_length, std::to_string(rep->size));
     } else if (!encoding.empty()) {
         // HTTP/1.1 recomputes content-length from the body we hand it; HTTP/2
         // forwards the header block untouched. Setting it makes both protocols
         // emit the same bytes.
         res->header(field::content_length, std::to_string(rep->size));
-    }
-
-    if (is_head) {
-        res->async_send_bodyless([done = std::move(done)](error_code) mutable { std::move(done)(true); });
-        return;
     }
 
     if (range) {

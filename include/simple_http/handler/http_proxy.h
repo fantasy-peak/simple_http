@@ -68,11 +68,24 @@ inline void run_http_proxy(RequestPtr req, ResponsePtr res, bool client_is_tls, 
             return;
         }
         if (target.hooks.error_handler) {
-            target.hooks.error_handler(res, *req, ec, [completion]() mutable {
-                auto callback = std::move(*completion);
-                std::move(callback)();
-            });
-            return;
+            // This runs from an asynchronous continuation, outside the
+            // dispatcher's exception guard. A throwing user hook must become a
+            // plain 502, not std::terminate.
+            try {
+                target.hooks.error_handler(res, *req, ec, [completion]() mutable {
+                    auto callback = std::move(*completion);
+                    std::move(callback)();
+                });
+                return;
+            } catch (const std::exception &e) {
+                SIMPLE_HTTP_ERROR_LOG("http-proxy: error_handler hook threw: {}", e.what());
+            } catch (...) {
+                SIMPLE_HTTP_ERROR_LOG("http-proxy: error_handler hook threw an unknown exception");
+            }
+            if (req->cancelled() || res->started()) {
+                finish();
+                return;
+            }
         }
         res->status(status).content_type("text/plain");
         res->async_send(std::string{reason_phrase(status)}, [completion](error_code) mutable {
@@ -141,8 +154,15 @@ inline void run_http_proxy(RequestPtr req, ResponsePtr res, bool client_is_tls, 
         }
     }
 
-    auto client =
-        std::make_shared<Client>(req->executor(), detail::proxy_hop_client_config(std::move(client_cfg), target));
+    std::shared_ptr<Client> client;
+    try {
+        client =
+            std::make_shared<Client>(req->executor(), detail::proxy_hop_client_config(std::move(client_cfg), target));
+    } catch (const std::exception &e) {
+        SIMPLE_HTTP_ERROR_LOG("http-proxy: building the upstream client threw: {}", e.what());
+        send_error(status::bad_gateway, make_error_code(asio::error::fault));
+        return;
+    }
     const std::string url = std::string{target.tls ? "https://" : "http://"} + target.host + ":" +
                             std::to_string(target.port == 0 ? (target.tls ? 443 : 80) : target.port) + forwarded_target;
     const std::size_t cap = 64u * 1024 * 1024;
@@ -150,36 +170,46 @@ inline void run_http_proxy(RequestPtr req, ResponsePtr res, bool client_is_tls, 
     auto forward = [client, url, cap, req, res, target, outbound, send_error, completion](std::string body) mutable {
         if (!body.empty())
             outbound->set_body(std::move(body));
-        client->async_send(outbound, url, cap,
-                           [req, res, target, send_error, completion](error_code ec, Response response) mutable {
-                               if (ec) {
-                                   SIMPLE_HTTP_ERROR_LOG("http-proxy: upstream {}:{} failed ({})", target.host,
-                                                         target.port, ec.message());
-                                   send_error(status::bad_gateway, ec);
-                                   return;
-                               }
-                               int status = response.status();
-                               Headers headers = response.headers();
-                               if (target.hooks.modify_response) {
-                                   if (error_code hook_ec = target.hooks.modify_response(status, headers, *req)) {
-                                       send_error(status::bad_gateway, hook_ec);
-                                       return;
-                                   }
-                               }
-                               res->status(status);
-                               const auto outbound_conn_tokens = connection_tokens(headers);
-                               for (const auto &[name, value] : headers) {
-                                   if (detail::proxy_drops_response_field(name) ||
-                                       std::find(outbound_conn_tokens.begin(), outbound_conn_tokens.end(), name) !=
-                                           outbound_conn_tokens.end())
-                                       continue;
-                                   res->header(name, value);
-                               }
-                               res->async_send(std::string{response.text()}, [completion](error_code) mutable {
-                                   auto callback = std::move(*completion);
-                                   std::move(callback)();
-                               });
-                           });
+        client->async_send(
+            outbound, url, cap, [req, res, target, send_error, completion](error_code ec, Response response) mutable {
+                if (ec) {
+                    SIMPLE_HTTP_ERROR_LOG("http-proxy: upstream {}:{} failed ({})", target.host, target.port,
+                                          ec.message());
+                    send_error(status::bad_gateway, ec);
+                    return;
+                }
+                int status = response.status();
+                Headers headers = response.headers();
+                if (target.hooks.modify_response) {
+                    try {
+                        if (error_code hook_ec = target.hooks.modify_response(status, headers, *req)) {
+                            send_error(status::bad_gateway, hook_ec);
+                            return;
+                        }
+                    } catch (const std::exception &e) {
+                        SIMPLE_HTTP_ERROR_LOG("http-proxy: modify_response hook threw: {}", e.what());
+                        send_error(status::bad_gateway, make_error_code(asio::error::fault));
+                        return;
+                    } catch (...) {
+                        SIMPLE_HTTP_ERROR_LOG("http-proxy: modify_response hook threw an unknown exception");
+                        send_error(status::bad_gateway, make_error_code(asio::error::fault));
+                        return;
+                    }
+                }
+                res->status(status);
+                const auto outbound_conn_tokens = connection_tokens(headers);
+                for (const auto &[name, value] : headers) {
+                    if (detail::proxy_drops_response_field(name) ||
+                        std::find(outbound_conn_tokens.begin(), outbound_conn_tokens.end(), name) !=
+                            outbound_conn_tokens.end())
+                        continue;
+                    res->header(name, value);
+                }
+                res->async_send(std::string{response.text()}, [completion](error_code) mutable {
+                    auto callback = std::move(*completion);
+                    std::move(callback)();
+                });
+            });
     };
 
     // Always read the body to its end. HTTP/2/3 requests need not carry a

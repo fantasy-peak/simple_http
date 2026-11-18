@@ -145,6 +145,11 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
         });
     }
 
+    // Whether every queued response write has reached the transport. The
+    // engine samples this before releasing its last reference: a TLS shutdown
+    // must not overlap an in-flight write.
+    bool writer_idle() const noexcept { return m_writer->idle(); }
+
     void close(WriteCompletion done) override {
         on_executor([self = this->shared_from_this(), done = std::move(done)]() mutable {
             self->m_open = false;
@@ -626,7 +631,11 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
 
     // --- connection lifetime -------------------------------------------------
 
-    void finish() {
+    // `graceful` controls whether a TLS transport gets an orderly shutdown or
+    // is simply closed. A shutdown must not overlap a response write that is
+    // still in flight (asio::ssl::stream shares one BIO between the two), so
+    // callers that see a busy writer pass false.
+    void finish(bool graceful = true) {
         if (m_finished)
             return;
         m_finished = true;
@@ -651,6 +660,14 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
         }
         auto self = this->shared_from_this();
         if (m_owner != TransportOwner::Engine) {
+            complete_done();
+            return;
+        }
+        if (!graceful) {
+            // Closing cancels whatever write is still pending; an orderly
+            // shutdown would run concurrently with it and corrupt the TLS
+            // record layer.
+            m_transport->close();
             complete_done();
             return;
         }
@@ -834,6 +851,10 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
         auto self = this->shared_from_this();
         auto proceed = [self, writer, request_keep_alive, handler_failed](bool drained) {
             writer->connected([self, writer, request_keep_alive, handler_failed, drained](error_code, bool still_open) {
+                // Sample before dropping the engine's reference: if a response
+                // write is still in flight, finish() must close rather than
+                // start a TLS shutdown that would overlap it.
+                const bool writer_idle = writer->writer_idle();
                 // The request/response cycle is over; the engine no longer needs
                 // the sink alive for the lazy 100-continue path.
                 self->m_active_writer.reset();
@@ -845,7 +866,7 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
                     self->m_exchange_life.reset();
                 }
                 if (!may_reuse(!handler_failed, request_keep_alive, writer->keep_alive_out(), still_open, drained)) {
-                    self->finish();
+                    self->finish(/*graceful=*/writer_idle);
                     return;
                 }
                 self->parse_head();
@@ -1333,7 +1354,12 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
         } else {
             SIMPLE_HTTP_ERROR_LOG("h1 ws route threw an unknown exception");
         }
-        if (m_ws_handoff_started || m_owner != TransportOwner::Engine)
+        // Also refuse when the connection is already finished or a response
+        // write is still on the wire: sending a 500 then would start a second
+        // response (or overlap the pending one on TLS).
+        if (m_ws_handoff_started || m_finished || m_owner != TransportOwner::Engine)
+            return;
+        if (m_active_writer && !m_active_writer->writer_idle())
             return;
         send_error_response(status::internal_server_error, {}, version);
     }

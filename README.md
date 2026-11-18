@@ -756,6 +756,10 @@ co_await writer->async_file("upload", "notes.txt", "./notes.txt",
 co_await writer->async_finish(boost::asio::use_awaitable);
 ```
 
+On the server side a multipart `filename` is attacker-controlled. Reduce it to a
+single path component with `simple_http::sanitize_filename()` before joining it
+to a directory, and generate your own name when it returns an empty string.
+
 ### Client configuration
 
 | Field | Default |

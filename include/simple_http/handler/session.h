@@ -307,7 +307,8 @@ inline Middleware session(std::shared_ptr<SessionStore> store, SessionConfig con
                         return;
                     }
                     SessionData out = current->data();
-                    out.expires_unix = config.max_age.count() > 0 ? now_unix() + config.max_age.count() : 0;
+                    out.expires_unix =
+                        config.max_age.count() > 0 ? saturating_add(now_unix(), config.max_age.count()) : 0;
                     store->save(std::string{current->id()}, std::move(out),
                                 [finish = std::move(finish)](error_code) mutable { finish(); });
                 };

@@ -23,7 +23,12 @@
 namespace simple_http {
 namespace detail {
 
-inline void append_arg(std::string &out, std::string_view value) { out.append(value.data(), value.size()); }
+inline void append_arg(std::string &out, std::string_view value) {
+    // `std::string::append(nullptr, 0)` is undefined even though it appends
+    // nothing; an empty view may have been built from a null pointer.
+    if (!value.empty())
+        out.append(value.data(), value.size());
+}
 inline void append_arg(std::string &out, const std::string &value) { out.append(value); }
 inline void append_arg(std::string &out, const char *value) {
     if (value)

@@ -13,10 +13,27 @@
 
 #include <ngtcp2/ngtcp2.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 
 namespace simple_http::quic {
+
+// ngtcp2 requires the configured payload size to be within its own bounds. The
+// value is also the size of the buffers this library allocates for sending and
+// receiving datagrams, so an unchecked configuration would make ngtcp2 write a
+// full path-MTU packet into a smaller buffer (or make receive truncate).
+inline std::size_t effective_max_udp_payload_size(std::uint64_t configured) noexcept {
+    const auto clamped =
+        std::clamp<std::uint64_t>(configured, NGTCP2_MAX_UDP_PAYLOAD_SIZE, NGTCP2_MAX_TX_UDP_PAYLOAD_SIZE);
+    return static_cast<std::size_t>(clamped);
+}
+
+// ngtcp2_cid::data holds exactly NGTCP2_MAX_CIDLEN octets. Every place that
+// turns the configured length into a CID must clamp to that.
+inline std::size_t effective_connection_id_length(std::size_t configured) noexcept {
+    return std::min<std::size_t>(configured, NGTCP2_MAX_CIDLEN);
+}
 
 // Tunables for a connection, all advertised to the peer in transport
 // parameters except the purely local ones.
@@ -82,7 +99,8 @@ inline Ngtcp2Params make_ngtcp2_params(const QuicConnectionConfig &cfg, ngtcp2_t
 
     ngtcp2_settings_default(&out.settings);
     out.settings.initial_ts = ts;
-    out.settings.max_tx_udp_payload_size = cfg.max_udp_payload_size;
+    const std::uint64_t payload_size = effective_max_udp_payload_size(cfg.max_udp_payload_size);
+    out.settings.max_tx_udp_payload_size = payload_size;
     out.settings.ack_thresh = static_cast<std::size_t>(cfg.ack_thresh);
 
     // Today's stack treats `max_udp_payload_size` as a hard ceiling, and so does
@@ -109,7 +127,7 @@ inline Ngtcp2Params make_ngtcp2_params(const QuicConnectionConfig &cfg, ngtcp2_t
     out.transport.initial_max_streams_bidi = cfg.initial_max_streams_bidi;
     out.transport.initial_max_streams_uni = cfg.initial_max_streams_uni;
     out.transport.max_idle_timeout = cfg.max_idle_timeout_ms * NGTCP2_MILLISECONDS;
-    out.transport.max_udp_payload_size = cfg.max_udp_payload_size;
+    out.transport.max_udp_payload_size = payload_size;
     out.transport.active_connection_id_limit = cfg.active_connection_id_limit;
     out.transport.ack_delay_exponent = cfg.ack_delay_exponent;
     out.transport.max_ack_delay = cfg.max_ack_delay_ms * NGTCP2_MILLISECONDS;

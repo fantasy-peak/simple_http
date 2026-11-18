@@ -93,7 +93,7 @@ struct Attr {
     Value value;
 
     Attr(std::string_view k, std::string_view v) : key(k), value(v) {}
-    Attr(std::string_view k, const char *v) : key(k), value(std::string_view{v}) {}
+    Attr(std::string_view k, const char *v) : key(k), value(v ? std::string_view{v} : std::string_view{}) {}
     Attr(std::string_view k, bool v) : key(k), value(v) {}
     // Any other arithmetic type (int, unsigned, long, size_t, float, ...)
     // narrows to a signed/unsigned 64-bit or a double, so there is one overload

@@ -108,7 +108,11 @@ class Http1ClientSession final : public ClientSession,
 
     void close() override {
         m_alive.store(false, std::memory_order_release);
-        m_transport->close();
+        // The socket is not thread-safe and may have an operation in flight.
+        // h2/h3 already post their close; h1 used to close inline, which races
+        // a caller closing from another thread.
+        auto self = this->shared_from_this();
+        asio::post(m_executor, [self] { self->m_transport->close(); });
     }
 
     void set_on_exchange_done(std::function<void()> cb) override { m_exchange_done = std::move(cb); }
