@@ -507,7 +507,7 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
     Version version() const override { return Version::Http3; }
 
     void close() override {
-        asio::post(m_executor, [self = this->shared_from_this()] { self->shutdown_now(); });
+        asio::dispatch(m_executor, [self = this->shared_from_this()] { self->shutdown_now(); });
     }
 
     // --- stream operations (called by Http3ClientStream, already hopped) ---

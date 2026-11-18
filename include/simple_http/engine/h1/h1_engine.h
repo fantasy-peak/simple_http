@@ -40,7 +40,7 @@
 #include <vector>
 
 #include <boost/asio/cancellation_signal.hpp>
-#include <boost/asio/post.hpp>
+#include <boost/asio/defer.hpp>
 
 #include "../../core/cancel.h"
 #include "../../core/http_field.h"
@@ -297,7 +297,7 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
 
     void cancel_write(const std::shared_ptr<WriteWait> &wait) {
         auto self = this->shared_from_this();
-        // Post: completing the composed operation destroys its cancellation
+        // Defer: completing the composed operation destroys its cancellation
         // state, which must not happen while its signal is still emitting.
         asio::post(m_executor, [self, wait]() mutable {
             wait->guard.clear();
@@ -583,6 +583,7 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
     // shut down and closed.
     void run(Dispatcher dispatch, std::string initial, WsLookup ws_lookup, WsProxyLookup ws_proxy_lookup,
              WsLookup ws_regex_lookup, std::function<void()> on_done) {
+        m_conn_life->bind_owner_thread();
         m_dispatch = std::move(dispatch);
         m_ws_lookup = std::move(ws_lookup);
         m_ws_proxy_lookup = std::move(ws_proxy_lookup);
@@ -1212,7 +1213,7 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
                 }
                 // Same reason as drain_body(): buffered trailer lines complete
                 // synchronously, and recursing per line is a stack overflow.
-                asio::post(self->m_executor, [self, done = std::move(done), slot]() mutable {
+                asio::defer(self->m_executor, [self, done = std::move(done), slot]() mutable {
                     self->read_trailers(std::move(done), slot);
                 });
             },
@@ -1238,8 +1239,8 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
             // synchronously, so one nested frame per chunk lets a peer send a
             // few KiB of tiny chunks and exhaust the stack. Yield to the
             // connection executor between chunks.
-            asio::post(self->m_executor,
-                       [self, done = std::move(done)]() mutable { self->drain_body(std::move(done)); });
+            asio::defer(self->m_executor,
+                        [self, done = std::move(done)]() mutable { self->drain_body(std::move(done)); });
         });
     }
 

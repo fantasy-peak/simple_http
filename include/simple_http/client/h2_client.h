@@ -286,7 +286,7 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
     Version version() const override { return Version::Http2; }
 
     void close() override {
-        asio::post(m_executor, [self = this->shared_from_this()] {
+        asio::dispatch(m_executor, [self = this->shared_from_this()] {
             self->m_alive = false;
             self->fail_all_streams(client_errc::session_closed);
             if (self->m_transport)

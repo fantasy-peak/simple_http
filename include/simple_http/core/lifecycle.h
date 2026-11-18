@@ -28,6 +28,7 @@
 #include <boost/asio/dispatch.hpp>
 #include <cstdint>
 #include <memory>
+#include <thread>
 #include <utility>
 
 namespace simple_http {
@@ -47,7 +48,8 @@ class Lifecycle {
     explicit Lifecycle(asio::any_io_executor exec) : m_exec(std::move(exec)) {}
 
     Lifecycle(asio::any_io_executor exec, const std::shared_ptr<Lifecycle> &parent)
-        : m_exec(std::move(exec)), m_parent(parent), m_has_parent(true) {}
+        : m_exec(std::move(exec)), m_parent(parent), m_has_parent(true),
+          m_owner_thread(parent ? parent->m_owner_thread : std::thread::id{}) {}
 
     // Whether `access` is allowed right now. An expired parent counts as
     // closed: resetting the root invalidates every descendant. The chain is at
@@ -88,6 +90,15 @@ class Lifecycle {
 
     [[nodiscard]] bool closed() const noexcept { return m_phase == Phase::Closed; }
     [[nodiscard]] const asio::any_io_executor &executor() const noexcept { return m_exec; }
+    // Thread that constructed this node. Engines build the root and every child
+    // on their connection executor, so this is the thread the connection's
+    // objects are affine to (model A). An async entry point already there can
+    // skip the executor hop it would otherwise take.
+    [[nodiscard]] std::thread::id owner_thread() const noexcept { return m_owner_thread; }
+    // Called by an engine when it starts running on its connection executor.
+    // Until then the id is empty and every async entry dispatches, which is
+    // what keeps an executor that is not running yet from being skipped.
+    void bind_owner_thread() noexcept { m_owner_thread = std::this_thread::get_id(); }
 
   private:
     asio::any_io_executor m_exec;
@@ -96,6 +107,7 @@ class Lifecycle {
     bool m_read_open{true};
     bool m_write_open{true};
     bool m_has_parent{false};
+    std::thread::id m_owner_thread{};
 };
 
 // Move-only handle to an object's operation state. Holding it keeps the state
@@ -150,11 +162,18 @@ template <typename State>
 // executor, which a caller may have bound to a different context. The entry
 // points also bind `owner` to their token so that every inner step completes
 // there; this argument keeps the initial hop correct on its own.
-template <typename Self> bool hop_to_owner(Self &self, asio::any_io_executor owner, bool &hopped) {
+template <typename Self>
+bool hop_to_owner(Self &self, asio::any_io_executor owner, const std::weak_ptr<Lifecycle> &life, bool &hopped) {
     if (hopped) {
         return false;
     }
     hopped = true;
+    // Already on the object's owner thread: the dispatch would run inline
+    // anyway, so skip the type-erased operation (and its allocation) entirely.
+    if (auto l = life.lock();
+        l && l->owner_thread() != std::thread::id{} && l->owner_thread() == std::this_thread::get_id()) {
+        return false;
+    }
     asio::dispatch(std::move(owner), std::move(self));
     return true;
 }

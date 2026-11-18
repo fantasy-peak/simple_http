@@ -347,7 +347,7 @@ namespace simple_http {
 // single-threaded io_context. A call from another thread would touch
 // deliberately lock-free engine state; log it and fail loudly rather than
 // corrupting the stream silently. Cross-thread callers must hop explicitly
-// (e.g. asio::post(req->executor(), ...)). Observability APIs such as
+// (e.g. asio::dispatch(req->executor(), ...)). Observability APIs such as
 // Server::active_connections() synchronize themselves and are exempt.
 inline void require_owner_thread(std::thread::id owner, const char *what) noexcept {
     if (owner != std::this_thread::get_id()) {

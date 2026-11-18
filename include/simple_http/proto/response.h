@@ -101,7 +101,7 @@ class ResponseWriter : public std::enable_shared_from_this<ResponseWriter> {
                 // Unbound writers (standalone tests) keep the historical
                 // same-thread initiation; a server-bound writer is reposted
                 // onto the connection executor.
-                if (managed && hop_to_owner(self, ex, hopped)) {
+                if (managed && hop_to_owner(self, ex, life, hopped)) {
                     return;
                 }
                 if (self.cancelled() != asio::cancellation_type::none) {
@@ -165,7 +165,7 @@ class ResponseWriter : public std::enable_shared_from_this<ResponseWriter> {
 
         template <typename Self> void operator()(Self &self, error_code ec = {}, bool value = false) {
             if (!started) {
-                if (managed && hop_to_owner(self, ex, hopped)) {
+                if (managed && hop_to_owner(self, ex, life, hopped)) {
                     return;
                 }
                 if (self.cancelled() != asio::cancellation_type::none) {

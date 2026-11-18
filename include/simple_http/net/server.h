@@ -560,7 +560,7 @@ class Server {
                 // close; the captured shared_ptr keeps the acceptor alive until
                 // the handler runs (or is destroyed with the context).
                 auto acceptor = slot.acceptor;
-                asio::post(acceptor->get_executor(), [acceptor] {
+                asio::dispatch(acceptor->get_executor(), [acceptor] {
                     error_code ignored;
                     acceptor->close(ignored);
                 });
@@ -590,7 +590,7 @@ class Server {
         for (auto &rt : m_quic_runtimes) {
             for (auto &ep : rt->endpoints) {
                 auto exec = ep->get_executor();
-                asio::post(exec, [ep] { ep->shutdown_on_executor(); });
+                asio::dispatch(exec, [ep] { ep->shutdown_on_executor(); });
             }
         }
 #endif
@@ -722,7 +722,7 @@ class Server {
             auto exec = slot.acceptor->get_executor();
             std::weak_ptr<ListenerState> weak_waiter = listener;
             listener->core->on_accept_capacity([weak_waiter, slot, exec] {
-                asio::post(exec, [weak_waiter, slot] {
+                asio::dispatch(exec, [weak_waiter, slot] {
                     if (auto again = weak_waiter.lock()) {
                         start_accept(again, slot);
                     }
@@ -807,7 +807,7 @@ class Server {
         // exactly the kind of order-dependent code that breaks on another
         // compiler or optimization level.
         auto socket_executor = socket.get_executor();
-        asio::post(socket_executor, [weak_listener, weak_core, socket = std::move(socket)]() mutable {
+        asio::dispatch(socket_executor, [weak_listener, weak_core, socket = std::move(socket)]() mutable {
             if (auto alive = weak_listener.lock()) {
                 serve_on_worker(alive, std::move(socket));
                 return;
@@ -826,7 +826,7 @@ class Server {
                                                                   std::shared_ptr<Transport> transport) {
         auto exec = transport->get_executor();
         auto closer = std::make_shared<std::function<void()>>(
-            [transport, exec] { asio::post(exec, [transport] { transport->close(); }); });
+            [transport, exec] { asio::dispatch(exec, [transport] { transport->close(); }); });
         core->register_closer(closer);
         return closer;
     }

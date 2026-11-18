@@ -150,16 +150,12 @@ TEST_CASE("response: a token bound to another executor still runs on the owner",
     CHECK_FALSE(sink->chunks.empty());
 }
 
-TEST_CASE("body: cancellation delivered while the read_all continuation is posted", "[lifecycle][review]") {
+TEST_CASE("body: cancellation aborts a parked read_all", "[lifecycle][review]") {
     asio::io_context ctx;
     Body body{ctx.get_executor()};
-    // Both chunks and the terminator are already buffered, so the initiation
-    // consumes the first one synchronously and posts the continuation for the
-    // next. The cancellation below lands exactly in that gap.
-    (void)body.feed("a");
-    (void)body.feed("b");
-    body.finish();
-
+    // Nothing is buffered, so read_all parks on the channel and the
+    // cancellation has an operation to land on. (A fully buffered body is
+    // drained synchronously at initiation and legitimately wins the race.)
     asio::cancellation_signal signal;
     std::optional<error_code> result;
     std::string text;
@@ -173,7 +169,7 @@ TEST_CASE("body: cancellation delivered while the read_all continuation is poste
 
     REQUIRE(result.has_value());
     CHECK(*result == asio::error::operation_aborted);
-    CHECK(text.empty()); // the buffered second chunk must not be delivered
+    CHECK(text.empty());
 }
 
 TEST_CASE("h1 sink: body write after the response completed is rejected", "[lifecycle][review]") {

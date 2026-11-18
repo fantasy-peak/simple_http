@@ -340,6 +340,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
     // may be opened at all. Anything reported before registration is replayed by
     // `set_protocol`.
     void run(Dispatcher dispatch, std::function<void()> done) {
+        m_conn_life->bind_owner_thread();
         m_dispatch = std::move(dispatch);
         m_conn->set_protocol(this->shared_from_this());
         auto self = this->shared_from_this();
@@ -1083,7 +1084,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         // open for the life of the session -- it only ends when the handler
         // closes the response -- so waiting here would deadlock instead of
         // merely serialising the body.
-        post_spawn_handler(stream_id);
+        defer_spawn_handler(stream_id);
     }
 
     void on_data(std::int64_t stream_id, boost::span<const std::uint8_t> data) noexcept override {
@@ -1133,7 +1134,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
             (void)stream.request->body().finish();
         else
             stream.finish_pending = true; // drained by drain_paused()
-        post_spawn_handler(stream_id);
+        defer_spawn_handler(stream_id);
     }
 
     void on_stream_closed(std::int64_t stream_id, std::uint64_t /*app_error_code*/) noexcept override {
@@ -1408,7 +1409,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
             if (auto eng = weak.lock()) {
                 eng->m_conn->extend_connection_offset(n);
             }
-            asio::post(exec, [weak, stream_id, n]() {
+            asio::dispatch(exec, [weak, stream_id, n]() {
                 if (auto eng = weak.lock()) {
                     // erase_stream/release_unread_body already credited every
                     // byte the handler had not read when the stream closed; a
@@ -1446,10 +1447,10 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
     // nghttp3_conn_read_stream2 is still on the stack. One turn of latency
     // keeps "dispatch at HEADERS" (the body pump and END_STREAM handling do not
     // depend on the handler running inside the callback).
-    void post_spawn_handler(std::int64_t stream_id) noexcept {
+    void defer_spawn_handler(std::int64_t stream_id) noexcept {
         try {
             auto self = this->shared_from_this();
-            asio::post(m_executor, [self, stream_id] { self->spawn_handler(stream_id); });
+            asio::defer(m_executor, [self, stream_id] { self->spawn_handler(stream_id); });
         } catch (...) {
             // Allocation failure: leave the stream to the connection's idle
             // timeout rather than calling into nghttp3 from the callback.

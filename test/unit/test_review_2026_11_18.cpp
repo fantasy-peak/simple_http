@@ -499,6 +499,53 @@ TEST_CASE("review/transport: async_error_only forwards the cancellation slot", "
 }
 
 // ---------------------------------------------------------------------------
+// body: a fully buffered push-mode body is drained iteratively, in one stack
+// frame, without an async read per chunk.
+// ---------------------------------------------------------------------------
+TEST_CASE("review/body: read_all drains a fully buffered body", "[body][review]") {
+    asio::io_context ctx;
+    Body body{ctx.get_executor(), 20000};
+
+    std::string expected;
+    for (int i = 0; i < 10000; ++i) {
+        std::string chunk(8, static_cast<char>('a' + i % 26));
+        expected += chunk;
+        REQUIRE(body.feed(std::move(chunk)));
+    }
+    body.finish();
+
+    auto result = run_on(ctx, body_read_all(body));
+    REQUIRE(result.has_value());
+    if (*result) {
+        CHECK((*result)->size() == expected.size());
+        CHECK(**result == expected);
+    }
+}
+
+TEST_CASE("review/body: read_all decodes a buffered compressed body", "[body][review]") {
+    asio::io_context ctx;
+    CompressionConfig cfg;
+    cfg.enabled = true;
+    const std::string plain(50000, 'x');
+    const std::string packed = compress_all("gzip", plain, cfg);
+
+    Body body{ctx.get_executor(), 4096};
+    REQUIRE(body.enable_decoding(make_decoder("gzip"), 1u << 20));
+    for (std::size_t i = 0; i < packed.size();) {
+        const std::size_t n = std::min<std::size_t>(7, packed.size() - i);
+        REQUIRE(body.feed(packed.substr(i, n)));
+        i += n;
+    }
+    body.finish();
+
+    auto result = run_on(ctx, body_read_all(body));
+    REQUIRE(result.has_value());
+    if (*result) {
+        CHECK(**result == plain);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // L1: time arithmetic on attacker-supplied claims saturates.
 // ---------------------------------------------------------------------------
 TEST_CASE("review/core: saturating time arithmetic", "[core][review]") {

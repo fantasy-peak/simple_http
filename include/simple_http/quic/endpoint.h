@@ -184,10 +184,10 @@ template <typename ConnectionType> class SharedCidRegistry {
             m_entries.erase(it);
             return false;
         }
-        // post() never runs the handler inline, so holding the lock here cannot
+        // defer() never runs the handler inline, so holding the lock here cannot
         // re-enter this registry. Do not log per datagram: a migrated connection
         // forwards every packet through here.
-        asio::post(it->second.exec, [conn = std::move(conn), data = std::move(datagram), from]() mutable {
+        asio::defer(it->second.exec, [conn = std::move(conn), data = std::move(datagram), from]() mutable {
             conn->on_datagram(
                 boost::span<const std::uint8_t>{reinterpret_cast<const std::uint8_t *>(data.data()), data.size()},
                 from);

@@ -368,6 +368,7 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
     // been shut down and closed.
     void run(Dispatcher dispatch, std::string prior_knowledge_bytes, WsLookup ws_lookup, WsProxyLookup ws_proxy_lookup,
              WsLookup ws_regex_lookup, std::function<void()> on_done) {
+        m_conn_life->bind_owner_thread();
         m_dispatch = std::move(dispatch);
         m_ws_lookup = std::move(ws_lookup);
         m_ws_proxy_lookup = std::move(ws_proxy_lookup);
@@ -387,6 +388,7 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
                  std::string target, Headers headers, std::string body, std::string prior_knowledge_bytes,
                  WsLookup ws_lookup, WsProxyLookup ws_proxy_lookup, WsLookup ws_regex_lookup,
                  std::function<void()> on_done) {
+        m_conn_life->bind_owner_thread();
         m_dispatch = std::move(dispatch);
         m_ws_lookup = std::move(ws_lookup);
         m_ws_proxy_lookup = std::move(ws_proxy_lookup);
@@ -974,7 +976,7 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
                         eng->on_body_consumed(stream_id, n);
                     return;
                 }
-                asio::post(exec, [weak, stream_id, n]() {
+                asio::dispatch(exec, [weak, stream_id, n]() {
                     if (auto eng = weak.lock())
                         eng->on_body_consumed(stream_id, n);
                 });
@@ -3023,7 +3025,7 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
             // and completing inline would make that pump recurse once per
             // message until the stack is exhausted. The bytes are already in
             // the caller's buffer, so only the notification is deferred.
-            asio::post(m_executor, [done = std::move(done), n]() mutable { std::move(done)(error_code{}, n); });
+            asio::defer(m_executor, [done = std::move(done), n]() mutable { std::move(done)(error_code{}, n); });
             return;
         }
         if (st.ws_closed) {

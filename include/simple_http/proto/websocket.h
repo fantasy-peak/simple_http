@@ -16,7 +16,7 @@
 // connection — must be used from that thread only. A call from another thread
 // is a contract violation: require_owner_thread logs it and aborts rather than
 // racing the reader/writer pumps. Code that needs to move work across threads
-// should hop explicitly with asio::post(req->executor(), ...). is_open() is the
+// should hop explicitly with asio::dispatch(req->executor(), ...). is_open() is the
 // single synchronous snapshot (an atomic). Writes are serialized by an internal
 // write pump; an internal reader keeps draining the transport into a bounded
 // inbox so a serialized read/write application cannot deadlock with a peer that
@@ -402,7 +402,7 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
             // tiny frames cannot exhaust the stack.
             if (++self->m_reader_yield >= kReaderYieldAfter) {
                 self->m_reader_yield = 0;
-                asio::post(self->m_executor, [self]() mutable { reader_loop(std::move(self)); });
+                asio::defer(self->m_executor, [self]() mutable { reader_loop(std::move(self)); });
                 return;
             }
             reader_loop(std::move(self));
@@ -837,7 +837,7 @@ class WebSocket : public std::enable_shared_from_this<WebSocket> {
             if (!started) {
                 // Unbound handles (client WebSockets and standalone tests) keep
                 // the historical same-thread initiation.
-                if (managed && hop_to_owner(self, ex, hopped)) {
+                if (managed && hop_to_owner(self, ex, life, hopped)) {
                     return;
                 }
                 if (self.cancelled() != asio::cancellation_type::none) {
@@ -896,7 +896,7 @@ class WebSocket : public std::enable_shared_from_this<WebSocket> {
 
         template <typename Self> void operator()(Self &self, error_code ec = {}, WsMessage msg = {}) {
             if (!started) {
-                if (managed && hop_to_owner(self, ex, hopped)) {
+                if (managed && hop_to_owner(self, ex, life, hopped)) {
                     return;
                 }
                 if (self.cancelled() != asio::cancellation_type::none) {

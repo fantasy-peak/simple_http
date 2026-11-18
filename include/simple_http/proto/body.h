@@ -28,8 +28,8 @@
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/bind_executor.hpp>
 #include <boost/asio/compose.hpp>
+#include <boost/asio/defer.hpp>
 #include <boost/asio/experimental/channel.hpp>
-#include <boost/asio/post.hpp>
 #include <boost/system/result.hpp>
 #include <cstddef>
 #include <functional>
@@ -133,6 +133,73 @@ class BodyState : public std::enable_shared_from_this<BodyState> {
 
     [[nodiscard]] bool is_pull() const { return static_cast<bool>(m_pull); }
 
+    enum class TryRead : std::uint8_t { Data, End, WouldBlock, Error };
+
+    // Pulls one already-buffered frame without initiating an async operation.
+    // `async_read_all` uses this to drain a fully buffered push-mode body in a
+    // single stack frame: calling async_read() again from its own completion
+    // would recurse once per chunk and overflow the stack. Pull-mode bodies
+    // always report WouldBlock — their provider is asynchronous by
+    // construction, so there is nothing to take synchronously.
+    TryRead try_read(ReadResult &out, error_code &ec) {
+        if (m_pull) {
+            return TryRead::WouldBlock;
+        }
+        if (m_eof) {
+            out = ReadResult::end();
+            return TryRead::End;
+        }
+        for (;;) {
+            Frame frame;
+            error_code recv_ec;
+            const bool got = channel().try_receive([&](error_code e, Frame f) {
+                recv_ec = e;
+                frame = std::move(f);
+            });
+            if (!got) {
+                // A finish()/fail() that could not fit when it arrived. The
+                // queue is drained, so delivering it now is exactly what a
+                // queued terminator would have done.
+                if (m_pending_error) {
+                    m_eof = true;
+                    ec = *m_pending_error;
+                    return TryRead::Error;
+                }
+                if (m_pending_eof) {
+                    return finish_try(out, ec);
+                }
+                return TryRead::WouldBlock;
+            }
+            if (recv_ec) {
+                m_eof = true;
+                ec = normalize_cancellation(recv_ec);
+                return TryRead::Error;
+            }
+            if (std::holds_alternative<Eof>(frame)) {
+                return finish_try(out, ec);
+            }
+            std::string data = std::move(std::get<std::string>(frame));
+            if (m_on_consumed && !data.empty()) {
+                m_on_consumed(data.size());
+            }
+            if (!m_decoder) {
+                out = ReadResult::chunk(std::move(data));
+                return TryRead::Data;
+            }
+            auto decoded = decode_chunk(data);
+            if (!decoded) {
+                m_eof = true;
+                ec = decoded.error();
+                return TryRead::Error;
+            }
+            if (!decoded->empty()) {
+                out = ReadResult::chunk(std::move(*decoded));
+                return TryRead::Data;
+            }
+            // The codec buffered these bytes; take the next frame.
+        }
+    }
+
     // The frame channel is created on first use. HTTP/1.x runs the body in pull
     // mode and never feeds or reads the channel, so building it in the
     // constructor would allocate a channel object plus its deque for every
@@ -186,6 +253,28 @@ class BodyState : public std::enable_shared_from_this<BodyState> {
         return tail;
     }
 
+    // Terminates try_read(): flush the decoder, then report the tail as data
+    // followed by End on the next call (or End directly when nothing remains).
+    TryRead finish_try(ReadResult &out, error_code &ec) {
+        if (!m_decoder) {
+            m_eof = true;
+            out = ReadResult::end();
+            return TryRead::End;
+        }
+        auto tail = finish_decoder();
+        m_eof = true;
+        if (!tail) {
+            ec = tail.error();
+            return TryRead::Error;
+        }
+        if (!tail->empty()) {
+            out = ReadResult::chunk(std::move(*tail));
+            return TryRead::Data;
+        }
+        out = ReadResult::end();
+        return TryRead::End;
+    }
+
     asio::any_io_executor m_exec;
     std::weak_ptr<Lifecycle> m_life;
     bool m_life_managed{false};
@@ -237,7 +326,7 @@ struct BodyReadOp {
             // Unmanaged bodies (client requests and standalone tests) keep the
             // historical same-thread initiation; only a body bound to a server
             // lifecycle is reposted onto its owner executor.
-            if (managed && hop_to_owner(self, exec, hopped)) {
+            if (managed && hop_to_owner(self, exec, life, hopped)) {
                 return;
             }
             if (self.cancelled() != asio::cancellation_type::none) {
@@ -450,7 +539,7 @@ struct BodyReadAllOp {
 
     template <typename Self> void operator()(Self &self, error_code ec = {}, ReadResult result = {}) {
         if (!started) {
-            if (managed && hop_to_owner(self, exec, hopped)) {
+            if (managed && hop_to_owner(self, exec, life, hopped)) {
                 return;
             }
             if (self.cancelled() != asio::cancellation_type::none) {
@@ -497,13 +586,40 @@ struct BodyReadAllOp {
         } else {
             out.append(result.data);
         }
-        // Break the synchronous chain. A body that is already buffered (the
-        // h2 paused-body path queues ~1300 chunks) would otherwise recurse one
-        // frame per chunk; ASan's larger frames overflow the stack. Posting
-        // between chunks keeps the stack bounded and is also fairer to other
-        // handlers on the connection.
+        // Push-mode bodies (h2/h3) hold every frame on a channel local to this
+        // thread: drain what is already buffered in this same stack frame
+        // instead of re-entering async_read() once per chunk. Pull-mode bodies
+        // (h1) answer from wire bytes and may complete synchronously, so defer
+        // one turn between chunks to keep the stack bounded (historical
+        // behaviour).
+        if (!state->is_pull()) {
+            for (;;) {
+                if (self.cancelled() != asio::cancellation_type::none) {
+                    self.complete(make_error_code(asio::error::operation_aborted), std::string{});
+                    return;
+                }
+                ReadResult next;
+                error_code tec;
+                const auto status = state->try_read(next, tec);
+                if (status == BodyState::TryRead::Error) {
+                    self.complete(tec, std::string{});
+                    return;
+                }
+                if (status == BodyState::TryRead::End) {
+                    self.complete(error_code{}, std::move(out));
+                    return;
+                }
+                if (status == BodyState::TryRead::WouldBlock) {
+                    // Nothing buffered: the next read parks on the channel, so
+                    // it cannot complete inline and recurse.
+                    state->async_read(std::move(self));
+                    return;
+                }
+                out.append(next.data);
+            }
+        }
         continuing = true;
-        asio::post(self.get_executor(), std::move(self));
+        asio::defer(self.get_executor(), std::move(self));
     }
 };
 
