@@ -264,14 +264,266 @@ struct StreamSpec {
 };
 
 class Stream {
+  private:
+    // Shared state for one exchange. The public Stream is a handle: in-flight
+    // operations reference this state instead of the handle, so a caller that
+    // drops its last shared_ptr<Stream> cannot invalidate a write that is
+    // already on its way. Stack-constructed Streams (tests, legacy callers) get
+    // the same guarantee because the state is heap-allocated by the handle's
+    // constructor.
+    //
+    // Cycle discipline: Exchange owns the transport (as the read path already
+    // does), and the transport stores the pending completion while a write is
+    // in flight. That "operation <-> transport" reference is the only strong
+    // cycle; it is broken when the operation completes, when Client::close()
+    // tears the session down, or when abort()/a timeout cancels the exchange.
+    // Nothing here stores an operation or a completion handler back into the
+    // Exchange, so no permanent cycle is possible.
+    struct Exchange {
+        std::shared_ptr<detail::ClientStream> stream;
+        std::chrono::milliseconds head_timeout{};
+        std::chrono::milliseconds idle_timeout{};
+        bool auto_expect_continue{false};
+        std::chrono::milliseconds continue_timeout{1000};
+        // Set by the first auto-Expect write and shared by every later write on
+        // this exchange.
+        bool continue_checked{false};
+
+        Exchange(std::shared_ptr<detail::ClientStream> s, std::chrono::milliseconds head,
+                 std::chrono::milliseconds idle, bool aec, std::chrono::milliseconds ct)
+            : stream(std::move(s)), head_timeout(head), idle_timeout(idle), auto_expect_continue(aec),
+              continue_timeout(ct) {}
+
+        template <typename Token> auto read_head_with(std::chrono::milliseconds timeout, Token &&token) {
+            auto stream = this->stream;
+            return asio::async_initiate<Token, void(error_code, detail::ResponseHead)>(
+                detail::make_executor_initiation(
+                    [stream, timeout](auto handler) {
+                        struct State {
+                            std::shared_ptr<detail::ClientStream> stream;
+                            std::chrono::milliseconds timeout;
+                            asio::any_completion_handler<void(error_code, detail::ResponseHead)> done;
+                            asio::steady_timer timer;
+                            std::shared_ptr<asio::cancellation_signal> signal{
+                                std::make_shared<asio::cancellation_signal>()};
+                            bool finished{false};
+                            bool timed_out{false};
+
+                            State(std::shared_ptr<detail::ClientStream> s, std::chrono::milliseconds t)
+                                : stream(std::move(s)), timeout(t), timer(stream->head_executor()) {}
+                        };
+                        auto state = std::make_shared<State>(stream, timeout);
+                        auto caller_slot = asio::get_associated_cancellation_slot(handler);
+                        state->done = std::move(handler);
+                        // A caller-supplied timer (asio::cancel_after) must reach the
+                        // inner read too, not just this helper's own deadline.
+                        install_cancel_handler(caller_slot, detail::ForwardCancellation{state->signal});
+                        auto finish = [state](error_code ec, detail::ResponseHead head) mutable {
+                            if (state->finished)
+                                return;
+                            state->finished = true;
+                            state->timer.cancel();
+                            std::move(state->done)(ec, std::move(head));
+                        };
+                        if (state->timeout.count() > 0) {
+                            state->timer.expires_after(state->timeout);
+                            state->timer.async_wait([state](error_code ec) mutable {
+                                if (ec || state->finished)
+                                    return;
+                                state->timed_out = true;
+                                state->signal->emit(asio::cancellation_type::terminal);
+                            });
+                        }
+                        state->stream->async_read_head(asio::bind_cancellation_slot(
+                            state->signal->slot(), [state, finish](error_code ec, detail::ResponseHead head) mutable {
+                                if (ec == asio::error::operation_aborted && state->timed_out) {
+                                    std::move(finish)(make_error_code(client_errc::response_head_timeout),
+                                                      detail::ResponseHead{});
+                                    return;
+                                }
+                                std::move(finish)(ec, std::move(head));
+                            }));
+                    },
+                    stream->head_executor()),
+                token);
+        }
+
+        template <typename Token> auto read_with(std::chrono::milliseconds timeout, Token &&token) {
+            auto stream = this->stream;
+            return asio::async_initiate<Token, void(error_code, ReadResult)>(
+                detail::make_executor_initiation(
+                    [stream, timeout](auto handler) {
+                        struct State {
+                            std::shared_ptr<detail::ClientStream> stream;
+                            std::chrono::milliseconds timeout;
+                            asio::any_completion_handler<void(error_code, ReadResult)> done;
+                            asio::steady_timer timer;
+                            std::shared_ptr<asio::cancellation_signal> signal{
+                                std::make_shared<asio::cancellation_signal>()};
+                            bool finished{false};
+                            bool timed_out{false};
+
+                            State(std::shared_ptr<detail::ClientStream> s, std::chrono::milliseconds t)
+                                : stream(std::move(s)), timeout(t), timer(stream->head_executor()) {}
+                        };
+                        auto state = std::make_shared<State>(stream, timeout);
+                        auto caller_slot = asio::get_associated_cancellation_slot(handler);
+                        state->done = std::move(handler);
+                        install_cancel_handler(caller_slot, detail::ForwardCancellation{state->signal});
+                        auto finish = [state](error_code ec, ReadResult result) mutable {
+                            if (state->finished)
+                                return;
+                            state->finished = true;
+                            state->timer.cancel();
+                            std::move(state->done)(ec, std::move(result));
+                        };
+                        if (state->timeout.count() > 0) {
+                            state->timer.expires_after(state->timeout);
+                            state->timer.async_wait([state](error_code ec) mutable {
+                                if (ec || state->finished)
+                                    return;
+                                state->timed_out = true;
+                                state->signal->emit(asio::cancellation_type::terminal);
+                            });
+                        }
+                        state->stream->async_read(asio::bind_cancellation_slot(
+                            state->signal->slot(), [state, finish](error_code ec, ReadResult result) mutable {
+                                if (ec == asio::error::operation_aborted && state->timed_out) {
+                                    std::move(finish)(make_error_code(client_errc::body_idle_timeout), ReadResult{});
+                                    return;
+                                }
+                                std::move(finish)(ec, std::move(result));
+                            }));
+                    },
+                    stream->head_executor()),
+                token);
+        }
+
+        template <typename Token> auto read_all(std::size_t max_bytes, Token &&token) {
+            auto stream = this->stream;
+            return asio::async_initiate<Token, void(error_code, std::string)>(
+                [stream, max_bytes](auto handler) mutable { stream->async_read_all(max_bytes, std::move(handler)); },
+                token);
+        }
+    };
+
+    struct WriteOp {
+        std::shared_ptr<Exchange> exchange;
+        std::string data;
+        bool finish;
+        Headers trailers;
+        int phase{0};
+
+        WriteOp(std::shared_ptr<Exchange> ex, std::string body, bool last, Headers trailer_fields)
+            : exchange(std::move(ex)), data(std::move(body)), finish(last), trailers(std::move(trailer_fields)) {}
+
+        asio::any_io_executor get_executor() const { return exchange->stream->head_executor(); }
+
+        template <typename Self> void start(Self &s) {
+            if (finish) {
+                exchange->stream->async_finish(std::move(data), std::move(s));
+            } else if (!trailers.empty()) {
+                exchange->stream->async_finish_trailers(std::move(trailers), std::move(s));
+            } else {
+                exchange->stream->async_write(std::move(data), std::move(s));
+            }
+        }
+
+        template <typename Self> void operator()(Self &s, error_code ec = {}) {
+            if (!exchange) {
+                s.complete(make_error_code(asio::error::not_connected));
+                return;
+            }
+            if (phase == 0) {
+                if (!exchange->auto_expect_continue || exchange->continue_checked) {
+                    phase = 2;
+                    start(s);
+                    return;
+                }
+                phase = 1;
+                (void)Stream::start_ensure_continue(exchange, std::move(s));
+                return;
+            }
+            if (phase == 1) {
+                if (ec) {
+                    s.complete(ec);
+                    return;
+                }
+                phase = 2;
+                start(s);
+                return;
+            }
+            s.complete(ec);
+        }
+    };
+
+    struct EnsureContinueOp {
+        std::shared_ptr<Exchange> exchange;
+        int phase{0};
+
+        explicit EnsureContinueOp(std::shared_ptr<Exchange> ex) : exchange(std::move(ex)) {}
+
+        asio::any_io_executor get_executor() const { return exchange->stream->head_executor(); }
+
+        template <typename Self> void operator()(Self &s, error_code ec = {}, detail::ResponseHead head = {}) {
+            if (!exchange) {
+                s.complete(make_error_code(asio::error::not_connected));
+                return;
+            }
+            if (phase == 0) {
+                phase = 1;
+                exchange->continue_checked = true;
+                if (!exchange->auto_expect_continue) {
+                    s.complete(error_code{});
+                    return;
+                }
+                // h1 and h2 surface the interim 100; h3 servers have no 1xx API,
+                // so the client sends the body without waiting.
+                if (exchange->stream->version() != Version::Http11 && exchange->stream->version() != Version::Http2) {
+                    s.complete(error_code{});
+                    return;
+                }
+                exchange->read_head_with(exchange->continue_timeout, std::move(s));
+                return;
+            }
+            if (ec == make_error_code(client_errc::response_head_timeout)) {
+                // No interim answer in time: proceed with the body, as Go does
+                // with a peer that ignores the header.
+                s.complete(error_code{});
+                return;
+            }
+            if (ec) {
+                s.complete(ec);
+                return;
+            }
+            if (head.status == status::continue_) {
+                // The interim head was handed to us; the final response still
+                // follows, so the next read_head() must parse it.
+                exchange->stream->clear_head_cache();
+                s.complete(error_code{});
+                return;
+            }
+            s.complete(make_error_code(client_errc::expectation_failed));
+        }
+    };
+
+    // Shared by a caller-facing ensure_continue() and by WriteOp's automatic
+    // Expect phase. The token is passed as an lvalue to async_compose (Boost
+    // 1.92 takes it by lvalue reference); the operation owns the Exchange, so
+    // the handle may go away while this runs.
+    template <typename Token> static auto start_ensure_continue(std::shared_ptr<Exchange> exchange, Token &&token) {
+        auto executor = exchange->stream->head_executor();
+        return asio::async_compose<Token, void(error_code)>(EnsureContinueOp{std::move(exchange)}, token, executor);
+    }
+
   public:
     // Constructed by the public client (open_stream). The budgets are captured
     // here so each read/head is bounded independently of later config changes.
     explicit Stream(std::shared_ptr<detail::ClientStream> stream, std::chrono::milliseconds head_timeout = {},
                     std::chrono::milliseconds idle_timeout = {}, bool auto_expect_continue = false,
                     std::chrono::milliseconds continue_timeout = std::chrono::milliseconds{1000})
-        : m_stream(std::move(stream)), m_head_timeout(head_timeout), m_idle_timeout(idle_timeout),
-          m_auto_expect_continue(auto_expect_continue), m_continue_timeout(continue_timeout) {}
+        : m_exchange(std::make_shared<Exchange>(std::move(stream), head_timeout, idle_timeout, auto_expect_continue,
+                                                continue_timeout)) {}
 
     template <typename Token> auto async_write(std::string data, Token &&token) {
         return start_write_op(std::move(data), false, {}, std::forward<Token>(token));
@@ -292,28 +544,25 @@ class Stream {
     // Bounded by the response-head (TTFB) budget: a slow service fails here as
     // client_errc::response_head_timeout, independently of body pace.
     template <typename Token> auto async_read_head(Token &&token) {
-        return read_head_with(m_head_timeout, std::forward<Token>(token));
+        return m_exchange->read_head_with(m_exchange->head_timeout, std::forward<Token>(token));
     }
     // Each read is bounded by the body-idle budget (silence between chunks).
     template <typename Token> auto async_read(Token &&token) {
-        return read_with(m_idle_timeout, std::forward<Token>(token));
+        return m_exchange->read_with(m_exchange->idle_timeout, std::forward<Token>(token));
     }
     template <typename Token> auto async_read_all(std::size_t max_bytes, Token &&token) {
-        auto stream = m_stream;
-        return asio::async_initiate<Token, void(error_code, std::string)>(
-            [stream, max_bytes](auto handler) mutable { stream->async_read_all(max_bytes, std::move(handler)); },
-            token);
+        return m_exchange->read_all(max_bytes, std::forward<Token>(token));
     }
-    const detail::ResponseHead &head() const { return m_stream->head(); }
-    const Headers &trailers() const { return m_stream->response_trailers(); }
-    bool finished() const { return m_stream->finished(); }
+    const detail::ResponseHead &head() const { return m_exchange->stream->head(); }
+    const Headers &trailers() const { return m_exchange->stream->response_trailers(); }
+    bool finished() const { return m_exchange->stream->finished(); }
 
     // Cancels the exchange and releases the engine's single-connection gate
     // now: waiting for the destructor would block later requests to the same
     // origin on a gate nobody holds.
     void abort() {
-        m_stream->async_cancel(asio::detached);
-        m_stream->run_destroy_hook();
+        m_exchange->stream->async_cancel(asio::detached);
+        m_exchange->stream->run_destroy_hook();
     }
 
     // Automatic Expect: 100-continue, performed once before the first body
@@ -321,263 +570,17 @@ class Stream {
     // expectation_failed; a timed-out wait sends the body anyway (Go's
     // ExpectContinueTimeout behaviour for a peer that ignores the header).
     template <typename Token> auto async_ensure_continue(Token &&token) {
-        return asio::async_compose<Token, void(error_code)>(EnsureContinueOp{*this}, token, m_stream->head_executor());
+        return start_ensure_continue(m_exchange, std::forward<Token>(token));
     }
 
   private:
     template <typename Token> auto start_write_op(std::string data, bool finish, Headers trailers, Token &&token) {
+        auto executor = m_exchange->stream->head_executor();
         return asio::async_compose<Token, void(error_code)>(
-            WriteOp{*this, std::move(data), finish, std::move(trailers)}, token, m_stream->head_executor());
+            WriteOp{m_exchange, std::move(data), finish, std::move(trailers)}, token, executor);
     }
 
-    template <typename Token> auto read_head_with(std::chrono::milliseconds timeout, Token &&token) {
-        auto stream = m_stream;
-        return asio::async_initiate<Token, void(error_code, detail::ResponseHead)>(
-            detail::make_executor_initiation(
-                [stream, timeout](auto handler) {
-                    struct State {
-                        std::shared_ptr<detail::ClientStream> stream;
-                        std::chrono::milliseconds timeout;
-                        asio::any_completion_handler<void(error_code, detail::ResponseHead)> done;
-                        asio::steady_timer timer;
-                        std::shared_ptr<asio::cancellation_signal> signal{
-                            std::make_shared<asio::cancellation_signal>()};
-                        bool finished{false};
-                        bool timed_out{false};
-
-                        State(std::shared_ptr<detail::ClientStream> s, std::chrono::milliseconds t)
-                            : stream(std::move(s)), timeout(t), timer(stream->head_executor()) {}
-                    };
-                    auto state = std::make_shared<State>(stream, timeout);
-                    auto caller_slot = asio::get_associated_cancellation_slot(handler);
-                    state->done = std::move(handler);
-                    // A caller-supplied timer (asio::cancel_after) must reach the
-                    // inner read too, not just this helper's own deadline.
-                    install_cancel_handler(caller_slot, detail::ForwardCancellation{state->signal});
-                    auto finish = [state](error_code ec, detail::ResponseHead head) mutable {
-                        if (state->finished)
-                            return;
-                        state->finished = true;
-                        state->timer.cancel();
-                        std::move(state->done)(ec, std::move(head));
-                    };
-                    if (state->timeout.count() > 0) {
-                        state->timer.expires_after(state->timeout);
-                        state->timer.async_wait([state](error_code ec) mutable {
-                            if (ec || state->finished)
-                                return;
-                            state->timed_out = true;
-                            state->signal->emit(asio::cancellation_type::terminal);
-                        });
-                    }
-                    state->stream->async_read_head(asio::bind_cancellation_slot(
-                        state->signal->slot(), [state, finish](error_code ec, detail::ResponseHead head) mutable {
-                            if (ec == asio::error::operation_aborted && state->timed_out) {
-                                std::move(finish)(make_error_code(client_errc::response_head_timeout),
-                                                  detail::ResponseHead{});
-                                return;
-                            }
-                            std::move(finish)(ec, std::move(head));
-                        }));
-                },
-                stream->head_executor()),
-            token);
-    }
-
-    template <typename Token> auto read_with(std::chrono::milliseconds timeout, Token &&token) {
-        auto stream = m_stream;
-        return asio::async_initiate<Token, void(error_code, ReadResult)>(
-            detail::make_executor_initiation(
-                [stream, timeout](auto handler) {
-                    struct State {
-                        std::shared_ptr<detail::ClientStream> stream;
-                        std::chrono::milliseconds timeout;
-                        asio::any_completion_handler<void(error_code, ReadResult)> done;
-                        asio::steady_timer timer;
-                        std::shared_ptr<asio::cancellation_signal> signal{
-                            std::make_shared<asio::cancellation_signal>()};
-                        bool finished{false};
-                        bool timed_out{false};
-
-                        State(std::shared_ptr<detail::ClientStream> s, std::chrono::milliseconds t)
-                            : stream(std::move(s)), timeout(t), timer(stream->head_executor()) {}
-                    };
-                    auto state = std::make_shared<State>(stream, timeout);
-                    auto caller_slot = asio::get_associated_cancellation_slot(handler);
-                    state->done = std::move(handler);
-                    install_cancel_handler(caller_slot, detail::ForwardCancellation{state->signal});
-                    auto finish = [state](error_code ec, ReadResult result) mutable {
-                        if (state->finished)
-                            return;
-                        state->finished = true;
-                        state->timer.cancel();
-                        std::move(state->done)(ec, std::move(result));
-                    };
-                    if (state->timeout.count() > 0) {
-                        state->timer.expires_after(state->timeout);
-                        state->timer.async_wait([state](error_code ec) mutable {
-                            if (ec || state->finished)
-                                return;
-                            state->timed_out = true;
-                            state->signal->emit(asio::cancellation_type::terminal);
-                        });
-                    }
-                    state->stream->async_read(asio::bind_cancellation_slot(
-                        state->signal->slot(), [state, finish](error_code ec, ReadResult result) mutable {
-                            if (ec == asio::error::operation_aborted && state->timed_out) {
-                                std::move(finish)(make_error_code(client_errc::body_idle_timeout), ReadResult{});
-                                return;
-                            }
-                            std::move(finish)(ec, std::move(result));
-                        }));
-                },
-                stream->head_executor()),
-            token);
-    }
-
-    struct WriteOp {
-        Stream &self;
-        std::string data;
-        bool finish;
-        Headers trailers;
-        int phase{0};
-
-        asio::any_io_executor get_executor() const { return self.m_stream->head_executor(); }
-
-        template <typename Self> void start(Self &s) {
-            if (finish) {
-                self.m_stream->async_finish(std::move(data), std::move(s));
-            } else if (!trailers.empty()) {
-                self.m_stream->async_finish_trailers(std::move(trailers), std::move(s));
-            } else {
-                self.m_stream->async_write(std::move(data), std::move(s));
-            }
-        }
-
-        template <typename Self> void operator()(Self &s, error_code ec = {}) {
-            if (phase == 0) {
-                if (!self.m_auto_expect_continue || self.m_continue_checked) {
-                    phase = 2;
-                    start(s);
-                    return;
-                }
-                phase = 1;
-                self.async_ensure_continue(std::move(s));
-                return;
-            }
-            if (phase == 1) {
-                if (ec) {
-                    s.complete(ec);
-                    return;
-                }
-                phase = 2;
-                start(s);
-                return;
-            }
-            s.complete(ec);
-        }
-    };
-
-    struct EnsureContinueOp {
-        Stream &self;
-        int phase{0};
-
-        asio::any_io_executor get_executor() const { return self.m_stream->head_executor(); }
-
-        template <typename Self> void operator()(Self &s, error_code ec = {}, detail::ResponseHead head = {}) {
-            if (phase == 0) {
-                phase = 1;
-                self.m_continue_checked = true;
-                if (!self.m_auto_expect_continue) {
-                    s.complete(error_code{});
-                    return;
-                }
-                // h1 and h2 surface the interim 100; h3 servers have no 1xx API,
-                // so the client sends the body without waiting.
-                if (self.m_stream->version() != Version::Http11 && self.m_stream->version() != Version::Http2) {
-                    s.complete(error_code{});
-                    return;
-                }
-                self.read_head_with(self.m_continue_timeout, std::move(s));
-                return;
-            }
-            if (ec == make_error_code(client_errc::response_head_timeout)) {
-                // No interim answer in time: proceed with the body, as Go does
-                // with a peer that ignores the header.
-                s.complete(error_code{});
-                return;
-            }
-            if (ec) {
-                s.complete(ec);
-                return;
-            }
-            if (head.status == status::continue_) {
-                // The interim head was handed to us; the final response still
-                // follows, so the next read_head() must parse it.
-                self.m_stream->clear_head_cache();
-                s.complete(error_code{});
-                return;
-            }
-            s.complete(make_error_code(client_errc::expectation_failed));
-        }
-    };
-
-    struct ReadHeadOp {
-        Stream &self;
-        std::chrono::milliseconds timeout;
-        int phase{0};
-
-        asio::any_io_executor get_executor() const { return self.m_stream->head_executor(); }
-
-        template <typename Self> void operator()(Self &s, error_code ec = {}, detail::ResponseHead head = {}) {
-            if (phase == 0) {
-                phase = 1;
-                if (timeout.count() > 0) {
-                    self.m_stream->async_read_head(asio::cancel_after(timeout, std::move(s)));
-                } else {
-                    self.m_stream->async_read_head(std::move(s));
-                }
-                return;
-            }
-            if (ec == asio::error::operation_aborted || ec == asio::error::timed_out) {
-                s.complete(make_error_code(client_errc::response_head_timeout), detail::ResponseHead{});
-                return;
-            }
-            s.complete(ec, std::move(head));
-        }
-    };
-
-    struct ReadOp {
-        Stream &self;
-        std::chrono::milliseconds timeout;
-        int phase{0};
-
-        asio::any_io_executor get_executor() const { return self.m_stream->head_executor(); }
-
-        template <typename Self> void operator()(Self &s, error_code ec = {}, ReadResult result = {}) {
-            if (phase == 0) {
-                phase = 1;
-                if (timeout.count() > 0) {
-                    self.m_stream->async_read(asio::cancel_after(timeout, std::move(s)));
-                } else {
-                    self.m_stream->async_read(std::move(s));
-                }
-                return;
-            }
-            if (ec == asio::error::operation_aborted || ec == asio::error::timed_out) {
-                s.complete(make_error_code(client_errc::body_idle_timeout), ReadResult{});
-                return;
-            }
-            s.complete(ec, std::move(result));
-        }
-    };
-
-    std::shared_ptr<detail::ClientStream> m_stream;
-    std::chrono::milliseconds m_head_timeout{};
-    std::chrono::milliseconds m_idle_timeout{};
-    bool m_auto_expect_continue{false};
-    std::chrono::milliseconds m_continue_timeout{1000};
-    bool m_continue_checked{false};
+    std::shared_ptr<Exchange> m_exchange;
 };
 
 class Client;

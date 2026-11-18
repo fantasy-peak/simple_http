@@ -23,6 +23,40 @@ using simple_http::test::MockTransport;
 
 namespace {
 
+// A transport that parks the request head and body writes until the test
+// completes them. This is what makes it possible to drop the user-facing
+// Stream handle while an operation is in flight.
+class DeferredClientStream final : public detail::ClientStream {
+  public:
+    explicit DeferredClientStream(asio::any_io_executor ex) : m_ex(std::move(ex)) {}
+
+    bool finished() const override { return false; }
+    Version version() const override { return Version::Http11; }
+    std::uint32_t id() const override { return 1; }
+
+    void write(std::string, WriteCompletion done) override { pending_write = std::move(done); }
+    void finish(std::string, WriteCompletion done) override { pending_write = std::move(done); }
+    void read(detail::ReadCompletion done) override { std::move(done)(error_code{}, ReadResult::end()); }
+    void cancel(WriteCompletion done) override { std::move(done)(error_code{}); }
+    void await_head(WriteCompletion done) override { pending_head = std::move(done); }
+    asio::any_io_executor head_executor() const override { return m_ex; }
+
+    // Publishes the interim head and wakes the parked head read.
+    void complete_head(int code) {
+        detail::ResponseHead head;
+        head.status = code;
+        set_head(std::move(head));
+        auto done = std::move(pending_head);
+        std::move(done)(error_code{});
+    }
+
+    WriteCompletion pending_head;
+    WriteCompletion pending_write;
+
+  private:
+    asio::any_io_executor m_ex;
+};
+
 // A managed writer whose last strong reference is dropped after the operation
 // has been queued on the owner executor. `life` is returned separately so the
 // test can keep the Lifecycle alive: the queued operation holds only a weak
@@ -97,8 +131,7 @@ TEST_CASE("response: a token bound to another executor still runs on the owner",
     // The caller says "complete on other_ctx". The state machine (and the sink
     // call) must still be posted to the owner context, so running other_ctx
     // alone must not touch the sink.
-    writer->async_write("x",
-                        asio::bind_executor(other_ctx.get_executor(), [&](error_code) { done = true; }));
+    writer->async_write("x", asio::bind_executor(other_ctx.get_executor(), [&](error_code) { done = true; }));
 
     other_ctx.run();
     CHECK_FALSE(done);
@@ -140,7 +173,7 @@ TEST_CASE("h1 sink: body write after the response completed is rejected", "[life
     auto transport = std::make_shared<MockTransport>(ctx.get_executor());
     auto deadline = std::make_shared<std::chrono::steady_clock::time_point>();
     auto sink = std::make_shared<Http1ResponseSink<MockTransport>>(transport, Version::Http11, deadline,
-                                                                  std::chrono::seconds{30});
+                                                                   std::chrono::seconds{30});
     sink->set_keep_alive(true);
 
     error_code first_ec;
@@ -161,4 +194,46 @@ TEST_CASE("h1 sink: body write after the response completed is rejected", "[life
     REQUIRE(late_done);
     CHECK(late_ec == asio::error::not_connected);
     CHECK(transport->written().size() == first_size);
+}
+
+TEST_CASE("stream: a write keeps the exchange alive after the handle is dropped", "[lifecycle][review]") {
+    asio::io_context ctx;
+    std::weak_ptr<DeferredClientStream> weak_inner;
+    std::optional<error_code> result;
+    bool completed = false;
+
+    {
+        auto inner = std::make_shared<DeferredClientStream>(ctx.get_executor());
+        weak_inner = inner;
+        auto stream = std::make_shared<Stream>(inner, std::chrono::milliseconds{0}, std::chrono::milliseconds{0},
+                                               /*auto_expect_continue=*/true, std::chrono::milliseconds{50});
+
+        stream->async_write("x", [&](error_code ec) {
+            result = ec;
+            completed = true;
+        });
+        REQUIRE(inner->pending_head);
+
+        // Drop the caller's last handle; the in-flight write must keep its
+        // exchange state (and the transport) alive on its own.
+        stream.reset();
+        CHECK_FALSE(weak_inner.expired());
+
+        asio::post(ctx, [inner] { inner->complete_head(status::continue_); });
+        // The mock transport parks the body write without registering I/O, so
+        // the composed operation's work guard would keep run() waiting. Pump
+        // with a deadline, as a real transport's readiness would drive it.
+        (void)ctx.run_for(std::chrono::milliseconds{200});
+
+        REQUIRE(inner->pending_write);
+        auto done = std::move(inner->pending_write);
+        std::move(done)(error_code{});
+    }
+
+    (void)ctx.run_for(std::chrono::milliseconds{200});
+    REQUIRE(completed);
+    CHECK_FALSE(*result);
+    // The operation released the exchange when it finished: no
+    // operation<->transport cycle remains.
+    CHECK(weak_inner.expired());
 }

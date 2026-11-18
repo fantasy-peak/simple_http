@@ -175,8 +175,8 @@ class ResponseWriter : public std::enable_shared_from_this<ResponseWriter> {
                     // See StartWriteOp: `raw` is only a valid borrow for an
                     // unbound stack writer; a managed one whose weak_ptr expired
                     // was destroyed while this operation was queued.
-                    guard =
-                        Guard<const ResponseWriter>{std::shared_ptr<const ResponseWriter>(raw, [](const ResponseWriter *) {})};
+                    guard = Guard<const ResponseWriter>{
+                        std::shared_ptr<const ResponseWriter>(raw, [](const ResponseWriter *) {})};
                 } else {
                     self.complete(make_error_code(asio::error::not_connected), false);
                     return;
@@ -213,13 +213,12 @@ class ResponseWriter : public std::enable_shared_from_this<ResponseWriter> {
     // writer) is bound to the token before composition, so the composed
     // operation's associated executor -- used by every inner step and by the
     // hop -- is the owner even if the caller bound something else to the token.
-    template <typename Fn, typename Token>
-    auto start_io(Lifecycle::Access access, Fn &&fn, Token &&token) {
+    template <typename Fn, typename Token> auto start_io(Lifecycle::Access access, Fn &&fn, Token &&token) {
         auto ex = m_writer->get_executor();
         auto bound = asio::bind_executor(ex, std::forward<Token>(token));
         return asio::async_compose<decltype(bound), void(error_code)>(
             StartWriteOp<std::decay_t<Fn>>{weak_from_this(), this, m_life, m_life_managed, access, ex,
-                                          std::forward<Fn>(fn)},
+                                           std::forward<Fn>(fn)},
             bound, ex);
     }
 
@@ -228,7 +227,7 @@ class ResponseWriter : public std::enable_shared_from_this<ResponseWriter> {
         auto bound = asio::bind_executor(ex, std::forward<Token>(token));
         return asio::async_compose<decltype(bound), void(error_code, bool)>(
             StartConnectedOp<std::decay_t<Fn>>{weak_from_this(), this, m_life, m_life_managed, ex,
-                                              std::forward<Fn>(fn)},
+                                               std::forward<Fn>(fn)},
             bound, ex);
     }
 

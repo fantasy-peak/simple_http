@@ -564,8 +564,7 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
     // superseded fetches - so this must be checked, not assumed.
     bool stream_writable(std::uint32_t stream_id) const {
         auto it = m_streams.find(stream_id);
-        return it != m_streams.end() && it->second.life &&
-               it->second.life->can(Lifecycle::Access::Write);
+        return it != m_streams.end() && it->second.life && it->second.life->can(Lifecycle::Access::Write);
     }
 
     // Parks the calling producer until this stream's outbound queue has drained

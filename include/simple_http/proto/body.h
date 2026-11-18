@@ -553,9 +553,7 @@ class Body {
     // channel_cancelled is normalized at this boundary so callers only see the
     // standard code. It may be started from any thread; the state machine is
     // reposted onto the body's executor.
-    template <typename Token> auto async_read(Token &&token) {
-        return m_state->async_read(std::forward<Token>(token));
-    }
+    template <typename Token> auto async_read(Token &&token) { return m_state->async_read(std::forward<Token>(token)); }
 
     // Reads and concatenates the entire remaining body.
     template <typename Token> auto async_read_all(Token &&token) {

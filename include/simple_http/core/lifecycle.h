@@ -63,8 +63,7 @@ class Lifecycle {
             if (node->m_phase != Phase::Open) {
                 return false;
             }
-            if (access == Access::Read ? !node->m_read_open
-                                       : access == Access::Write ? !node->m_write_open : false) {
+            if (access == Access::Read ? !node->m_read_open : access == Access::Write ? !node->m_write_open : false) {
                 return false;
             }
             if (!node->m_has_parent) {
