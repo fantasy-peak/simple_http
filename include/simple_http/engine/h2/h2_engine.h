@@ -126,197 +126,173 @@ inline constexpr std::size_t kMaxFramedPerPass = 256u << 10; // 256 KiB
 
 // ResponseSink for a single HTTP/2 stream. Holds a weak_ptr to the engine so it
 // can be used safely from any thread and after the connection has closed.
-template <typename Transport>
-class Http2ResponseSink final : public ResponseSink, public std::enable_shared_from_this<Http2ResponseSink<Transport>> {
+template <typename Transport> class Http2ResponseSink final : public ResponseSink {
   public:
     using Executor = asio::any_io_executor;
 
     Http2ResponseSink(std::weak_ptr<Http2Engine<Transport>> engine, std::uint32_t stream_id, Executor exec)
         : m_engine(std::move(engine)), m_stream_id(stream_id), m_executor(std::move(exec)) {}
 
+    // Sink calls arrive on the connection executor (model A), so they run the
+    // engine path inline.
     void send(int status, Headers headers, std::string body, WriteCompletion done) override {
-        on_executor([self = this->shared_from_this(), status, headers = std::move(headers), body = std::move(body),
-                     done = std::move(done)]() mutable {
-            auto eng = self->m_engine.lock();
-            if (!eng || !eng->alive() || !eng->stream_writable(self->m_stream_id)) {
-                std::move(done)(make_error_code(asio::error::not_connected));
-                return;
-            }
-            self->m_head_started = true;
-            ensure_date(headers);
-            const bool head = eng->method_is_head(self->m_stream_id);
-            if (head) {
-                headers.erase("content-length");
-                headers.add_lower("content-length", std::to_string(body.size()));
-            }
-            eng->submit_headers(self->m_stream_id, status, headers, /*end_stream=*/head);
-            if (!head)
-                eng->enqueue_body(self->m_stream_id, std::move(body), /*last=*/true);
-            // A HEAD/one-shot response has nothing in the body queue to nudge
-            // the write loop; without this the client sees it only after the
-            // handler returns.
-            eng->flush();
-            std::move(done)(error_code{});
-        });
+        auto eng = m_engine.lock();
+        if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
+            std::move(done)(make_error_code(asio::error::not_connected));
+            return;
+        }
+        m_head_started = true;
+        ensure_date(headers);
+        const bool head = eng->method_is_head(m_stream_id);
+        if (head) {
+            headers.erase("content-length");
+            headers.add_lower("content-length", std::to_string(body.size()));
+        }
+        eng->submit_headers(m_stream_id, status, headers, /*end_stream=*/head);
+        if (!head)
+            eng->enqueue_body(m_stream_id, std::move(body), /*last=*/true);
+        // A HEAD/one-shot response has nothing in the body queue to nudge the
+        // write loop; without this the client sees it only after the handler
+        // returns.
+        eng->flush();
+        std::move(done)(error_code{});
     }
 
     void send_bodyless(int status, Headers headers, WriteCompletion done) override {
-        on_executor(
-            [self = this->shared_from_this(), status, headers = std::move(headers), done = std::move(done)]() mutable {
-                auto eng = self->m_engine.lock();
-                if (!eng || !eng->alive() || !eng->stream_writable(self->m_stream_id)) {
-                    std::move(done)(make_error_code(asio::error::not_connected));
-                    return;
-                }
-                // 204 and 1xx carry no content; a handler-set Content-Length
-                // would describe a body that cannot exist. 304 may keep one
-                // (RFC 9110 §15.4.5), matching h1.
-                if (status == status::no_content || (status >= 100 && status < 200)) {
-                    headers.erase("content-length");
-                }
-                self->m_head_started = true;
-                ensure_date(headers);
-                eng->submit_headers(self->m_stream_id, status, headers, /*end_stream=*/true);
-                eng->flush();
-                std::move(done)(error_code{});
-            });
+        auto eng = m_engine.lock();
+        if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
+            std::move(done)(make_error_code(asio::error::not_connected));
+            return;
+        }
+        // 204 and 1xx carry no content; a handler-set Content-Length would
+        // describe a body that cannot exist. 304 may keep one
+        // (RFC 9110 §15.4.5), matching h1.
+        if (status == status::no_content || (status >= 100 && status < 200)) {
+            headers.erase("content-length");
+        }
+        m_head_started = true;
+        ensure_date(headers);
+        eng->submit_headers(m_stream_id, status, headers, /*end_stream=*/true);
+        eng->flush();
+        std::move(done)(error_code{});
     }
 
     void send_continue(WriteCompletion done) override {
-        on_executor([self = this->shared_from_this(), done = std::move(done)]() mutable {
-            auto eng = self->m_engine.lock();
-            if (!eng || !eng->alive() || !eng->stream_writable(self->m_stream_id)) {
-                std::move(done)(make_error_code(asio::error::not_connected));
-                return;
-            }
-            // An interim response must precede the final one (RFC 9110 §15.2):
-            // a handler that answers before reading the body must not cause a
-            // 100 to be emitted after the final HEADERS.
-            if (!self->m_continue_sent && !self->m_head_started) {
-                self->m_continue_sent = true;
-                eng->submit_headers(self->m_stream_id, status::continue_, Headers{}, /*end_stream=*/false);
-                eng->flush();
-            }
-            std::move(done)(error_code{});
-        });
+        auto eng = m_engine.lock();
+        if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
+            std::move(done)(make_error_code(asio::error::not_connected));
+            return;
+        }
+        // An interim response must precede the final one (RFC 9110 §15.2): a
+        // handler that answers before reading the body must not cause a 100 to
+        // be emitted after the final HEADERS.
+        if (!m_continue_sent && !m_head_started) {
+            m_continue_sent = true;
+            eng->submit_headers(m_stream_id, status::continue_, Headers{}, /*end_stream=*/false);
+            eng->flush();
+        }
+        std::move(done)(error_code{});
     }
 
     void send_headers(int status, Headers headers, WriteCompletion done) override {
-        on_executor(
-            [self = this->shared_from_this(), status, headers = std::move(headers), done = std::move(done)]() mutable {
-                auto eng = self->m_engine.lock();
-                if (!eng || !eng->alive() || !eng->stream_writable(self->m_stream_id)) {
-                    std::move(done)(make_error_code(asio::error::not_connected));
-                    return;
-                }
-                self->m_head_started = true;
-                ensure_date(headers);
-                headers.erase("content-length");
-                eng->submit_headers(self->m_stream_id, status, headers,
-                                    /*end_stream=*/eng->method_is_head(self->m_stream_id));
-                eng->flush();
-                std::move(done)(error_code{});
-            });
+        auto eng = m_engine.lock();
+        if (!eng || !eng->alive() || !eng->stream_writable(m_stream_id)) {
+            std::move(done)(make_error_code(asio::error::not_connected));
+            return;
+        }
+        m_head_started = true;
+        ensure_date(headers);
+        headers.erase("content-length");
+        eng->submit_headers(m_stream_id, status, headers, /*end_stream=*/eng->method_is_head(m_stream_id));
+        eng->flush();
+        std::move(done)(error_code{});
     }
 
     void send_chunk(std::string data, WriteCompletion done) override {
-        on_executor([self = this->shared_from_this(), data = std::move(data), done = std::move(done)]() mutable {
-            auto eng = self->m_engine.lock();
-            if (!eng || !eng->alive()) {
-                std::move(done)(make_error_code(asio::error::not_connected));
-                return;
-            }
-            if (self->m_head_request) {
-                std::move(done)(error_code{});
-                return;
-            }
-            if (!eng->stream_writable(self->m_stream_id)) {
-                std::move(done)(make_error_code(asio::error::not_connected));
-                return;
-            }
-            auto self_keep = self;
-            // Keep the caller's cancellation slot on the wait: wrapping the
-            // completion in a plain lambda would drop its associators, and a
-            // per-operation timer could then never release a parked writer.
-            const auto slot = asio::get_associated_cancellation_slot(done);
-            eng->await_out_space(self->m_stream_id,
-                                 forward_cancel_slot(slot, [self_keep, eng, data = std::move(data),
+        auto eng = m_engine.lock();
+        if (!eng || !eng->alive()) {
+            std::move(done)(make_error_code(asio::error::not_connected));
+            return;
+        }
+        if (m_head_request) {
+            std::move(done)(error_code{});
+            return;
+        }
+        if (!eng->stream_writable(m_stream_id)) {
+            std::move(done)(make_error_code(asio::error::not_connected));
+            return;
+        }
+        // Keep the caller's cancellation slot on the wait: wrapping the
+        // completion in a plain lambda would drop its associators, and a
+        // per-operation timer could then never release a parked writer.
+        const auto id = m_stream_id;
+        const auto slot = asio::get_associated_cancellation_slot(done);
+        eng->await_out_space(id, forward_cancel_slot(slot, [eng, id, data = std::move(data),
                                                             done = std::move(done)](error_code ec) mutable {
-                                     if (ec) {
-                                         std::move(done)(ec);
-                                         return;
-                                     }
-                                     eng->enqueue_body(self_keep->m_stream_id, std::move(data), /*last=*/false);
-                                     std::move(done)(error_code{});
-                                 }));
-        });
+                                 if (ec) {
+                                     std::move(done)(ec);
+                                     return;
+                                 }
+                                 eng->enqueue_body(id, std::move(data), /*last=*/false);
+                                 std::move(done)(error_code{});
+                             }));
     }
 
     void send_last(std::string data, WriteCompletion done) override {
-        on_executor([self = this->shared_from_this(), data = std::move(data), done = std::move(done)]() mutable {
-            auto eng = self->m_engine.lock();
-            if (!eng || !eng->alive()) {
-                std::move(done)(make_error_code(asio::error::not_connected));
-                return;
-            }
-            if (self->m_head_request) {
-                std::move(done)(error_code{});
-                return;
-            }
-            if (!eng->stream_writable(self->m_stream_id)) {
-                std::move(done)(make_error_code(asio::error::not_connected));
-                return;
-            }
-            auto self_keep = self;
-            const auto slot = asio::get_associated_cancellation_slot(done);
-            eng->await_out_space(self->m_stream_id,
-                                 forward_cancel_slot(slot, [self_keep, eng, data = std::move(data),
+        auto eng = m_engine.lock();
+        if (!eng || !eng->alive()) {
+            std::move(done)(make_error_code(asio::error::not_connected));
+            return;
+        }
+        if (m_head_request) {
+            std::move(done)(error_code{});
+            return;
+        }
+        if (!eng->stream_writable(m_stream_id)) {
+            std::move(done)(make_error_code(asio::error::not_connected));
+            return;
+        }
+        const auto id = m_stream_id;
+        const auto slot = asio::get_associated_cancellation_slot(done);
+        eng->await_out_space(id, forward_cancel_slot(slot, [eng, id, data = std::move(data),
                                                             done = std::move(done)](error_code ec) mutable {
-                                     if (ec) {
-                                         std::move(done)(ec);
-                                         return;
-                                     }
-                                     eng->enqueue_body(self_keep->m_stream_id, std::move(data), /*last=*/true);
-                                     std::move(done)(error_code{});
-                                 }));
-        });
+                                 if (ec) {
+                                     std::move(done)(ec);
+                                     return;
+                                 }
+                                 eng->enqueue_body(id, std::move(data), /*last=*/true);
+                                 std::move(done)(error_code{});
+                             }));
     }
 
     void send_trailers(Headers trailers, WriteCompletion done) override {
-        on_executor(
-            [self = this->shared_from_this(), trailers = std::move(trailers), done = std::move(done)]() mutable {
-                auto eng = self->m_engine.lock();
-                if (!eng || !eng->alive()) {
-                    std::move(done)(make_error_code(asio::error::not_connected));
-                    return;
-                }
-                if (self->m_head_request) {
-                    std::move(done)(error_code{});
-                    return;
-                }
-                if (!eng->stream_writable(self->m_stream_id)) {
-                    std::move(done)(make_error_code(asio::error::not_connected));
-                    return;
-                }
-                eng->submit_trailers(self->m_stream_id, trailers);
-                std::move(done)(error_code{});
-            });
+        auto eng = m_engine.lock();
+        if (!eng || !eng->alive()) {
+            std::move(done)(make_error_code(asio::error::not_connected));
+            return;
+        }
+        if (m_head_request) {
+            std::move(done)(error_code{});
+            return;
+        }
+        if (!eng->stream_writable(m_stream_id)) {
+            std::move(done)(make_error_code(asio::error::not_connected));
+            return;
+        }
+        eng->submit_trailers(m_stream_id, trailers);
+        std::move(done)(error_code{});
     }
 
     void connected(ConnectedCompletion done) const override {
-        on_executor([self = this->shared_from_this(), done = std::move(done)]() mutable {
-            auto eng = self->m_engine.lock();
-            std::move(done)(error_code{}, eng && eng->alive() && eng->stream_writable(self->m_stream_id));
-        });
+        auto eng = m_engine.lock();
+        std::move(done)(error_code{}, eng && eng->alive() && eng->stream_writable(m_stream_id));
     }
 
     void close(WriteCompletion done) override {
-        on_executor([self = this->shared_from_this(), done = std::move(done)]() mutable {
-            if (auto eng = self->m_engine.lock()) {
-                eng->close_stream(self->m_stream_id);
-            }
-            std::move(done)(error_code{});
-        });
+        if (auto eng = m_engine.lock()) {
+            eng->close_stream(m_stream_id);
+        }
+        std::move(done)(error_code{});
     }
 
     Version version() const override { return Version::Http2; }
@@ -326,8 +302,6 @@ class Http2ResponseSink final : public ResponseSink, public std::enable_shared_f
     void set_head_request(bool head) noexcept { m_head_request = head; }
 
   private:
-    template <typename Fn> void on_executor(Fn &&fn) const { asio::dispatch(m_executor, std::forward<Fn>(fn)); }
-
     std::weak_ptr<Http2Engine<Transport>> m_engine;
     std::uint32_t m_stream_id;
     asio::any_io_executor m_executor;

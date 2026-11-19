@@ -58,8 +58,8 @@ class ResponseSink {
     // with `Expect: 100-continue`. Protocols without the concept ignore it.
     virtual void send_continue(WriteCompletion done) { std::move(done)(error_code{}); }
 
-    // Connection state. Implementations hop onto the connection executor before
-    // touching engine state, exactly like the writes.
+    // Connection state. Like every other sink call, these arrive on the
+    // connection executor; implementations touch engine state directly.
     virtual void connected(ConnectedCompletion done) const = 0;
     virtual void close(WriteCompletion done) = 0;
 

@@ -95,7 +95,7 @@ class Http1ClientSession final : public ClientSession,
         });
     }
 
-    bool alive() const override { return m_alive.load(std::memory_order_acquire); }
+    bool alive() const override { return m_alive; }
     bool reusable() const override {
         return alive() && !m_busy && !m_close_after && m_body_complete && !m_connection_error;
     }
@@ -107,12 +107,13 @@ class Http1ClientSession final : public ClientSession,
     asio::any_io_executor executor() const override { return m_executor; }
 
     void close() override {
-        m_alive.store(false, std::memory_order_release);
-        m_transport->close();
+        // Same shape as the h2/h3 sessions: close may be called from the Client
+        // on its executor (inline) or defensively from elsewhere (queued).
+        hop([self = this->shared_from_this()] {
+            self->m_alive = false;
+            self->m_transport->close();
+        });
     }
-
-    void set_on_exchange_done(std::function<void()> cb) override { m_exchange_done = std::move(cb); }
-    std::shared_ptr<std::atomic<bool>> exchange_done_flag() const override { return m_current_done; }
 
     // --- token operations used by the stream ---
     //
@@ -172,7 +173,7 @@ class Http1ClientSession final : public ClientSession,
                 std::move(done)(make_error_code(client_errc::session_closed));
                 return;
             }
-            self->m_alive.store(false);
+            self->m_alive = false;
             self->m_transport->close();
             self->release_exchange();
             std::move(done)(error_code{});
@@ -186,9 +187,7 @@ class Http1ClientSession final : public ClientSession,
 
     enum class BodyMode { None, Fixed, Chunked, EofDelimited };
 
-    template <typename Fn> void hop(Fn &&fn) {
-        asio::dispatch(asio::bind_executor(asio::any_io_executor{m_executor}, std::forward<Fn>(fn)));
-    }
+    template <typename Fn> void hop(Fn &&fn) { asio::dispatch(m_executor, std::forward<Fn>(fn)); }
 
     static bool method_expects_body(Method method) {
         return method != Method::Get && method != Method::Head && method != Method::Options &&
@@ -200,20 +199,15 @@ class Http1ClientSession final : public ClientSession,
         m_request_finished = false;
         m_chunk_remaining = 0;
         m_chunk_need_crlf = false;
-        if (m_current_done)
-            m_current_done->store(true, std::memory_order_release);
         if (auto current = m_current.lock()) {
             current->mark_finished();
         }
         m_current.reset();
-        auto hook = m_exchange_done;
-        if (hook)
-            hook();
     }
 
     void fail_exchange(error_code ec) {
         m_connection_error = ec;
-        m_alive.store(false, std::memory_order_release);
+        m_alive = false;
         m_transport->close();
         m_body_complete = false;
         release_exchange();
@@ -256,7 +250,6 @@ class Http1ClientSession final : public ClientSession,
         m_in.clear();
         m_trailers = Headers{};
         m_trailer_bytes = 0;
-        m_current_done = std::make_shared<std::atomic<bool>>(false);
         auto stream = std::make_shared<Http1ClientStream<Transport>>(this->shared_from_this());
         m_current = stream;
 
@@ -1059,10 +1052,8 @@ class Http1ClientSession final : public ClientSession,
     // must not own the stream back. A caller may keep the Stream handle after
     // dropping the Client; that handle keeps the session and transport alive.
     std::weak_ptr<Http1ClientStream<Transport>> m_current;
-    std::shared_ptr<std::atomic<bool>> m_current_done;
-    std::function<void()> m_exchange_done;
 
-    std::atomic<bool> m_alive{true};
+    bool m_alive{true};
     bool m_busy{false};
     bool m_close_after{false};
     error_code m_connection_error;

@@ -25,6 +25,7 @@
 #include <utility>
 
 #include "../core/base64.h"
+#include "../core/compat.h"
 #include "../core/http_field.h"
 #include "../core/http_method.h"
 #include "../core/result.h"
@@ -319,9 +320,6 @@ class ClientSession {
     virtual std::string_view authority() const = 0;
     virtual asio::any_io_executor executor() const = 0;
     virtual void close() = 0;
-
-    virtual void set_on_exchange_done(std::function<void()> cb) { (void)cb; }
-    virtual std::shared_ptr<std::atomic<bool>> exchange_done_flag() const { return nullptr; }
 };
 
 } // namespace simple_http::detail

@@ -13,21 +13,19 @@
 //
 // Concurrency (model A): a connection is pinned to one single-threaded
 // io_context, and this handle — like every other object owned by the
-// connection — must be used from that thread only. A call from another thread
-// is a contract violation: require_owner_thread logs it and aborts rather than
-// racing the reader/writer pumps. Code that needs to move work across threads
-// should hop explicitly with asio::post(req->executor(), ...). is_open() is the
-// single synchronous snapshot (an atomic). Writes are serialized by an internal
-// write pump; an internal reader keeps draining the transport into a bounded
-// inbox so a serialized read/write application cannot deadlock with a peer that
-// stops reading.
+// connection — runs entirely on that socket executor. The caller guarantees
+// every call (including destruction and is_open()) happens there; there is no
+// runtime thread check. Code that needs to move work across threads should hop
+// explicitly with asio::post(req->executor(), ...). Writes are serialized by an
+// internal write pump; an internal reader keeps draining the transport into a
+// bounded inbox so a serialized read/write application cannot deadlock with a
+// peer that stops reading.
 //
 // Fragmentation and control frames are handled inside the reader: continuation
 // frames are reassembled, Ping is answered with Pong, and a received Close is
 // answered with a Close before the read reports end-of-stream.
 
 #include <array>
-#include <atomic>
 #include <boost/asio.hpp>
 #include <boost/asio/any_completion_handler.hpp>
 #include <boost/asio/async_result.hpp>
@@ -45,7 +43,6 @@
 #include <random>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <type_traits>
 #include <utility>
 
@@ -196,10 +193,9 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
 
     // --- reads -------------------------------------------------------------
 
-    void read(WsReadCompletion done) override {
-        auto self = this->shared_from_this();
-        hop([self, done = std::move(done)]() mutable { self->read_impl(std::move(done)); });
-    }
+    // Every entry point runs on the socket executor (model A), so the backend
+    // operates inline.
+    void read(WsReadCompletion done) override { read_impl(std::move(done)); }
 
     bool is_open() const override { return m_open; }
     bool compression_negotiated() const override { return m_compress_active; }
@@ -207,10 +203,7 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
     // --- writes ------------------------------------------------------------
 
     void write(std::string data, bool text, WriteCompletion done) override {
-        auto self = this->shared_from_this();
-        hop([self, data = std::move(data), text, done = std::move(done)]() mutable {
-            self->write_impl(std::move(data), text, std::move(done));
-        });
+        write_impl(std::move(data), text, std::move(done));
     }
 
     void write_view(std::string_view data, bool text, WriteCompletion done) override {
@@ -220,30 +213,24 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
             return;
         }
         const WsOpcode opcode = text ? WsOpcode::Text : WsOpcode::Binary;
-        auto self = this->shared_from_this();
-        hop([self, opcode, data, done = std::move(done)]() mutable {
-            if (!self->m_open) {
-                std::move(done)(make_error_code(asio::error::not_connected));
-                return;
-            }
-            self->m_writer->enqueue(make_borrowed_entry(opcode, data, false), std::move(done));
-        });
+        if (!m_open) {
+            std::move(done)(make_error_code(asio::error::not_connected));
+            return;
+        }
+        m_writer->enqueue(make_borrowed_entry(opcode, data, false), std::move(done));
     }
 
     void ping(std::string payload, WriteCompletion done) override {
-        auto self = this->shared_from_this();
-        hop([self, payload = std::move(payload), done = std::move(done)]() mutable {
-            if (!self->m_open) {
-                std::move(done)(make_error_code(asio::error::not_connected));
-                return;
-            }
-            if (payload.size() > 125) {
-                std::move(done)(make_error_code(asio::error::invalid_argument));
-                return;
-            }
-            const bool mask = !self->m_expect_masked;
-            self->m_writer->enqueue(make_entry(WsOpcode::Ping, std::move(payload), mask, false), std::move(done));
-        });
+        if (!m_open) {
+            std::move(done)(make_error_code(asio::error::not_connected));
+            return;
+        }
+        if (payload.size() > 125) {
+            std::move(done)(make_error_code(asio::error::invalid_argument));
+            return;
+        }
+        const bool mask = !m_expect_masked;
+        m_writer->enqueue(make_entry(WsOpcode::Ping, std::move(payload), mask, false), std::move(done));
     }
 
     void close(WriteCompletion done) override { close_with(ws_close_payload(1000), std::move(done)); }
@@ -268,13 +255,10 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
     }
 
     void enable_write_compression(bool enable, WriteCompletion done) override {
-        auto self = this->shared_from_this();
-        hop([self, enable, done = std::move(done)]() mutable {
-            if (self->m_compress_active) {
-                self->m_write_compression = enable;
-            }
-            std::move(done)(error_code{});
-        });
+        if (m_compress_active) {
+            m_write_compression = enable;
+        }
+        std::move(done)(error_code{});
     }
 
     void set_compression_level(int level, WriteCompletion done) override {
@@ -282,15 +266,12 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
             std::move(done)(make_error_code(asio::error::invalid_argument));
             return;
         }
-        auto self = this->shared_from_this();
-        hop([self, level, done = std::move(done)]() mutable {
-            if (self->m_compress_active && !self->m_out->set_level(level)) {
-                std::move(done)(make_error_code(asio::error::invalid_argument));
-                return;
-            }
-            self->m_compression_level = level;
-            std::move(done)(error_code{});
-        });
+        if (m_compress_active && !m_out->set_level(level)) {
+            std::move(done)(make_error_code(asio::error::invalid_argument));
+            return;
+        }
+        m_compression_level = level;
+        std::move(done)(error_code{});
     }
 
     // --- pumps -------------------------------------------------------------
@@ -304,17 +285,11 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
             start_watchdog(std::weak_ptr<WsBackendImpl>(this->shared_from_this()));
     }
 
-    void abort() override {
-        auto self = this->shared_from_this();
-        asio::dispatch(m_executor, [self]() { self->do_abort(); });
-    }
+    // Called on the socket executor (the engine tears the connection down
+    // there, and ~WebSocket runs with its owning handler).
+    void abort() override { do_abort(); }
 
   private:
-    template <typename Fn> void hop(Fn &&fn) {
-        auto self = this->shared_from_this();
-        asio::dispatch(m_executor, [self, fn = std::forward<Fn>(fn)]() mutable { fn(); });
-    }
-
     void read_impl(WsReadCompletion done) {
         ensure_reader();
         for (;;) {
@@ -661,21 +636,19 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
     // tears the connection down. The wait is load-bearing: the peer decides how
     // the connection failed from the code it receives.
     void close_with(std::string payload, WriteCompletion done) {
+        if (!m_open) {
+            teardown();
+            std::move(done)(error_code{});
+            return;
+        }
+        m_open = false;
         auto self = this->shared_from_this();
-        hop([self, payload = std::move(payload), done = std::move(done)]() mutable {
-            if (!self->m_open) {
-                self->teardown();
-                std::move(done)(error_code{});
-                return;
-            }
-            self->m_open = false;
-            const bool mask = !self->m_expect_masked;
-            auto after = WriteCompletion([self, done = std::move(done)](error_code) mutable {
-                self->teardown();
-                std::move(done)(error_code{});
-            });
-            self->m_writer->enqueue(make_entry(WsOpcode::Close, std::move(payload), mask, false), std::move(after));
+        const bool mask = !m_expect_masked;
+        auto after = WriteCompletion([self, done = std::move(done)](error_code) mutable {
+            self->teardown();
+            std::move(done)(error_code{});
         });
+        m_writer->enqueue(make_entry(WsOpcode::Close, std::move(payload), mask, false), std::move(after));
     }
 
     void teardown() {
@@ -757,7 +730,7 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
     std::uint16_t m_close_code{0};
     Notify m_inbox_ready;
     Notify m_inbox_space;
-    std::atomic<bool> m_open{true};
+    bool m_open{true};
     // Reader-local per-message state. Only reader_loop calls read_message(),
     // so these do not need to be re-entrant.
     std::array<std::byte, 8192> m_read_buf;
@@ -773,18 +746,12 @@ class WebSocket {
   public:
     explicit WebSocket(std::shared_ptr<WsBackend> backend) : m_backend(std::move(backend)) {}
 
-    // Model A: the handle is used only from the connection thread that owns the
-    // backend. A call from another thread is a contract violation; log and abort
-    // (see require_owner_thread) instead of racing the reader/writer pumps.
-    void require_owner() const noexcept { require_owner_thread(m_owner_thread, "WebSocket"); }
-
     // Dropping the handle without awaiting close() must still stop the detached
     // write pump, otherwise it would keep the backend alive forever.
     ~WebSocket() { m_backend->abort(); }
 
     // Reads one complete message. Completion: void(error_code, WsMessage).
     template <typename Token> auto async_read(Token &&token) {
-        require_owner();
         auto backend = m_backend;
         return asio::async_compose<Token, void(error_code, WsMessage)>(
             ReadOp{[backend](WsReadCompletion done) mutable { backend->read(std::move(done)); },
@@ -799,7 +766,6 @@ class WebSocket {
         return async_write(std::move(data), false, std::forward<Token>(token));
     }
     template <typename Token> auto async_write(std::string data, bool text, Token &&token) {
-        require_owner();
         auto backend = m_backend;
         return asio::async_compose<Token, void(error_code)>(
             WriteOp{[backend, data = std::move(data), text](WriteCompletion done) mutable {
@@ -816,7 +782,6 @@ class WebSocket {
         return async_write_view(data, false, std::forward<Token>(token));
     }
     template <typename Token> auto async_write_view(std::string_view data, bool text, Token &&token) {
-        require_owner();
         auto backend = m_backend;
         return asio::async_compose<Token, void(error_code)>(
             WriteOp{[backend, data, text](WriteCompletion done) mutable {
@@ -827,7 +792,6 @@ class WebSocket {
     }
 
     template <typename Token> auto async_ping(std::string payload, Token &&token) {
-        require_owner();
         auto backend = m_backend;
         return asio::async_compose<Token, void(error_code)>(
             WriteOp{[backend, payload = std::move(payload)](WriteCompletion done) mutable {
@@ -838,7 +802,6 @@ class WebSocket {
     }
 
     template <typename Token> auto async_close(Token &&token) {
-        require_owner();
         auto backend = m_backend;
         return asio::async_compose<Token, void(error_code)>(
             WriteOp{[backend](WriteCompletion done) mutable { backend->close(std::move(done)); },
@@ -847,7 +810,6 @@ class WebSocket {
     }
 
     template <typename Token> auto async_close(std::uint16_t code, std::string reason, Token &&token) {
-        require_owner();
         auto backend = m_backend;
         return asio::async_compose<Token, void(error_code)>(
             WriteOp{[backend, code, reason = std::move(reason)](WriteCompletion done) mutable {
@@ -858,7 +820,6 @@ class WebSocket {
     }
 
     template <typename Token> auto async_enable_write_compression(bool enable, Token &&token) {
-        require_owner();
         auto backend = m_backend;
         return asio::async_compose<Token, void(error_code)>(WriteOp{[backend, enable](WriteCompletion done) mutable {
                                                                         backend->enable_write_compression(
@@ -869,7 +830,6 @@ class WebSocket {
     }
 
     template <typename Token> auto async_set_compression_level(int level, Token &&token) {
-        require_owner();
         auto backend = m_backend;
         return asio::async_compose<Token, void(error_code)>(WriteOp{[backend, level](WriteCompletion done) mutable {
                                                                         backend->set_compression_level(level,
@@ -885,10 +845,7 @@ class WebSocket {
     // Starts the serializing write pump and the idle watchdog (the engine calls
     // this on the connection executor right after the upgrade). The pump holds
     // its own reference to the backend, so it may outlive this handle.
-    void run_writer() {
-        require_owner();
-        m_backend->run_writer();
-    }
+    void run_writer() { m_backend->run_writer(); }
 
   private:
     struct ReadOp {
@@ -931,7 +888,6 @@ class WebSocket {
     };
 
     std::shared_ptr<WsBackend> m_backend;
-    std::thread::id m_owner_thread{std::this_thread::get_id()};
 };
 
 } // namespace simple_http

@@ -14,10 +14,9 @@
 // HTTP/2 phase and the proxy phase respectively.
 //
 // Thread affinity (model A): the sink and the ResponseWriter built on it belong
-// to the connection thread. Writes are serialized by SerializedWriter (two
-// overlapping async_write calls on one socket are undefined even on the same
-// thread); using either object from another thread aborts via
-// require_owner_thread.
+// to the connection thread, and callers guarantee they are used there. Writes
+// are serialized by SerializedWriter (two overlapping async_write calls on one
+// socket are undefined even on the same thread).
 
 #include <algorithm>
 #include <array>
@@ -87,83 +86,57 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
     void set_keep_alive(bool ka) { m_keep_alive_out = ka; }
     bool keep_alive_out() const { return m_keep_alive_out; }
 
+    // Sink calls arrive on the connection executor (model A), so they run the
+    // enqueue path inline.
     void send(int status, Headers headers, std::string body, WriteCompletion done) override {
-        on_executor([self = this->shared_from_this(), status, headers = std::move(headers), body = std::move(body),
-                     done = std::move(done)]() mutable {
-            self->enqueue_send(status, std::move(headers), std::move(body), std::move(done));
-        });
+        enqueue_send(status, std::move(headers), std::move(body), std::move(done));
     }
 
     void send_bodyless(int status, Headers headers, WriteCompletion done) override {
-        on_executor(
-            [self = this->shared_from_this(), status, headers = std::move(headers), done = std::move(done)]() mutable {
-                self->enqueue_bodyless(status, std::move(headers), std::move(done));
-            });
+        enqueue_bodyless(status, std::move(headers), std::move(done));
     }
 
-    void send_continue(WriteCompletion done) override {
-        on_executor([self = this->shared_from_this(), done = std::move(done)]() mutable {
-            self->enqueue_continue(std::move(done));
-        });
-    }
+    void send_continue(WriteCompletion done) override { enqueue_continue(std::move(done)); }
 
     void send_headers(int status, Headers headers, WriteCompletion done) override {
-        on_executor(
-            [self = this->shared_from_this(), status, headers = std::move(headers), done = std::move(done)]() mutable {
-                self->enqueue_headers(status, std::move(headers), std::move(done));
-            });
+        enqueue_headers(status, std::move(headers), std::move(done));
     }
 
     void send_chunk(std::string data, WriteCompletion done) override {
-        on_executor([self = this->shared_from_this(), data = std::move(data), done = std::move(done)]() mutable {
-            self->enqueue_chunk(std::move(data), std::move(done));
-        });
+        enqueue_chunk(std::move(data), std::move(done));
     }
 
-    void send_last(std::string data, WriteCompletion done) override {
-        on_executor([self = this->shared_from_this(), data = std::move(data), done = std::move(done)]() mutable {
-            self->enqueue_last(std::move(data), std::move(done));
-        });
-    }
+    void send_last(std::string data, WriteCompletion done) override { enqueue_last(std::move(data), std::move(done)); }
 
     void send_trailers(Headers trailers, WriteCompletion done) override {
-        on_executor(
-            [self = this->shared_from_this(), trailers = std::move(trailers), done = std::move(done)]() mutable {
-                self->enqueue_trailers(std::move(trailers), std::move(done));
-            });
+        enqueue_trailers(std::move(trailers), std::move(done));
     }
 
     void connected(ConnectedCompletion done) const override {
-        on_executor([self = this->shared_from_this(), done = std::move(done)]() mutable {
-            // Pending writes mean the response is not on the wire yet; the
-            // connection must not be reused for another request. A response
-            // that was begun but never finished has no terminator either, so
-            // reusing the connection would splice the next response into this
-            // body (or leave the client waiting forever).
-            std::move(done)(error_code{}, self->m_open && self->m_writer->idle() && self->m_response_complete);
-        });
+        // Pending writes mean the response is not on the wire yet; the
+        // connection must not be reused for another request. A response that
+        // was begun but never finished has no terminator either, so reusing the
+        // connection would splice the next response into this body (or leave
+        // the client waiting forever).
+        std::move(done)(error_code{}, m_open && m_writer->idle() && m_response_complete);
     }
 
     void close(WriteCompletion done) override {
-        on_executor([self = this->shared_from_this(), done = std::move(done)]() mutable {
-            self->m_open = false;
-            self->m_writer->close(make_error_code(asio::error::not_connected));
-            self->m_transport->close();
-            std::move(done)(error_code{});
-        });
+        m_open = false;
+        m_writer->close(make_error_code(asio::error::not_connected));
+        m_transport->close();
+        std::move(done)(error_code{});
     }
 
     // Raw bytes on the wire (the ws 101 handshake). They go through the same
     // per-connection writer as any response a route/middleware has already
     // queued, so a second transport write can never overlap it.
     void enqueue_raw(std::string bytes, WriteCompletion done) {
-        on_executor([self = this->shared_from_this(), bytes = std::move(bytes), done = std::move(done)]() mutable {
-            if (!self->m_open) {
-                std::move(done)(make_error_code(asio::error::not_connected));
-                return;
-            }
-            self->m_writer->enqueue(WriteEntry::owned(std::move(bytes)), self->wrap(std::move(done)));
-        });
+        if (!m_open) {
+            std::move(done)(make_error_code(asio::error::not_connected));
+            return;
+        }
+        m_writer->enqueue(WriteEntry::owned(std::move(bytes)), wrap(std::move(done)));
     }
 
     Version version() const override { return m_version; }
@@ -171,8 +144,6 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
     bool head_request() const noexcept override { return m_head_request; }
 
   private:
-    template <typename Fn> void on_executor(Fn &&fn) const { asio::dispatch(m_executor, std::forward<Fn>(fn)); }
-
     static constexpr std::size_t kResponseOverhead = 96;
     static constexpr std::string_view kCrLf = "\r\n";
     static constexpr std::string_view kLastChunk = "0\r\n\r\n";

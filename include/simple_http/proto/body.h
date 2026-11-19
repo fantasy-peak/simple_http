@@ -79,13 +79,11 @@ class Body {
     // channel_cancelled is normalized at this boundary so callers only see the
     // standard code.
     template <typename Token> auto async_read(Token &&token) {
-        require_owner();
         return asio::async_compose<Token, void(error_code, ReadResult)>(ReadOp{*this}, token, m_exec);
     }
 
     // Reads and concatenates the entire remaining body.
     template <typename Token> auto async_read_all(Token &&token) {
-        require_owner();
         return asio::async_compose<Token, void(error_code, std::string)>(ReadAllOp{*this}, token, m_exec);
     }
 
@@ -107,7 +105,6 @@ class Body {
     // Enqueues a body chunk. Returns false if the channel is full or closed, and
     // on failure `data` is left untouched so the caller can retry it.
     [[nodiscard]] bool feed(std::string &&data) {
-        require_owner();
         if (!channel().try_send(error_code{}, std::move(data)))
             return false;
         m_fed = true;
@@ -118,7 +115,6 @@ class Body {
     // the consumer *waits* for it, so it is recorded out of band and read()
     // reports it once the queued frames have drained.
     void finish() {
-        require_owner();
         if (m_terminated)
             return; // first terminator wins (see fail())
         m_terminated = true;
@@ -130,7 +126,6 @@ class Body {
     // Signals a stream failure (reset/disconnect) to the consumer. Same
     // out-of-band guarantee as finish(), and for the same reason.
     void fail(error_code ec) {
-        require_owner();
         if (m_terminated)
             return;
         m_terminated = true;
@@ -457,10 +452,7 @@ class Body {
         }
     };
 
-    void require_owner() const noexcept { require_owner_thread(m_owner_thread, "Body"); }
-
     asio::any_io_executor m_exec;
-    std::thread::id m_owner_thread{std::this_thread::get_id()};
     std::size_t m_capacity{1024};
     std::shared_ptr<Channel> m_channel;
     bool m_eof{false};

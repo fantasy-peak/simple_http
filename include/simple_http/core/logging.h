@@ -30,12 +30,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -342,18 +340,11 @@ inline void log_with_attrs(LogLevel level, std::string_view category, source_loc
 
 namespace simple_http {
 
-// Model A: an object owned by one connection (Request/Body, ResponseWriter,
-// WebSocket) is used only from the thread running that connection's
-// single-threaded io_context. A call from another thread would touch
-// deliberately lock-free engine state; log it and fail loudly rather than
-// corrupting the stream silently. Cross-thread callers must hop explicitly
-// (e.g. asio::post(req->executor(), ...)). Observability APIs such as
+// Model A has no runtime enforcement: connection-owned objects (Request,
+// Body, ResponseWriter, WebSocket) are used only from the thread running the
+// connection's single-threaded io_context, and the caller is responsible for
+// hopping explicitly (e.g. asio::post(req->executor(), ...)) when it needs to
+// move work between threads. Observability APIs such as
 // Server::active_connections() synchronize themselves and are exempt.
-inline void require_owner_thread(std::thread::id owner, const char *what) noexcept {
-    if (owner != std::this_thread::get_id()) {
-        SIMPLE_HTTP_ERROR_LOG("model A violated: {} used from a non-owner thread", what);
-        std::abort();
-    }
-}
 
 } // namespace simple_http

@@ -218,9 +218,11 @@ transport（TCP / TLS / QUIC 字节流）
 - **handler 中所有操作都是 owner-thread only**：`Request`（`cancel()` /
   `cancelled()` 除外）、`Body`、`ResponseWriter`、`WebSocket`，以及路由、中间件、
   `extract`、session/CSRF/JWT 等辅助对象，都只能在处理该请求的 executor 线程调用，
-  **不支持跨线程操作**。`ResponseWriter` / `Body` / `WebSocket` 的
-  `require_owner_thread` 检测到跨线程调用会记录 error 并 `abort`；`Request` 与
-  handler 辅助类型没有运行期检查，违反契约属于未定义行为。
+  **不支持跨线程操作**。调用方保证所有 `req`/`res`/`Body`/`WebSocket` 操作
+  （包括 `is_open()` 与析构）都在 socket 的 executor 上；这些类型没有运行期线程
+  检查，违反契约属于未定义行为。
+- 引擎的 `ResponseSink` 实现也不再做防御性 hop：`ResponseWriter` 到达时已经在
+  连接 executor 上，sink 直接执行对应操作。
 - **`Client` 同样绑定单线程 executor**：构造时传入的 executor 就是它唯一的执行
   线程；`async_send` / `async_open_stream` / `async_open_websocket` 以及后续
   `Stream` 操作都必须在 own executor 上调用，不支持跨线程。连接缓存内部的

@@ -9,7 +9,6 @@
 // StreamOutcome, forwards writes/reads to the session on its executor, and
 // reports the terminal state from a snapshot that outlives the table entry.
 
-#include <atomic>
 #include <boost/asio.hpp>
 #include <cstddef>
 #include <cstdint>
@@ -38,21 +37,19 @@ class MultiplexedClientSession : public ClientSession, public std::enable_shared
     MultiplexedClientSession(const MultiplexedClientSession &) = delete;
     MultiplexedClientSession &operator=(const MultiplexedClientSession &) = delete;
 
-    bool alive() const override { return m_alive.load(std::memory_order_acquire); }
+    // Every flag below is written on the session's single executor: close()
+    // posts there, and the protocol callbacks only run there. Reads come from
+    // the same Client executor (take_cached), so plain bools are enough.
+    bool alive() const override { return m_alive; }
 
     bool reusable() const override {
-        return m_alive.load(std::memory_order_acquire) && !m_goaway_received.load(std::memory_order_acquire) &&
-               !m_close_requested.load(std::memory_order_acquire) &&
-               m_active_streams.load(std::memory_order_acquire) == 0;
+        return m_alive && !m_goaway_received && !m_close_requested && m_active_streams == 0;
     }
 
-    bool keepable() const override {
-        return m_alive.load(std::memory_order_acquire) && !m_goaway_received.load(std::memory_order_acquire) &&
-               !m_close_requested.load(std::memory_order_acquire);
-    }
+    bool keepable() const override { return m_alive && !m_goaway_received && !m_close_requested; }
 
     bool multiplexes() const override { return true; }
-    bool has_active_exchange() const override { return m_active_streams.load(std::memory_order_acquire) > 0; }
+    bool has_active_exchange() const override { return m_active_streams > 0; }
 
     std::string_view authority() const override { return m_authority; }
     asio::any_io_executor executor() const override { return m_executor; }
@@ -60,27 +57,22 @@ class MultiplexedClientSession : public ClientSession, public std::enable_shared
 
   protected:
     // Runs `fn` on the pinned executor (model A); inline when already there.
-    template <typename Fn> void hop(Fn &&fn) const {
-        asio::dispatch(asio::bind_executor(asio::any_io_executor{m_executor}, std::forward<Fn>(fn)));
-    }
+    template <typename Fn> void hop(Fn &&fn) const { asio::dispatch(m_executor, std::forward<Fn>(fn)); }
 
-    void stream_opened() noexcept { m_active_streams.fetch_add(1, std::memory_order_release); }
+    void stream_opened() noexcept { ++m_active_streams; }
     void stream_closed() noexcept {
         // finish_session() zeroes the count before the remaining stream-table
-        // entries are erased, so a plain fetch_sub could wrap to SIZE_MAX and
-        // report a wildly wrong diagnostic number.
-        auto current = m_active_streams.load(std::memory_order_relaxed);
-        while (current != 0 && !m_active_streams.compare_exchange_weak(current, current - 1, std::memory_order_release,
-                                                                       std::memory_order_relaxed)) {
-        }
+        // entries are erased, so guard against wrapping to SIZE_MAX.
+        if (m_active_streams > 0)
+            --m_active_streams;
     }
 
     Executor m_executor;
     std::string m_authority;
-    std::atomic<std::size_t> m_active_streams{0};
-    std::atomic<bool> m_alive{false};
-    std::atomic<bool> m_close_requested{false};
-    std::atomic<bool> m_goaway_received{false};
+    std::size_t m_active_streams{0};
+    bool m_alive{false};
+    bool m_close_requested{false};
+    bool m_goaway_received{false};
 };
 
 template <typename Session, typename Id> class MultiplexedClientStream final : public ClientStream {
@@ -132,11 +124,10 @@ template <typename Session, typename Id> class MultiplexedClientStream final : p
     void cancel(WriteCompletion done) override {
         auto session = m_session;
         auto id = m_id;
-        asio::dispatch(asio::bind_executor(asio::any_io_executor{session->get_executor()},
-                                           [session, id, done = std::move(done)]() mutable {
-                                               session->stream_cancel(id);
-                                               std::move(done)(error_code{});
-                                           }));
+        asio::dispatch(session->get_executor(), [session, id, done = std::move(done)]() mutable {
+            session->stream_cancel(id);
+            std::move(done)(error_code{});
+        });
     }
 
     friend Session;

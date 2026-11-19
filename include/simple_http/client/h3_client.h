@@ -498,7 +498,7 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
     Version version() const override { return Version::Http3; }
 
     void close() override {
-        asio::post(m_executor, [self = this->shared_from_this()] { self->shutdown_now(); });
+        asio::dispatch(m_executor, [self = this->shared_from_this()] { self->shutdown_now(); });
     }
 
     // --- stream operations (called by Http3ClientStream, already hopped) ---
@@ -1286,10 +1286,13 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         auto self = this->shared_from_this();
         run();
 
-        auto finished = std::make_shared<std::atomic<bool>>(false);
+        // Both producers (the ready channel and the connect timer) run on
+        // m_executor, so a plain one-shot flag is enough.
+        auto finished = std::make_shared<bool>(false);
         auto complete = [finished, done = std::move(done)](error_code ec) mutable {
-            if (finished->exchange(true))
+            if (*finished)
                 return;
+            *finished = true;
             std::move(done)(ec);
         };
         std::shared_ptr<asio::steady_timer> timer;
