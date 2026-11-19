@@ -1103,8 +1103,8 @@ TEST_CASE("request: path parameters survive a target rewrite", "[request][review
 static_assert(!std::is_move_constructible_v<TlsContext>, "TlsContext registers &m_alpn_state with OpenSSL");
 static_assert(!std::is_move_assignable_v<TlsContext>, "TlsContext registers &m_alpn_state with OpenSSL");
 static_assert(!std::is_copy_constructible_v<TlsContext>, "TlsContext registers &m_alpn_state with OpenSSL");
-static_assert(!std::is_reference_v<decltype(std::declval<IoCtxPool &>().at(0))>,
-              "at() must not return a reference into a vector add_main_context() can reallocate");
+static_assert(std::is_same_v<decltype(std::declval<IoCtxPool &>().at(0)), asio::io_context &>,
+              "at() returns the fixed pool's stable context reference");
 
 TEST_CASE("response: bodyless framing is limited to 204/304/HEAD", "[response][review]") {
     asio::io_context ctx;

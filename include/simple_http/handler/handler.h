@@ -7,6 +7,12 @@
 // synchronous function, or -- when the library is compiled as C++20 -- a
 // coroutine. make_handler normalizes all of them to CallbackHandler.
 //
+// Threading (model A): handlers and middleware run on the connection's
+// single-threaded executor and must start and complete their operations there.
+// Everything they touch (Request, ResponseWriter, Body, session/CSRF/JWT
+// helpers, route state) is owner-thread only -- cross-thread use is not
+// supported. Hop explicitly with asio::post(req->executor(), ...).
+//
 // Middleware keeps the Go net/http / tower shape, expressed with completion
 // handlers instead of coroutines:
 //

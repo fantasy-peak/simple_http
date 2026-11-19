@@ -1,13 +1,11 @@
 #pragma once
 
-// A pool of single-threaded io_contexts, each pinned to its own thread. Work is
-// distributed round-robin. Keeping one io_context per thread avoids handler
-// synchronization inside a context and gives predictable per-connection
-// affinity. A "main" context, created last, can be added for acceptors when the
-// accept topology needs a thread of its own (Server does this unless the
-// listener is fanned out with SO_REUSEPORT).
+// A pool of single-threaded io_contexts, each pinned to its own thread.
+// Keeping one io_context per thread avoids handler synchronization inside a
+// context and gives predictable per-connection affinity. Server pairs every
+// context with one acceptor: a connection accepted on a worker is served on
+// that same worker for its whole life.
 
-#include <atomic>
 #include <boost/asio.hpp>
 #include <cassert>
 #include <chrono>
@@ -25,7 +23,7 @@ namespace asio = boost::asio;
 
 class IoCtxPool final {
   public:
-    explicit IoCtxPool(std::size_t pool_size) : m_pool_size(pool_size) {
+    explicit IoCtxPool(std::size_t pool_size) {
         if (pool_size == 0) {
             throw std::runtime_error("IoCtxPool size is 0");
         }
@@ -67,15 +65,13 @@ class IoCtxPool final {
 
     // Stop every context and join its thread, draining first.
     //
-    // The draining is the point. A connection coroutine parked on a read is
-    // unwound *by* its own completion handler: the read completes with
-    // operation_aborted, the coroutine runs to its end, and the frame is
+    // The draining is the point. A pending composed operation is unwound *by*
+    // its own completion handler: the inner read/write completes with
+    // operation_aborted, the handler runs its cleanup, and the state it owns is
     // destroyed from a place that knows its invariants. Calling stop() on the
-    // context first abandons that handler, and the frame is then destroyed from
-    // the io_context's destructor instead — several layers from anything that
-    // knows what the frame holds. For an engine that races two child coroutines
-    // with `operator||`, that destruction walks state the operator's own
-    // teardown has already released.
+    // context first abandons that handler, and the state is then released from
+    // the io_context's destructor instead — several layers away from anything
+    // that knows what it holds.
     //
     // stop() remains the backstop: a context still busy after the grace period
     // is stopped the hard way, which is what makes a stuck handler a delayed
@@ -99,39 +95,14 @@ class IoCtxPool final {
         }
     }
 
-    // Round-robin selection of the next worker io_context.
-    asio::io_context &next() { return *next_ptr(); }
-
-    // The same, as the shared_ptr. Returned by value: add_main_context() grows
-    // m_io_contexts, and a reference (or pointer) into the vector would be
-    // invalidated by the reallocation. A value also keeps the "handing out a
-    // mutable reference let callers rebind a pooled context" hole closed.
-    std::shared_ptr<asio::io_context> next_ptr() {
-        std::size_t index = m_cursor.fetch_add(1, std::memory_order_relaxed);
-        return m_io_contexts[index % m_pool_size];
+    // The pool is fixed at construction, so a reference stays valid for the
+    // pool's lifetime.
+    asio::io_context &at(std::size_t index) {
+        assert(index < m_io_contexts.size());
+        return *m_io_contexts[index];
     }
 
-    // The context reserved for acceptors (added via add_main_context()).
-    std::shared_ptr<asio::io_context> main_context() { return m_io_contexts.back(); }
-
-    // The worker contexts only: a main context, if one was added, is not
-    // counted here and is never reachable through at().
-    std::size_t size() const { return m_pool_size; }
-
-    // Bounds-checked, as the name implies. An out-of-range index used to read
-    // past the end — or, for index == pool_size, hand back the main context,
-    // which is precisely the one this accessor exists to keep away from workers.
-    std::shared_ptr<asio::io_context> at(std::size_t index) {
-        assert(index < m_pool_size);
-        return m_io_contexts[index];
-    }
-
-    // The main context is appended last, so it may only be added before the
-    // pool starts handing out contexts (and before any thread owns one).
-    void add_main_context() {
-        assert(!m_started);
-        create();
-    }
+    std::size_t size() const { return m_io_contexts.size(); }
 
   private:
     void create() {
@@ -147,9 +118,7 @@ class IoCtxPool final {
     std::mutex m_idle_mutex;
     std::condition_variable m_idle_cv;
     std::size_t m_running{0};
-    std::atomic_uint64_t m_cursor{0};
     std::vector<std::thread> m_threads;
-    std::size_t m_pool_size;
     bool m_started{false};
 };
 

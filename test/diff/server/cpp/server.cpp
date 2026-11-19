@@ -654,7 +654,6 @@ int main(int argc, char **argv) {
     h3_cfg.listen = InetAddress{"0.0.0.0", 7823, false};
     h3_cfg.quic = InetAddress{"0.0.0.0", 7823, false};
     h3_cfg.worker_threads = 2;
-    h3_cfg.reuse_port = true;
     h3_cfg.limits.max_body_bytes = 1024 * 1024;
     h3_cfg.tls = TlsConfig{
         .cert_chain_file = "./test/tls_certificates/server_cert.pem",

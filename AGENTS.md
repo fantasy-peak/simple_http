@@ -207,12 +207,28 @@ transport（TCP / TLS / QUIC 字节流）
 
 ### 3.2 并发模型 A（必须遵守）
 
-- 每条连接在 accept 时绑定到 `IoCtxPool` 中一个**单线程** `io_context`。
+- `IoCtxPool` 有 `worker_threads` 个**单线程** `io_context`，每个 worker 拥有一个
+  acceptor；同一 listener 的 acceptor 用 `SO_REUSEPORT` 共享端口，由内核分派新连接。
+- acceptor 在哪个 worker 的 context 上，它接受的 socket 就绑定到哪个 context：
+  连接不会在 worker 之间迁移。
+- connection closer 注册表按 worker 分片，只在所属 worker 线程读写；`stop()`
+  通过向每个 worker `post` 一次来关闭其名下的连接。
 - 该连接上的引擎、writer、handler、`Body`、`WebSocket` 全部只在这一个线程执行。
 - 因此 `engine/` 下没有 mutex/atomic 保护连接状态。
-- `ResponseWriter` / `Body` / `WebSocket` 的 `require_owner_thread` 检测到跨线程
-  调用会记录 error 并 `abort`。需要换线程时调用方显式
-  `asio::post(req->executor(), ...)`；不要依赖库内 hop 把调用方协程恢复回来。
+- **handler 中所有操作都是 owner-thread only**：`Request`（`cancel()` /
+  `cancelled()` 除外）、`Body`、`ResponseWriter`、`WebSocket`，以及路由、中间件、
+  `extract`、session/CSRF/JWT 等辅助对象，都只能在处理该请求的 executor 线程调用，
+  **不支持跨线程操作**。`ResponseWriter` / `Body` / `WebSocket` 的
+  `require_owner_thread` 检测到跨线程调用会记录 error 并 `abort`；`Request` 与
+  handler 辅助类型没有运行期检查，违反契约属于未定义行为。
+- **`Client` 同样绑定单线程 executor**：构造时传入的 executor 就是它唯一的执行
+  线程；`async_send` / `async_open_stream` / `async_open_websocket` 以及后续
+  `Stream` 操作都必须在 own executor 上调用，不支持跨线程。连接缓存内部的
+  `dispatch`/互斥只是实现细节，不构成跨线程 API 承诺。
+- 需要换线程时调用方显式 `asio::post(req->executor(), ...)`（客户端用
+  `asio::post(client.executor(), ...)`）；不要依赖库内 hop 把调用方协程恢复回来。
+  例如 `SessionStore` 可以在自己的线程完成回调，但 `session` 中间件会先
+  `dispatch` 回连接 executor，再触碰 request/response。
 - 刻意的跨连接共享例外（都在 handler 层，不在 `engine/`）：
   - `RateLimiter` 按 key 分桶加锁；
   - `Router` 惰性构建链的 atomic + mutex；
@@ -277,7 +293,6 @@ ServerConfig cfg;
 cfg.listen = InetAddress{"0.0.0.0", 7788};
 cfg.worker_threads = 4;
 cfg.max_connections = 0;          // 0 = 不限；到上限留在内核 backlog
-cfg.reuse_port = true;
 cfg.tcp_nodelay = true;
 cfg.plaintext_protocols = PlaintextProtocols::Both;
 cfg.shutdown_grace = std::chrono::milliseconds{5000};
@@ -290,6 +305,8 @@ auto started = server.start();    // result<StartReport, StartupError>
 server.stop();
 ```
 
+- accept 拓扑固定：每个 worker 一个 acceptor，socket 在 accept 线程上直接服务；
+  没有单 acceptor 轮询模式，也没有独立的 acceptor 线程/context。
 - `start(StartPolicy)`：`AllOrNothing`（默认）或 `BestEffort`。
 - 多监听：`cfg.listeners`，或 `server.listen(TcpListenerConfig{...})`。
 - 每个 listener 可带自己的 `EngineLimits`、`max_connections`、`tls`、
@@ -553,7 +570,9 @@ auto ws = co_await client.async_open_websocket("wss://host/chat", WebSocketSpec{
 - `Stream`：`async_write` / `async_finish` / `async_finish_trailers` /
   `async_read_head` / `async_read` / `async_read_all` / `async_ensure_continue` /
   `head()` / `trailers()` / `finished()` / `abort()`。
-- 客户端绑定单线程 executor（模型 A）；`io_context` 必须活过会话。
+- 客户端绑定单线程 executor（模型 A）：所有 initiating function 与后续
+  `Stream` 操作都必须在构造时的 executor 上调用，不支持跨线程；`io_context`
+  必须活过会话。
 - 单连接模型：对第一个 origin 保持一条连接（h1 FIFO / h2 多路复用），其他
   origin 使用一次性连接。`Client::close()` 关闭缓存会话。
 - 自动解压对齐 Go：`auto_decompress=true` 且只广告 gzip；调用方显式设置
@@ -1116,9 +1135,10 @@ test/run.sh server-diff
     的 `ossl_ht_get` 里产生 TSan race。需要共享 context 时用
     `TlsClientConfig::shared_context`，不要做全局单例。
     `transport/openssl_init.h`；`tls_context.h:118-124`。
-38. **`IoCtxPool::at()` 返回 shared_ptr**：`add_main_context()` 会使 vector
-    reallocate，引用会失效；index==pool_size 曾会误返回 main context。
-    `core/io_pool.h:102-127`；`test_review_regressions.cpp:1103-1107`。
+38. **`IoCtxPool::at()` 返回稳定引用**：pool 大小在构造时固定、之后不再
+    增删 context，`at()` 返回 `asio::io_context &`；没有 main context，
+    `at()` 只接受 `[0, size())`。`core/io_pool.h`；
+    `test_review_regressions.cpp`。
 39. **`TlsContext` 不可移动**：OpenSSL ALPN callback 持有 `&m_alpn_state`；
     移动会让指针悬空。`transport/tls_context.h:98-106`。
 40. **异步 `ResolveFn` completion 必须 marshal 回调用方 executor**：hook 可能
@@ -1195,6 +1215,8 @@ test/run.sh server-diff
 - HTTP/3 客户端不支持代理、请求 trailers、1xx；服务端不支持 WS、request
   trailers、100-continue、push、0-RTT。
 - 不支持 UNIX-domain 服务端监听。
+- 没有 `SO_REUSEPORT` 的平台只启动一个 acceptor（固定在第 0 个 worker），
+  所有连接都由该 worker 的线程服务。
 - `NO_PROXY` 不支持 CIDR / 通配。
 - `CookieJar` 不内置 PSL 数据。
 - CORS 不覆盖 WebSocket 升级；WebSocket 用 `ws_origin`。
@@ -1216,13 +1238,8 @@ test/run.sh server-diff
 
 - `include/simple_http.h` 说 “HTTP/3/QUIC is not part of this port”，但 h3 引擎
   与 QUIC 监听实际存在（宏门控）。
-- `net/connection.h` 说 “HTTP/2 尚未 port，所有 plaintext 都走 HTTP/1.x”；
-  实际 `Server` 支持 h2 prior knowledge 与 h2c Upgrade。
-- `net/server.h` 顶部说 h2/h3/UNIX socket/代理/静态/OpenAPI 都是 deferred；
-  除 UNIX listener 外均已实现。
 - `engine/h2/h2_engine.h` 某处注释说 dispatch 等 END_STREAM；实际在
   END_HEADERS 后即 dispatch。
-- `client/http.h` 顶部说 h2/代理/自动解压/WebSocket 是下一阶段；实际已实现。
 - `client/sse.h` 注释写 `client.async_open_sse(...)`；实际是
   `SseStream::async_open(client, ...)`。
 - `client/multipart_stream.h` 注释写 `client.async_open_multipart(...)`；

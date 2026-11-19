@@ -50,9 +50,14 @@ The library is header-only: `include/` contains no `.cpp` files.
 - **Bounded and backpressured.** Header/body limits, per-stream HTTP/2 flow
   control, a bounded WebSocket read-ahead queue, and output high/low
   watermarks are part of the design rather than an afterthought.
-- **Single-threaded connection affinity.** Each accepted connection is pinned
-  to one single-threaded `io_context`. Engines, writers and handlers for that
-  connection run on one thread, so the protocol paths need no mutexes.
+- **Single-threaded connection affinity.** Each worker owns one single-threaded
+  `io_context` and one acceptor (`SO_REUSEPORT` shares the listen port), and a
+  connection is accepted and served on that same thread. Engines, writers and
+  handlers for that connection run on one thread, so the protocol paths need no
+  mutexes. The handler-side objects (`Request`, `ResponseWriter`, `Body`,
+  `WebSocket` and middleware/extraction helpers) do not support cross-thread
+  calls and must be used on their own executor; a `Client` is likewise bound to
+  the single-threaded executor passed to its constructor.
 - **No exceptions for control flow.** Fallible operations return
   `error_code` or `boost::system::result`. Client failures are never thrown.
 - **Pluggable edges.** DNS resolution, logging, TLS context construction,
@@ -262,9 +267,8 @@ Useful `ServerConfig` fields:
 
 | Field | Default | Meaning |
 |---|---|---|
-| `worker_threads` | 4 | Single-threaded `io_context` workers |
+| `worker_threads` | 4 | Single-threaded `io_context` workers; each owns one acceptor and serves the sockets it accepts |
 | `max_connections` | 0 | 0 = unlimited; excess connections stay in the kernel backlog |
-| `reuse_port` | true | One acceptor per worker with `SO_REUSEPORT` |
 | `shutdown_grace` | 5000 ms | Time allowed for in-flight handlers before cancellation |
 | `tcp_nodelay` | true | Copied into the implicit listener |
 | `plaintext_protocols` | `Both` | `Http1`, `Http2` (prior knowledge), or `Both` |
@@ -322,6 +326,10 @@ The client keeps one reusable connection per origin (HTTP/1.1 queues on it,
 HTTP/2 multiplexes over it). Requests to a different origin dial a connection
 that closes after the exchange. `Client::close()` should be called before
 destroying an `io_context` that still has a keep-alive session pending.
+
+A `Client` is single-threaded: `send`, `async_open_stream`,
+`async_open_websocket` and every subsequent `Stream` operation must run on the
+executor passed to the constructor; cross-thread calls are not supported.
 
 ## Routing and middleware
 

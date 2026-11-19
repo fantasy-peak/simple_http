@@ -183,21 +183,16 @@ TEST_CASE("core/method: idempotence decides whether a request may be replayed", 
     CHECK_FALSE(is_idempotent(Method::Unknown));
 }
 
-TEST_CASE("core/io_pool: round-robin, main context and clean shutdown", "[core]") {
+TEST_CASE("core/io_pool: one context per worker and clean shutdown", "[core]") {
     CHECK_THROWS_AS(IoCtxPool{0}, std::runtime_error);
 
     IoCtxPool pool{2};
-    pool.add_main_context(); // the acceptor context: created last, returned by
-                             // main_context()
-    auto *first = pool.next_ptr().get();
-    auto *second = pool.next_ptr().get();
-    auto *third = pool.next_ptr().get();
-    CHECK(first != second);
-    CHECK(first == third); // the cursor wraps over the worker contexts
-    // The acceptor context is created last and must never be handed out as a
-    // worker.
-    auto *main_ctx = pool.main_context().get();
-    CHECK(main_ctx != first);
-    for (int i = 0; i < 6; ++i)
-        CHECK(pool.next_ptr().get() != main_ctx);
+    CHECK(pool.size() == 2);
+    auto &first = pool.at(0);
+    auto &second = pool.at(1);
+    CHECK(&first != &second);
+    // A worker keeps its identity: Server pins one acceptor and its accepted
+    // connections to each index for the listener's lifetime.
+    CHECK(&pool.at(0) == &first);
+    CHECK(&pool.at(1) == &second);
 }

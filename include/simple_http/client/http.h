@@ -2,14 +2,18 @@
 
 // Public outbound client API (C++17 token-only port).
 //
-//   client.get(url).header("x", "y").send(token);       // void(error_code, Response)
+//   client.get(url).header("x", "y").send(token);   // void(error_code, Response)
 //   client.post(url).body(payload).send(token);
-//   client.open_stream(url, spec, token);               // void(error_code, Stream)
+//   client.async_open_stream(url, spec, max_bytes, token); // void(error_code, Stream)
 //
-// This first port covers HTTP/1.1 (plaintext and TLS), redirects, cookies and
-// the buffered convenience path. HTTP/2 multiplexing, outbound proxies,
-// automatic decompression and the WebSocket client are the next phases; the
-// types keep their shape so callers can migrate incrementally.
+// Covers HTTP/1.1, HTTP/2 and (when built) HTTP/3, redirects, cookies,
+// outbound proxies, automatic decompression, streaming and WebSocket.
+//
+// Threading (model A): a Client is single-threaded. Every initiating function
+// and every subsequent Stream operation must run on the executor passed to the
+// constructor; cross-thread calls are not supported. The dispatch/mutex around
+// the kept-connection cache is an implementation detail, not a cross-thread API
+// promise.
 
 #include <algorithm>
 #include <boost/asio.hpp>

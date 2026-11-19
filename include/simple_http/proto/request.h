@@ -7,6 +7,12 @@
 // `req.body().async_read(token)`. Client-side: the caller sets method/target/
 // headers/body (or streams the body via body().feed()), and the engine reads it
 // to send. Go's http.Request is the same single type for both roles; so is this.
+//
+// Threading (model A): every member except cancel()/cancelled() must be used on
+// the executor that owns the request -- the connection executor on the server,
+// the Client's executor on the client. Request has no runtime owner-thread
+// check; touching it from another thread is undefined behavior. Hop explicitly
+// with asio::post(req->executor(), ...) instead.
 
 #include <algorithm>
 #include <any>

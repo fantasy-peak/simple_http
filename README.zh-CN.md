@@ -47,9 +47,12 @@ token。C++17 下可以使用回调、`asio::deferred`、`asio::detached` 和
   C++20/23 程序可以按需使用 `asio::use_awaitable` 或协程 handler，而不需要改变库。
 - **有界且具备反压。** 请求头/请求体上限、HTTP/2 每流流控、有界 WebSocket
   read-ahead 队列，以及输出高低水位，都是设计的一部分，而不是事后补丁。
-- **单线程连接亲和。** 每条被接受的连接固定到一个单线程 `io_context`。
-  该连接的引擎、writer 和 handler 都在同一个线程上运行，因此协议路径内部不需要
-  mutex。
+- **单线程连接亲和。** 每个 worker 拥有一个单线程 `io_context` 和一个
+  acceptor（同组 acceptor 通过 `SO_REUSEPORT` 共享监听端口），连接在哪个线程
+  被接受就在该线程服务。该连接的引擎、writer 和 handler 都在同一个线程上运行，
+  因此协议路径内部不需要 mutex。handler 侧对象（`Request`、`ResponseWriter`、
+  `Body`、`WebSocket` 及中间件/提取辅助）不支持跨线程调用，只能在自己的
+  executor 上使用；`Client` 同样绑定构造时的单线程 executor。
 - **不用异常做控制流。** 可失败操作返回 `error_code` 或
   `boost::system::result`。客户端失败从不抛出异常。
 - **边缘可插拔。** DNS 解析、日志、TLS context 构造、会话存储与路由查找都可以注入。
@@ -252,9 +255,8 @@ cfg.listeners.push_back(secure);
 
 | 字段 | 默认值 | 含义 |
 |---|---|---|
-| `worker_threads` | 4 | 单线程 `io_context` 工作线程数 |
+| `worker_threads` | 4 | 单线程 `io_context` 工作线程数；每个 worker 拥有一个 acceptor 并服务它接受的 socket |
 | `max_connections` | 0 | 0 = 不限制；超出的连接留在内核 backlog |
-| `reuse_port` | true | 每个 worker 一个 acceptor，使用 `SO_REUSEPORT` |
 | `shutdown_grace` | 5000 ms | 关闭前允许在飞 handler 完成的时间 |
 | `tcp_nodelay` | true | 复制到隐式 listener |
 | `plaintext_protocols` | `Both` | `Http1`、`Http2`（prior knowledge）或 `Both` |
@@ -311,6 +313,9 @@ boost::asio::awaitable<void> fetch() {
 客户端对每个 origin 保留一条可复用连接（HTTP/1.1 在这条连接上排队，HTTP/2 在其上
 多路复用）。发往其他 origin 的请求会建立一条在交换结束后关闭的一次性连接。如果
 `io_context` 上还有 keep-alive 会话，应在销毁它之前调用 `Client::close()`。
+
+`Client` 是单线程对象：`send`、`async_open_stream`、`async_open_websocket` 以及
+后续 `Stream` 操作都必须在构造时传入的 executor 上调用，不支持从其他线程直接调用。
 
 ## 路由与中间件
 

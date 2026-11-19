@@ -157,7 +157,6 @@ int main() {
     dual_cfg.listen = InetAddress{"0.0.0.0", 7792, false};
     dual_cfg.quic = InetAddress{"0.0.0.0", 7792, false};
     dual_cfg.worker_threads = 4;
-    dual_cfg.reuse_port = true;
     dual_cfg.tls = TlsConfig{
         .cert_chain_file = "./test/tls_certificates/server_cert.pem",
         .private_key_file = "./test/tls_certificates/server_key.pem",

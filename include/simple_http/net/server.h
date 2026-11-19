@@ -1,15 +1,12 @@
 #pragma once
 
-// Server: listeners, connection lifecycle and the router facade (C++17 port).
+// Server: listeners, connection lifecycle and the router facade.
 //
-// This first version serves HTTP/1.x over TCP, plaintext or TLS, with local
-// WebSocket upgrades. HTTP/2 (and therefore h2c/ALPN h2), HTTP/3, UNIX sockets
-// and the reverse-proxy/static/OpenAPI stages are deferred; the configuration
-// types keep their shape so fixtures and applications port incrementally.
-//
-// Threading follows model A: every accepted connection is handed to one worker
-// io_context from an IoCtxPool (one thread per context), and all of its engine,
-// writer and handler work happens there.
+// Threading follows model A: the IoCtxPool has one single-threaded io_context
+// per worker, and every worker owns one acceptor (the group shares the port
+// through SO_REUSEPORT). A socket accepted by a worker's acceptor is served on
+// that same worker, so all of its engine, writer and handler work happens
+// there for the connection's whole life.
 
 #include <algorithm>
 #include <array>
@@ -89,8 +86,6 @@ struct TcpListenerConfig {
     std::optional<TlsConfig> tls; // nullopt = plaintext
     PlaintextHttp plaintext{PlaintextHttp::Http1AndHttp2};
     TlsHttp alpn{TlsHttp::Http1AndHttp2};
-    bool reuse_port{true};
-    std::size_t acceptors{0};
     std::size_t max_connections{0};
     std::optional<EngineLimits> limits;
     // TCP_NODELAY for connections accepted by this listener; ServerConfig's
@@ -132,8 +127,6 @@ struct BoundEndpoint {
     std::string host;
     std::uint16_t port{0};
     bool tls{false};
-    std::size_t acceptors{1};
-    bool reuse_port{false};
 };
 
 struct ListenerFailure {
@@ -154,10 +147,10 @@ struct ServerConfig {
     std::vector<ListenerConfig> listeners;
     std::optional<Listen> listen{InetAddress{}};
     std::optional<TlsConfig> tls;
+    // Each worker gets one single-threaded io_context and one acceptor; a
+    // connection accepted there is served there.
     unsigned worker_threads{4};
     std::size_t max_connections{0};
-    bool reuse_port{true};
-    std::size_t acceptors{0};
     std::chrono::milliseconds shutdown_grace{5000};
     bool auto_alt_svc{true};
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
@@ -322,8 +315,6 @@ class Server {
             TcpListenerConfig cfg;
             cfg.address = *m_cfg.listen;
             cfg.tls = m_cfg.tls;
-            cfg.reuse_port = m_cfg.reuse_port;
-            cfg.acceptors = m_cfg.acceptors;
             cfg.max_connections = m_cfg.max_connections;
             cfg.limits = m_cfg.limits;
             cfg.tcp_nodelay = m_cfg.tcp_nodelay;
@@ -347,7 +338,7 @@ class Server {
         core->router = m_router;
         core->limits = m_cfg.limits;
         core->pool = std::make_shared<IoCtxPool>(m_cfg.worker_threads);
-        core->pool->add_main_context();
+        core->workers.resize(core->pool->size());
         store_core(core);
         build_core();
         m_stopping.store(false, std::memory_order_release);
@@ -401,26 +392,32 @@ class Server {
                                                           make_error_code(server_errc::bind_failed)});
                 continue;
             }
-            const auto endpoint = asio::ip::tcp::endpoint{address, inet->port};
-            // reuse_port: one acceptor per worker, each on its own worker
-            // context with SO_REUSEPORT (the kernel hashes connections). Without
-            // it, one acceptor on the main context round-robins the pool.
-            const std::size_t acceptor_count =
-                cfg.reuse_port ? (cfg.acceptors == 0 ? core->pool->size() : std::min(cfg.acceptors, core->pool->size()))
-                               : 1;
+            // One acceptor per worker, each created on (and pinned to) its
+            // worker context. SO_REUSEPORT lets the kernel hash new
+            // connections across the group; without it a single acceptor on
+            // the first worker is the only portable option.
+#ifdef SO_REUSEPORT
+            constexpr bool kernel_fanout = true;
+#else
+            constexpr bool kernel_fanout = false;
+#endif
+            const std::size_t acceptor_count = kernel_fanout ? core->pool->size() : 1;
             std::uint16_t bound_port = inet->port;
             bool bound_ok = true;
             for (std::size_t ai = 0; ai < acceptor_count; ++ai) {
-                auto ctx_keep = cfg.reuse_port ? core->pool->at(ai) : core->pool->main_context();
-                asio::io_context &ctx = *ctx_keep;
-                asio::io_context *pinned = cfg.reuse_port ? &ctx : nullptr;
+                auto &ctx = core->pool->at(ai);
                 auto acceptor = std::make_shared<asio::ip::tcp::acceptor>(ctx.get_executor());
+                // With port 0 the kernel picks the port on the first bind; the
+                // rest of the group must join *that* port, otherwise every
+                // acceptor would land on a different ephemeral port and the
+                // reported port would only serve one of them.
+                const asio::ip::tcp::endpoint endpoint{address, bound_port};
                 acceptor->open(endpoint.protocol(), ec);
                 if (!ec) {
                     acceptor->set_option(asio::socket_base::reuse_address{true}, ec);
                 }
 #ifdef SO_REUSEPORT
-                if (!ec && cfg.reuse_port) {
+                if (!ec && kernel_fanout) {
                     int one = 1;
                     (void)::setsockopt(acceptor->native_handle(), SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
                 }
@@ -443,17 +440,15 @@ class Server {
                 if (ai == 0) {
                     bound_port = acceptor->local_endpoint(ec).port();
                     if (ec) {
-                        bound_port = inet->port;
+                        SIMPLE_HTTP_ERROR_LOG("server: local_endpoint failed after bind: {}", ec.message());
+                        bound_ok = false;
+                        break;
                     }
                 }
-                listener->acceptors.push_back(AcceptorSlot{std::move(acceptor), pinned});
+                listener->acceptors.push_back(AcceptorSlot{std::move(acceptor), ai});
             }
             if (!bound_ok) {
-                for (auto &slot : listener->acceptors) {
-                    error_code ignored;
-                    slot.acceptor->close(ignored);
-                }
-                listener->acceptors.clear();
+                close_acceptors(*listener);
                 report.failures.push_back(ListenerFailure{cfg.name.empty() ? inet->host : cfg.name, ec});
                 continue;
             }
@@ -479,16 +474,13 @@ class Server {
             listener->max_connections = cfg.max_connections != 0 ? cfg.max_connections : m_cfg.max_connections;
             m_port.store(bound_port, std::memory_order_release);
             started.push_back(listener);
-            report.bound.push_back(BoundEndpoint{listener->name, cfg.tls ? "https" : "http", inet->host, bound_port,
-                                                 cfg.tls.has_value(), listener->acceptors.size(), cfg.reuse_port});
+            report.bound.push_back(
+                BoundEndpoint{listener->name, cfg.tls ? "https" : "http", inet->host, bound_port, cfg.tls.has_value()});
         }
 
         if (report.bound.empty() || (policy == StartPolicy::AllOrNothing && !report.failures.empty())) {
             for (auto &listener : started) {
-                for (auto &slot : listener->acceptors) {
-                    error_code ignored;
-                    slot.acceptor->close(ignored);
-                }
+                close_acceptors(*listener);
             }
             return StartupError{std::move(report.failures)};
         }
@@ -501,10 +493,7 @@ class Server {
                 report.failures.push_back(ListenerFailure{"quic", make_error_code(*err)});
                 if (policy == StartPolicy::AllOrNothing) {
                     for (auto &listener : m_listeners) {
-                        for (auto &slot : listener->acceptors) {
-                            error_code ignored;
-                            slot.acceptor->close(ignored);
-                        }
+                        close_acceptors(*listener);
                     }
                     m_listeners.clear();
                     return StartupError{std::move(report.failures)};
@@ -561,7 +550,7 @@ class Server {
                     std::this_thread::sleep_for(std::chrono::milliseconds{5});
                 }
             }
-            core->close_all();
+            core->close_all(core);
         }
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
         for (auto &rt : m_quic_runtimes) {
@@ -608,17 +597,25 @@ class Server {
         std::shared_ptr<std::atomic<std::size_t>> connections{std::make_shared<std::atomic<std::size_t>>(0)};
         std::atomic<std::size_t> requests{0};
 
-        // Connection lifecycle registry. `closers` lets stop() cancel idle
-        // keep-alive connections instead of waiting out IoCtxPool's generic
-        // drain grace; `accept_waiters` re-arms an acceptor that stopped at
-        // max_connections once a slot frees. Both are guarded because accept
-        // callbacks and engine completion callbacks run on different workers.
+        // Connections never leave the worker that accepted them, so the
+        // closer registry is sharded by worker: registration and release both
+        // run on that worker's thread and touch its vector without a lock.
+        // stop() reaches a shard by posting a task to the same context.
+        struct WorkerState {
+            std::vector<std::weak_ptr<std::function<void()>>> closers;
+        };
+        std::vector<WorkerState> workers;
+
+        // `accept_waiters` re-arms an acceptor that stopped at
+        // max_connections once a slot frees. A connection may be released on
+        // one worker while the paused acceptor lives on another, so this one
+        // stays shared and is guarded.
         std::mutex lifecycle_mutex;
-        std::vector<std::weak_ptr<std::function<void()>>> closers;
         std::vector<std::function<void()>> accept_waiters;
 
-        void register_closer(const std::shared_ptr<std::function<void()>> &closer) {
-            std::lock_guard<std::mutex> lock(lifecycle_mutex);
+        // Worker-thread only.
+        void register_closer(std::size_t worker, const std::shared_ptr<std::function<void()>> &closer) {
+            auto &closers = workers[worker].closers;
             // Drop entries whose connection is gone; otherwise a long-running
             // server grows this vector by one slot per connection until stop().
             closers.erase(
@@ -626,6 +623,24 @@ class Server {
                                [](const std::weak_ptr<std::function<void()>> &entry) { return entry.expired(); }),
                 closers.end());
             closers.push_back(closer);
+        }
+
+        // Worker-thread only.
+        void close_worker_connections(std::size_t worker) {
+            auto &closers = workers[worker].closers;
+            std::vector<std::shared_ptr<std::function<void()>>> live;
+            live.reserve(closers.size());
+            for (auto &entry : closers) {
+                if (auto closer = entry.lock()) {
+                    live.push_back(std::move(closer));
+                }
+            }
+            closers.clear();
+            // The post that got us here runs on this worker, so closing the
+            // transport inline is safe.
+            for (auto &closer : live) {
+                (*closer)();
+            }
         }
 
         void on_accept_capacity(std::function<void()> waiter) {
@@ -652,32 +667,30 @@ class Server {
             resume_accept_waiters();
         }
 
-        void close_all() {
-            std::vector<std::shared_ptr<std::function<void()>>> live;
+        // Called from the stopping thread. Each worker closes its own
+        // connections in a posted task; asio objects must not be touched from
+        // here. The weak capture keeps a queued task from owning the pool.
+        void close_all(const std::shared_ptr<Core> &self) {
             {
                 std::lock_guard<std::mutex> lock(lifecycle_mutex);
-                for (auto &entry : closers) {
-                    if (auto closer = entry.lock()) {
-                        live.push_back(std::move(closer));
-                    }
-                }
-                closers.clear();
                 accept_waiters.clear();
             }
-            // Each closer posts the transport close onto its own connection
-            // executor; asio objects must not be closed from this thread.
-            for (auto &closer : live) {
-                (*closer)();
+            for (std::size_t i = 0; i < workers.size(); ++i) {
+                std::weak_ptr<Core> weak = self;
+                asio::post(pool->at(i), [weak, i] {
+                    if (auto core = weak.lock()) {
+                        core->close_worker_connections(i);
+                    }
+                });
             }
         }
     };
 
-    // One acceptor. With reuse_port set there is one per worker, pinned to it
-    // (SO_REUSEPORT lets the kernel pick); otherwise a single acceptor on the
-    // main context round-robins incoming connections over the pool.
+    // One acceptor per worker. Each acceptor lives on the context that will
+    // also serve the sockets it accepts; `worker` is that context's index.
     struct AcceptorSlot {
         std::shared_ptr<asio::ip::tcp::acceptor> acceptor;
-        asio::io_context *pinned{nullptr};
+        std::size_t worker{0};
     };
 
     struct ListenerState {
@@ -691,6 +704,15 @@ class Server {
         PlaintextProtocols protocols{PlaintextProtocols::Both};
         bool h2c_upgrade{false};
     };
+
+    // Shared by the bind loop, the AllOrNothing rollback and the QUIC rollback.
+    static void close_acceptors(ListenerState &listener) {
+        for (auto &slot : listener.acceptors) {
+            error_code ignored;
+            slot.acceptor->close(ignored);
+        }
+        listener.acceptors.clear();
+    }
 
     static void start_accept(const std::shared_ptr<ListenerState> &listener, const AcceptorSlot &slot) {
         // At the limit, do not issue another accept: the kernel backlog applies
@@ -709,13 +731,10 @@ class Server {
             return;
         }
         auto &acceptor = *slot.acceptor;
-        // Pick the worker now and accept into a socket *created on it*: a socket
-        // keeps the executor it was constructed with, so accepting the default
-        // way (which uses the acceptor's context) would pin every connection's
-        // I/O to the accept thread regardless of where the handler was posted.
-        // A pinned acceptor (SO_REUSEPORT fan-out) already runs on its worker.
-        auto &worker = slot.pinned ? *slot.pinned : listener->core->pool->next();
-        auto socket = std::make_shared<asio::ip::tcp::socket>(worker);
+        // Create the socket on the acceptor's own context: a socket keeps the
+        // executor it was constructed with, and this is the worker that will
+        // run the connection from here on.
+        auto socket = std::make_shared<asio::ip::tcp::socket>(acceptor.get_executor());
         // The pending accept lives inside the acceptor, which the listener owns.
         // A strong capture here would make listener -> acceptor -> handler ->
         // listener a cycle whenever a connection is pending at teardown.
@@ -745,73 +764,55 @@ class Server {
                 socket->close(ignored);
                 return;
             }
-            serve_socket(listener, std::move(*socket));
+            serve_connection(listener, slot.worker, std::move(socket));
             start_accept(listener, slot);
         });
     }
 
-    static void serve_socket(const std::shared_ptr<ListenerState> &listener, asio::ip::tcp::socket socket) {
+    // Registers a closer for stop(). `worker` is the connection's own thread;
+    // close_all() runs the callback there via a posted task, so the transport
+    // can be touched inline.
+    template <typename Transport>
+    static std::shared_ptr<std::function<void()>> register_closer(const std::shared_ptr<Core> &core, std::size_t worker,
+                                                                  std::shared_ptr<Transport> transport) {
+        auto closer = std::make_shared<std::function<void()>>([transport] { transport->close(); });
+        core->register_closer(worker, closer);
+        return closer;
+    }
+
+    // Runs on the accept worker. Socket options, the user hook and the engine
+    // all stay on this thread, which is why the socket is never re-posted or
+    // re-allocated between accept and service.
+    static void serve_connection(const std::shared_ptr<ListenerState> &listener, std::size_t worker,
+                                 std::shared_ptr<asio::ip::tcp::socket> socket) {
         error_code ec;
-        socket.set_option(asio::ip::tcp::no_delay{listener->cfg.tcp_nodelay}, ec);
+        socket->set_option(asio::ip::tcp::no_delay{listener->cfg.tcp_nodelay}, ec);
         if (listener->cfg.socket_setup) {
             // A user callback MUST NOT be allowed to throw out of the accept
             // handler: the exception would escape io_context::run() and call
             // std::terminate on the worker.
             try {
-                listener->cfg.socket_setup(socket);
+                listener->cfg.socket_setup(*socket);
             } catch (const std::exception &e) {
                 SIMPLE_HTTP_ERROR_LOG("server: socket_setup threw: {}", e.what());
                 error_code ignored;
-                socket.close(ignored);
+                socket->close(ignored);
                 return;
             } catch (...) {
                 SIMPLE_HTTP_ERROR_LOG("server: socket_setup threw unknown exception");
                 error_code ignored;
-                socket.close(ignored);
+                socket->close(ignored);
                 return;
             }
         }
         auto core = listener->core;
         core->connections->fetch_add(1, std::memory_order_acq_rel);
-        // The socket was created on its worker (see start_accept), so its own
-        // executor is the one to run the engine on. Weak captures: a post that
-        // is still queued at teardown must not keep the listener (and through
-        // it the Core/pool/io_context) alive.
-        std::weak_ptr<ListenerState> weak_listener = listener;
-        std::weak_ptr<Core> weak_core = core;
-        asio::post(socket.get_executor(), [weak_listener, weak_core, socket = std::move(socket)]() mutable {
-            if (auto alive = weak_listener.lock()) {
-                serve_on_worker(alive, std::move(socket));
-                return;
-            }
-            if (auto c = weak_core.lock()) {
-                c->connection_released();
-            }
-        });
-    }
-
-    // Registers a closer that stop() can invoke from any thread. The close is
-    // posted to the connection's executor because asio sockets/TLS streams are
-    // not safe to touch from the stopping thread.
-    template <typename Transport>
-    static std::shared_ptr<std::function<void()>> register_closer(const std::shared_ptr<Core> &core,
-                                                                  std::shared_ptr<Transport> transport) {
-        auto exec = transport->get_executor();
-        auto closer = std::make_shared<std::function<void()>>(
-            [transport, exec] { asio::post(exec, [transport] { transport->close(); }); });
-        core->register_closer(closer);
-        return closer;
-    }
-
-    static void serve_on_worker(const std::shared_ptr<ListenerState> &listener, asio::ip::tcp::socket socket) {
-        auto core = listener->core;
         if (listener->tls) {
-            auto stream =
-                std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(std::move(socket), listener->tls->context());
-            error_code ec;
+            auto stream = std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(std::move(*socket),
+                                                                                     listener->tls->context());
             const auto peer = stream->lowest_layer().remote_endpoint(ec);
             auto transport = std::make_shared<TlsStreamTransport>(stream, peer);
-            auto closer = register_closer(core, transport);
+            auto closer = register_closer(core, worker, transport);
             std::weak_ptr<ListenerState> weak_listener = listener;
             std::weak_ptr<Core> weak_core = core;
             // A peer that completes the TCP handshake and then sends no (or a
@@ -858,11 +859,9 @@ class Server {
             });
             return;
         }
-        error_code ec;
-        const auto peer = socket.remote_endpoint(ec);
-        auto transport =
-            std::make_shared<TcpStreamTransport>(std::make_shared<asio::ip::tcp::socket>(std::move(socket)), peer);
-        auto closer = register_closer(core, transport);
+        const auto peer = socket->remote_endpoint(ec);
+        auto transport = std::make_shared<TcpStreamTransport>(std::move(socket), peer);
+        auto closer = register_closer(core, worker, transport);
         switch (listener->protocols) {
         case PlaintextProtocols::Http2:
             run_h2(listener, std::move(transport), std::string{}, closer);
@@ -900,8 +899,8 @@ class Server {
             }
             if (!alive) {
                 // The listener was torn down while this connection was in the
-                // sniff phase. serve_socket already counted it; release that
-                // slot even though the listener itself is gone.
+                // sniff phase. serve_connection already counted it; release
+                // that slot even though the listener itself is gone.
                 transport->close();
                 if (auto c = weak_core.lock()) {
                     c->connection_released();
@@ -978,7 +977,6 @@ class Server {
         std::shared_ptr<quic::SharedCidRegistry<QuicConnectionType>> cids;
         std::vector<std::shared_ptr<QuicEndpointType>> endpoints;
         EngineLimits limits;
-        bool reuse_port{true};
     };
 
     typename QuicEndpointType::ServeFn make_h3_serve(EngineLimits limits) {
@@ -1000,7 +998,6 @@ class Server {
         auto rt = std::make_shared<QuicRuntime>();
         rt->address = *m_cfg.quic;
         rt->limits = m_cfg.limits;
-        rt->reuse_port = m_cfg.reuse_port;
         try {
             rt->tls = std::make_shared<quic::QuicTlsContext>(*m_cfg.tls);
         } catch (const std::exception &e) {
@@ -1013,7 +1010,6 @@ class Server {
             SIMPLE_HTTP_ERROR_LOG("server: QUIC bind({}): {}", rt->address.host, ec.message());
             return server_errc::invalid_config;
         }
-        const asio::ip::udp::endpoint endpoint{addr, rt->address.port};
         rt->active = std::make_shared<std::atomic<std::size_t>>(0);
         auto endpoint_config = m_cfg.quic_options;
         endpoint_config.max_connections = m_cfg.max_connections;
@@ -1034,17 +1030,35 @@ class Server {
         }
         endpoint_config.use_shared_secret = true;
         rt->cids = std::make_shared<quic::SharedCidRegistry<QuicConnectionType>>();
-        const std::size_t sockets = rt->reuse_port ? (core->pool->size() == 0 ? 1 : core->pool->size()) : 1;
+        // One QUIC socket per worker, mirroring the TCP acceptors. Like the TCP
+        // path, a configured port 0 is resolved on the first bind and the other
+        // sockets join the port the kernel chose.
+#ifdef SO_REUSEPORT
+        const std::size_t sockets = core->pool->size();
+#else
+        const std::size_t sockets = 1;
+#endif
+        const bool reuse_port = sockets > 1;
+        std::uint16_t bind_port = rt->address.port;
         for (std::size_t i = 0; i < sockets; ++i) {
-            auto ctx = rt->reuse_port ? core->pool->at(i) : core->pool->main_context();
-            auto quic = std::make_shared<QuicEndpointType>(ctx->get_executor(), rt->tls->native_handle(),
+            auto &ctx = core->pool->at(i);
+            const asio::ip::udp::endpoint endpoint{addr, bind_port};
+            auto quic = std::make_shared<QuicEndpointType>(ctx.get_executor(), rt->tls->native_handle(),
                                                            endpoint_config, make_h3_serve(rt->limits), rt->cids);
-            if (!quic->open(endpoint, rt->reuse_port, ec)) {
-                SIMPLE_HTTP_ERROR_LOG("server: QUIC bind({}:{}) [{}]: {}", rt->address.host, rt->address.port, i,
+            if (!quic->open(endpoint, reuse_port, ec)) {
+                SIMPLE_HTTP_ERROR_LOG("server: QUIC bind({}:{}) [{}]: {}", rt->address.host, bind_port, i,
                                       ec.message());
                 for (auto &bound : rt->endpoints)
                     bound->close();
                 return server_errc::bind_failed;
+            }
+            if (i == 0) {
+                bind_port = quic->port();
+                if (bind_port == 0) {
+                    SIMPLE_HTTP_ERROR_LOG("server: QUIC local_endpoint failed after bind");
+                    quic->close();
+                    return server_errc::bind_failed;
+                }
             }
             quic->start();
             rt->endpoints.push_back(std::move(quic));
