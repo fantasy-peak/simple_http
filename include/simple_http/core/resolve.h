@@ -34,7 +34,9 @@
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <cstdint>
+#include <exception>
 #include <functional>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -79,19 +81,39 @@ class ResolveOp {
                 // type erasure is involved: this is the concrete executor the
                 // composed operation was given.
                 auto executor = self.get_executor();
-                resolve(std::move(host), m_port, executor,
-                        [self = std::move(self), executor](error_code rec,
-                                                           std::vector<asio::ip::tcp::endpoint> endpoints) mutable {
-                            // The hook may complete synchronously or from its
-                            // own thread (c-ares, a resolver thread). Post
-                            // unconditionally: an asio operation must not
-                            // complete from its initiating function, and the
-                            // answer has to land on the caller's executor.
-                            asio::dispatch(executor,
-                                           [self = std::move(self), rec, endpoints = std::move(endpoints)]() mutable {
-                                               self.complete(rec, std::move(endpoints));
-                                           });
-                        });
+                // The hook is user code (a cache, c-ares, DoH, ...) and may
+                // throw. It owns the completion once passed in, so a throw would
+                // otherwise leave the operation suspended forever -- and, when
+                // the dial was started from an asynchronous continuation, escape
+                // io_context::run(). Keep the composed operation behind a
+                // shared_ptr plus a one-shot flag: a throw can still fail the
+                // operation, and a hook that completes and then throws cannot
+                // complete it twice.
+                auto holder = std::make_shared<Self>(std::move(self));
+                auto fired = std::make_shared<bool>(false);
+                auto finish = [holder, fired, executor](error_code rec,
+                                                        std::vector<asio::ip::tcp::endpoint> endpoints) {
+                    // The hook may complete synchronously or from its own
+                    // thread (c-ares, a resolver thread). Dispatch
+                    // unconditionally: an asio operation must not complete from
+                    // its initiating function, and the answer has to land on
+                    // the caller's executor.
+                    asio::dispatch(executor, [holder, fired, rec, endpoints = std::move(endpoints)]() mutable {
+                        if (std::exchange(*fired, true))
+                            return;
+                        std::move(*holder).complete(rec, std::move(endpoints));
+                    });
+                };
+                try {
+                    resolve(std::move(host), m_port, executor,
+                            [finish](error_code rec, std::vector<asio::ip::tcp::endpoint> endpoints) mutable {
+                                finish(rec, std::move(endpoints));
+                            });
+                } catch (const std::exception &) {
+                    finish(make_error_code(asio::error::host_not_found), std::vector<asio::ip::tcp::endpoint>{});
+                } catch (...) {
+                    finish(make_error_code(asio::error::host_not_found), std::vector<asio::ip::tcp::endpoint>{});
+                }
                 return;
             }
             m_resolver.async_resolve(m_host, std::to_string(m_port), std::move(self));

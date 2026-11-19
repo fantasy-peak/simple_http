@@ -390,11 +390,16 @@ inline Middleware jwt(JwtConfig config = {}) {
             jwt_reject(res, status::unauthorized, "JWT has no exp claim", std::move(done));
             return;
         }
-        if (payload.exp != 0 && now > payload.exp + leeway) {
+        // Written as differences rather than `exp + leeway` / `now + leeway`:
+        // `exp` is attacker-controlled and may be INT64_MAX, so the addition is
+        // signed integer overflow (undefined behavior). The subtractions below
+        // are only evaluated when their result is non-negative, so they cannot
+        // overflow either.
+        if (payload.exp != 0 && now > payload.exp && now - payload.exp > leeway) {
             jwt_reject(res, status::unauthorized, "JWT has expired", std::move(done));
             return;
         }
-        if (payload.nbf != 0 && now + leeway < payload.nbf) {
+        if (payload.nbf != 0 && payload.nbf > now && payload.nbf - now > leeway) {
             jwt_reject(res, status::unauthorized, "JWT is not valid yet", std::move(done));
             return;
         }

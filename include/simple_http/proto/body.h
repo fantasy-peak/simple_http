@@ -66,8 +66,40 @@ class Body {
 
     Body(const Body &) = delete;
     Body &operator=(const Body &) = delete;
-    Body(Body &&) = default;
-    Body &operator=(Body &&) = default;
+    // Movable, but the executor is copied rather than moved. A moved-from Body
+    // must remain a valid object (Request is movable and its cancel() API stays
+    // callable on the source); moving the executor would leave the source with
+    // an empty one, so a later feed()/async_read() would construct a channel on
+    // an empty executor and throw bad_executor.
+    Body(Body &&other) noexcept
+        : m_exec(other.m_exec), m_capacity(other.m_capacity), m_channel(std::move(other.m_channel)), m_eof(other.m_eof),
+          m_pending_eof(other.m_pending_eof), m_terminated(other.m_terminated), m_fed(other.m_fed),
+          m_pending_error(std::move(other.m_pending_error)), m_on_consumed(std::move(other.m_on_consumed)),
+          m_first_read_hook(std::move(other.m_first_read_hook)), m_pull(std::move(other.m_pull)),
+          m_decoder(std::move(other.m_decoder)), m_max_decoded(other.m_max_decoded),
+          m_decoded_total(other.m_decoded_total), m_read_started(other.m_read_started),
+          m_decoder_finished(other.m_decoder_finished) {}
+    Body &operator=(Body &&other) noexcept {
+        if (this == &other)
+            return *this;
+        m_exec = other.m_exec;
+        m_capacity = other.m_capacity;
+        m_channel = std::move(other.m_channel);
+        m_eof = other.m_eof;
+        m_pending_eof = other.m_pending_eof;
+        m_terminated = other.m_terminated;
+        m_fed = other.m_fed;
+        m_pending_error = std::move(other.m_pending_error);
+        m_on_consumed = std::move(other.m_on_consumed);
+        m_first_read_hook = std::move(other.m_first_read_hook);
+        m_pull = std::move(other.m_pull);
+        m_decoder = std::move(other.m_decoder);
+        m_max_decoded = other.m_max_decoded;
+        m_decoded_total = other.m_decoded_total;
+        m_read_started = other.m_read_started;
+        m_decoder_finished = other.m_decoder_finished;
+        return *this;
+    }
 
     // --- consumer API (handler side) ---
 

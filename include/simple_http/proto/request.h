@@ -61,15 +61,20 @@ class Request {
     // Movable but not copyable: the owned Body stream cannot be duplicated, and
     // once owned by a Request the body has already begun flowing. The path/query
     // views are rebound to the moved-to target.
+    //
+    // The executor and the cancellation state are *copied*, not moved: cancel()
+    // and cancelled() are documented as safe from any thread and must not turn
+    // into a null-pointer dereference when called on a moved-from Request. The
+    // Body's executor is copied for the same reason (see Body's move ctor).
     Request(Request &&other) noexcept
-        : m_version(other.m_version), m_peer(std::move(other.m_peer)), m_exec(std::move(other.m_exec)),
+        : m_version(other.m_version), m_peer(std::move(other.m_peer)), m_exec(other.m_exec),
           m_body(std::move(other.m_body)), m_close(other.m_close), m_stream_body(other.m_stream_body),
           m_content_length(other.m_content_length), m_url(std::move(other.m_url)),
           m_body_source(std::move(other.m_body_source)), m_method(other.m_method),
           m_method_token(std::move(other.m_method_token)), m_target(std::move(other.m_target)),
           m_headers(std::move(other.m_headers)), m_trailers(std::move(other.m_trailers)),
           m_params(std::move(other.m_params)), m_query_params(std::move(other.m_query_params)),
-          m_query_parsed(other.m_query_parsed), m_state(std::move(other.m_state)), m_cancel(std::move(other.m_cancel)) {
+          m_query_parsed(other.m_query_parsed), m_state(std::move(other.m_state)), m_cancel(other.m_cancel) {
         rebind_views();
     }
     Request &operator=(Request &&other) noexcept {
@@ -77,7 +82,7 @@ class Request {
             return *this;
         m_version = other.m_version;
         m_peer = std::move(other.m_peer);
-        m_exec = std::move(other.m_exec);
+        m_exec = other.m_exec; // copied: a moved-from Request stays usable
         m_body = std::move(other.m_body);
         m_method = other.m_method;
         m_method_token = std::move(other.m_method_token);
@@ -93,7 +98,7 @@ class Request {
         m_url = std::move(other.m_url);
         m_body_source = std::move(other.m_body_source);
         m_state = std::move(other.m_state);
-        m_cancel = std::move(other.m_cancel);
+        m_cancel = other.m_cancel; // copied: a moved-from Request stays usable
         rebind_views();
         return *this;
     }

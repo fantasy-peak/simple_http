@@ -850,8 +850,10 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
             m_out.clear();
             m_deadline = std::chrono::steady_clock::now() + m_idle_timeout;
             auto self = this->shared_from_this();
+            m_write_in_flight = true;
             m_transport->async_write(ConstByteSpan{reinterpret_cast<const std::byte *>(chunk->data()), chunk->size()},
                                      [self, chunk](error_code ec, std::size_t) {
+                                         self->m_write_in_flight = false;
                                          if (ec || self->m_finished) {
                                              self->finish_session();
                                              return;
@@ -875,31 +877,44 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
     }
 
     void finish_session() {
-        if (m_finished)
-            return;
-        m_finished = true;
-        m_alive = false;
-        m_watchdog->cancel();
-        m_notify.close();
-        for (auto &[id, st] : m_streams) {
-            if (st.out_space)
-                st.out_space->close();
-            if (st.remote_end) {
-                // A complete response may still have parsed bytes in the
-                // queue. Marking EOF here makes MultiplexedClientStream::read
-                // short-circuit to an empty end and silently drops the body;
-                // keep the stream Open until the reader drains it, then the
-                // normal remote_end path reports EOF.
-                if (st.in_queue.empty())
-                    st.outcome->set(StreamState::Eof);
-            } else {
-                st.failed = true;
-                st.outcome->set(StreamState::Disconnect, make_error_code(asio::error::eof));
+        if (!m_finished) {
+            m_finished = true;
+            m_alive = false;
+            m_watchdog->cancel();
+            m_notify.close();
+            for (auto &[id, st] : m_streams) {
+                (void)id;
+                if (st.out_space)
+                    st.out_space->close();
+                if (st.remote_end) {
+                    // A complete response may still have parsed bytes in the
+                    // queue. Marking EOF here makes MultiplexedClientStream::read
+                    // short-circuit to an empty end and silently drops the body;
+                    // keep the stream Open until the reader drains it, then the
+                    // normal remote_end path reports EOF.
+                    if (st.in_queue.empty())
+                        st.outcome->set(StreamState::Eof);
+                } else {
+                    st.failed = true;
+                    st.outcome->set(StreamState::Disconnect, make_error_code(asio::error::eof));
+                }
+                if (st.in_notify)
+                    st.in_notify->close();
             }
-            if (st.in_notify)
-                st.in_notify->close();
+            m_active_streams = 0;
         }
-        m_active_streams = 0;
+        // A transport write already owns the socket. Asio forbids a second
+        // concurrent async_write on the same stream (the bytes would interleave
+        // and it is undefined behavior), so wait for that write's completion —
+        // it calls back here — and bound the wait so a peer that stopped
+        // reading cannot keep the teardown pending forever.
+        if (m_write_in_flight) {
+            arm_finish_deadline();
+            return;
+        }
+        if (m_finish_started)
+            return;
+        m_finish_started = true;
         auto self = this->shared_from_this();
         auto close_transport = [self]() {
             self->m_transport->close();
@@ -911,10 +926,28 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
         }
         auto chunk = std::make_shared<std::string>(std::move(m_out));
         m_out.clear();
+        m_write_in_flight = true;
         m_transport->async_write(
             ConstByteSpan{reinterpret_cast<const std::byte *>(chunk->data()), chunk->size()},
-            asio::cancel_after(std::chrono::seconds(2),
-                               [self, chunk, close_transport](error_code, std::size_t) { close_transport(); }));
+            asio::cancel_after(std::chrono::seconds(2), [self, chunk, close_transport](error_code, std::size_t) {
+                self->m_write_in_flight = false;
+                close_transport();
+            }));
+    }
+
+    // Bounds how long finish_session() waits for an in-flight write. Closing
+    // the transport aborts that write, whose completion re-enters finish_session
+    // with the socket already gone.
+    void arm_finish_deadline() {
+        if (m_finish_deadline_armed)
+            return;
+        m_finish_deadline_armed = true;
+        auto self = this->shared_from_this();
+        m_finish_timer->expires_after(std::chrono::seconds(2));
+        m_finish_timer->async_wait([self](error_code ec) {
+            if (!ec)
+                self->m_transport->close();
+        });
     }
 
     void flush() { (void)m_notify.try_send(error_code{}); }
@@ -1831,7 +1864,17 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
     asio::experimental::concurrent_channel<void(error_code)> m_notify;
     std::chrono::steady_clock::time_point m_deadline{};
     std::shared_ptr<asio::steady_timer> m_watchdog{std::make_shared<asio::steady_timer>(m_executor)};
+    // Separate from the watchdog: finish_session() cancels the watchdog but must
+    // keep this deadline armed while it waits for an in-flight write.
+    std::shared_ptr<asio::steady_timer> m_finish_timer{std::make_shared<asio::steady_timer>(m_executor)};
     bool m_finished{false};
+    // A transport write is on the wire (write_loop or the terminal flush).
+    // finish_session() must not start another one while this is set.
+    bool m_write_in_flight{false};
+    // The terminal flush/close has been issued (the teardown runs once, even
+    // though it may be re-entered from the write completion).
+    bool m_finish_started{false};
+    bool m_finish_deadline_armed{false};
     std::array<std::byte, 32 * 1024> m_read_scratch{};
 
     codec::HpackDecoder m_decoder; // connection-scoped: the dynamic table is shared

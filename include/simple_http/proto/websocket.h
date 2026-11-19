@@ -298,7 +298,15 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
                 m_inbox.pop_front();
                 m_inbox_bytes -= kInboxMsgOverhead + msg.data.size();
                 (void)m_inbox_space.try_send(error_code{});
-                std::move(done)(error_code{}, std::move(msg));
+                // Deliver from a fresh stack instead of completing inline. An
+                // inline completion lets a handler that reads in a tight loop
+                // (co_await read; no write/yield) recurse once per queued
+                // message; with ws_read_ahead_bytes at its 4 MiB default that
+                // is up to ~32k nested completions and can overflow the thread
+                // stack. The post unwinds the caller before the next delivery.
+                asio::post(m_executor, [done = std::move(done), msg = std::move(msg)]() mutable {
+                    std::move(done)(error_code{}, std::move(msg));
+                });
                 return;
             }
             if (m_reader_done) {

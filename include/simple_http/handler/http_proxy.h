@@ -68,10 +68,22 @@ inline void run_http_proxy(RequestPtr req, ResponsePtr res, bool client_is_tls, 
             return;
         }
         if (target.hooks.error_handler) {
-            target.hooks.error_handler(res, *req, ec, [completion]() mutable {
-                auto callback = std::move(*completion);
-                std::move(callback)();
-            });
+            // This runs from an asynchronous completion (the upstream send or a
+            // timeout), not from the initiating call. A throwing hook must not
+            // escape io_context::run(), so it is guarded like every other
+            // user-supplied hook in the library.
+            try {
+                target.hooks.error_handler(res, *req, ec, [completion]() mutable {
+                    auto callback = std::move(*completion);
+                    std::move(callback)();
+                });
+            } catch (const std::exception &e) {
+                SIMPLE_HTTP_ERROR_LOG("http-proxy: error_handler threw: {}", e.what());
+                finish();
+            } catch (...) {
+                SIMPLE_HTTP_ERROR_LOG("http-proxy: error_handler threw an unknown exception");
+                finish();
+            }
             return;
         }
         res->status(status).content_type("text/plain");
@@ -161,7 +173,19 @@ inline void run_http_proxy(RequestPtr req, ResponsePtr res, bool client_is_tls, 
                                int status = response.status();
                                Headers headers = response.headers();
                                if (target.hooks.modify_response) {
-                                   if (error_code hook_ec = target.hooks.modify_response(status, headers, *req)) {
+                                   error_code hook_ec;
+                                   try {
+                                       hook_ec = target.hooks.modify_response(status, headers, *req);
+                                   } catch (const std::exception &e) {
+                                       SIMPLE_HTTP_ERROR_LOG("http-proxy: modify_response threw: {}", e.what());
+                                       send_error(status::bad_gateway, make_error_code(asio::error::invalid_argument));
+                                       return;
+                                   } catch (...) {
+                                       SIMPLE_HTTP_ERROR_LOG("http-proxy: modify_response threw an unknown exception");
+                                       send_error(status::bad_gateway, make_error_code(asio::error::invalid_argument));
+                                       return;
+                                   }
+                                   if (hook_ec) {
                                        send_error(status::bad_gateway, hook_ec);
                                        return;
                                    }

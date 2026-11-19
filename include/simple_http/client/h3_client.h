@@ -987,6 +987,10 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         auto it = m_streams.find(stream_id);
         if (it == m_streams.end())
             return false;
+        // A new field section: reset the decoded-size budget (QPACK references
+        // let a tiny compressed block expand into a much larger field list, so
+        // the compressed bound below is not enough on its own).
+        it->second->decoded_field_bytes = 0;
         // nghttp3 does not enforce SETTINGS_MAX_FIELD_SECTION_SIZE locally; a
         // peer could otherwise make the client buffer an arbitrarily large
         // HEADERS block. Failing the callback aborts the connection (fail
@@ -1005,6 +1009,12 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         if (it == m_streams.end())
             return;
         Stream &st = *it->second;
+        // The field callback runs after a rejection was recorded: keep copying
+        // nothing, or a decompression bomb would still be buffered.
+        if (st.failed)
+            return;
+        if (!field_within_budget(stream_id, st, name, value))
+            return;
         if (contains_ctl(name) || contains_ctl(value)) {
             st.failed = true;
             st.outcome->set(StreamState::Failed, make_error_code(client_errc::protocol_error));
@@ -1023,6 +1033,14 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         if (it == m_streams.end())
             return;
         Stream &st = *it->second;
+        if (st.failed) {
+            // A field callback rejected this section (CR/LF/NUL, or the decoded
+            // list passed max_header_bytes). Do not publish a head for it.
+            st.header_tmp.clear();
+            st.status_text.clear();
+            h3::wake(st.in_space);
+            return;
+        }
 
         // A section before the final head with a 1xx status is informational
         // (100-continue, 103 Early Hints); the final response follows. Only 100
@@ -1074,8 +1092,10 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
     // --- trailer section (RFC 9110 §6.5, RFC 9114 §4.1) -------------------
 
     bool on_trailers_begin(std::int64_t stream_id) noexcept override {
-        if (m_streams.find(stream_id) == m_streams.end())
+        auto it = m_streams.find(stream_id);
+        if (it == m_streams.end())
             return false;
+        it->second->decoded_field_bytes = 0;
         if (h3() != nullptr && nghttp3_conn_get_frame_payload_left2(h3(), stream_id) > m_limits.max_header_bytes) {
             SIMPLE_HTTP_ERROR_LOG("h3 client: response trailer section exceeds {} bytes (stream={})",
                                   m_limits.max_header_bytes, stream_id);
@@ -1090,6 +1110,10 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         if (it == m_streams.end())
             return;
         Stream &st = *it->second;
+        if (st.failed)
+            return;
+        if (!field_within_budget(stream_id, st, name, value))
+            return;
         if (contains_ctl(name) || contains_ctl(value)) {
             st.failed = true;
             st.outcome->set(StreamState::Failed, make_error_code(client_errc::protocol_error));
@@ -1105,6 +1129,11 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         if (it == m_streams.end())
             return;
         Stream &st = *it->second;
+        if (st.failed) {
+            st.trailer_tmp.clear();
+            h3::wake(st.in_space);
+            return;
+        }
         if (auto handle = st.handle.lock()) {
             Headers trailers;
             for (auto &[name, value] : st.trailer_tmp)
@@ -1254,6 +1283,11 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         bool failed{false};
         bool write_shut{false};
         std::string status_text;
+        // Decoded size of the field section being received (name + value + 32
+        // per field, RFC 9204 §4.1). QPACK index references can expand a small
+        // compressed block into a much larger list, so this — not the compressed
+        // payload length — is what bounds memory. Reset at each field section.
+        std::size_t decoded_field_bytes{0};
         std::vector<std::pair<std::string, std::string>> header_tmp;
         std::vector<std::pair<std::string, std::string>> trailer_tmp;
         std::deque<std::string> in_queue;
@@ -1278,6 +1312,26 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         Signal in_space;
         Signal out_space;
     };
+
+    // Accounts one decoded field against the stream's field-section budget. A
+    // field whose cost would push the section past SETTINGS_MAX_FIELD_SECTION_SIZE
+    // (what this client advertises as max_header_bytes) fails the stream; the
+    // field is not stored, so a compressed block made of QPACK references
+    // cannot make the client allocate an unbounded list.
+    bool field_within_budget(std::int64_t stream_id, Stream &st, std::string_view name,
+                             std::string_view value) const noexcept {
+        constexpr std::size_t kFieldOverhead = 32;
+        const std::size_t cost = name.size() + value.size() + kFieldOverhead;
+        const std::size_t limit = m_limits.max_header_bytes;
+        if (st.decoded_field_bytes > limit || cost > limit - st.decoded_field_bytes) {
+            SIMPLE_HTTP_ERROR_LOG("h3 client: decoded header list exceeds {} bytes (stream={})", limit, stream_id);
+            st.failed = true;
+            st.outcome->set(StreamState::Failed, make_error_code(client_errc::header_too_large));
+            return false;
+        }
+        st.decoded_field_bytes += cost;
+        return true;
+    }
 
     // Start the connection and wait for the 1-RTT keys (when the HTTP/3 control
     // streams can be opened). Completion signature: void(error_code).

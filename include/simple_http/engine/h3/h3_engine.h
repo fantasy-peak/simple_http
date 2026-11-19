@@ -103,10 +103,10 @@ template <typename Connection> class Http3Engine;
 // an operation issued after the connection closed fails instead of
 // dereferencing it.
 //
-// Model A: the sink is used only on the connection thread; every method also
-// hops onto the connection executor defensively, so no engine state is touched
-// before the hop. The completion runs after the engine-side work for that call
-// is done, so a caller can chain stream writes.
+// Model A: the sink is used only on the connection thread. Its methods touch
+// engine state inline; they do not hop onto the executor, so calling one from
+// another thread is a data race. The completion runs after the engine-side work
+// for that call is done, so a caller can chain stream writes.
 template <typename Connection> class Http3ResponseSink : public ResponseSink {
   public:
     using Executor = typename Connection::executor_type;

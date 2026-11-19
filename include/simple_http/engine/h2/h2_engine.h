@@ -14,9 +14,10 @@
 // header parse/serialize (h2_frame.h), HPACK decode (HpackDecoder) and a small
 // fresh HPACK response encoder (hpack_encoder.h). All connection state
 // (stream table, HPACK decoder, flow-control windows, output buffer) is touched
-// only on the single-threaded connection executor. Per "model A", every
-// Http2ResponseSink operation hops onto that executor before touching engine
-// state, so a Response used from any thread stays safe.
+// only on the single-threaded connection executor. Under model A, callers
+// guarantee that Http2ResponseSink operations run on that executor; they are
+// forwarded inline and do not hop, so a Response is not safe to use from
+// another thread.
 //
 // Lifetime: the engine is held by shared_ptr; handler coroutines capture it, so
 // it (and the stream state) outlives every in-flight handler, including
@@ -124,8 +125,15 @@ inline constexpr std::size_t kQueueCompactDivisor = 3;
 // anyway).
 inline constexpr std::size_t kMaxFramedPerPass = 256u << 10; // 256 KiB
 
-// ResponseSink for a single HTTP/2 stream. Holds a weak_ptr to the engine so it
-// can be used safely from any thread and after the connection has closed.
+// ResponseSink for a single HTTP/2 stream. Holds a weak_ptr to the engine so an
+// operation issued after the connection closed fails instead of dereferencing a
+// destroyed engine.
+//
+// Threading (model A): this object is used only on the connection's executor.
+// Its methods touch engine state (stream table, HPACK output, flow-control
+// queues) directly and do NOT hop onto the executor, so calling it from another
+// thread is a data race. The weak lock makes a torn-down engine detectable, not
+// the object cross-thread safe.
 template <typename Transport> class Http2ResponseSink final : public ResponseSink {
   public:
     using Executor = asio::any_io_executor;
@@ -1072,16 +1080,32 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
             m_notify.close();
             // Queued handlers must not start after teardown (see pump_dispatch).
             m_pending_dispatch.clear();
+            // Phase 1: only pure state, no user code. Closing a channel completes
+            // waiters through post, so nothing here can re-enter the engine.
+            std::vector<std::shared_ptr<Request>> requests;
+            requests.reserve(m_streams.size());
             for (auto &entry : m_streams) {
-                if (entry.second.request) {
-                    (void)entry.second.request->body().fail(make_error_code(asio::error::connection_reset));
-                    entry.second.request->cancel();
-                }
-                if (entry.second.out_space)
-                    entry.second.out_space->close();
-                entry.second.ws_closed = true;
-                if (entry.second.ws_wake)
-                    entry.second.ws_wake->close();
+                Stream &st = entry.second;
+                st.ws_closed = true;
+                if (st.out_space)
+                    st.out_space->close();
+                if (st.ws_wake)
+                    st.ws_wake->close();
+                if (st.request)
+                    requests.push_back(st.request);
+            }
+            // Phase 2: fail and cancel. `Request::cancel()` runs its fan-out on
+            // this executor, and a cancellation handler is allowed to complete
+            // synchronously (a timer/socket operation completes through
+            // handler_work::dispatch; a user handler may call its completion
+            // directly). That completion can reach handler_finished(), whose
+            // reset_stream() -> erase_stream() removes the entry. Iterating
+            // m_streams here would then touch a dangling reference and an
+            // invalidated iterator, so the requests are snapshotted first; the
+            // shared_ptr keeps each Request/Body alive across the erasures.
+            for (auto &request : requests) {
+                (void)request->body().fail(make_error_code(asio::error::connection_reset));
+                request->cancel();
             }
         }
         // An in-flight write owns the transport; waiting for it avoids two
@@ -2774,6 +2798,12 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
     // Dispatch an extended-CONNECT WebSocket stream: run the ws middleware chain
     // and, if it reaches the terminal, upgrade. With no matching ws route the
     // stream is answered 404 and ended.
+    //
+    // A route or middleware may throw synchronously (the h1 engine has always
+    // guarded its equivalent path). Unwinding out of the frame parser would
+    // escape io_context::run() and terminate the worker, so the whole dispatch
+    // runs under a try/catch and the executing-handler slot is released exactly
+    // once, whichever path finishes the stream first.
     void dispatch_ws_stream(std::uint32_t stream_id) {
         auto it = m_streams.find(stream_id);
         if (it == m_streams.end()) {
@@ -2782,36 +2812,53 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
         }
         auto request = it->second.request;
         auto writer = it->second.writer;
-        const std::string path{request->path()};
-        std::optional<WsHandlerFn> handler_fn;
-        if (m_ws_lookup)
-            handler_fn = m_ws_lookup(path);
         auto self = this->shared_from_this();
-        // Nginx order: local exact ws route beats a proxy route, which beats a
-        // local regex ws route.
-        if (!handler_fn && m_ws_proxy_lookup) {
-            if (auto target = m_ws_proxy_lookup(path)) {
-                auto run = std::make_shared<H2WsProxyRun>(self, stream_id, request, writer, std::move(*target));
-                run->start();
+        auto completed = std::make_shared<bool>(false);
+        auto finish = [self, stream_id, completed]() mutable {
+            if (std::exchange(*completed, true))
+                return;
+            self->handler_finished(stream_id);
+        };
+        try {
+            const std::string path{request->path()};
+            std::optional<WsHandlerFn> handler_fn;
+            if (m_ws_lookup)
+                handler_fn = m_ws_lookup(path);
+            // Nginx order: local exact ws route beats a proxy route, which beats
+            // a local regex ws route.
+            if (!handler_fn && m_ws_proxy_lookup) {
+                if (auto target = m_ws_proxy_lookup(path)) {
+                    auto run =
+                        std::make_shared<H2WsProxyRun>(self, stream_id, request, writer, std::move(*target), finish);
+                    run->start();
+                    return;
+                }
+            }
+            if (!handler_fn && m_ws_regex_lookup)
+                handler_fn = m_ws_regex_lookup(path);
+            if (!handler_fn) {
+                writer->send_bodyless(status::not_found, Headers{}, [self, stream_id, finish](error_code) mutable {
+                    self->ws_stream_close(stream_id);
+                    finish();
+                });
                 return;
             }
+            auto response = std::make_shared<ResponseWriter>(writer);
+            auto upgrade = [self, stream_id](RequestPtr req, ResponsePtr res, CallbackWsHandler h,
+                                             WsUpgradeCompletion done) mutable {
+                self->do_ws_upgrade(stream_id, std::move(req), std::move(res), std::move(h), std::move(done));
+            };
+            (*handler_fn)(request, response, m_transport->tls_handle(), upgrade,
+                          [finish](error_code, bool) mutable { finish(); });
+        } catch (const std::exception &e) {
+            SIMPLE_HTTP_ERROR_LOG("h2 ws dispatch(stream={}) threw: {}", stream_id, e.what());
+            self->reset_stream(stream_id, codec::H2_INTERNAL_ERROR);
+            finish();
+        } catch (...) {
+            SIMPLE_HTTP_ERROR_LOG("h2 ws dispatch(stream={}) threw unknown exception", stream_id);
+            self->reset_stream(stream_id, codec::H2_INTERNAL_ERROR);
+            finish();
         }
-        if (!handler_fn && m_ws_regex_lookup)
-            handler_fn = m_ws_regex_lookup(path);
-        if (!handler_fn) {
-            writer->send_bodyless(status::not_found, Headers{}, [self, stream_id](error_code) {
-                self->ws_stream_close(stream_id);
-                self->handler_finished(stream_id);
-            });
-            return;
-        }
-        auto response = std::make_shared<ResponseWriter>(writer);
-        auto upgrade = [self, stream_id](RequestPtr req, ResponsePtr res, CallbackWsHandler h,
-                                         WsUpgradeCompletion done) mutable {
-            self->do_ws_upgrade(stream_id, std::move(req), std::move(res), std::move(h), std::move(done));
-        };
-        (*handler_fn)(request, response, m_transport->tls_handle(), upgrade,
-                      [self, stream_id](error_code, bool) { self->handler_finished(stream_id); });
     }
 
     // The ws middleware chain's terminal: accept the tunnel with a 200 head and
@@ -2967,9 +3014,10 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
     class H2WsProxyRun : public std::enable_shared_from_this<H2WsProxyRun> {
       public:
         H2WsProxyRun(std::shared_ptr<Http2Engine> engine, std::uint32_t stream_id, std::shared_ptr<Request> request,
-                     std::shared_ptr<Http2ResponseSink<Transport>> sink, WsProxyTarget target)
+                     std::shared_ptr<Http2ResponseSink<Transport>> sink, WsProxyTarget target,
+                     std::function<void()> released)
             : m_engine(std::move(engine)), m_id(stream_id), m_request(std::move(request)), m_sink(std::move(sink)),
-              m_target(std::move(target)), m_timer(m_engine->m_executor) {}
+              m_target(std::move(target)), m_released(std::move(released)), m_timer(m_engine->m_executor) {}
 
         void start() {
             auto self = this->shared_from_this();
@@ -3231,7 +3279,13 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
             m_timer.cancel();
             close_backend();
             m_engine->ws_stream_close(m_id);
-            m_engine->handler_finished(m_id);
+            // The engine's one-shot release: a synchronous throw out of start()
+            // may already have released the handler slot, and this run object
+            // must not release it a second time.
+            if (m_released)
+                m_released();
+            else
+                m_engine->handler_finished(m_id);
         }
 
         std::shared_ptr<Http2Engine> m_engine;
@@ -3239,6 +3293,7 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
         std::shared_ptr<Request> m_request;
         std::shared_ptr<Http2ResponseSink<Transport>> m_sink;
         WsProxyTarget m_target;
+        std::function<void()> m_released;
 
         std::shared_ptr<asio::ip::tcp::socket> m_backend;
         std::string m_key;
