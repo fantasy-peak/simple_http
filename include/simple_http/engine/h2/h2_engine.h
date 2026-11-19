@@ -326,9 +326,7 @@ class Http2ResponseSink final : public ResponseSink, public std::enable_shared_f
     void set_head_request(bool head) noexcept { m_head_request = head; }
 
   private:
-    template <typename Fn> void on_executor(Fn &&fn) const {
-        asio::dispatch(asio::bind_executor(asio::any_io_executor{m_executor}, std::forward<Fn>(fn)));
-    }
+    template <typename Fn> void on_executor(Fn &&fn) const { asio::dispatch(m_executor, std::forward<Fn>(fn)); }
 
     std::weak_ptr<Http2Engine<Transport>> m_engine;
     std::uint32_t m_stream_id;
@@ -941,24 +939,15 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
             st.recv_window = m_limits.h2_initial_window; // our advertised per-stream window
 
             // Consumption-based flow control: when the handler reads body bytes,
-            // hop back onto the connection executor and replenish credit for
-            // exactly that many bytes. Un-consumed data therefore keeps the
-            // window closed, bounding in-flight memory (no unbounded backlog).
+            // replenish credit for exactly that many bytes. Un-consumed data
+            // therefore keeps the window closed, bounding in-flight memory (no
+            // unbounded backlog). dispatch() runs inline when the reader is
+            // already on the connection executor (the common case) and hops
+            // otherwise, so the steady state costs no queued operation.
             std::weak_ptr<Http2Engine> weak = this->weak_from_this();
             auto exec = m_executor;
-            // The common case is a handler reading its body on the connection
-            // executor, where on_body_consumed() may run inline. Posting for
-            // every body chunk cost an executor operation (and its allocation)
-            // per request. A reader on any other thread still hops, which is
-            // what keeps this correct for a Body handed to another executor.
-            const std::thread::id connection_thread = m_thread_id;
-            st.request->body().set_on_consumed([weak, exec, stream_id, connection_thread](std::size_t n) {
-                if (std::this_thread::get_id() == connection_thread) {
-                    if (auto eng = weak.lock())
-                        eng->on_body_consumed(stream_id, n);
-                    return;
-                }
-                asio::post(exec, [weak, stream_id, n]() {
+            st.request->body().set_on_consumed([weak, exec, stream_id](std::size_t n) {
+                asio::dispatch(exec, [weak, stream_id, n] {
                     if (auto eng = weak.lock())
                         eng->on_body_consumed(stream_id, n);
                 });
@@ -3291,7 +3280,6 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
     // --- members (touched only on the connection executor) ---
     std::shared_ptr<Transport> m_transport;
     Executor m_executor;
-    const std::thread::id m_thread_id{std::this_thread::get_id()};
     asio::experimental::channel<void(error_code)> m_notify;
     EngineLimits m_limits;
     std::chrono::steady_clock::time_point m_deadline{};

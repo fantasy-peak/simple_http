@@ -116,8 +116,8 @@ template <typename Connection> class Http3ResponseSink : public ResponseSink {
 
     void send(int status, Headers headers, std::string body, WriteCompletion done) override {
         auto weak = m_engine;
-        asio::dispatch(asio::bind_executor(m_executor, [weak, id = m_stream_id, status, headers = std::move(headers),
-                                                        body = std::move(body), done = std::move(done)]() mutable {
+        asio::dispatch(m_executor, [weak, id = m_stream_id, status, headers = std::move(headers),
+                                    body = std::move(body), done = std::move(done)]() mutable {
             auto eng = weak.lock();
             if (!eng || !eng->alive() || !eng->stream_writable(id)) {
                 std::move(done)(make_error_code(asio::error::not_connected));
@@ -132,13 +132,13 @@ template <typename Connection> class Http3ResponseSink : public ResponseSink {
             if (!head)
                 eng->enqueue_body(id, std::move(body), /*last=*/true);
             std::move(done)(error_code{});
-        }));
+        });
     }
 
     void send_bodyless(int status, Headers headers, WriteCompletion done) override {
         auto weak = m_engine;
-        asio::dispatch(asio::bind_executor(m_executor, [weak, id = m_stream_id, status, headers = std::move(headers),
-                                                        done = std::move(done)]() mutable {
+        asio::dispatch(m_executor, [weak, id = m_stream_id, status, headers = std::move(headers),
+                                    done = std::move(done)]() mutable {
             auto eng = weak.lock();
             if (!eng || !eng->alive() || !eng->stream_writable(id)) {
                 std::move(done)(make_error_code(asio::error::not_connected));
@@ -150,13 +150,13 @@ template <typename Connection> class Http3ResponseSink : public ResponseSink {
             // (§4.1).
             eng->begin_response(id, status, headers, /*end_stream=*/true, /*with_body=*/false);
             std::move(done)(error_code{});
-        }));
+        });
     }
 
     void send_headers(int status, Headers headers, WriteCompletion done) override {
         auto weak = m_engine;
-        asio::dispatch(asio::bind_executor(m_executor, [weak, id = m_stream_id, status, headers = std::move(headers),
-                                                        done = std::move(done)]() mutable {
+        asio::dispatch(m_executor, [weak, id = m_stream_id, status, headers = std::move(headers),
+                                    done = std::move(done)]() mutable {
             auto eng = weak.lock();
             if (!eng || !eng->alive() || !eng->stream_writable(id)) {
                 std::move(done)(make_error_code(asio::error::not_connected));
@@ -169,13 +169,13 @@ template <typename Connection> class Http3ResponseSink : public ResponseSink {
             // has no body at all", which is what send_bodyless is for.
             eng->begin_response(id, status, headers, /*end_stream=*/head, /*with_body=*/!head);
             std::move(done)(error_code{});
-        }));
+        });
     }
 
     void send_chunk(std::string data, WriteCompletion done) override {
         auto weak = m_engine;
-        asio::dispatch(asio::bind_executor(m_executor, [weak, id = m_stream_id, head = m_head_request,
-                                                        data = std::move(data), done = std::move(done)]() mutable {
+        asio::dispatch(m_executor, [weak, id = m_stream_id, head = m_head_request, data = std::move(data),
+                                    done = std::move(done)]() mutable {
             auto eng = weak.lock();
             // Deliberately NOT gating on nghttp3_conn_is_stream_writable2
             // (which is what `stream_writable` is): that reports false while
@@ -210,13 +210,13 @@ template <typename Connection> class Http3ResponseSink : public ResponseSink {
                                            eng->enqueue_body(id, std::move(data), /*last=*/false);
                                            std::move(done)(error_code{});
                                        }));
-        }));
+        });
     }
 
     void send_last(std::string data, WriteCompletion done) override {
         auto weak = m_engine;
-        asio::dispatch(asio::bind_executor(m_executor, [weak, id = m_stream_id, head = m_head_request,
-                                                        data = std::move(data), done = std::move(done)]() mutable {
+        asio::dispatch(m_executor, [weak, id = m_stream_id, head = m_head_request, data = std::move(data),
+                                    done = std::move(done)]() mutable {
             auto eng = weak.lock();
             if (!eng || !eng->alive()) {
                 std::move(done)(make_error_code(asio::error::not_connected));
@@ -240,30 +240,29 @@ template <typename Connection> class Http3ResponseSink : public ResponseSink {
                                            eng->enqueue_body(id, std::move(data), /*last=*/true);
                                            std::move(done)(error_code{});
                                        }));
-        }));
+        });
     }
 
     void send_trailers(Headers trailers, WriteCompletion done) override {
         auto weak = m_engine;
-        asio::dispatch(
-            asio::bind_executor(m_executor, [weak, id = m_stream_id, head = m_head_request,
-                                             trailers = std::move(trailers), done = std::move(done)]() mutable {
-                auto eng = weak.lock();
-                if (!eng || !eng->alive()) {
-                    std::move(done)(make_error_code(asio::error::not_connected));
-                    return;
-                }
-                if (head) {
-                    std::move(done)(error_code{}); // HEAD: no body, so no trailer section either
-                    return;
-                }
-                if (!eng->stream_sendable(id)) {
-                    std::move(done)(make_error_code(asio::error::not_connected));
-                    return;
-                }
-                eng->submit_trailers(id, trailers);
-                std::move(done)(error_code{});
-            }));
+        asio::dispatch(m_executor, [weak, id = m_stream_id, head = m_head_request, trailers = std::move(trailers),
+                                    done = std::move(done)]() mutable {
+            auto eng = weak.lock();
+            if (!eng || !eng->alive()) {
+                std::move(done)(make_error_code(asio::error::not_connected));
+                return;
+            }
+            if (head) {
+                std::move(done)(error_code{}); // HEAD: no body, so no trailer section either
+                return;
+            }
+            if (!eng->stream_sendable(id)) {
+                std::move(done)(make_error_code(asio::error::not_connected));
+                return;
+            }
+            eng->submit_trailers(id, trailers);
+            std::move(done)(error_code{});
+        });
     }
 
     void connected(ConnectedCompletion done) const override {
@@ -271,23 +270,23 @@ template <typename Connection> class Http3ResponseSink : public ResponseSink {
         // engine's stream table, which the connection executor is inserting into
         // and erasing from concurrently.
         auto weak = m_engine;
-        asio::dispatch(asio::bind_executor(m_executor, [weak, id = m_stream_id, done = std::move(done)]() mutable {
+        asio::dispatch(m_executor, [weak, id = m_stream_id, done = std::move(done)]() mutable {
             auto eng = weak.lock();
             // A reset or finished stream cannot take a response either: report
             // the response as unwritable so callers (a proxy's 502 path, say)
             // stop rather than writing onto a dead stream.
             const bool open = eng && eng->alive() && eng->stream_writable(id);
             std::move(done)(error_code{}, open);
-        }));
+        });
     }
 
     void close(WriteCompletion done) override {
         auto weak = m_engine;
-        asio::dispatch(asio::bind_executor(m_executor, [weak, id = m_stream_id, done = std::move(done)]() mutable {
+        asio::dispatch(m_executor, [weak, id = m_stream_id, done = std::move(done)]() mutable {
             if (auto eng = weak.lock())
                 eng->reset_stream(id, kH3RequestCancelled);
             std::move(done)(error_code{});
-        }));
+        });
     }
 
     Version version() const override { return Version::Http3; }
@@ -1372,10 +1371,11 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         // POST 1 KiB body failed ~800 of 200000 requests, precisely at
         // (1 MiB / 1 KiB) requests x 200 connections.
         //
-        // Model A: the hook fires from Body::async_read on the connection
-        // executor (Body rejects a read from another thread). The post below is
-        // kept as a defensive hop; extend_* mutates ngtcp2 window state and
-        // pokes its wake-up, so it must only run on this connection's thread.
+        // Model A: the hook usually fires on the connection executor. dispatch
+        // runs the extend_* calls inline there (no queued operation per body
+        // chunk) and still hops when the read came from another executor;
+        // extend_* mutates ngtcp2 window state and pokes its wake-up, so it
+        // must only run on this connection's thread.
         std::weak_ptr<Http3Engine> weak = this->weak_from_this();
         auto exec = m_executor;
         auto consumed = stream->body_consumed;
@@ -1384,7 +1384,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
             // connection executor must not double-credit bytes the handler
             // already read.
             consumed->fetch_add(n, std::memory_order_acq_rel);
-            asio::post(exec, [weak, stream_id, n]() {
+            asio::dispatch(exec, [weak, stream_id, n] {
                 if (auto eng = weak.lock()) {
                     // erase_stream/release_unread_body already credited every
                     // byte the handler had not read when the stream closed; a

@@ -78,7 +78,7 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
   public:
     Http1ResponseSink(std::shared_ptr<Transport> transport, Version version, SharedDeadline deadline,
                       std::chrono::steady_clock::duration idle_timeout, std::string alt_svc = {},
-                      std::shared_ptr<std::atomic<bool>> continue_sent = {})
+                      std::shared_ptr<bool> continue_sent = {})
         : m_transport(std::move(transport)), m_executor(m_transport->get_executor()), m_version(version),
           m_alt_svc(std::move(alt_svc)), m_continue_sent(std::move(continue_sent)),
           m_writer(std::make_shared<SerializedWriter<Transport>>(m_transport, std::move(deadline), idle_timeout)) {}
@@ -171,9 +171,7 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
     bool head_request() const noexcept override { return m_head_request; }
 
   private:
-    template <typename Fn> void on_executor(Fn &&fn) const {
-        asio::dispatch(asio::bind_executor(asio::any_io_executor{m_executor}, std::forward<Fn>(fn)));
-    }
+    template <typename Fn> void on_executor(Fn &&fn) const { asio::dispatch(m_executor, std::forward<Fn>(fn)); }
 
     static constexpr std::size_t kResponseOverhead = 96;
     static constexpr std::string_view kCrLf = "\r\n";
@@ -390,9 +388,12 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
         }
         // At most one interim response per request, shared with the body
         // puller through the engine's flag.
-        if (m_continue_sent && m_continue_sent->exchange(true, std::memory_order_relaxed)) {
-            std::move(done)(error_code{});
-            return;
+        if (m_continue_sent) {
+            if (*m_continue_sent) {
+                std::move(done)(error_code{});
+                return;
+            }
+            *m_continue_sent = true;
         }
         m_writer->enqueue(WriteEntry::owned(std::string{kContinueResponse}), wrap(std::move(done)));
     }
@@ -533,7 +534,7 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
     // the next response.
     bool m_response_complete{false};
     std::string m_alt_svc;
-    std::shared_ptr<std::atomic<bool>> m_continue_sent;
+    std::shared_ptr<bool> m_continue_sent;
     // Sole owner of the transport write direction; see serialized_writer.h.
     std::shared_ptr<SerializedWriter<Transport>> m_writer;
 };
@@ -751,7 +752,7 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
             version != Version::Http1 && framing.has_body && header_has_token(head.headers, "expect", "100-continue");
         setup_body_framing(framing.chunked, framing.content_length);
         m_body_state.expect_continue = expect_continue;
-        m_continue_sent->store(false, std::memory_order_relaxed);
+        *m_continue_sent = false;
         request->mutable_headers() = std::move(head.headers);
         m_body_request = request;
 
@@ -959,10 +960,11 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
                 m_active_writer->send_continue(std::move(after));
                 return;
             }
-            if (m_continue_sent->exchange(true, std::memory_order_relaxed)) {
+            if (*m_continue_sent) {
                 pull_mode(std::move(done), slot);
                 return;
             }
+            *m_continue_sent = true;
             auto keep = std::make_shared<std::string>(kContinueResponse);
             const std::array<ConstByteSpan, 1> buffers{
                 ConstByteSpan{reinterpret_cast<const std::byte *>(keep->data()), keep->size()}};
@@ -1622,7 +1624,7 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
     void do_h2c_upgrade(const ParsedHead &head, const BodyFraming &framing) {
         setup_body_framing(framing.chunked, framing.content_length);
         m_body_state.expect_continue = framing.has_body && header_has_token(head.headers, "expect", "100-continue");
-        m_continue_sent->store(false, std::memory_order_relaxed);
+        *m_continue_sent = false;
         auto body = std::make_shared<std::string>();
         auto self = this->shared_from_this();
         drain_h2c_body(head, std::move(body));
@@ -1764,7 +1766,7 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
     // The sink handling the current request, used to serialize the lazy
     // 100-continue with any response the handler is writing concurrently.
     std::shared_ptr<Http1ResponseSink<Transport>> m_active_writer;
-    std::shared_ptr<std::atomic<bool>> m_continue_sent{std::make_shared<std::atomic<bool>>(false)};
+    std::shared_ptr<bool> m_continue_sent{std::make_shared<bool>(false)};
     bool m_pull_active{false};
     std::deque<std::shared_ptr<PendingPull>> m_pending_pulls;
     std::size_t m_trailer_bytes{0};

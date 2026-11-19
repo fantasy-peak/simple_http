@@ -182,7 +182,7 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
                 m_in.reset();
                 m_deflate.enabled = false;
             }
-            m_write_compression.store(m_compress_active.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            m_write_compression = m_compress_active;
         }
     }
 
@@ -312,8 +312,7 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
   private:
     template <typename Fn> void hop(Fn &&fn) {
         auto self = this->shared_from_this();
-        asio::dispatch(asio::bind_executor(asio::any_io_executor{m_executor},
-                                           [self, fn = std::forward<Fn>(fn)]() mutable { fn(); }));
+        asio::dispatch(m_executor, [self, fn = std::forward<Fn>(fn)]() mutable { fn(); });
     }
 
     void read_impl(WsReadCompletion done) {
@@ -739,11 +738,11 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
     std::size_t m_inbox_limit;
     bool m_expect_masked{true};
     WsDeflateConfig m_deflate;
-    // write_view()/compression_negotiated() read these synchronously from the
-    // caller's thread, before hopping onto the connection executor. They are
-    // written on the executor, so the snapshot must be atomic.
-    std::atomic<bool> m_compress_active{false};
-    std::atomic<bool> m_write_compression{false};
+    // m_compress_active is immutable after construction, so the cross-thread
+    // compression_negotiated() snapshot needs no atomic. m_write_compression
+    // is touched only on the connection executor.
+    bool m_compress_active{false};
+    bool m_write_compression{false};
     int m_compression_level{0};
     std::unique_ptr<WsDeflater> m_out;
     std::unique_ptr<WsInflater> m_in;
