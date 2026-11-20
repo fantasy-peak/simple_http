@@ -20,6 +20,7 @@
 // proxy's upstream I/O is unaffected because it is a different connection (and
 // usually a different executor in the pool).
 
+#include <algorithm>
 #include <array>
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/compose.hpp>
@@ -43,12 +44,20 @@ namespace asio = boost::asio;
 struct SendFileOptions {
     // Empty = derive from the file extension via mime::by_extension().
     std::string content_type;
-    // Refuse files larger than this (0 = no cap). Checked before opening.
+    // Refuse transfers larger than this (0 = no cap). Checked before opening.
     std::uint64_t max_bytes{0};
     // Send Content-Length before the body. Necessary for the one-shot framing a
     // HEAD response needs; a streamed GET could omit it, but keeping it lets
     // clients show progress and preserves the HEAD/GET symmetry.
     bool set_content_length{true};
+    // Set Content-Type from `content_type` / the extension. A caller that has
+    // already built the response head (static_files) turns this off to avoid
+    // duplicates.
+    bool apply_content_type{true};
+    // Stream [offset, offset + length) instead of the whole file. length == 0
+    // means "to EOF". Used by Range responses.
+    std::uint64_t offset{0};
+    std::uint64_t length{0};
 };
 
 namespace detail {
@@ -62,6 +71,7 @@ struct SendFileOp {
     std::array<char, 64 * 1024> buffer{};
     error_code pre;
     std::uintmax_t size{0};
+    std::uintmax_t remaining{0};
     int stage{0};
 
     asio::any_io_executor get_executor() const noexcept { return response.writer().get_executor(); }
@@ -75,23 +85,39 @@ struct SendFileOp {
         if (stat_ec) {
             return boost::system::errc::make_error_code(boost::system::errc::no_such_file_or_directory);
         }
-        if (options.max_bytes != 0 && size > options.max_bytes) {
+        if (options.offset > size) {
+            return boost::system::errc::make_error_code(boost::system::errc::invalid_argument);
+        }
+        const std::uintmax_t available = size - static_cast<std::uintmax_t>(options.offset);
+        remaining = options.length == 0 ? available : static_cast<std::uintmax_t>(options.length);
+        if (remaining > available) {
+            return boost::system::errc::make_error_code(boost::system::errc::invalid_argument);
+        }
+        if (options.max_bytes != 0 && remaining > options.max_bytes) {
             return boost::system::errc::make_error_code(boost::system::errc::file_too_large);
         }
         return {};
     }
 
     void apply_headers() {
-        const auto content_type =
-            options.content_type.empty() ? std::string{mime::by_extension(path)} : options.content_type;
-        response.content_type(content_type);
+        if (options.apply_content_type) {
+            const auto content_type =
+                options.content_type.empty() ? std::string{mime::by_extension(path)} : options.content_type;
+            response.content_type(content_type);
+        }
         if (options.set_content_length) {
-            response.header(field::content_length, std::to_string(size));
+            response.header(field::content_length, std::to_string(remaining));
         }
     }
 
     template <typename Self> void read_and_write(Self &self) {
-        file.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        if (remaining == 0) {
+            stage = 3;
+            response.async_finish(std::move(self));
+            return;
+        }
+        const auto want = static_cast<std::streamsize>(std::min<std::uintmax_t>(buffer.size(), remaining));
+        file.read(buffer.data(), want);
         const auto n = file.gcount();
         if (n <= 0) {
             if (file.bad()) {
@@ -102,6 +128,7 @@ struct SendFileOp {
             response.async_finish(std::move(self));
             return;
         }
+        remaining -= static_cast<std::uintmax_t>(n);
         stage = 2;
         response.async_write(std::string(buffer.data(), static_cast<std::size_t>(n)), std::move(self));
     }
@@ -120,6 +147,13 @@ struct SendFileOp {
             if (!file) {
                 self.complete(boost::system::errc::make_error_code(boost::system::errc::no_such_file_or_directory));
                 return;
+            }
+            if (options.offset != 0) {
+                file.seekg(static_cast<std::streamoff>(options.offset));
+                if (!file) {
+                    self.complete(boost::system::errc::make_error_code(boost::system::errc::io_error));
+                    return;
+                }
             }
             apply_headers();
             if (response.writer().head_request()) {
