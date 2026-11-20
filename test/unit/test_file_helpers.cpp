@@ -102,6 +102,28 @@ TEST_CASE("file: send_file honours max_bytes and custom options", "[file]") {
     }
 }
 
+TEST_CASE("file: send_file streams a requested byte range", "[file]") {
+    StaticFixture fixture;
+    fixture.write("range.txt", "0123456789");
+
+    asio::io_context ctx;
+    auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
+    ResponseWriter res{writer};
+    res.content_type("text/plain"); // the caller already built the head
+    SendFileOptions opts;
+    opts.offset = 2;
+    opts.length = 3;
+    opts.apply_content_type = false;
+    opts.set_content_length = false;
+    auto ec = run_on(ctx, as_ec(async_send_file(res, fixture.root_string() + "/range.txt", opts,
+                                                asio::as_tuple(asio::use_awaitable))));
+    REQUIRE(ec.has_value());
+    CHECK_FALSE(*ec);
+    CHECK(chunks_of(*writer) == "234");
+    CHECK(writer->header("content-type") == "text/plain");
+    CHECK_FALSE(writer->has_header("content-length"));
+}
+
 TEST_CASE("file: send_file answers HEAD without a body", "[file]") {
     StaticFixture fixture;
     fixture.write("a.txt", "hello file");

@@ -58,7 +58,8 @@
 #include "../core/url_path.h" // decode_and_normalize, under_prefix
 #include "../proto/request.h"
 #include "../proto/response.h"
-#include "handler.h" // RequestPtr, ResponsePtr
+#include "file_response.h" // async_send_file: stream on-demand representations
+#include "handler.h"       // RequestPtr, ResponsePtr
 
 namespace simple_http {
 
@@ -335,13 +336,19 @@ inline void StaticFiles::try_serve(const RequestPtr &req, const ResponsePtr &res
         // through and send the full representation, which RFC 9110 permits.
     }
 
-    auto body = m_table.read_body(*rep);
-    if (!body) {
-        // The file disappeared between startup and now. Treat it as a miss so the
-        // normal 404 path answers, rather than emitting an empty 200.
-        SIMPLE_HTTP_WARN_LOG("static: {} vanished after startup scan", rep->disk_path);
-        std::move(done)(false);
-        return;
+    // Preloaded representations are already in memory. Everything else is
+    // streamed from disk below: reading a large file into one std::string made
+    // every request (and every 1-byte Range) allocate the whole file.
+    std::optional<std::string> body;
+    if (rep->body) {
+        body = m_table.read_body(*rep);
+        if (!body) {
+            // The preloaded copy cannot normally vanish; keep the miss path for
+            // a table that was mutated by a future refactor.
+            SIMPLE_HTTP_WARN_LOG("static: {} vanished after startup scan", rep->disk_path);
+            std::move(done)(false);
+            return;
+        }
     }
 
     res->status(range ? status::partial_content : status::ok);
@@ -377,10 +384,46 @@ inline void StaticFiles::try_serve(const RequestPtr &req, const ResponsePtr &res
         // forwards the header block untouched. Setting it makes both protocols
         // emit the same bytes.
         res->header(field::content_length, std::to_string(rep->size));
+    } else {
+        // Plain GET: explicit length for the streamed path below (and the same
+        // header a one-shot send would have computed).
+        res->header(field::content_length, std::to_string(rep->size));
     }
 
     if (is_head) {
         res->async_send_bodyless([done = std::move(done)](error_code) mutable { std::move(done)(true); });
+        return;
+    }
+
+    if (!body) {
+        // On-demand representation: stream it in 64 KiB chunks. A Range streams
+        // only [first, last], not the whole file followed by substr().
+        SendFileOptions opts;
+        opts.apply_content_type = false; // already set by apply_headers()
+        opts.set_content_length = false; // ...and the exact length above
+        if (range) {
+            opts.offset = range->first;
+            opts.length = range->length();
+        }
+        async_send_file(*res, rep->disk_path, std::move(opts), [res, done = std::move(done)](error_code ec) mutable {
+            if (!ec) {
+                std::move(done)(true);
+                return;
+            }
+            if (ec == make_error_code(boost::system::errc::no_such_file_or_directory) && res->reset_for_error()) {
+                // Vanished since the scan: the normal 404 path answers.
+                std::move(done)(false);
+                return;
+            }
+            if (!res->reset_for_error()) {
+                // The head is already on the wire; closing is the
+                // only remaining option.
+                std::move(done)(true);
+                return;
+            }
+            res->status(status::internal_server_error);
+            res->async_send("", [done = std::move(done)](error_code) mutable { std::move(done)(true); });
+        });
         return;
     }
 
