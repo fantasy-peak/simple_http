@@ -29,9 +29,9 @@ typedef struct {
 
 // Definitions are inline at the bottom of this header (header-only).
 inline int http_huffman_decode_bits(unsigned char *state, unsigned char *ending, unsigned int bits, std::string &dst);
-inline int http_huffman_decode(unsigned char *state, unsigned char *src, size_t len, std::string &outstr,
+inline int http_huffman_decode(unsigned char *state, const unsigned char *src, size_t len, std::string &outstr,
                                unsigned int last);
-inline int http_huffman_encode(unsigned char *src, unsigned int len, std::string &outstr);
+inline int http_huffman_encode(const unsigned char *src, unsigned int len, std::string &outstr);
 
 inline const huffman_static_encode_t huffman_encode_table[] = {
     {13, 0xffc00000u}, {23, 0xffffb000u}, {28, 0xfffffe20u}, {28, 0xfffffe30u}, {28, 0xfffffe40u}, {28, 0xfffffe50u},
@@ -4229,9 +4229,10 @@ inline const http_huffman_decode_code_t http_huffman_decode_tables[256][16] = {/
 
 // --- inline definitions ---
 
-inline int http_huffman_decode(unsigned char *state, unsigned char *src, size_t len, std::string &outstr,
+inline int http_huffman_decode(unsigned char *state, const unsigned char *src, size_t len, std::string &outstr,
                                unsigned int last) {
-    unsigned char *end, ch, ending;
+    const unsigned char *end;
+    unsigned char ch, ending;
     ch = 0;
     ending = 1;
     end = src + len;
@@ -4271,7 +4272,7 @@ inline int http_huffman_decode_bits(unsigned char *state, unsigned char *ending,
     return SIMPLE_HTTP_HUFFMAN_OK;
 }
 
-inline int http_huffman_encode(unsigned char *src, unsigned int len, std::string &outstr) {
+inline int http_huffman_encode(const unsigned char *src, unsigned int len, std::string &outstr) {
     // Size first, then write through a pointer into the string's own storage.
     // The old implementation appended one byte at a time while shifting the
     // code bit-by-bit, which showed up as ~2% of the CPU in the response writer.

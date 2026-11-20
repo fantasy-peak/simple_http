@@ -93,6 +93,10 @@ class DecompressingClientStream final : public ClientStream,
     }
 
     void clear_head_cache() override {
+        // The decoder belongs to the head that created it. An interim 100 is
+        // followed by a second head; keeping the decoder would apply the
+        // interim's Content-Encoding to the final (possibly identity) body.
+        m_decoder.reset();
         reset_head();
         m_inner->clear_head_cache();
     }
@@ -113,7 +117,9 @@ class DecompressingClientStream final : public ClientStream,
                 std::move(done)(ec);
                 return;
             }
-            if (!head.bodyless) {
+            // 1xx is interim: it carries no body, and its fields are not the
+            // final representation's.
+            if (!head.bodyless && head.status >= 200) {
                 const auto values = head.headers.get_all("content-encoding");
                 if (values.size() == 1) {
                     const auto coding = parse_content_coding(values.front());

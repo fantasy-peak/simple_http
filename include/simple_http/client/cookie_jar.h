@@ -64,6 +64,13 @@ class CookieJar {
             if (!cookie) {
                 continue;
             }
+            // RFC 6265bis §5.3: a Secure cookie delivered over a non-secure
+            // scheme must be discarded. Otherwise a plaintext hop can plant a
+            // cookie that is later sent over HTTPS (session fixation). The
+            // loopback exception mirrors matches().
+            if (cookie->secure && parsed.scheme != "https" && !loopback_domain(parsed.host)) {
+                continue;
+            }
             // RFC 6265 §5.3 step 6: a Domain attribute that does not cover the
             // request host makes the whole cookie invalid (it is not silently
             // broadened to the host). A public suffix (or a single label such
@@ -237,8 +244,10 @@ class CookieJar {
         if (starts_with(request_path, cookie_path)) {
             // A cookie Path of "/" matches everything; otherwise the match must
             // end on a segment boundary ("/api" does not match "/apix").
-            return cookie_path.size() == 1 /* "/" */ || request_path.size() == cookie_path.size() ||
-                   request_path[cookie_path.size()] == '/';
+            // RFC 6265 §5.1.4: a cookie-path ending in "/" matches everything
+            // below it, not only an exact path or a "/"-delimited child.
+            return cookie_path.size() == 1 /* "/" */ || cookie_path.back() == '/' ||
+                   request_path.size() == cookie_path.size() || request_path[cookie_path.size()] == '/';
         }
         return false;
     }

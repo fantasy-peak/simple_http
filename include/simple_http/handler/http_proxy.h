@@ -55,6 +55,12 @@ inline ClientConfig proxy_hop_client_config(ClientConfig cfg, const HttpProxyTar
 
 } // namespace detail
 
+// The proxy buffers the whole request body before forwarding it. That buffer is
+// attacker-controlled and must have its own bound: EngineLimits::max_body_bytes
+// defaults to 64 MiB but its documented "0 = no limit" is a valid configuration,
+// and a reverse proxy that trusts it would read an arbitrary body into memory.
+inline constexpr std::size_t kHttpProxyMaxRequestBody = 64u * 1024 * 1024;
+
 inline void run_http_proxy(RequestPtr req, ResponsePtr res, bool client_is_tls, HttpProxyTarget target,
                            ClientConfig client_cfg, HandlerCompletion done) {
     auto completion = std::make_shared<HandlerCompletion>(std::move(done));
@@ -211,13 +217,18 @@ inline void run_http_proxy(RequestPtr req, ResponsePtr res, bool client_is_tls, 
     // the absence of CL silently dropped the body of every such proxied
     // request. A bodyless request completes immediately (h1 None mode, h2/h3
     // END_STREAM on the headers).
-    req->body().async_read_all([forward = std::move(forward), send_error](error_code ec, std::string body) mutable {
-        if (ec) {
-            send_error(status::bad_request, ec);
-            return;
-        }
-        forward(std::move(body));
-    });
+    req->body().async_read_all(kHttpProxyMaxRequestBody,
+                               [forward = std::move(forward), send_error](error_code ec, std::string body) mutable {
+                                   if (ec == asio::error::message_size) {
+                                       send_error(status::payload_too_large, ec);
+                                       return;
+                                   }
+                                   if (ec) {
+                                       send_error(status::bad_request, ec);
+                                       return;
+                                   }
+                                   forward(std::move(body));
+                               });
 }
 
 } // namespace simple_http

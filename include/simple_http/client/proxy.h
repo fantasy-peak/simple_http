@@ -167,6 +167,11 @@ inline result<ProxyConfig> parse_proxy_url(std::string_view raw) {
         }
     } else if (auto colon = rest.rfind(':'); colon != std::string_view::npos) {
         out.host = std::string{rest.substr(0, colon)};
+        // RFC 3986 §3.2.2 requires brackets around an IPv6 literal. Without
+        // this check "fe80::1" is split into host "fe80:" and port "1".
+        if (out.host.find(':') != std::string::npos) {
+            return result<ProxyConfig>(make_error_code(client_errc::proxy_error));
+        }
         port_str = rest.substr(colon + 1);
     } else {
         out.host = std::string{rest};
@@ -564,7 +569,7 @@ template <typename Stream> struct HttpConnectOp {
     template <typename Self> void operator()(Self &self, error_code ec = {}, std::string head = {}) {
         switch (stage) {
         case 0:
-            if (authority.empty() || contains_ctl(authority)) {
+            if (authority.empty() || contains_invalid_url_byte(authority)) {
                 self.complete(make_error_code(client_errc::proxy_error));
                 return;
             }

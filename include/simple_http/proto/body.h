@@ -20,7 +20,9 @@
 #include <boost/asio/any_completion_handler.hpp>
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/compose.hpp>
+#include <boost/asio/error.hpp>
 #include <boost/asio/experimental/channel.hpp>
+#include <boost/asio/post.hpp>
 #include <boost/system/result.hpp>
 #include <cstddef>
 #include <functional>
@@ -116,7 +118,15 @@ class Body {
 
     // Reads and concatenates the entire remaining body.
     template <typename Token> auto async_read_all(Token &&token) {
-        return asio::async_compose<Token, void(error_code, std::string)>(ReadAllOp{*this}, token, m_exec);
+        return async_read_all(0, std::forward<Token>(token));
+    }
+
+    // Same, but fails with asio::error::message_size as soon as the accumulated
+    // body would exceed `max_bytes` (0 = no limit). Callers that buffer an
+    // untrusted body must use this rather than trusting EngineLimits: a limit
+    // of 0 there means "unlimited", not "safe default".
+    template <typename Token> auto async_read_all(std::size_t max_bytes, Token &&token) {
+        return asio::async_compose<Token, void(error_code, std::string)>(ReadAllOp{*this, max_bytes}, token, m_exec);
     }
 
     // The executor this body's channel is bound to (model A: the connection's
@@ -450,10 +460,21 @@ class Body {
     };
 
     struct ReadAllOp {
+        // Bounds the inline read chain. A channel with buffered frames completes
+        // async_read() synchronously, and the h2/h3 consume hooks feed parked
+        // frames from inside that completion; without a yield the read-all
+        // operation would recurse once per frame (a few thousand 1-byte DATA
+        // frames overflow the worker stack).
+        static constexpr std::size_t kYieldAfter = 32;
+
+        explicit ReadAllOp(Body &b, std::size_t max = 0) : body(b), max_bytes(max) {}
+
         Body &body;
+        std::size_t max_bytes{0};
         std::string out;
         bool first{true};
         bool started{false};
+        std::size_t budget{kYieldAfter};
 
         asio::any_io_executor get_executor() noexcept { return body.m_exec; }
 
@@ -471,6 +492,10 @@ class Body {
                 self.complete(error_code{}, std::move(out));
                 return;
             }
+            if (max_bytes != 0 && out.size() + result.data.size() > max_bytes) {
+                self.complete(make_error_code(asio::error::message_size), std::string{});
+                return;
+            }
             // The first chunk is moved, not appended: async_read() already hands
             // its buffer over, so appending it into an empty string would be a
             // second allocation plus a copy of the whole (usually the only) chunk.
@@ -480,6 +505,14 @@ class Body {
             } else {
                 out.append(result.data);
             }
+            if (budget == 0) {
+                Body *next = &body;
+                budget = kYieldAfter;
+                asio::post(next->get_executor(),
+                           [self = std::move(self), next]() mutable { next->async_read(std::move(self)); });
+                return;
+            }
+            --budget;
             body.async_read(std::move(self));
         }
     };

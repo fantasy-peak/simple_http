@@ -8,6 +8,7 @@
 
 #include <boost/system/error_code.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <memory>
@@ -153,8 +154,35 @@ TEST_CASE("file: read_body_to_file caps the upload before it fills the disk", "[
     REQUIRE(result.has_value());
     REQUIRE_FALSE(result->has_value());
     CHECK(result->error() == boost::system::errc::make_error_code(boost::system::errc::file_too_large));
-    // The chunk that crossed the bound was never written.
-    CHECK(read_file(path).empty());
+    // The upload wrote to a temporary file, which is removed on failure; the
+    // target is never created.
+    CHECK_FALSE(std::filesystem::exists(path));
+}
+
+TEST_CASE("file: a failed upload leaves an existing target untouched", "[file]") {
+    StaticFixture fixture;
+    fixture.write("upload.bin", "ORIGINAL-CONTENT");
+    const std::string path = fixture.root_string() + "/upload.bin";
+
+    asio::io_context ctx;
+    Body body{ctx.get_executor()};
+    REQUIRE(body.feed(std::string{"0123456789"}));
+    body.finish();
+
+    auto result = run_on(
+        ctx, as_expected(async_read_body_to_file(body, path, /*max_bytes=*/4, asio::as_tuple(asio::use_awaitable))));
+    REQUIRE(result.has_value());
+    REQUIRE_FALSE(result->has_value());
+    CHECK(result->error() == boost::system::errc::make_error_code(boost::system::errc::file_too_large));
+    CHECK(read_file(path) == "ORIGINAL-CONTENT");
+
+    // No temporary file is left behind.
+    std::size_t entries = 0;
+    for (const auto &entry : std::filesystem::directory_iterator(fixture.root())) {
+        ++entries;
+        CHECK(entry.path().filename() == "upload.bin");
+    }
+    CHECK(entries == 1);
 }
 
 // client/multipart_stream.h: a short read at end-of-file sets both eofbit and

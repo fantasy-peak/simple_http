@@ -192,6 +192,9 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         std::size_t next{0};
         error_code last_error{make_error_code(asio::error::host_not_found)};
         Clock::time_point deadline{};
+        // Called once the UDP socket / QUIC session exists so the caller's
+        // cancellation hook can close it. Empty when no cancellation is wired.
+        std::function<void(std::function<void()>)> set_abort;
         asio::any_completion_handler<void(error_code, std::shared_ptr<Http3ClientSession>)> done;
     };
 
@@ -206,7 +209,8 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
     static auto async_connect(Executor ex, SSL_CTX *ssl_ctx, const ClientTarget &target, const ClientTlsHandshake &hs,
                               const EngineLimits &limits, std::uint32_t max_udp_payload_size,
                               std::chrono::milliseconds connect_timeout, std::chrono::milliseconds idle_timeout,
-                              const ResolveFn &resolve_fn, Token &&token) {
+                              const ResolveFn &resolve_fn, std::function<void(std::function<void()>)> set_abort,
+                              Token &&token) {
         auto state = std::make_shared<ConnectState>();
         state->ex = ex;
         state->ssl_ctx = ssl_ctx;
@@ -217,6 +221,7 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         state->connect_timeout = connect_timeout;
         state->idle_timeout = idle_timeout;
         state->resolve_fn = resolve_fn;
+        state->set_abort = std::move(set_abort);
         return asio::async_initiate<Token, void(error_code, std::shared_ptr<Http3ClientSession>)>(
             [state](auto handler) {
                 state->done = std::move(handler);
@@ -244,6 +249,15 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         if (ec) {
             std::move(done)(ec, nullptr);
             return;
+        }
+        if (state->set_abort) {
+            // Until the session exists, closing the UDP socket is the only
+            // resource that can be released. send/recv then fail and the
+            // connect attempt completes instead of waiting out its timer.
+            state->set_abort([socket] {
+                error_code ignored;
+                socket->close(ignored);
+            });
         }
 
         auto udp = std::make_shared<Udp>(socket);
@@ -283,6 +297,11 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
 
         auto session = std::make_shared<Http3ClientSession>(state->ex, std::move(conn), std::move(udp), state->target,
                                                             state->limits);
+        if (state->set_abort) {
+            // Once the session exists, close it (connection, timers and socket)
+            // rather than only the raw UDP socket.
+            state->set_abort([session] { session->close(); });
+        }
         SIMPLE_HTTP_DEBUG_LOG("h3 client: connection built, waiting for handshake");
         session->start(attempt_timeout, [session, done = std::move(done)](error_code ec) mutable {
             if (ec) {
@@ -332,8 +351,14 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
             std::move(state->done)(make_error_code(client_errc::version_not_negotiated), nullptr);
             return;
         }
-        async_resolve_endpoints(
-            state->resolve_fn, state->target.host, state->target.effective_port(), state->ex,
+        // Count resolution against the same budget as the QUIC handshake. The
+        // resolve hook may never call back; without a deadline the open would
+        // hang forever before connect_timeout even starts.
+        state->deadline =
+            state->connect_timeout.count() > 0 ? Clock::now() + state->connect_timeout : Clock::time_point::max();
+        async_resolve_bounded(
+            state->resolve_fn, state->target.host, state->target.effective_port(), state->ex, state->connect_timeout,
+            make_error_code(client_errc::connect_timeout),
             [state](error_code ec, std::vector<asio::ip::tcp::endpoint> endpoints) {
                 if (ec) {
                     std::move(state->done)(ec, nullptr);
@@ -362,8 +387,6 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
                         ++v6;
                     }
                 }
-                state->deadline = state->connect_timeout.count() > 0 ? Clock::now() + state->connect_timeout
-                                                                     : Clock::time_point::max();
                 connect_next(state);
             });
     }
@@ -448,6 +471,14 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
   private:
     void submit_open(std::shared_ptr<Request> request, std::int64_t id, std::shared_ptr<Stream> st,
                      std::string up_front, OpenCompletion done) {
+        // The request body may have been read asynchronously; m_h3_dead can
+        // have been set in that window, in which case h3() is null and
+        // nghttp3 must not be called.
+        if (h3() == nullptr || !m_alive) {
+            erase_stream(id);
+            std::move(done)(make_error_code(client_errc::session_closed), nullptr);
+            return;
+        }
         auto it = m_streams.find(id);
         if (it == m_streams.end()) {
             std::move(done)(make_error_code(client_errc::session_closed), nullptr);
@@ -522,6 +553,9 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
                     return;
                 }
             }
+            // Same associator loss as h2: the inner lambda is plain, so carry
+            // the caller's cancellation slot explicitly into await_out_space.
+            auto slot = asio::get_associated_cancellation_slot(done);
             auto finish_write = [self, id, last, done = std::move(done)](error_code ec) mutable {
                 if (ec) {
                     std::move(done)(ec);
@@ -542,21 +576,26 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
                 finish_write(error_code{});
                 return;
             }
-            self->await_out_space(
-                id, [self, id, data = std::move(data), finish_write = std::move(finish_write)](error_code ec) mutable {
-                    if (ec) {
-                        finish_write(ec);
-                        return;
-                    }
-                    auto it = self->m_streams.find(id);
-                    if (it == self->m_streams.end()) {
-                        finish_write(make_error_code(client_errc::session_closed));
-                        return;
-                    }
-                    it->second->out_bytes += data.size();
-                    it->second->out_q.push_back(std::move(data));
-                    finish_write(error_code{});
-                });
+            auto enqueue = [self, id, data = std::move(data),
+                            finish_write = std::move(finish_write)](error_code ec) mutable {
+                if (ec) {
+                    finish_write(ec);
+                    return;
+                }
+                auto it = self->m_streams.find(id);
+                if (it == self->m_streams.end()) {
+                    finish_write(make_error_code(client_errc::session_closed));
+                    return;
+                }
+                it->second->out_bytes += data.size();
+                it->second->out_q.push_back(std::move(data));
+                finish_write(error_code{});
+            };
+            if (slot.is_connected()) {
+                self->await_out_space(id, WriteCompletion(asio::bind_cancellation_slot(slot, std::move(enqueue))));
+            } else {
+                self->await_out_space(id, std::move(enqueue));
+            }
         });
     }
 
@@ -1015,7 +1054,7 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
             return;
         if (!field_within_budget(stream_id, st, name, value))
             return;
-        if (contains_ctl(name) || contains_ctl(value)) {
+        if (contains_ctl(name) || contains_ctl(value) || has_leading_or_trailing_ws(value)) {
             st.failed = true;
             st.outcome->set(StreamState::Failed, make_error_code(client_errc::protocol_error));
             return;
@@ -1024,6 +1063,21 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
             if (name == ":status")
                 st.status_text.assign(value);
             return; // other pseudo-headers are not response state we surface
+        }
+        // Regular field names are HTTP/1.1 tokens and must be lowercase
+        // (RFC 9113 §8.2.1 / RFC 9114 §4.1.2). QPACK can encode arbitrary
+        // bytes, so this has to be checked here.
+        if (!is_http_token(name)) {
+            st.failed = true;
+            st.outcome->set(StreamState::Failed, make_error_code(client_errc::protocol_error));
+            return;
+        }
+        for (char c : name) {
+            if (c >= 'A' && c <= 'Z') {
+                st.failed = true;
+                st.outcome->set(StreamState::Failed, make_error_code(client_errc::protocol_error));
+                return;
+            }
         }
         st.header_tmp.emplace_back(std::string{name}, std::string{value});
     }
@@ -1114,7 +1168,7 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
             return;
         if (!field_within_budget(stream_id, st, name, value))
             return;
-        if (contains_ctl(name) || contains_ctl(value)) {
+        if (contains_ctl(name) || contains_ctl(value) || has_leading_or_trailing_ws(value)) {
             st.failed = true;
             st.outcome->set(StreamState::Failed, make_error_code(client_errc::protocol_error));
             return;
@@ -1525,8 +1579,20 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
             return;
         }
         Stream &st = *it->second;
-        if (st.write_shut) {
+        if (st.write_shut || st.reset) {
             std::move(done)(make_error_code(client_errc::stream_reset));
+            return;
+        }
+        if (!m_alive) {
+            // The connection is gone; out_bytes will never drain.
+            std::move(done)(make_error_code(asio::error::connection_aborted));
+            return;
+        }
+        // A terminal stream state (reset by the peer, connection closed) never
+        // drains out_bytes, so checking only the watermark would park the write
+        // forever after the wake that reported the termination.
+        if (const auto state = st.outcome->get(); state != StreamState::Open) {
+            std::move(done)(outcome_error(*st.outcome));
             return;
         }
         // Bound the accumulated queue, not the subset currently in flight:

@@ -13,6 +13,7 @@
 
 #include <ngtcp2/ngtcp2.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 
@@ -82,7 +83,9 @@ inline Ngtcp2Params make_ngtcp2_params(const QuicConnectionConfig &cfg, ngtcp2_t
 
     ngtcp2_settings_default(&out.settings);
     out.settings.initial_ts = ts;
-    out.settings.max_tx_udp_payload_size = cfg.max_udp_payload_size;
+    // 65535 is the largest value a UDP length field can carry. The connection's
+    // send buffer is sized from the same clamped value.
+    out.settings.max_tx_udp_payload_size = std::min<std::uint64_t>(cfg.max_udp_payload_size, 65535);
     out.settings.ack_thresh = static_cast<std::size_t>(cfg.ack_thresh);
 
     // Today's stack treats `max_udp_payload_size` as a hard ceiling, and so does

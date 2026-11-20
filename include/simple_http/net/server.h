@@ -171,7 +171,15 @@ class Server {
     Server(const Server &) = delete;
     Server &operator=(const Server &) = delete;
 
-    ~Server() { stop(); }
+    ~Server() {
+        try {
+            stop();
+        } catch (...) {
+            // A destructor must not let an exception escape: stop() joins the
+            // worker threads (std::system_error is possible) and calls the
+            // user's LogSink, either of which may throw.
+        }
+    }
 
     // --- routing facade (forwards to the Router) ---
 
@@ -513,6 +521,14 @@ class Server {
 
     void stop() {
         if (!m_started) {
+            return;
+        }
+        // Teardown from a connection handler would join this worker thread to
+        // itself (std::system_error, then terminate) and destroy state the
+        // running request still uses. Refuse it; the caller must post stop()
+        // to a thread outside the pool.
+        if (const auto probe = core_snapshot(); probe && probe->pool && probe->pool->on_worker_thread()) {
+            SIMPLE_HTTP_ERROR_LOG("server: stop() called from a worker thread; post it to another thread");
             return;
         }
         m_stopping.store(true, std::memory_order_release);

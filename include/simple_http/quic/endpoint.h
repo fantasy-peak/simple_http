@@ -435,7 +435,11 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
 
     void handle_datagram(boost::span<const std::uint8_t> data, const asio::ip::udp::endpoint &remote) {
         ngtcp2_version_cid vc{};
-        const std::size_t scid_len = m_config.connection.connection_id_length;
+        // RFC 9000 §17.2 caps a connection ID at NGTCP2_MAX_CIDLEN (20)
+        // octets. The configured length is a public knob; passing an
+        // unchecked one to ngtcp2_pkt_decode_version_cid lets vc.dcidlen
+        // exceed the fixed ngtcp2_cid buffer used by send_stateless_reset.
+        const std::size_t scid_len = std::min<std::size_t>(m_config.connection.connection_id_length, NGTCP2_MAX_CIDLEN);
         switch (const int rv = ngtcp2_pkt_decode_version_cid(&vc, data.data(), data.size(), scid_len)) {
         case 0:
             break;
@@ -791,7 +795,9 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
         // makes it unforgeable by an attacker who cannot see the traffic, and
         // verifiable by the peer that can. conn::init advertises the same
         // derivation for the connection's own CIDs.
-        ngtcp2_cid_init(&cid, vc.dcid, vc.dcidlen);
+        // Defence in depth: even if a future decoder path reports a longer
+        // DCID, never write past ngtcp2_cid::data.
+        ngtcp2_cid_init(&cid, vc.dcid, std::min<std::size_t>(vc.dcidlen, NGTCP2_MAX_CIDLEN));
         if (ngtcp2_crypto_generate_stateless_reset_token(token.data(), m_secret.data(), m_secret.size(), &cid) != 0) {
             return;
         }

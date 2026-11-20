@@ -375,6 +375,11 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
             }
 
             const bool has_data = !data.empty();
+            // A parked write must stay cancellable. `enqueue` is a plain
+            // lambda, which carries no associators; sample the caller's slot
+            // before moving the completion into it and re-bind it for
+            // await_out_space (which parks on flow control).
+            auto slot = asio::get_associated_cancellation_slot(done);
             auto enqueue = [self, id, data = std::move(data), last, done = std::move(done)](error_code ec) mutable {
                 if (ec) {
                     if (auto found = self->m_streams.find(id); found != self->m_streams.end())
@@ -397,7 +402,11 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
                 std::move(done)(error_code{});
             };
             if (has_data) {
-                self->await_out_space(id, std::move(enqueue));
+                if (slot.is_connected()) {
+                    self->await_out_space(id, WriteCompletion(asio::bind_cancellation_slot(slot, std::move(enqueue))));
+                } else {
+                    self->await_out_space(id, std::move(enqueue));
+                }
                 return;
             }
             enqueue(error_code{});
@@ -507,6 +516,14 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
                     return;
                 }
                 if (ec) {
+                    std::move(done)(outcome_error(*outcome));
+                    return;
+                }
+                // it_finish() erases the entry before waking waiters. Walking
+                // back into await_head_impl() would then report protocol_error
+                // instead of the real terminal state (REFUSED_STREAM, reset,
+                // GOAWAY) — and is_retryable() depends on that code.
+                if (self->m_streams.find(id) == self->m_streams.end()) {
                     std::move(done)(outcome_error(*outcome));
                     return;
                 }
@@ -723,7 +740,7 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
             return make_error_code(client_errc::protocol_error);
         const std::string_view target =
             request.target().empty() ? std::string_view{"/"} : std::string_view{request.target()};
-        if (target.front() != '/' || contains_ctl(target)) {
+        if (target.front() != '/' || contains_invalid_url_byte(target)) {
             return make_error_code(client_errc::protocol_error); // :path must be origin-form
         }
 
@@ -741,7 +758,7 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
         // on the Request is an explicit override (reverse proxy preserve_host);
         // otherwise the connection target owns it.
         if (const auto host_override = request.header("host")) {
-            if (contains_ctl(*host_override)) {
+            if (contains_invalid_url_byte(*host_override)) {
                 return make_error_code(client_errc::invalid_header);
             }
             codec::hpack_append_literal(block, ":authority", *host_override);
@@ -1276,7 +1293,7 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
         int status = 0;
         bool saw_status = false;
         for (auto &f : fields) {
-            if (contains_ctl(f.name) || contains_ctl(f.value)) { // §8.2.1
+            if (contains_ctl(f.name) || contains_ctl(f.value) || has_leading_or_trailing_ws(f.value)) { // §8.2.1
                 reset_stream(id, codec::H2_PROTOCOL_ERROR);
                 return true;
             }
@@ -1301,6 +1318,14 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
                     reset_stream(id, codec::H2_PROTOCOL_ERROR);
                     return true;
                 }
+            }
+            // A regular field name is an HTTP/1.1 token (RFC 9113 §8.2.1).
+            // HPACK can encode any byte sequence; letting "x y" or "a:b"
+            // through would surface fields that no HTTP/1.1 serializer can
+            // reproduce. The server engine applies the same rule.
+            if (!is_http_token(f.name)) {
+                reset_stream(id, codec::H2_PROTOCOL_ERROR);
+                return true;
             }
             // TE is the one connection-specific field HTTP/2 allows, and only
             // with the value "trailers" (case-insensitive per RFC 9110 §5.6.2).

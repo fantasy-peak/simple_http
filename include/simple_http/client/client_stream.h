@@ -17,6 +17,7 @@
 #include <boost/asio/any_completion_handler.hpp>
 #include <boost/asio/async_result.hpp>
 #include <boost/asio/experimental/channel_error.hpp>
+#include <boost/asio/post.hpp>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -178,8 +179,16 @@ class ClientStream {
     }
 
     template <typename Token> auto async_read_all(std::size_t max_bytes, Token &&token) {
-        return asio::async_compose<Token, void(error_code, std::string)>(ReadAllOp{*this, max_bytes}, token,
-                                                                         head_executor());
+        return async_read_all(max_bytes, std::shared_ptr<void>{}, std::forward<Token>(token));
+    }
+
+    // `owner` keeps the object that owns this ClientStream (the public Stream
+    // handle) alive for the whole read. The caller may drop its handle right
+    // after starting the read; h2/h3 then deliver the next chunk later, from
+    // the session, and a bare reference would call into freed memory.
+    template <typename Token> auto async_read_all(std::size_t max_bytes, std::shared_ptr<void> owner, Token &&token) {
+        return asio::async_compose<Token, void(error_code, std::string)>(ReadAllOp{*this, max_bytes, std::move(owner)},
+                                                                         token, head_executor());
     }
 
     // --- state ---
@@ -257,10 +266,20 @@ class ClientStream {
     };
 
     struct ReadAllOp {
+        // A buffered read can complete synchronously and the session may hand
+        // the next chunk over inline; yield periodically so one read-all does
+        // not recurse once per chunk.
+        static constexpr std::size_t kYieldAfter = 32;
+
+        ReadAllOp(ClientStream &s, std::size_t max, std::shared_ptr<void> keep)
+            : stream(s), max_bytes(max), owner(std::move(keep)) {}
+
         ClientStream &stream;
         std::size_t max_bytes;
+        std::shared_ptr<void> owner;
         std::string out;
         bool started{false};
+        std::size_t budget{kYieldAfter};
 
         asio::any_io_executor get_executor() const noexcept { return stream.head_executor(); }
 
@@ -288,6 +307,14 @@ class ClientStream {
                 return;
             }
             out.append(chunk.data);
+            if (budget == 0) {
+                ClientStream *next = &stream;
+                budget = kYieldAfter;
+                asio::post(stream.head_executor(),
+                           [self = std::move(self), next]() mutable { next->read(ReadCompletion(std::move(self))); });
+                return;
+            }
+            --budget;
             stream.read(ReadCompletion(std::move(self)));
         }
     };

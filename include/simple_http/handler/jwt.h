@@ -390,18 +390,25 @@ inline Middleware jwt(JwtConfig config = {}) {
             jwt_reject(res, status::unauthorized, "JWT has no exp claim", std::move(done));
             return;
         }
-        // Written as differences rather than `exp + leeway` / `now + leeway`:
-        // `exp` is attacker-controlled and may be INT64_MAX, so the addition is
-        // signed integer overflow (undefined behavior). The subtractions below
-        // are only evaluated when their result is non-negative, so they cannot
-        // overflow either.
-        if (payload.exp != 0 && now > payload.exp && now - payload.exp > leeway) {
-            jwt_reject(res, status::unauthorized, "JWT has expired", std::move(done));
-            return;
+        // Differences, not sums: `exp`/`nbf` are attacker-controlled and may be
+        // at the end of the int64 range, where `exp + leeway` overflows. The
+        // comparisons below happen first, and the subtraction is done in
+        // unsigned arithmetic so that a negative `exp` (or a `nbf` near
+        // INT64_MAX) wraps into the correct positive distance instead of
+        // invoking signed-overflow UB.
+        if (payload.exp != 0 && now > payload.exp) {
+            const auto elapsed = static_cast<std::uint64_t>(now) - static_cast<std::uint64_t>(payload.exp);
+            if (elapsed > static_cast<std::uint64_t>(leeway)) {
+                jwt_reject(res, status::unauthorized, "JWT has expired", std::move(done));
+                return;
+            }
         }
-        if (payload.nbf != 0 && payload.nbf > now && payload.nbf - now > leeway) {
-            jwt_reject(res, status::unauthorized, "JWT is not valid yet", std::move(done));
-            return;
+        if (payload.nbf != 0 && payload.nbf > now) {
+            const auto early = static_cast<std::uint64_t>(payload.nbf) - static_cast<std::uint64_t>(now);
+            if (early > static_cast<std::uint64_t>(leeway)) {
+                jwt_reject(res, status::unauthorized, "JWT is not valid yet", std::move(done));
+                return;
+            }
         }
         if (!config.issuer.empty() && payload.iss != config.issuer) {
             jwt_reject(res, status::unauthorized, "JWT issuer mismatch", std::move(done));

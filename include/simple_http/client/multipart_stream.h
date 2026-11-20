@@ -52,7 +52,10 @@ inline std::string quote_multipart_param(std::string_view value) {
 }
 
 inline bool valid_multipart_param(std::string_view value) {
-    return value.find_first_of("\r\n") == std::string_view::npos;
+    // Match proto/multipart.h::validate_param: CR/LF would break the part
+    // header, and a NUL makes receivers that use c_str() see a shorter name
+    // (the classic "evil.php\0.jpg" filter bypass).
+    return value.find_first_of("\r\n") == std::string_view::npos && value.find('\0') == std::string_view::npos;
 }
 
 using MultipartDone = asio::any_completion_handler<void(error_code)>;

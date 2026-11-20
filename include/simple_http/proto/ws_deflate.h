@@ -324,6 +324,12 @@ class WsDeflater {
             }
             return true;
         }
+        // zlib's avail_in is 32-bit; a longer message would be compressed as
+        // its prefix and presented as if complete.
+        if (plain.size() > std::numeric_limits<uInt>::max()) {
+            m_ok = false;
+            return false;
+        }
         m_strm.next_in = reinterpret_cast<Bytef *>(const_cast<char *>(plain.data()));
         m_strm.avail_in = static_cast<uInt>(plain.size());
         std::array<char, 16384> tmp{};
@@ -408,6 +414,10 @@ class WsInflater {
   private:
     WsInflateStatus pump(std::string_view in, int flush, std::string &out, std::size_t budget) {
         if (!m_ok) {
+            return WsInflateStatus::Error;
+        }
+        if (in.size() > std::numeric_limits<uInt>::max()) {
+            m_ok = false;
             return WsInflateStatus::Error;
         }
         m_strm.next_in = reinterpret_cast<Bytef *>(const_cast<char *>(in.data()));

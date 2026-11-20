@@ -338,7 +338,7 @@ class Http1ClientSession final : public ClientSession,
     }
 
     error_code build_request_head(const Request &request, std::string &out) {
-        if (contains_ctl(request.method_token()) || contains_ctl(request.target())) {
+        if (contains_invalid_url_byte(request.method_token()) || contains_invalid_url_byte(request.target())) {
             return make_error_code(client_errc::invalid_spec);
         }
         out.reserve(256);
@@ -805,6 +805,15 @@ class Http1ClientSession final : public ClientSession,
                 if (ec) {
                     self->fail_exchange(ec);
                     std::move(done)(ec, ReadResult{});
+                    return;
+                }
+                if (!self->m_head_parsed) {
+                    // read_head() succeeds for an interim 1xx it surfaced to
+                    // the caller, but the real response is still on the wire.
+                    // Reading the body now would use the previous exchange's
+                    // framing (and on a first exchange finish the body at
+                    // once), so go back for the final head.
+                    self->do_exchange_read(std::move(done));
                     return;
                 }
                 self->read_body(std::move(done));

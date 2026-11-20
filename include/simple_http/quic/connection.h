@@ -243,8 +243,7 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
     }
 
     [[nodiscard]] SslHandle tls_handle() const {
-        auto *self = const_cast<QuicConnection *>(this);
-        SSL *ssl = self->m_crypto.ssl();
+        SSL *ssl = m_crypto.ssl();
         return ssl != nullptr ? SslHandle{ssl} : SslHandle{};
     }
 
@@ -258,8 +257,7 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
     // yet. QUIC mandates ALPN (§8.1), so an empty answer after the handshake
     // means the peer refused every protocol we offered.
     [[nodiscard]] std::string_view alpn_selected() const {
-        auto *self = const_cast<QuicConnection *>(this);
-        SSL *ssl = self->m_crypto.ssl();
+        SSL *ssl = m_crypto.ssl();
         if (ssl == nullptr)
             return {};
         const unsigned char *data = nullptr;
@@ -1156,7 +1154,15 @@ template <typename Executor> bool QuicConnection<Executor>::flush_writes() {
         // (see the PADDING note in write_pkt), so a batch would be sent as one
         // malformed datagram.
         const std::size_t packets_per_flush = m_client ? 1 : kPacketsPerFlush;
-        std::vector<std::uint8_t> buf(static_cast<std::size_t>(kMaxDatagram) * packets_per_flush);
+        // ngtcp2 is told to use `max_udp_payload_size` as both the MTU and the
+        // shaping ceiling (see make_ngtcp2_params). Allocating kMaxDatagram
+        // per segment would let it write past the buffer whenever the
+        // configured payload is larger than the default datagram size.
+        // 65535 is the largest value a UDP length field can represent.
+        const auto configured_payload = static_cast<std::size_t>(m_config.max_udp_payload_size);
+        const std::size_t max_datagram =
+            std::min<std::size_t>(std::max<std::size_t>(kMaxDatagram, configured_payload), 65535);
+        std::vector<std::uint8_t> buf(max_datagram * packets_per_flush);
         ngtcp2_path_storage ps;
         ngtcp2_path_storage_zero(&ps);
         ngtcp2_pkt_info pi{};
