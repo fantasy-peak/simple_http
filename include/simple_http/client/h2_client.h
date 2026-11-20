@@ -34,8 +34,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <boost/asio.hpp>
-#include <boost/asio/experimental/concurrent_channel.hpp>
 #include <charconv>
 #include <chrono>
 #include <cstddef>
@@ -51,6 +49,7 @@
 #include <utility>
 #include <vector>
 
+#include "../core/asio_compat.h"
 #include "../core/base64.h"
 #include "../core/http_field.h" // is_connection_specific_field
 #include "../core/http_method.h"
@@ -69,8 +68,6 @@
 #include "multiplexed_session.h"
 
 namespace simple_http::detail {
-
-namespace asio = boost::asio;
 
 // Protocol defaults (RFC 9113 §6.5.2, §6.9.2): what a peer may assume about us
 // until our SETTINGS say otherwise. The server engine has its own copies; these

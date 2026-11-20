@@ -9,7 +9,6 @@
 // StreamOutcome, forwards writes/reads to the session on its executor, and
 // reports the terminal state from a snapshot that outlives the table entry.
 
-#include <boost/asio.hpp>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -17,14 +16,13 @@
 #include <string_view>
 #include <utility>
 
+#include "../core/asio_compat.h"
 #include "../core/result.h"
 #include "../core/types.h"
 #include "client_config.h"
 #include "client_stream.h"
 
 namespace simple_http::detail {
-
-namespace asio = boost::asio;
 
 template <typename Derived>
 class MultiplexedClientSession : public ClientSession, public std::enable_shared_from_this<Derived> {

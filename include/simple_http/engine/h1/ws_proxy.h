@@ -26,7 +26,6 @@
 
 #include <algorithm>
 #include <array>
-#include <boost/asio.hpp>
 #include <chrono>
 #include <cstddef>
 #include <memory>
@@ -36,6 +35,7 @@
 #include <utility>
 
 #include "../../core/address.h"
+#include "../../core/asio_compat.h"
 #include "../../core/compat.h"
 #include "../../core/http_status.h" // reason_phrase (the 502 body/status line)
 #include "../../core/logging.h"
@@ -48,8 +48,6 @@
 #include "h1_parser.h"          // ParsedHead
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 // Reconstructs the raw HTTP/1.x request head (request line + headers + blank
 // line) from a ParsedHead. Kept as the low-level spelling used by the parser

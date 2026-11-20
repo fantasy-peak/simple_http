@@ -1,7 +1,6 @@
 // client/: the pure parts — URL parsing, targets and policy, the TLS knobs that
 // can be checked without a handshake, the h2c settings payload, error codes.
 
-#include <boost/asio/cancel_after.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
 #include <memory>
@@ -11,6 +10,7 @@
 
 #include "simple_http.h"
 #include "test_support.h"
+#include <simple_http/core/asio_compat.h>
 
 using namespace simple_http;
 using namespace simple_http::detail;

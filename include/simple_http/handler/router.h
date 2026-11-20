@@ -45,6 +45,7 @@
 #include <utility>
 #include <vector>
 
+#include "../core/asio_compat.h"
 #include "../core/glaze_support.h"
 #include "../core/http_field.h"
 #include "../core/http_method.h"
@@ -71,8 +72,6 @@ namespace simple_http_regex = std;
 #endif
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 // A reverse-proxy route: the backend recipe plus the client policy it dials
 // with. Each proxied request builds a fresh Client from this config.

@@ -9,18 +9,16 @@
 
 #include <algorithm>
 #include <array>
-#include <boost/asio.hpp>
 #include <cstddef>
 #include <memory>
 #include <utility>
 
+#include "../core/asio_compat.h"
 #include "../core/span.h"
 #include "../core/types.h"
 #include "transport.h"
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 template <typename Socket> class TcpTransport {
   public:

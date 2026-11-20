@@ -18,9 +18,6 @@
 // cancellation slot survives every intermediate sink call.
 
 #include <atomic>
-#include <boost/asio/any_completion_handler.hpp>
-#include <boost/asio/any_io_executor.hpp>
-#include <boost/asio/compose.hpp>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -29,6 +26,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "../core/asio_compat.h"
 #include "../core/http_field.h"
 #include "../core/http_status.h"
 #include "../core/logging.h"
@@ -38,8 +36,6 @@
 #include "response_writer.h"
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 class ResponseWriter {
   public:

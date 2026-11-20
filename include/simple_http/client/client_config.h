@@ -13,8 +13,6 @@
 // as the underlying asio error_code; failures the client itself decides on use
 // client_errc below.
 
-#include <boost/asio.hpp>
-#include <boost/asio/ssl.hpp>
 #include <boost/system/error_code.hpp>
 #include <charconv>
 #include <chrono>
@@ -30,6 +28,7 @@
 #include <utility>
 #include <vector>
 
+#include "../core/asio_ssl.h"
 #include "../core/http_date.h"
 #include "../core/http_method.h" // RetryPolicy::condition names Method
 #include "../core/limits.h"
@@ -38,8 +37,6 @@
 #include "../core/types.h"
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 // Feeds ClientConfig::cookie_jar; defined in client/cookie_jar.h.
 class CookieJar;

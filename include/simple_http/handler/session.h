@@ -30,8 +30,6 @@
 // trusted from the client. The id is generated with RAND_bytes (OpenSSL) and is
 // base64url-encoded without padding.
 
-#include <boost/asio/post.hpp>
-
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -46,9 +44,9 @@
 #include <unordered_map>
 #include <utility>
 
-#include <boost/asio/any_completion_handler.hpp>
 #include <openssl/rand.h>
 
+#include "../core/asio_compat.h"
 #include "../core/base64.h"
 #include "../core/compat.h"
 #include "../core/http_date.h"

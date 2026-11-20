@@ -17,10 +17,6 @@
 #include <algorithm>
 #include <any>
 #include <atomic>
-#include <boost/asio/any_io_executor.hpp>
-#include <boost/asio/cancellation_signal.hpp>
-#include <boost/asio/dispatch.hpp>
-#include <boost/asio/ip/tcp.hpp>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -34,7 +30,8 @@
 #include <vector>
 
 #include "../core/address.h" // peer_address
-#include "../core/base64.h"  // basic_auth
+#include "../core/asio_compat.h"
+#include "../core/base64.h" // basic_auth
 #include "../core/http_field.h"
 #include "../core/http_method.h"
 #include "../core/logging.h" // LogFields (access-log context)
@@ -44,8 +41,6 @@
 #include "query.h"
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 // A non-owning view of the Router's application-state registry, placed on the
 // Request by Router::dispatch. The registry itself is owned by the Router and

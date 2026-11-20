@@ -16,13 +16,13 @@
 // Boundaries split across reads are handled; the parser keeps only the tail
 // that could be the start of a boundary.
 
-#include <boost/asio/compose.hpp>
 #include <cstddef>
 #include <functional>
 #include <string>
 #include <string_view>
 #include <utility>
 
+#include "../core/asio_compat.h"
 #include "../core/types.h"
 #include "body.h"
 #include "multipart.h"

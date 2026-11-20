@@ -43,7 +43,6 @@
 // while the pre-compressed siblings sit unused — correct, just not the cheapest
 // path.
 
-#include <boost/asio/any_completion_handler.hpp>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -51,6 +50,7 @@
 #include <string_view>
 #include <vector>
 
+#include "../core/asio_compat.h"
 #include "../core/http_date.h"   // http_date
 #include "../core/http_field.h"  // field::
 #include "../core/http_status.h" // status::
@@ -62,8 +62,6 @@
 #include "handler.h"       // RequestPtr, ResponsePtr
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 struct StaticFilesConfig {
     // The table this server answers from. Nested rather than flattened so the

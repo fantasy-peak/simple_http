@@ -28,12 +28,7 @@
 // port keeps working when built as C++17. An empty list with no error is
 // treated as host_not_found by callers; IP literals need no query.
 
-#include <boost/asio/any_completion_handler.hpp>
-#include <boost/asio/any_io_executor.hpp>
-#include <boost/asio/compose.hpp>
-#include <boost/asio/dispatch.hpp>
-#include <boost/asio/ip/tcp.hpp>
-#include <boost/asio/steady_timer.hpp>
+#include "asio_compat.h"
 #include <chrono>
 #include <cstdint>
 #include <exception>
@@ -46,8 +41,6 @@
 #include "types.h"
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 using ResolveCompletion = asio::any_completion_handler<void(error_code, std::vector<asio::ip::tcp::endpoint>)>;
 

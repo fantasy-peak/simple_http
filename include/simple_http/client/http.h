@@ -16,15 +16,6 @@
 // promise.
 
 #include <algorithm>
-#include <boost/asio.hpp>
-#include <boost/asio/any_completion_handler.hpp>
-#include <boost/asio/any_io_executor.hpp>
-#include <boost/asio/associated_cancellation_slot.hpp>
-#include <boost/asio/async_result.hpp>
-#include <boost/asio/bind_cancellation_slot.hpp>
-#include <boost/asio/cancel_after.hpp>
-#include <boost/asio/cancellation_signal.hpp>
-#include <boost/asio/ssl.hpp>
 #include <chrono>
 #include <cstdio>
 #include <functional>
@@ -37,6 +28,7 @@
 #include <tuple>
 #include <utility>
 
+#include "../core/asio_ssl.h"
 #include "../core/base64.h"
 #include "../core/cancel.h"
 #include "../core/content_encoding.h"
@@ -65,8 +57,6 @@
 #include "ws_client.h"
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 namespace detail {
 // Marks a request whose Accept-Encoding the client injected itself; only those

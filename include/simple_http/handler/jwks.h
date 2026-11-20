@@ -30,11 +30,11 @@
 // document parser uses glaze reflection, so a plain C++17 build does not see
 // it.
 
+#include "../core/asio_compat.h"
 #include "../core/glaze_support.h"
 
 #if SIMPLE_HTTP_HAS_GLAZE
 
-#include <boost/asio/compose.hpp>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -52,8 +52,6 @@
 #include <optional>
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 struct JwkDocument {
     struct Key {

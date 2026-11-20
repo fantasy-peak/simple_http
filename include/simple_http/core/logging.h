@@ -38,6 +38,7 @@
 #include <variant>
 #include <vector>
 
+#include "asio_compat.h"
 #include "format.h"
 #include "source_location.h"
 #include "span.h"

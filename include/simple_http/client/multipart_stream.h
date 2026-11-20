@@ -19,10 +19,9 @@
 #include <string_view>
 #include <utility>
 
-#include <boost/asio/any_completion_handler.hpp>
-#include <boost/asio/async_result.hpp>
 #include <boost/system/error_code.hpp>
 
+#include "../core/asio_compat.h"
 #include "../core/mime.h"
 #include "../proto/headers.h"
 #include "../proto/multipart.h"

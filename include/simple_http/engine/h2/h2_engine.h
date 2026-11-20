@@ -25,9 +25,8 @@
 // Http2ResponseSink holds a weak_ptr and lock()s it per operation.
 
 #include <array>
-#include <boost/asio.hpp>
-#include <boost/asio/experimental/channel.hpp>
 
+#include "../../core/asio_compat.h"
 #include "../../core/cancel.h"
 #include <charconv>
 #include <chrono>
@@ -69,8 +68,6 @@
 #include "hpack_encoder.h"
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 template <typename Transport> class Http2Engine;
 

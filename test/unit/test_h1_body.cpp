@@ -5,7 +5,6 @@
 // the max_body_bytes bound. A disagreement here is a request-smuggling vector,
 // so each malformed shape must fail closed.
 
-#include <boost/asio.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <memory>
 #include <string>
@@ -13,6 +12,7 @@
 
 #include "simple_http.h"
 #include "test_support.h"
+#include <simple_http/core/asio_compat.h>
 
 using namespace simple_http;
 using namespace simple_http::test;

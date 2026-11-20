@@ -17,9 +17,8 @@
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 
+#include "../core/asio_ssl.h"
 #include "../core/format.h"
-#include <boost/asio.hpp>
-#include <boost/asio/ssl.hpp>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -32,8 +31,6 @@
 #include "client_config.h"
 
 namespace simple_http::detail {
-
-namespace asio = boost::asio;
 
 // Whether `host` is an IP literal (an IPv4/IPv6 address rather than a name).
 // Certificate matching for an IP goes through X509_VERIFY_PARAM_set1_ip_asc,

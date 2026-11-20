@@ -16,8 +16,6 @@
 // not have. Each chunk is bounded, so the executor is blocked only for one
 // write.
 
-#include <boost/asio/any_io_executor.hpp>
-#include <boost/asio/compose.hpp>
 #include <boost/system/error_code.hpp>
 #include <cstdint>
 #include <filesystem>
@@ -27,12 +25,11 @@
 #include <system_error>
 #include <utility>
 
+#include "../core/asio_compat.h"
 #include "../core/types.h"
 #include "../proto/body.h"
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 namespace detail {
 

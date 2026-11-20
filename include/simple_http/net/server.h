@@ -11,8 +11,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <boost/asio.hpp>
-#include <boost/asio/ssl.hpp>
 #include <boost/system/result.hpp>
 #include <chrono>
 #include <cstdint>
@@ -31,6 +29,7 @@
 #include <variant>
 #include <vector>
 
+#include "../core/asio_ssl.h"
 #include "../core/io_pool.h"
 #include "../core/limits.h"
 #include "../core/logging.h"
@@ -51,8 +50,6 @@
 #include "connection.h"
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 // An IP endpoint. Leave v6 false on an IPv6 host for dual-stack.
 struct InetAddress {

@@ -25,12 +25,11 @@
 // is described in core/glaze_support.h: a real C++17 build does not see these
 // helpers.
 
+#include "../core/asio_compat.h"
 #include "../core/glaze_support.h"
 
 #if SIMPLE_HTTP_HAS_GLAZE
 
-#include <boost/asio/any_io_executor.hpp>
-#include <boost/asio/compose.hpp>
 #include <string>
 #include <utility>
 
@@ -43,8 +42,6 @@
 #include "response.h"
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 namespace detail {
 

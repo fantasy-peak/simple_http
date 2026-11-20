@@ -27,12 +27,11 @@
 
 #include <nghttp3/nghttp3.h>
 
+#include "../core/asio_compat.h"
 #include "../core/compat.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <boost/asio.hpp>
-#include <boost/asio/experimental/concurrent_channel.hpp>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -65,8 +64,6 @@
 #include "tls_client.h"
 
 namespace simple_http::detail {
-
-namespace asio = boost::asio;
 
 // nghttp3 settings the server adapter also uses; kept local so this header does
 // not depend on engine/h3/h3_engine.h (which would pull the whole Dispatcher).

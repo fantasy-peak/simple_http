@@ -12,13 +12,12 @@
 // error_code completion argument; the caller's token decides whether they
 // surface as values or exceptions.
 
-#include <boost/asio/any_io_executor.hpp>
-#include <boost/asio/compose.hpp>
 #include <cstddef>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "../core/asio_compat.h"
 #include "../core/http_field.h"
 #include "../core/types.h"
 #include "body.h"
@@ -27,8 +26,6 @@
 #include "request.h"
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 namespace detail {
 

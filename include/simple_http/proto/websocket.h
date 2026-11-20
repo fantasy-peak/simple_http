@@ -26,11 +26,6 @@
 // answered with a Close before the read reports end-of-stream.
 
 #include <array>
-#include <boost/asio.hpp>
-#include <boost/asio/any_completion_handler.hpp>
-#include <boost/asio/async_result.hpp>
-#include <boost/asio/compose.hpp>
-#include <boost/asio/experimental/channel.hpp>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -46,6 +41,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "../core/asio_compat.h"
 #include "../core/logging.h"
 #include "../core/types.h"
 #include "../transport/serialized_writer.h"
@@ -55,8 +51,6 @@
 #include "ws_frame.h"
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 // Detects a Transport whose read-side EOF means only that this direction ended
 // (an HTTP/2 extended-CONNECT stream's END_STREAM), not that the connection is

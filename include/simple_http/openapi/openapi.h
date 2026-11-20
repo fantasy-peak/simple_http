@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../core/asio_compat.h"
 #include "../core/glaze_support.h"
 
 #if SIMPLE_HTTP_HAS_GLAZE
@@ -18,8 +19,6 @@
 
 #include <algorithm>
 #include <array>
-#include <boost/asio/any_io_executor.hpp>
-#include <boost/asio/compose.hpp>
 #include <cstddef>
 #include <glaze/glaze.hpp>
 #include <glaze/json/schema.hpp>

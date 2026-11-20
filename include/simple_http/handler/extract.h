@@ -41,6 +41,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "../core/asio_compat.h"
 #include "../core/glaze_support.h"
 #include "../core/logging.h"
 #include "../core/result.h"
@@ -479,7 +480,7 @@ void invoke_extracted(std::shared_ptr<F> fn, Tuple values, RequestPtr req, Respo
                 [&](auto &&...args) { (*fn)(std::forward<decltype(args)>(args)..., std::move(req), std::move(res)); },
                 std::move(values));
             finish();
-#if defined(BOOST_ASIO_HAS_CO_AWAIT)
+#if defined(SIMPLE_HTTP_HAS_CO_AWAIT)
         } else if constexpr (detail::extracted_coro_ssl<D, Tuple>::value) {
             detail::execute_extracted_coroutine(req, res, std::move(handed), fn,
                                                 std::tuple_cat(std::move(values), std::make_tuple(req, res, ssl)));
@@ -556,7 +557,7 @@ template <typename... Es, typename F> Handler extract(F &&fn) {
     using Fn = std::decay_t<F>;
     static_assert(detail::extracted_callback_ssl<Fn, values>::value || detail::extracted_callback<Fn, values>::value ||
                       detail::extracted_sync_ssl<Fn, values>::value || detail::extracted_sync<Fn, values>::value
-#if defined(BOOST_ASIO_HAS_CO_AWAIT)
+#if defined(SIMPLE_HTTP_HAS_CO_AWAIT)
                       || detail::extracted_coro_ssl<Fn, values>::value || detail::extracted_coro<Fn, values>::value
 #endif
                   ,

@@ -6,8 +6,8 @@
 // context with one acceptor: a connection accepted on a worker is served on
 // that same worker for its whole life.
 
+#include "asio_compat.h"
 #include <algorithm>
-#include <boost/asio.hpp>
 #include <cassert>
 #include <chrono>
 #include <condition_variable>
@@ -19,8 +19,6 @@
 #include <vector>
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 class IoCtxPool final {
   public:

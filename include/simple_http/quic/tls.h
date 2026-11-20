@@ -13,12 +13,12 @@
 #include <openssl/ssl.h>
 
 #include <array>
-#include <boost/asio/ssl.hpp>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 
+#include "../core/asio_ssl.h"
 #include "../core/logging.h"
 #include "../core/types.h"
 #include "../transport/tls_context.h"

@@ -14,9 +14,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <boost/asio.hpp>
-#include <boost/asio/associated_cancellation_slot.hpp>
-#include <boost/asio/bind_cancellation_slot.hpp>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -29,6 +26,7 @@
 #include <string_view>
 #include <utility>
 
+#include "../core/asio_compat.h"
 #include "../core/http_field.h"
 #include "../core/http_method.h"
 #include "../core/logging.h"
@@ -41,8 +39,6 @@
 #include "client_stream.h"
 
 namespace simple_http::detail {
-
-namespace asio = boost::asio;
 
 template <typename Transport> class Http1ClientSession;
 

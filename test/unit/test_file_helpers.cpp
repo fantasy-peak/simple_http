@@ -17,6 +17,7 @@
 #include "../support/static_fixture.h"
 #include "simple_http.h"
 #include "test_support.h"
+#include <simple_http/core/asio_compat.h>
 
 using namespace simple_http;
 using namespace simple_http::test;

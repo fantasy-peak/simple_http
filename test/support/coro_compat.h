@@ -9,9 +9,6 @@
 // back into the value-or-error (`std::expected`) model the reference drivers
 // were written against. Nothing here is part of the library.
 
-#include <boost/asio/as_tuple.hpp>
-#include <boost/asio/use_awaitable.hpp>
-
 #include <expected>
 #include <memory>
 #include <string>
@@ -19,10 +16,11 @@
 #include <utility>
 
 #include "simple_http.h"
+#include <simple_http/core/asio_compat.h>
 
 namespace simple_http::test {
 
-namespace asio = boost::asio;
+namespace asio = simple_http::asio;
 
 template <typename T>
 asio::awaitable<std::expected<T, error_code>> as_expected(asio::awaitable<std::tuple<error_code, T>> op) {

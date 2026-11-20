@@ -31,14 +31,14 @@
 #include <thread>
 #include <vector>
 
-#include <boost/asio/bind_cancellation_slot.hpp>
 #include <glaze/glaze.hpp>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 
 #include "simple_http.h"
+#include <simple_http/core/asio_compat.h>
 
-namespace asio = boost::asio;
+namespace asio = simple_http::asio;
 using namespace simple_http;
 
 namespace {

@@ -31,11 +31,10 @@
 #include <ngtcp2/ngtcp2.h>
 #include <openssl/rand.h>
 
+#include "../core/asio_compat.h"
 #include "../core/compat.h"
 #include <algorithm>
 #include <array>
-#include <boost/asio.hpp>
-#include <boost/asio/experimental/concurrent_channel.hpp>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -78,8 +77,6 @@
 #include "tls.h"
 
 namespace simple_http::quic {
-
-namespace asio = boost::asio;
 
 // One datagram in flight, and where it goes.
 //

@@ -17,7 +17,6 @@
 // checked against the request host, not against the PSL).
 
 #include <algorithm>
-#include <boost/asio/ip/address.hpp>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -27,6 +26,7 @@
 #include <string_view>
 #include <vector>
 
+#include "../core/asio_compat.h"
 #include "../core/compat.h"
 #include "../core/http_date.h" // parse_http_date
 #include "../core/http_field.h"

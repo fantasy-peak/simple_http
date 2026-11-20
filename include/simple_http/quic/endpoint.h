@@ -31,11 +31,11 @@
 #include <ngtcp2/ngtcp2_crypto.h>
 #include <openssl/rand.h>
 
+#include "../core/asio_compat.h"
 #include "../core/compat.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <boost/asio.hpp>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
@@ -68,8 +68,6 @@
 #include "tls.h"
 
 namespace simple_http::quic {
-
-namespace asio = boost::asio;
 
 // How long a Retry token stays valid. Bounded because the token is what proves
 // the client owned its address at some point, and "some point" has to expire.

@@ -22,8 +22,6 @@
 
 #include <algorithm>
 #include <array>
-#include <boost/asio/any_io_executor.hpp>
-#include <boost/asio/compose.hpp>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -32,14 +30,13 @@
 #include <system_error>
 #include <utility>
 
+#include "../core/asio_compat.h"
 #include "../core/http_field.h"
 #include "../core/mime.h"
 #include "../core/types.h"
 #include "../proto/response.h"
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 struct SendFileOptions {
     // Empty = derive from the file extension via mime::by_extension().

@@ -44,11 +44,10 @@
 
 #include <nghttp3/nghttp3.h>
 
+#include "../../core/asio_compat.h"
 #include "../../core/compat.h"
 #include <algorithm>
 #include <array>
-#include <boost/asio.hpp>
-#include <boost/asio/experimental/channel.hpp>
 
 #include "../../core/cancel.h"
 #include <chrono>
@@ -82,8 +81,6 @@
 #include "h3_stream.h"
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 // HTTP/3 error codes, spelled as nghttp3 spells them, so that a grep for a code
 // found in a trace lands on the same name the library reports.

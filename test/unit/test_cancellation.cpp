@@ -2,7 +2,6 @@
 // built on it (middleware::timeout): the Go r.Context() / axum CancellationToken
 // shape, adapted to asio coroutines.
 
-#include <boost/asio/experimental/awaitable_operators.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
 #include <memory>
@@ -10,6 +9,7 @@
 
 #include "simple_http.h"
 #include "test_support.h"
+#include <simple_http/core/asio_compat.h>
 
 using namespace simple_http;
 using namespace simple_http::test;

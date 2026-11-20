@@ -15,7 +15,6 @@
 // The JSONL observation format is in test/diff/support/harness.py.
 
 #include <algorithm>
-#include <boost/asio.hpp>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -32,10 +31,11 @@
 #include <glaze/glaze.hpp>
 
 #include "simple_http.h"
+#include <simple_http/core/asio_compat.h>
 
 #include "../../../support/coro_compat.h"
 
-namespace asio = boost::asio;
+namespace asio = simple_http::asio;
 using namespace simple_http;
 using namespace simple_http::test;
 using namespace std::chrono_literals;

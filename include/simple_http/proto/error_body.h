@@ -14,12 +14,12 @@
 // port deliberately does not depend on a JSON library yet. Generic JSON
 // serialization (read_json_body / write_json) is a later phase.
 
-#include <boost/asio/any_completion_handler.hpp>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
 
+#include "../core/asio_compat.h"
 #include "../core/http_status.h"
 #include "response.h"
 

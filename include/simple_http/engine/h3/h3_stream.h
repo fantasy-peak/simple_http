@@ -26,7 +26,6 @@
 // information, so dropping it is correct.
 
 #include <atomic>
-#include <boost/asio/experimental/channel.hpp>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -35,13 +34,12 @@
 #include <utility>
 #include <vector>
 
+#include "../../core/asio_compat.h"
 #include "../../core/types.h"
 #include "../../proto/request.h"
 #include "../../proto/response.h"
 
 namespace simple_http::h3 {
-
-namespace asio = boost::asio;
 
 // A one-shot wake-up with a coalescing send. `try_send` posts rather than
 // inlining the wake, which is what makes it safe to call from inside an ngtcp2

@@ -10,9 +10,6 @@
 
 #include <algorithm>
 #include <array>
-#include <boost/asio.hpp>
-#include <boost/asio/cancel_after.hpp>
-#include <boost/asio/ssl.hpp>
 #include <chrono>
 #include <cstddef>
 #include <cstring>
@@ -20,13 +17,12 @@
 #include <string_view>
 #include <utility>
 
+#include "../core/asio_ssl.h"
 #include "../core/span.h"
 #include "../core/types.h"
 #include "transport.h"
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 template <typename Socket> class TlsTransport {
   public:

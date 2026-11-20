@@ -13,11 +13,6 @@
 // sessions multiplex.
 
 #include <atomic>
-#include <boost/asio.hpp>
-#include <boost/asio/any_completion_handler.hpp>
-#include <boost/asio/async_result.hpp>
-#include <boost/asio/experimental/channel_error.hpp>
-#include <boost/asio/post.hpp>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -25,6 +20,7 @@
 #include <string_view>
 #include <utility>
 
+#include "../core/asio_compat.h"
 #include "../core/base64.h"
 #include "../core/compat.h"
 #include "../core/http_field.h"
@@ -38,8 +34,6 @@
 #include "client_config.h"
 
 namespace simple_http::detail {
-
-namespace asio = boost::asio;
 
 // The response head, as async_read_head() returns it.
 struct ResponseHead {
