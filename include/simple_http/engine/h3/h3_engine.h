@@ -1424,6 +1424,31 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         stream.dispatched = true;
         ++m_active_handlers;
 
+        // A synchronous callback handler would otherwise run inside nghttp3's
+        // parse callback: on_headers_end/on_end_stream are invoked from
+        // nghttp3_conn_read_stream2, and a handler that calls res->async_send()
+        // reaches nghttp3_conn_submit_response/resume_stream before the parser
+        // has returned. nghttp3's callback contract does not allow that.
+        // Accounting (dispatched flag, active-handler count, queue bound) stays
+        // synchronous so Rapid Reset remains bounded; only the user code is
+        // deferred to the next executor turn.
+        auto self = this->shared_from_this();
+        asio::post(m_executor, [self, stream_id] { self->start_handler(stream_id); });
+    }
+
+    // Runs on the connection executor, outside any nghttp3 parse callback.
+    void start_handler(std::int64_t stream_id) {
+        auto it = m_streams.find(stream_id);
+        if (it == m_streams.end()) {
+            handler_finished(stream_id); // retired while the start was queued
+            return;
+        }
+        Stream &stream = *it->second;
+        if (stream.reset || stream.headers_rejected) {
+            handler_finished(stream_id);
+            return;
+        }
+
         auto writer = std::make_shared<Http3ResponseSink<Connection>>(this->weak_from_this(), stream_id, m_executor);
         writer->set_head_request(stream.is_head); // cached before the response can retire the stream entry
         stream.response =
