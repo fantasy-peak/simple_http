@@ -1130,49 +1130,6 @@ inline void async_connect_bounded(std::shared_ptr<asio::ip::tcp::socket> socket,
         [state, finish](error_code ec, const asio::ip::tcp::endpoint &peer) mutable { finish(ec, peer); });
 }
 
-// Resolves with the whole-dial connect budget. The underlying resolver is not
-// cancellable, but the one-shot completion means a late answer is ignored and
-// the caller stops waiting. Without this, a black-holed DNS server (or a custom
-// ResolveFn that never calls back) hung dial() forever.
-struct ResolveBoundedState {
-    std::shared_ptr<asio::steady_timer> timer;
-    asio::any_completion_handler<void(error_code, std::vector<asio::ip::tcp::endpoint>)> done;
-    bool finished{false};
-};
-
-inline void
-async_resolve_bounded(ResolveFn resolve, std::string host, std::uint16_t port, asio::any_io_executor ex,
-                      std::chrono::milliseconds limit,
-                      asio::any_completion_handler<void(error_code, std::vector<asio::ip::tcp::endpoint>)> done) {
-    auto state = std::make_shared<ResolveBoundedState>();
-    state->done = std::move(done);
-    auto finish = [state](error_code ec, std::vector<asio::ip::tcp::endpoint> endpoints) {
-        if (state->finished)
-            return;
-        state->finished = true;
-        if (state->timer)
-            state->timer->cancel();
-        auto completion = std::move(state->done);
-        std::move(completion)(ec, std::move(endpoints));
-    };
-    if (limit.count() > 0) {
-        state->timer = std::make_shared<asio::steady_timer>(ex);
-        state->timer->expires_after(limit);
-        state->timer->async_wait([state](error_code ec) {
-            if (ec || state->finished)
-                return;
-            state->finished = true;
-            auto completion = std::move(state->done);
-            std::move(completion)(make_error_code(client_errc::connect_timeout),
-                                  std::vector<asio::ip::tcp::endpoint>{});
-        });
-    }
-    async_resolve_endpoints(std::move(resolve), std::move(host), port, ex,
-                            [finish](error_code ec, std::vector<asio::ip::tcp::endpoint> endpoints) mutable {
-                                finish(ec, std::move(endpoints));
-                            });
-}
-
 // Bounds a CONNECT/SOCKS5 handshake. The tunnel operations touch a socket the
 // caller owns, so timeout means "close that socket, report connect_timeout";
 // their late completion is ignored. IPv6-only/WSL2 paths can otherwise drop a
@@ -1578,75 +1535,75 @@ inline void Client::dial(const detail::Url &url, HttpVersionPolicy version, std:
     }
 
     auto self = keep_alive();
-    detail::async_resolve_bounded(
-        m_config.resolve, url.host, url.effective_port(), m_executor, m_config.connect_timeout,
-        [self, url, version, cancel, done = std::move(done)](error_code ec,
-                                                             std::vector<asio::ip::tcp::endpoint> endpoints) mutable {
-            if (cancel && cancel->cancelled) {
-                std::move(done)(make_error_code(asio::error::operation_aborted), nullptr);
-                return;
-            }
-            if (ec) {
-                std::move(done)(ec, nullptr);
-                return;
-            }
-            if (endpoints.empty()) {
-                std::move(done)(make_error_code(asio::error::host_not_found), nullptr);
-                return;
-            }
-            auto socket = std::make_shared<asio::ip::tcp::socket>(self->m_executor);
-            if (cancel) {
-                cancel->abort_transport = [socket] {
-                    error_code ignored;
-                    socket->close(ignored);
-                };
-            }
-            error_code option_ec;
-            if (self->m_config.tcp_nodelay) {
-                socket->set_option(asio::ip::tcp::no_delay(true), option_ec);
-            }
-            if (self->m_config.tcp_keepalive) {
-                socket->set_option(asio::socket_base::keep_alive(true), option_ec);
-            }
-            if (self->m_config.socket_setup) {
-                try {
-                    self->m_config.socket_setup(*socket);
-                } catch (const std::exception &) {
-                }
-            }
-            detail::async_connect_bounded(
-                socket, std::make_shared<std::vector<asio::ip::tcp::endpoint>>(std::move(endpoints)),
-                self->m_config.connect_timeout, self->m_executor,
-                [self, url, socket, version, cancel, done = std::move(done)](error_code cec,
-                                                                             asio::ip::tcp::endpoint peer) mutable {
-                    if (cancel && cancel->cancelled) {
-                        std::move(done)(make_error_code(asio::error::operation_aborted), nullptr);
-                        return;
-                    }
-                    if (cec) {
-                        std::move(done)(cec, nullptr);
-                        return;
-                    }
-                    if (!url.use_tls()) {
-                        self->start_session(std::make_shared<TcpStreamTransport>(socket, peer), url, version,
-                                            std::move(done));
-                        return;
-                    }
-                    auto context = self->m_tls_context;
-                    if (!context) {
-                        try {
-                            context = detail::make_client_ssl_context(self->m_config.tls);
-                        } catch (const std::exception &) {
-                            std::move(done)(make_error_code(client_errc::invalid_spec), nullptr);
-                            return;
-                        }
-                    }
-                    auto stream =
-                        std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(std::move(*socket), *context);
-                    self->tls_handshake_and_start(std::make_shared<TlsStreamTransport>(stream, peer), url, version,
-                                                  cancel, std::move(done));
-                });
-        });
+    async_resolve_bounded(m_config.resolve, url.host, url.effective_port(), m_executor, m_config.connect_timeout,
+                          make_error_code(client_errc::connect_timeout),
+                          [self, url, version, cancel, done = std::move(done)](
+                              error_code ec, std::vector<asio::ip::tcp::endpoint> endpoints) mutable {
+                              if (cancel && cancel->cancelled) {
+                                  std::move(done)(make_error_code(asio::error::operation_aborted), nullptr);
+                                  return;
+                              }
+                              if (ec) {
+                                  std::move(done)(ec, nullptr);
+                                  return;
+                              }
+                              if (endpoints.empty()) {
+                                  std::move(done)(make_error_code(asio::error::host_not_found), nullptr);
+                                  return;
+                              }
+                              auto socket = std::make_shared<asio::ip::tcp::socket>(self->m_executor);
+                              if (cancel) {
+                                  cancel->abort_transport = [socket] {
+                                      error_code ignored;
+                                      socket->close(ignored);
+                                  };
+                              }
+                              error_code option_ec;
+                              if (self->m_config.tcp_nodelay) {
+                                  socket->set_option(asio::ip::tcp::no_delay(true), option_ec);
+                              }
+                              if (self->m_config.tcp_keepalive) {
+                                  socket->set_option(asio::socket_base::keep_alive(true), option_ec);
+                              }
+                              if (self->m_config.socket_setup) {
+                                  try {
+                                      self->m_config.socket_setup(*socket);
+                                  } catch (const std::exception &) {
+                                  }
+                              }
+                              detail::async_connect_bounded(
+                                  socket, std::make_shared<std::vector<asio::ip::tcp::endpoint>>(std::move(endpoints)),
+                                  self->m_config.connect_timeout, self->m_executor,
+                                  [self, url, socket, version, cancel,
+                                   done = std::move(done)](error_code cec, asio::ip::tcp::endpoint peer) mutable {
+                                      if (cancel && cancel->cancelled) {
+                                          std::move(done)(make_error_code(asio::error::operation_aborted), nullptr);
+                                          return;
+                                      }
+                                      if (cec) {
+                                          std::move(done)(cec, nullptr);
+                                          return;
+                                      }
+                                      if (!url.use_tls()) {
+                                          self->start_session(std::make_shared<TcpStreamTransport>(socket, peer), url,
+                                                              version, std::move(done));
+                                          return;
+                                      }
+                                      auto context = self->m_tls_context;
+                                      if (!context) {
+                                          try {
+                                              context = detail::make_client_ssl_context(self->m_config.tls);
+                                          } catch (const std::exception &) {
+                                              std::move(done)(make_error_code(client_errc::invalid_spec), nullptr);
+                                              return;
+                                          }
+                                      }
+                                      auto stream = std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(
+                                          std::move(*socket), *context);
+                                      self->tls_handshake_and_start(std::make_shared<TlsStreamTransport>(stream, peer),
+                                                                    url, version, cancel, std::move(done));
+                                  });
+                          });
 }
 
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
@@ -1681,6 +1638,10 @@ inline void Client::dial_h3(const detail::Url &url, std::shared_ptr<detail::HopC
     detail::Http3ClientSession<asio::any_io_executor>::async_connect(
         m_executor, context->native_handle(), target, hs, m_config.limits, m_config.quic_max_udp_payload_size,
         m_config.connect_timeout, m_config.idle_timeout, m_config.resolve,
+        [cancel](std::function<void()> abort) {
+            if (cancel)
+                cancel->abort_transport = std::move(abort);
+        },
         // Keep the SSL_CTX alive until the connection (and therefore SSL_new,
         // which takes its own reference) has been created. When the Client had
         // no context of its own, `context` above is a local that would otherwise
@@ -1704,8 +1665,9 @@ inline void Client::dial_h3(const detail::Url &url, std::shared_ptr<detail::HopC
 inline void Client::dial_via_proxy(const detail::Url &url, const ProxyConfig &proxy, HttpVersionPolicy version,
                                    std::shared_ptr<detail::HopCancel> cancel, DialDone done) const {
     auto self = keep_alive();
-    detail::async_resolve_bounded(
+    async_resolve_bounded(
         m_config.resolve, proxy.host, proxy.effective_port(), m_executor, m_config.connect_timeout,
+        make_error_code(client_errc::connect_timeout),
         [self, url, proxy, version, cancel,
          done = std::move(done)](error_code ec, std::vector<asio::ip::tcp::endpoint> endpoints) mutable {
             if (cancel && cancel->cancelled) {
@@ -2338,8 +2300,9 @@ Client::open_ws_via_proxy(const detail::Url &url, const ProxyConfig &proxy, std:
     // helpers and socket options as a direct dial: otherwise a custom
     // ResolveFn, connect_timeout, tcp_nodelay and socket_setup are all
     // silently ignored for wss:// over a proxy.
-    detail::async_resolve_bounded(
+    async_resolve_bounded(
         m_config.resolve, proxy.host, proxy.effective_port(), m_executor, m_config.connect_timeout,
+        make_error_code(client_errc::connect_timeout),
         [self, url, proxy, path, authority, spec, cancel,
          done = std::move(done)](error_code ec, std::vector<asio::ip::tcp::endpoint> endpoints) mutable {
             if (cancel && cancel->cancelled) {
@@ -2571,8 +2534,9 @@ inline void Client::open_ws_hop(std::string url, WebSocketSpec spec, std::shared
     // apply to a WebSocket too. A black-holed DNS server or a dropped SYN used
     // to hang open_websocket() forever, and tcp_nodelay/socket_setup were
     // silently ignored on this path.
-    detail::async_resolve_bounded(
+    async_resolve_bounded(
         m_config.resolve, target.host, target.effective_port(), m_executor, m_config.connect_timeout,
+        make_error_code(client_errc::connect_timeout),
         [self, target, path, authority, spec, cancel,
          done = std::move(done)](error_code ec, std::vector<asio::ip::tcp::endpoint> endpoints) mutable {
             if (cancel && cancel->cancelled) {

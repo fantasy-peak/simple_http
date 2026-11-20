@@ -192,6 +192,9 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         std::size_t next{0};
         error_code last_error{make_error_code(asio::error::host_not_found)};
         Clock::time_point deadline{};
+        // Called once the UDP socket / QUIC session exists so the caller's
+        // cancellation hook can close it. Empty when no cancellation is wired.
+        std::function<void(std::function<void()>)> set_abort;
         asio::any_completion_handler<void(error_code, std::shared_ptr<Http3ClientSession>)> done;
     };
 
@@ -206,7 +209,8 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
     static auto async_connect(Executor ex, SSL_CTX *ssl_ctx, const ClientTarget &target, const ClientTlsHandshake &hs,
                               const EngineLimits &limits, std::uint32_t max_udp_payload_size,
                               std::chrono::milliseconds connect_timeout, std::chrono::milliseconds idle_timeout,
-                              const ResolveFn &resolve_fn, Token &&token) {
+                              const ResolveFn &resolve_fn, std::function<void(std::function<void()>)> set_abort,
+                              Token &&token) {
         auto state = std::make_shared<ConnectState>();
         state->ex = ex;
         state->ssl_ctx = ssl_ctx;
@@ -217,6 +221,7 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         state->connect_timeout = connect_timeout;
         state->idle_timeout = idle_timeout;
         state->resolve_fn = resolve_fn;
+        state->set_abort = std::move(set_abort);
         return asio::async_initiate<Token, void(error_code, std::shared_ptr<Http3ClientSession>)>(
             [state](auto handler) {
                 state->done = std::move(handler);
@@ -244,6 +249,15 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         if (ec) {
             std::move(done)(ec, nullptr);
             return;
+        }
+        if (state->set_abort) {
+            // Until the session exists, closing the UDP socket is the only
+            // resource that can be released. send/recv then fail and the
+            // connect attempt completes instead of waiting out its timer.
+            state->set_abort([socket] {
+                error_code ignored;
+                socket->close(ignored);
+            });
         }
 
         auto udp = std::make_shared<Udp>(socket);
@@ -283,6 +297,11 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
 
         auto session = std::make_shared<Http3ClientSession>(state->ex, std::move(conn), std::move(udp), state->target,
                                                             state->limits);
+        if (state->set_abort) {
+            // Once the session exists, close it (connection, timers and socket)
+            // rather than only the raw UDP socket.
+            state->set_abort([session] { session->close(); });
+        }
         SIMPLE_HTTP_DEBUG_LOG("h3 client: connection built, waiting for handshake");
         session->start(attempt_timeout, [session, done = std::move(done)](error_code ec) mutable {
             if (ec) {
@@ -332,8 +351,14 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
             std::move(state->done)(make_error_code(client_errc::version_not_negotiated), nullptr);
             return;
         }
-        async_resolve_endpoints(
-            state->resolve_fn, state->target.host, state->target.effective_port(), state->ex,
+        // Count resolution against the same budget as the QUIC handshake. The
+        // resolve hook may never call back; without a deadline the open would
+        // hang forever before connect_timeout even starts.
+        state->deadline =
+            state->connect_timeout.count() > 0 ? Clock::now() + state->connect_timeout : Clock::time_point::max();
+        async_resolve_bounded(
+            state->resolve_fn, state->target.host, state->target.effective_port(), state->ex, state->connect_timeout,
+            make_error_code(client_errc::connect_timeout),
             [state](error_code ec, std::vector<asio::ip::tcp::endpoint> endpoints) {
                 if (ec) {
                     std::move(state->done)(ec, nullptr);
@@ -362,8 +387,6 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
                         ++v6;
                     }
                 }
-                state->deadline = state->connect_timeout.count() > 0 ? Clock::now() + state->connect_timeout
-                                                                     : Clock::time_point::max();
                 connect_next(state);
             });
     }

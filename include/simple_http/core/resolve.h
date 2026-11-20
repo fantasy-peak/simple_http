@@ -33,6 +33,8 @@
 #include <boost/asio/compose.hpp>
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/steady_timer.hpp>
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <functional>
@@ -147,6 +149,50 @@ auto async_resolve_endpoints(ResolveFn resolve, std::string host, std::uint16_t 
     auto object = ex;
     return asio::async_compose<Token, void(error_code, std::vector<asio::ip::tcp::endpoint>)>(
         detail::ResolveOp{std::move(resolve), std::move(host), port, std::move(ex)}, token, object);
+}
+
+// Resolves with a whole-dial budget. The underlying resolver is not
+// cancellable, but the one-shot completion means a late answer is ignored and
+// the caller stops waiting. Without this, a black-holed DNS server (or a
+// custom ResolveFn that never calls back) hung dial() forever. `timeout_error`
+// is the caller's error category (client_errc::connect_timeout for the HTTP
+// client); core does not depend on the client layer.
+struct ResolveBoundedState {
+    std::shared_ptr<asio::steady_timer> timer;
+    asio::any_completion_handler<void(error_code, std::vector<asio::ip::tcp::endpoint>)> done;
+    bool finished{false};
+};
+
+inline void
+async_resolve_bounded(ResolveFn resolve, std::string host, std::uint16_t port, asio::any_io_executor ex,
+                      std::chrono::milliseconds limit, error_code timeout_error,
+                      asio::any_completion_handler<void(error_code, std::vector<asio::ip::tcp::endpoint>)> done) {
+    auto state = std::make_shared<ResolveBoundedState>();
+    state->done = std::move(done);
+    auto finish = [state](error_code ec, std::vector<asio::ip::tcp::endpoint> endpoints) {
+        if (state->finished)
+            return;
+        state->finished = true;
+        if (state->timer)
+            state->timer->cancel();
+        auto completion = std::move(state->done);
+        std::move(completion)(ec, std::move(endpoints));
+    };
+    if (limit.count() > 0) {
+        state->timer = std::make_shared<asio::steady_timer>(ex);
+        state->timer->expires_after(limit);
+        state->timer->async_wait([state, timeout_error](error_code ec) {
+            if (ec || state->finished)
+                return;
+            state->finished = true;
+            auto completion = std::move(state->done);
+            std::move(completion)(timeout_error, std::vector<asio::ip::tcp::endpoint>{});
+        });
+    }
+    async_resolve_endpoints(std::move(resolve), std::move(host), port, ex,
+                            [finish](error_code ec, std::vector<asio::ip::tcp::endpoint> endpoints) mutable {
+                                finish(ec, std::move(endpoints));
+                            });
 }
 
 } // namespace simple_http
