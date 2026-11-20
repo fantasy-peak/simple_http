@@ -202,6 +202,41 @@ TEST_CASE("static: an on-demand read refuses a file replaced by a symlink", "[st
     CHECK_FALSE(body.has_value());
     std::filesystem::remove(outside);
 }
+
+// O_NOFOLLOW only protects the *last* component. If a scanned subdirectory is
+// replaced by a symlink after load(), open() follows it and the on-demand path
+// reads a file outside the document root. The lookup key, size and mtime all
+// come from the scan, so the request itself looks entirely legitimate.
+TEST_CASE("static: an on-demand read refuses a symlinked parent directory", "[static]") {
+    StaticFixture fx;
+    fx.write("uploads/secret.txt", "0123456789abcdef"); // 16 bytes, recorded at scan
+    const auto outside_dir = fx.root().parent_path() / ("simple_http_outside_" + std::to_string(::getpid()));
+    std::filesystem::create_directories(outside_dir);
+    {
+        std::ofstream out(outside_dir / "secret.txt", std::ios::binary);
+        out << "OUTSIDE-SECRET-0123456789";
+    }
+
+    StaticTableConfig cfg;
+    cfg.root = fx.root_string();
+    cfg.preload_max_file_bytes = 0; // force read_body() to hit the filesystem
+    StaticTable table{cfg};
+    std::string error;
+    REQUIRE(table.load(error));
+
+    const StaticEntry *entry = table.find("/uploads/secret.txt");
+    REQUIRE(entry != nullptr);
+
+    std::filesystem::remove_all(fx.root() / "uploads");
+    fx.symlink("uploads", outside_dir);
+
+    const auto body = table.read_body(entry->identity);
+    if (body) {
+        INFO("read bytes from outside the root: " << *body);
+    }
+    CHECK_FALSE(body.has_value());
+    std::filesystem::remove_all(outside_dir);
+}
 #else
 TEST_CASE("static: symlink and FIFO cases are POSIX-only", "[static]") { SUCCEED(); }
 #endif

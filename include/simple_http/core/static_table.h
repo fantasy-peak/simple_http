@@ -199,19 +199,79 @@ inline std::string_view content_encoding_of(const StaticEntry &entry, const Stat
     return {};
 }
 
+#if !defined(_WIN32)
+// Opens `path` (which must be `root` + "/" + relative) one component at a time,
+// starting from a descriptor on the canonical root. O_NOFOLLOW on the final
+// component does not stop open() from following a symlinked *intermediate*
+// directory; opening every directory relative to the previous descriptor does.
+inline std::optional<int> open_under_root(std::string_view root, std::string_view path) {
+    if (root.empty() || path.size() <= root.size())
+        return std::nullopt;
+    if (path.compare(0, root.size(), root) != 0)
+        return std::nullopt;
+    std::string_view rel = path.substr(root.size());
+    if (root.back() != '/') {
+        if (rel.empty() || rel.front() != '/')
+            return std::nullopt;
+        rel.remove_prefix(1);
+    }
+    if (rel.empty())
+        return std::nullopt;
+
+    const std::string root_str{root};
+    int dir = ::open(root_str.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir < 0)
+        return std::nullopt;
+    for (;;) {
+        const std::size_t slash = rel.find('/');
+        const bool last = slash == std::string_view::npos;
+        const std::string_view component = rel.substr(0, slash);
+        if (component.empty() || component == "." || component == "..") {
+            ::close(dir);
+            return std::nullopt;
+        }
+        const std::string name{component};
+        if (last) {
+            const int fd = ::openat(dir, name.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+            ::close(dir);
+            if (fd < 0)
+                return std::nullopt;
+            return fd;
+        }
+        const int next = ::openat(dir, name.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        ::close(dir);
+        if (next < 0)
+            return std::nullopt;
+        dir = next;
+        rel.remove_prefix(slash + 1);
+    }
+}
+#endif
+
 // Reads exactly `size` bytes from a path recorded by the scan, or reports
 // failure. Both the preloader and the on-demand path need the same "short read
 // is not a body" rule.
 //
-// The path comes from the scan, but the file can be replaced between the scan
-// and this open: a document root that is writable (uploads, a CMS) makes that
-// realistic. On POSIX, O_NOFOLLOW makes a planted symlink fail here instead of
-// leaking its target, and fstat keeps a FIFO/device from being read. Windows has
-// no std::ifstream equivalent of O_NOFOLLOW, so it refuses a symlink before
-// opening (best effort; the same local write access is required).
-inline std::optional<std::string> read_file_exact(const std::string &path, std::uint64_t size) {
+// The path comes from the scan, but the file or one of its parent directories
+// can be replaced between the scan and this open: a document root that is
+// writable (uploads, a CMS) makes that realistic. On POSIX every component is
+// opened with O_NOFOLLOW relative to the previous directory descriptor, so a
+// planted symlink at any depth fails instead of leaking its target; fstat keeps
+// a FIFO/device from being read. Windows has no O_NOFOLLOW equivalent, so it
+// checks that the resolved path is still under the root and refuses a symlink
+// before opening (best effort; the same local write access is required).
+inline std::optional<std::string> read_file_exact(const std::string &root, const std::string &path,
+                                                  std::uint64_t size) {
 #if !defined(_WIN32)
-    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    int fd = -1;
+    if (root.empty()) {
+        fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    } else {
+        const auto opened = open_under_root(root, path);
+        if (!opened)
+            return std::nullopt;
+        fd = *opened;
+    }
     if (fd < 0)
         return std::nullopt;
     struct stat st{};
@@ -233,6 +293,15 @@ inline std::optional<std::string> read_file_exact(const std::string &path, std::
     ::close(fd);
     return out;
 #else
+    if (!root.empty()) {
+        std::error_code containment_ec;
+        const auto canonical_root = std::filesystem::weakly_canonical(root, containment_ec);
+        if (containment_ec)
+            return std::nullopt;
+        const auto canonical_path = std::filesystem::weakly_canonical(path, containment_ec);
+        if (containment_ec || !path_is_under(canonical_root.string(), canonical_path.string()))
+            return std::nullopt;
+    }
     std::error_code symlink_ec;
     if (std::filesystem::is_symlink(std::filesystem::symlink_status(path, symlink_ec)))
         return std::nullopt;
@@ -420,7 +489,7 @@ inline bool StaticTable::load(std::string &error) {
         rep.etag = make_etag(mtime_s, rep.size, suffix);
 
         if (rep.size <= m_preload_max && rep.size <= budget) {
-            if (auto body = detail::read_file_exact(rep.disk_path, rep.size)) {
+            if (auto body = detail::read_file_exact(m_root, rep.disk_path, rep.size)) {
                 rep.body = std::make_shared<std::string>(std::move(*body));
                 budget -= rep.size;
                 ++m_stats.preloaded;
@@ -569,7 +638,7 @@ inline std::string StaticTable::cache_control_for(const StaticEntry &entry) cons
 inline std::optional<std::string> StaticTable::read_body(const StaticRepresentation &rep) const {
     if (rep.body)
         return *rep.body; // preloaded: copy only
-    return detail::read_file_exact(rep.disk_path, rep.size);
+    return detail::read_file_exact(m_root, rep.disk_path, rep.size);
 }
 
 } // namespace simple_http
