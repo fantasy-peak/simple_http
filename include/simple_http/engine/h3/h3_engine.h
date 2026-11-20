@@ -751,7 +751,15 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
             const int rv = nghttp3_conn_close_stream(m_h3, stream_id, code);
             // A stream nghttp3 never saw is not an error: it is how a reset
             // arrives for a stream that was already torn down.
-            if (rv != 0 && rv != NGHTTP3_ERR_STREAM_NOT_FOUND) {
+            if (rv == NGHTTP3_ERR_H3_CLOSED_CRITICAL_STREAM) {
+                // RFC 9114 §6.2.1: closing a control or QPACK stream is a
+                // connection error, not something to log and ignore. Continuing
+                // would leave nghttp3's internal stream state out of sync with
+                // the QUIC stream ngtcp2 already removed.
+                SIMPLE_HTTP_ERROR_LOG("h3: critical stream closed by peer (stream={})", stream_id);
+                m_h3_dead = true;
+                m_conn->close(NGHTTP3_H3_CLOSED_CRITICAL_STREAM, "http3: critical stream closed");
+            } else if (rv != 0 && rv != NGHTTP3_ERR_STREAM_NOT_FOUND) {
                 SIMPLE_HTTP_ERROR_LOG("h3: close_stream failed: {} (stream={})", nghttp3_strerror(rv), stream_id);
             }
         }
@@ -980,8 +988,10 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
 
         // §4.2 forbids CR, LF and NUL in a field. HTTP/3 has no line folding, so
         // those bytes survive decoding and would let a peer inject a request line
-        // into whatever HTTP/1.1 message is built downstream.
-        if (contains_ctl(name) || contains_ctl(value)) {
+        // into whatever HTTP/1.1 message is built downstream. RFC 9113 §8.2.1
+        // (referenced for HTTP/3 field validity) also rejects leading/trailing
+        // SP/HTAB in a field value.
+        if (contains_ctl(name) || contains_ctl(value) || has_leading_or_trailing_ws(value)) {
             reject_stream(stream_id, stream, kH3MessageError);
             return;
         }
@@ -1358,7 +1368,10 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
                     // erase_stream/release_unread_body already credited every
                     // byte the handler had not read when the stream closed; a
                     // read that races that teardown must not credit them twice.
-                    if (eng->m_streams.find(stream_id) == eng->m_streams.end())
+                    auto it = eng->m_streams.find(stream_id);
+                    if (it == eng->m_streams.end())
+                        return;
+                    if (it->second->body_credit_closed.load(std::memory_order_acquire))
                         return;
                     eng->m_conn->extend_stream_offset(stream_id, n);
                     eng->m_conn->extend_connection_offset(n);
@@ -1508,6 +1521,9 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
     void release_unread_body(Stream &stream) noexcept {
         if (!stream.body_consumed)
             return;
+        // From here on the unread tail has been credited; a read completion
+        // that races the teardown must not credit the same bytes again.
+        stream.body_credit_closed.store(true, std::memory_order_release);
         const std::uint64_t consumed = stream.body_consumed->load(std::memory_order_acquire);
         if (stream.body_received > consumed) {
             m_conn->extend_connection_offset(stream.body_received - consumed);
@@ -1535,7 +1551,11 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
             stream->in_space->close();
         if (stream->out_space)
             stream->out_space->close();
-        if (stream->request && !stream->request_complete) {
+        // `finish_pending` means END_STREAM arrived while DATA frames were
+        // still parked. request_complete is true in that case, but the Body
+        // never received those bytes or an EOF: failing it is what unblocks a
+        // parked reader. fail() is a no-op once the Body has terminated.
+        if (stream->request && (!stream->request_complete || stream->finish_pending)) {
             (void)stream->request->body().fail(make_error_code(asio::error::connection_reset));
         }
     }

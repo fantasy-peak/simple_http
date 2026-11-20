@@ -176,9 +176,10 @@ inline result<Url> parse_url(std::string_view url) {
         out.target = std::string{tail};
     }
 
-    // Reject control bytes outright: they would be spliced into a request line
-    // or header downstream, which can split the message in two.
-    if (contains_ctl(out.host) || contains_ctl(out.target)) {
+    // Reject anything a URI cannot carry: CTLs (message splitting), SP (a
+    // lenient parser splits the request line on it) and a raw backslash
+    // (normalised to '/' by some intermediaries).
+    if (contains_invalid_url_byte(out.host) || contains_invalid_url_byte(out.target)) {
         return make_error_code(client_errc::bad_url);
     }
     return out;

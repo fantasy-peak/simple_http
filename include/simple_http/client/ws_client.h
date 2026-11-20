@@ -150,7 +150,9 @@ void async_ws_upgrade_impl(std::shared_ptr<Transport> transport, std::string aut
                 const std::size_t head_end = response->find("\r\n\r\n") + 4;
                 const std::string head = response->substr(0, head_end);
                 const std::string extra = response->substr(head_end);
-                if (!starts_with(head, "HTTP/1.1 101")) {
+                // The status code is exactly three digits; require the SP or
+                // CR that follows it, so "HTTP/1.1 1010" is not accepted.
+                if (head.size() < 13 || !starts_with(head, "HTTP/1.1 101") || (head[12] != ' ' && head[12] != '\r')) {
                     SIMPLE_HTTP_ERROR_LOG("ws client: upgrade to {} refused (not 101)", authority);
                     transport->close();
                     finish(make_error_code(client_errc::protocol_error), nullptr);
@@ -174,6 +176,11 @@ void async_ws_upgrade_impl(std::shared_ptr<Transport> transport, std::string aut
                             std::string_view value = line.substr(colon + 1);
                             while (!value.empty() && (value.front() == ' ' || value.front() == '\t'))
                                 value.remove_prefix(1);
+                            // Trailing OWS is not part of the field value
+                            // (RFC 9110 §5.5) and must not fail the accept-key
+                            // comparison.
+                            while (!value.empty() && (value.back() == ' ' || value.back() == '\t'))
+                                value.remove_suffix(1);
                             accept = value;
                         }
                     }

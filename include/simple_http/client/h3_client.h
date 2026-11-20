@@ -448,6 +448,14 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
   private:
     void submit_open(std::shared_ptr<Request> request, std::int64_t id, std::shared_ptr<Stream> st,
                      std::string up_front, OpenCompletion done) {
+        // The request body may have been read asynchronously; m_h3_dead can
+        // have been set in that window, in which case h3() is null and
+        // nghttp3 must not be called.
+        if (h3() == nullptr || !m_alive) {
+            erase_stream(id);
+            std::move(done)(make_error_code(client_errc::session_closed), nullptr);
+            return;
+        }
         auto it = m_streams.find(id);
         if (it == m_streams.end()) {
             std::move(done)(make_error_code(client_errc::session_closed), nullptr);
@@ -522,6 +530,9 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
                     return;
                 }
             }
+            // Same associator loss as h2: the inner lambda is plain, so carry
+            // the caller's cancellation slot explicitly into await_out_space.
+            auto slot = asio::get_associated_cancellation_slot(done);
             auto finish_write = [self, id, last, done = std::move(done)](error_code ec) mutable {
                 if (ec) {
                     std::move(done)(ec);
@@ -542,21 +553,26 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
                 finish_write(error_code{});
                 return;
             }
-            self->await_out_space(
-                id, [self, id, data = std::move(data), finish_write = std::move(finish_write)](error_code ec) mutable {
-                    if (ec) {
-                        finish_write(ec);
-                        return;
-                    }
-                    auto it = self->m_streams.find(id);
-                    if (it == self->m_streams.end()) {
-                        finish_write(make_error_code(client_errc::session_closed));
-                        return;
-                    }
-                    it->second->out_bytes += data.size();
-                    it->second->out_q.push_back(std::move(data));
-                    finish_write(error_code{});
-                });
+            auto enqueue = [self, id, data = std::move(data),
+                            finish_write = std::move(finish_write)](error_code ec) mutable {
+                if (ec) {
+                    finish_write(ec);
+                    return;
+                }
+                auto it = self->m_streams.find(id);
+                if (it == self->m_streams.end()) {
+                    finish_write(make_error_code(client_errc::session_closed));
+                    return;
+                }
+                it->second->out_bytes += data.size();
+                it->second->out_q.push_back(std::move(data));
+                finish_write(error_code{});
+            };
+            if (slot.is_connected()) {
+                self->await_out_space(id, WriteCompletion(asio::bind_cancellation_slot(slot, std::move(enqueue))));
+            } else {
+                self->await_out_space(id, std::move(enqueue));
+            }
         });
     }
 
@@ -1015,7 +1031,7 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
             return;
         if (!field_within_budget(stream_id, st, name, value))
             return;
-        if (contains_ctl(name) || contains_ctl(value)) {
+        if (contains_ctl(name) || contains_ctl(value) || has_leading_or_trailing_ws(value)) {
             st.failed = true;
             st.outcome->set(StreamState::Failed, make_error_code(client_errc::protocol_error));
             return;
@@ -1024,6 +1040,21 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
             if (name == ":status")
                 st.status_text.assign(value);
             return; // other pseudo-headers are not response state we surface
+        }
+        // Regular field names are HTTP/1.1 tokens and must be lowercase
+        // (RFC 9113 §8.2.1 / RFC 9114 §4.1.2). QPACK can encode arbitrary
+        // bytes, so this has to be checked here.
+        if (!is_http_token(name)) {
+            st.failed = true;
+            st.outcome->set(StreamState::Failed, make_error_code(client_errc::protocol_error));
+            return;
+        }
+        for (char c : name) {
+            if (c >= 'A' && c <= 'Z') {
+                st.failed = true;
+                st.outcome->set(StreamState::Failed, make_error_code(client_errc::protocol_error));
+                return;
+            }
         }
         st.header_tmp.emplace_back(std::string{name}, std::string{value});
     }
@@ -1114,7 +1145,7 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
             return;
         if (!field_within_budget(stream_id, st, name, value))
             return;
-        if (contains_ctl(name) || contains_ctl(value)) {
+        if (contains_ctl(name) || contains_ctl(value) || has_leading_or_trailing_ws(value)) {
             st.failed = true;
             st.outcome->set(StreamState::Failed, make_error_code(client_errc::protocol_error));
             return;
@@ -1525,8 +1556,20 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
             return;
         }
         Stream &st = *it->second;
-        if (st.write_shut) {
+        if (st.write_shut || st.reset) {
             std::move(done)(make_error_code(client_errc::stream_reset));
+            return;
+        }
+        if (!m_alive) {
+            // The connection is gone; out_bytes will never drain.
+            std::move(done)(make_error_code(asio::error::connection_aborted));
+            return;
+        }
+        // A terminal stream state (reset by the peer, connection closed) never
+        // drains out_bytes, so checking only the watermark would park the write
+        // forever after the wake that reported the termination.
+        if (const auto state = st.outcome->get(); state != StreamState::Open) {
+            std::move(done)(outcome_error(*st.outcome));
             return;
         }
         // Bound the accumulated queue, not the subset currently in flight:

@@ -29,6 +29,7 @@
 #include <atomic>
 #include <boost/unordered_map.hpp>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <initializer_list>
 #include <iterator>
@@ -123,7 +124,7 @@ class Router {
   public:
     using StateRegistry = AppStateView::Registry;
 
-    Router() : m_states(std::make_shared<StateRegistry>()) {}
+    Router() : Router(std::make_shared<StateRegistry>()) {}
 
     // --- registration (fluent) ---
 
@@ -325,7 +326,7 @@ class Router {
         return host(std::move(pattern), {}, std::forward<F>(register_routes));
     }
     template <typename F> Router &host(std::string pattern, std::vector<Middleware> middlewares, F &&register_routes) {
-        auto child = std::shared_ptr<Router>(new Router(m_states));
+        auto child = std::shared_ptr<Router>(new Router(m_states, m_openapi));
         for (auto &middleware : middlewares) {
             child->use(std::move(middleware));
         }
@@ -376,7 +377,15 @@ class Router {
         scope.mws.insert(scope.mws.end(), std::make_move_iterator(group_middlewares.begin()),
                          std::make_move_iterator(group_middlewares.end()));
         m_scopes.push_back(std::move(scope));
-        std::forward<F>(register_routes)(*this);
+        // The registration callback is user code. If it throws, the scope must
+        // not stay on the stack: every later route would inherit its prefix and
+        // middleware.
+        try {
+            std::forward<F>(register_routes)(*this);
+        } catch (...) {
+            m_scopes.pop_back();
+            throw;
+        }
         m_scopes.pop_back();
         return *this;
     }
@@ -528,7 +537,11 @@ class Router {
     }
 
   private:
-    explicit Router(std::shared_ptr<StateRegistry> states) : m_states(std::move(states)) {}
+    // Host routers share the parent's document: their operations are part of
+    // the same API and must appear in Server::openapi()/serve_openapi().
+    explicit Router(std::shared_ptr<StateRegistry> states,
+                    std::shared_ptr<openapi::OpenApiSpec> spec = std::make_shared<openapi::OpenApiSpec>())
+        : m_openapi(std::move(spec)), m_states(std::move(states)) {}
 
     struct HostWildcard {
         std::string pattern;
@@ -582,9 +595,13 @@ class Router {
                       [](const HostWildcard &a, const HostWildcard &b) { return a.suffix.size() > b.suffix.size(); });
             return;
         }
-        if (!m_host_exact.emplace(std::move(pattern), std::move(router)).second) {
+        // Check before moving: the duplicate branch still wants the pattern for
+        // the log line.
+        if (m_host_exact.find(pattern) != m_host_exact.end()) {
             SIMPLE_HTTP_INFO_LOG("host [{}] already registered; the first router stays", pattern);
+            return;
         }
+        m_host_exact.emplace(std::move(pattern), std::move(router));
     }
 
     std::shared_ptr<Router> find_host_router(const Request &req) const {
@@ -677,10 +694,14 @@ class Router {
             return;
         }
 
-        // Path-template routes (`/users/{id}`).
+        // Path-template routes (`/users/{id}`). The DFS is method-aware: a
+        // shape that matches the path but not the method must not shadow a
+        // sibling shape that does. `template_bits` accumulates the Allow set
+        // of the mismatching shapes for the 405 below.
         const TrieTerminal *term = nullptr;
         std::vector<std::string_view> values;
-        if (match_template(m_trie, path, term, values)) {
+        std::uint16_t template_bits = 0;
+        if (match_template(m_trie, path, method, term, values, template_bits)) {
             if (const RouteEntry *hit = lookup(term->tbl, method)) {
                 for (std::size_t i = 0; i < values.size(); ++i) {
                     req->set_param(term->param_names[i], values[i]);
@@ -688,11 +709,12 @@ class Router {
                 run_handler(*hit, std::move(req), std::move(res), ssl, std::move(done));
                 return;
             }
-            const std::uint16_t bits = method_allow_bits(term->tbl);
+        }
+        if (template_bits != 0) {
             if (method == Method::Options) {
-                reply_auto_options(std::move(res), bits, std::move(done));
+                reply_auto_options(std::move(res), template_bits, std::move(done));
             } else {
-                reply_method_not_allowed(std::move(res), bits, std::move(done));
+                reply_method_not_allowed(std::move(res), template_bits, std::move(done));
             }
             return;
         }
@@ -926,10 +948,8 @@ class Router {
         }
         const TrieTerminal *term = nullptr;
         std::vector<std::string_view> values;
-        if (match_template(m_trie, path, term, values)) {
-            return lookup(term->tbl, m) != nullptr;
-        }
-        return false;
+        std::uint16_t mismatch_bits = 0;
+        return match_template(m_trie, path, m, term, values, mismatch_bits);
     }
 
     Router &insert_route(std::vector<Method> methods, std::string path, std::optional<RouteEntry> entry) {
@@ -1045,14 +1065,15 @@ class Router {
         insert_entry(term.tbl, entry, methods);
     }
 
-    bool match_template(const std::vector<TrieNode> &trie, std::string_view path, const TrieTerminal *&term,
-                        std::vector<std::string_view> &values) const {
+    bool match_template(const std::deque<TrieNode> &trie, std::string_view path, Method method,
+                        const TrieTerminal *&term, std::vector<std::string_view> &values,
+                        std::uint16_t &mismatch_bits) const {
         if (trie.empty()) {
             return false;
         }
         std::vector<std::string_view> found;
         term = nullptr;
-        if (!walk_template(trie, 0, path, 0, found, term))
+        if (!walk_template(trie, 0, path, 0, method, found, term, mismatch_bits))
             return false;
         values = std::move(found);
         return true;
@@ -1060,9 +1081,13 @@ class Router {
 
     // One DFS step: literal edge first, then the anonymous {param} edge, then
     // the catch-all. A literal subtree that cannot finish the path falls back to
-    // the param sibling rather than shadowing it.
-    bool walk_template(const std::vector<TrieNode> &trie, std::size_t node, std::string_view path, std::size_t pos,
-                       std::vector<std::string_view> &found, const TrieTerminal *&term) const {
+    // the param sibling rather than shadowing it. A terminal that matches the
+    // path but not the method is recorded in `mismatch_bits` and the DFS keeps
+    // looking, so `GET /{a}/b` is not rejected because `POST /x/{c}` matched
+    // the same path first.
+    bool walk_template(const std::deque<TrieNode> &trie, std::size_t node, std::string_view path, std::size_t pos,
+                       Method method, std::vector<std::string_view> &found, const TrieTerminal *&term,
+                       std::uint16_t &mismatch_bits) const {
         if (node >= trie.size())
             return false;
         const TrieNode &n = trie[node];
@@ -1073,24 +1098,25 @@ class Router {
 
         if (const auto lit = n.literals.find(part); lit != n.literals.end()) {
             if (last) {
-                if (terminal_ready(trie, lit->second, term))
+                if (terminal_ready(trie, lit->second, method, term, mismatch_bits))
                     return true;
-            } else if (walk_template(trie, lit->second, path, end + 1, found, term)) {
+            } else if (walk_template(trie, lit->second, path, end + 1, method, found, term, mismatch_bits)) {
                 return true;
             }
         }
 
         if (n.param_child != TrieNode::npos && !part.empty()) {
             found.push_back(part);
-            const bool hit = last ? terminal_ready(trie, n.param_child, term)
-                                  : walk_template(trie, n.param_child, path, end + 1, found, term);
+            const bool hit =
+                last ? terminal_ready(trie, n.param_child, method, term, mismatch_bits)
+                     : walk_template(trie, n.param_child, path, end + 1, method, found, term, mismatch_bits);
             if (hit)
                 return true;
             found.pop_back();
         }
 
         if (n.wildcard_child != TrieNode::npos) {
-            if (terminal_ready(trie, n.wildcard_child, term)) {
+            if (terminal_ready(trie, n.wildcard_child, method, term, mismatch_bits)) {
                 found.push_back(path.substr(pos));
                 return true;
             }
@@ -1098,7 +1124,8 @@ class Router {
         return false;
     }
 
-    static bool terminal_ready(const std::vector<TrieNode> &trie, std::size_t node, const TrieTerminal *&term) {
+    static bool terminal_ready(const std::deque<TrieNode> &trie, std::size_t node, Method method,
+                               const TrieTerminal *&term, std::uint16_t &mismatch_bits) {
         if (node >= trie.size())
             return false;
         const TrieTerminal &candidate = trie[node].terminal;
@@ -1112,6 +1139,10 @@ class Router {
             }
             if (!has_handler)
                 return false;
+        }
+        if (lookup(candidate.tbl, method) == nullptr) {
+            mismatch_bits |= method_allow_bits(candidate.tbl);
+            return false;
         }
         term = &candidate;
         return true;
@@ -1186,12 +1217,16 @@ class Router {
     // Transparent hashing/equality would be enough on C++20; boost::unordered_map
     // provides the heterogeneous find under C++17.
     boost::unordered_map<std::string, MethodTable, StringHash, std::equal_to<>> m_exact;
-    std::vector<TrieNode> m_trie;
+    // Deque, not vector: dispatch holds references into these containers while
+    // the handler runs, and a handler may register another route. push_back on
+    // a deque never relocates the elements already stored, so the std::function
+    // being executed is not freed under the caller.
+    std::deque<TrieNode> m_trie;
     // The collected OpenAPI document. Always present so serve_openapi() works
     // even when no route carries a descriptor; routes record into it only when
     // glaze is enabled (openapi::doc() exists only in that build).
     std::shared_ptr<openapi::OpenApiSpec> m_openapi{std::make_shared<openapi::OpenApiSpec>()};
-    std::vector<std::pair<RegexRoute, RouteEntry>> m_regex;
+    std::deque<std::pair<RegexRoute, RouteEntry>> m_regex;
     std::optional<Handler> m_fallback;
     std::vector<std::shared_ptr<StaticFiles>> m_static;
     std::vector<Middleware> m_middleware;
@@ -1207,12 +1242,12 @@ class Router {
     std::vector<HostWildcard> m_host_wildcards;
 
     boost::unordered_map<std::string, WsRouteEntry, StringHash, std::equal_to<>> m_ws_exact;
-    std::vector<std::pair<RegexRoute, WsRouteEntry>> m_ws_regex;
+    std::deque<std::pair<RegexRoute, WsRouteEntry>> m_ws_regex;
     std::unordered_map<std::string, WsProxyTarget, StringHash, std::equal_to<>> m_ws_proxy_exact;
-    std::vector<std::pair<RegexRoute, WsProxyTarget>> m_ws_proxy_regex;
+    std::deque<std::pair<RegexRoute, WsProxyTarget>> m_ws_proxy_regex;
 
     boost::unordered_map<std::string, HttpProxyRoute, StringHash, std::equal_to<>> m_http_proxy_exact;
-    std::vector<std::pair<RegexRoute, HttpProxyRoute>> m_http_proxy_regex;
+    std::deque<std::pair<RegexRoute, HttpProxyRoute>> m_http_proxy_regex;
 };
 
 } // namespace simple_http

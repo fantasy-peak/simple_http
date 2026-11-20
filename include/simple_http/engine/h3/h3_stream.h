@@ -114,6 +114,9 @@ struct H3Stream {
     // extended). Shared with the consume hook, which can run on any thread.
     // erase_stream/release_unread_body credit the difference.
     std::shared_ptr<std::atomic<std::uint64_t>> body_consumed{std::make_shared<std::atomic<std::uint64_t>>(0)};
+    // Set once release_unread_body() has credited the unread tail. A consume
+    // notification that races the teardown must not credit those bytes again.
+    std::atomic<bool> body_credit_closed{false};
     // We told ngtcp2 to stop reading this request (STOP_SENDING): the handler
     // returned without consuming the body, so nobody will ever read it.
     bool read_stopped{false};

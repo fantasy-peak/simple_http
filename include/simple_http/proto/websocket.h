@@ -349,7 +349,12 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
         reader_loop(this->shared_from_this());
     }
 
-    static void reader_loop(std::shared_ptr<WsBackendImpl> self) {
+    // Bounds the inline message chain. h2's ws_stream_read completes inline
+    // from ws_inbox, so a fast peer with many small frames would otherwise
+    // recurse once per message inside one read pump call.
+    static constexpr std::size_t kReaderYieldAfter = 32;
+
+    static void reader_loop(std::shared_ptr<WsBackendImpl> self, std::size_t budget = kReaderYieldAfter) {
         if (!self->m_open) {
             self->reader_finished();
             return;
@@ -365,7 +370,7 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
             });
             return;
         }
-        self->read_message([self](error_code ec, WsMessage msg) {
+        self->read_message([self, budget](error_code ec, WsMessage msg) {
             if (ec) {
                 self->m_reader_ec = ec;
                 self->reader_finished();
@@ -374,7 +379,11 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
             self->m_inbox_bytes += kInboxMsgOverhead + msg.data.size();
             self->m_inbox.push_back(std::move(msg));
             (void)self->m_inbox_ready.try_send(error_code{});
-            reader_loop(std::move(self));
+            if (budget == 0) {
+                asio::post(self->m_executor, [self]() mutable { reader_loop(std::move(self)); });
+                return;
+            }
+            reader_loop(std::move(self), budget - 1);
         });
     }
 
@@ -400,7 +409,8 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
         read_message_step(std::move(done));
     }
 
-    void read_message_step(asio::any_completion_handler<void(error_code, WsMessage)> done) {
+    void read_message_step(asio::any_completion_handler<void(error_code, WsMessage)> done,
+                           std::size_t budget = kReaderYieldAfter) {
         for (;;) {
             WsFrame frame;
             auto status = m_parser.next(frame);
@@ -432,19 +442,26 @@ class WsBackendImpl final : public WsBackend, public std::enable_shared_from_thi
                     }
                 }
                 auto self = this->shared_from_this();
-                m_transport->async_read_some(ByteSpan{m_read_buf.data(), m_read_buf.size()},
-                                             [self, done = std::move(done)](error_code ec, std::size_t n) mutable {
-                                                 if (ec) {
-                                                     if constexpr (!ws_read_eof_is_half_close<Transport>::value) {
-                                                         self->m_open = false;
-                                                     }
-                                                     std::move(done)(ec, WsMessage{});
-                                                     return;
-                                                 }
-                                                 self->touch_deadline();
-                                                 self->m_parser.append(self->m_read_buf.data(), n);
-                                                 self->read_message_step(std::move(done));
-                                             });
+                m_transport->async_read_some(
+                    ByteSpan{m_read_buf.data(), m_read_buf.size()},
+                    [self, done = std::move(done), budget](error_code ec, std::size_t n) mutable {
+                        if (ec) {
+                            if constexpr (!ws_read_eof_is_half_close<Transport>::value) {
+                                self->m_open = false;
+                            }
+                            std::move(done)(ec, WsMessage{});
+                            return;
+                        }
+                        self->touch_deadline();
+                        self->m_parser.append(self->m_read_buf.data(), n);
+                        if (budget == 0) {
+                            asio::post(self->m_executor, [self, done = std::move(done)]() mutable {
+                                self->read_message_step(std::move(done));
+                            });
+                            return;
+                        }
+                        self->read_message_step(std::move(done), budget - 1);
+                    });
                 return;
             }
 

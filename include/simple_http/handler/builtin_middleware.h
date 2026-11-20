@@ -448,7 +448,12 @@ inline Middleware redirect_slashes() {
                 location.push_back('?');
                 location.append(req->query());
             }
-            res->redirect(std::move(location), status::moved_permanently);
+            // 301 lets a user agent rewrite a non-idempotent method to GET and
+            // drop the body. Preserve the method for everything but GET/HEAD.
+            const int code = (req->method() == Method::Get || req->method() == Method::Head)
+                                 ? status::moved_permanently
+                                 : status::permanent_redirect;
+            res->redirect(std::move(location), code);
             res->async_send("", finish_with(std::move(done)));
             return;
         }
@@ -512,6 +517,9 @@ inline Middleware timeout(std::chrono::milliseconds deadline) {
             next(std::move(req), std::move(res), ssl, std::move(done));
             return;
         }
+        // The downstream call consumes `res`; keep a copy for the synchronous-
+        // exception path, which must still produce a response.
+        const ResponsePtr fallback = res;
 
         using clock = std::chrono::steady_clock;
         auto tick = deadline / 4;
@@ -583,7 +591,27 @@ inline Middleware timeout(std::chrono::milliseconds deadline) {
         try {
             next(std::move(req), std::move(res), ssl, finish_chain);
         } catch (...) {
-            finish_chain();
+            // A middleware (or a handler that did not convert its own throw)
+            // failed while this timer was installed. Swallowing the exception
+            // and completing without a response leaves the client with a
+            // closed connection and an outer recovery() unable to answer.
+            if (*finished) {
+                return; // downstream already completed (possibly synchronously)
+            }
+            *finished = true;
+            timer->cancel();
+            auto finish = finish_with(std::move(*completion));
+            if (!fallback) {
+                std::move(finish)(error_code{});
+                return;
+            }
+            if (fallback->started()) {
+                fallback->async_close(std::move(finish));
+            } else {
+                fallback->reset_for_error();
+                fallback->status(status::internal_server_error);
+                fallback->async_send("", std::move(finish));
+            }
         }
     };
 }

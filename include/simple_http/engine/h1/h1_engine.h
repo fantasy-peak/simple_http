@@ -121,6 +121,16 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
         std::move(done)(error_code{}, m_open && m_writer->idle() && m_response_complete);
     }
 
+    // Whether every byte handed to the writer has actually reached the
+    // transport. The engine consults this before shutting the connection down:
+    // closing an SSL stream while a write is still in flight is an overlapping
+    // operation, and closing a TCP socket drops the unwritten remainder.
+    [[nodiscard]] bool writer_idle() const noexcept { return m_writer->idle(); }
+
+    // Whether a final status line has been enqueued for this response. A
+    // second response must never be produced after this point.
+    [[nodiscard]] bool final_started() const noexcept { return m_final_started; }
+
     void close(WriteCompletion done) override {
         m_open = false;
         m_writer->close(make_error_code(asio::error::not_connected));
@@ -575,10 +585,18 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
 
     // --- connection lifetime -------------------------------------------------
 
-    void finish() {
+    void finish(bool graceful = true) {
         if (m_finished)
             return;
         m_finished = true;
+        // A response write may still be in flight (a handler is allowed to
+        // complete with asio::detached). An SSL shutdown issues its own write
+        // on the same stream, which Asio does not allow to overlap; a TCP
+        // shutdown closes the socket and truncates the response. Close instead
+        // of shutting down in that case.
+        if (graceful && m_active_writer && !m_active_writer->writer_idle()) {
+            graceful = false;
+        }
         m_active_writer.reset();
         m_watchdog->cancel();
         // Body reads queued behind the active pull will never be satisfied now.
@@ -594,6 +612,13 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
         }
         auto self = this->shared_from_this();
         if (m_owner != TransportOwner::Engine) {
+            complete_done();
+            return;
+        }
+        if (!graceful) {
+            // close() cancels any pending transport write; its completion runs
+            // with an error and does not touch the (now reset) writer.
+            m_transport->close();
             complete_done();
             return;
         }
@@ -666,7 +691,11 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
             return;
         }
         if (state == H1Parser::State::Error) {
-            send_error_response(status::bad_request);
+            // The request line may already be parsed (the error is in a header
+            // field), so the method decides whether the error response may
+            // carry a body: a HEAD response must not.
+            const bool head_request = m_parser.head().method == Method::Head;
+            send_error_response(status::bad_request, {}, m_parser.head().version, head_request);
             return;
         }
         if (m_parser.consumed() > m_limits.max_header_bytes) {
@@ -771,11 +800,14 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
         auto self = this->shared_from_this();
         auto proceed = [self, writer, request_keep_alive, handler_failed](bool drained) {
             writer->connected([self, writer, request_keep_alive, handler_failed, drained](error_code, bool still_open) {
+                // Sample before resetting the engine's reference: finish() uses
+                // it to decide between a graceful shutdown and a hard close.
+                const bool writer_busy = !writer->writer_idle();
                 // The request/response cycle is over; the engine no longer needs
                 // the sink alive for the lazy 100-continue path.
                 self->m_active_writer.reset();
                 if (!may_reuse(!handler_failed, request_keep_alive, writer->keep_alive_out(), still_open, drained)) {
-                    self->finish();
+                    self->finish(!writer_busy);
                     return;
                 }
                 self->parse_head();
@@ -1091,10 +1123,10 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
             slot);
     }
 
-    void read_trailers(PullCompletion done, CancelSlot slot) {
+    void read_trailers(PullCompletion done, CancelSlot slot, std::size_t budget = kDrainYieldAfter) {
         auto self = this->shared_from_this();
         read_line(
-            [self, done = std::move(done), slot](error_code ec, std::string trailer) mutable {
+            [self, done = std::move(done), slot, budget](error_code ec, std::string trailer) mutable {
                 if (ec) {
                     self->body_failed(ec, std::move(done));
                     return;
@@ -1120,18 +1152,33 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
                         }
                     }
                 }
-                self->read_trailers(std::move(done), slot);
+                // read_line completes inline when the trailer is already
+                // buffered; yield periodically so a large trailer section
+                // cannot recurse once per line on one stack.
+                if (budget == 0) {
+                    asio::post(self->m_executor, [self, done = std::move(done), slot]() mutable {
+                        self->read_trailers(std::move(done), slot);
+                    });
+                    return;
+                }
+                self->read_trailers(std::move(done), slot, budget - 1);
             },
             slot);
     }
 
-    void drain_body(std::function<void(bool)> done) {
+    // `budget` bounds the synchronous recursion: when the body is already
+    // buffered, pull_body_chunk completes inline, and draining chunk by chunk
+    // would otherwise put one stack frame per chunk on the call stack (a small
+    // chunked body can overflow it). Yield to the executor periodically.
+    static constexpr std::size_t kDrainYieldAfter = 32;
+
+    void drain_body(std::function<void(bool)> done, std::size_t budget = kDrainYieldAfter) {
         if (m_body_state.done) {
             done(!m_body_state.error);
             return;
         }
         auto self = this->shared_from_this();
-        pull_body_chunk([self, done = std::move(done)](error_code ec, ReadResult r) mutable {
+        pull_body_chunk([self, done = std::move(done), budget](error_code ec, ReadResult r) mutable {
             if (ec) {
                 done(false);
                 return;
@@ -1140,7 +1187,12 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
                 done(!self->m_body_state.error);
                 return;
             }
-            self->drain_body(std::move(done));
+            if (budget == 0) {
+                asio::post(self->m_executor,
+                           [self, done = std::move(done)]() mutable { self->drain_body(std::move(done)); });
+                return;
+            }
+            self->drain_body(std::move(done), budget - 1);
         });
     }
 
@@ -1255,7 +1307,14 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
         } else {
             SIMPLE_HTTP_ERROR_LOG("h1 ws route threw an unknown exception");
         }
-        if (m_ws_handoff_started || m_owner != TransportOwner::Engine)
+        // A middleware may have written a response through `res` and then
+        // thrown. Appending a second status line (from a brand-new sink and
+        // writer) would either run a second writer concurrently with the first
+        // or put two responses on one connection. Only answer when nothing has
+        // been started and no write is still queued.
+        if (m_finished || m_ws_handoff_started || m_owner != TransportOwner::Engine)
+            return;
+        if (m_active_writer && (m_active_writer->final_started() || !m_active_writer->writer_idle()))
             return;
         send_error_response(status::internal_server_error, {}, version);
     }
@@ -1601,13 +1660,13 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
         drain_h2c_body(head, std::move(body));
     }
 
-    void drain_h2c_body(ParsedHead head, std::shared_ptr<std::string> body) {
+    void drain_h2c_body(ParsedHead head, std::shared_ptr<std::string> body, std::size_t budget = kDrainYieldAfter) {
         if (m_body_state.done) {
             start_h2c(std::move(head), std::move(*body));
             return;
         }
         auto self = this->shared_from_this();
-        pull_body_chunk([self, head = std::move(head), body](error_code ec, ReadResult r) mutable {
+        pull_body_chunk([self, head = std::move(head), body, budget](error_code ec, ReadResult r) mutable {
             if (ec) {
                 self->m_transport->close();
                 self->finish();
@@ -1623,7 +1682,13 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
                 return;
             }
             body->append(r.data);
-            self->drain_h2c_body(std::move(head), std::move(body));
+            if (budget == 0) {
+                asio::post(self->m_executor, [self, head = std::move(head), body]() mutable {
+                    self->drain_h2c_body(std::move(head), std::move(body));
+                });
+                return;
+            }
+            self->drain_h2c_body(std::move(head), std::move(body), budget - 1);
         });
     }
 

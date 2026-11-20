@@ -18,6 +18,7 @@
 //   * client responses: ClientConfig::auto_decompress (Go-like default).
 // The server does not touch Content-Encoding unless that middleware is mounted.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -118,6 +119,11 @@ class ContentEncoder {
     virtual ~ContentEncoder() = default;
     virtual std::string write(std::string_view data) = 0;
     virtual std::string finish() = 0;
+    // False when the underlying codec failed to initialise (or failed while
+    // streaming). Callers must not advertise Content-Encoding for an encoder
+    // that cannot produce bytes: its write()/finish() return empty strings,
+    // which look exactly like codec buffering.
+    [[nodiscard]] virtual bool ok() const noexcept { return true; }
 };
 
 // The decoding counterpart, used by the client. `write` returns whatever could
@@ -162,35 +168,45 @@ class ContentDecoder {
 namespace detail {
 
 inline std::string zlib_run(z_stream &zs, bool &ok, std::string_view data, int flush) {
-    zs.next_in = reinterpret_cast<Bytef *>(const_cast<char *>(data.data()));
-    zs.avail_in = static_cast<uInt>(data.size());
+    // zlib's avail_in is a 32-bit uInt. Feeding a longer view in one go
+    // truncates it and produces a "valid" stream for a prefix only, so stream
+    // the input in chunks zlib can represent.
+    std::size_t remaining = data.size();
+    const char *input = data.data();
     std::string out;
-    for (;;) {
-        char buf[16 * 1024];
-        zs.next_out = reinterpret_cast<Bytef *>(buf);
-        zs.avail_out = sizeof(buf);
-        const int rc = ::deflate(&zs, flush);
-        out.append(buf, sizeof(buf) - zs.avail_out);
-        if (rc == Z_STREAM_END) {
-            break;
+    do {
+        const std::size_t feed = std::min<std::size_t>(remaining, std::numeric_limits<uInt>::max());
+        zs.next_in = reinterpret_cast<Bytef *>(const_cast<char *>(input));
+        zs.avail_in = static_cast<uInt>(feed);
+        for (;;) {
+            char buf[16 * 1024];
+            zs.next_out = reinterpret_cast<Bytef *>(buf);
+            zs.avail_out = sizeof(buf);
+            const int rc = ::deflate(&zs, flush);
+            out.append(buf, sizeof(buf) - zs.avail_out);
+            if (rc == Z_STREAM_END) {
+                return out;
+            }
+            // Z_BUF_ERROR is not a failure: with Z_NO_FLUSH it means "not
+            // enough input to produce output yet", which is the normal state
+            // after a small write. Treating it as fatal silently swallowed
+            // everything that followed.
+            if (rc == Z_BUF_ERROR) {
+                break;
+            }
+            if (rc != Z_OK) {
+                ok = false;
+                return out;
+            }
+            // Z_OK: keep going while input remains, or the output buffer filled
+            // up (which means the codec still has bytes to give us).
+            if (zs.avail_in == 0 && zs.avail_out != 0) {
+                break;
+            }
         }
-        // Z_BUF_ERROR is not a failure: with Z_NO_FLUSH it means "not enough
-        // input to produce output yet", which is the normal state after a small
-        // write. Treating it as fatal silently swallowed everything that
-        // followed.
-        if (rc == Z_BUF_ERROR) {
-            break;
-        }
-        if (rc != Z_OK) {
-            ok = false;
-            break;
-        }
-        // Z_OK: keep going while input remains, or the output buffer filled up
-        // (which means the codec still has bytes to give us).
-        if (zs.avail_in == 0 && zs.avail_out != 0) {
-            break;
-        }
-    }
+        input += feed;
+        remaining -= feed;
+    } while (remaining > 0);
     return out;
 }
 
@@ -244,6 +260,7 @@ class GzipEncoder final : public ContentEncoder {
         }
         return zlib_run(m_zs, m_ok, {}, Z_FINISH);
     }
+    [[nodiscard]] bool ok() const noexcept override { return m_ok; }
 
   private:
     z_stream m_zs{};
@@ -276,6 +293,7 @@ class BrotliEncoderImpl final : public ContentEncoder {
         }
         return brotli_run(m_st, m_ok, {}, BROTLI_OPERATION_FINISH);
     }
+    [[nodiscard]] bool ok() const noexcept override { return m_st != nullptr && m_ok; }
 
   private:
     BrotliEncoderState *m_st{nullptr};
@@ -467,13 +485,20 @@ class BrotliDecoderImpl final : public ContentDecoder {
 // Returns nullptr when `encoding` is unknown or the codec failed to start.
 [[nodiscard]] inline std::unique_ptr<ContentEncoder> make_encoder(std::string_view encoding,
                                                                   const CompressionConfig &config) {
+    std::unique_ptr<ContentEncoder> encoder;
     if (encoding == kEncodingGzip) {
-        return std::make_unique<detail::GzipEncoder>(config.gzip_level);
+        encoder = std::make_unique<detail::GzipEncoder>(config.gzip_level);
+    } else if (encoding == kEncodingBrotli) {
+        encoder = std::make_unique<detail::BrotliEncoderImpl>(config.brotli_quality);
+    } else {
+        return nullptr;
     }
-    if (encoding == kEncodingBrotli) {
-        return std::make_unique<detail::BrotliEncoderImpl>(config.brotli_quality);
+    // A non-null encoder that never produces bytes would make the streaming
+    // sink advertise Content-Encoding and then send an empty body.
+    if (!encoder->ok()) {
+        return nullptr;
     }
-    return nullptr;
+    return encoder;
 }
 
 // Returns nullptr when `encoding` is unknown or is `identity` - the caller then

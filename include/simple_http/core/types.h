@@ -28,6 +28,30 @@ inline bool contains_ctl(std::string_view s) noexcept {
     return false;
 }
 
+// RFC 3986: a request-target or authority contains no SP, no control byte,
+// and no raw backslash. Backslash matters because several intermediaries
+// (and WHATWG URL parsing) normalise it to '/', so `http://trusted.com\.evil/`
+// and `GET /\evil` can mean different hosts/paths to different parsers.
+// Percent-encode such bytes instead.
+inline bool contains_invalid_url_byte(std::string_view s) noexcept {
+    for (unsigned char c : s) {
+        if (c <= 0x20 || c == 0x7f || c == '\\')
+            return true;
+    }
+    return false;
+}
+
+// RFC 9113 §8.2.1 (required minimal validation for HTTP/2, applied to HTTP/3
+// as well): a field value MUST NOT start or end with SP or HTAB. Internal
+// whitespace is part of the value; leading/trailing whitespace is not, and
+// forwarding it to HTTP/1.1 lets different parsers disagree about the value.
+inline bool has_leading_or_trailing_ws(std::string_view s) noexcept {
+    if (s.empty())
+        return false;
+    const auto is_ws = [](char c) noexcept { return c == ' ' || c == '\t'; };
+    return is_ws(s.front()) || is_ws(s.back());
+}
+
 // RFC 9110 §5.5: a field value is *( HTAB / SP / VCHAR / obs-text ). Other
 // control characters, including DEL, cannot be serialized into an HTTP/1.1
 // field line and are not something HPACK peers expect either.

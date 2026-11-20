@@ -930,6 +930,78 @@ asio::awaitable<void> run_policy_group() {
         emit(co_await get_observation(client, base + "/cookies", "policy.cookies"));
     }
 
+    // RFC 6265 §5.1.4: a cookie-path ending in "/" matches descendants. Go's
+    // jar already implements this; the C++ jar did not, so pin it directly.
+    {
+        CookieJar jar;
+        Headers headers;
+        headers.add("set-cookie", std::string{"g=1; Path=/deep/"});
+        jar.store("http://example.com/deep/set", headers);
+        Observation obs;
+        obs.case_id = "policy.cookie_path_trailing_slash";
+        obs.mode = "cpp-only";
+        if (jar.cookie_header("https://example.com/deep/wider").find("g=1") == std::string::npos) {
+            obs.error = "trailing-slash cookie path did not match a descendant";
+        }
+        emit(std::move(obs));
+    }
+
+    // A Secure cookie received over plaintext http is discarded (browser /
+    // RFC 6265bis hardening; RFC 6265 itself only restricts sending).
+    {
+        CookieJar jar;
+        Headers headers;
+        headers.add("set-cookie", std::string{"s=1; Secure; Path=/"});
+        jar.store("http://example.com/", headers);
+        Observation obs;
+        obs.case_id = "policy.cookie_secure_from_http";
+        obs.mode = "cpp-only";
+        if (!jar.cookie_header("https://example.com/").empty()) {
+            obs.error = "Secure cookie received over http was stored";
+        }
+        emit(std::move(obs));
+    }
+
+    // RFC 3986: SP/TAB/DEL and a raw backslash are not URI bytes.
+    {
+        ClientConfig cfg;
+        cfg.default_version = HttpVersionPolicy::Http11;
+        cfg.default_h2c = H2cMode::Off;
+        Client client{co_await asio::this_coro::executor, cfg};
+        auto response = co_await client_send(client.get("http://127.0.0.1:7810/a\tb"));
+        Observation obs;
+        obs.case_id = "policy.url_control_byte";
+        obs.mode = "cpp-only";
+        if (response) {
+            obs.error = "URL with a TAB in the target was accepted";
+        } else if (response.error() != make_error_code(client_errc::bad_url)) {
+            obs.error = std::string{"wrong_error: "} + response.error().message();
+        }
+        emit(std::move(obs));
+    }
+
+    // The injected Accept-Encoding is normalised, but the user's list need not
+    // be; the buffered decode path must compare case-insensitively.
+    {
+        ClientConfig cfg;
+        cfg.default_version = HttpVersionPolicy::Http11;
+        cfg.default_h2c = H2cMode::Off;
+        cfg.auto_decompress = true;
+        cfg.accept_encodings = {"GZIP"};
+        Client client{co_await asio::this_coro::executor, cfg};
+        auto response = co_await client_send(
+            client.get(base + "/compress/gzip?body=hello-compressed").header("user-agent", "diff-probe"));
+        Observation obs;
+        obs.case_id = "policy.accept_encoding_case";
+        obs.mode = "cpp-only";
+        if (!response) {
+            obs.error = std::string{"request failed: "} + response.error().message();
+        } else if (!response->uncompressed() || response->text() != "hello-compressed") {
+            obs.error = "response was not decompressed";
+        }
+        emit(std::move(obs));
+    }
+
     // Request timeout.
     {
         ClientConfig cfg;

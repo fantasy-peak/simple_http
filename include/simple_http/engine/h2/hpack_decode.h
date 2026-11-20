@@ -81,6 +81,12 @@ class HpackDecoder {
     // cap (a stream error, not a compression error). Reset at each decode().
     bool header_list_too_large() const { return m_list_too_large; }
 
+    // True when the last decode() returned false because the block itself was
+    // malformed (truncated integer/string, bad index, ...). This is distinct
+    // from header_list_too_large(): crossing the list cap is not a compression
+    // error, but a malformed block that also crossed it is.
+    bool compression_error() const { return m_compression_error; }
+
     // Dynamic-table entry cap, a belt-and-braces bound on top of the RFC byte
     // accounting (an entry can never be smaller than 32 bytes, so a legitimate
     // table cannot exceed the size limit / 32 entries).
@@ -118,6 +124,7 @@ class HpackDecoder {
     std::size_t m_max_list_size = kDefaultMaxListSize;
     std::size_t m_list_size = 0; // running decoded size of the current block
     bool m_list_too_large = false;
+    bool m_compression_error = false;
     unsigned int m_error = 0;
 };
 
@@ -258,7 +265,22 @@ inline void HpackDecoder::evict_to_fit() {
 inline bool HpackDecoder::decode(std::string_view block, std::vector<HpackHeader> &out) {
     m_error = 0;
     m_list_too_large = false;
+    m_compression_error = false;
     m_list_size = 0;
+    // Every early `return false` below is a malformed representation. The
+    // guard marks those without having to annotate each site; the successful
+    // (or list-too-large) path disarms it before returning. A list-too-large
+    // block that is also truncated therefore reports a compression error, as
+    // RFC 7541 requires, instead of a stream-level size error.
+    struct CompressionGuard {
+        bool &flag;
+        bool armed{true};
+        ~CompressionGuard() {
+            if (armed) {
+                flag = true;
+            }
+        }
+    } compression_guard{m_compression_error};
     std::size_t pos = 0;
     // Appends one decoded field, enforcing the decoded-size cap as it grows so a
     // small block cannot allocate an unbounded list. Once the cap is crossed we
@@ -366,6 +388,7 @@ inline bool HpackDecoder::decode(std::string_view block, std::vector<HpackHeader
     }
     // The block was decoded to the end either way, so the dynamic table is in
     // sync. Report the size violation only after that.
+    compression_guard.armed = false;
     return !m_list_too_large;
 }
 

@@ -269,8 +269,10 @@ class ResponseWriter {
     // the final finish(). Completion signature: void(error_code).
     template <typename Token> auto async_finish_trailers(Headers trailers, Token &&token) {
         for (const auto &[name, value] : trailers) {
-            if (contains_ctl(name) || contains_ctl(value)) {
-                SIMPLE_HTTP_ERROR_LOG("response trailer with CR/LF/NUL rejected");
+            // Same rule as trailer(): a field name must be a token, and a field
+            // value must not carry control bytes other than HTAB.
+            if (!is_http_token(name) || contains_invalid_field_value(value)) {
+                SIMPLE_HTTP_ERROR_LOG("response trailer with invalid name/value rejected");
                 m_field_rejected = true;
                 break;
             }

@@ -148,7 +148,9 @@ inline std::optional<std::string> multipart_boundary(std::string_view content_ty
         while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
             value.remove_prefix(1);
         }
-        if (name == "boundary") {
+        // RFC 2045 parameter names are case-insensitive; RFC 9110 allows OWS
+        // before the ';' that ends an unquoted value.
+        if (iequals_ci(name, "boundary")) {
             std::string out;
             if (!value.empty() && value.front() == '"') {
                 value.remove_prefix(1);
@@ -156,7 +158,9 @@ inline std::optional<std::string> multipart_boundary(std::string_view content_ty
                 out.append(value.substr(0, quote == std::string_view::npos ? value.size() : quote));
             } else {
                 const std::size_t semi = value.find(';');
-                out.append(value.substr(0, semi == std::string_view::npos ? value.size() : semi));
+                const std::string_view raw = value.substr(0, semi == std::string_view::npos ? value.size() : semi);
+                const std::string_view trimmed = trim_ows(raw);
+                out.append(trimmed.data(), trimmed.size());
             }
             return out.empty() ? std::nullopt : std::optional<std::string>{std::move(out)};
         }

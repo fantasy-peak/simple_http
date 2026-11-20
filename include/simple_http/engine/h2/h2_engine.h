@@ -1182,6 +1182,20 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
     // false on a connection-fatal protocol error (a GOAWAY has been queued);
     // true if it consumed all it could and wants more bytes.
     bool parse_available() {
+        // Re-entry guard. Dispatching a request happens inside handle_frame,
+        // and a callback handler can read already-buffered body data inline,
+        // which calls on_body_consumed() -> parse_available() again. The
+        // outer pass has not committed m_recv_pos yet, so restarting here
+        // would replay the frames it already handled. The outer pass resumes
+        // as soon as the handler returns.
+        if (m_parsing) {
+            return true;
+        }
+        m_parsing = true;
+        struct ParseGuard {
+            bool *flag;
+            ~ParseGuard() { *flag = false; }
+        } parse_guard{&m_parsing};
         if (!consume_client_preface())
             return false; // fatal: not the h2 preface
         if (!m_preface_consumed)
@@ -1722,6 +1736,16 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
         auto &fields = m_decode_fields;
         fields.clear();
         if (!m_decoder.decode(block, fields)) {
+            // A malformed representation is always a connection-level
+            // compression error, even if the list cap was crossed earlier in
+            // the same block. header_list_too_large() alone would misclassify
+            // that as a stream-size error and leave the decoder behind the
+            // peer's dynamic table.
+            if (m_decoder.compression_error()) {
+                SIMPLE_HTTP_ERROR_LOG("h2 HPACK decode failed (stream={}, err={})", stream_id, m_decoder.last_error());
+                go_away(codec::H2_COMPRESSION_ERROR);
+                return false;
+            }
             if (m_decoder.header_list_too_large()) {
                 // The decoded list exceeded the bound advertised as
                 // SETTINGS_MAX_HEADER_LIST_SIZE. RFC 9113 §6.5.2 makes that a
@@ -1769,13 +1793,13 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
         };
 
         for (auto &f : fields) {
-            // RFC 9113 §8.2.1: a field name or value must not contain CR, LF or NUL.
-            // HTTP/2 has no line folding, so these bytes survive decoding verbatim
-            // and would let a peer inject request lines/headers into whatever
-            // HTTP/1.1 message is built downstream (handlers, reverse proxy). A
-            // request is malformed -> stream error (§8.1.1); the connection stays
-            // usable.
-            if (contains_ctl(f.name) || has_forbidden_value_byte(f.value)) {
+            // RFC 9113 §8.2.1: a field name or value must not contain CR, LF or NUL,
+            // and a field value must not start or end with SP/HTAB. HTTP/2 has no
+            // line folding, so these bytes survive decoding verbatim and would let a
+            // peer inject request lines/headers into whatever HTTP/1.1 message is
+            // built downstream (handlers, reverse proxy). A request is malformed ->
+            // stream error (§8.1.1); the connection stays usable.
+            if (contains_ctl(f.name) || has_forbidden_value_byte(f.value) || has_leading_or_trailing_ws(f.value)) {
                 SIMPLE_HTTP_ERROR_LOG("h2 field with CR/LF/NUL (stream={}); resetting stream", stream_id);
                 reset_stream(stream_id, codec::H2_PROTOCOL_ERROR);
                 return true; // stream is gone: the caller must not dispatch it
@@ -2434,6 +2458,15 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
         if (it->second.finish_pending) {
             return;
         }
+        // A split trailing header block still has CONTINUATION frames on the
+        // way, and they must reach both the HPACK decoder and the stream's
+        // trailer bookkeeping. Retiring the stream here would make the next
+        // CONTINUATION a connection error; on_continuation() clears
+        // m_continuation_stream before it calls back into this function, so
+        // retirement happens once the block is complete.
+        if (m_continuation_stream == stream_id) {
+            return;
+        }
         if (it->second.half_closed_remote && it->second.end_stream_sent) {
             // Both halves ended: §5.1 lets a later frame be a STREAM_CLOSED
             // connection error (it is not a stream we reset).
@@ -2894,6 +2927,9 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
                 }
                 auto adapter = std::make_shared<WsStreamAdapter>(self->weak_from_this(), stream_id, self->m_executor);
                 auto transport = std::make_shared<Http2WsTransport<WsStreamAdapter>>(adapter);
+                // RFC 8441 does not change RFC 6455's masking rules: the peer
+                // is still a WebSocket client, so its frames MUST be masked
+                // (RFC 6455 §5.3). The server's own frames stay unmasked.
                 auto backend = std::make_shared<WsBackendImpl<Http2WsTransport<WsStreamAdapter>>>(
                     transport, self->m_limits.max_body_bytes, self->m_limits.idle_timeout, /*expect_masked=*/true,
                     self->m_limits.ws_read_ahead_bytes, deflate);
@@ -3346,6 +3382,7 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
 
     std::string m_recv_buf;    // received bytes awaiting frame parsing
     std::size_t m_recv_pos{0}; // consumed prefix of m_recv_buf (compacted in bulk)
+    bool m_parsing{false};     // parse_available() re-entry guard
     std::string m_writing;     // bytes of the in-flight transport write (reused)
     std::string m_out;         // serialized frames awaiting transport write
 

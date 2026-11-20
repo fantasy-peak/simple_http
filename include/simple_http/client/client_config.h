@@ -525,6 +525,8 @@ class ClientErrorCategory : public boost::system::error_category {
             return "response head exceeded the configured limit";
         case client_errc::body_too_large:
             return "response body exceeded the configured limit";
+        case client_errc::body_decode_failed:
+            return "the response body could not be decompressed";
         case client_errc::session_busy:
             return "HTTP/1.1 session already has an exchange in flight";
         case client_errc::session_closed:

@@ -21,6 +21,7 @@
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/compose.hpp>
 #include <boost/asio/experimental/channel.hpp>
+#include <boost/asio/post.hpp>
 #include <boost/system/result.hpp>
 #include <cstddef>
 #include <functional>
@@ -450,10 +451,20 @@ class Body {
     };
 
     struct ReadAllOp {
+        // Bounds the inline read chain. A channel with buffered frames completes
+        // async_read() synchronously, and the h2/h3 consume hooks feed parked
+        // frames from inside that completion; without a yield the read-all
+        // operation would recurse once per frame (a few thousand 1-byte DATA
+        // frames overflow the worker stack).
+        static constexpr std::size_t kYieldAfter = 32;
+
+        explicit ReadAllOp(Body &b) : body(b) {}
+
         Body &body;
         std::string out;
         bool first{true};
         bool started{false};
+        std::size_t budget{kYieldAfter};
 
         asio::any_io_executor get_executor() noexcept { return body.m_exec; }
 
@@ -480,6 +491,14 @@ class Body {
             } else {
                 out.append(result.data);
             }
+            if (budget == 0) {
+                Body *next = &body;
+                budget = kYieldAfter;
+                asio::post(next->get_executor(),
+                           [self = std::move(self), next]() mutable { next->async_read(std::move(self)); });
+                return;
+            }
+            --budget;
             body.async_read(std::move(self));
         }
     };

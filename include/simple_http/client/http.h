@@ -158,13 +158,21 @@ template <typename... Args> class HopState : public std::enable_shared_from_this
     };
 
     void cancel_from_caller(asio::cancellation_type_t type) {
-        if (!is_terminal_cancel(type) || m_finished) {
+        if (!is_terminal_cancel(type)) {
             return;
         }
-        m_finished = true;
-        abort_hop();
+        // A cancellation slot may be emitted from any thread. m_finished,
+        // abort_hop() and the timer are owner-only state, so do the whole
+        // transition on the executor, not just the completion.
         auto self = this->shared_from_this();
-        asio::post(m_exec, [self]() mutable { self->deliver_cancelled(); });
+        asio::post(m_exec, [self]() mutable {
+            if (self->m_finished) {
+                return;
+            }
+            self->m_finished = true;
+            self->abort_hop();
+            self->deliver_cancelled();
+        });
     }
 
     void stop_timer() {
@@ -262,7 +270,7 @@ struct StreamSpec {
     std::chrono::milliseconds continue_timeout{1000};
 };
 
-class Stream {
+class Stream : public std::enable_shared_from_this<Stream> {
   public:
     // Constructed by the public client (open_stream). The budgets are captured
     // here so each read/head is bounded independently of later config changes.
@@ -299,8 +307,15 @@ class Stream {
     }
     template <typename Token> auto async_read_all(std::size_t max_bytes, Token &&token) {
         auto stream = m_stream;
+        // The composed read holds a reference to the ClientStream, not to this
+        // handle. Keep both alive until it completes: the caller may drop the
+        // Stream immediately after starting the read (h2/h3 deliver the next
+        // chunk later, from the session).
+        std::shared_ptr<void> owner = keep_alive();
         return asio::async_initiate<Token, void(error_code, std::string)>(
-            [stream, max_bytes](auto handler) mutable { stream->async_read_all(max_bytes, std::move(handler)); },
+            [stream, owner = std::move(owner), max_bytes](auto handler) mutable {
+                stream->async_read_all(max_bytes, std::move(owner), std::move(handler));
+            },
             token);
     }
     const detail::ResponseHead &head() const { return m_stream->head(); }
@@ -320,13 +335,23 @@ class Stream {
     // expectation_failed; a timed-out wait sends the body anyway (Go's
     // ExpectContinueTimeout behaviour for a peer that ignores the header).
     template <typename Token> auto async_ensure_continue(Token &&token) {
-        return asio::async_compose<Token, void(error_code)>(EnsureContinueOp{*this}, token, m_stream->head_executor());
+        return asio::async_compose<Token, void(error_code)>(EnsureContinueOp{keep_alive(), this}, token,
+                                                            m_stream->head_executor());
     }
 
   private:
+    // Non-owning for a stack-constructed Stream, which is why the operations
+    // below keep both the shared handle (when there is one) and a raw pointer.
+    // The public Client always constructs Stream through make_shared.
+    [[nodiscard]] std::shared_ptr<Stream> keep_alive() {
+        auto weak = weak_from_this();
+        return weak.expired() ? nullptr : weak.lock();
+    }
+
     template <typename Token> auto start_write_op(std::string data, bool finish, Headers trailers, Token &&token) {
         return asio::async_compose<Token, void(error_code)>(
-            WriteOp{*this, std::move(data), finish, std::move(trailers)}, token, m_stream->head_executor());
+            WriteOp{keep_alive(), this, std::move(data), finish, std::move(trailers)}, token,
+            m_stream->head_executor());
     }
 
     template <typename Token> auto read_head_with(std::chrono::milliseconds timeout, Token &&token) {
@@ -435,33 +460,38 @@ class Stream {
     }
 
     struct WriteOp {
-        Stream &self;
+        // Pins the public handle (and therefore m_stream) for a shared-owned
+        // Stream. Without it, dropping the caller's last shared_ptr while a
+        // write or the 100-continue wait is parked frees the Stream under the
+        // operation.
+        std::shared_ptr<Stream> keep;
+        Stream *self;
         std::string data;
         bool finish;
         Headers trailers;
         int phase{0};
 
-        asio::any_io_executor get_executor() const { return self.m_stream->head_executor(); }
+        asio::any_io_executor get_executor() const { return self->m_stream->head_executor(); }
 
         template <typename Self> void start(Self &s) {
             if (finish) {
-                self.m_stream->async_finish(std::move(data), std::move(s));
+                self->m_stream->async_finish(std::move(data), std::move(s));
             } else if (!trailers.empty()) {
-                self.m_stream->async_finish_trailers(std::move(trailers), std::move(s));
+                self->m_stream->async_finish_trailers(std::move(trailers), std::move(s));
             } else {
-                self.m_stream->async_write(std::move(data), std::move(s));
+                self->m_stream->async_write(std::move(data), std::move(s));
             }
         }
 
         template <typename Self> void operator()(Self &s, error_code ec = {}) {
             if (phase == 0) {
-                if (!self.m_auto_expect_continue || self.m_continue_checked) {
+                if (!self->m_auto_expect_continue || self->m_continue_checked) {
                     phase = 2;
                     start(s);
                     return;
                 }
                 phase = 1;
-                self.async_ensure_continue(std::move(s));
+                self->async_ensure_continue(std::move(s));
                 return;
             }
             if (phase == 1) {
@@ -478,26 +508,27 @@ class Stream {
     };
 
     struct EnsureContinueOp {
-        Stream &self;
+        std::shared_ptr<Stream> keep;
+        Stream *self;
         int phase{0};
 
-        asio::any_io_executor get_executor() const { return self.m_stream->head_executor(); }
+        asio::any_io_executor get_executor() const { return self->m_stream->head_executor(); }
 
         template <typename Self> void operator()(Self &s, error_code ec = {}, detail::ResponseHead head = {}) {
             if (phase == 0) {
                 phase = 1;
-                self.m_continue_checked = true;
-                if (!self.m_auto_expect_continue) {
+                self->m_continue_checked = true;
+                if (!self->m_auto_expect_continue) {
                     s.complete(error_code{});
                     return;
                 }
                 // h1 and h2 surface the interim 100; h3 servers have no 1xx API,
                 // so the client sends the body without waiting.
-                if (self.m_stream->version() != Version::Http11 && self.m_stream->version() != Version::Http2) {
+                if (self->m_stream->version() != Version::Http11 && self->m_stream->version() != Version::Http2) {
                     s.complete(error_code{});
                     return;
                 }
-                self.read_head_with(self.m_continue_timeout, std::move(s));
+                self->read_head_with(self->m_continue_timeout, std::move(s));
                 return;
             }
             if (ec == make_error_code(client_errc::response_head_timeout)) {
@@ -513,7 +544,7 @@ class Stream {
             if (head.status == status::continue_) {
                 // The interim head was handed to us; the final response still
                 // follows, so the next read_head() must parse it.
-                self.m_stream->clear_head_cache();
+                self->m_stream->clear_head_cache();
                 s.complete(error_code{});
                 return;
             }
@@ -1849,6 +1880,20 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
         std::move(done)(make_error_code(asio::error::operation_aborted), Response{});
         return;
     }
+    // A streaming request body is driven through Stream::async_write only; the
+    // buffered send path has no way to feed or terminate it and would wait for
+    // a response head until the timeout.
+    if (request->stream_body()) {
+        std::move(done)(make_error_code(client_errc::invalid_spec), Response{});
+        return;
+    }
+    if (cancel) {
+        // Redirect/retry re-enters send_hop with the same HopCancel. The
+        // previous hop's stream is finished; leaving it here would make
+        // abort_hop() cancel that dead stream instead of the new hop's dial.
+        cancel->stream.reset();
+        cancel->abort_transport = {};
+    }
     // Per-request budgets override the Client's defaults (0 = use the default).
     const std::chrono::milliseconds head_budget =
         response_head_timeout.count() > 0 ? response_head_timeout : m_config.response_head_timeout;
@@ -2046,14 +2091,18 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
                                 head.status != status::not_modified) {
                                 if (const auto encoding = head.header(field::content_encoding)) {
                                     const ContentCoding coding = parse_content_coding(*encoding);
-                                    const bool wanted = (coding == ContentCoding::Gzip &&
-                                                         std::find(self->m_config.accept_encodings.begin(),
-                                                                   self->m_config.accept_encodings.end(),
-                                                                   "gzip") != self->m_config.accept_encodings.end()) ||
-                                                        (coding == ContentCoding::Brotli &&
-                                                         std::find(self->m_config.accept_encodings.begin(),
-                                                                   self->m_config.accept_encodings.end(),
-                                                                   "br") != self->m_config.accept_encodings.end());
+                                    // The injected Accept-Encoding is normalised to
+                                    // lowercase, but the user's list may not be. Compare
+                                    // case-insensitively, exactly as the streaming decorator
+                                    // does with its normalised advertisement.
+                                    const auto advertised = [&self](std::string_view name) {
+                                        const auto &list = self->m_config.accept_encodings;
+                                        return std::any_of(list.begin(), list.end(), [name](const std::string &entry) {
+                                            return iequals_ci(entry, name);
+                                        });
+                                    };
+                                    const bool wanted = (coding == ContentCoding::Gzip && advertised("gzip")) ||
+                                                        (coding == ContentCoding::Brotli && advertised("br"));
                                     if (wanted) {
                                         if (auto decoder = make_decoder(*encoding)) {
                                             // The wire body is already capped, but

@@ -46,6 +46,10 @@ class SseParser {
     // A line longer than this is not a legitimate SSE event; keeping it in
     // m_buf forever is an unbounded allocation controlled by the peer.
     static constexpr std::size_t max_line_bytes = 1u << 20;
+    // Same bound for the event being assembled: a peer that keeps sending
+    // `data:` lines without the blank line that dispatches the event would
+    // otherwise grow m_data without limit.
+    static constexpr std::size_t max_event_bytes = 8u << 20;
 
     bool overflowed() const noexcept { return m_overflow; }
 
@@ -56,7 +60,11 @@ class SseParser {
         for (;;) {
             std::size_t end = std::string::npos;
             std::size_t term = 0;
-            for (std::size_t i = pos; i < m_buf.size(); ++i) {
+            // Resume scanning where the previous feed stopped: re-examining
+            // the whole unterminated tail on every chunk made a line delivered
+            // one byte at a time O(n²) in the peer's input.
+            std::size_t i = std::max(pos, m_scan_from);
+            for (; i < m_buf.size(); ++i) {
                 if (m_buf[i] == '\n') {
                     end = i;
                     term = 1;
@@ -64,7 +72,10 @@ class SseParser {
                 }
                 if (m_buf[i] == '\r') {
                     if (i + 1 >= m_buf.size()) {
-                        break; // a trailing CR may be the first half of CRLF: wait
+                        // A trailing CR may be the first half of CRLF. Keep it
+                        // unscanned so the next feed re-examines this byte.
+                        m_scan_from = i;
+                        break;
                     }
                     end = i;
                     term = (m_buf[i + 1] == '\n') ? 2 : 1;
@@ -72,14 +83,23 @@ class SseParser {
                 }
             }
             if (end == std::string::npos) {
+                if (i >= m_buf.size()) {
+                    m_scan_from = m_buf.size();
+                }
                 break;
             }
             process_line(std::string_view{m_buf.data() + pos, end - pos}, out);
             pos = end + term;
+            m_scan_from = pos;
         }
         m_buf.erase(0, pos);
+        m_scan_from = m_scan_from >= pos ? m_scan_from - pos : 0;
+        if (m_buf.empty()) {
+            m_scan_from = 0;
+        }
         if (m_buf.size() > max_line_bytes) {
             m_buf.clear();
+            m_scan_from = 0;
             m_overflow = true;
         }
         return out;
@@ -91,6 +111,7 @@ class SseParser {
             process_line(m_buf, out);
             m_buf.clear();
         }
+        m_scan_from = 0;
         dispatch(out);
         return out;
     }
@@ -114,6 +135,15 @@ class SseParser {
             }
         }
         if (field == "data") {
+            if (m_data.size() + value.size() + 1 > max_event_bytes) {
+                // Drop the oversized event rather than buffering the peer's
+                // allocation. The stream is still usable; the caller sees
+                // overflowed().
+                m_overflow = true;
+                m_data.clear();
+                m_has_data = false;
+                return;
+            }
             m_data.append(value);
             m_data.push_back('\n');
             m_has_data = true;
@@ -154,6 +184,9 @@ class SseParser {
     }
 
     std::string m_buf;
+    // Offset in m_buf up to which the last feed() scanned without finding a
+    // line terminator. Resuming here keeps a byte-at-a-time line linear.
+    std::size_t m_scan_from{0};
     bool m_overflow{false};
     std::string m_data;
     std::string m_event;

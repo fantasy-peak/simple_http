@@ -678,6 +678,50 @@ func checkExtendedConnect(addr string) error {
 	return fmt.Errorf("no complete echo frame")
 }
 
+// RFC 9113 §8.2.1 requires a minimal field-value check: a value MUST NOT
+// start or end with SP/HTAB. HPACK can carry such a value verbatim, and
+// forwarding it to HTTP/1.1 lets parsers disagree about the value.
+func checkFieldLeadingWS(addr string) error {
+	c, err := dial(addr, 3*time.Second)
+	if err != nil {
+		return err
+	}
+	defer c.conn.Close()
+	c.conn.SetDeadline(time.Now().Add(5 * time.Second))
+	fields := []hpack.HeaderField{
+		{Name: ":method", Value: "GET"},
+		{Name: ":scheme", Value: "http"},
+		{Name: ":authority", Value: addr},
+		{Name: ":path", Value: "/"},
+		{Name: "x-test", Value: " leading"},
+	}
+	if err := c.writeFrame(frameHeaders, flagEndHeaders|flagEndStream, 1, encodeFields(fields)); err != nil {
+		return err
+	}
+	for {
+		typ, flags, id, payload, err := c.readFrame()
+		if err != nil {
+			return err
+		}
+		switch typ {
+		case frameSettings:
+			if flags&flagAck == 0 {
+				_ = c.writeFrame(frameSettings, flagAck, 0, nil)
+			}
+		case framePing:
+			c.ackPing(payload)
+		case frameRSTStream:
+			if id == 1 {
+				return nil
+			}
+		case frameHeaders:
+			return fmt.Errorf("response HEADERS instead of RST_STREAM")
+		case frameGoAway:
+			return fmt.Errorf("GOAWAY instead of stream reset")
+		}
+	}
+}
+
 func checkRapidReset(addr string) error {
 	c, err := dial(addr, 3*time.Second)
 	if err != nil {
@@ -788,6 +832,7 @@ func main() {
 	check("h2.ws_route_miss", checkWSRouteMiss(addr))
 	check("h2.ws_unknown_protocol", checkWSUnknownProtocol(addr))
 	check("h2.ws_missing_scheme", checkWSMissingScheme(addr))
+	check("h2.field_leading_ws", checkFieldLeadingWS(addr))
 	check("h2.rapid_reset", checkRapidReset(addr))
 	check("h2.upgrade", checkH2cUpgrade(sniffAddr))
 	if failed != 0 {
