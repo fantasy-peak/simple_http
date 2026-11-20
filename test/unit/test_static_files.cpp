@@ -404,7 +404,14 @@ TEST_CASE("static: preload respects both the per-file cap and the budget", "[sta
         auto r = get(*site, ctx, "/app.js");
         CHECK(r.handled);
         CHECK(r.writer->last_status == status::ok);
-        CHECK(r.writer->last_body == "console.log('app');");
+        // Zero cap forces the on-demand path, which streams instead of a
+        // one-shot send(); the fake sink records streamed bytes in `chunks`.
+        CHECK(r.writer->begun);
+        CHECK(r.writer->finished);
+        std::string streamed;
+        for (const auto &chunk : r.writer->chunks)
+            streamed += chunk;
+        CHECK(streamed == "console.log('app');");
     }
 }
 
