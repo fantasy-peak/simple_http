@@ -19,6 +19,7 @@
 #include <utility>
 
 #include "../../core/compat.h"
+#include "../../core/span.h"
 #include "../../core/types.h"
 #include "../../transport/transport.h"
 

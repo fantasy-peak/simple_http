@@ -51,6 +51,7 @@
 #include "../core/logging.h"
 #include "../core/resolve.h"
 #include "../core/result.h"
+#include "../core/span.h"
 #include "../core/types.h"
 #include "../core/version.h"
 #include "../engine/h3/h3_callbacks.h"

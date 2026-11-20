@@ -69,6 +69,7 @@
 #endif
 
 #include "../core/logging.h"
+#include "../core/span.h"
 #include "../core/types.h"
 #include "../transport/transport.h" // SslHandle
 #include "ngtcp2_config.h"

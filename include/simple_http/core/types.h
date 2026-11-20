@@ -16,6 +16,7 @@
 #include <functional>
 #include <string>
 #include <string_view>
+#include <type_traits>
 
 namespace simple_http {
 
@@ -191,16 +192,15 @@ namespace detail {
 // construction per lookup. Centralised here so callers do not each grow an
 // #if, and so the cost is visible in one place.
 #if defined(__cpp_lib_generic_unordered_lookup) && __cpp_lib_generic_unordered_lookup >= 201911L
-template <typename Map, typename Key> inline auto unordered_find(const Map &map, const Key &key) {
-    return map.find(key);
-}
 template <typename Map, typename Key> inline auto unordered_find(Map &map, const Key &key) { return map.find(key); }
 #else
-template <typename Map, typename Key> inline auto unordered_find(const Map &map, const Key &key) {
-    return map.find(typename Map::key_type(key));
-}
 template <typename Map, typename Key> inline auto unordered_find(Map &map, const Key &key) {
-    return map.find(typename Map::key_type(key));
+    // Map & deduces to const Map for const lvalues, so one overload serves both.
+    if constexpr (std::is_same_v<Key, typename Map::key_type>) {
+        return map.find(key);
+    } else {
+        return map.find(typename Map::key_type(key));
+    }
 }
 #endif
 

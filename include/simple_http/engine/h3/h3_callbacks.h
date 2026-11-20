@@ -23,6 +23,7 @@
 #include <openssl/rand.h>
 
 #include "../../core/compat.h"
+#include "../../core/span.h"
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>

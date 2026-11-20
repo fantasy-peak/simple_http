@@ -68,6 +68,7 @@
 #include "../../core/http_method.h"
 #include "../../core/limits.h"
 #include "../../core/logging.h"
+#include "../../core/span.h"
 #include "../../core/types.h"
 #include "../../core/version.h"
 #include "../../proto/compressing_writer.h"

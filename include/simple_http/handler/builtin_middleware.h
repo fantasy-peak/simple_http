@@ -34,6 +34,7 @@
 #include "../core/http_status.h"
 #include "../core/logging.h"
 #include "../core/result.h"
+#include "../core/span.h"
 #include "../core/types.h"
 #include "../core/url_path.h"
 #include "handler.h"

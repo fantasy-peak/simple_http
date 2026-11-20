@@ -10,6 +10,17 @@
 
 #include <cstddef>
 
+// The feature-test macro is only guaranteed to be defined after the standard
+// header that provides it (or <version>) has been seen, so it must be included
+// here explicitly. Inheriting whatever an earlier Boost/std header happened to
+// define would make the std::span-vs-fallback choice depend on include order,
+// and differing choices across translation units would be an ODR violation.
+#if defined(__has_include)
+#if __has_include(<version>)
+#include <version> // __cpp_lib_span
+#endif
+#endif
+
 #if defined(__cpp_lib_span) && __cpp_lib_span >= 202002L
 #include <span>
 #else

@@ -24,6 +24,7 @@
 #include <utility>
 
 #include "../core/compat.h"
+#include "../core/span.h"
 #include "../core/types.h"
 
 namespace simple_http {
