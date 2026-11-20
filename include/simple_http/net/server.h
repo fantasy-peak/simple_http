@@ -35,6 +35,7 @@
 #include "../core/limits.h"
 #include "../core/logging.h"
 #include "../core/result.h"
+#include "../core/span.h"
 #include "../core/types.h"
 #include "../engine/h1/h1_engine.h"
 #include "../engine/h2/h2_engine.h"
@@ -382,9 +383,9 @@ class Server {
                         alpn = {"h2", "http/1.1"};
                         break;
                     }
-                    listener->tls = std::make_shared<TlsContext>(
-                        *cfg.tls, boost::span<const std::string_view>{alpn.data(), alpn.size()},
-                        cfg.alpn == TlsHttp::Http2Only);
+                    listener->tls =
+                        std::make_shared<TlsContext>(*cfg.tls, span<const std::string_view>{alpn.data(), alpn.size()},
+                                                     cfg.alpn == TlsHttp::Http2Only);
                 } catch (const std::exception &e) {
                     SIMPLE_HTTP_ERROR_LOG("server: TLS setup failed: {}", e.what());
                     report.failures.push_back(ListenerFailure{cfg.name.empty() ? inet->host : cfg.name,

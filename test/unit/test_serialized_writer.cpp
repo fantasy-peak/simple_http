@@ -30,7 +30,7 @@ class DeferredTransport {
   public:
     explicit DeferredTransport(asio::any_io_executor ex) : m_executor(std::move(ex)) {}
 
-    template <typename Token> auto async_write_seq(boost::span<const ConstByteSpan> buffers, Token &&token) {
+    template <typename Token> auto async_write_seq(simple_http::span<const ConstByteSpan> buffers, Token &&token) {
         ++m_starts;
         m_pending.assign(buffers.begin(), buffers.end());
         auto initiation = [this](auto handler) {

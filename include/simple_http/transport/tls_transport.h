@@ -20,6 +20,7 @@
 #include <string_view>
 #include <utility>
 
+#include "../core/span.h"
 #include "../core/types.h"
 #include "transport.h"
 
@@ -62,7 +63,7 @@ template <typename Socket> class TlsTransport {
 
     // Writes several buffers as one TLS record batch, so a frame header and its
     // payload need not be concatenated first.
-    template <typename Token> auto async_write_seq(boost::span<const ConstByteSpan> buffers, Token &&token) {
+    template <typename Token> auto async_write_seq(span<const ConstByteSpan> buffers, Token &&token) {
         return detail::async_stream_write_seq(*m_stream, buffers, std::forward<Token>(token));
     }
 

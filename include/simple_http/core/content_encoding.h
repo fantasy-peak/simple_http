@@ -29,6 +29,7 @@
 
 #include "compression.h"
 #include "http_field.h" // trim_ows / value_has_token
+#include "qvalue.h"     // parse_qvalue
 
 #include <brotli/decode.h>
 #include <brotli/encode.h>
@@ -81,33 +82,8 @@ inline std::string_view mime_essence(std::string_view content_type) {
     return trim_ows(content_type);
 }
 
-// Parses the value of an Accept-Encoding q parameter ("0", "1", "0.8", ".5").
-// Anything unparseable yields 0, which reads as "not acceptable" - the safe
-// direction, since it only ever suppresses compression.
-inline double parse_qvalue(std::string_view s) {
-    s = trim_ows(s);
-    double value = 0.0;
-    bool seen_dot = false;
-    double scale = 0.1;
-    for (char c : s) {
-        if (c >= '0' && c <= '9') {
-            if (!seen_dot) {
-                value = value * 10.0 + (c - '0');
-            } else {
-                value += (c - '0') * scale;
-                scale *= 0.1;
-            }
-        } else if (c == '.') {
-            if (seen_dot) {
-                break;
-            }
-            seen_dot = true;
-        } else {
-            break;
-        }
-    }
-    return value;
-}
+// `parse_qvalue` lives in core/types.h so accept_encoding.h can use it without
+// depending on this codec header.
 
 // --- encoders -------------------------------------------------------------
 

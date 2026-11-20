@@ -189,8 +189,7 @@ template <typename ConnectionType> class SharedCidRegistry {
         // forwards every packet through here.
         asio::post(it->second.exec, [conn = std::move(conn), data = std::move(datagram), from]() mutable {
             conn->on_datagram(
-                boost::span<const std::uint8_t>{reinterpret_cast<const std::uint8_t *>(data.data()), data.size()},
-                from);
+                span<const std::uint8_t>{reinterpret_cast<const std::uint8_t *>(data.data()), data.size()}, from);
         });
         return true;
     }
@@ -405,9 +404,8 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
                         continue;
                     state->from[i].resize(state->msgs[i].msg_hdr.msg_namelen);
                     self->handle_datagram(
-                        boost::span<const std::uint8_t>{state->scratch.data() +
-                                                            static_cast<std::size_t>(i) * kMaxDatagram,
-                                                        static_cast<std::size_t>(state->msgs[i].msg_len)},
+                        span<const std::uint8_t>{state->scratch.data() + static_cast<std::size_t>(i) * kMaxDatagram,
+                                                 static_cast<std::size_t>(state->msgs[i].msg_len)},
                         state->from[i]);
                 }
             }
@@ -426,14 +424,14 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
                     return;
                 }
                 if (n != 0) {
-                    self->handle_datagram(boost::span<const std::uint8_t>{state->buffer.data(), n}, state->remote);
+                    self->handle_datagram(span<const std::uint8_t>{state->buffer.data(), n}, state->remote);
                 }
                 self->receive_wait(std::move(state));
             });
 #endif
     }
 
-    void handle_datagram(boost::span<const std::uint8_t> data, const asio::ip::udp::endpoint &remote) {
+    void handle_datagram(span<const std::uint8_t> data, const asio::ip::udp::endpoint &remote) {
         ngtcp2_version_cid vc{};
         // RFC 9000 §17.2 caps a connection ID at NGTCP2_MAX_CIDLEN (20)
         // octets. The configured length is a public knob; passing an
@@ -579,7 +577,7 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
 
         auto conn = std::make_shared<Connection>(m_executor, m_ssl_ctx, m_config.connection, bootstrap,
                                                  m_config.supported_versions, local, remote,
-                                                 boost::span<const std::uint8_t>{m_secret.data(), m_secret.size()},
+                                                 span<const std::uint8_t>{m_secret.data(), m_secret.size()},
                                                  [self](SendItem &&item) { self->queue_datagram(std::move(item)); });
         if (conn->init_failed()) {
             release_connection();
@@ -590,10 +588,11 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
         // this a client that migrates to a fresh connection ID becomes
         // unreachable — and its packets look exactly like those of a connection
         // that never existed.
-        conn->set_cid_callbacks([self, weak = std::weak_ptr<Connection>(conn)](
-                                    boost::span<const std::uint8_t> cid,
-                                    boost::span<const std::uint8_t>) { self->associate_cid(cid, weak); },
-                                [self](boost::span<const std::uint8_t> cid) { self->dissociate_cid(cid); });
+        conn->set_cid_callbacks(
+            [self, weak = std::weak_ptr<Connection>(conn)](span<const std::uint8_t> cid, span<const std::uint8_t>) {
+                self->associate_cid(cid, weak);
+            },
+            [self](span<const std::uint8_t> cid) { self->dissociate_cid(cid); });
 
         if (!conn->init()) {
             release_connection();
@@ -671,7 +670,7 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
         return key;
     }
 
-    void associate_cid(boost::span<const std::uint8_t> cid, const std::weak_ptr<Connection> &conn) {
+    void associate_cid(span<const std::uint8_t> cid, const std::weak_ptr<Connection> &conn) {
         if (cid.empty())
             return;
         const CidKey key = cid_key(cid.data(), cid.size());
@@ -688,7 +687,7 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
             m_cids_by_conn[live.get()].push_back(key);
     }
 
-    void dissociate_cid(boost::span<const std::uint8_t> cid) {
+    void dissociate_cid(span<const std::uint8_t> cid) {
         if (cid.empty())
             return;
         const CidKey key = cid_key(cid.data(), cid.size());
@@ -729,7 +728,7 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
     // These build their datagram in a stack buffer, so the payload is copied
     // into the queued item — the cheap move path below is for the connection's
     // persistent send buffers; these are one-per-connection events at most.
-    void queue_datagram_copy(boost::span<const std::uint8_t> data, const asio::ip::udp::endpoint &to) {
+    void queue_datagram_copy(span<const std::uint8_t> data, const asio::ip::udp::endpoint &to) {
         if (m_closed)
             return;
         SendItem item;
@@ -747,7 +746,7 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
             buf.data(), buf.size(), static_cast<std::uint8_t>(random_byte()), vc.scid, vc.scidlen, vc.dcid, vc.dcidlen,
             m_config.supported_versions.data(), m_config.supported_versions.size());
         if (n > 0)
-            queue_datagram_copy(boost::span<const std::uint8_t>{buf.data(), static_cast<std::size_t>(n)}, remote);
+            queue_datagram_copy(span<const std::uint8_t>{buf.data(), static_cast<std::size_t>(n)}, remote);
     }
 
     void send_retry(const ngtcp2_pkt_hd &hd, const ngtcp2_version_cid &vc, const asio::ip::udp::endpoint &remote) {
@@ -775,7 +774,7 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
         const ngtcp2_ssize n = ngtcp2_crypto_write_retry(buf.data(), buf.size(), hd.version, &hd.scid, &retry_scid,
                                                          &hd.dcid, token.data(), static_cast<std::size_t>(tokenlen));
         if (n > 0)
-            queue_datagram_copy(boost::span<const std::uint8_t>{buf.data(), static_cast<std::size_t>(n)}, remote);
+            queue_datagram_copy(span<const std::uint8_t>{buf.data(), static_cast<std::size_t>(n)}, remote);
     }
 
     void send_stateless_reset(std::size_t packet_len, const ngtcp2_version_cid &vc,
@@ -809,7 +808,7 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
         const ngtcp2_ssize n =
             ngtcp2_pkt_write_stateless_reset(buf.data(), buf.size(), token.data(), rand.data(), rand_len);
         if (n > 0)
-            queue_datagram_copy(boost::span<const std::uint8_t>{buf.data(), static_cast<std::size_t>(n)}, remote);
+            queue_datagram_copy(span<const std::uint8_t>{buf.data(), static_cast<std::size_t>(n)}, remote);
     }
 
     static std::uint8_t random_byte() {

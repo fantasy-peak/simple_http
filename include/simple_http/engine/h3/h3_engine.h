@@ -629,7 +629,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         }
         out.stream_id = stream_id;
         out.fin = fin;
-        out.vec = boost::span<const quic::ByteVec>{m_vec.data(), m_vec_count};
+        out.vec = span<const quic::ByteVec>{m_vec.data(), m_vec_count};
         return out;
     }
 
@@ -674,8 +674,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
 
     // --- quic::Protocol: the read side and events ---------------------------
 
-    void on_stream_data(std::uint32_t flags, std::int64_t stream_id,
-                        boost::span<const std::uint8_t> data) noexcept override {
+    void on_stream_data(std::uint32_t flags, std::int64_t stream_id, span<const std::uint8_t> data) noexcept override {
         if (h3() == nullptr)
             return;
 
@@ -1052,7 +1051,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         spawn_handler(stream_id);
     }
 
-    void on_data(std::int64_t stream_id, boost::span<const std::uint8_t> data) noexcept override {
+    void on_data(std::int64_t stream_id, span<const std::uint8_t> data) noexcept override {
         auto it = m_streams.find(stream_id);
         if (it == m_streams.end())
             return;

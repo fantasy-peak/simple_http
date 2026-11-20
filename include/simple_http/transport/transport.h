@@ -66,7 +66,7 @@ auto async_stream_write_all(Stream &stream, ConstByteSpan buffer, Token &&token)
 // Writes several buffers as one operation (one writev / TLS record batch), so a
 // frame header and its payload need not be concatenated first.
 template <typename Stream, typename Token>
-auto async_stream_write_seq(Stream &stream, boost::span<const ConstByteSpan> buffers, Token &&token) {
+auto async_stream_write_seq(Stream &stream, span<const ConstByteSpan> buffers, Token &&token) {
     // Bounded by the iovec this builds. Callers pass a handful at most, so the
     // cap is a backstop rather than a real limit — dropping buffers past it
     // would write a *shorter* message and still report success, which is silent

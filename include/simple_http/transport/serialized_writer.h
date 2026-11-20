@@ -184,7 +184,7 @@ class SerializedWriter final : public std::enable_shared_from_this<SerializedWri
             const Item &item = m_queue.front();
             std::array<ConstByteSpan, 3> buffers{};
             const std::size_t count = item.entry.append_buffers(buffers);
-            m_transport->async_write_seq(boost::span<const ConstByteSpan>{buffers.data(), count},
+            m_transport->async_write_seq(span<const ConstByteSpan>{buffers.data(), count},
                                          [self](error_code ec, std::size_t) { self->on_written(ec); });
             // A synchronous completion cleared m_in_flight and popped the
             // entry; loop for the next one. An asynchronous one owns the

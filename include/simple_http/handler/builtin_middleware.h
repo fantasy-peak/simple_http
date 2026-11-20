@@ -111,7 +111,8 @@ inline Middleware access_log() {
                  }
                  const LogLevel level =
                      status >= 500 ? LogLevel::Error : (status >= 400 ? LogLevel::Warn : LogLevel::Info);
-                 log_with_attrs(level, "access", source_location::current(), "request", attrs);
+                 log_with_attrs(level, "access", source_location::current(), "request",
+                                span<const Attr>{attrs.data(), attrs.size()});
 #endif
                  std::move(done)();
              });

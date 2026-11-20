@@ -51,6 +51,7 @@
 #include "../../core/http_method.h"
 #include "../../core/limits.h"
 #include "../../core/logging.h"
+#include "../../core/span.h"
 #include "../../core/types.h"
 #include "../../core/version.h"
 #include "../../proto/compressing_writer.h"
@@ -2809,7 +2810,7 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
             std::move(done)(make_error_code(asio::error::operation_aborted), 0);
         }
 
-        void write_seq(boost::span<const ConstByteSpan> buffers, IoCompletion done) override {
+        void write_seq(span<const ConstByteSpan> buffers, IoCompletion done) override {
             if (auto eng = m_engine.lock()) {
                 eng->ws_stream_write(m_id, buffers, std::move(done));
                 return;
@@ -3000,7 +3001,7 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
 
     // Outbound tunnel write: frames every buffer as DATA on this stream, waiting
     // on the same backpressure the response path uses.
-    void ws_stream_write(std::uint32_t id, boost::span<const ConstByteSpan> bufs, H2WsStream::IoCompletion done) {
+    void ws_stream_write(std::uint32_t id, span<const ConstByteSpan> bufs, H2WsStream::IoCompletion done) {
         std::size_t total = 0;
         for (const auto &b : bufs)
             total += b.size();
@@ -3186,7 +3187,7 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
                 auto initial = std::make_shared<std::string>(std::move(m_initial));
                 auto self = this->shared_from_this();
                 ConstByteSpan one{reinterpret_cast<const std::byte *>(initial->data()), initial->size()};
-                m_engine->ws_stream_write(m_id, boost::span<const ConstByteSpan>{&one, 1},
+                m_engine->ws_stream_write(m_id, span<const ConstByteSpan>{&one, 1},
                                           [self, initial](error_code ec, std::size_t) mutable {
                                               if (ec) {
                                                   self->close_backend();
@@ -3245,7 +3246,7 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
                     }
                     self->touch();
                     ConstByteSpan one{buf->data(), n};
-                    self->m_engine->ws_stream_write(self->m_id, boost::span<const ConstByteSpan>{&one, 1},
+                    self->m_engine->ws_stream_write(self->m_id, span<const ConstByteSpan>{&one, 1},
                                                     [self, buf](error_code wec, std::size_t) mutable {
                                                         if (wec) {
                                                             self->m_b2c_done = true;

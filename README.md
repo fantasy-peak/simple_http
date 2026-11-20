@@ -106,7 +106,7 @@ The library is header-only: `include/` contains no `.cpp` files.
 
 | Dependency | Purpose |
 |---|---|
-| Boost (Asio, System, Regex, Core) | I/O, error model, routing regex |
+| Boost (Asio, System, Regex) | I/O, error model, routing regex |
 | OpenSSL | TLS, certificate verification, mTLS, QUIC TLS |
 | zlib, brotli | gzip/br content coding and WebSocket permessage-deflate |
 | glaze | JSON reflection, typed params/extractors, JWT/JWKS, OpenAPI |

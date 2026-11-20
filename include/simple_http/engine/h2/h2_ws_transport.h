@@ -32,7 +32,7 @@ class H2WsStream {
 
     virtual ~H2WsStream() = default;
     virtual void read_some(ByteSpan out, IoCompletion done) = 0;
-    virtual void write_seq(boost::span<const ConstByteSpan> buffers, IoCompletion done) = 0;
+    virtual void write_seq(span<const ConstByteSpan> buffers, IoCompletion done) = 0;
     virtual void close() = 0;
     virtual asio::any_io_executor get_executor() = 0;
 };
@@ -53,7 +53,7 @@ template <typename Adapter> class Http2WsTransport {
             [adapter, out](auto handler) mutable { adapter->read_some(out, std::move(handler)); }, token);
     }
 
-    template <typename Token> auto async_write_seq(boost::span<const ConstByteSpan> buffers, Token &&token) {
+    template <typename Token> auto async_write_seq(span<const ConstByteSpan> buffers, Token &&token) {
         auto adapter = m_adapter;
         return asio::async_initiate<Token, void(error_code, std::size_t)>(
             [adapter, buffers](auto handler) mutable { adapter->write_seq(buffers, std::move(handler)); }, token);
@@ -64,8 +64,7 @@ template <typename Adapter> class Http2WsTransport {
         return asio::async_initiate<Token, void(error_code, std::size_t)>(
             [adapter, buffer](auto handler) mutable {
                 const std::array<ConstByteSpan, 1> buffers{buffer};
-                adapter->write_seq(boost::span<const ConstByteSpan>{buffers.data(), buffers.size()},
-                                   std::move(handler));
+                adapter->write_seq(span<const ConstByteSpan>{buffers.data(), buffers.size()}, std::move(handler));
             },
             token);
     }

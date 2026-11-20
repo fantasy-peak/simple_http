@@ -47,6 +47,7 @@
 #include "../../core/http_status.h"
 #include "../../core/limits.h"
 #include "../../core/logging.h"
+#include "../../core/span.h"
 #include "../../core/types.h"
 #include "../../core/version.h"
 #include "../../proto/compressing_writer.h"
@@ -972,7 +973,7 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
             const std::array<ConstByteSpan, 1> buffers{
                 ConstByteSpan{reinterpret_cast<const std::byte *>(keep->data()), keep->size()}};
             touch_deadline();
-            m_transport->async_write_seq(boost::span<const ConstByteSpan>{buffers.data(), buffers.size()},
+            m_transport->async_write_seq(span<const ConstByteSpan>{buffers.data(), buffers.size()},
                                          forward_cancel_slot(slot, [self, keep, done = std::move(done),
                                                                     slot](error_code ec, std::size_t) mutable {
                                              if (ec) {
@@ -1724,7 +1725,7 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
             [transport, response](asio::any_completion_handler<void(error_code, std::size_t)> handler) {
                 const std::array<ConstByteSpan, 1> buffers{
                     ConstByteSpan{reinterpret_cast<const std::byte *>(response->data()), response->size()}};
-                transport->async_write_seq(boost::span<const ConstByteSpan>{buffers.data(), buffers.size()},
+                transport->async_write_seq(span<const ConstByteSpan>{buffers.data(), buffers.size()},
                                            std::move(handler));
             });
     }

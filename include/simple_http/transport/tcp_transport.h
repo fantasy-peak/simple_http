@@ -14,6 +14,7 @@
 #include <memory>
 #include <utility>
 
+#include "../core/span.h"
 #include "../core/types.h"
 #include "transport.h"
 
@@ -38,7 +39,7 @@ template <typename Socket> class TcpTransport {
         return detail::async_stream_write_all(*m_socket, buffer, std::forward<Token>(token));
     }
 
-    template <typename Token> auto async_write_seq(boost::span<const ConstByteSpan> buffers, Token &&token) {
+    template <typename Token> auto async_write_seq(span<const ConstByteSpan> buffers, Token &&token) {
         return detail::async_stream_write_seq(*m_socket, buffers, std::forward<Token>(token));
     }
 

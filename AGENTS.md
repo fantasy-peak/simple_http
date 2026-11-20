@@ -18,7 +18,7 @@
 | 异步模型 | Asio initiating function + 显式 completion token |
 | 协程 | 仅在 `BOOST_ASIO_HAS_CO_AWAIT`（C++20+）下作为可选适配层 |
 | JSON/typed params/OpenAPI/JWT | 由 `SIMPLE_HTTP_HAS_GLAZE` 门控，需 C++23 + glaze |
-| 依赖 | Boost（Asio/System/Regex/Core）、OpenSSL、zlib、brotli；glaze 可选；HTTP/3 需 ngtcp2 + nghttp3 |
+| 依赖 | Boost（Asio/System/Regex）、OpenSSL、zlib、brotli；glaze 可选；HTTP/3 需 ngtcp2 + nghttp3 |
 | 许可 | MIT |
 
 ### 1.1 异步 API 的核心约定
@@ -90,6 +90,7 @@ include/
       resolve.h                     ResolveFn（客户端与 WS 反代 DNS 钩子）
       result.h                      boost::system::result 别名
       source_location.h             C++17 source_location 替身
+      span.h                        span 兼容层（C++20 用 std::span，C++17 自带最小视图）
       static_table.h                静态文件查找表
       tls_version.h                 TlsMinVersion
       types.h                       error_code、Version、Method 辅助、tcl 校验

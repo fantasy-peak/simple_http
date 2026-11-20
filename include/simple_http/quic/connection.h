@@ -194,7 +194,7 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
 
     QuicConnection(Executor exec, SSL_CTX *ssl_ctx, QuicConnectionConfig config, QuicBootstrap bootstrap,
                    std::vector<std::uint32_t> versions, asio::ip::udp::endpoint local, asio::ip::udp::endpoint remote,
-                   boost::span<const std::uint8_t> reset_secret, DatagramSink sink)
+                   span<const std::uint8_t> reset_secret, DatagramSink sink)
         : m_executor(exec), m_timer(exec), m_wake(exec, 1), m_closed_signal(exec, 1), m_config(config),
           m_bootstrap(bootstrap), m_versions(std::move(versions)), m_local(std::move(local)),
           m_remote(std::move(remote)), m_sink(std::move(sink)), m_crypto(this) {
@@ -275,7 +275,7 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
     [[nodiscard]] bool init();
 
     // Feed one received datagram in. Runs on this connection's executor.
-    void on_datagram(boost::span<const std::uint8_t> datagram, const asio::ip::udp::endpoint &from);
+    void on_datagram(span<const std::uint8_t> datagram, const asio::ip::udp::endpoint &from);
 
     // Drive the connection until it is closed. Starts the send/expiry loop and
     // returns immediately; `async_await_closed()` observes the end.
@@ -310,7 +310,7 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
             m_pending_stream_data.clear();
             for (const PendingStreamData &event : pending) {
                 protocol->on_stream_data(event.flags, event.stream_id,
-                                         boost::span<const std::uint8_t>{event.data.data(), event.data.size()});
+                                         span<const std::uint8_t>{event.data.data(), event.data.size()});
             }
         }
         if (m_closed)
@@ -440,8 +440,8 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
 
     // The endpoint needs to hear about CIDs ngtcp2 hands out mid-connection, so
     // that datagrams addressed to a new CID still find this connection.
-    using CidCallback = std::function<void(boost::span<const std::uint8_t>, boost::span<const std::uint8_t>)>;
-    using CidRetireCallback = std::function<void(boost::span<const std::uint8_t>)>;
+    using CidCallback = std::function<void(span<const std::uint8_t>, span<const std::uint8_t>)>;
+    using CidRetireCallback = std::function<void(span<const std::uint8_t>)>;
 
   public:
     void set_cid_callbacks(CidCallback on_new, CidRetireCallback on_retire) {
@@ -760,15 +760,14 @@ template <typename Executor> bool QuicConnection<Executor>::init() {
         std::vector<ngtcp2_cid> cids(count);
         ngtcp2_conn_get_scid2(m_conn, cids.data());
         for (const ngtcp2_cid &cid : cids) {
-            m_on_new_cid(boost::span<const std::uint8_t>{cid.data, cid.datalen}, {});
+            m_on_new_cid(span<const std::uint8_t>{cid.data, cid.datalen}, {});
         }
     }
     return true;
 }
 
 template <typename Executor>
-void QuicConnection<Executor>::on_datagram(boost::span<const std::uint8_t> datagram,
-                                           const asio::ip::udp::endpoint &from) {
+void QuicConnection<Executor>::on_datagram(span<const std::uint8_t> datagram, const asio::ip::udp::endpoint &from) {
     if (m_closed || m_conn == nullptr)
         return;
 
@@ -1289,7 +1288,7 @@ int QuicConnection<Executor>::cb_recv_stream_data(ngtcp2_conn *, std::uint32_t f
     // the seam is translated here so `engine/h3/` needs no ngtcp2 header.
     const std::uint32_t translated = (flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0 ? quic::kStreamDataFin : 0u;
     if (auto proto = self->protocol()) {
-        proto->on_stream_data(translated, stream_id, boost::span<const std::uint8_t>{data, datalen});
+        proto->on_stream_data(translated, stream_id, span<const std::uint8_t>{data, datalen});
         return 0;
     }
     // No engine yet — see set_protocol(). Hold the event and let the engine
@@ -1416,8 +1415,8 @@ int QuicConnection<Executor>::cb_get_new_connection_id(ngtcp2_conn *, ngtcp2_cid
             return NGTCP2_ERR_CALLBACK_FAILURE;
     }
     if (self->m_on_new_cid) {
-        self->m_on_new_cid(boost::span<const std::uint8_t>{cid->data, cid->datalen},
-                           boost::span<const std::uint8_t>{token->data, sizeof(token->data)});
+        self->m_on_new_cid(span<const std::uint8_t>{cid->data, cid->datalen},
+                           span<const std::uint8_t>{token->data, sizeof(token->data)});
     }
     return 0;
 }
@@ -1426,7 +1425,7 @@ template <typename Executor>
 int QuicConnection<Executor>::cb_remove_connection_id(ngtcp2_conn *, const ngtcp2_cid *cid, void *user_data) noexcept {
     auto *self = from(user_data);
     if (self->m_on_retire_cid) {
-        self->m_on_retire_cid(boost::span<const std::uint8_t>{cid->data, cid->datalen});
+        self->m_on_retire_cid(span<const std::uint8_t>{cid->data, cid->datalen});
     }
     return 0;
 }

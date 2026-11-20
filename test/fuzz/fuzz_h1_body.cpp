@@ -70,7 +70,7 @@ class FuzzTransport {
             detail::make_executor_initiation(std::move(initiation), m_executor), token);
     }
 
-    template <typename Token> auto async_write_seq(boost::span<const ConstByteSpan> buffers, Token &&token) {
+    template <typename Token> auto async_write_seq(simple_http::span<const ConstByteSpan> buffers, Token &&token) {
         auto initiation = [this, buffers](auto handler) {
             asio::co_spawn(m_executor, do_write_seq(buffers),
                            [handler = std::move(handler)](std::exception_ptr, IoResult r) mutable {
@@ -119,7 +119,7 @@ class FuzzTransport {
         co_return IoResult{error_code{}, buffer.size()};
     }
 
-    asio::awaitable<IoResult> do_write_seq(boost::span<const ConstByteSpan> buffers) {
+    asio::awaitable<IoResult> do_write_seq(simple_http::span<const ConstByteSpan> buffers) {
         std::size_t total = 0;
         for (const ConstByteSpan buffer : buffers) {
             m_written.append(reinterpret_cast<const char *>(buffer.data()), buffer.size());

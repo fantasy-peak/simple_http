@@ -10,7 +10,6 @@
 #include <openssl/ssl.h>
 
 #include <boost/asio/ssl.hpp>
-#include <boost/core/span.hpp>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -22,6 +21,7 @@
 
 #include "../core/format.h"
 #include "../core/logging.h"
+#include "../core/span.h"
 #include "../core/tls_version.h" // TlsMinVersion
 #include "../core/types.h"       // error_code: used below, and this header must stand alone
 #include "openssl_init.h"
@@ -55,7 +55,7 @@ inline const std::vector<unsigned char> &alpn_wire_list() {
 
 // TLS wire format for an explicit protocol list, in preference order. An
 // empty span means "use alpn_wire_list()" (the historical h2 + http/1.1 set).
-inline std::vector<unsigned char> make_alpn_wire_list(boost::span<const std::string_view> protocols) {
+inline std::vector<unsigned char> make_alpn_wire_list(span<const std::string_view> protocols) {
     std::vector<unsigned char> out;
     std::size_t bytes = 0;
     for (auto protocol : protocols)
@@ -80,8 +80,7 @@ class TlsContext {
     // a fatal handshake alert instead of NOACK. An HTTP/2-only listener must set
     // it: NOACK lets the handshake succeed with no ALPN and the server then
     // falls back to HTTP/1.1, silently defeating the policy.
-    explicit TlsContext(const TlsConfig &cfg, boost::span<const std::string_view> alpn = {},
-                        bool require_alpn_match = false)
+    explicit TlsContext(const TlsConfig &cfg, span<const std::string_view> alpn = {}, bool require_alpn_match = false)
         : m_ctx(context_method(cfg)) {
         m_alpn_state.require_match = require_alpn_match;
         if (cfg.min_version == TlsMinVersion::Tls12) {
@@ -120,7 +119,7 @@ class TlsContext {
         return std::filesystem::is_regular_file(path, ec) && !ec;
     }
 
-    void configure(const TlsConfig &cfg, boost::span<const std::string_view> alpn) {
+    void configure(const TlsConfig &cfg, span<const std::string_view> alpn) {
         if (!is_regular_file(cfg.cert_chain_file)) {
             throw std::runtime_error(simple_http::format("TLS certificate not found: {}", cfg.cert_chain_file));
         }
@@ -170,7 +169,7 @@ class TlsContext {
         bool require_match{false};
     };
 
-    void install_alpn(boost::span<const std::string_view> alpn) {
+    void install_alpn(span<const std::string_view> alpn) {
         m_alpn_state.wire = alpn.empty() ? alpn_wire_list() : make_alpn_wire_list(alpn);
         SSL_CTX_set_alpn_select_cb(
             m_ctx.native_handle(),
