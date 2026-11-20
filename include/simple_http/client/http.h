@@ -31,6 +31,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -619,6 +620,16 @@ class Client : public std::enable_shared_from_this<Client> {
   public:
     Client(asio::any_io_executor executor, ClientConfig config = {})
         : m_executor(std::move(executor)), m_config(std::move(config)) {
+        // Validate the ALPN override before any I/O. alpn_wire_list() throws
+        // on an empty or oversized entry; it used to run inside the connect
+        // completion, where the exception escapes io_context::run() and
+        // terminates the process unless the caller wraps run(). Construction-
+        // time TLS configuration errors are already allowed to throw.
+        for (const auto &proto : m_config.tls.alpn) {
+            if (proto.empty() || proto.size() > 255) {
+                throw std::runtime_error("TLS ALPN protocol name out of range");
+            }
+        }
         if (m_config.tls.verify_peer || !m_config.tls.cert_chain_file.empty())
             m_tls_context = detail::make_client_ssl_context(m_config.tls);
     }
@@ -1797,6 +1808,13 @@ inline void Client::dial_via_proxy(const detail::Url &url, const ProxyConfig &pr
                     auto inner =
                         std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(std::move(*socket), *proxy_context);
                     auto proxy_transport = std::make_shared<TlsStreamTransport>(inner, peer);
+                    if (cancel) {
+                        // The TCP socket was moved into the TLS stream; the
+                        // original abort hook still closes the moved-from
+                        // socket and is a no-op. Point it at the stream that now
+                        // owns the descriptor.
+                        cancel->abort_transport = [proxy_transport] { proxy_transport->close(); };
+                    }
                     detail::ClientTlsHandshake hs;
                     hs.sni = proxy.server_name.empty() ? proxy.host : proxy.server_name;
                     hs.verify_host = proxy.verify_peer && proxy.verify_host;
@@ -2435,6 +2453,11 @@ Client::open_ws_via_proxy(const detail::Url &url, const ProxyConfig &proxy, std:
                     auto inner =
                         std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(std::move(*socket), *proxy_context);
                     auto proxy_transport = std::make_shared<TlsStreamTransport>(inner, peer);
+                    if (cancel) {
+                        // Same as the request path: the moved-from socket's
+                        // close hook no longer owns the descriptor.
+                        cancel->abort_transport = [proxy_transport] { proxy_transport->close(); };
+                    }
                     detail::ClientTlsHandshake hs;
                     hs.sni = proxy.server_name.empty() ? proxy.host : proxy.server_name;
                     hs.verify_host = proxy.verify_peer && proxy.verify_host;
