@@ -243,8 +243,7 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
     }
 
     [[nodiscard]] SslHandle tls_handle() const {
-        auto *self = const_cast<QuicConnection *>(this);
-        SSL *ssl = self->m_crypto.ssl();
+        SSL *ssl = m_crypto.ssl();
         return ssl != nullptr ? SslHandle{ssl} : SslHandle{};
     }
 
@@ -258,8 +257,7 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
     // yet. QUIC mandates ALPN (§8.1), so an empty answer after the handshake
     // means the peer refused every protocol we offered.
     [[nodiscard]] std::string_view alpn_selected() const {
-        auto *self = const_cast<QuicConnection *>(this);
-        SSL *ssl = self->m_crypto.ssl();
+        SSL *ssl = m_crypto.ssl();
         if (ssl == nullptr)
             return {};
         const unsigned char *data = nullptr;

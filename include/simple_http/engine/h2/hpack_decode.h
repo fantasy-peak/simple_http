@@ -187,7 +187,7 @@ inline bool HpackDecoder::decode_string(std::string_view block, std::size_t &pos
     if (huffman) {
         const std::size_t decoded_at = out.size();
         unsigned char state = 0;
-        if (http_huffman_decode(&state, reinterpret_cast<unsigned char *>(const_cast<char *>(block.data() + pos)),
+        if (http_huffman_decode(&state, reinterpret_cast<const unsigned char *>(block.data() + pos),
                                 static_cast<std::size_t>(len), out, 1) != SIMPLE_HTTP_HUFFMAN_OK) {
             m_error = 40144;
             return false;
@@ -201,7 +201,7 @@ inline bool HpackDecoder::decode_string(std::string_view block, std::size_t &pos
         // octet 0xff, and that is what keeps this off the common path.
         if (len > 0 && static_cast<unsigned char>(block[pos + len - 1]) == 0xff) {
             std::string reencoded;
-            http_huffman_encode(reinterpret_cast<unsigned char *>(out.data() + decoded_at),
+            http_huffman_encode(reinterpret_cast<const unsigned char *>(out.data() + decoded_at),
                                 static_cast<unsigned int>(out.size() - decoded_at), reencoded);
             if (reencoded.size() != len || !std::equal(reencoded.begin(), reencoded.end(), block.begin() + pos)) {
                 m_error = 40145;

@@ -153,7 +153,7 @@ class QuicCrypto {
         return true;
     }
 
-    [[nodiscard]] SSL *ssl() { return ngtcp2_crypto_ossl_ctx_get_ssl(m_ctx); }
+    [[nodiscard]] SSL *ssl() const { return ngtcp2_crypto_ossl_ctx_get_ssl(m_ctx); }
     // What the connection must hand to `ngtcp2_conn_set_tls_native_handle`. The
     // crypto helper retrieves its per-connection state with
     // `ngtcp2_conn_get_tls_native_handle2(conn)` and dereferences it without a

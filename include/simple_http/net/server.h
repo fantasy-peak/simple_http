@@ -171,7 +171,15 @@ class Server {
     Server(const Server &) = delete;
     Server &operator=(const Server &) = delete;
 
-    ~Server() { stop(); }
+    ~Server() {
+        try {
+            stop();
+        } catch (...) {
+            // A destructor must not let an exception escape: stop() joins the
+            // worker threads (std::system_error is possible) and calls the
+            // user's LogSink, either of which may throw.
+        }
+    }
 
     // --- routing facade (forwards to the Router) ---
 

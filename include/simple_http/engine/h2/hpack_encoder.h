@@ -61,8 +61,8 @@ inline void hpack_append_string(std::string &out, std::string_view value) {
     // never calls back into this function, so one buffer per thread is enough.
     static thread_local std::string huff;
     huff.clear();
-    http_huffman_encode(reinterpret_cast<unsigned char *>(const_cast<char *>(value.data())),
-                        static_cast<unsigned int>(value.size()), huff);
+    http_huffman_encode(reinterpret_cast<const unsigned char *>(value.data()), static_cast<unsigned int>(value.size()),
+                        huff);
     hpack_append_integer(out, 0x80, 7, huff.size());
     out.append(huff);
 }
