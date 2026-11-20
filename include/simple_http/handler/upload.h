@@ -20,7 +20,9 @@
 #include <boost/asio/compose.hpp>
 #include <boost/system/error_code.hpp>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
+#include <random>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -40,16 +42,34 @@ struct ReadBodyToFileOp {
     std::uint64_t max_bytes{0};
 
     std::ofstream file;
+    std::string temp_path;
     std::uint64_t written{0};
     bool started{false};
 
     asio::any_io_executor get_executor() const noexcept { return body.get_executor(); }
 
+    // The target is replaced only after a successful EOF. Opening it with
+    // trunc here would destroy an existing file before a single byte has been
+    // validated: an oversized or aborted upload would leave an empty/partial
+    // file behind, and a published path would expose it.
+    void cleanup() noexcept {
+        if (file.is_open())
+            file.close();
+        if (!temp_path.empty()) {
+            std::error_code ignored;
+            std::filesystem::remove(temp_path, ignored);
+            temp_path.clear();
+        }
+    }
+
     template <typename Self> void operator()(Self &self, error_code ec = {}, ReadResult chunk = {}) {
         if (!started) {
             started = true;
-            file.open(path, std::ios::binary | std::ios::trunc);
+            std::random_device nonce;
+            temp_path = path + ".tmp." + std::to_string(nonce());
+            file.open(temp_path, std::ios::binary | std::ios::trunc);
             if (!file) {
+                cleanup();
                 self.complete(boost::system::errc::make_error_code(boost::system::errc::no_such_file_or_directory), 0);
                 return;
             }
@@ -57,25 +77,38 @@ struct ReadBodyToFileOp {
             return;
         }
         if (ec) {
+            cleanup();
             self.complete(ec, written);
             return;
         }
         if (chunk.eof) {
             file.flush();
             if (!file) {
+                cleanup();
                 self.complete(boost::system::errc::make_error_code(boost::system::errc::io_error), written);
                 return;
             }
+            file.close();
+            std::error_code rename_ec;
+            std::filesystem::rename(temp_path, path, rename_ec);
+            if (rename_ec) {
+                cleanup();
+                self.complete(boost::system::errc::make_error_code(boost::system::errc::io_error), written);
+                return;
+            }
+            temp_path.clear();
             self.complete(error_code{}, written);
             return;
         }
         written += chunk.data.size();
         if (max_bytes != 0 && written > max_bytes) {
+            cleanup();
             self.complete(boost::system::errc::make_error_code(boost::system::errc::file_too_large), written);
             return;
         }
         file.write(chunk.data.data(), static_cast<std::streamsize>(chunk.data.size()));
         if (!file) {
+            cleanup();
             self.complete(boost::system::errc::make_error_code(boost::system::errc::io_error), written);
             return;
         }
@@ -85,7 +118,9 @@ struct ReadBodyToFileOp {
 
 } // namespace detail
 
-// Reads `body` to EOF, writing each chunk to `path` (created/truncated).
+// Reads `body` to EOF, writing each chunk to a temporary file in the target's
+// directory and renaming it over `path` only after a successful EOF. A failed
+// or oversized upload therefore leaves an existing target untouched.
 // `max_bytes` (0 = no cap) is enforced while streaming, so an oversized upload
 // is rejected before the disk fills.
 template <typename Token>
