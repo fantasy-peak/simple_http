@@ -28,6 +28,7 @@
 #include <string_view>
 
 #include "http_field.h" // trim_ows
+#include "qvalue.h"     // parse_qvalue
 #include "types.h"      // iequals_ci
 
 namespace simple_http {
@@ -73,22 +74,14 @@ inline AcceptEncoding parse_accept_encoding(std::string_view header) {
                 const auto param = trim_ows(params.substr(0, next));
                 const auto eq = param.find('=');
                 if (eq != std::string_view::npos && iequals_ci(trim_ows(param.substr(0, eq)), "q")) {
-                    std::string_view value = trim_ows(param.substr(eq + 1));
-                    std::string tmp;
-                    for (char c : value) {
-                        if (c == ' ' || c == '\t')
-                            continue;
-                        if ((c >= '0' && c <= '9') || c == '.') {
-                            tmp.push_back(c);
-                        } else {
-                            break;
-                        }
-                    }
-                    try {
-                        if (!tmp.empty())
-                            q = std::stod(tmp);
-                    } catch (const std::exception &) {
-                        q = 0.0;
+                    const std::string_view value = trim_ows(param.substr(eq + 1));
+                    // A non-numeric first byte leaves q at its default (1.0),
+                    // matching the historical behaviour. Numeric shapes use the
+                    // locale-independent parser: std::stod reads the decimal
+                    // point via LC_NUMERIC, so in a comma-decimal locale every
+                    // "0.8" became 0 and compression was silently disabled.
+                    if (!value.empty() && ((value.front() >= '0' && value.front() <= '9') || value.front() == '.')) {
+                        q = parse_qvalue(value);
                     }
                     break;
                 }

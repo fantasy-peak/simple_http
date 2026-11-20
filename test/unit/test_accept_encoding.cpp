@@ -6,6 +6,8 @@
 // has a default that only "*;q=0" overrides.
 
 #include <catch2/catch_test_macros.hpp>
+#include <clocale>
+#include <string>
 #include <string_view>
 
 #include "simple_http.h"
@@ -83,16 +85,36 @@ TEST_CASE("accept_encoding: a malformed qvalue", "[accept_encoding]") {
     // keeps its default of 1.0.
     CHECK(parse_accept_encoding("br;q=abc").br == 1.0);
 
-    // std::stod parses as much as it can and stops rather than failing, so
-    // trailing garbage yields the numeric prefix.
+    // The locale-independent parser reads the numeric prefix and stops at the
+    // second dot, so trailing garbage yields the numeric prefix.
     CHECK(parse_accept_encoding("br;q=1.2.3").br == 1.2);
 
     // A bare "q" with no '=' is ignored entirely, leaving the default.
     CHECK(parse_accept_encoding("br;q").br == 1.0);
 
-    // Digits-and-dots that std::stod still rejects — the only shape that
-    // reaches the catch and produces 0.
+    // A bare dot has no digits and produces 0.
     CHECK(parse_accept_encoding("br;q=.").br == 0.0);
+}
+
+TEST_CASE("accept_encoding: qvalue parsing is locale-independent", "[accept_encoding]") {
+    CHECK(parse_qvalue("0.8") == 0.8);
+    CHECK(parse_qvalue(" 0.5 ") == 0.5);
+
+    // strtod/std::stod read the decimal point through LC_NUMERIC. In a
+    // comma-decimal locale they stop at '.', turning q=0.8 into q=0 and
+    // silently disabling compression. Only run this half where such a locale
+    // is installed; restore the process locale afterwards.
+    const char *saved = std::setlocale(LC_NUMERIC, nullptr);
+    const std::string restore = saved != nullptr ? saved : "C";
+    const bool switched =
+        std::setlocale(LC_NUMERIC, "de_DE.UTF-8") != nullptr || std::setlocale(LC_NUMERIC, "de_DE.utf8") != nullptr;
+    if (switched) {
+        CHECK(parse_qvalue("0.8") == 0.8);
+        const auto ae = parse_accept_encoding("gzip;q=0.8, br;q=0.5");
+        CHECK(ae.gzip == 0.8);
+        CHECK(ae.br == 0.5);
+        std::setlocale(LC_NUMERIC, restore.c_str());
+    }
 }
 
 TEST_CASE("accept_encoding: q is a parameter name, matched case-insensitively", "[accept_encoding]") {
