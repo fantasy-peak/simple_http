@@ -123,7 +123,7 @@ template <typename Executor> class QuicClientUdp : public std::enable_shared_fro
                                              if (ec == asio::error::operation_aborted || !self->m_socket->is_open())
                                                  return;
                                          } else {
-                                             conn->on_datagram(boost::span<const std::uint8_t>{buf->data(), n}, *from);
+                                             conn->on_datagram(span<const std::uint8_t>{buf->data(), n}, *from);
                                          }
                                          self->receive_next(std::move(conn), std::move(buf));
                                      });
@@ -816,7 +816,7 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         }
         out.stream_id = stream_id;
         out.fin = fin;
-        out.vec = boost::span<const quic::ByteVec>(m_vec.data(), m_vec_count);
+        out.vec = span<const quic::ByteVec>(m_vec.data(), m_vec_count);
         return out;
     }
 
@@ -849,8 +849,7 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
 
     // --- quic::Protocol: read side and events ---
 
-    void on_stream_data(std::uint32_t flags, std::int64_t stream_id,
-                        boost::span<const std::uint8_t> data) noexcept override {
+    void on_stream_data(std::uint32_t flags, std::int64_t stream_id, span<const std::uint8_t> data) noexcept override {
         if (h3() == nullptr)
             return;
 
@@ -1200,7 +1199,7 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         h3::wake(st.in_space);
     }
 
-    void on_data(std::int64_t stream_id, boost::span<const std::uint8_t> data) noexcept override {
+    void on_data(std::int64_t stream_id, span<const std::uint8_t> data) noexcept override {
         auto it = m_streams.find(stream_id);
         if (it == m_streams.end())
             return;

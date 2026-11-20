@@ -14,7 +14,7 @@
 // C++17 substitutions relative to the C++23 implementation:
 //   * std::format / std::format_string -> core/format.h's `{}` subset;
 //   * std::source_location              -> core/source_location.h;
-//   * std::span<const Attr>             -> boost::span<const Attr>;
+//   * std::span<const Attr>             -> simple_http::span<const Attr>;
 //   * std::atomic<std::shared_ptr<>>    -> gated on __cpp_lib_atomic_shared_ptr:
 //     std::atomic<std::shared_ptr<LogSink>> when available, otherwise the
 //     atomic_load/atomic_store free functions (the C++17 spelling of the same
@@ -25,7 +25,6 @@
 
 #include <array>
 #include <atomic>
-#include <boost/core/span.hpp>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -41,6 +40,7 @@
 
 #include "format.h"
 #include "source_location.h"
+#include "span.h"
 
 namespace simple_http {
 
@@ -125,7 +125,7 @@ struct LogRecord {
     std::string_view category; // module tag; empty when the caller has none
     source_location where;
     std::string_view message;
-    boost::span<const Attr> attrs{};
+    span<const Attr> attrs{};
 };
 
 class LogSink {
@@ -261,7 +261,7 @@ void dispatch(LogLevel level, std::string_view category, source_location where, 
 
 // Structured entry point: a ready message plus typed attributes.
 inline void emit_attrs(LogLevel level, std::string_view category, source_location where, std::string_view message,
-                       boost::span<const Attr> attrs) {
+                       span<const Attr> attrs) {
     auto sink = load_sink();
     if (!sink || !sink->enabled(level)) {
         return;
@@ -300,7 +300,7 @@ inline void log(LogLevel level, std::string_view category, source_location where
 
 // The structured entry point: a ready message plus typed attributes.
 inline void log_with_attrs(LogLevel level, std::string_view category, source_location where, std::string_view message,
-                           boost::span<const Attr> attrs) {
+                           span<const Attr> attrs) {
     detail::emit_attrs(level, category, where, message, attrs);
 }
 

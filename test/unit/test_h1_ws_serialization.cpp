@@ -77,7 +77,7 @@ class OverlapTransport {
             detail::make_executor_initiation(std::move(init), m_ex), token);
     }
 
-    template <typename Token> auto async_write_seq(boost::span<const ConstByteSpan>, Token &&token) {
+    template <typename Token> auto async_write_seq(simple_http::span<const ConstByteSpan>, Token &&token) {
         ++m_writes;
         if (m_inflight > 0)
             m_overlap = true;

@@ -137,7 +137,7 @@ class ParkedWriteTransport {
             ExecInit<decltype(initiation)>{std::move(initiation), m_executor}, token);
     }
 
-    template <typename Token> auto async_write_seq(boost::span<const ConstByteSpan> buffers, Token &&token) {
+    template <typename Token> auto async_write_seq(simple_http::span<const ConstByteSpan> buffers, Token &&token) {
         std::size_t total = 0;
         for (const auto &buffer : buffers) {
             total += buffer.size();

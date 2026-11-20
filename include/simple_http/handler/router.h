@@ -27,7 +27,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <boost/unordered_map.hpp>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -595,7 +594,7 @@ class Router {
     }
 
     const WsRouteEntry *find_ws_exact(std::string_view path) const {
-        if (auto it = m_ws_exact.find(path); it != m_ws_exact.end()) {
+        if (auto it = detail::unordered_find(m_ws_exact, path); it != m_ws_exact.end()) {
             return &it->second;
         }
         return nullptr;
@@ -621,7 +620,7 @@ class Router {
     }
 
     std::optional<HttpProxyRoute> find_http_proxy(std::string_view path) const {
-        if (auto it = m_http_proxy_exact.find(path); it != m_http_proxy_exact.end()) {
+        if (auto it = detail::unordered_find(m_http_proxy_exact, path); it != m_http_proxy_exact.end()) {
             return it->second;
         }
         if (m_http_proxy_regex.empty()) {
@@ -647,7 +646,7 @@ class Router {
     // groups from the match are expanded here, so the returned target's
     // rewrite_path is the final path to send to the backend.
     std::optional<WsProxyTarget> find_ws_proxy(std::string_view path) const {
-        if (auto it = m_ws_proxy_exact.find(std::string{path}); it != m_ws_proxy_exact.end()) {
+        if (auto it = detail::unordered_find(m_ws_proxy_exact, path); it != m_ws_proxy_exact.end()) {
             return it->second; // exact route: rewrite_path used verbatim
         }
         if (m_ws_proxy_regex.empty()) {
@@ -839,7 +838,7 @@ class Router {
         const Method method = req->method();
 
         // Local exact routes win outright.
-        if (auto it = m_exact.find(path); it != m_exact.end()) {
+        if (auto it = detail::unordered_find(m_exact, path); it != m_exact.end()) {
             const MethodTable &tbl = it->second;
             if (const RouteEntry *hit = lookup(tbl, method)) {
                 run_handler(*hit, std::move(req), std::move(res), ssl, std::move(done));
@@ -1103,7 +1102,7 @@ class Router {
     // Whether this router actually serves (method, path). Used by
     // verify_openapi's startup reconciliation.
     bool serves_route(Method m, std::string_view path) const {
-        if (auto it = m_exact.find(std::string{path}); it != m_exact.end()) {
+        if (auto it = detail::unordered_find(m_exact, path); it != m_exact.end()) {
             return lookup(it->second, m) != nullptr;
         }
         const TrieTerminal *term = nullptr;
@@ -1374,9 +1373,9 @@ class Router {
         simple_http_regex::regex pattern;
     };
 
-    // Transparent hashing/equality would be enough on C++20; boost::unordered_map
-    // provides the heterogeneous find under C++17.
-    boost::unordered_map<std::string, MethodTable, StringHash, std::equal_to<>> m_exact;
+    // std::unordered_map gains the transparent find only in C++20; under the
+    // C++17 baseline detail::unordered_find materialises the key instead.
+    std::unordered_map<std::string, MethodTable, StringHash, std::equal_to<>> m_exact;
     // Deque, not vector: dispatch holds references into these containers while
     // the handler runs, and a handler may register another route. push_back on
     // a deque never relocates the elements already stored, so the std::function
@@ -1398,15 +1397,15 @@ class Router {
 
     std::shared_ptr<StateRegistry> m_states;
 
-    boost::unordered_map<std::string, std::shared_ptr<Router>, StringHash, std::equal_to<>> m_host_exact;
+    std::unordered_map<std::string, std::shared_ptr<Router>, StringHash, std::equal_to<>> m_host_exact;
     std::vector<HostWildcard> m_host_wildcards;
 
-    boost::unordered_map<std::string, WsRouteEntry, StringHash, std::equal_to<>> m_ws_exact;
+    std::unordered_map<std::string, WsRouteEntry, StringHash, std::equal_to<>> m_ws_exact;
     std::deque<std::pair<RegexRoute, WsRouteEntry>> m_ws_regex;
     std::unordered_map<std::string, WsProxyTarget, StringHash, std::equal_to<>> m_ws_proxy_exact;
     std::deque<std::pair<RegexRoute, WsProxyTarget>> m_ws_proxy_regex;
 
-    boost::unordered_map<std::string, HttpProxyRoute, StringHash, std::equal_to<>> m_http_proxy_exact;
+    std::unordered_map<std::string, HttpProxyRoute, StringHash, std::equal_to<>> m_http_proxy_exact;
     std::deque<std::pair<RegexRoute, HttpProxyRoute>> m_http_proxy_regex;
 };
 

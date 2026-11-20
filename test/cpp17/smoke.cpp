@@ -668,8 +668,8 @@ template <typename Handler>
 #if defined(__GNUC__)
 __attribute__((noinline))
 #endif
-void scatter_write_noinline(boost::asio::ip::tcp::socket &socket, boost::span<const simple_http::ConstByteSpan> buffers,
-                            Handler &&handler) {
+void scatter_write_noinline(boost::asio::ip::tcp::socket &socket,
+                            simple_http::span<const simple_http::ConstByteSpan> buffers, Handler &&handler) {
     simple_http::detail::async_stream_write_seq(socket, buffers, std::forward<Handler>(handler));
 }
 
@@ -720,7 +720,7 @@ void test_scatter_write() {
     // operation_aborted and turns the check below into a normal failure.
     boost::asio::steady_timer watchdog{context};
     auto cancel_watchdog = [&] { watchdog.cancel(); };
-    scatter_write_noinline(server, boost::span<const simple_http::ConstByteSpan>{buffers.data(), buffers.size()},
+    scatter_write_noinline(server, simple_http::span<const simple_http::ConstByteSpan>{buffers.data(), buffers.size()},
                            [&](simple_http::error_code ec, std::size_t n) {
                                wrote = !ec && n == total;
                                if (wrote && read)

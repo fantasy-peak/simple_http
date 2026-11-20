@@ -30,7 +30,6 @@
 // handler/static_files.h, which is the half that needs them.
 
 #include <algorithm>
-#include <boost/unordered_map.hpp>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -38,6 +37,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #if !defined(_WIN32)
@@ -351,7 +351,7 @@ class StaticTable {
     // mutated afterwards, so handing out const pointers is sound and lets every
     // worker thread look up concurrently without a lock.
     const StaticEntry *find(std::string_view key) const {
-        auto it = m_table.find(key);
+        auto it = detail::unordered_find(m_table, key);
         return it == m_table.end() ? nullptr : it->second.get();
     }
 
@@ -381,7 +381,7 @@ class StaticTable {
     // worker thread reads it concurrently; nothing mutates it, so no lock is
     // needed — and none may be added without also revisiting the serving half,
     // which deliberately holds no lock across any await point.
-    boost::unordered_map<std::string, EntryPtr, StringHash, std::equal_to<>> m_table;
+    std::unordered_map<std::string, EntryPtr, StringHash, std::equal_to<>> m_table;
 
     EntryPtr m_not_found;
 
@@ -505,7 +505,7 @@ inline bool StaticTable::load(std::string &error) {
     // Looking the base up in m_table would also match an alias key (a directory
     // index or the extensionless .html spelling), which is how blog.gz used to
     // become the gzip representation of /blog's index.html.
-    boost::unordered_map<std::string, std::shared_ptr<StaticEntry>> direct;
+    std::unordered_map<std::string, std::shared_ptr<StaticEntry>> direct;
 
     // Pass 1: the base files.
     for (const auto &rel : rels) {

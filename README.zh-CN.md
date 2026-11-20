@@ -100,7 +100,7 @@ token。C++17 下可以使用回调、`asio::deferred`、`asio::detached` 和
 
 | 依赖 | 用途 |
 |---|---|
-| Boost（Asio、System、Regex、Core） | I/O、错误模型、路由正则 |
+| Boost（Asio、System、Regex） | I/O、错误模型、路由正则 |
 | OpenSSL | TLS、证书校验、mTLS、QUIC TLS |
 | zlib、brotli | gzip/br 内容编码、WebSocket permessage-deflate |
 | glaze | JSON 反射、类型化 params/extractor、JWT/JWKS、OpenAPI |

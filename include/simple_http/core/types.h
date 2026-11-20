@@ -5,6 +5,12 @@
 // boost.system (for error_code), so it can be included from anywhere without
 // pulling in Beast/Asio I/O machinery.
 
+#if defined(__has_include)
+#if __has_include(<version>)
+#include <version> // __cpp_lib_generic_unordered_lookup
+#endif
+#endif
+
 #include <boost/system/error_code.hpp>
 #include <cstdint>
 #include <functional>
@@ -176,6 +182,29 @@ struct StringHash {
     using is_transparent = void;
     std::size_t operator()(std::string_view s) const noexcept { return std::hash<std::string_view>{}(s); }
 };
+
+namespace detail {
+
+// Heterogeneous lookup for a std::unordered_map keyed by std::string. P0919
+// (transparent unordered lookup) only exists in C++20; on the C++17 baseline
+// the key has to be materialized, so that path pays one std::string
+// construction per lookup. Centralised here so callers do not each grow an
+// #if, and so the cost is visible in one place.
+#if defined(__cpp_lib_generic_unordered_lookup) && __cpp_lib_generic_unordered_lookup >= 201911L
+template <typename Map, typename Key> inline auto unordered_find(const Map &map, const Key &key) {
+    return map.find(key);
+}
+template <typename Map, typename Key> inline auto unordered_find(Map &map, const Key &key) { return map.find(key); }
+#else
+template <typename Map, typename Key> inline auto unordered_find(const Map &map, const Key &key) {
+    return map.find(typename Map::key_type(key));
+}
+template <typename Map, typename Key> inline auto unordered_find(Map &map, const Key &key) {
+    return map.find(typename Map::key_type(key));
+}
+#endif
+
+} // namespace detail
 
 // The wire protocol a request/response is being served over.
 enum class Version : std::uint8_t {
