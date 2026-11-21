@@ -63,7 +63,7 @@ template <typename T> struct JsonReadOp {
         }
         auto value = glz::read_json<T>(raw);
         if (!value) {
-            const auto error = boost::system::errc::make_error_code(boost::system::errc::invalid_argument);
+            const auto error = make_errc_code(std::errc::invalid_argument);
             self.complete(error, result<T>{error});
             return;
         }
@@ -114,7 +114,7 @@ auto async_write_json(std::shared_ptr<ResponseWriter> response, const T &value, 
     std::string body;
     if (!json) {
         SIMPLE_HTTP_ERROR_LOG("json: failed to serialize the response");
-        pre = boost::system::errc::make_error_code(boost::system::errc::invalid_argument);
+        pre = make_errc_code(std::errc::invalid_argument);
     } else {
         body = std::move(*json);
         response->status(status_code).content_type(mime::app_json);

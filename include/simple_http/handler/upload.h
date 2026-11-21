@@ -16,7 +16,6 @@
 // not have. Each chunk is bounded, so the executor is blocked only for one
 // write.
 
-#include <boost/system/error_code.hpp>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -67,7 +66,7 @@ struct ReadBodyToFileOp {
             file.open(temp_path, std::ios::binary | std::ios::trunc);
             if (!file) {
                 cleanup();
-                self.complete(boost::system::errc::make_error_code(boost::system::errc::no_such_file_or_directory), 0);
+                self.complete(make_errc_code(std::errc::no_such_file_or_directory), 0);
                 return;
             }
             body.async_read(std::move(self));
@@ -82,7 +81,7 @@ struct ReadBodyToFileOp {
             file.flush();
             if (!file) {
                 cleanup();
-                self.complete(boost::system::errc::make_error_code(boost::system::errc::io_error), written);
+                self.complete(make_errc_code(std::errc::io_error), written);
                 return;
             }
             file.close();
@@ -90,7 +89,7 @@ struct ReadBodyToFileOp {
             std::filesystem::rename(temp_path, path, rename_ec);
             if (rename_ec) {
                 cleanup();
-                self.complete(boost::system::errc::make_error_code(boost::system::errc::io_error), written);
+                self.complete(make_errc_code(std::errc::io_error), written);
                 return;
             }
             temp_path.clear();
@@ -100,13 +99,13 @@ struct ReadBodyToFileOp {
         written += chunk.data.size();
         if (max_bytes != 0 && written > max_bytes) {
             cleanup();
-            self.complete(boost::system::errc::make_error_code(boost::system::errc::file_too_large), written);
+            self.complete(make_errc_code(std::errc::file_too_large), written);
             return;
         }
         file.write(chunk.data.data(), static_cast<std::streamsize>(chunk.data.size()));
         if (!file) {
             cleanup();
-            self.complete(boost::system::errc::make_error_code(boost::system::errc::io_error), written);
+            self.complete(make_errc_code(std::errc::io_error), written);
             return;
         }
         body.async_read(std::move(self));

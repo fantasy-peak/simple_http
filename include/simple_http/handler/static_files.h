@@ -408,7 +408,7 @@ inline void StaticFiles::try_serve(const RequestPtr &req, const ResponsePtr &res
                 std::move(done)(true);
                 return;
             }
-            if (ec == make_error_code(boost::system::errc::no_such_file_or_directory) && res->reset_for_error()) {
+            if (ec == make_errc_code(std::errc::no_such_file_or_directory) && res->reset_for_error()) {
                 // Vanished since the scan: the normal 404 path answers.
                 std::move(done)(false);
                 return;

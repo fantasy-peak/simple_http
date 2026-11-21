@@ -235,7 +235,7 @@ class Body {
         bool exceeded = false;
         auto out = m_decoder->write_bounded(data, decode_room(), exceeded);
         if (m_decoder->failed()) {
-            return boost::system::errc::make_error_code(boost::system::errc::invalid_argument);
+            return make_errc_code(std::errc::invalid_argument);
         }
         if (exceeded || over_decoded_limit(out.size())) {
             return make_error_code(asio::error::message_size);
@@ -251,7 +251,7 @@ class Body {
         bool exceeded = false;
         auto tail = m_decoder->finish_bounded(decode_room(), exceeded);
         if (m_decoder->failed()) {
-            return boost::system::errc::make_error_code(boost::system::errc::invalid_argument);
+            return make_errc_code(std::errc::invalid_argument);
         }
         if (exceeded || over_decoded_limit(tail.size())) {
             return make_error_code(asio::error::message_size);

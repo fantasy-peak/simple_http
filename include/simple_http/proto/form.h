@@ -75,8 +75,7 @@ struct MultipartBodyOp {
         }
         auto parts = parse_multipart(raw, boundary, max_part_bytes, max_parts);
         if (!parts) {
-            self.complete(boost::system::errc::make_error_code(boost::system::errc::invalid_argument),
-                          std::vector<MultipartPart>{});
+            self.complete(make_errc_code(std::errc::invalid_argument), std::vector<MultipartPart>{});
             return;
         }
         self.complete(error_code{}, std::move(*parts));
@@ -102,11 +101,11 @@ auto read_multipart_body(Request &request, std::size_t max_part_bytes, std::size
     std::string boundary;
     const auto content_type = request.header(field::content_type);
     if (!content_type) {
-        pre = boost::system::errc::make_error_code(boost::system::errc::invalid_argument);
+        pre = make_errc_code(std::errc::invalid_argument);
     } else if (auto parsed = multipart_boundary(*content_type)) {
         boundary = std::move(*parsed);
     } else {
-        pre = boost::system::errc::make_error_code(boost::system::errc::invalid_argument);
+        pre = make_errc_code(std::errc::invalid_argument);
     }
     return asio::async_compose<Token, void(error_code, std::vector<MultipartPart>)>(
         detail::MultipartBodyOp{request, pre, std::move(boundary), max_part_bytes, max_parts}, token,

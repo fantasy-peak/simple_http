@@ -250,14 +250,14 @@ struct MultipartStreamOp {
         }
         if (chunk.eof) {
             if (!parser.finish(callbacks)) {
-                self.complete(boost::system::errc::make_error_code(boost::system::errc::invalid_argument));
+                self.complete(make_errc_code(std::errc::invalid_argument));
                 return;
             }
             self.complete(error_code{});
             return;
         }
         if (!parser.feed(chunk.data, callbacks)) {
-            self.complete(boost::system::errc::make_error_code(boost::system::errc::invalid_argument));
+            self.complete(make_errc_code(std::errc::invalid_argument));
             return;
         }
         body.async_read(std::move(self));

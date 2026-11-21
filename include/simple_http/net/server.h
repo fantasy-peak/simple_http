@@ -98,8 +98,8 @@ enum class StartPolicy { AllOrNothing, BestEffort };
 
 enum class server_errc { bind_failed = 1, tls_setup_failed, invalid_config };
 
-inline const boost::system::error_category &server_category() {
-    static const struct : boost::system::error_category {
+inline const error_category &server_category() {
+    static const struct : error_category {
         const char *name() const noexcept override { return "simple_http.server"; }
         std::string message(int ev) const override {
             switch (static_cast<server_errc>(ev)) {

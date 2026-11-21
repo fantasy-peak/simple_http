@@ -16,9 +16,9 @@
 | 入口头 | `#include <simple_http.h>` |
 | 最低标准 | C++17 |
 | 异步模型 | Asio initiating function + 显式 completion token |
-| 协程 | 仅在 `BOOST_ASIO_HAS_CO_AWAIT`（C++20+）下作为可选适配层 |
+| 协程 | 仅在 `SIMPLE_HTTP_HAS_CO_AWAIT`（C++20+，由所用 Asio 决定）下作为可选适配层 |
 | JSON/typed params/OpenAPI/JWT | 由 `SIMPLE_HTTP_HAS_GLAZE` 门控，需 C++23 + glaze |
-| 依赖 | Boost（Asio/System/Regex）、OpenSSL、zlib、brotli；glaze 可选；HTTP/3 需 ngtcp2 + nghttp3 |
+| 依赖 | 默认 Boost（Asio/System/Regex）或独立 Asio（`SIMPLE_HTTP_USE_STANDALONE_ASIO`，仍需 Boost.Regex）、OpenSSL、zlib、brotli；glaze 可选；HTTP/3 需 ngtcp2 + nghttp3 |
 | 许可 | MIT |
 
 ### 1.1 异步 API 的核心约定
@@ -33,7 +33,11 @@
   allocator / cancellation slot 不会在转发时丢失。
 - 组合操作使用 `asio::async_compose` 状态机；不要引入自定义协程桥接。
 - 库内部不以异常做控制流；同步可失败 API 返回 `error_code` 或
-  `boost::system::result<T>`（别名 `simple_http::result<T>`）。
+  `simple_http::result<T>`（库内基于 `std::variant`/`std::optional` 的
+  expected 风格类型，不依赖 Boost.System）。
+- `error_code` 跟随 Asio 来源：默认构建是 `boost::system::error_code`，
+  `SIMPLE_HTTP_USE_STANDALONE_ASIO` 下是 `std::error_code`；两者都由
+  `simple_http::error_code` 别名暴露。
 
 ### 1.2 协议矩阵
 
@@ -73,6 +77,8 @@ include/
     core/                           协议无关基础设施
       accept_encoding.h             Accept-Encoding qvalue
       address.h                     peer 地址展示（IPv4-mapped 处理）
+      asio_compat.h                 Asio 来源选择（Boost vs 独立）+ namespace 别名
+      asio_ssl.h                    SSL 半边（避免非 TLS 头引入 OpenSSL）
       base64.h
       compat.h                      C++17 兼容：ByteSpan、starts_with、executor_initiation
       compression.h                 CompressionConfig / RequestDecompressionConfig
@@ -88,7 +94,7 @@ include/
       logging.h                     LogSink / LogLevel / LogRecord / 宏
       mime.h
       resolve.h                     ResolveFn（客户端与 WS 反代 DNS 钩子）
-      result.h                      boost::system::result 别名
+      result.h                      项目内 expected 风格 result（不依赖 Boost.System）
       source_location.h             C++17 source_location 替身
       span.h                        span 兼容层（C++20 用 std::span，C++17 自带最小视图）
       static_table.h                静态文件查找表
@@ -339,7 +345,7 @@ using HandlerCompletion = asio::any_completion_handler<void()>;
 using CallbackHandler =
     std::function<void(RequestPtr, ResponsePtr, SslHandle, HandlerCompletion)>;
 
-#if defined(BOOST_ASIO_HAS_CO_AWAIT)
+#if defined(SIMPLE_HTTP_HAS_CO_AWAIT)
 using CoroHandler = std::function<asio::awaitable<void>(RequestPtr, ResponsePtr, SslHandle)>;
 using Handler = std::variant<CallbackHandler, CoroHandler>;
 #else
@@ -360,7 +366,7 @@ using Handler = CallbackHandler;
 using Next = CallbackHandler;
 using Middleware =
     std::function<void(RequestPtr, ResponsePtr, SslHandle, Next, HandlerCompletion)>;
-#if defined(BOOST_ASIO_HAS_CO_AWAIT)
+#if defined(SIMPLE_HTTP_HAS_CO_AWAIT)
 using CoroNext = std::function<asio::awaitable<void>(RequestPtr, ResponsePtr, SslHandle)>;
 using CoroMiddleware =
     std::function<asio::awaitable<void>(RequestPtr, ResponsePtr, SslHandle, CoroNext)>;
@@ -740,8 +746,14 @@ xmake build -j 12 fixture_conformance_server
 xmake build -j 12 diff_server_cpp
 xmake build -j 12 diff_openapi_server
 xmake run test_unit
+
+# 独立 Asio（Boost.Regex 仍然使用）
+xmake f --standalone_asio=y -m release
 ```
 
+- `--standalone_asio=y` 定义 `SIMPLE_HTTP_USE_STANDALONE_ASIO`，拉取
+  `asio` 包；Asio 头路径与 namespace 由 `core/asio_compat.h` 选择，
+  `error_code` 随之变成 `std::error_code`。
 - `set_languages("c++23")`：库与测试默认按 C++23 编译；glaze 辅助因此可用。
 - `test_cpp17_smoke` 单独 `set_languages("c++17")`，验证 C++17 公共 API。
 - 全局 `-O2 -Wextra`，关闭少量 GCC 误报；全局定义
@@ -765,6 +777,8 @@ target_link_libraries(app PRIVATE simple_http::simple_http)
 当前 `CMakeLists.txt`：
 
 - `simple_http` 是 `INTERFACE` 目标，`cxx_std_23`；
+- 选项 `SIMPLE_HTTP_USE_STANDALONE_ASIO=ON` 时 `find_path(ASIO_INCLUDE_DIR
+  asio.hpp)` 并给 target 加 `SIMPLE_HTTP_USE_STANDALONE_ASIO`；
 - 链接 Boost、OpenSSL、ZLIB、Brotli、glaze；
 - **没有** ngtcp2/nghttp3，也没有 `SIMPLE_HTTP_ENABLE_HTTP3`；
 - 另有一个 `simple_http_cpp17` INTERFACE 目标，指向
@@ -781,11 +795,12 @@ target_link_libraries(app PRIVATE simple_http::simple_http)
 | 宏 | 默认 | 作用 |
 |---|---|---|
 | `SIMPLE_HTTP_ENABLE_HTTP3` | 未定义 | 编入 HTTP/3 与 QUIC 监听 |
+| `SIMPLE_HTTP_USE_STANDALONE_ASIO` | 未定义 | 使用独立 Asio 而非 Boost.Asio；`error_code` 变为 `std::error_code`，Boost.Regex 仍保留 |
 | `SIMPLE_HTTP_USE_BOOST_REGEX` | 本仓库定义 | 路由正则使用 Boost.Regex |
 | `SIMPLE_HTTP_HAS_GLAZE` | 自动检测 | glaze 辅助（C++23 + glaze） |
 | `SIMPLE_HTTP_ENABLE_LOG` | 1 | 日志总开关 |
 | `SIMPLE_HTTP_LOG_ACTIVE_LEVEL` | 0 | 编译期最低日志级别 |
-| `BOOST_ASIO_HAS_CO_AWAIT` | Boost 决定 | 协程 handler/middleware 适配 |
+| `SIMPLE_HTTP_HAS_CO_AWAIT` | Asio 决定 | 协程 handler/middleware 适配（映射 `BOOST_ASIO_HAS_CO_AWAIT` / `ASIO_HAS_CO_AWAIT`） |
 
 压缩、WebSocket、OpenAPI、UNIX socket 都没有独立开关宏。
 
@@ -1208,6 +1223,9 @@ test/run.sh server-diff
 
 ### 10.1 已知限制
 
+- 独立 Asio 构建（`SIMPLE_HTTP_USE_STANDALONE_ASIO`）不在 CI 矩阵中；该模式下
+  `simple_http::error_code` 是 `std::error_code`，与默认 Boost.Asio 构建的
+  `boost::system::error_code` 不是同一类型，跨构建的二进制/回调不可混用。
 - 客户端 `H2cMode::Upgrade` 未接线；`ClientConfig::default_h2c` 未被读取。
   明文 `HttpVersionPolicy::Http2` 走 prior knowledge。
 - `RetryPolicy::condition` / `require_replayable` 未使用；只有状态码重试。

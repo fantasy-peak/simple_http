@@ -52,6 +52,10 @@ namespace asio = ::asio;
 #define SIMPLE_HTTP_HAS_CO_AWAIT 1
 #endif
 
+#if defined(ASIO_HAS_LOCAL_SOCKETS)
+#define SIMPLE_HTTP_HAS_LOCAL_SOCKETS 1
+#endif
+
 #else
 
 #include <boost/asio.hpp>
@@ -85,6 +89,10 @@ namespace asio = boost::asio;
 
 #if defined(BOOST_ASIO_HAS_CO_AWAIT)
 #define SIMPLE_HTTP_HAS_CO_AWAIT 1
+#endif
+
+#if defined(BOOST_ASIO_HAS_LOCAL_SOCKETS)
+#define SIMPLE_HTTP_HAS_LOCAL_SOCKETS 1
 #endif
 
 #endif

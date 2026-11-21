@@ -67,7 +67,7 @@ template <typename Socket> class TcpTransport {
 };
 
 using TcpStreamTransport = TcpTransport<asio::ip::tcp::socket>;
-#ifdef BOOST_ASIO_HAS_LOCAL_SOCKETS
+#ifdef SIMPLE_HTTP_HAS_LOCAL_SOCKETS
 using UnixStreamTransport = TcpTransport<asio::local::stream_protocol::socket>;
 #endif
 

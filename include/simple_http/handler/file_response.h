@@ -80,18 +80,18 @@ struct SendFileOp {
         std::error_code stat_ec;
         size = std::filesystem::file_size(path, stat_ec);
         if (stat_ec) {
-            return boost::system::errc::make_error_code(boost::system::errc::no_such_file_or_directory);
+            return make_errc_code(std::errc::no_such_file_or_directory);
         }
         if (options.offset > size) {
-            return boost::system::errc::make_error_code(boost::system::errc::invalid_argument);
+            return make_errc_code(std::errc::invalid_argument);
         }
         const std::uintmax_t available = size - static_cast<std::uintmax_t>(options.offset);
         remaining = options.length == 0 ? available : static_cast<std::uintmax_t>(options.length);
         if (remaining > available) {
-            return boost::system::errc::make_error_code(boost::system::errc::invalid_argument);
+            return make_errc_code(std::errc::invalid_argument);
         }
         if (options.max_bytes != 0 && remaining > options.max_bytes) {
-            return boost::system::errc::make_error_code(boost::system::errc::file_too_large);
+            return make_errc_code(std::errc::file_too_large);
         }
         return {};
     }
@@ -118,7 +118,7 @@ struct SendFileOp {
         const auto n = file.gcount();
         if (n <= 0) {
             if (file.bad()) {
-                self.complete(boost::system::errc::make_error_code(boost::system::errc::io_error));
+                self.complete(make_errc_code(std::errc::io_error));
                 return;
             }
             stage = 3;
@@ -142,13 +142,13 @@ struct SendFileOp {
             // response untouched so the caller can still send its own 404/500.
             file.open(path, std::ios::binary);
             if (!file) {
-                self.complete(boost::system::errc::make_error_code(boost::system::errc::no_such_file_or_directory));
+                self.complete(make_errc_code(std::errc::no_such_file_or_directory));
                 return;
             }
             if (options.offset != 0) {
                 file.seekg(static_cast<std::streamoff>(options.offset));
                 if (!file) {
-                    self.complete(boost::system::errc::make_error_code(boost::system::errc::io_error));
+                    self.complete(make_errc_code(std::errc::io_error));
                     return;
                 }
             }
@@ -180,7 +180,7 @@ struct SendFileOp {
             self.complete(ec);
             return;
         default:
-            self.complete(boost::system::errc::make_error_code(boost::system::errc::operation_canceled));
+            self.complete(make_errc_code(std::errc::operation_canceled));
             return;
         }
     }

@@ -54,7 +54,7 @@ token。C++17 下可以使用回调、`asio::deferred`、`asio::detached` 和
   `Body`、`WebSocket` 及中间件/提取辅助）不支持跨线程调用，只能在自己的
   executor 上使用；`Client` 同样绑定构造时的单线程 executor。
 - **不用异常做控制流。** 可失败操作返回 `error_code` 或
-  `boost::system::result`。客户端失败从不抛出异常。
+  `simple_http::result`。客户端失败从不抛出异常。
 - **边缘可插拔。** DNS 解析、日志、TLS context 构造、会话存储与路由查找都可以注入。
 
 ## 协议支持
@@ -100,7 +100,8 @@ token。C++17 下可以使用回调、`asio::deferred`、`asio::detached` 和
 
 | 依赖 | 用途 |
 |---|---|
-| Boost（Asio、System、Regex） | I/O、错误模型、路由正则 |
+| Boost（Asio、System、Regex） | 默认的 I/O、错误模型、路由正则 |
+| 独立 Asio（可选） | 定义 `SIMPLE_HTTP_USE_STANDALONE_ASIO` 时替代 Boost.Asio；仍使用 Boost.Regex |
 | OpenSSL | TLS、证书校验、mTLS、QUIC TLS |
 | zlib、brotli | gzip/br 内容编码、WebSocket permessage-deflate |
 | glaze | JSON 反射、类型化 params/extractor、JWT/JWKS、OpenAPI |
@@ -111,7 +112,7 @@ token。C++17 下可以使用回调、`asio::deferred`、`asio::detached` 和
 - **C++17** 足以使用 core、proto、transport、HTTP/1.x、HTTP/2、WebSocket、
   路由、中间件、静态文件、反向代理与客户端。
 - **C++20 或更高** 额外启用协程 handler 与 `asio::use_awaitable`
-  （`BOOST_ASIO_HAS_CO_AWAIT`）。
+  （`SIMPLE_HTTP_HAS_CO_AWAIT`）。
 - **C++23 + glaze** 启用 glaze 辅助：JSON 反射、类型化
   `path_params` / `query_params`、`Path` / `Query` / `Json` / `Form`
   extractor、JWT/JWKS 与 OpenAPI 文档模型。
@@ -133,11 +134,15 @@ class-type 非类型模板参数。
 
 仓库的 `xmake.lua` 会构建纯头文件目标与全部测试二进制。它期望以下包：
 `boost`、`openssl4`、`glaze`、`zlib`、`brotli`，以及可选的
-`ngtcp2` / `nghttp3`。
+`ngtcp2` / `nghttp3`。加 `--standalone_asio=y` 可改用独立 Asio（Boost 仍用于
+Boost.Regex；错误类型变为 `std::error_code`）。
 
 ```sh
 xmake f -m release
 xmake build -j 12
+
+# 使用独立 Asio 而不是 Boost.Asio
+xmake f --standalone_asio=y -m release
 ```
 
 库的使用者只需要 include 目录与链接依赖。测试目标声明为

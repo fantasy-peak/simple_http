@@ -19,10 +19,9 @@
 #include <string_view>
 #include <utility>
 
-#include <boost/system/error_code.hpp>
-
 #include "../core/asio_compat.h"
 #include "../core/mime.h"
+#include "../core/types.h"
 #include "../proto/headers.h"
 #include "../proto/multipart.h"
 #include "http.h"
@@ -64,7 +63,7 @@ using MultipartDone = asio::any_completion_handler<void(error_code)>;
 // badbit means the stream itself failed. Using fail() here made every upload
 // finish with io_error after writing all its bytes.
 inline error_code file_read_error(const std::istream &in) noexcept {
-    return in.bad() ? make_error_code(boost::system::errc::io_error) : error_code{};
+    return in.bad() ? make_errc_code(std::errc::io_error) : error_code{};
 }
 
 // Reads `path` in chunks and writes each as a Stream chunk.
@@ -104,7 +103,7 @@ auto async_stream_file_body(std::shared_ptr<Stream> stream, std::string path, st
             auto in = std::make_shared<std::ifstream>(path, std::ios::binary);
             if (!*in) {
                 auto callback = std::move(*done);
-                std::move(callback)(make_error_code(boost::system::errc::no_such_file_or_directory));
+                std::move(callback)(make_errc_code(std::errc::no_such_file_or_directory));
                 return;
             }
             const std::size_t chunk = chunk_bytes == 0 ? 64 * 1024 : chunk_bytes;
@@ -277,12 +276,12 @@ class MultipartStreamWriter : public std::enable_shared_from_this<MultipartStrea
     void write_part_head(std::string_view name, std::string_view filename, std::string_view content_type,
                          std::function<void(error_code)> done) {
         if (m_finished) {
-            done(make_error_code(boost::system::errc::operation_not_permitted));
+            done(make_errc_code(std::errc::operation_not_permitted));
             return;
         }
         if (!detail::valid_multipart_param(name) || !detail::valid_multipart_param(filename) ||
             !detail::valid_multipart_param(content_type)) {
-            done(make_error_code(boost::system::errc::invalid_argument));
+            done(make_errc_code(std::errc::invalid_argument));
             return;
         }
         std::string out;
