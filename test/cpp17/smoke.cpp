@@ -56,9 +56,9 @@ void test_url_path() {
 
 void test_result() {
     const simple_http::result<int> good{42};
-    check(good && *good == 42, "boost::system::result value");
+    check(good && *good == 42, "result value");
     const simple_http::result<int> bad{boost::system::errc::make_error_code(boost::system::errc::invalid_argument)};
-    check(!bad && bad.error(), "boost::system::result error");
+    check(!bad && bad.error(), "result error");
 }
 
 void test_body_tokens() {

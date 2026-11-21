@@ -11,7 +11,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <boost/system/result.hpp>
 #include <chrono>
 #include <cstdint>
 #include <functional>

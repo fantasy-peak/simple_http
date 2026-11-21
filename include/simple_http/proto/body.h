@@ -17,7 +17,6 @@
 // caller's associated executor, allocator and cancellation slot travel through
 // the hook, the pull provider and the channel receive without being erased.
 
-#include <boost/system/result.hpp>
 #include <cstddef>
 #include <functional>
 #include <limits>

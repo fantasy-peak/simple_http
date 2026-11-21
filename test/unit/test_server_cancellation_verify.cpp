@@ -19,6 +19,12 @@
 #include "test_support.h"
 #include <simple_http/core/asio_compat.h>
 
+#if defined(SIMPLE_HTTP_USE_STANDALONE_ASIO)
+#include <asio/experimental/awaitable_operators.hpp>
+#else
+#include <boost/asio/experimental/awaitable_operators.hpp>
+#endif
+
 using namespace simple_http;
 using namespace simple_http::codec;
 using namespace simple_http::test;

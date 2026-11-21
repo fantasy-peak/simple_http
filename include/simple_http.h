@@ -21,7 +21,7 @@
 //     OpenAPI, JWT/JWKS) are feature-gated: a plain C++17 translation unit
 //     does not see them; compiling this include root as C++23 turns them on.
 //     See core/glaze_support.h;
-//   * synchronous value-or-error APIs return boost::system::result<T, error_code>.
+//   * synchronous value-or-error APIs return simple_http::result<T, error_code>.
 
 // --- core layer ---
 #include "simple_http/core/accept_encoding.h"
