@@ -753,3 +753,19 @@ TEST_CASE("h2/engine: an early response returns the unread body's flow-control c
     CHECK(has_window_update(transport->written(), 1));
     CHECK_FALSE(has_goaway(transport->written(), codec::H2_FLOW_CONTROL_ERROR));
 }
+
+TEST_CASE("core: :path origin-form and asterisk-form validation", "[core][path]") {
+    // Shared by the h2 and h3 servers (and mirrored by the clients): the value
+    // is the URI path/query, so no fragment, no SP/DEL/backslash or other
+    // control; "*" is the RFC 9113 §8.3.1 asterisk-form.
+    CHECK_FALSE(valid_pseudo_path(""));
+    CHECK(valid_pseudo_path("/"));
+    CHECK(valid_pseudo_path("/a/b?c=d"));
+    CHECK(valid_pseudo_path("*"));
+    CHECK_FALSE(valid_pseudo_path("a"));
+    CHECK_FALSE(valid_pseudo_path("/a b"));
+    CHECK_FALSE(valid_pseudo_path("/a\\b"));
+    CHECK_FALSE(valid_pseudo_path("/a#frag"));
+    CHECK_FALSE(valid_pseudo_path("/a\tb"));
+    CHECK_FALSE(valid_pseudo_path(std::string_view{"/a\x7f", 3}));
+}

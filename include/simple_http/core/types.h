@@ -81,6 +81,20 @@ inline bool has_leading_or_trailing_ws(std::string_view s) noexcept {
     return is_ws(s.front()) || is_ws(s.back());
 }
 
+// RFC 9113 §8.3.1 / RFC 9114 §4.3.1: `:path` is origin-form ("/...") or the
+// asterisk-form ("*") an OPTIONS request may use. It never carries a fragment,
+// and a raw SP/DEL/backslash (or other control) would not survive as a URL
+// path or could split an HTTP/1.1 request line when replayed downstream.
+inline bool valid_pseudo_path(std::string_view p) noexcept {
+    if (p.empty())
+        return false;
+    if (p == "*")
+        return true;
+    if (p.front() != '/')
+        return false;
+    return !contains_invalid_url_byte(p) && p.find('#') == std::string_view::npos;
+}
+
 // RFC 9110 §5.5: a field value is *( HTAB / SP / VCHAR / obs-text ). Other
 // control characters, including DEL, cannot be serialized into an HTTP/1.1
 // field line and are not something HPACK peers expect either.

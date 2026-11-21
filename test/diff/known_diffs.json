@@ -50,6 +50,41 @@
       ],
       "verdict": "acceptable",
       "reason": "C++ HTTP/3 request trailers are not exposed to handlers (documented limitation: only h1/h2 expose Request::trailers()); Go's quic-go server forwards them to r.Trailer, so /trailer-echo answers yes there and missing here. The case pins the limitation rather than hiding it."
+    },
+    "h3raw.method_not_token": {
+      "fields": ["outcome"],
+      "verdict": "acceptable",
+      "reason": "nghttp3 rejects a non-token :method inside nghttp3_conn_read_stream2 with a connection-level NGHTTP3_ERR_MALFORMED_HTTP_HEADER, so C++ closes the QUIC connection; quic-go resets only the stream. RFC 9114 §4.1.2 asks for an H3_MESSAGE_ERROR stream error, so Go's granularity is closer to the RFC, but the decision is made by nghttp3, not by this library."
+    },
+    "h3raw.method_empty": {
+      "fields": ["outcome"],
+      "verdict": "acceptable",
+      "reason": "Same nghttp3 connection-level MALFORMED_HTTP_HEADER path as h3raw.method_not_token: an empty :method is not a token (RFC 9110 §9), nghttp3 closes the connection, quic-go resets the stream."
+    },
+    "h3raw.path_space": {
+      "fields": ["outcome"],
+      "verdict": "acceptable",
+      "reason": "nghttp3 treats a raw SP in :path as MALFORMED_HTTP_HEADER and closes the connection; quic-go accepts the request and the Go reference server answers 404. RFC 9113 §8.3.1 defines :path as the URI path/query, whose grammar excludes SP, so rejecting is RFC-aligned even though nghttp3 escalates to a connection error."
+    },
+    "h3raw.path_backslash": {
+      "fields": ["outcome"],
+      "verdict": "acceptable",
+      "reason": "simple_http rejects DEL/backslash in :path as malformed (RFC 3986 path grammar excludes a raw backslash) and resets the stream; quic-go accepts it and answers 404. The C++ side is the stricter, RFC-aligned behaviour."
+    },
+    "h3raw.authority_space": {
+      "fields": ["outcome"],
+      "verdict": "acceptable",
+      "reason": "nghttp3 closes the connection for SP in :authority; quic-go accepts it. The authority production (RFC 3986 §3.2) excludes SP, so the C++ rejection is correct, only its granularity is nghttp3's."
+    },
+    "h3raw.header_uppercase": {
+      "fields": ["outcome"],
+      "verdict": "acceptable",
+      "reason": "Both reject an uppercase field name, as RFC 9113 §8.2.1 and RFC 9114 §4.2 require, but nghttp3 surfaces it as a connection error while quic-go resets the stream. The difference is nghttp3's error classification."
+    },
+    "h3raw.header_separator": {
+      "fields": ["outcome"],
+      "verdict": "acceptable",
+      "reason": "nghttp3 drops a regular field whose name is not a token (e.g. `x(y`) and lets the request through, so C++ answers 200; quic-go treats it as malformed and resets the stream. RFC 9110 §5.1 defines field-name = token and RFC 9114 §4.1.2 treats an invalid field as malformed, so Go is closer to the RFC; nghttp3 does not hand the field to the application, which is why the library's own token check cannot fire."
     }
   }
 }

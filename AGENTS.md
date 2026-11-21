@@ -176,7 +176,7 @@ test/
   unit/                             Catch2 单测（约 511 个 TEST_CASE）
   cpp17/smoke.cpp                   以 C++17 编译并运行公共 API
   diff/client/                      C++ 客户端 ↔ Go net/http 客户端
-  diff/server/                      Go 探针 → C++ server ↔ Go server + h2raw
+  diff/server/                      Go 探针 → C++ server ↔ Go server + h2raw/h3raw
   diff/openapi/                     OAS 3.1 契约 + Swagger UI
   diff/support/harness.py           归一化、比较、known_diffs
   fixtures/conformance_server.cpp   外部合规/压力专用 server
@@ -826,7 +826,7 @@ test/run.sh unit '[h2]'
 | `cpp17` | fast | `test/cpp17/smoke.cpp` 以 `-std=c++17` 编译并运行 |
 | `openapi` | standard | OAS 3.1 元模式 + 文档/路由契约 + Swagger UI |
 | `client-diff` | full | C++ client ↔ Go `net/http` client |
-| `server-diff` | full | Go 探针 → C++ server ↔ Go server；含 `h2raw` |
+| `server-diff` | full | Go 探针 → C++ server ↔ Go server；含 `h2raw` / `h3raw` |
 | `concurrency` | full | 多客户端/多线程/teardown harness |
 | `conformance` | full | h2spec / h1spec / h3spec / Autobahn |
 | `stress` | full | h2load / k6 |
@@ -853,8 +853,11 @@ test/run.sh unit '[h2]'
   `basic`、`body`、`policy`、`ws`、`h3`。端口 7810–7817。
 - **server-diff**（`test/diff/server/`）：同一个 Go 探针分别打 C++ 与 Go 参考
   服务端（7820–7825 / 7830–7834）。组：`routing`、`body`、`semantics`、
-  `middleware`、`framework`、`static`、`ws`、`raw`、`h2raw`。
+  `middleware`、`framework`、`static`、`ws`、`raw`、`h2raw`、`h3raw`。
   `h2raw` 是 C++ 单侧原始 HTTP/2 / h2c / WebSocket 断言，输出 PASS/FAIL。
+  `h3raw` 用 `test/.venv` 的 aioquic 向 C++（7823）与 Go（7833）参考服务端发送
+  畸形 HTTP/3 字段并比较终端行为；nghttp3 与 quic-go 的差异登记在
+  `test/diff/known_diffs.json` 的 `h3raw.*`。
 - **归一化**（`test/diff/support/harness.py`）：header 名小写；
   `allow`/`vary`/`accept-encoding`/`cache-control` 按集合比较；默认忽略
   Date/Server/Content-Length/Transfer-Encoding/Connection/ETag/Last-Modified/
@@ -864,7 +867,8 @@ test/run.sh unit '[h2]'
   - client：`policy.redirect_referer`（body）、`policy.redirect_cross_origin`
     （body）、`h3.status_204`（framing）；
   - server：`raw.cl_te`、`raw.duplicate_cl`、`raw.obs_fold`（status）、
-    `body.request_trailers_h3`（body）。
+    `body.request_trailers_h3`（body）、`h3raw.*`（outcome，nghttp3 与
+    quic-go 对畸形 HTTP/3 字段的粒度差异）。
 - 新增功能时：C++ 与 Go 参考实现同步加行为 → 加用例 → 跑 diff → 只登记确属
   合法差异的项，并写清 RFC 依据。Go 无对应能力时标 `cpp-only`。
 
@@ -1235,6 +1239,10 @@ test/run.sh server-diff
 - h1 客户端没有独立 idle timeout；h2 用 `ClientConfig::idle_timeout`。
 - HTTP/3 客户端不支持代理、请求 trailers、1xx；服务端不支持 WS、request
   trailers、100-continue、push、0-RTT。
+- HTTP/3 的畸形字段由 nghttp3 定夺：非法伪头/大写字段名会以连接级
+  `NGHTTP3_ERR_MALFORMED_HTTP_HEADER` 关闭连接，部分非 token 常规字段被
+  nghttp3 直接丢弃（不会交给 `on_header`）。因此与 quic-go 的流级 reset
+  粒度不同；`h3raw` 差分把这些差异登记在 `known_diffs.json`。
 - 不支持 UNIX-domain 服务端监听。
 - 没有 `SO_REUSEPORT` 的平台只启动一个 acceptor（固定在第 0 个 worker），
   所有连接都由该 worker 的线程服务。
@@ -1308,7 +1316,7 @@ test/run.sh stress
 
 # 直接运行差分 runner（Go 二进制由 runner 自行构建）
 test/.venv/bin/python test/diff/client/run.py --groups basic,body,policy,ws,h3
-test/.venv/bin/python test/diff/server/run.py --groups routing,body,semantics,middleware,framework,static,ws,raw,h2raw
+test/.venv/bin/python test/diff/server/run.py --groups routing,body,semantics,middleware,framework,static,ws,raw,h2raw,h3raw
 test/.venv/bin/python test/diff/openapi/run.py
 
 # 覆盖率

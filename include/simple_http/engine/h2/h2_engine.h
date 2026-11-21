@@ -1697,17 +1697,7 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
     // RFC 9113 §8.3.1: :path is origin-form ("/" ...) or "*" for OPTIONS. It
     // never carries a fragment, and a raw space would split an HTTP/1.1 request
     // line when the proxy replays it.
-    static bool valid_h2_path(std::string_view p) noexcept {
-        if (p.empty())
-            return false;
-        if (p == "*")
-            return true;
-        if (p.front() != '/')
-            return false;
-        // Reject SP/DEL/backslash/other controls (the same set the client
-        // applies) plus the fragment delimiter, which never belongs in :path.
-        return !contains_invalid_url_byte(p) && p.find('#') == std::string_view::npos;
-    }
+    static bool valid_h2_path(std::string_view p) noexcept { return valid_pseudo_path(p); }
 
     // A field value may contain VCHAR, SP, HTAB and obs-text, but no other CTL
     // and not DEL. contains_ctl() only knows CR/LF/NUL — enough to stop header

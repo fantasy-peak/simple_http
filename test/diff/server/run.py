@@ -31,7 +31,8 @@ sys.path.insert(0, str(DIFF / "support"))
 
 import harness  # noqa: E402
 
-ALL_GROUPS = ("routing", "body", "semantics", "middleware", "framework", "static", "ws", "raw", "h2raw")
+ALL_GROUPS = ("routing", "body", "semantics", "middleware", "framework", "static", "ws", "raw", "h2raw",
+              "h3raw")
 
 # The two reference servers bind different ports, and /echo reports the Host
 # header verbatim. Scrub the port so the same request is byte-comparable.
@@ -121,6 +122,11 @@ def build_go(cache: Path, groups: tuple[str, ...]) -> dict[str, Path]:
         raise RuntimeError(f"go build server failed:\n{result.stderr}")
     outputs["server"] = server
     for group in groups:
+        if group == "h3raw":
+            # aioquic-based probe: raw HTTP/3 fields cannot be expressed with
+            # Go's high-level client, and there is no Go binary to build.
+            outputs[group] = HERE / "h3raw" / "probe.py"
+            continue
         binary = binary_dir / f"server_probe_{group}"
         if group == "h2raw":
             command = [go, "build", "-o", str(binary), "./server/go/h2raw"]
@@ -201,8 +207,37 @@ def run_h2raw(probe: Path, report_dir: Path, registry: dict) -> int:
     return report.summary(report_dir / "h2raw")
 
 
+def run_h3raw(probe: Path, report_dir: Path, registry: dict, h3_ok: bool) -> int:
+    """Raw HTTP/3 field-validity probe (aioquic) against both reference servers."""
+    report = harness.DiffReport("server-h3raw", registry)
+    if not h3_ok:
+        report.skip("h3raw", "HTTP/3 listener unavailable")
+        return report.summary(report_dir / "h3raw")
+
+    output = report_dir / "h3raw.jsonl"
+    stderr_path = report_dir / "h3raw.stderr"
+    result = run_probe([sys.executable, str(probe), "--cpp", "127.0.0.1:7823",
+                        "--go", "127.0.0.1:7833"], output)
+    stderr_path.write_text(result.stderr or "", encoding="utf-8")
+    if result.returncode == 3:
+        # aioquic is missing (the probe prints SKIP): this is an environment
+        # gap, not a server failure.
+        report.skip("h3raw", "aioquic is not available")
+        return report.summary(report_dir / "h3raw")
+    if result.returncode != 0:
+        report.fail("h3raw", (result.stderr or "probe failed").strip()[-500:])
+        return report.summary(report_dir / "h3raw")
+
+    for row in harness.load_jsonl(output):
+        cpp, go = row.get("cpp"), row.get("go")
+        report.record(row["case"], [] if cpp == go else [("outcome", cpp, go)])
+    return report.summary(report_dir / "h3raw")
+
+
 def compare_group(group: str, probe: Path, report_dir: Path, registry: dict,
                   h3_ok: bool) -> int:
+    if group == "h3raw":
+        return run_h3raw(probe, report_dir, registry, h3_ok)
     if group == "h2raw":
         return run_h2raw(probe, report_dir, registry)
 
@@ -284,7 +319,9 @@ def main() -> int:
             return 1
 
         cpp_text = cpp_log.read_text(encoding="utf-8", errors="replace")
-        h3_ok = "tcp+udp h3 (ok=true)" in cpp_text
+        # The C++ fixture prints `(ok=1)`; accept the boolean spelling too so a
+        # future change to the banner does not silently skip every h3 case.
+        h3_ok = re.search(r"tcp\+udp h3 \(ok=(?:true|1)\)", cpp_text) is not None
 
         exit_code = 0
         for group in groups:
