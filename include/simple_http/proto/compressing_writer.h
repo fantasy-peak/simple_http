@@ -19,13 +19,13 @@
 //     ending the body early, so an empty string must never reach it. A codec
 //     legitimately buffers without producing output, so this is a normal case.
 
-#include <boost/asio.hpp>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
 
+#include "../core/asio_compat.h"
 #include "../core/compression.h"
 #include "../core/content_encoding.h"
 #include "../core/http_status.h"
@@ -34,8 +34,6 @@
 #include "response_writer.h"
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 class CompressingResponseSink final : public ResponseSink,
                                       public std::enable_shared_from_this<CompressingResponseSink> {

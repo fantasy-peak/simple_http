@@ -28,10 +28,11 @@
 #include <thread>
 
 #include "simple_http.h"
+#include <simple_http/core/asio_compat.h>
 
 #include "../support/coro_compat.h"
 
-namespace asio = boost::asio;
+namespace asio = simple_http::asio;
 using namespace simple_http;
 using namespace simple_http::test;
 

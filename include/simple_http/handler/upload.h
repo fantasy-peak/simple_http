@@ -16,9 +16,6 @@
 // not have. Each chunk is bounded, so the executor is blocked only for one
 // write.
 
-#include <boost/asio/any_io_executor.hpp>
-#include <boost/asio/compose.hpp>
-#include <boost/system/error_code.hpp>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -27,12 +24,11 @@
 #include <system_error>
 #include <utility>
 
+#include "../core/asio_compat.h"
 #include "../core/types.h"
 #include "../proto/body.h"
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 namespace detail {
 
@@ -45,6 +41,12 @@ struct ReadBodyToFileOp {
     std::string temp_path;
     std::uint64_t written{0};
     bool started{false};
+    // Bound the inline read chain: a channel with buffered frames completes
+    // async_read() synchronously, and the h2/h3 consume hooks feed parked
+    // frames from inside that completion. Without a yield this recursion grows
+    // once per DATA frame (thousands of small frames overflow the worker stack).
+    static constexpr std::size_t kYieldAfter = 32;
+    std::size_t budget{kYieldAfter};
 
     asio::any_io_executor get_executor() const noexcept { return body.get_executor(); }
 
@@ -70,7 +72,7 @@ struct ReadBodyToFileOp {
             file.open(temp_path, std::ios::binary | std::ios::trunc);
             if (!file) {
                 cleanup();
-                self.complete(boost::system::errc::make_error_code(boost::system::errc::no_such_file_or_directory), 0);
+                self.complete(make_errc_code(std::errc::no_such_file_or_directory), 0);
                 return;
             }
             body.async_read(std::move(self));
@@ -85,7 +87,7 @@ struct ReadBodyToFileOp {
             file.flush();
             if (!file) {
                 cleanup();
-                self.complete(boost::system::errc::make_error_code(boost::system::errc::io_error), written);
+                self.complete(make_errc_code(std::errc::io_error), written);
                 return;
             }
             file.close();
@@ -93,7 +95,7 @@ struct ReadBodyToFileOp {
             std::filesystem::rename(temp_path, path, rename_ec);
             if (rename_ec) {
                 cleanup();
-                self.complete(boost::system::errc::make_error_code(boost::system::errc::io_error), written);
+                self.complete(make_errc_code(std::errc::io_error), written);
                 return;
             }
             temp_path.clear();
@@ -103,15 +105,23 @@ struct ReadBodyToFileOp {
         written += chunk.data.size();
         if (max_bytes != 0 && written > max_bytes) {
             cleanup();
-            self.complete(boost::system::errc::make_error_code(boost::system::errc::file_too_large), written);
+            self.complete(make_errc_code(std::errc::file_too_large), written);
             return;
         }
         file.write(chunk.data.data(), static_cast<std::streamsize>(chunk.data.size()));
         if (!file) {
             cleanup();
-            self.complete(boost::system::errc::make_error_code(boost::system::errc::io_error), written);
+            self.complete(make_errc_code(std::errc::io_error), written);
             return;
         }
+        if (budget == 0) {
+            Body *next = &body;
+            budget = kYieldAfter;
+            asio::post(next->get_executor(),
+                       [self = std::move(self), next]() mutable { next->async_read(std::move(self)); });
+            return;
+        }
+        --budget;
         body.async_read(std::move(self));
     }
 };

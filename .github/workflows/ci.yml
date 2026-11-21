@@ -14,7 +14,7 @@ concurrency:
 env:
   # The runners have fewer cores than the development box; keep xmake from
   # oversubscribing and OOMing while the package graph compiles.
-  XMAKE_JOBS: "4"
+  XMAKE_JOBS: "3"
 
 jobs:
   build-and-test:

@@ -10,9 +10,6 @@
 
 #include <algorithm>
 #include <array>
-#include <boost/asio.hpp>
-#include <boost/asio/cancel_after.hpp>
-#include <boost/asio/ssl.hpp>
 #include <chrono>
 #include <cstddef>
 #include <cstring>
@@ -20,13 +17,12 @@
 #include <string_view>
 #include <utility>
 
+#include "../core/asio_ssl.h"
 #include "../core/span.h"
 #include "../core/types.h"
 #include "transport.h"
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 template <typename Socket> class TlsTransport {
   public:
@@ -103,7 +99,7 @@ using TlsStreamTransport = TlsTransport<asio::ip::tcp::socket>;
 // TLS over a TLS connection: the client's origin TLS runs inside the TLS
 // connection it already established to an HTTPS proxy.
 using NestedTlsTransport = TlsTransport<asio::ssl::stream<asio::ip::tcp::socket>>;
-#ifdef BOOST_ASIO_HAS_LOCAL_SOCKETS
+#ifdef SIMPLE_HTTP_HAS_LOCAL_SOCKETS
 using TlsUnixTransport = TlsTransport<asio::local::stream_protocol::socket>;
 #endif
 

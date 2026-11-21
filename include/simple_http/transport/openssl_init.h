@@ -20,8 +20,9 @@
 
 #include <mutex>
 
-#include <boost/asio/ssl/context.hpp>
 #include <openssl/ssl.h>
+
+#include "../core/asio_ssl.h"
 
 namespace simple_http::detail {
 
@@ -32,7 +33,7 @@ inline void ensure_openssl_initialized() {
         // Warm the lazy tables by constructing and destroying one context.
         // `tls_client` is sufficient: the tables are process-wide, and the
         // throwaway context is never used for a connection.
-        boost::asio::ssl::context warmup{boost::asio::ssl::context::tls_client};
+        simple_http::asio::ssl::context warmup{simple_http::asio::ssl::context::tls_client};
     });
 }
 

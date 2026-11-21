@@ -7,6 +7,7 @@
 #include <thread>
 
 #include "simple_http.h"
+#include <simple_http/core/asio_compat.h>
 
 using namespace simple_http;
 

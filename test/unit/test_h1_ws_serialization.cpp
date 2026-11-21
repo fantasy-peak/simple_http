@@ -5,7 +5,6 @@
 // counts in-flight writes and never completes them, which makes the window
 // deterministic instead of timing-dependent.
 
-#include <boost/asio.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
 #include <cstring>
@@ -19,12 +18,13 @@
 
 #include "simple_http.h"
 #include "test_support.h"
+#include <simple_http/core/asio_compat.h>
 
 using namespace simple_http;
 
 namespace {
 
-namespace asio = boost::asio;
+namespace asio = simple_http::asio;
 
 class OverlapTransport {
   public:

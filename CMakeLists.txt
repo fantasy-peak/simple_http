@@ -26,6 +26,13 @@ project(simple_http VERSION ${SIMPLE_HTTP_VERSION} LANGUAGES CXX)
 find_package(Boost REQUIRED CONFIG)
 find_package(OpenSSL REQUIRED)
 
+# Standalone Asio (think-async.com) instead of Boost.Asio. Boost stays for
+# Boost.Regex; core/asio_compat.h selects the Asio source.
+option(SIMPLE_HTTP_USE_STANDALONE_ASIO "Build against standalone Asio instead of Boost.Asio" OFF)
+if(SIMPLE_HTTP_USE_STANDALONE_ASIO)
+    find_path(ASIO_INCLUDE_DIR asio.hpp REQUIRED)
+endif()
+
 # glaze is an unconditional dependency: it backs the JSON helpers
 # (proto/json.h, read_json_body / write_json). The OpenAPI layer stays opt-in.
 find_package(glaze CONFIG REQUIRED)
@@ -47,6 +54,11 @@ target_include_directories(simple_http INTERFACE
 # The library requires C++23. Stating it here turns "consumer sets C++20" into a
 # configure-time error instead of a screen of parse errors inside the headers.
 target_compile_features(simple_http INTERFACE cxx_std_23)
+
+if(SIMPLE_HTTP_USE_STANDALONE_ASIO)
+    target_include_directories(simple_http INTERFACE ${ASIO_INCLUDE_DIR})
+    target_compile_definitions(simple_http INTERFACE SIMPLE_HTTP_USE_STANDALONE_ASIO)
+endif()
 
 target_link_libraries(simple_http INTERFACE
     Boost::boost

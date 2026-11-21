@@ -13,9 +13,6 @@
 // as the underlying asio error_code; failures the client itself decides on use
 // client_errc below.
 
-#include <boost/asio.hpp>
-#include <boost/asio/ssl.hpp>
-#include <boost/system/error_code.hpp>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -27,9 +24,11 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
+#include "../core/asio_ssl.h"
 #include "../core/http_date.h"
 #include "../core/http_method.h" // RetryPolicy::condition names Method
 #include "../core/limits.h"
@@ -38,8 +37,6 @@
 #include "../core/types.h"
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 // Feeds ClientConfig::cookie_jar; defined in client/cookie_jar.h.
 class CookieJar;
@@ -492,11 +489,19 @@ enum class client_errc : int {
 
 } // namespace simple_http
 
-// Lets `error_code ec = client_errc::bad_url;` work through the library's
-// boost::system::error_code. This must be visible before the first conversion —
-// boost's converting constructor is gated on the trait, and a non-template
-// function's body is compiled where it is defined — so it sits here rather than
-// at the end of the header.
+// Lets `error_code ec = client_errc::bad_url;` work. Both std::error_code and
+// boost::system::error_code enable that converting constructor only when their
+// is_error_code_enum trait is specialized, so the trait follows the active
+// error type. It must be visible before the first conversion — a non-template
+// function's body is compiled where it is defined — hence its position here
+// rather than at the end of the header.
+#if defined(SIMPLE_HTTP_USE_STANDALONE_ASIO)
+namespace std {
+
+template <> struct is_error_code_enum<simple_http::client_errc> : true_type {};
+
+} // namespace std
+#else
 namespace boost::system {
 
 template <> struct is_error_code_enum<simple_http::client_errc> {
@@ -504,10 +509,11 @@ template <> struct is_error_code_enum<simple_http::client_errc> {
 };
 
 } // namespace boost::system
+#endif
 
 namespace simple_http {
 
-class ClientErrorCategory : public boost::system::error_category {
+class ClientErrorCategory : public error_category {
   public:
     const char *name() const noexcept override { return "simple_http.client"; }
 
@@ -577,7 +583,7 @@ class ClientErrorCategory : public boost::system::error_category {
     }
 };
 
-inline const boost::system::error_category &client_category() {
+inline const error_category &client_category() {
     static const ClientErrorCategory instance;
     return instance;
 }

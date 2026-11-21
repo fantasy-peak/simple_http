@@ -25,9 +25,8 @@
 // Http2ResponseSink holds a weak_ptr and lock()s it per operation.
 
 #include <array>
-#include <boost/asio.hpp>
-#include <boost/asio/experimental/channel.hpp>
 
+#include "../../core/asio_compat.h"
 #include "../../core/cancel.h"
 #include <charconv>
 #include <chrono>
@@ -69,8 +68,6 @@
 #include "hpack_encoder.h"
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 template <typename Transport> class Http2Engine;
 
@@ -1700,15 +1697,7 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
     // RFC 9113 §8.3.1: :path is origin-form ("/" ...) or "*" for OPTIONS. It
     // never carries a fragment, and a raw space would split an HTTP/1.1 request
     // line when the proxy replays it.
-    static bool valid_h2_path(std::string_view p) noexcept {
-        if (p.empty())
-            return false;
-        if (p == "*")
-            return true;
-        if (p.front() != '/')
-            return false;
-        return p.find_first_of(" #\t") == std::string_view::npos;
-    }
+    static bool valid_h2_path(std::string_view p) noexcept { return valid_pseudo_path(p); }
 
     // A field value may contain VCHAR, SP, HTAB and obs-text, but no other CTL
     // and not DEL. contains_ctl() only knows CR/LF/NUL — enough to stop header

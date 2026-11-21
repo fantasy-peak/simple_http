@@ -21,8 +21,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <boost/asio.hpp>
-#include <boost/asio/any_completion_handler.hpp>
 #include <charconv>
 #include <chrono>
 #include <cstddef>
@@ -38,9 +36,7 @@
 #include <utility>
 #include <vector>
 
-#include <boost/asio/cancellation_signal.hpp>
-#include <boost/asio/post.hpp>
-
+#include "../../core/asio_compat.h"
 #include "../../core/cancel.h"
 #include "../../core/http_field.h"
 #include "../../core/http_method.h"
@@ -64,8 +60,6 @@
 #include "ws_proxy.h"
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 // A connection-level idle deadline shared between the engine and the response
 // writer(s) it creates.

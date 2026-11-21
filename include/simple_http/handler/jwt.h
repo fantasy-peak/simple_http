@@ -385,7 +385,10 @@ inline Middleware jwt(JwtConfig config = {}) {
         }
 
         const std::int64_t now = now_unix();
-        const std::int64_t leeway = config.leeway.count();
+        // A negative leeway is meaningless, and casting it to uint64_t below
+        // would wrap to 2^64-1 and disable the expiry checks entirely. Clamp.
+        const std::uint64_t leeway =
+            config.leeway.count() > 0 ? static_cast<std::uint64_t>(config.leeway.count()) : std::uint64_t{0};
         if (config.require_exp && payload.exp == 0) {
             jwt_reject(res, status::unauthorized, "JWT has no exp claim", std::move(done));
             return;
@@ -398,14 +401,14 @@ inline Middleware jwt(JwtConfig config = {}) {
         // invoking signed-overflow UB.
         if (payload.exp != 0 && now > payload.exp) {
             const auto elapsed = static_cast<std::uint64_t>(now) - static_cast<std::uint64_t>(payload.exp);
-            if (elapsed > static_cast<std::uint64_t>(leeway)) {
+            if (elapsed > leeway) {
                 jwt_reject(res, status::unauthorized, "JWT has expired", std::move(done));
                 return;
             }
         }
         if (payload.nbf != 0 && payload.nbf > now) {
             const auto early = static_cast<std::uint64_t>(payload.nbf) - static_cast<std::uint64_t>(now);
-            if (early > static_cast<std::uint64_t>(leeway)) {
+            if (early > leeway) {
                 jwt_reject(res, status::unauthorized, "JWT is not valid yet", std::move(done));
                 return;
             }

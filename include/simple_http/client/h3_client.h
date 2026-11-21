@@ -27,12 +27,11 @@
 
 #include <nghttp3/nghttp3.h>
 
+#include "../core/asio_compat.h"
 #include "../core/compat.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <boost/asio.hpp>
-#include <boost/asio/experimental/concurrent_channel.hpp>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -51,6 +50,7 @@
 #include "../core/logging.h"
 #include "../core/resolve.h"
 #include "../core/result.h"
+#include "../core/span.h"
 #include "../core/types.h"
 #include "../core/version.h"
 #include "../engine/h3/h3_callbacks.h"
@@ -64,8 +64,6 @@
 #include "tls_client.h"
 
 namespace simple_http::detail {
-
-namespace asio = boost::asio;
 
 // nghttp3 settings the server adapter also uses; kept local so this header does
 // not depend on engine/h3/h3_engine.h (which would pull the whole Dispatcher).
@@ -1174,6 +1172,20 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         }
         if (!name.empty() && name.front() == ':')
             return; // pseudo-headers are not valid in a trailer section
+        // Trailer names are regular fields: a token, lowercase, and not
+        // carrying the upper-case spelling HPACK/QPACK can encode verbatim.
+        if (!is_http_token(name)) {
+            st.failed = true;
+            st.outcome->set(StreamState::Failed, make_error_code(client_errc::protocol_error));
+            return;
+        }
+        for (char c : name) {
+            if (c >= 'A' && c <= 'Z') {
+                st.failed = true;
+                st.outcome->set(StreamState::Failed, make_error_code(client_errc::protocol_error));
+                return;
+            }
+        }
         st.trailer_tmp.emplace_back(std::string{name}, std::string{value});
     }
 
@@ -1514,11 +1526,15 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         std::string_view method = request.method_token();
         if (method.empty())
             method = to_string(request.method());
-        if (method.empty() || contains_ctl(method))
+        // `:method` is a token (RFC 9114 §4.3.1 / RFC 9113 §8.3.1).
+        if (!is_http_token(method))
             return make_error_code(client_errc::protocol_error);
 
         std::string_view target = request.target().empty() ? std::string_view{"/"} : std::string_view{request.target()};
-        if (target.front() != '/' || contains_ctl(target))
+        // origin-form, or RFC 9114 §4.3.1 / RFC 9113 §8.3.1's asterisk-form for
+        // OPTIONS. Reject SP/TAB/DEL/backslash and other controls.
+        const bool asterisk_form = target == "*" && method == "OPTIONS";
+        if ((target.front() != '/' && !asterisk_form) || contains_invalid_url_byte(target))
             return make_error_code(client_errc::protocol_error);
 
         owned.emplace_back(method);
@@ -1528,7 +1544,7 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         {
             const auto host_override = request.header("host");
             const std::string_view authority = host_override ? *host_override : std::string_view{m_authority};
-            if (contains_ctl(authority)) {
+            if (contains_invalid_url_byte(authority)) {
                 return make_error_code(client_errc::invalid_header);
             }
             owned.emplace_back(authority);

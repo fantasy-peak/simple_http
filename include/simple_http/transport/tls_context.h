@@ -9,7 +9,6 @@
 
 #include <openssl/ssl.h>
 
-#include <boost/asio/ssl.hpp>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -19,6 +18,7 @@
 #include <string_view>
 #include <vector>
 
+#include "../core/asio_ssl.h"
 #include "../core/format.h"
 #include "../core/logging.h"
 #include "../core/span.h"
@@ -27,8 +27,6 @@
 #include "openssl_init.h"
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 struct TlsConfig {
     std::string cert_chain_file;                     // server certificate chain (PEM)

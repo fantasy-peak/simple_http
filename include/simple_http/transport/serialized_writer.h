@@ -28,15 +28,12 @@
 #include <utility>
 #include <vector>
 
-#include <boost/asio/any_completion_handler.hpp>
-#include <boost/asio/error.hpp>
-
+#include "../core/asio_compat.h"
 #include "../core/compat.h"
+#include "../core/span.h"
 #include "../core/types.h"
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 // One queued write: up to three byte ranges (framing head, body, tail). The
 // head and body are owned unless the entry was built with borrowed(); the tail

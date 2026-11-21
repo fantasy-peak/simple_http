@@ -21,8 +21,9 @@
 #include <vector>
 
 #include "simple_http.h"
+#include <simple_http/core/asio_compat.h>
 
-namespace asio = boost::asio;
+namespace asio = simple_http::asio;
 using namespace simple_http;
 
 // --- domain types: glass can reflect these with zero metadata, so each one's

@@ -51,6 +51,7 @@ const (
 
 	settingMaxConcurrentStreams  = 0x3
 	settingEnableConnectProtocol = 0x8
+	errorProtocol                = 0x1
 	errorEnhanceYourCalm         = 0x0b
 	errorCancel                  = 0x8
 )
@@ -722,6 +723,151 @@ func checkFieldLeadingWS(addr string) error {
 	}
 }
 
+// checkMalformedHead sends one request HEADERS block and expects the server to
+// treat it as malformed: RST_STREAM(PROTOCOL_ERROR) on that stream, never a
+// response. Covers the RFC 9113 §8.2.1/§8.3.1 rules that Go's net/http server
+// is too lenient about to compare directly (`:method` with SP, `:path` with SP,
+// uppercase or separator field names), so it stays a single-side assertion.
+func checkMalformedHead(addr string, fields []hpack.HeaderField) error {
+	c, err := dial(addr, 3*time.Second)
+	if err != nil {
+		return err
+	}
+	defer c.conn.Close()
+	c.conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if err := c.writeFrame(frameHeaders, flagEndHeaders|flagEndStream, 1, encodeFields(fields)); err != nil {
+		return err
+	}
+	for {
+		typ, flags, id, payload, err := c.readFrame()
+		if err != nil {
+			return err
+		}
+		switch typ {
+		case frameSettings:
+			if flags&flagAck == 0 {
+				_ = c.writeFrame(frameSettings, flagAck, 0, nil)
+			}
+		case framePing:
+			c.ackPing(payload)
+		case frameRSTStream:
+			if id != 1 {
+				return fmt.Errorf("RST_STREAM for stream %d", id)
+			}
+			if len(payload) != 4 {
+				return fmt.Errorf("short RST_STREAM")
+			}
+			if got := binary.BigEndian.Uint32(payload); got != errorProtocol {
+				return fmt.Errorf("RST code 0x%x, want 0x%x", got, errorProtocol)
+			}
+			return nil
+		case frameHeaders:
+			return fmt.Errorf("response HEADERS instead of RST_STREAM")
+		case frameGoAway:
+			return fmt.Errorf("GOAWAY instead of stream reset")
+		}
+	}
+}
+
+// checkMalformedTrailer sends a body followed by a trailing HEADERS block and
+// expects the trailer field to be rejected with RST_STREAM(PROTOCOL_ERROR).
+func checkMalformedTrailer(addr string, trailer hpack.HeaderField) error {
+	c, err := dial(addr, 3*time.Second)
+	if err != nil {
+		return err
+	}
+	defer c.conn.Close()
+	c.conn.SetDeadline(time.Now().Add(5 * time.Second))
+	head := []hpack.HeaderField{
+		{Name: ":method", Value: "POST"},
+		{Name: ":scheme", Value: "http"},
+		{Name: ":authority", Value: addr},
+		{Name: ":path", Value: "/echo"},
+		{Name: "content-length", Value: "1"},
+	}
+	if err := c.writeFrame(frameHeaders, flagEndHeaders, 1, encodeFields(head)); err != nil {
+		return err
+	}
+	if err := c.writeFrame(frameData, 0, 1, []byte("x")); err != nil {
+		return err
+	}
+	if err := c.writeFrame(frameHeaders, flagEndHeaders|flagEndStream, 1,
+		encodeFields([]hpack.HeaderField{trailer})); err != nil {
+		return err
+	}
+	for {
+		typ, flags, id, payload, err := c.readFrame()
+		if err != nil {
+			return err
+		}
+		switch typ {
+		case frameSettings:
+			if flags&flagAck == 0 {
+				_ = c.writeFrame(frameSettings, flagAck, 0, nil)
+			}
+		case framePing:
+			c.ackPing(payload)
+		case frameRSTStream:
+			if id != 1 {
+				return fmt.Errorf("RST_STREAM for stream %d", id)
+			}
+			if len(payload) != 4 {
+				return fmt.Errorf("short RST_STREAM")
+			}
+			if got := binary.BigEndian.Uint32(payload); got != errorProtocol {
+				return fmt.Errorf("RST code 0x%x, want 0x%x", got, errorProtocol)
+			}
+			return nil
+		case frameHeaders:
+			return fmt.Errorf("response HEADERS instead of RST_STREAM")
+		case frameGoAway:
+			return fmt.Errorf("GOAWAY instead of stream reset")
+		}
+	}
+}
+
+// checkOptionsAsterisk asserts the RFC 9113 §8.3.1 asterisk-form is accepted
+// (dispatched, so some response HEADERS arrives) rather than reset.
+func checkOptionsAsterisk(addr string) error {
+	c, err := dial(addr, 3*time.Second)
+	if err != nil {
+		return err
+	}
+	defer c.conn.Close()
+	c.conn.SetDeadline(time.Now().Add(5 * time.Second))
+	fields := []hpack.HeaderField{
+		{Name: ":method", Value: "OPTIONS"},
+		{Name: ":scheme", Value: "http"},
+		{Name: ":authority", Value: addr},
+		{Name: ":path", Value: "*"},
+	}
+	if err := c.writeFrame(frameHeaders, flagEndHeaders|flagEndStream, 1, encodeFields(fields)); err != nil {
+		return err
+	}
+	for {
+		typ, flags, id, payload, err := c.readFrame()
+		if err != nil {
+			return err
+		}
+		switch typ {
+		case frameSettings:
+			if flags&flagAck == 0 {
+				_ = c.writeFrame(frameSettings, flagAck, 0, nil)
+			}
+		case framePing:
+			c.ackPing(payload)
+		case frameRSTStream:
+			if id == 1 {
+				return fmt.Errorf("stream reset; asterisk-form must be accepted")
+			}
+		case frameGoAway:
+			return fmt.Errorf("GOAWAY; asterisk-form must be accepted")
+		case frameHeaders:
+			return nil
+		}
+	}
+}
+
 func checkRapidReset(addr string) error {
 	c, err := dial(addr, 3*time.Second)
 	if err != nil {
@@ -833,6 +979,31 @@ func main() {
 	check("h2.ws_unknown_protocol", checkWSUnknownProtocol(addr))
 	check("h2.ws_missing_scheme", checkWSMissingScheme(addr))
 	check("h2.field_leading_ws", checkFieldLeadingWS(addr))
+	base := func(method, path string, extra ...hpack.HeaderField) []hpack.HeaderField {
+		fields := []hpack.HeaderField{
+			{Name: ":method", Value: method},
+			{Name: ":scheme", Value: "http"},
+			{Name: ":authority", Value: addr},
+			{Name: ":path", Value: path},
+		}
+		return append(fields, extra...)
+	}
+	// RFC 9113 §8.2.1/§8.3.1: a request with a non-token :method, a :path that
+	// is not origin-form/asterisk-form (or carries SP/backslash/DEL), an
+	// uppercase field name or a non-token field name is malformed and must be
+	// reset at the stream level.
+	check("h2.method_not_token", checkMalformedHead(addr, base("GE T", "/")))
+	check("h2.path_space", checkMalformedHead(addr, base("GET", "/a b")))
+	check("h2.path_backslash", checkMalformedHead(addr, base("GET", "/a\\b")))
+	check("h2.header_uppercase",
+		checkMalformedHead(addr, base("GET", "/", hpack.HeaderField{Name: "X-Foo", Value: "v"})))
+	check("h2.header_separator",
+		checkMalformedHead(addr, base("GET", "/", hpack.HeaderField{Name: "x(y", Value: "v"})))
+	check("h2.trailer_uppercase",
+		checkMalformedTrailer(addr, hpack.HeaderField{Name: "X-Tail", Value: "v"}))
+	check("h2.trailer_separator",
+		checkMalformedTrailer(addr, hpack.HeaderField{Name: "x(y", Value: "v"}))
+	check("h2.options_asterisk", checkOptionsAsterisk(addr))
 	check("h2.rapid_reset", checkRapidReset(addr))
 	check("h2.upgrade", checkH2cUpgrade(sniffAddr))
 	if failed != 0 {

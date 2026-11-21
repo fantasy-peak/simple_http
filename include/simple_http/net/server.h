@@ -11,9 +11,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <boost/asio.hpp>
-#include <boost/asio/ssl.hpp>
-#include <boost/system/result.hpp>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -31,6 +28,7 @@
 #include <variant>
 #include <vector>
 
+#include "../core/asio_ssl.h"
 #include "../core/io_pool.h"
 #include "../core/limits.h"
 #include "../core/logging.h"
@@ -51,8 +49,6 @@
 #include "connection.h"
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 // An IP endpoint. Leave v6 false on an IPv6 host for dual-stack.
 struct InetAddress {
@@ -102,8 +98,8 @@ enum class StartPolicy { AllOrNothing, BestEffort };
 
 enum class server_errc { bind_failed = 1, tls_setup_failed, invalid_config };
 
-inline const boost::system::error_category &server_category() {
-    static const struct : boost::system::error_category {
+inline const error_category &server_category() {
+    static const struct : error_category {
         const char *name() const noexcept override { return "simple_http.server"; }
         std::string message(int ev) const override {
             switch (static_cast<server_errc>(ev)) {

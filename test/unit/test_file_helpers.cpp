@@ -6,7 +6,6 @@
 // failure that leaks headers — so each is driven over a real ResponseWriter or
 // Body here.
 
-#include <boost/system/error_code.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <filesystem>
 #include <fstream>
@@ -17,6 +16,7 @@
 #include "../support/static_fixture.h"
 #include "simple_http.h"
 #include "test_support.h"
+#include <simple_http/core/asio_compat.h>
 
 using namespace simple_http;
 using namespace simple_http::test;
@@ -69,7 +69,7 @@ TEST_CASE("file: send_file honours max_bytes and custom options", "[file]") {
             run_on(ctx, as_ec(async_send_file(res, fixture.root_string() + "/a.txt", SendFileOptions{.max_bytes = 4},
                                               asio::as_tuple(asio::use_awaitable))));
         REQUIRE(ec.has_value());
-        CHECK(*ec == boost::system::errc::make_error_code(boost::system::errc::file_too_large));
+        CHECK(*ec == simple_http::make_errc_code(std::errc::file_too_large));
         CHECK_FALSE(writer->begun);
         CHECK(writer->calls == 0);
         CHECK(writer->chunks.empty());
@@ -82,7 +82,7 @@ TEST_CASE("file: send_file honours max_bytes and custom options", "[file]") {
         auto ec = run_on(ctx, as_ec(async_send_file(res, fixture.root_string() + "/missing.txt",
                                                     asio::as_tuple(asio::use_awaitable))));
         REQUIRE(ec.has_value());
-        CHECK(*ec == boost::system::errc::make_error_code(boost::system::errc::no_such_file_or_directory));
+        CHECK(*ec == simple_http::make_errc_code(std::errc::no_such_file_or_directory));
         CHECK_FALSE(writer->begun);
         CHECK(writer->calls == 0);
     }
@@ -175,7 +175,7 @@ TEST_CASE("file: read_body_to_file caps the upload before it fills the disk", "[
         ctx, as_expected(async_read_body_to_file(body, path, /*max_bytes=*/4, asio::as_tuple(asio::use_awaitable))));
     REQUIRE(result.has_value());
     REQUIRE_FALSE(result->has_value());
-    CHECK(result->error() == boost::system::errc::make_error_code(boost::system::errc::file_too_large));
+    CHECK(result->error() == simple_http::make_errc_code(std::errc::file_too_large));
     // The upload wrote to a temporary file, which is removed on failure; the
     // target is never created.
     CHECK_FALSE(std::filesystem::exists(path));
@@ -195,7 +195,7 @@ TEST_CASE("file: a failed upload leaves an existing target untouched", "[file]")
         ctx, as_expected(async_read_body_to_file(body, path, /*max_bytes=*/4, asio::as_tuple(asio::use_awaitable))));
     REQUIRE(result.has_value());
     REQUIRE_FALSE(result->has_value());
-    CHECK(result->error() == boost::system::errc::make_error_code(boost::system::errc::file_too_large));
+    CHECK(result->error() == simple_http::make_errc_code(std::errc::file_too_large));
     CHECK(read_file(path) == "ORIGINAL-CONTENT");
 
     // No temporary file is left behind.

@@ -17,8 +17,6 @@
 
 #include <algorithm>
 #include <array>
-#include <boost/asio.hpp>
-#include <boost/asio/cancel_after.hpp>
 #include <charconv>
 #include <chrono>
 #include <cstddef>
@@ -31,6 +29,7 @@
 #include <utility>
 #include <vector>
 
+#include "../core/asio_compat.h"
 #include "../core/base64.h"
 #include "../core/compat.h"
 #include "../core/http_field.h"
@@ -44,8 +43,6 @@
 #include "h1/h1_parser.h"      // H1ResponseParser / ParsedResponseHead
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 namespace detail {
 

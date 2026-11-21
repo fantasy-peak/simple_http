@@ -8,7 +8,6 @@
 // instead of hanging the suite.
 
 #include <atomic>
-#include <boost/asio.hpp>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -23,10 +22,11 @@
 #include <vector>
 
 #include "simple_http.h"
+#include <simple_http/core/asio_compat.h>
 
 namespace simple_http::test {
 
-namespace asio = boost::asio;
+namespace asio = simple_http::asio;
 
 // --- running awaitables ------------------------------------------------------
 

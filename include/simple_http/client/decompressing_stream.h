@@ -15,7 +15,6 @@
 // set_head() so the non-virtual head()/status()/read_head() report it.
 
 #include <algorithm>
-#include <boost/asio.hpp>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -24,11 +23,7 @@
 #include <utility>
 #include <vector>
 
-#include <boost/asio/any_completion_handler.hpp>
-#include <boost/asio/associated_cancellation_slot.hpp>
-#include <boost/asio/async_result.hpp>
-#include <boost/asio/bind_cancellation_slot.hpp>
-
+#include "../core/asio_compat.h"
 #include "../core/content_encoding.h"
 #include "../core/http_status.h"
 #include "../core/types.h"
@@ -36,8 +31,6 @@
 #include "client_stream.h"
 
 namespace simple_http::detail {
-
-namespace asio = boost::asio;
 
 // What the client advertised for this exchange, and therefore what it is
 // allowed to decode. Go's Transport only decompresses a response when it was

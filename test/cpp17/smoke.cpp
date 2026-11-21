@@ -7,9 +7,9 @@
 // phases extend it to start a real server.
 
 #include <simple_http.h>
+#include <simple_http/core/asio_compat.h>
 
 #include <array>
-#include <boost/asio/io_context.hpp>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
@@ -19,6 +19,7 @@
 #include <string_view>
 #include <unistd.h>
 #include <utility>
+#include <vector>
 
 static_assert(__cplusplus >= 201703L && __cplusplus < 202002L, "cpp17 smoke must build as C++17");
 
@@ -56,13 +57,25 @@ void test_url_path() {
 
 void test_result() {
     const simple_http::result<int> good{42};
-    check(good && *good == 42, "boost::system::result value");
-    const simple_http::result<int> bad{boost::system::errc::make_error_code(boost::system::errc::invalid_argument)};
-    check(!bad && bad.error(), "boost::system::result error");
+    check(good && *good == 42, "result value");
+    const simple_http::result<int> bad{simple_http::make_errc_code(std::errc::invalid_argument)};
+    check(!bad && bad.error(), "result error");
+}
+
+void test_span() {
+    // C++17 has no std::span; the fallback must still accept the shapes the
+    // public API relied on under boost::span (C arrays and contiguous
+    // containers), not just (pointer, count).
+    int values[3] = {1, 2, 3};
+    simple_http::span<const int> from_array = values;
+    check(from_array.size() == 3 && from_array[1] == 2, "span from a C array");
+    const std::vector<int> vec{4, 5};
+    simple_http::span<const int> from_vector = vec;
+    check(from_vector.size() == 2 && from_vector[0] == 4, "span from a container");
 }
 
 void test_body_tokens() {
-    boost::asio::io_context context;
+    simple_http::asio::io_context context;
     simple_http::Body body{context.get_executor()};
     (void)body.feed("abc");
     body.finish();
@@ -91,7 +104,7 @@ void test_body_tokens() {
 
 class CaptureSink final : public simple_http::ResponseSink {
   public:
-    explicit CaptureSink(boost::asio::any_io_executor executor) : m_executor(std::move(executor)) {}
+    explicit CaptureSink(simple_http::asio::any_io_executor executor) : m_executor(std::move(executor)) {}
 
     void send(int code, simple_http::Headers headers, std::string body, simple_http::WriteCompletion done) override {
         status = code;
@@ -121,20 +134,20 @@ class CaptureSink final : public simple_http::ResponseSink {
         std::move(done)(simple_http::error_code{}, true);
     }
     void close(simple_http::WriteCompletion done) override { std::move(done)(simple_http::error_code{}); }
-    boost::asio::any_io_executor get_executor() const override { return m_executor; }
+    simple_http::asio::any_io_executor get_executor() const override { return m_executor; }
     simple_http::Version version() const override { return simple_http::Version::Http11; }
 
     int status{0};
     std::string body() const { return m_body; }
 
   private:
-    boost::asio::any_io_executor m_executor;
+    simple_http::asio::any_io_executor m_executor;
     simple_http::Headers m_headers;
     std::string m_body;
 };
 
 void test_router() {
-    boost::asio::io_context context;
+    simple_http::asio::io_context context;
     simple_http::Router router;
     router.route({simple_http::Method::Get}, "/hello",
                  [](simple_http::RequestPtr, simple_http::ResponsePtr res, simple_http::HandlerCompletion done) {
@@ -200,27 +213,30 @@ void test_server() {
         return;
     }
 
-    boost::asio::io_context context;
-    boost::asio::ip::tcp::socket socket{context};
-    boost::system::error_code ec;
-    socket.connect(boost::asio::ip::tcp::endpoint{boost::asio::ip::make_address("127.0.0.1"), server.port()}, ec);
+    simple_http::asio::io_context context;
+    simple_http::asio::ip::tcp::socket socket{context};
+    simple_http::error_code ec;
+    socket.connect(
+        simple_http::asio::ip::tcp::endpoint{simple_http::asio::ip::make_address("127.0.0.1"), server.port()}, ec);
     if (ec) {
         check(false, "Server connect");
         server.stop();
         return;
     }
     auto round_trip = [&](const std::string &request) {
-        boost::asio::ip::tcp::socket client{context};
-        boost::system::error_code error;
-        client.connect(boost::asio::ip::tcp::endpoint{boost::asio::ip::make_address("127.0.0.1"), server.port()},
-                       error);
+        simple_http::asio::ip::tcp::socket client{context};
+        simple_http::error_code error;
+        client.connect(
+            simple_http::asio::ip::tcp::endpoint{simple_http::asio::ip::make_address("127.0.0.1"), server.port()},
+            error);
         if (error) {
             return std::string{};
         }
-        boost::asio::write(client, boost::asio::buffer(request), error);
-        boost::asio::streambuf response;
-        boost::asio::read(client, response, error);
-        return std::string{boost::asio::buffers_begin(response.data()), boost::asio::buffers_end(response.data())};
+        simple_http::asio::write(client, simple_http::asio::buffer(request), error);
+        simple_http::asio::streambuf response;
+        simple_http::asio::read(client, response, error);
+        return std::string{simple_http::asio::buffers_begin(response.data()),
+                           simple_http::asio::buffers_end(response.data())};
     };
 
     const auto text = round_trip("GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
@@ -238,14 +254,15 @@ void test_server() {
     server.stop();
 }
 
-std::string read_one_response(boost::asio::ip::tcp::socket &socket) {
-    boost::system::error_code ec;
-    boost::asio::streambuf buffer;
-    boost::asio::read_until(socket, buffer, "\r\n\r\n", ec);
+std::string read_one_response(simple_http::asio::ip::tcp::socket &socket) {
+    simple_http::error_code ec;
+    simple_http::asio::streambuf buffer;
+    simple_http::asio::read_until(socket, buffer, "\r\n\r\n", ec);
     if (ec) {
         return {};
     }
-    const std::string all{boost::asio::buffers_begin(buffer.data()), boost::asio::buffers_end(buffer.data())};
+    const std::string all{simple_http::asio::buffers_begin(buffer.data()),
+                          simple_http::asio::buffers_end(buffer.data())};
     const auto header_end = all.find("\r\n\r\n");
     if (header_end == std::string::npos) {
         return {};
@@ -258,11 +275,12 @@ std::string read_one_response(boost::asio::ip::tcp::socket &socket) {
     }
     buffer.consume(all.size());
     if (body.size() < content_length) {
-        boost::asio::read(socket, buffer, boost::asio::transfer_exactly(content_length - body.size()), ec);
+        simple_http::asio::read(socket, buffer, simple_http::asio::transfer_exactly(content_length - body.size()), ec);
         if (ec) {
             return {};
         }
-        body += std::string{boost::asio::buffers_begin(buffer.data()), boost::asio::buffers_end(buffer.data())};
+        body +=
+            std::string{simple_http::asio::buffers_begin(buffer.data()), simple_http::asio::buffers_end(buffer.data())};
     }
     return head + body;
 }
@@ -279,19 +297,20 @@ void test_keep_alive() {
                  });
     check(server.start().has_value(), "keep-alive server start");
 
-    boost::asio::io_context context;
-    boost::asio::ip::tcp::socket socket{context};
-    boost::system::error_code ec;
-    socket.connect(boost::asio::ip::tcp::endpoint{boost::asio::ip::make_address("127.0.0.1"), server.port()}, ec);
+    simple_http::asio::io_context context;
+    simple_http::asio::ip::tcp::socket socket{context};
+    simple_http::error_code ec;
+    socket.connect(
+        simple_http::asio::ip::tcp::endpoint{simple_http::asio::ip::make_address("127.0.0.1"), server.port()}, ec);
     if (!ec) {
         const std::string first = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
-        boost::asio::write(socket, boost::asio::buffer(first), ec);
+        simple_http::asio::write(socket, simple_http::asio::buffer(first), ec);
         const auto response = read_one_response(socket);
         check(response.find("200") != std::string::npos && response.find("one") != std::string::npos,
               "keep-alive first response");
 
         const std::string second = "GET /missing HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-        boost::asio::write(socket, boost::asio::buffer(second), ec);
+        simple_http::asio::write(socket, simple_http::asio::buffer(second), ec);
         const auto second_response = read_one_response(socket);
         check(second_response.find("404") != std::string::npos, "keep-alive second request on the same connection");
     } else {
@@ -332,18 +351,20 @@ void test_websocket() {
     });
     check(server.start().has_value(), "websocket server start");
 
-    boost::asio::io_context context;
-    boost::asio::ip::tcp::socket socket{context};
-    boost::system::error_code ec;
-    socket.connect(boost::asio::ip::tcp::endpoint{boost::asio::ip::make_address("127.0.0.1"), server.port()}, ec);
+    simple_http::asio::io_context context;
+    simple_http::asio::ip::tcp::socket socket{context};
+    simple_http::error_code ec;
+    socket.connect(
+        simple_http::asio::ip::tcp::endpoint{simple_http::asio::ip::make_address("127.0.0.1"), server.port()}, ec);
     if (!ec) {
         const std::string handshake = "GET /echo HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
                                       "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
                                       "Sec-WebSocket-Version: 13\r\n\r\n";
-        boost::asio::write(socket, boost::asio::buffer(handshake), ec);
-        boost::asio::streambuf reply;
-        boost::asio::read_until(socket, reply, "\r\n\r\n", ec);
-        const std::string head{boost::asio::buffers_begin(reply.data()), boost::asio::buffers_end(reply.data())};
+        simple_http::asio::write(socket, simple_http::asio::buffer(handshake), ec);
+        simple_http::asio::streambuf reply;
+        simple_http::asio::read_until(socket, reply, "\r\n\r\n", ec);
+        const std::string head{simple_http::asio::buffers_begin(reply.data()),
+                               simple_http::asio::buffers_end(reply.data())};
         check(head.find("101") != std::string::npos, "websocket handshake");
 
         // One masked text frame: FIN|text, len=5, key, "hello" XOR key.
@@ -356,14 +377,14 @@ void test_websocket() {
         for (std::size_t i = 0; i < payload.size(); ++i) {
             frame.push_back(static_cast<char>(payload[i] ^ key[i % 4]));
         }
-        boost::asio::write(socket, boost::asio::buffer(frame), ec);
+        simple_http::asio::write(socket, simple_http::asio::buffer(frame), ec);
 
         std::array<unsigned char, 2> header{};
-        boost::asio::read(socket, boost::asio::buffer(header), ec);
+        simple_http::asio::read(socket, simple_http::asio::buffer(header), ec);
         std::string echoed;
         if (!ec && header[0] == 0x81 && (header[1] & 0x7f) == 5) {
             echoed.resize(5);
-            boost::asio::read(socket, boost::asio::buffer(echoed), ec);
+            simple_http::asio::read(socket, simple_http::asio::buffer(echoed), ec);
         }
         check(echoed == "hello", "websocket echo");
     } else {
@@ -386,19 +407,21 @@ void test_middleware() {
                  });
     check(server.start().has_value(), "middleware server start");
 
-    boost::asio::io_context context;
+    simple_http::asio::io_context context;
     auto round_trip = [&](const std::string &request) {
-        boost::asio::ip::tcp::socket client{context};
-        boost::system::error_code error;
-        client.connect(boost::asio::ip::tcp::endpoint{boost::asio::ip::make_address("127.0.0.1"), server.port()},
-                       error);
+        simple_http::asio::ip::tcp::socket client{context};
+        simple_http::error_code error;
+        client.connect(
+            simple_http::asio::ip::tcp::endpoint{simple_http::asio::ip::make_address("127.0.0.1"), server.port()},
+            error);
         if (error) {
             return std::string{};
         }
-        boost::asio::write(client, boost::asio::buffer(request), error);
-        boost::asio::streambuf response;
-        boost::asio::read(client, response, error);
-        return std::string{boost::asio::buffers_begin(response.data()), boost::asio::buffers_end(response.data())};
+        simple_http::asio::write(client, simple_http::asio::buffer(request), error);
+        simple_http::asio::streambuf response;
+        simple_http::asio::read(client, response, error);
+        return std::string{simple_http::asio::buffers_begin(response.data()),
+                           simple_http::asio::buffers_end(response.data())};
     };
 
     const auto unauthorized = round_trip("GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
@@ -425,19 +448,21 @@ void test_cors() {
                  });
     check(server.start().has_value(), "cors server start");
 
-    boost::asio::io_context context;
+    simple_http::asio::io_context context;
     auto round_trip = [&](const std::string &request) {
-        boost::asio::ip::tcp::socket client{context};
-        boost::system::error_code error;
-        client.connect(boost::asio::ip::tcp::endpoint{boost::asio::ip::make_address("127.0.0.1"), server.port()},
-                       error);
+        simple_http::asio::ip::tcp::socket client{context};
+        simple_http::error_code error;
+        client.connect(
+            simple_http::asio::ip::tcp::endpoint{simple_http::asio::ip::make_address("127.0.0.1"), server.port()},
+            error);
         if (error) {
             return std::string{};
         }
-        boost::asio::write(client, boost::asio::buffer(request), error);
-        boost::asio::streambuf response;
-        boost::asio::read(client, response, error);
-        return std::string{boost::asio::buffers_begin(response.data()), boost::asio::buffers_end(response.data())};
+        simple_http::asio::write(client, simple_http::asio::buffer(request), error);
+        simple_http::asio::streambuf response;
+        simple_http::asio::read(client, response, error);
+        return std::string{simple_http::asio::buffers_begin(response.data()),
+                           simple_http::asio::buffers_end(response.data())};
     };
 
     const auto preflight = round_trip("OPTIONS / HTTP/1.1\r\nHost: localhost\r\nOrigin: https://app.example\r\n"
@@ -481,19 +506,21 @@ void test_static_files() {
     server.static_files(site);
     check(server.start().has_value(), "static server start");
 
-    boost::asio::io_context context;
+    simple_http::asio::io_context context;
     auto round_trip = [&](const std::string &request) {
-        boost::asio::ip::tcp::socket client{context};
-        boost::system::error_code error_code;
-        client.connect(boost::asio::ip::tcp::endpoint{boost::asio::ip::make_address("127.0.0.1"), server.port()},
-                       error_code);
+        simple_http::asio::ip::tcp::socket client{context};
+        simple_http::error_code error_code;
+        client.connect(
+            simple_http::asio::ip::tcp::endpoint{simple_http::asio::ip::make_address("127.0.0.1"), server.port()},
+            error_code);
         if (error_code) {
             return std::string{};
         }
-        boost::asio::write(client, boost::asio::buffer(request), error_code);
-        boost::asio::streambuf response;
-        boost::asio::read(client, response, error_code);
-        return std::string{boost::asio::buffers_begin(response.data()), boost::asio::buffers_end(response.data())};
+        simple_http::asio::write(client, simple_http::asio::buffer(request), error_code);
+        simple_http::asio::streambuf response;
+        simple_http::asio::read(client, response, error_code);
+        return std::string{simple_http::asio::buffers_begin(response.data()),
+                           simple_http::asio::buffers_end(response.data())};
     };
 
     const auto file = round_trip("GET /hello.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
@@ -553,19 +580,21 @@ void test_session_csrf() {
                  });
     check(server.start().has_value(), "session server start");
 
-    boost::asio::io_context context;
+    simple_http::asio::io_context context;
     auto round_trip = [&](const std::string &request) {
-        boost::asio::ip::tcp::socket client{context};
-        boost::system::error_code error;
-        client.connect(boost::asio::ip::tcp::endpoint{boost::asio::ip::make_address("127.0.0.1"), server.port()},
-                       error);
+        simple_http::asio::ip::tcp::socket client{context};
+        simple_http::error_code error;
+        client.connect(
+            simple_http::asio::ip::tcp::endpoint{simple_http::asio::ip::make_address("127.0.0.1"), server.port()},
+            error);
         if (error) {
             return std::string{};
         }
-        boost::asio::write(client, boost::asio::buffer(request), error);
-        boost::asio::streambuf response;
-        boost::asio::read(client, response, error);
-        return std::string{boost::asio::buffers_begin(response.data()), boost::asio::buffers_end(response.data())};
+        simple_http::asio::write(client, simple_http::asio::buffer(request), error);
+        simple_http::asio::streambuf response;
+        simple_http::asio::read(client, response, error);
+        return std::string{simple_http::asio::buffers_begin(response.data()),
+                           simple_http::asio::buffers_end(response.data())};
     };
 
     const auto first = round_trip("GET /me HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
@@ -634,18 +663,21 @@ void test_http_proxy() {
     proxy.http_proxy("/echo", target);
     check(proxy.start().has_value(), "proxy server start");
 
-    boost::asio::io_context context;
+    simple_http::asio::io_context context;
     auto round_trip = [&](const std::string &request) {
-        boost::asio::ip::tcp::socket client{context};
-        boost::system::error_code error;
-        client.connect(boost::asio::ip::tcp::endpoint{boost::asio::ip::make_address("127.0.0.1"), proxy.port()}, error);
+        simple_http::asio::ip::tcp::socket client{context};
+        simple_http::error_code error;
+        client.connect(
+            simple_http::asio::ip::tcp::endpoint{simple_http::asio::ip::make_address("127.0.0.1"), proxy.port()},
+            error);
         if (error) {
             return std::string{};
         }
-        boost::asio::write(client, boost::asio::buffer(request), error);
-        boost::asio::streambuf response;
-        boost::asio::read(client, response, error);
-        return std::string{boost::asio::buffers_begin(response.data()), boost::asio::buffers_end(response.data())};
+        simple_http::asio::write(client, simple_http::asio::buffer(request), error);
+        simple_http::asio::streambuf response;
+        simple_http::asio::read(client, response, error);
+        return std::string{simple_http::asio::buffers_begin(response.data()),
+                           simple_http::asio::buffers_end(response.data())};
     };
 
     const auto get = round_trip("GET /hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
@@ -668,7 +700,7 @@ template <typename Handler>
 #if defined(__GNUC__)
 __attribute__((noinline))
 #endif
-void scatter_write_noinline(boost::asio::ip::tcp::socket &socket,
+void scatter_write_noinline(simple_http::asio::ip::tcp::socket &socket,
                             simple_http::span<const simple_http::ConstByteSpan> buffers, Handler &&handler) {
     simple_http::detail::async_stream_write_seq(socket, buffers, std::forward<Handler>(handler));
 }
@@ -688,9 +720,9 @@ void poison_stack(unsigned depth) {
 // read buffer descriptors out of a dead frame (observed as a WebSocket echo
 // stalling at 128 KiB).
 void test_scatter_write() {
-    boost::asio::io_context context;
-    using boost::asio::ip::tcp;
-    tcp::acceptor acceptor{context, tcp::endpoint{boost::asio::ip::make_address("127.0.0.1"), 0}};
+    simple_http::asio::io_context context;
+    using simple_http::asio::ip::tcp;
+    tcp::acceptor acceptor{context, tcp::endpoint{simple_http::asio::ip::make_address("127.0.0.1"), 0}};
     tcp::socket server{context};
     tcp::socket client{context};
     bool accepted = false;
@@ -702,9 +734,9 @@ void test_scatter_write() {
 
     // Tiny kernel buffers plus a read started only after the write is
     // initiated force the composed write to resume across callbacks.
-    boost::system::error_code ignored;
-    server.set_option(boost::asio::socket_base::send_buffer_size{4096}, ignored);
-    client.set_option(boost::asio::socket_base::receive_buffer_size{4096}, ignored);
+    simple_http::error_code ignored;
+    server.set_option(simple_http::asio::socket_base::send_buffer_size{4096}, ignored);
+    client.set_option(simple_http::asio::socket_base::receive_buffer_size{4096}, ignored);
 
     const std::string first(128 * 1024, 'a');
     const std::string second(128 * 1024, 'b');
@@ -718,7 +750,7 @@ void test_scatter_write() {
     // Never let a broken write path hang the whole suite: close both sockets
     // after five seconds, which completes the pending operations with
     // operation_aborted and turns the check below into a normal failure.
-    boost::asio::steady_timer watchdog{context};
+    simple_http::asio::steady_timer watchdog{context};
     auto cancel_watchdog = [&] { watchdog.cancel(); };
     scatter_write_noinline(server, simple_http::span<const simple_http::ConstByteSpan>{buffers.data(), buffers.size()},
                            [&](simple_http::error_code ec, std::size_t n) {
@@ -726,16 +758,16 @@ void test_scatter_write() {
                                if (wrote && read)
                                    cancel_watchdog();
                            });
-    boost::asio::async_read(client, boost::asio::buffer(received->data(), received->size()),
-                            [&](simple_http::error_code ec, std::size_t n) {
-                                read = !ec && n == total;
-                                if (wrote && read)
-                                    cancel_watchdog();
-                            });
+    simple_http::asio::async_read(client, simple_http::asio::buffer(received->data(), received->size()),
+                                  [&](simple_http::error_code ec, std::size_t n) {
+                                      read = !ec && n == total;
+                                      if (wrote && read)
+                                          cancel_watchdog();
+                                  });
     watchdog.expires_after(std::chrono::seconds(5));
     watchdog.async_wait([&](simple_http::error_code ec) {
         if (!ec) {
-            boost::system::error_code close_ec;
+            simple_http::error_code close_ec;
             server.close(close_ec);
             client.close(close_ec);
         }
@@ -760,6 +792,7 @@ int main() {
     test_http_date();
     test_url_path();
     test_result();
+    test_span();
     test_body_tokens();
     test_router();
     test_server();

@@ -8,10 +8,6 @@
 // void(error_code, std::shared_ptr<WebSocket>).
 
 #include <array>
-#include <boost/asio.hpp>
-#include <boost/asio/any_completion_handler.hpp>
-#include <boost/asio/async_result.hpp>
-#include <boost/asio/steady_timer.hpp>
 #include <cctype>
 #include <cstddef>
 #include <cstring>
@@ -21,6 +17,7 @@
 #include <string_view>
 #include <utility>
 
+#include "../core/asio_compat.h"
 #include "../core/base64.h"
 #include "../core/compat.h"
 #include "../core/logging.h"
@@ -31,8 +28,6 @@
 #include "client_config.h"
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 struct WebSocketSpec {
     Headers headers;

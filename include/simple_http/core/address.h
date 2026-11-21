@@ -12,24 +12,24 @@
 //
 // Boost 1.92 removed `address_v6::to_v4()`; the v4-mapped conversion is the
 // free `make_address_v4(v4_mapped, v6)`, valid only for mapped addresses (we
-// guard with `is_v4_mapped()` first). Fully qualified `boost::asio::` on purpose:
+// guard with `is_v4_mapped()` first). Fully qualified `simple_http::asio::` on purpose:
 // the `asio` alias lives in each consumer's scope, not here.
 
-#include <boost/asio.hpp>
+#include "asio_compat.h"
 #include <string>
 
 namespace simple_http {
 
-inline std::string address_string(const boost::asio::ip::address &a) {
+inline std::string address_string(const simple_http::asio::ip::address &a) {
     if (a.is_v6() && a.to_v6().is_v4_mapped())
-        return boost::asio::ip::make_address_v4(boost::asio::ip::v4_mapped, a.to_v6()).to_string();
+        return simple_http::asio::ip::make_address_v4(simple_http::asio::ip::v4_mapped, a.to_v6()).to_string();
     return a.to_string();
 }
 
 // The peer's IP for logs and forwarding headers, or an empty string for a
 // peerless transport (UNIX socket). The emptiness is meaningful: X-Forwarded-For
 // must not gain a bogus "::" for a local socket.
-inline std::string address_string_if_specified(const boost::asio::ip::address &a) {
+inline std::string address_string_if_specified(const simple_http::asio::ip::address &a) {
     return a.is_unspecified() ? std::string{} : address_string(a);
 }
 

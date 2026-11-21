@@ -12,16 +12,13 @@
 // The public, token-shaped API lives on ResponseWriter (response.h); this
 // interface is what h1/h2/h3 implement and what the facade forwards to.
 
-#include <boost/asio/any_completion_handler.hpp>
-#include <boost/asio/any_io_executor.hpp>
 #include <string>
 
+#include "../core/asio_compat.h"
 #include "../core/types.h"
 #include "headers.h"
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 using WriteCompletion = asio::any_completion_handler<void(error_code)>;
 using ConnectedCompletion = asio::any_completion_handler<void(error_code, bool)>;

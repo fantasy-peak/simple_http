@@ -14,7 +14,7 @@
 //
 // Nothing here owns state; these are header-only helpers.
 
-#include <boost/asio/any_io_executor.hpp>
+#include "asio_compat.h"
 #include <cstddef>
 #include <string_view>
 #include <type_traits>
@@ -31,7 +31,7 @@ namespace detail {
 // `executor_type`/`get_executor()` (they construct their timer on it), which a
 // plain lambda does not provide.
 template <typename F> struct executor_initiation {
-    using executor_type = boost::asio::any_io_executor;
+    using executor_type = simple_http::asio::any_io_executor;
     F fn;
     executor_type ex;
 
@@ -40,7 +40,7 @@ template <typename F> struct executor_initiation {
 };
 
 template <typename F>
-executor_initiation<std::decay_t<F>> make_executor_initiation(F &&fn, boost::asio::any_io_executor ex) {
+executor_initiation<std::decay_t<F>> make_executor_initiation(F &&fn, simple_http::asio::any_io_executor ex) {
     return {std::forward<F>(fn), std::move(ex)};
 }
 

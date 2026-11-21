@@ -45,6 +45,7 @@
 #include <utility>
 #include <vector>
 
+#include "../core/asio_compat.h"
 #include "../core/glaze_support.h"
 #include "../core/http_field.h"
 #include "../core/http_method.h"
@@ -71,8 +72,6 @@ namespace simple_http_regex = std;
 #endif
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 // A reverse-proxy route: the backend recipe plus the client policy it dials
 // with. Each proxied request builds a fresh Client from this config.
@@ -121,133 +120,17 @@ struct RegistrationScope {
 
 namespace detail {
 
-// Conservative static check for patterns that make a backtracking engine
-// (std::regex, or Boost.Regex before its complexity guard) spend exponential
-// time. Rejects backreferences and a quantifier applied to a group that itself
-// contains a quantifier or an alternation — the shapes behind `(a+)+`,
-// `(a*)*`, `(.*a){20}` and `(a|aa)+`. Returns an empty string when the pattern
-// is acceptable, otherwise a human-readable reason.
-inline std::string unsafe_regex_reason(std::string_view pattern) {
-    struct Group {
-        bool has_quantifier{false};
-        bool has_alternation{false};
-    };
-    Group root;
-    std::vector<Group> stack;
-    Group last_closed;
-    bool have_last_closed = false;
-    auto current = [&]() -> Group & { return stack.empty() ? root : stack.back(); };
-
-    for (std::size_t i = 0; i < pattern.size(); ++i) {
-        const char c = pattern[i];
-        if (c == '\\') {
-            if (i + 1 < pattern.size()) {
-                const char next = pattern[++i];
-                if (next >= '1' && next <= '9')
-                    return "backreferences are not supported in route regexes";
-                if (next == 'k' && i + 1 < pattern.size() && pattern[i + 1] == '<')
-                    return "backreferences are not supported in route regexes";
-            }
-            have_last_closed = false;
-            continue;
-        }
-        if (c == '[') {
-            // Character class: every metacharacter inside is literal.
-            if (i + 1 < pattern.size() && pattern[i + 1] == '^')
-                ++i;
-            if (i + 1 < pattern.size() && pattern[i + 1] == ']')
-                ++i; // a leading ] is literal
-            while (i + 1 < pattern.size() && pattern[i + 1] != ']') {
-                ++i;
-                if (pattern[i] == '\\' && i + 1 < pattern.size())
-                    ++i;
-            }
-            if (i + 1 < pattern.size())
-                ++i;
-            have_last_closed = false;
-            continue;
-        }
-        if (c == '(') {
-            // `(?` introduces a non-capturing group, a lookaround or a named
-            // group; its `?` (and prefix) is syntax, not a quantifier.
-            if (i + 1 < pattern.size() && pattern[i + 1] == '?') {
-                ++i;
-                if (i + 1 < pattern.size() &&
-                    (pattern[i + 1] == ':' || pattern[i + 1] == '=' || pattern[i + 1] == '!')) {
-                    ++i;
-                } else if (i + 2 < pattern.size() && pattern[i + 1] == '<' &&
-                           (pattern[i + 2] == '=' || pattern[i + 2] == '!')) {
-                    i += 2;
-                } else if (i + 1 < pattern.size() && pattern[i + 1] == '<') {
-                    const auto close = pattern.find('>', i + 2);
-                    if (close != std::string_view::npos)
-                        i = close;
-                } else if (i + 1 < pattern.size() && pattern[i + 1] == 'P') {
-                    const auto close = pattern.find('>', i + 2);
-                    if (close != std::string_view::npos)
-                        i = close;
-                }
-            }
-            stack.push_back(Group{});
-            have_last_closed = false;
-            continue;
-        }
-        if (c == '|') {
-            current().has_alternation = true;
-            have_last_closed = false;
-            continue;
-        }
-        if (c == ')') {
-            if (!stack.empty()) {
-                last_closed = stack.back();
-                stack.pop_back();
-                have_last_closed = true;
-                Group &parent = current();
-                parent.has_quantifier = parent.has_quantifier || last_closed.has_quantifier;
-                parent.has_alternation = parent.has_alternation || last_closed.has_alternation;
-            }
-            continue;
-        }
-        bool quantifier = false;
-        if (c == '*' || c == '+' || c == '?') {
-            quantifier = true;
-        } else if (c == '{') {
-            std::size_t j = i + 1;
-            while (j < pattern.size() && pattern[j] >= '0' && pattern[j] <= '9')
-                ++j;
-            if (j > i + 1) {
-                if (j < pattern.size() && pattern[j] == ',') {
-                    ++j;
-                    while (j < pattern.size() && pattern[j] >= '0' && pattern[j] <= '9')
-                        ++j;
-                }
-                if (j < pattern.size() && pattern[j] == '}') {
-                    quantifier = true;
-                    i = j;
-                }
-            }
-        }
-        if (quantifier) {
-            if (have_last_closed) {
-                if (last_closed.has_quantifier)
-                    return "nested quantifier";
-                if (last_closed.has_alternation)
-                    return "quantified alternation";
-                have_last_closed = false;
-            }
-            current().has_quantifier = true;
-            continue;
-        }
-        have_last_closed = false;
-    }
-    return {};
-}
-
 // Matches through the selected engine, but never lets a regex_error escape:
 // Boost.Regex throws when its complexity guard trips, and a thrown exception in
 // a WebSocket/proxy lookup would otherwise unwind out of io_context::run().
 // A path longer than kMaxRegexPathBytes is not treated as a candidate; every
 // legitimate route pattern is far below this.
+//
+// The pattern itself is not vetted here or at registration: a route regex is
+// application configuration, and choosing one that backtracks pathologically
+// (e.g. `(a+)+$`) is the caller's responsibility. This wrapper only guarantees
+// that such a pattern cannot crash the worker and that the input is bounded;
+// note that Boost may still spend up to its state budget before giving up.
 inline constexpr std::size_t kMaxRegexPathBytes = 16 * 1024;
 
 template <typename Path, typename... Args> bool safe_regex_match(const Path &path, Args &&...args) {
@@ -317,10 +200,6 @@ class Router {
     template <typename F>
     Router &route_regex(std::vector<Method> methods, const std::string &pattern, std::vector<Middleware> middlewares,
                         F &&handler) {
-        if (const auto reason = detail::unsafe_regex_reason(pattern); !reason.empty()) {
-            SIMPLE_HTTP_ERROR_LOG("unsafe route regex [{}] rejected: {}", pattern, reason);
-            return *this;
-        }
         auto scoped_registration = scoped(pattern, std::move(middlewares));
         auto entry =
             make_route_entry(methods, make_handler(std::forward<F>(handler)), std::move(scoped_registration.second));
@@ -396,10 +275,6 @@ class Router {
     }
 
     Router &ws_proxy_regex(const std::string &pattern, WsProxyTarget target) {
-        if (const auto reason = detail::unsafe_regex_reason(pattern); !reason.empty()) {
-            SIMPLE_HTTP_ERROR_LOG("unsafe ws proxy regex [{}] rejected: {}", pattern, reason);
-            return *this;
-        }
         if (!m_scopes.empty() && !m_scopes.back().mws.empty()) {
             SIMPLE_HTTP_ERROR_LOG("ws_proxy_regex [{}] registered inside a group with middleware; refusing "
                                   "(unsupported)",
@@ -425,10 +300,6 @@ class Router {
     }
 
     Router &http_proxy_regex(const std::string &pattern, HttpProxyTarget target, ClientConfig client_cfg = {}) {
-        if (const auto reason = detail::unsafe_regex_reason(pattern); !reason.empty()) {
-            SIMPLE_HTTP_ERROR_LOG("unsafe http proxy regex [{}] rejected: {}", pattern, reason);
-            return *this;
-        }
         auto scoped_registration = scoped(pattern, {});
         const std::string full_pattern = m_scopes.empty() ? pattern : scope_regex(pattern);
         try {
@@ -569,10 +440,6 @@ class Router {
         return ws_route_regex(pattern, {}, std::move(handler));
     }
     Router &ws_route_regex(const std::string &pattern, std::vector<Middleware> middlewares, WsHandler handler) {
-        if (const auto reason = detail::unsafe_regex_reason(pattern); !reason.empty()) {
-            SIMPLE_HTTP_ERROR_LOG("unsafe ws route regex [{}] rejected: {}", pattern, reason);
-            return *this;
-        }
         auto scoped_registration = scoped(pattern, std::move(middlewares));
         WsRouteEntry entry{std::move(handler), std::move(scoped_registration.second)};
         const std::string full_pattern = m_scopes.empty() ? pattern : scope_regex(pattern);

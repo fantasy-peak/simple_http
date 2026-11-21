@@ -28,7 +28,7 @@
 // `<ngtcp2/ngtcp2.h>`; the connection translates it to `ngtcp2_vec`, which is
 // layout-compatible but a different type with a non-const base pointer.
 
-#include "../core/compat.h"
+#include "../core/span.h"
 #include <cstddef>
 #include <cstdint>
 #include <optional>

@@ -17,6 +17,7 @@
 #include "simple_http.h"
 #include "simple_http/transport/serialized_writer.h"
 #include "test_support.h"
+#include <simple_http/core/asio_compat.h>
 
 using namespace simple_http;
 using namespace simple_http::test;

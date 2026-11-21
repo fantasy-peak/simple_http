@@ -26,8 +26,7 @@
 #include <utility>
 #include <vector>
 
-#include <boost/asio.hpp>
-
+#include "../core/asio_compat.h"
 #include "../core/base64.h"
 #include "../core/compat.h"
 #include "../core/http_status.h"
@@ -39,8 +38,6 @@
 #include "url.h" // url_valid_port
 
 namespace simple_http::detail {
-
-namespace asio = boost::asio;
 
 // --- proxy URL ---------------------------------------------------------------
 

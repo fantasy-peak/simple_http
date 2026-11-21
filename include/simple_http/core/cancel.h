@@ -4,23 +4,16 @@
 //
 // The library follows Asio's per-operation cancellation contract: a pending
 // operation that observes cancellation completes with operation_aborted.
-// boost::asio::experimental::channel reports its own channel_cancelled instead,
+// simple_http::asio::experimental::channel reports its own channel_cancelled instead,
 // so composed operations normalize it at the completion boundary rather than
 // leaking a second cancellation vocabulary to callers.
 
-#include <boost/asio/associated_cancellation_slot.hpp>
-#include <boost/asio/bind_cancellation_slot.hpp>
-#include <boost/asio/cancellation_type.hpp>
-#include <boost/asio/error.hpp>
-#include <boost/asio/experimental/channel_error.hpp>
-#include <boost/asio/post.hpp>
+#include "asio_compat.h"
 #include <utility>
 
 #include "types.h"
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 // Request::cancel() and asio::cancel_after() both emit terminal by default.
 inline bool is_terminal_cancel(asio::cancellation_type_t type) noexcept {

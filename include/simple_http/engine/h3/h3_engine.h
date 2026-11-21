@@ -44,11 +44,10 @@
 
 #include <nghttp3/nghttp3.h>
 
+#include "../../core/asio_compat.h"
 #include "../../core/compat.h"
 #include <algorithm>
 #include <array>
-#include <boost/asio.hpp>
-#include <boost/asio/experimental/channel.hpp>
 
 #include "../../core/cancel.h"
 #include <chrono>
@@ -68,6 +67,7 @@
 #include "../../core/http_method.h"
 #include "../../core/limits.h"
 #include "../../core/logging.h"
+#include "../../core/span.h"
 #include "../../core/types.h"
 #include "../../core/version.h"
 #include "../../proto/compressing_writer.h"
@@ -81,8 +81,6 @@
 #include "h3_stream.h"
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 // HTTP/3 error codes, spelled as nghttp3 spells them, so that a grep for a code
 // found in a trace lands on the same name the library reports.
@@ -960,6 +958,30 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         return true;
     }
 
+    void on_trailer(std::int64_t stream_id, std::int32_t /*token*/, std::string_view name,
+                    std::string_view value) noexcept override {
+        // Request trailers are not surfaced, but the field section is still an
+        // HTTP field section: apply the same name/value rules the header block
+        // gets, so a malformed trailer is rejected rather than silently kept
+        // on a connection that might forward it.
+        auto it = m_streams.find(stream_id);
+        if (it == m_streams.end())
+            return;
+        Stream &stream = *it->second;
+        if (stream.headers_rejected)
+            return;
+        if (contains_ctl(name) || contains_ctl(value) || has_leading_or_trailing_ws(value) || !is_http_token(name)) {
+            reject_stream(stream_id, stream, kH3MessageError);
+            return;
+        }
+        for (char c : name) {
+            if (c >= 'A' && c <= 'Z') {
+                reject_stream(stream_id, stream, kH3MessageError);
+                return;
+            }
+        }
+    }
+
     void on_header(std::int64_t stream_id, std::int32_t /*token*/, std::string_view name,
                    std::string_view value) noexcept override {
         auto it = m_streams.find(stream_id);
@@ -1000,17 +1022,45 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
             // ones only a response may carry — are nghttp3's to validate and ours
             // to record.
             if (name == ":method") {
+                // Replayed into an HTTP/1.1 request line downstream, so it has
+                // to re-parse as a token (RFC 9110 §9).
+                if (!is_http_token(value)) {
+                    reject_stream(stream_id, stream, kH3MessageError);
+                    return;
+                }
                 stream.request->set_method_token(std::string{value});
                 stream.is_head = iequals_ci(value, "HEAD");
             } else if (name == ":path") {
+                // Same origin-form/asterisk-form rule as the h2 server.
+                if (!valid_pseudo_path(value)) {
+                    reject_stream(stream_id, stream, kH3MessageError);
+                    return;
+                }
                 stream.request->set_target(std::string{value});
             } else if (name == ":scheme") {
                 stream.scheme = std::string{value};
             } else if (name == ":authority") {
+                if (value.empty() || contains_invalid_url_byte(value)) {
+                    reject_stream(stream_id, stream, kH3MessageError);
+                    return;
+                }
                 stream.seen_authority = true;
                 stream.authority = std::string{value};
             }
             return;
+        }
+        // RFC 9114 §4.2: regular field names are lowercase tokens (the same
+        // rules the h2 server and Go's HTTP/3 server enforce). add_lower()
+        // would hide an uppercase name instead of rejecting the message.
+        if (!is_http_token(name)) {
+            reject_stream(stream_id, stream, kH3MessageError);
+            return;
+        }
+        for (char c : name) {
+            if (c >= 'A' && c <= 'Z') {
+                reject_stream(stream_id, stream, kH3MessageError);
+                return;
+            }
         }
         stream.request->mutable_headers().add_lower(std::string{name}, std::string{value});
     }

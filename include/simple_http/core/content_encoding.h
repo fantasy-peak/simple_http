@@ -82,7 +82,7 @@ inline std::string_view mime_essence(std::string_view content_type) {
     return trim_ows(content_type);
 }
 
-// `parse_qvalue` lives in core/types.h so accept_encoding.h can use it without
+// `parse_qvalue` lives in core/qvalue.h so accept_encoding.h can use it without
 // depending on this codec header.
 
 // --- encoders -------------------------------------------------------------

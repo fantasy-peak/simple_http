@@ -9,18 +9,16 @@
 
 #include <algorithm>
 #include <array>
-#include <boost/asio.hpp>
 #include <cstddef>
 #include <memory>
 #include <utility>
 
+#include "../core/asio_compat.h"
 #include "../core/span.h"
 #include "../core/types.h"
 #include "transport.h"
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 template <typename Socket> class TcpTransport {
   public:
@@ -69,7 +67,7 @@ template <typename Socket> class TcpTransport {
 };
 
 using TcpStreamTransport = TcpTransport<asio::ip::tcp::socket>;
-#ifdef BOOST_ASIO_HAS_LOCAL_SOCKETS
+#ifdef SIMPLE_HTTP_HAS_LOCAL_SOCKETS
 using UnixStreamTransport = TcpTransport<asio::local::stream_protocol::socket>;
 #endif
 

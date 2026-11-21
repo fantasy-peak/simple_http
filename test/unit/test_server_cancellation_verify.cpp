@@ -6,11 +6,6 @@
 // actually completed with operation_aborted, then the test asserts the observed
 // contract of the current implementation.
 
-#include <boost/asio.hpp>
-#include <boost/asio/associated_cancellation_slot.hpp>
-#include <boost/asio/cancel_after.hpp>
-#include <boost/asio/cancel_at.hpp>
-#include <boost/asio/experimental/awaitable_operators.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
 #include <cstring>
@@ -22,6 +17,13 @@
 
 #include "simple_http.h"
 #include "test_support.h"
+#include <simple_http/core/asio_compat.h>
+
+#if defined(SIMPLE_HTTP_USE_STANDALONE_ASIO)
+#include <asio/experimental/awaitable_operators.hpp>
+#else
+#include <boost/asio/experimental/awaitable_operators.hpp>
+#endif
 
 using namespace simple_http;
 using namespace simple_http::codec;
@@ -29,7 +31,7 @@ using namespace simple_http::test;
 
 namespace {
 
-namespace asio = boost::asio;
+namespace asio = simple_http::asio;
 using namespace std::chrono_literals;
 
 // Fires req->cancel() from a coroutine on the request's owner executor, the way

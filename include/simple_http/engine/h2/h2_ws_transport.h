@@ -11,20 +11,17 @@
 // them, preserving its associated executor and cancellation slot.
 
 #include <array>
-#include <boost/asio/any_completion_handler.hpp>
-#include <boost/asio/any_io_executor.hpp>
-#include <boost/asio/async_result.hpp>
 #include <cstddef>
 #include <memory>
 #include <utility>
 
+#include "../../core/asio_compat.h"
 #include "../../core/compat.h"
+#include "../../core/span.h"
 #include "../../core/types.h"
 #include "../../transport/transport.h"
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 class H2WsStream {
   public:

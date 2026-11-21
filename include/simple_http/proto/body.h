@@ -17,13 +17,6 @@
 // caller's associated executor, allocator and cancellation slot travel through
 // the hook, the pull provider and the channel receive without being erased.
 
-#include <boost/asio/any_completion_handler.hpp>
-#include <boost/asio/any_io_executor.hpp>
-#include <boost/asio/compose.hpp>
-#include <boost/asio/error.hpp>
-#include <boost/asio/experimental/channel.hpp>
-#include <boost/asio/post.hpp>
-#include <boost/system/result.hpp>
 #include <cstddef>
 #include <functional>
 #include <limits>
@@ -34,6 +27,7 @@
 #include <utility>
 #include <variant>
 
+#include "../core/asio_compat.h"
 #include "../core/cancel.h"
 #include "../core/content_encoding.h"
 #include "../core/logging.h"
@@ -41,8 +35,6 @@
 #include "../core/types.h"
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 // Result of a single async_read(). When `eof` is true the body is complete and
 // `data` is empty; otherwise `data` holds the chunk (which may itself be
@@ -243,7 +235,7 @@ class Body {
         bool exceeded = false;
         auto out = m_decoder->write_bounded(data, decode_room(), exceeded);
         if (m_decoder->failed()) {
-            return boost::system::errc::make_error_code(boost::system::errc::invalid_argument);
+            return make_errc_code(std::errc::invalid_argument);
         }
         if (exceeded || over_decoded_limit(out.size())) {
             return make_error_code(asio::error::message_size);
@@ -259,7 +251,7 @@ class Body {
         bool exceeded = false;
         auto tail = m_decoder->finish_bounded(decode_room(), exceeded);
         if (m_decoder->failed()) {
-            return boost::system::errc::make_error_code(boost::system::errc::invalid_argument);
+            return make_errc_code(std::errc::invalid_argument);
         }
         if (exceeded || over_decoded_limit(tail.size())) {
             return make_error_code(asio::error::message_size);

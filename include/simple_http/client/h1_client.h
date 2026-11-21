@@ -14,9 +14,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <boost/asio.hpp>
-#include <boost/asio/associated_cancellation_slot.hpp>
-#include <boost/asio/bind_cancellation_slot.hpp>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -29,6 +26,7 @@
 #include <string_view>
 #include <utility>
 
+#include "../core/asio_compat.h"
 #include "../core/http_field.h"
 #include "../core/http_method.h"
 #include "../core/logging.h"
@@ -41,8 +39,6 @@
 #include "client_stream.h"
 
 namespace simple_http::detail {
-
-namespace asio = boost::asio;
 
 template <typename Transport> class Http1ClientSession;
 
@@ -338,7 +334,9 @@ class Http1ClientSession final : public ClientSession,
     }
 
     error_code build_request_head(const Request &request, std::string &out) {
-        if (contains_invalid_url_byte(request.method_token()) || contains_invalid_url_byte(request.target())) {
+        // The method must be a real token: an empty token would serialize as
+        // " /path HTTP/1.1" (leading SP), which no peer parses as our request.
+        if (!is_http_token(request.method_token()) || contains_invalid_url_byte(request.target())) {
             return make_error_code(client_errc::invalid_spec);
         }
         out.reserve(256);

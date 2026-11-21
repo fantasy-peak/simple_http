@@ -11,8 +11,6 @@
 // reconnect (last_event_id() is exposed for that).
 
 #include <algorithm>
-#include <boost/asio/any_completion_handler.hpp>
-#include <boost/asio/async_result.hpp>
 #include <charconv>
 #include <cstddef>
 #include <deque>
@@ -23,6 +21,7 @@
 #include <utility>
 #include <vector>
 
+#include "../core/asio_compat.h"
 #include "../proto/body.h"
 #include "http.h"
 

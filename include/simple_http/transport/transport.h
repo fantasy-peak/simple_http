@@ -15,7 +15,6 @@
 
 #include <algorithm>
 #include <array>
-#include <boost/asio.hpp>
 #include <cassert>
 #include <cstddef>
 #include <memory>
@@ -23,12 +22,12 @@
 #include <type_traits>
 #include <utility>
 
+#include "../core/asio_compat.h"
 #include "../core/compat.h"
+#include "../core/span.h"
 #include "../core/types.h"
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 // Native TLS handle exposed to TLS-aware handlers (client-cert inspection etc).
 // std::nullopt for plaintext transports.

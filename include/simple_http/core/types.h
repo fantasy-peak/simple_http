@@ -1,9 +1,9 @@
 #pragma once
 
 // Core protocol-agnostic value types shared across every layer of the server.
-// This header intentionally depends only on the standard library and
-// boost.system (for error_code), so it can be included from anywhere without
-// pulling in Beast/Asio I/O machinery.
+// This header intentionally depends only on the standard library (plus
+// boost.system for error_code in Boost.Asio builds), so it can be included
+// from anywhere without pulling in Asio I/O machinery.
 
 #if defined(__has_include)
 #if __has_include(<version>)
@@ -11,15 +11,38 @@
 #endif
 #endif
 
+#if !defined(SIMPLE_HTTP_USE_STANDALONE_ASIO)
 #include <boost/system/error_code.hpp>
+#endif
 #include <cstdint>
 #include <functional>
 #include <string>
 #include <string_view>
+#include <system_error>
+#include <type_traits>
 
 namespace simple_http {
 
+// The error type follows the Asio source: standalone Asio completes with
+// std::error_code, Boost.Asio with boost::system::error_code. Keeping the alias
+// exact means no conversion is needed at any Asio boundary.
+#if defined(SIMPLE_HTTP_USE_STANDALONE_ASIO)
+using error_code = std::error_code;
+using error_category = std::error_category;
+#else
 using error_code = boost::system::error_code;
+using error_category = boost::system::error_category;
+#endif
+
+// std::errc -> the active error_code type. Call sites spell the POSIX condition
+// once; this keeps EINVAL-style checks value-compatible in both builds.
+inline error_code make_errc_code(std::errc condition) noexcept {
+#if defined(SIMPLE_HTTP_USE_STANDALONE_ASIO)
+    return std::make_error_code(condition);
+#else
+    return boost::system::errc::make_error_code(static_cast<boost::system::errc::errc_t>(condition));
+#endif
+}
 
 // Whether a string carries a byte that must never appear in an HTTP field name,
 // value or request target (CR, LF, NUL). HTTP/2 does not delimit fields itself,
@@ -56,6 +79,20 @@ inline bool has_leading_or_trailing_ws(std::string_view s) noexcept {
         return false;
     const auto is_ws = [](char c) noexcept { return c == ' ' || c == '\t'; };
     return is_ws(s.front()) || is_ws(s.back());
+}
+
+// RFC 9113 §8.3.1 / RFC 9114 §4.3.1: `:path` is origin-form ("/...") or the
+// asterisk-form ("*") an OPTIONS request may use. It never carries a fragment,
+// and a raw SP/DEL/backslash (or other control) would not survive as a URL
+// path or could split an HTTP/1.1 request line when replayed downstream.
+inline bool valid_pseudo_path(std::string_view p) noexcept {
+    if (p.empty())
+        return false;
+    if (p == "*")
+        return true;
+    if (p.front() != '/')
+        return false;
+    return !contains_invalid_url_byte(p) && p.find('#') == std::string_view::npos;
 }
 
 // RFC 9110 §5.5: a field value is *( HTAB / SP / VCHAR / obs-text ). Other
@@ -191,16 +228,15 @@ namespace detail {
 // construction per lookup. Centralised here so callers do not each grow an
 // #if, and so the cost is visible in one place.
 #if defined(__cpp_lib_generic_unordered_lookup) && __cpp_lib_generic_unordered_lookup >= 201911L
-template <typename Map, typename Key> inline auto unordered_find(const Map &map, const Key &key) {
-    return map.find(key);
-}
 template <typename Map, typename Key> inline auto unordered_find(Map &map, const Key &key) { return map.find(key); }
 #else
-template <typename Map, typename Key> inline auto unordered_find(const Map &map, const Key &key) {
-    return map.find(typename Map::key_type(key));
-}
 template <typename Map, typename Key> inline auto unordered_find(Map &map, const Key &key) {
-    return map.find(typename Map::key_type(key));
+    // Map & deduces to const Map for const lvalues, so one overload serves both.
+    if constexpr (std::is_same_v<Key, typename Map::key_type>) {
+        return map.find(key);
+    } else {
+        return map.find(typename Map::key_type(key));
+    }
 }
 #endif
 

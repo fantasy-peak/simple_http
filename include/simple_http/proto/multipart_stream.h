@@ -16,13 +16,13 @@
 // Boundaries split across reads are handled; the parser keeps only the tail
 // that could be the start of a boundary.
 
-#include <boost/asio/compose.hpp>
 #include <cstddef>
 #include <functional>
 #include <string>
 #include <string_view>
 #include <utility>
 
+#include "../core/asio_compat.h"
 #include "../core/types.h"
 #include "body.h"
 #include "multipart.h"
@@ -235,6 +235,10 @@ struct MultipartStreamOp {
     MultipartStreamParser parser;
     MultipartStreamCallbacks callbacks;
     bool started{false};
+    // Same inline-recursion bound as Body::ReadAllOp: buffered frames complete
+    // async_read() synchronously and h2/h3 refill from the completion.
+    static constexpr std::size_t kYieldAfter = 32;
+    std::size_t budget{kYieldAfter};
 
     asio::any_io_executor get_executor() const noexcept { return body.get_executor(); }
 
@@ -250,16 +254,24 @@ struct MultipartStreamOp {
         }
         if (chunk.eof) {
             if (!parser.finish(callbacks)) {
-                self.complete(boost::system::errc::make_error_code(boost::system::errc::invalid_argument));
+                self.complete(make_errc_code(std::errc::invalid_argument));
                 return;
             }
             self.complete(error_code{});
             return;
         }
         if (!parser.feed(chunk.data, callbacks)) {
-            self.complete(boost::system::errc::make_error_code(boost::system::errc::invalid_argument));
+            self.complete(make_errc_code(std::errc::invalid_argument));
             return;
         }
+        if (budget == 0) {
+            Body *next = &body;
+            budget = kYieldAfter;
+            asio::post(next->get_executor(),
+                       [self = std::move(self), next]() mutable { next->async_read(std::move(self)); });
+            return;
+        }
+        --budget;
         body.async_read(std::move(self));
     }
 };

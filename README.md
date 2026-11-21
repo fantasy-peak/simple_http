@@ -59,7 +59,7 @@ The library is header-only: `include/` contains no `.cpp` files.
   calls and must be used on their own executor; a `Client` is likewise bound to
   the single-threaded executor passed to its constructor.
 - **No exceptions for control flow.** Fallible operations return
-  `error_code` or `boost::system::result`. Client failures are never thrown.
+  `error_code` or `simple_http::result`. Client failures are never thrown.
 - **Pluggable edges.** DNS resolution, logging, TLS context construction,
   session storage and route lookup are all injectable.
 
@@ -106,7 +106,8 @@ The library is header-only: `include/` contains no `.cpp` files.
 
 | Dependency | Purpose |
 |---|---|
-| Boost (Asio, System, Regex) | I/O, error model, routing regex |
+| Boost (Asio, System, Regex) | Default I/O, error model, routing regex |
+| standalone Asio (optional) | I/O when `SIMPLE_HTTP_USE_STANDALONE_ASIO` is defined; Boost.Regex is still used |
 | OpenSSL | TLS, certificate verification, mTLS, QUIC TLS |
 | zlib, brotli | gzip/br content coding and WebSocket permessage-deflate |
 | glaze | JSON reflection, typed params/extractors, JWT/JWKS, OpenAPI |
@@ -117,7 +118,7 @@ The library is header-only: `include/` contains no `.cpp` files.
 - **C++17** is enough for core, proto, transport, HTTP/1.x, HTTP/2, WebSocket,
   routing, middleware, static files, reverse proxies and the client.
 - **C++20 or newer** additionally enables coroutine handlers and
-  `asio::use_awaitable` (`BOOST_ASIO_HAS_CO_AWAIT`).
+  `asio::use_awaitable` (`SIMPLE_HTTP_HAS_CO_AWAIT`).
 - **C++23 + glaze** enables the glaze-backed helpers: JSON reflection, typed
   `path_params` / `query_params`, the `Path` / `Query` / `Json` / `Form`
   extractors, JWT/JWKS and the OpenAPI document model.
@@ -141,11 +142,16 @@ minimum integration.
 
 The repository's `xmake.lua` builds the header-only target and all test
 binaries. It expects the packages `boost`, `openssl4`, `glaze`, `zlib`,
-`brotli`, and optionally `ngtcp2` / `nghttp3`.
+`brotli`, and optionally `ngtcp2` / `nghttp3`. Pass `--standalone_asio=y` to
+build against standalone Asio instead of Boost.Asio (Boost is still used for
+Boost.Regex; the error type becomes `std::error_code`).
 
 ```sh
 xmake f -m release
 xmake build -j 12
+
+# standalone Asio instead of Boost.Asio
+xmake f --standalone_asio=y -m release
 ```
 
 Library consumers only need the include directory and the link dependencies.

@@ -18,6 +18,7 @@
 
 #include "../client/http.h"
 #include "../core/address.h"
+#include "../core/asio_compat.h"
 #include "../core/http_status.h"
 #include "../core/logging.h"
 #include "../core/types.h"
@@ -27,8 +28,6 @@
 #include "../proto/response.h"
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 namespace detail {
 

@@ -16,9 +16,9 @@
 | 入口头 | `#include <simple_http.h>` |
 | 最低标准 | C++17 |
 | 异步模型 | Asio initiating function + 显式 completion token |
-| 协程 | 仅在 `BOOST_ASIO_HAS_CO_AWAIT`（C++20+）下作为可选适配层 |
+| 协程 | 仅在 `SIMPLE_HTTP_HAS_CO_AWAIT`（C++20+，由所用 Asio 决定）下作为可选适配层 |
 | JSON/typed params/OpenAPI/JWT | 由 `SIMPLE_HTTP_HAS_GLAZE` 门控，需 C++23 + glaze |
-| 依赖 | Boost（Asio/System/Regex）、OpenSSL、zlib、brotli；glaze 可选；HTTP/3 需 ngtcp2 + nghttp3 |
+| 依赖 | 默认 Boost（Asio/System/Regex）或独立 Asio（`SIMPLE_HTTP_USE_STANDALONE_ASIO`，仍需 Boost.Regex）、OpenSSL、zlib、brotli；glaze 可选；HTTP/3 需 ngtcp2 + nghttp3 |
 | 许可 | MIT |
 
 ### 1.1 异步 API 的核心约定
@@ -33,7 +33,11 @@
   allocator / cancellation slot 不会在转发时丢失。
 - 组合操作使用 `asio::async_compose` 状态机；不要引入自定义协程桥接。
 - 库内部不以异常做控制流；同步可失败 API 返回 `error_code` 或
-  `boost::system::result<T>`（别名 `simple_http::result<T>`）。
+  `simple_http::result<T>`（库内基于 `std::variant`/`std::optional` 的
+  expected 风格类型，不依赖 Boost.System）。
+- `error_code` 跟随 Asio 来源：默认构建是 `boost::system::error_code`，
+  `SIMPLE_HTTP_USE_STANDALONE_ASIO` 下是 `std::error_code`；两者都由
+  `simple_http::error_code` 别名暴露。
 
 ### 1.2 协议矩阵
 
@@ -73,6 +77,8 @@ include/
     core/                           协议无关基础设施
       accept_encoding.h             Accept-Encoding qvalue
       address.h                     peer 地址展示（IPv4-mapped 处理）
+      asio_compat.h                 Asio 来源选择（Boost vs 独立）+ namespace 别名
+      asio_ssl.h                    SSL 半边（避免非 TLS 头引入 OpenSSL）
       base64.h
       compat.h                      C++17 兼容：ByteSpan、starts_with、executor_initiation
       compression.h                 CompressionConfig / RequestDecompressionConfig
@@ -88,7 +94,7 @@ include/
       logging.h                     LogSink / LogLevel / LogRecord / 宏
       mime.h
       resolve.h                     ResolveFn（客户端与 WS 反代 DNS 钩子）
-      result.h                      boost::system::result 别名
+      result.h                      项目内 expected 风格 result（不依赖 Boost.System）
       source_location.h             C++17 source_location 替身
       span.h                        span 兼容层（C++20 用 std::span，C++17 自带最小视图）
       static_table.h                静态文件查找表
@@ -170,7 +176,7 @@ test/
   unit/                             Catch2 单测（约 511 个 TEST_CASE）
   cpp17/smoke.cpp                   以 C++17 编译并运行公共 API
   diff/client/                      C++ 客户端 ↔ Go net/http 客户端
-  diff/server/                      Go 探针 → C++ server ↔ Go server + h2raw
+  diff/server/                      Go 探针 → C++ server ↔ Go server + h2raw/h3raw
   diff/openapi/                     OAS 3.1 契约 + Swagger UI
   diff/support/harness.py           归一化、比较、known_diffs
   fixtures/conformance_server.cpp   外部合规/压力专用 server
@@ -339,7 +345,7 @@ using HandlerCompletion = asio::any_completion_handler<void()>;
 using CallbackHandler =
     std::function<void(RequestPtr, ResponsePtr, SslHandle, HandlerCompletion)>;
 
-#if defined(BOOST_ASIO_HAS_CO_AWAIT)
+#if defined(SIMPLE_HTTP_HAS_CO_AWAIT)
 using CoroHandler = std::function<asio::awaitable<void>(RequestPtr, ResponsePtr, SslHandle)>;
 using Handler = std::variant<CallbackHandler, CoroHandler>;
 #else
@@ -360,7 +366,7 @@ using Handler = CallbackHandler;
 using Next = CallbackHandler;
 using Middleware =
     std::function<void(RequestPtr, ResponsePtr, SslHandle, Next, HandlerCompletion)>;
-#if defined(BOOST_ASIO_HAS_CO_AWAIT)
+#if defined(SIMPLE_HTTP_HAS_CO_AWAIT)
 using CoroNext = std::function<asio::awaitable<void>(RequestPtr, ResponsePtr, SslHandle)>;
 using CoroMiddleware =
     std::function<asio::awaitable<void>(RequestPtr, ResponsePtr, SslHandle, CoroNext)>;
@@ -740,8 +746,14 @@ xmake build -j 12 fixture_conformance_server
 xmake build -j 12 diff_server_cpp
 xmake build -j 12 diff_openapi_server
 xmake run test_unit
+
+# 独立 Asio（Boost.Regex 仍然使用）
+xmake f --standalone_asio=y -m release
 ```
 
+- `--standalone_asio=y` 定义 `SIMPLE_HTTP_USE_STANDALONE_ASIO`，拉取
+  `asio` 包；Asio 头路径与 namespace 由 `core/asio_compat.h` 选择，
+  `error_code` 随之变成 `std::error_code`。
 - `set_languages("c++23")`：库与测试默认按 C++23 编译；glaze 辅助因此可用。
 - `test_cpp17_smoke` 单独 `set_languages("c++17")`，验证 C++17 公共 API。
 - 全局 `-O2 -Wextra`，关闭少量 GCC 误报；全局定义
@@ -765,6 +777,8 @@ target_link_libraries(app PRIVATE simple_http::simple_http)
 当前 `CMakeLists.txt`：
 
 - `simple_http` 是 `INTERFACE` 目标，`cxx_std_23`；
+- 选项 `SIMPLE_HTTP_USE_STANDALONE_ASIO=ON` 时 `find_path(ASIO_INCLUDE_DIR
+  asio.hpp)` 并给 target 加 `SIMPLE_HTTP_USE_STANDALONE_ASIO`；
 - 链接 Boost、OpenSSL、ZLIB、Brotli、glaze；
 - **没有** ngtcp2/nghttp3，也没有 `SIMPLE_HTTP_ENABLE_HTTP3`；
 - 另有一个 `simple_http_cpp17` INTERFACE 目标，指向
@@ -781,11 +795,12 @@ target_link_libraries(app PRIVATE simple_http::simple_http)
 | 宏 | 默认 | 作用 |
 |---|---|---|
 | `SIMPLE_HTTP_ENABLE_HTTP3` | 未定义 | 编入 HTTP/3 与 QUIC 监听 |
+| `SIMPLE_HTTP_USE_STANDALONE_ASIO` | 未定义 | 使用独立 Asio 而非 Boost.Asio；`error_code` 变为 `std::error_code`，Boost.Regex 仍保留 |
 | `SIMPLE_HTTP_USE_BOOST_REGEX` | 本仓库定义 | 路由正则使用 Boost.Regex |
 | `SIMPLE_HTTP_HAS_GLAZE` | 自动检测 | glaze 辅助（C++23 + glaze） |
 | `SIMPLE_HTTP_ENABLE_LOG` | 1 | 日志总开关 |
 | `SIMPLE_HTTP_LOG_ACTIVE_LEVEL` | 0 | 编译期最低日志级别 |
-| `BOOST_ASIO_HAS_CO_AWAIT` | Boost 决定 | 协程 handler/middleware 适配 |
+| `SIMPLE_HTTP_HAS_CO_AWAIT` | Asio 决定 | 协程 handler/middleware 适配（映射 `BOOST_ASIO_HAS_CO_AWAIT` / `ASIO_HAS_CO_AWAIT`） |
 
 压缩、WebSocket、OpenAPI、UNIX socket 都没有独立开关宏。
 
@@ -811,7 +826,7 @@ test/run.sh unit '[h2]'
 | `cpp17` | fast | `test/cpp17/smoke.cpp` 以 `-std=c++17` 编译并运行 |
 | `openapi` | standard | OAS 3.1 元模式 + 文档/路由契约 + Swagger UI |
 | `client-diff` | full | C++ client ↔ Go `net/http` client |
-| `server-diff` | full | Go 探针 → C++ server ↔ Go server；含 `h2raw` |
+| `server-diff` | full | Go 探针 → C++ server ↔ Go server；含 `h2raw` / `h3raw` |
 | `concurrency` | full | 多客户端/多线程/teardown harness |
 | `conformance` | full | h2spec / h1spec / h3spec / Autobahn |
 | `stress` | full | h2load / k6 |
@@ -838,8 +853,11 @@ test/run.sh unit '[h2]'
   `basic`、`body`、`policy`、`ws`、`h3`。端口 7810–7817。
 - **server-diff**（`test/diff/server/`）：同一个 Go 探针分别打 C++ 与 Go 参考
   服务端（7820–7825 / 7830–7834）。组：`routing`、`body`、`semantics`、
-  `middleware`、`framework`、`static`、`ws`、`raw`、`h2raw`。
+  `middleware`、`framework`、`static`、`ws`、`raw`、`h2raw`、`h3raw`。
   `h2raw` 是 C++ 单侧原始 HTTP/2 / h2c / WebSocket 断言，输出 PASS/FAIL。
+  `h3raw` 用 `test/.venv` 的 aioquic 向 C++（7823）与 Go（7833）参考服务端发送
+  畸形 HTTP/3 字段并比较终端行为；nghttp3 与 quic-go 的差异登记在
+  `test/diff/known_diffs.json` 的 `h3raw.*`。
 - **归一化**（`test/diff/support/harness.py`）：header 名小写；
   `allow`/`vary`/`accept-encoding`/`cache-control` 按集合比较；默认忽略
   Date/Server/Content-Length/Transfer-Encoding/Connection/ETag/Last-Modified/
@@ -849,7 +867,8 @@ test/run.sh unit '[h2]'
   - client：`policy.redirect_referer`（body）、`policy.redirect_cross_origin`
     （body）、`h3.status_204`（framing）；
   - server：`raw.cl_te`、`raw.duplicate_cl`、`raw.obs_fold`（status）、
-    `body.request_trailers_h3`（body）。
+    `body.request_trailers_h3`（body）、`h3raw.*`（outcome，nghttp3 与
+    quic-go 对畸形 HTTP/3 字段的粒度差异）。
 - 新增功能时：C++ 与 Go 参考实现同步加行为 → 加用例 → 跑 diff → 只登记确属
   合法差异的项，并写清 RFC 依据。Go 无对应能力时标 `cpp-only`。
 
@@ -1208,6 +1227,9 @@ test/run.sh server-diff
 
 ### 10.1 已知限制
 
+- 独立 Asio 构建（`SIMPLE_HTTP_USE_STANDALONE_ASIO`）不在 CI 矩阵中；该模式下
+  `simple_http::error_code` 是 `std::error_code`，与默认 Boost.Asio 构建的
+  `boost::system::error_code` 不是同一类型，跨构建的二进制/回调不可混用。
 - 客户端 `H2cMode::Upgrade` 未接线；`ClientConfig::default_h2c` 未被读取。
   明文 `HttpVersionPolicy::Http2` 走 prior knowledge。
 - `RetryPolicy::condition` / `require_replayable` 未使用；只有状态码重试。
@@ -1217,6 +1239,10 @@ test/run.sh server-diff
 - h1 客户端没有独立 idle timeout；h2 用 `ClientConfig::idle_timeout`。
 - HTTP/3 客户端不支持代理、请求 trailers、1xx；服务端不支持 WS、request
   trailers、100-continue、push、0-RTT。
+- HTTP/3 的畸形字段由 nghttp3 定夺：非法伪头/大写字段名会以连接级
+  `NGHTTP3_ERR_MALFORMED_HTTP_HEADER` 关闭连接，部分非 token 常规字段被
+  nghttp3 直接丢弃（不会交给 `on_header`）。因此与 quic-go 的流级 reset
+  粒度不同；`h3raw` 差分把这些差异登记在 `known_diffs.json`。
 - 不支持 UNIX-domain 服务端监听。
 - 没有 `SO_REUSEPORT` 的平台只启动一个 acceptor（固定在第 0 个 worker），
   所有连接都由该 worker 的线程服务。
@@ -1290,7 +1316,7 @@ test/run.sh stress
 
 # 直接运行差分 runner（Go 二进制由 runner 自行构建）
 test/.venv/bin/python test/diff/client/run.py --groups basic,body,policy,ws,h3
-test/.venv/bin/python test/diff/server/run.py --groups routing,body,semantics,middleware,framework,static,ws,raw,h2raw
+test/.venv/bin/python test/diff/server/run.py --groups routing,body,semantics,middleware,framework,static,ws,raw,h2raw,h3raw
 test/.venv/bin/python test/diff/openapi/run.py
 
 # 覆盖率

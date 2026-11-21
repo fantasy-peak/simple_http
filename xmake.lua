@@ -39,6 +39,20 @@ add_requires("glaze")
 -- ClientConfig::auto_decompress).
 add_requires("zlib", "brotli")
 
+-- Standalone Asio (think-async.com) instead of Boost.Asio. Boost stays around
+-- for Boost.Regex; the two Asio sources are selected in core/asio_compat.h.
+-- xmake f --standalone_asio=y
+option("standalone_asio")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Build against standalone Asio instead of Boost.Asio (Boost.Regex is still used)")
+option_end()
+
+if has_config("standalone_asio") then
+    add_requires("asio")
+    add_defines("SIMPLE_HTTP_USE_STANDALONE_ASIO")
+end
+
 add_cxflags("-O2 -Wextra -Wno-missing-field-initializers -Wno-ignored-qualifiers")
 add_defines("SIMPLE_HTTP_USE_BOOST_REGEX")
 
@@ -58,6 +72,9 @@ target("simple_http")
         "brotli",
         {public = true}
     )
+    if has_config("standalone_asio") then
+        add_packages("asio", {public = true})
+    end
 target_end()
 
 -- TEST TARGETS --

@@ -23,9 +23,7 @@
 #include <utility>
 #include <vector>
 
-#include <boost/asio/ip/address.hpp>
-#include <boost/asio/steady_timer.hpp>
-
+#include "../core/asio_compat.h"
 #include "../core/base64.h"
 #include "../core/compression.h"
 #include "../core/content_encoding.h"
@@ -34,6 +32,7 @@
 #include "../core/http_status.h"
 #include "../core/logging.h"
 #include "../core/result.h"
+#include "../core/span.h"
 #include "../core/types.h"
 #include "../core/url_path.h"
 #include "handler.h"

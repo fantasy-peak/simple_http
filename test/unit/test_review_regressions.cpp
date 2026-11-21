@@ -11,6 +11,7 @@
 
 #include "simple_http.h"
 #include "test_support.h"
+#include <simple_http/core/asio_compat.h>
 
 using namespace simple_http;
 using namespace simple_http::test;
@@ -583,7 +584,7 @@ TEST_CASE("middleware: callback form is accepted by make_middleware", "[middlewa
     CHECK(finished);
 }
 
-#if defined(BOOST_ASIO_HAS_CO_AWAIT)
+#if defined(SIMPLE_HTTP_HAS_CO_AWAIT)
 TEST_CASE("router: coroutine websocket handler is accepted directly", "[router][middleware][review]") {
     Router router;
     router.ws_route("/ws", [](RequestPtr, std::shared_ptr<WebSocket>) -> asio::awaitable<void> { co_return; });

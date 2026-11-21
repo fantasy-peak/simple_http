@@ -10,12 +10,11 @@
 // ETag and Last-Modified validators, then, when the client's own validators
 // match, answers 304 bodyless and reports true so the handler skips the body.
 
-#include <boost/asio/any_completion_handler.hpp>
-#include <boost/asio/async_result.hpp>
 #include <cstdint>
 #include <string>
 #include <utility>
 
+#include "../core/asio_compat.h"
 #include "../core/http_date.h"
 #include "../core/http_field.h"
 #include "../core/http_method.h"
@@ -26,8 +25,6 @@
 #include "handler.h"
 
 namespace simple_http {
-
-namespace asio = boost::asio;
 
 template <typename Token>
 auto async_maybe_not_modified(const RequestPtr &req, const ResponsePtr &res, std::string etag,

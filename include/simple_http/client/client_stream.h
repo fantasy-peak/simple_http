@@ -13,11 +13,6 @@
 // sessions multiplex.
 
 #include <atomic>
-#include <boost/asio.hpp>
-#include <boost/asio/any_completion_handler.hpp>
-#include <boost/asio/async_result.hpp>
-#include <boost/asio/experimental/channel_error.hpp>
-#include <boost/asio/post.hpp>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -25,6 +20,7 @@
 #include <string_view>
 #include <utility>
 
+#include "../core/asio_compat.h"
 #include "../core/base64.h"
 #include "../core/compat.h"
 #include "../core/http_field.h"
@@ -38,8 +34,6 @@
 #include "client_config.h"
 
 namespace simple_http::detail {
-
-namespace asio = boost::asio;
 
 // The response head, as async_read_head() returns it.
 struct ResponseHead {
@@ -81,7 +75,9 @@ inline result<ReadResult> outcome_result(const StreamOutcome &outcome) {
     case StreamState::Eof:
         return ReadResult::end();
     case StreamState::Reset:
-        return make_error_code(client_errc::stream_reset);
+        // Preserve the recorded cause: RST_STREAM(REFUSED_STREAM) is retryable,
+        // a plain reset is not. Only fall back when no code was stored.
+        return outcome.ec ? outcome.ec : make_error_code(client_errc::stream_reset);
     case StreamState::Disconnect:
         return make_error_code(asio::error::connection_reset);
     case StreamState::Failed:
@@ -95,7 +91,7 @@ inline result<ReadResult> outcome_result(const StreamOutcome &outcome) {
 inline error_code outcome_error(const StreamOutcome &outcome) {
     switch (outcome.get()) {
     case StreamState::Reset:
-        return make_error_code(client_errc::stream_reset);
+        return outcome.ec ? outcome.ec : make_error_code(client_errc::stream_reset);
     case StreamState::Disconnect:
         return make_error_code(asio::error::connection_reset);
     case StreamState::Failed:
