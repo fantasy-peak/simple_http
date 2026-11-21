@@ -1704,7 +1704,9 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
             return true;
         if (p.front() != '/')
             return false;
-        return p.find_first_of(" #\t") == std::string_view::npos;
+        // Reject SP/DEL/backslash/other controls (the same set the client
+        // applies) plus the fragment delimiter, which never belongs in :path.
+        return !contains_invalid_url_byte(p) && p.find('#') == std::string_view::npos;
     }
 
     // A field value may contain VCHAR, SP, HTAB and obs-text, but no other CTL

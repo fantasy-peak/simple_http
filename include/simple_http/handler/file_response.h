@@ -30,9 +30,17 @@
 #include <system_error>
 #include <utility>
 
+#if !defined(_WIN32)
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 #include "../core/asio_compat.h"
 #include "../core/http_field.h"
 #include "../core/mime.h"
+#include "../core/static_table.h" // detail::open_under_root
 #include "../core/types.h"
 #include "../proto/response.h"
 
@@ -55,9 +63,49 @@ struct SendFileOptions {
     // means "to EOF". Used by Range responses.
     std::uint64_t offset{0};
     std::uint64_t length{0};
+    // When set, `path` must be under this document root. On POSIX the file is
+    // opened one component at a time with O_NOFOLLOW relative to the root
+    // descriptor, so a symlink planted after a directory scan cannot redirect
+    // the read outside the root. Empty keeps the legacy behaviour: the caller
+    // owns the path and it is opened as given (following symlinks).
+    std::string root;
 };
 
 namespace detail {
+
+// Owns a POSIX descriptor for the lifetime of the composed operation, including
+// the destruction path when the operation is abandoned.
+class UniqueFd {
+  public:
+    UniqueFd() = default;
+    explicit UniqueFd(int fd) noexcept : m_fd(fd) {}
+    UniqueFd(const UniqueFd &) = delete;
+    UniqueFd &operator=(const UniqueFd &) = delete;
+    UniqueFd(UniqueFd &&other) noexcept : m_fd(other.m_fd) { other.m_fd = -1; }
+    UniqueFd &operator=(UniqueFd &&other) noexcept {
+        if (this != &other) {
+            reset(other.m_fd);
+            other.m_fd = -1;
+        }
+        return *this;
+    }
+    ~UniqueFd() { reset(); }
+
+    [[nodiscard]] int get() const noexcept { return m_fd; }
+    [[nodiscard]] bool valid() const noexcept { return m_fd >= 0; }
+    void reset(int fd = -1) noexcept {
+#if !defined(_WIN32)
+        if (m_fd >= 0)
+            ::close(m_fd);
+#else
+        (void)fd;
+#endif
+        m_fd = fd;
+    }
+
+  private:
+    int m_fd{-1};
+};
 
 struct SendFileOp {
     ResponseWriter &response;
@@ -65,6 +113,7 @@ struct SendFileOp {
     SendFileOptions options;
 
     std::ifstream file;
+    UniqueFd fd;
     std::array<char, 64 * 1024> buffer{};
     error_code pre;
     std::uintmax_t size{0};
@@ -77,10 +126,45 @@ struct SendFileOp {
     // would survive a later open() failure and describe a body the caller is
     // about to replace with a 404/500.
     error_code prepare() {
-        std::error_code stat_ec;
-        size = std::filesystem::file_size(path, stat_ec);
-        if (stat_ec) {
-            return make_errc_code(std::errc::no_such_file_or_directory);
+#if !defined(_WIN32)
+        if (!options.root.empty()) {
+            auto opened = open_under_root(options.root, path);
+            if (!opened) {
+                return make_errc_code(std::errc::no_such_file_or_directory);
+            }
+            struct stat st{};
+            if (::fstat(*opened, &st) != 0 || !S_ISREG(st.st_mode)) {
+                ::close(*opened);
+                return make_errc_code(std::errc::invalid_argument);
+            }
+            fd.reset(*opened);
+            size = static_cast<std::uintmax_t>(st.st_size);
+        } else
+#else
+        if (!options.root.empty()) {
+            // Windows has no openat/O_NOFOLLOW; canonicalise and require the
+            // result to stay under the root, then refuse a symlink (best effort).
+            std::error_code canonical_ec;
+            const auto canonical_root = std::filesystem::weakly_canonical(options.root, canonical_ec);
+            if (canonical_ec) {
+                return make_errc_code(std::errc::no_such_file_or_directory);
+            }
+            const auto canonical_path = std::filesystem::weakly_canonical(path, canonical_ec);
+            if (canonical_ec || !path_is_under(canonical_root.string(), canonical_path.string())) {
+                return make_errc_code(std::errc::no_such_file_or_directory);
+            }
+            std::error_code symlink_ec;
+            if (std::filesystem::is_symlink(std::filesystem::symlink_status(path, symlink_ec))) {
+                return make_errc_code(std::errc::no_such_file_or_directory);
+            }
+        }
+#endif
+            if (!fd.valid()) {
+            std::error_code stat_ec;
+            size = std::filesystem::file_size(path, stat_ec);
+            if (stat_ec) {
+                return make_errc_code(std::errc::no_such_file_or_directory);
+            }
         }
         if (options.offset > size) {
             return make_errc_code(std::errc::invalid_argument);
@@ -113,6 +197,29 @@ struct SendFileOp {
             response.async_finish(std::move(self));
             return;
         }
+#if !defined(_WIN32)
+        if (fd.valid()) {
+            const auto want = static_cast<std::size_t>(std::min<std::uintmax_t>(buffer.size(), remaining));
+            ssize_t n = 0;
+            do {
+                n = ::read(fd.get(), buffer.data(), want);
+            } while (n < 0 && errno == EINTR);
+            if (n < 0) {
+                self.complete(make_errc_code(std::errc::io_error));
+                return;
+            }
+            if (n == 0) {
+                // The file shrank after prepare(); the declared length has
+                // already been sent, so fail instead of silently truncating.
+                self.complete(make_errc_code(std::errc::io_error));
+                return;
+            }
+            remaining -= static_cast<std::uintmax_t>(n);
+            stage = 2;
+            response.async_write(std::string(buffer.data(), static_cast<std::size_t>(n)), std::move(self));
+            return;
+        }
+#endif
         const auto want = static_cast<std::streamsize>(std::min<std::uintmax_t>(buffer.size(), remaining));
         file.read(buffer.data(), want);
         const auto n = file.gcount();
@@ -140,16 +247,25 @@ struct SendFileOp {
             }
             // Open before writing any head field: a failure here must leave the
             // response untouched so the caller can still send its own 404/500.
-            file.open(path, std::ios::binary);
-            if (!file) {
-                self.complete(make_errc_code(std::errc::no_such_file_or_directory));
-                return;
-            }
-            if (options.offset != 0) {
-                file.seekg(static_cast<std::streamoff>(options.offset));
-                if (!file) {
+            if (fd.valid()) {
+#if !defined(_WIN32)
+                if (options.offset != 0 && ::lseek(fd.get(), static_cast<off_t>(options.offset), SEEK_SET) < 0) {
                     self.complete(make_errc_code(std::errc::io_error));
                     return;
+                }
+#endif
+            } else {
+                file.open(path, std::ios::binary);
+                if (!file) {
+                    self.complete(make_errc_code(std::errc::no_such_file_or_directory));
+                    return;
+                }
+                if (options.offset != 0) {
+                    file.seekg(static_cast<std::streamoff>(options.offset));
+                    if (!file) {
+                        self.complete(make_errc_code(std::errc::io_error));
+                        return;
+                    }
                 }
             }
             apply_headers();

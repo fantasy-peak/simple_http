@@ -19,6 +19,7 @@
 #include <string_view>
 #include <unistd.h>
 #include <utility>
+#include <vector>
 
 static_assert(__cplusplus >= 201703L && __cplusplus < 202002L, "cpp17 smoke must build as C++17");
 
@@ -59,6 +60,18 @@ void test_result() {
     check(good && *good == 42, "result value");
     const simple_http::result<int> bad{simple_http::make_errc_code(std::errc::invalid_argument)};
     check(!bad && bad.error(), "result error");
+}
+
+void test_span() {
+    // C++17 has no std::span; the fallback must still accept the shapes the
+    // public API relied on under boost::span (C arrays and contiguous
+    // containers), not just (pointer, count).
+    int values[3] = {1, 2, 3};
+    simple_http::span<const int> from_array = values;
+    check(from_array.size() == 3 && from_array[1] == 2, "span from a C array");
+    const std::vector<int> vec{4, 5};
+    simple_http::span<const int> from_vector = vec;
+    check(from_vector.size() == 2 && from_vector[0] == 4, "span from a container");
 }
 
 void test_body_tokens() {
@@ -779,6 +792,7 @@ int main() {
     test_http_date();
     test_url_path();
     test_result();
+    test_span();
     test_body_tokens();
     test_router();
     test_server();

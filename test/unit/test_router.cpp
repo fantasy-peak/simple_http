@@ -66,6 +66,19 @@ TEST_CASE("router: exact, regex and fallback matching", "[router]") {
     CHECK(dispatch("/exact")->last_status == status::ok);
 }
 
+TEST_CASE("router: a regex is registered exactly as the caller wrote it", "[router][regex]") {
+    // Pattern safety is the caller's responsibility: registration does not
+    // second-guess the expression, so perfectly linear forms that a static
+    // checker might flag must still be served.
+    Router router;
+    router.route_regex({Method::Get}, R"(^/(?:foo|bar)+$)", body_handler("alternation"));
+    router.route_regex({Method::Get}, R"(^/(?:[a-z0-9-]+/)*$)", body_handler("segments"));
+
+    asio::io_context ctx;
+    CHECK(dispatch(ctx, router, make_request(ctx, "/foobar"))->last_body == "alternation");
+    CHECK(dispatch(ctx, router, make_request(ctx, "/a-b/c-d/"))->last_body == "segments");
+}
+
 TEST_CASE("router: a literal dead end falls back to a template sibling", "[router]") {
     Router router;
     // Both are template routes (each contains a {param}), so both live in the
@@ -783,41 +796,6 @@ TEST_CASE("router: invalid regexes are dropped, not thrown", "[router]") {
     auto res = std::make_shared<ResponseWriter>(writer);
     REQUIRE(run_on(ctx, await_dispatch(router, req, res))); // no route: the built-in 404
     CHECK(writer->last_status == status::not_found);
-}
-
-TEST_CASE("router: unsafe regex patterns are rejected at registration", "[router]") {
-    using simple_http::detail::unsafe_regex_reason;
-    CHECK_FALSE(unsafe_regex_reason("^/(a+)+$").empty());
-    CHECK_FALSE(unsafe_regex_reason("(a*)*").empty());
-    CHECK_FALSE(unsafe_regex_reason("(.*a){20}").empty());
-    CHECK_FALSE(unsafe_regex_reason("(a|aa)+").empty());
-    CHECK_FALSE(unsafe_regex_reason(R"((\d+)+)").empty());
-    CHECK_FALSE(unsafe_regex_reason(R"(\1)").empty());
-    // Ordinary route patterns keep compiling: alternation is fine when it is
-    // not under a quantifier, and a quantified non-capturing group is fine when
-    // it contains no quantifier of its own.
-    CHECK(unsafe_regex_reason(R"(^/items/(\d+)$)").empty());
-    CHECK(unsafe_regex_reason("^/(foo|bar)/x$").empty());
-    CHECK(unsafe_regex_reason("^/(?:foo)+$").empty());
-    CHECK(unsafe_regex_reason("^/files/?$").empty());
-}
-
-TEST_CASE("router: an unsafe regex route is not registered", "[router]") {
-    ScopedLog capture;
-    Router router;
-    router.route_regex({Method::Get}, "^/(a+)+$", body_handler("unsafe"));
-    router.route({Method::Get}, "/safe", body_handler("safe"));
-
-    asio::io_context ctx;
-    auto dispatch = [&](const std::string &path) {
-        auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
-        auto req = make_request(ctx, path);
-        auto res = std::make_shared<ResponseWriter>(writer);
-        REQUIRE(run_on(ctx, await_dispatch(router, req, res)));
-        return writer;
-    };
-    CHECK(dispatch("/safe")->last_body == "safe");
-    CHECK(dispatch("/" + std::string(40, 'a') + "b")->last_status == status::not_found);
 }
 
 TEST_CASE("router: a registered handler is found by path, first registration wins", "[router]") {

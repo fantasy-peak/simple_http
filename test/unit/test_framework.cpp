@@ -584,6 +584,27 @@ TEST_CASE("framework: JWT verifies HS256, claims and scopes", "[framework][jwt]"
     CHECK(dispatch(ctx, router, scoped)->last_status == status::no_content);
 }
 
+TEST_CASE("framework: JWT treats a negative leeway as zero", "[framework][jwt]") {
+    // A caller may set leeway to a negative duration meaning "no grace". The
+    // check compares unsigned distances, so a negative value must be clamped
+    // rather than wrapping to 2^64-1 (which accepted every expired token).
+    asio::io_context ctx;
+    Router router;
+    JwtConfig config;
+    config.secret = "secret";
+    config.leeway = std::chrono::seconds{-1};
+    router.use(middleware::jwt(config));
+    router.route({Method::Get}, "/me", [](RequestPtr, ResponsePtr res) -> asio::awaitable<void> {
+        co_await res->async_send("ok", asio::use_awaitable);
+    });
+
+    const std::string header = R"({"alg":"HS256","typ":"JWT"})";
+    auto expired = make_request(ctx, "/me");
+    expired->mutable_headers().add(
+        "authorization", "Bearer " + hs256_token(header, jwt_payload("alice", "read", now_unix() - 3600), "secret"));
+    CHECK(dispatch(ctx, router, expired)->last_status == status::unauthorized);
+}
+
 TEST_CASE("framework: JWT rejects malformed, unsigned and mismatched tokens", "[framework][jwt]") {
     asio::io_context ctx;
     const std::string header = R"({"alg":"HS256","typ":"JWT"})";

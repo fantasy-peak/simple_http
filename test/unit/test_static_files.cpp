@@ -238,6 +238,37 @@ TEST_CASE("static: an on-demand read refuses a symlinked parent directory", "[st
     CHECK_FALSE(body.has_value());
     std::filesystem::remove_all(outside_dir);
 }
+
+// The serving path does not use read_body(): a representation too large to
+// preload is streamed by async_send_file(). It must apply the same root
+// containment, or the table-level hardening above protects nothing that is
+// actually served.
+TEST_CASE("static: on-demand streaming refuses a file replaced by a symlink", "[static]") {
+    StaticFixture fx;
+    fx.write("victim.txt", "0123456789abcdef");
+    const auto outside = fx.root().parent_path() / ("simple_http_stream_secret_" + std::to_string(::getpid()));
+    {
+        std::ofstream out(outside, std::ios::binary);
+        out << "STREAMED-SECRET-MUST-NOT-LEAK";
+    }
+
+    StaticFilesConfig cfg = standard_config(fx);
+    cfg.table.preload_max_file_bytes = 0; // force the on-demand streaming path
+    auto site = load_standard(fx, cfg);
+    REQUIRE(site->find("/victim.txt") != nullptr);
+
+    std::filesystem::remove(fx.root() / "victim.txt");
+    std::filesystem::create_symlink(outside, fx.root() / "victim.txt");
+
+    asio::io_context ctx;
+    const auto served = get(*site, ctx, "/victim.txt");
+    std::string wire;
+    for (const auto &chunk : served.writer->chunks) {
+        wire += chunk;
+    }
+    CHECK(wire.find("SECRET") == std::string::npos);
+    std::filesystem::remove(outside);
+}
 #else
 TEST_CASE("static: symlink and FIFO cases are POSIX-only", "[static]") { SUCCEED(); }
 #endif

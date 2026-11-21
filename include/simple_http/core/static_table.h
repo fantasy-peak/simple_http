@@ -345,7 +345,9 @@ class StaticTable {
 
     bool enabled() const noexcept { return !m_root.empty(); }
     const Stats &stats() const noexcept { return m_stats; }
-    const std::string &root() const noexcept { return m_root; } // canonical, for logging only
+    // Canonical. Also the containment base handed to open_under_root() when a
+    // representation is read on demand, not just a label for logging.
+    const std::string &root() const noexcept { return m_root; }
 
     // Read-only view. The table is built entirely inside load() and never
     // mutated afterwards, so handing out const pointers is sound and lets every
@@ -372,7 +374,7 @@ class StaticTable {
     using EntryPtr = std::shared_ptr<StaticEntry>;
 
     StaticTableConfig m_config;
-    std::string m_root; // canonical, for logging only
+    std::string m_root; // canonical; containment base for on-demand reads
 
     std::uint64_t m_preload_max{0};
     std::uint64_t m_preload_budget{0};

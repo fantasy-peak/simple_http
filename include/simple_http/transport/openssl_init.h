@@ -22,6 +22,8 @@
 
 #include <openssl/ssl.h>
 
+#include "../core/asio_ssl.h"
+
 namespace simple_http::detail {
 
 inline void ensure_openssl_initialized() {
@@ -36,5 +38,3 @@ inline void ensure_openssl_initialized() {
 }
 
 } // namespace simple_http::detail
-
-#include "../core/asio_ssl.h"

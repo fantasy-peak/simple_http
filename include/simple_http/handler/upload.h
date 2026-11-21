@@ -41,6 +41,12 @@ struct ReadBodyToFileOp {
     std::string temp_path;
     std::uint64_t written{0};
     bool started{false};
+    // Bound the inline read chain: a channel with buffered frames completes
+    // async_read() synchronously, and the h2/h3 consume hooks feed parked
+    // frames from inside that completion. Without a yield this recursion grows
+    // once per DATA frame (thousands of small frames overflow the worker stack).
+    static constexpr std::size_t kYieldAfter = 32;
+    std::size_t budget{kYieldAfter};
 
     asio::any_io_executor get_executor() const noexcept { return body.get_executor(); }
 
@@ -108,6 +114,14 @@ struct ReadBodyToFileOp {
             self.complete(make_errc_code(std::errc::io_error), written);
             return;
         }
+        if (budget == 0) {
+            Body *next = &body;
+            budget = kYieldAfter;
+            asio::post(next->get_executor(),
+                       [self = std::move(self), next]() mutable { next->async_read(std::move(self)); });
+            return;
+        }
+        --budget;
         body.async_read(std::move(self));
     }
 };

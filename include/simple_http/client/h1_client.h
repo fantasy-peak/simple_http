@@ -334,7 +334,9 @@ class Http1ClientSession final : public ClientSession,
     }
 
     error_code build_request_head(const Request &request, std::string &out) {
-        if (contains_invalid_url_byte(request.method_token()) || contains_invalid_url_byte(request.target())) {
+        // The method must be a real token: an empty token would serialize as
+        // " /path HTTP/1.1" (leading SP), which no peer parses as our request.
+        if (!is_http_token(request.method_token()) || contains_invalid_url_byte(request.target())) {
             return make_error_code(client_errc::invalid_spec);
         }
         out.reserve(256);

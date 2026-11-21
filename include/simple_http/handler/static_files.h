@@ -382,9 +382,11 @@ inline void StaticFiles::try_serve(const RequestPtr &req, const ResponsePtr &res
         // forwards the header block untouched. Setting it makes both protocols
         // emit the same bytes.
         res->header(field::content_length, std::to_string(rep->size));
-    } else {
-        // Plain GET: explicit length for the streamed path below (and the same
-        // header a one-shot send would have computed).
+    } else if (body) {
+        // Plain GET from a preloaded body: state the length here, exactly as a
+        // one-shot send would. The on-demand path below lets SendFileOp write
+        // Content-Length from the descriptor it actually opened, so a file
+        // replaced since the scan cannot produce a header/body mismatch.
         res->header(field::content_length, std::to_string(rep->size));
     }
 
@@ -398,10 +400,19 @@ inline void StaticFiles::try_serve(const RequestPtr &req, const ResponsePtr &res
         // only [first, last], not the whole file followed by substr().
         SendFileOptions opts;
         opts.apply_content_type = false; // already set by apply_headers()
-        opts.set_content_length = false; // ...and the exact length above
+        opts.set_content_length = false; // range/encoded branches wrote it above
+        // Open relative to the scanned root, one component at a time with
+        // O_NOFOLLOW: the path came from a directory scan, and a symlink planted
+        // after it must not redirect the read outside the document root.
+        opts.root = m_table.root();
         if (range) {
             opts.offset = range->first;
             opts.length = range->length();
+        } else if (encoding.empty() && !spa_hit) {
+            // Plain on-demand GET: no length was written above, so let the
+            // opener derive it from the descriptor it actually opened. A
+            // spa_hit already wrote rep->size above, so keep it single.
+            opts.set_content_length = true;
         }
         async_send_file(*res, rep->disk_path, std::move(opts), [res, done = std::move(done)](error_code ec) mutable {
             if (!ec) {

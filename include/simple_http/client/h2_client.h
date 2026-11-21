@@ -733,12 +733,18 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
         std::string_view method = request.method_token();
         if (method.empty())
             method = to_string(request.method());
-        if (method.empty() || contains_ctl(method))
+        // `:method` is a token (RFC 9113 §8.3.1); reject empty tokens and
+        // separators/whitespace rather than HPACK-encoding them.
+        if (!is_http_token(method))
             return make_error_code(client_errc::protocol_error);
         const std::string_view target =
             request.target().empty() ? std::string_view{"/"} : std::string_view{request.target()};
-        if (target.front() != '/' || contains_invalid_url_byte(target)) {
-            return make_error_code(client_errc::protocol_error); // :path must be origin-form
+        // origin-form, or the asterisk-form that RFC 9113 §8.3.1 defines for
+        // OPTIONS (`:path = *`). Anything else must start with "/" and carry no
+        // SP/DEL/backslash.
+        const bool asterisk_form = target == "*" && method == "OPTIONS";
+        if ((target.front() != '/' && !asterisk_form) || contains_invalid_url_byte(target)) {
+            return make_error_code(client_errc::protocol_error);
         }
 
         // RFC 7541 Appendix A: 2 = :method GET, 3 = :method POST, 4 = :path /,

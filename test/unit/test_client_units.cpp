@@ -717,3 +717,14 @@ TEST_CASE("client cancel: open_websocket(cancel_after) aborts during dial", "[cl
     REQUIRE(out.has_value());
     CHECK(*out == asio::error::operation_aborted);
 }
+
+TEST_CASE("client: a refused stream keeps its retryable error", "[client]") {
+    // it_finish() records RST_STREAM(REFUSED_STREAM) as stream_refused; the
+    // terminal-state mapping must not overwrite it with a generic stream_reset,
+    // or is_retryable() can never report the peer did not process the request.
+    StreamOutcome outcome;
+    outcome.set(StreamState::Reset, make_error_code(client_errc::stream_refused));
+    const auto ec = outcome_error(outcome);
+    CHECK(ec == make_error_code(client_errc::stream_refused));
+    CHECK(is_retryable(ec));
+}

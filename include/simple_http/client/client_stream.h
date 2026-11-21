@@ -75,7 +75,9 @@ inline result<ReadResult> outcome_result(const StreamOutcome &outcome) {
     case StreamState::Eof:
         return ReadResult::end();
     case StreamState::Reset:
-        return make_error_code(client_errc::stream_reset);
+        // Preserve the recorded cause: RST_STREAM(REFUSED_STREAM) is retryable,
+        // a plain reset is not. Only fall back when no code was stored.
+        return outcome.ec ? outcome.ec : make_error_code(client_errc::stream_reset);
     case StreamState::Disconnect:
         return make_error_code(asio::error::connection_reset);
     case StreamState::Failed:
@@ -89,7 +91,7 @@ inline result<ReadResult> outcome_result(const StreamOutcome &outcome) {
 inline error_code outcome_error(const StreamOutcome &outcome) {
     switch (outcome.get()) {
     case StreamState::Reset:
-        return make_error_code(client_errc::stream_reset);
+        return outcome.ec ? outcome.ec : make_error_code(client_errc::stream_reset);
     case StreamState::Disconnect:
         return make_error_code(asio::error::connection_reset);
     case StreamState::Failed:

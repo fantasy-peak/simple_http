@@ -74,25 +74,32 @@ class IoCtxPool final {
         }
         m_started = true;
         m_idle->running = m_io_contexts.size();
-        m_thread_ids.assign(m_io_contexts.size(), std::thread::id{});
+        m_ids->ids.assign(m_io_contexts.size(), std::thread::id{});
         for (std::size_t i = 0, n = m_io_contexts.size(); i < n; ++i) {
             auto context = m_io_contexts.at(i);
-            m_threads.emplace_back([this, context, i] {
+            // Capture both shared states by value: the destructor may detach
+            // this very thread (teardown from a handler), after which the pool
+            // object is gone. Capturing `this` would leave the tail block
+            // dereferencing a destroyed pool; these shared_ptrs keep the state
+            // it touches alive.
+            auto idle = m_idle;
+            auto ids = m_ids;
+            m_threads.emplace_back([context, i, idle, ids] {
                 // Record the id before run(): stop() may be called from this
                 // very thread (a handler) and must recognise it.
                 {
-                    std::scoped_lock lock(m_ids_mutex);
-                    m_thread_ids.at(i) = std::this_thread::get_id();
+                    std::scoped_lock lock(ids->mutex);
+                    ids->ids.at(i) = std::this_thread::get_id();
                 }
                 context->run();
                 // This context has nothing left to do; stop() waits on this
-                // before it forces anything. Only the shared state is touched
-                // here, never `this`: the pool may already have been destroyed.
+                // before it forces anything. Only the captured shared state is
+                // touched here, never `this`: the pool may already be destroyed.
                 {
-                    std::scoped_lock lock(m_idle->mutex);
-                    --m_idle->running;
+                    std::scoped_lock lock(idle->mutex);
+                    --idle->running;
                 }
-                m_idle->cv.notify_all();
+                idle->cv.notify_all();
             });
         }
     }
@@ -102,8 +109,8 @@ class IoCtxPool final {
     // itself (which throws std::system_error and aborts the process).
     [[nodiscard]] bool on_worker_thread() const noexcept {
         const auto self = std::this_thread::get_id();
-        std::scoped_lock lock(m_ids_mutex);
-        return std::any_of(m_thread_ids.begin(), m_thread_ids.end(),
+        std::scoped_lock lock(m_ids->mutex);
+        return std::any_of(m_ids->ids.begin(), m_ids->ids.end(),
                            [self](const std::thread::id id) noexcept { return id == self; });
     }
 
@@ -172,6 +179,13 @@ class IoCtxPool final {
         std::condition_variable cv;
         std::size_t running{0};
     };
+    // Thread ids live behind a shared_ptr for the same reason: a detached
+    // worker still writes its entry before run(), and on_worker_thread() may be
+    // called from the destructor after the pool is gone on that path.
+    struct IdsState {
+        mutable std::mutex mutex;
+        std::vector<std::thread::id> ids;
+    };
 
     std::vector<std::shared_ptr<asio::io_context>> m_io_contexts;
     std::vector<asio::executor_work_guard<asio::io_context::executor_type>> m_work;
@@ -180,8 +194,7 @@ class IoCtxPool final {
     std::shared_ptr<IdleState> m_idle{std::make_shared<IdleState>()};
     // Worker thread ids, written by each thread as it starts and read by
     // on_worker_thread(). Guarded because start() may race the first stop().
-    mutable std::mutex m_ids_mutex;
-    std::vector<std::thread::id> m_thread_ids;
+    std::shared_ptr<IdsState> m_ids{std::make_shared<IdsState>()};
     std::vector<std::thread> m_threads;
     bool m_started{false};
 };

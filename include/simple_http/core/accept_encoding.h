@@ -17,7 +17,7 @@
 //
 // NAMES THIS FILE MUST NOT DEFINE: `trim_ows` and `iequals_ci` already exist in
 // core/http_field.h / core/types.h, and `starts_with_ci` / `parse_qvalue` in
-// core/content_encoding.h. Same-named
+// core/content_encoding.h / core/qvalue.h. Same-named
 // `inline` functions in one namespace are a redefinition error, and the
 // umbrella header pulls both in — so a duplicate here fails to compile across
 // the whole library. Reuse them; the case-folding used below is `iequals_ci`

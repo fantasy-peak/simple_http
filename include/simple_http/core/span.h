@@ -24,7 +24,9 @@
 #if defined(__cpp_lib_span) && __cpp_lib_span >= 202002L
 #include <span>
 #else
+#include <iterator>
 #include <type_traits>
+#include <utility>
 #endif
 
 namespace simple_http {
@@ -34,6 +36,10 @@ namespace simple_http {
 template <typename T> using span = std::span<T>;
 
 #else
+
+template <typename T> class span;
+template <typename T> struct is_span : std::false_type {};
+template <typename T> struct is_span<span<T>> : std::true_type {};
 
 // Dynamic-extent stand-in for std::span. Deliberately minimal: adding members
 // (subspan, extent-tracked constructors, ...) here would invite code that only
@@ -53,6 +59,20 @@ template <typename T> class span {
     // Qualification conversion, e.g. span<std::byte> -> span<const std::byte>.
     template <typename U, std::enable_if_t<std::is_convertible_v<U (*)[], T (*)[]>, int> = 0>
     constexpr span(const span<U> &other) noexcept : m_data(other.data()), m_size(other.size()) {}
+
+    // C arrays, as std::span/boost::span accept them.
+    template <typename U, std::size_t N, std::enable_if_t<std::is_convertible_v<U (*)[], T (*)[]>, int> = 0>
+    constexpr span(U (&arr)[N]) noexcept : m_data(arr), m_size(N) {}
+
+    // Contiguous containers (std::vector, std::array, std::string, ...). The
+    // constraints keep this from competing with the copy constructor and the
+    // qualification conversion above.
+    template <typename C,
+              std::enable_if_t<!std::is_array_v<C> && !is_span<std::decay_t<C>>::value &&
+                                   std::is_convertible_v<
+                                       std::remove_pointer_t<decltype(std::data(std::declval<C &>()))> (*)[], T (*)[]>,
+                               int> = 0>
+    constexpr span(C &container) noexcept : m_data(std::data(container)), m_size(std::size(container)) {}
 
     constexpr pointer data() const noexcept { return m_data; }
     constexpr size_type size() const noexcept { return m_size; }
