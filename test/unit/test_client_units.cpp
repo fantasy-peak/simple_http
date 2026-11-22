@@ -808,3 +808,40 @@ TEST_CASE("client/multipart: stream_file_body forwards the caller's cancellation
     CHECK(probe->body == "hello");
     CHECK(probe->slot_connected);
 }
+
+TEST_CASE("client/transport: async_error_only forwards the cancellation slot", "[client][token]") {
+    asio::io_context ctx;
+    asio::cancellation_signal signal;
+    bool slot_connected = false;
+    bool done = false;
+
+    detail::async_error_only(ctx.get_executor(),
+                             asio::bind_cancellation_slot(signal.slot(),
+                                                          [&](error_code ec) {
+                                                              done = true;
+                                                              CHECK_FALSE(ec);
+                                                          }),
+                             [&](auto completion) {
+                                 slot_connected = asio::get_associated_cancellation_slot(completion).is_connected();
+                                 std::move(completion)(error_code{}, std::size_t{0});
+                             });
+    ctx.run();
+
+    CHECK(done);
+    CHECK(slot_connected);
+}
+
+TEST_CASE("client/transport: tcp async_shutdown submits its completion", "[client][token]") {
+    asio::io_context ctx;
+    auto socket = std::make_shared<asio::ip::tcp::socket>(ctx);
+    TcpTransport<asio::ip::tcp::socket> transport{socket};
+
+    bool done = false;
+    transport.async_shutdown([&](error_code ec) {
+        done = true;
+        CHECK_FALSE(ec);
+    });
+    CHECK_FALSE(done); // posted to the transport executor
+    ctx.run();
+    CHECK(done);
+}

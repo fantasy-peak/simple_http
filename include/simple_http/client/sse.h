@@ -282,6 +282,9 @@ class SseStream : public std::enable_shared_from_this<SseStream> {
   private:
     void next_impl(std::shared_ptr<asio::any_completion_handler<void(error_code, SseEvent)>> done,
                    asio::cancellation_slot slot) {
+        // A buffered event or an already-seen EOF completes inline: SseStream
+        // has no executor accessor to post to. Socket-backed reads are async
+        // and carry `slot`.
         for (;;) {
             if (!m_pending.empty()) {
                 SseEvent event = std::move(m_pending.front());

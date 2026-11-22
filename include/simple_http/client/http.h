@@ -220,7 +220,9 @@ class Response {
 
     // A Response is only produced by the buffered send() path, which has
     // already drained the exchange into m_body. Completing from m_body here is
-    // the contract; walking m_stream would ask a finished exchange for more
+    // the contract; the handler may therefore run inline, because a buffered
+    // Response deliberately owns only its bytes and has no executor to post to.
+    // Walking m_stream would ask a finished exchange for more
     // bytes (session_closed on h1, an empty EOF on h2/h3) and could even read
     // the next response when the connection has been reused.
     template <typename Token> auto async_read_all(std::size_t max_bytes, Token &&token) {

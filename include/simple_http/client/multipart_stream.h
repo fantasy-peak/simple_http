@@ -108,6 +108,8 @@ auto async_stream_file_body(std::shared_ptr<Stream> stream, std::string path, st
             auto done = std::make_shared<detail::MultipartDone>(std::move(handler));
             auto in = std::make_shared<std::ifstream>(path, std::ios::binary);
             if (!*in) {
+                // Stream exposes no executor here, so this ready failure
+                // completes inline; callers must not assume a later turn.
                 auto callback = std::move(*done);
                 std::move(callback)(make_errc_code(std::errc::no_such_file_or_directory));
                 return;
@@ -143,7 +145,13 @@ class MultipartStreamWriter : public std::enable_shared_from_this<MultipartStrea
                                                    handler = std::move(handler)](
                                                       error_code ec, std::shared_ptr<Stream> stream) mutable {
                             if (ec) {
-                                std::move(handler)(ec, nullptr);
+                                // An invalid URL/version is decided synchronously
+                                // by async_open_stream; submit the completion to
+                                // this client's executor rather than calling it
+                                // from the initiating function.
+                                asio::post(ex, [handler = std::move(handler), ec]() mutable {
+                                    std::move(handler)(ec, nullptr);
+                                });
                                 return;
                             }
                             std::move(handler)(error_code{},
@@ -170,8 +178,12 @@ class MultipartStreamWriter : public std::enable_shared_from_this<MultipartStrea
                         name, {}, {},
                         [self, value = std::move(value), done, slot](error_code ec) mutable {
                             if (ec) {
-                                auto callback = std::move(*done);
-                                std::move(callback)(ec);
+                                // write_part_head rejects invalid parameters and
+                                // a finished writer synchronously.
+                                asio::post(self->m_executor, [done, ec]() mutable {
+                                    auto callback = std::move(*done);
+                                    std::move(callback)(ec);
+                                });
                                 return;
                             }
                             self->m_stream->async_write(std::move(value),
@@ -200,8 +212,10 @@ class MultipartStreamWriter : public std::enable_shared_from_this<MultipartStrea
                         name, filename, content_type,
                         [self, data = std::move(data), done, slot](error_code ec) mutable {
                             if (ec) {
-                                auto callback = std::move(*done);
-                                std::move(callback)(ec);
+                                asio::post(self->m_executor, [done, ec]() mutable {
+                                    auto callback = std::move(*done);
+                                    std::move(callback)(ec);
+                                });
                                 return;
                             }
                             self->m_stream->async_write(std::move(data),
@@ -236,8 +250,10 @@ class MultipartStreamWriter : public std::enable_shared_from_this<MultipartStrea
                         name, filename, content_type,
                         [self, path = std::move(path), done, slot](error_code ec) mutable {
                             if (ec) {
-                                auto callback = std::move(*done);
-                                std::move(callback)(ec);
+                                asio::post(self->m_executor, [done, ec]() mutable {
+                                    auto callback = std::move(*done);
+                                    std::move(callback)(ec);
+                                });
                                 return;
                             }
                             auto stream = self->m_stream;
@@ -266,7 +282,8 @@ class MultipartStreamWriter : public std::enable_shared_from_this<MultipartStrea
                 [self](auto handler) mutable {
                     auto slot = asio::get_associated_cancellation_slot(handler);
                     if (self->m_finished) {
-                        std::move(handler)(error_code{});
+                        auto ex = self->m_executor;
+                        asio::post(ex, [handler = std::move(handler)]() mutable { std::move(handler)(error_code{}); });
                         return;
                     }
                     std::string out;

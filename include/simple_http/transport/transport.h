@@ -23,6 +23,7 @@
 #include <utility>
 
 #include "../core/asio_compat.h"
+#include "../core/cancel.h"
 #include "../core/compat.h"
 #include "../core/span.h"
 #include "../core/types.h"
@@ -115,11 +116,15 @@ template <typename Start> struct ErrorOnlyOp {
             // beyond the one `any_completion_handler` already performs.
             static_assert(std::is_copy_constructible_v<Start>, "async_error_only's Start must be copyable");
             auto action = start;
-            auto inner = asio::any_completion_handler<void(error_code, std::size_t)>(
-                [keep = std::move(start), self = std::move(self)](error_code inner_ec, std::size_t) mutable {
+            // Carry the composed operation's cancellation slot into the
+            // operation that actually performs the write; a bare lambda would
+            // drop it and the caller could no longer abort a parked write.
+            auto slot = asio::get_associated_cancellation_slot(self);
+            auto inner = asio::any_completion_handler<void(error_code, std::size_t)>(forward_cancel_slot(
+                slot, [keep = std::move(start), self = std::move(self)](error_code inner_ec, std::size_t) mutable {
                     (void)keep;
                     self.complete(inner_ec);
-                });
+                }));
             action(std::move(inner));
             return;
         }

@@ -47,13 +47,19 @@ template <typename Socket> class TcpTransport {
 
     SslHandle tls_handle() const { return std::nullopt; }
 
-    // TCP's FIN is its close notification; nothing to flush first. This is an
-    // immediate completion: Asio's completion machinery (use_awaitable /
-    // as_tuple) handles an initiating function that completes without
-    // suspending.
+    // TCP's FIN is its close notification; nothing to flush first. The
+    // operation is still submitted to this transport's executor rather than
+    // completing inside the initiating function, so a caller's callback never
+    // re-enters before async_shutdown returns.
     template <typename Token> auto async_shutdown(Token &&token) {
-        return asio::async_initiate<Token, void(error_code)>([](auto handler) { std::move(handler)(error_code{}); },
-                                                             token);
+        auto ex = get_executor();
+        return asio::async_initiate<Token, void(error_code)>(
+            detail::make_executor_initiation(
+                [ex](auto handler) mutable {
+                    asio::post(ex, [handler = std::move(handler)]() mutable { std::move(handler)(error_code{}); });
+                },
+                ex),
+            token);
     }
 
     void close() { shutdown_socket(*m_socket); }
