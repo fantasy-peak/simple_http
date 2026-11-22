@@ -675,7 +675,12 @@ class Server {
             }
         }
 
-        void connection_released() {
+        void connection_released(const std::shared_ptr<std::atomic<std::size_t>> &listener_active = {}) {
+            // Per-listener max_connections is enforced against this counter;
+            // the server-wide one stays for active_connections() and QUIC.
+            if (listener_active) {
+                listener_active->fetch_sub(1, std::memory_order_acq_rel);
+            }
             connections->fetch_sub(1, std::memory_order_acq_rel);
             resume_accept_waiters();
         }
@@ -714,6 +719,9 @@ class Server {
         std::shared_ptr<Core> core;
         std::atomic<bool> *stopping{nullptr};
         std::size_t max_connections{0};
+        // Connections currently served by this listener. Shared so a release
+        // callback still decrements it after the listener itself is gone.
+        std::shared_ptr<std::atomic<std::size_t>> active{std::make_shared<std::atomic<std::size_t>>(0)};
         PlaintextProtocols protocols{PlaintextProtocols::Both};
         bool h2c_upgrade{false};
     };
@@ -731,7 +739,7 @@ class Server {
         // At the limit, do not issue another accept: the kernel backlog applies
         // backpressure. Re-arm from connection_released() when a slot frees.
         if (listener->max_connections != 0 &&
-            listener->core->connections->load(std::memory_order_acquire) >= listener->max_connections) {
+            listener->active->load(std::memory_order_acquire) >= listener->max_connections) {
             auto exec = slot.acceptor->get_executor();
             std::weak_ptr<ListenerState> weak_waiter = listener;
             listener->core->on_accept_capacity([weak_waiter, slot, exec] {
@@ -820,6 +828,7 @@ class Server {
         }
         auto core = listener->core;
         core->connections->fetch_add(1, std::memory_order_acq_rel);
+        listener->active->fetch_add(1, std::memory_order_acq_rel);
         if (listener->tls) {
             auto stream = std::make_shared<asio::ssl::stream<asio::ip::tcp::socket>>(std::move(*socket),
                                                                                      listener->tls->context());
@@ -842,7 +851,8 @@ class Server {
                         transport->close();
                 });
             }
-            transport->async_handshake([weak_listener, weak_core, transport, closer, handshake_timer,
+            auto active = listener->active;
+            transport->async_handshake([weak_listener, weak_core, active, transport, closer, handshake_timer,
                                         handshake_done](error_code handshake_ec) {
                 handshake_done->store(true, std::memory_order_release);
                 handshake_timer->cancel();
@@ -850,9 +860,9 @@ class Server {
                 if (handshake_ec || !alive) {
                     transport->close();
                     if (alive) {
-                        alive->core->connection_released();
+                        alive->core->connection_released(active);
                     } else if (auto c = weak_core.lock()) {
-                        c->connection_released();
+                        c->connection_released(active);
                     }
                     return;
                 }
@@ -865,7 +875,7 @@ class Server {
                 // select callback in that case, so the policy is enforced here.
                 if (alive->cfg.alpn == TlsHttp::Http2Only) {
                     transport->close();
-                    alive->core->connection_released();
+                    alive->core->connection_released(active);
                     return;
                 }
                 run_h1(alive, std::move(transport), std::string{}, false, closer);
@@ -899,14 +909,15 @@ class Server {
         auto buffer = std::make_shared<std::array<std::byte, 14>>();
         std::weak_ptr<ListenerState> weak_listener = listener;
         std::weak_ptr<Core> weak_core = listener->core;
-        auto on_read = [weak_listener, weak_core, transport, buffer, closer](error_code ec, std::size_t n) {
+        auto active = listener->active;
+        auto on_read = [weak_listener, weak_core, active, transport, buffer, closer](error_code ec, std::size_t n) {
             auto alive = weak_listener.lock();
             if (ec && n == 0) {
                 transport->close();
                 if (alive) {
-                    alive->core->connection_released();
+                    alive->core->connection_released(active);
                 } else if (auto c = weak_core.lock()) {
-                    c->connection_released();
+                    c->connection_released(active);
                 }
                 return;
             }
@@ -916,7 +927,7 @@ class Server {
                 // that slot even though the listener itself is gone.
                 transport->close();
                 if (auto c = weak_core.lock()) {
-                    c->connection_released();
+                    c->connection_released(active);
                 }
                 return;
             }
@@ -955,10 +966,11 @@ class Server {
         std::weak_ptr<Core> weak_core = core;
         // Keep the closer alive for the whole connection: the registry only
         // holds a weak reference so a finished connection is not leaked.
+        auto active = listener->active;
         engine->run(std::move(dispatch), std::move(initial), std::move(ws_exact), std::move(ws_proxy),
-                    std::move(ws_regex), [weak_core, closer] {
+                    std::move(ws_regex), [weak_core, active, closer] {
                         if (auto c = weak_core.lock())
-                            c->connection_released();
+                            c->connection_released(active);
                     });
     }
 
@@ -972,10 +984,11 @@ class Server {
         auto ws_regex = core->ws_regex;
         auto engine = std::make_shared<Http2Engine<Transport>>(transport, listener_limits(listener));
         std::weak_ptr<Core> weak_core = core;
+        auto active = listener->active;
         engine->run(std::move(dispatch), std::move(initial), std::move(ws_exact), std::move(ws_proxy),
-                    std::move(ws_regex), [weak_core, closer] {
+                    std::move(ws_regex), [weak_core, active, closer] {
                         if (auto c = weak_core.lock())
-                            c->connection_released();
+                            c->connection_released(active);
                     });
     }
 

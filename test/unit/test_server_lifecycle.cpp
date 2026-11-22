@@ -142,3 +142,56 @@ TEST_CASE("server: max_connections stops accepting at the limit", "[server][revi
     CHECK(server.active_connections() == 1);
     server.stop();
 }
+
+TEST_CASE("server: per-listener max_connections does not block another listener", "[server][review]") {
+    ServerConfig cfg;
+    cfg.worker_threads = 1;
+    cfg.shutdown_grace = std::chrono::milliseconds{200};
+
+    TcpListenerConfig first_listener;
+    first_listener.name = "a";
+    first_listener.address = InetAddress{"127.0.0.1", 0, false};
+    first_listener.plaintext = PlaintextHttp::Http1Only;
+    first_listener.max_connections = 1;
+
+    TcpListenerConfig second_listener = first_listener;
+    second_listener.name = "b";
+    cfg.listeners = {first_listener, second_listener};
+
+    Server server{cfg};
+    auto started = server.start();
+    REQUIRE(started.has_value());
+    REQUIRE(started->bound.size() == 2);
+
+    std::uint16_t port_a = 0;
+    std::uint16_t port_b = 0;
+    for (const auto &bound : started->bound) {
+        if (bound.name == "a")
+            port_a = bound.port;
+        else if (bound.name == "b")
+            port_b = bound.port;
+    }
+    REQUIRE(port_a != 0);
+    REQUIRE(port_b != 0);
+
+    asio::io_context io;
+    asio::ip::tcp::socket first{io};
+    first.connect({asio::ip::make_address("127.0.0.1"), port_a});
+    wait_for_connections(server, 1);
+    REQUIRE(server.active_connections() == 1);
+
+    // Listener a is at its limit; listener b's budget is independent, so its
+    // connection must still be accepted.
+    asio::ip::tcp::socket second{io};
+    second.connect({asio::ip::make_address("127.0.0.1"), port_b});
+    wait_for_connections(server, 2);
+    CHECK(server.active_connections() == 2);
+
+    // Listener a still refuses a second connection while its slot is taken.
+    asio::ip::tcp::socket third{io};
+    third.connect({asio::ip::make_address("127.0.0.1"), port_a});
+    std::this_thread::sleep_for(std::chrono::milliseconds{200});
+    CHECK(server.active_connections() == 2);
+
+    server.stop();
+}
