@@ -522,21 +522,38 @@ template <typename Handler, typename... Es> struct ExtractAllState : ExtractionC
 
 template <typename... Es, typename Token> auto async_extract_all(Request &req, Token &&token) {
     return asio::async_initiate<Token, void(HttpError, detail::extracted_values<Es...>)>(
-        [&req](auto handler) {
+        // Capture the request by pointer value rather than a reference to the
+        // reference parameter: the initiation may be stored and invoked later
+        // by a deferred token, and the pointer makes the lifetime requirement
+        // explicit instead of relying on reference-capture rules.
+        [request = &req](auto handler) {
             using Handler = std::decay_t<decltype(handler)>;
             using State = detail::ExtractAllState<Handler, Es...>;
-            auto state = std::make_shared<State>(req, std::move(handler));
+            auto state = std::make_shared<State>(*request, std::move(handler));
             // The extraction callbacks below capture a raw pointer: the context
             // owns them, and every callback runs while the extraction chain
             // still holds the context's shared_ptr (see extract_step), so the
             // state cannot be destroyed mid-callback. Capturing the shared_ptr
             // here would be a ownership cycle (state -> context -> callback).
+            //
+            // Completion is always posted: synchronous extractors finish inside
+            // this initiating function, and an Asio operation must submit its
+            // completion rather than invoke it inline. Moving the handler out
+            // before posting also lets the state die with the extraction chain.
             State *raw = state.get();
             raw->on_error = [raw](HttpError error) mutable {
-                std::move(raw->completion)(std::move(error), typename State::Values{});
+                auto ex = raw->req.executor();
+                auto completion = std::move(raw->completion);
+                asio::post(ex, [completion = std::move(completion), error = std::move(error)]() mutable {
+                    std::move(completion)(std::move(error), typename State::Values{});
+                });
             };
             raw->on_success = [raw](typename State::Values values) mutable {
-                std::move(raw->completion)(detail::extract_ok(), std::move(values));
+                auto ex = raw->req.executor();
+                auto completion = std::move(raw->completion);
+                asio::post(ex, [completion = std::move(completion), values = std::move(values)]() mutable {
+                    std::move(completion)(detail::extract_ok(), std::move(values));
+                });
             };
             // Explicit upcast: GCC does not apply the shared_ptr converting
             // constructor to an explicitly-specialized function-template

@@ -432,3 +432,29 @@ TEST_CASE("proto/response: a writer error is reported to the caller", "[proto]")
     REQUIRE(ec.has_value());
     CHECK(*ec == asio::error::broken_pipe);
 }
+
+// Deferred tokens are part of the documented token set: constructing the
+// operation must not start it, and invoking it must deliver the same result as
+// the coroutine form.
+TEST_CASE("proto/body: a deferred read runs only when invoked", "[proto][token]") {
+    asio::io_context ctx;
+    Body body{ctx.get_executor()};
+    REQUIRE(body.feed("abc"));
+    body.finish();
+
+    bool completed = false;
+    ReadResult result;
+    auto op = body.async_read(asio::deferred);
+    CHECK_FALSE(completed);
+
+    std::move(op)([&](error_code ec, ReadResult r) {
+        completed = true;
+        CHECK_FALSE(ec);
+        result = std::move(r);
+    });
+    ctx.run();
+
+    CHECK(completed);
+    CHECK(result.data == "abc");
+    CHECK_FALSE(result.eof);
+}

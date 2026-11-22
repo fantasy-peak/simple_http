@@ -825,3 +825,28 @@ TEST_CASE("framework: JWKS selects RSA/EC keys by kid", "[framework][jwt][jwks]"
     single_request->mutable_headers().add("authorization", "Bearer " + make_no_kid_token(rsa.key.get(), "RS256"));
     CHECK(dispatch(ctx, single, single_request)->last_body == "single");
 }
+
+// async_extract_all used to invoke its completion from inside the initiating
+// function when every extractor was synchronous. An Asio operation must submit
+// the completion instead: an inline callback would re-enter the caller before
+// async_extract_all returned.
+TEST_CASE("framework: async_extract_all submits a synchronous completion", "[framework][extract][token]") {
+    asio::io_context ctx;
+    auto req = make_request(ctx, "/list?q=x&page=2");
+
+    bool completed = false;
+    HttpError error;
+    detail::extracted_values<Query<ListQuery>> values;
+    async_extract_all<Query<ListQuery>>(*req, [&](HttpError e, detail::extracted_values<Query<ListQuery>> v) {
+        completed = true;
+        error = std::move(e);
+        values = std::move(v);
+    });
+
+    CHECK_FALSE(completed); // submitted, not invoked inline
+    ctx.run();
+    CHECK(completed);
+    CHECK(error.status == 0);
+    CHECK(std::get<0>(values).q == "x");
+    CHECK(std::get<0>(values).page == 2);
+}
