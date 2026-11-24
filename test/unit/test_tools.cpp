@@ -187,3 +187,23 @@ TEST_CASE("access_log: the request id is included when request_id ran", "[tools]
     CHECK(rec.attr("request_id").size() == 32); // 16 random bytes, hex
     CHECK(rec.attr("path") == "/ok");
 }
+// The "not conditional" answer used to be invoked from inside the initiating
+// function. An Asio operation must submit its completion instead.
+TEST_CASE("conditionals: a non-matching request completes asynchronously", "[tools][token]") {
+    asio::io_context ctx;
+    auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
+    auto res = std::make_shared<ResponseWriter>(writer);
+    auto req = make_request(ctx, "/doc");
+
+    bool completed = false;
+    bool not_modified = true;
+    async_maybe_not_modified(req, res, make_etag(1700000000, 100, "id"), 1700000000, [&](error_code ec, bool value) {
+        completed = true;
+        not_modified = value;
+        CHECK_FALSE(ec);
+    });
+    CHECK_FALSE(completed); // submitted, not invoked inline
+    ctx.run();
+    CHECK(completed);
+    CHECK_FALSE(not_modified);
+}

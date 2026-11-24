@@ -1,6 +1,7 @@
 // proto/: the version-agnostic HTTP model — Headers, Body, Request, ResponseWriter.
 
 #include <catch2/catch_test_macros.hpp>
+#include <future>
 #include <memory>
 #include <string>
 
@@ -327,6 +328,88 @@ TEST_CASE("proto/response: defaults are filled in but never override", "[proto]"
     }
 }
 
+// Deferred tokens must not touch the response until the operation is invoked:
+// prepare_one_shot() (started flag, Date/Server/Content-Type) and the SSE
+// header writes all belong to the initiation.
+TEST_CASE("proto/response: a deferred send has no side effects before invocation", "[proto][token]") {
+    asio::io_context ctx;
+    auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
+    ResponseWriter res{writer};
+    res.status(status::created);
+
+    auto op = res.async_send("deferred", asio::deferred);
+    CHECK_FALSE(res.started());
+    CHECK(writer->calls == 0);
+    CHECK(writer->header("date").empty());
+
+    std::move(op)([&](error_code ec) { CHECK_FALSE(ec); });
+    ctx.run();
+
+    CHECK(res.started());
+    CHECK(writer->last_status == status::created);
+    CHECK(writer->last_body == "deferred");
+    CHECK_FALSE(writer->header("date").empty());
+}
+
+TEST_CASE("proto/response: deferred sse_begin adds its headers only when invoked", "[proto][token]") {
+    asio::io_context ctx;
+    auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
+    ResponseWriter res{writer};
+
+    auto op = res.async_sse_begin(asio::deferred);
+    CHECK(res.headers().empty());
+    CHECK(writer->calls == 0);
+
+    std::move(op)([&](error_code ec) { CHECK_FALSE(ec); });
+    ctx.run();
+
+    CHECK(writer->header("content-type") == "text/event-stream; charset=utf-8");
+    CHECK(writer->header("cache-control") == "no-cache");
+}
+
+// Token adapters that reshape or re-bind the completion handler must survive
+// the initiation layering (the pre-flight now runs inside async_initiate).
+TEST_CASE("proto/response: async_send supports use_future", "[proto][token]") {
+    asio::io_context ctx;
+    auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
+    ResponseWriter res{writer};
+
+    auto fut = res.async_send("future", asio::use_future);
+    ctx.run();
+    CHECK_NOTHROW(fut.get());
+    CHECK(writer->last_body == "future");
+}
+
+TEST_CASE("proto/response: async_send supports redirect_error", "[proto][token]") {
+    asio::io_context ctx;
+    auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
+    ResponseWriter res{writer};
+
+    error_code captured = asio::error::would_block;
+    bool called = false;
+    res.async_send("redirect", asio::redirect_error([&called] { called = true; }, captured));
+    ctx.run();
+    CHECK(called);
+    CHECK_FALSE(captured);
+    CHECK(writer->last_body == "redirect");
+}
+
+TEST_CASE("proto/response: async_send accepts an associated executor", "[proto][token]") {
+    asio::io_context ctx;
+    auto writer = std::make_shared<FakeResponseSink>(ctx.get_executor());
+    ResponseWriter res{writer};
+
+    asio::strand<asio::io_context::executor_type> strand{ctx.get_executor()};
+    bool called = false;
+    res.async_send("strand", asio::bind_executor(strand, [&](error_code ec) {
+                       called = true;
+                       CHECK_FALSE(ec);
+                   }));
+    ctx.run();
+    CHECK(called);
+    CHECK(writer->last_body == "strand");
+}
+
 TEST_CASE("proto/response: header injection is refused at the writer boundary", "[proto]") {
     asio::io_context ctx;
 
@@ -431,4 +514,30 @@ TEST_CASE("proto/response: a writer error is reported to the caller", "[proto]")
     auto ec = run_on(ctx, as_ec(res.async_send("x", asio::as_tuple(asio::use_awaitable))));
     REQUIRE(ec.has_value());
     CHECK(*ec == asio::error::broken_pipe);
+}
+
+// Deferred tokens are part of the documented token set: constructing the
+// operation must not start it, and invoking it must deliver the same result as
+// the coroutine form.
+TEST_CASE("proto/body: a deferred read runs only when invoked", "[proto][token]") {
+    asio::io_context ctx;
+    Body body{ctx.get_executor()};
+    REQUIRE(body.feed("abc"));
+    body.finish();
+
+    bool completed = false;
+    ReadResult result;
+    auto op = body.async_read(asio::deferred);
+    CHECK_FALSE(completed);
+
+    std::move(op)([&](error_code ec, ReadResult r) {
+        completed = true;
+        CHECK_FALSE(ec);
+        result = std::move(r);
+    });
+    ctx.run();
+
+    CHECK(completed);
+    CHECK(result.data == "abc");
+    CHECK_FALSE(result.eof);
 }

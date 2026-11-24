@@ -109,7 +109,10 @@ class SessionStore {
 
 // In-process store. All operations are synchronous internally but expose the
 // awaitable interface; the mutex is the deliberate handler-layer exception to
-// model A, because one store is shared by every connection.
+// model A, because one store is shared by every connection. Completions may be
+// invoked inline from the initiating call; the session middleware dispatches
+// back to the connection executor, so a store is free to complete on its own
+// thread as well.
 class MemorySessionStore final : public SessionStore {
   public:
     explicit MemorySessionStore(std::size_t max_sessions = 100000) : m_max_sessions(max_sessions) {}

@@ -229,3 +229,65 @@ TEST_CASE("middleware: redirect_slashes cannot emit a scheme-relative Location",
     auto writer2 = dispatch(ctx, router, make_request(ctx, "/\\evil.example/"));
     CHECK(writer2->header(field::location).empty());
 }
+
+// Regression: async_compose's token parameter is `type_identity_t<Token>&`, so
+// forwarding the token rejects prvalue tokens. as_tuple(use_awaitable) is a
+// prvalue and must keep compiling (and completing) through async_next.
+TEST_CASE("middleware: async_next accepts a prvalue completion token", "[middleware][token]") {
+    asio::io_context ctx;
+    bool called = false;
+    Next next = [&called](RequestPtr, ResponsePtr, SslHandle, HandlerCompletion done) {
+        called = true;
+        std::move(done)();
+    };
+    auto req = make_request(ctx, "/");
+    auto res = std::make_shared<ResponseWriter>(std::make_shared<FakeResponseSink>(ctx.get_executor()));
+    auto run = [&]() -> asio::awaitable<void> {
+        co_await middleware_detail::async_next(next, std::move(req), std::move(res), std::nullopt,
+                                               asio::as_tuple(asio::use_awaitable));
+        co_return;
+    };
+    REQUIRE(run_on(ctx, run()));
+    CHECK(called);
+}
+
+// The composed operation used to wrap itself in a bare lambda when handing the
+// completion to the rest of the chain, dropping the caller's cancellation slot.
+TEST_CASE("middleware: async_next forwards the caller's cancellation slot", "[middleware][token]") {
+    asio::io_context ctx;
+    asio::cancellation_signal signal;
+    bool slot_connected = false;
+    Next next = [&](RequestPtr, ResponsePtr, SslHandle, HandlerCompletion done) {
+        slot_connected = asio::get_associated_cancellation_slot(done).is_connected();
+        std::move(done)();
+    };
+    auto req = make_request(ctx, "/");
+    auto res = std::make_shared<ResponseWriter>(std::make_shared<FakeResponseSink>(ctx.get_executor()));
+    auto run = [&]() -> asio::awaitable<void> {
+        co_await middleware_detail::async_next(next, std::move(req), std::move(res), std::nullopt,
+                                               asio::bind_cancellation_slot(signal.slot(), asio::use_awaitable));
+        co_return;
+    };
+    REQUIRE(run_on(ctx, run()));
+    CHECK(slot_connected);
+}
+
+// Deferred tokens must not start the chain until the operation is invoked.
+TEST_CASE("middleware: async_next supports a deferred token", "[middleware][token]") {
+    asio::io_context ctx;
+    bool started = false;
+    bool completed = false;
+    Next next = [&](RequestPtr, ResponsePtr, SslHandle, HandlerCompletion done) {
+        started = true;
+        asio::post(ctx, [done = std::move(done)]() mutable { std::move(done)(); });
+    };
+    auto req = make_request(ctx, "/");
+    auto res = std::make_shared<ResponseWriter>(std::make_shared<FakeResponseSink>(ctx.get_executor()));
+    auto op = middleware_detail::async_next(next, std::move(req), std::move(res), std::nullopt, asio::deferred);
+    CHECK_FALSE(started);
+    std::move(op)([&completed]() { completed = true; });
+    CHECK(started);         // initiation runs when the deferred op is invoked
+    CHECK_FALSE(completed); // the chain posted its completion
+    ctx.run();
+    CHECK(completed);
+}

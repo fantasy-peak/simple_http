@@ -26,6 +26,7 @@
 // helpers.
 
 #include "../core/asio_compat.h"
+#include "../core/compat.h"
 #include "../core/glaze_support.h"
 
 #if SIMPLE_HTTP_HAS_GLAZE
@@ -83,7 +84,10 @@ struct JsonWriteOp {
         if (!started) {
             started = true;
             if (pre) {
-                self.complete(pre);
+                // Submit the pre-flight failure instead of completing inside
+                // the initiating function.
+                auto ex = self.get_executor();
+                asio::post(ex, [self = std::move(self), ec = pre]() mutable { self.complete(ec); });
                 return;
             }
             response->async_send(std::move(json), std::move(self));
@@ -109,6 +113,8 @@ template <typename T, typename Token> auto async_read_json_body(Request &request
 // invalid_argument and leaves the response untouched.
 template <typename T, typename Token>
 auto async_write_json(std::shared_ptr<ResponseWriter> response, const T &value, int status_code, Token &&token) {
+    // Serialization is pure and happens now; mutating the response is part of
+    // the operation and must wait for a deferred token to be invoked.
     auto json = glz::write_json(value);
     error_code pre{};
     std::string body;
@@ -117,11 +123,20 @@ auto async_write_json(std::shared_ptr<ResponseWriter> response, const T &value, 
         pre = make_errc_code(std::errc::invalid_argument);
     } else {
         body = std::move(*json);
-        response->status(status_code).content_type(mime::app_json);
     }
     auto executor = response->writer().get_executor();
-    return asio::async_compose<Token, void(error_code)>(detail::JsonWriteOp{std::move(response), std::move(body), pre},
-                                                        token, executor);
+    return asio::async_initiate<Token, void(error_code)>(
+        detail::make_executor_initiation(
+            [response = std::move(response), body = std::move(body), pre, status_code](auto handler) mutable {
+                if (!pre) {
+                    response->status(status_code).content_type(mime::app_json);
+                }
+                auto ex = response->writer().get_executor();
+                asio::async_compose<decltype(handler), void(error_code)>(
+                    detail::JsonWriteOp{std::move(response), std::move(body), pre}, handler, ex);
+            },
+            std::move(executor)),
+        token);
 }
 
 template <typename T, typename Token>

@@ -27,6 +27,7 @@
 #include <utility>
 
 #include "../core/asio_compat.h"
+#include "../core/compat.h"
 #include "../core/http_field.h"
 #include "../core/http_status.h"
 #include "../core/logging.h"
@@ -155,78 +156,105 @@ class ResponseWriter {
     }
 
     template <typename Token> auto async_send(std::string body, Token &&token) {
-        error_code pre = prepare_one_shot();
-        Mode mode = Mode::Direct;
-        if (!pre) {
-            if (m_status == status::no_content || m_status == status::not_modified) {
-                mode = Mode::Bodyless;
-            } else if (!m_trailers.empty() && !m_writer->head_request() && m_writer->version() != Version::Http1) {
-                // A response carrying trailers cannot be one-shot: the fields
-                // follow the body, so it is framed as a stream (chunked on
-                // HTTP/1.x) and closed by the trailer section. A HEAD response
-                // or an HTTP/1.0 peer keeps the one-shot framing and drops the
-                // fields instead.
-                mode = Mode::Stream;
-            }
-        }
-        return compose_send(pre, mode, std::move(body), std::forward<Token>(token));
+        // The pre-flight runs inside the initiation, not in this function: a
+        // deferred token must not mark the response started (or append Date /
+        // Server / Content-Type) until the operation is actually invoked.
+        return asio::async_initiate<Token, void(error_code)>(
+            initiator([this, body = std::move(body)](auto handler) mutable {
+                error_code pre = prepare_one_shot();
+                Mode mode = Mode::Direct;
+                if (!pre) {
+                    if (m_status == status::no_content || m_status == status::not_modified) {
+                        mode = Mode::Bodyless;
+                    } else if (!m_trailers.empty() && !m_writer->head_request() &&
+                               m_writer->version() != Version::Http1) {
+                        // A response carrying trailers cannot be one-shot: the fields
+                        // follow the body, so it is framed as a stream (chunked on
+                        // HTTP/1.x) and closed by the trailer section. A HEAD response
+                        // or an HTTP/1.0 peer keeps the one-shot framing and drops the
+                        // fields instead.
+                        mode = Mode::Stream;
+                    }
+                }
+                compose_send(pre, mode, std::move(body), std::move(handler));
+            }),
+            token);
     }
 
     // Status + headers with no body and no body framing at all (204/304 and
     // every response to HEAD).
     template <typename Token> auto async_send_bodyless(Token &&token) {
-        // Without a body, a response can only be framed by the status (204/304)
-        // or by being the answer to HEAD. A bodyless 200 on a keep-alive h1
-        // connection has no length and no terminator: the peer takes the next
-        // response's bytes as this body (response smuggling).
-        //
-        // Validate before prepare_one_shot(): it marks the response started, and
-        // invoke_handler's 500 fallback only runs while started() is false.
-        error_code pre;
-        if (!m_writer->head_request() && m_status != status::no_content && m_status != status::not_modified) {
-            pre = make_error_code(asio::error::invalid_argument);
-        } else {
-            pre = prepare_one_shot();
-        }
-        return compose_send(pre, Mode::Bodyless, std::string{}, std::forward<Token>(token));
+        return asio::async_initiate<Token, void(error_code)>(
+            initiator([this](auto handler) mutable {
+                // Without a body, a response can only be framed by the status
+                // (204/304) or by being the answer to HEAD. A bodyless 200 on a
+                // keep-alive h1 connection has no length and no terminator: the
+                // peer takes the next response's bytes as this body (response
+                // smuggling).
+                //
+                // Validate before prepare_one_shot(): it marks the response
+                // started, and invoke_handler's 500 fallback only runs while
+                // started() is false.
+                error_code pre;
+                if (!m_writer->head_request() && m_status != status::no_content && m_status != status::not_modified) {
+                    pre = make_error_code(asio::error::invalid_argument);
+                } else {
+                    pre = prepare_one_shot();
+                }
+                compose_send(pre, Mode::Bodyless, std::string{}, std::move(handler));
+            }),
+            token);
     }
 
     // --- streaming ---
     template <typename Token> auto async_begin(Token &&token) {
-        // 204/304 have no body by definition; streaming one emits a chunked
-        // 204 (h1) or DATA frames (h2) that a conforming peer rejects or reads
-        // as the next message. Check before prepare_one_shot() so the failure
-        // leaves started() false and the 500 fallback can still answer.
-        error_code pre;
-        if (m_status == status::no_content || m_status == status::not_modified) {
-            pre = make_error_code(asio::error::invalid_argument);
-        } else {
-            pre = prepare_one_shot();
-        }
-        auto sink = m_writer;
-        const int code = m_status;
-        auto headers = std::move(m_headers);
-        return compose_one(pre, sink->get_executor(), std::forward<Token>(token),
-                           [sink, code, headers = std::move(headers)](WriteCompletion done) mutable {
-                               sink->send_headers(code, std::move(headers), std::move(done));
-                           });
+        return asio::async_initiate<Token, void(error_code)>(
+            initiator([this](auto handler) mutable {
+                // 204/304 have no body by definition; streaming one emits a
+                // chunked 204 (h1) or DATA frames (h2) that a conforming peer
+                // rejects or reads as the next message. Check before
+                // prepare_one_shot() so the failure leaves started() false and
+                // the 500 fallback can still answer.
+                error_code pre;
+                if (m_status == status::no_content || m_status == status::not_modified) {
+                    pre = make_error_code(asio::error::invalid_argument);
+                } else {
+                    pre = prepare_one_shot();
+                }
+                auto sink = m_writer;
+                const int code = m_status;
+                auto headers = std::move(m_headers);
+                compose_one(pre, sink->get_executor(), std::move(handler),
+                            [sink, code, headers = std::move(headers)](WriteCompletion done) mutable {
+                                sink->send_headers(code, std::move(headers), std::move(done));
+                            });
+            }),
+            token);
     }
 
     // Sends an interim 1xx response (100 Continue).
     template <typename Token> auto async_send_continue(Token &&token) {
-        note_activity();
-        auto sink = m_writer;
-        return compose_one(error_code{}, sink->get_executor(), std::forward<Token>(token),
-                           [sink](WriteCompletion done) mutable { sink->send_continue(std::move(done)); });
+        return asio::async_initiate<Token, void(error_code)>(
+            initiator([this](auto handler) mutable {
+                note_activity();
+                auto sink = m_writer;
+                compose_one(error_code{}, sink->get_executor(), std::move(handler),
+                            [sink](WriteCompletion done) mutable { sink->send_continue(std::move(done)); });
+            }),
+            token);
     }
 
     template <typename Token> auto async_write(std::string data, Token &&token) {
-        note_activity();
-        auto sink = m_writer;
-        return compose_one(error_code{}, sink->get_executor(), std::forward<Token>(token),
-                           [sink, data = std::move(data)](WriteCompletion done) mutable {
-                               sink->send_chunk(std::move(data), std::move(done));
-                           });
+        return asio::async_initiate<Token, void(error_code)>(
+            initiator([this, data = std::move(data)](auto handler) mutable {
+                note_activity();
+                auto sink = m_writer;
+                compose_one(error_code{}, sink->get_executor(), std::move(handler),
+                            [sink, data = std::move(data)](WriteCompletion done) mutable {
+                                sink->send_chunk(std::move(data), std::move(done));
+                            });
+            }),
+            token);
     }
 
     template <typename Token> auto async_finish(Token &&token) {
@@ -234,19 +262,26 @@ class ResponseWriter {
     }
 
     template <typename Token> auto async_finish(std::string data, Token &&token) {
-        note_activity();
-        auto sink = m_writer;
-        // Trailer fields accumulated with trailer() end the response instead of
-        // the final body chunk, so a finish() after them still emits them.
-        if (!m_trailers.empty()) {
-            const error_code pre = m_field_rejected ? make_error_code(asio::error::invalid_argument) : error_code{};
-            auto trailers = std::move(m_trailers);
-            return compose_finish_trailers(pre, std::move(data), std::move(trailers), sink, std::forward<Token>(token));
-        }
-        return compose_one(error_code{}, sink->get_executor(), std::forward<Token>(token),
-                           [sink, data = std::move(data)](WriteCompletion done) mutable {
-                               sink->send_last(std::move(data), std::move(done));
-                           });
+        return asio::async_initiate<Token, void(error_code)>(
+            initiator([this, data = std::move(data)](auto handler) mutable {
+                note_activity();
+                auto sink = m_writer;
+                // Trailer fields accumulated with trailer() end the response
+                // instead of the final body chunk, so a finish() after them
+                // still emits them.
+                if (!m_trailers.empty()) {
+                    const error_code pre =
+                        m_field_rejected ? make_error_code(asio::error::invalid_argument) : error_code{};
+                    auto trailers = std::move(m_trailers);
+                    compose_finish_trailers(pre, std::move(data), std::move(trailers), sink, std::move(handler));
+                    return;
+                }
+                compose_one(error_code{}, sink->get_executor(), std::move(handler),
+                            [sink, data = std::move(data)](WriteCompletion done) mutable {
+                                sink->send_last(std::move(data), std::move(done));
+                            });
+            }),
+            token);
     }
 
     ResponseWriter &trailer(std::string_view name, std::string value) {
@@ -264,23 +299,31 @@ class ResponseWriter {
     // Ends a streamed response with the given trailing field section, replacing
     // the final finish(). Completion signature: void(error_code).
     template <typename Token> auto async_finish_trailers(Headers trailers, Token &&token) {
-        for (const auto &[name, value] : trailers) {
-            // Same rule as trailer(): a field name must be a token, and a field
-            // value must not carry control bytes other than HTAB.
-            if (!is_http_token(name) || contains_invalid_field_value(value)) {
-                SIMPLE_HTTP_ERROR_LOG("response trailer with invalid name/value rejected");
-                m_field_rejected = true;
-                break;
-            }
-        }
-        note_activity();
-        auto sink = m_writer;
-        const error_code pre = m_field_rejected ? make_error_code(asio::error::invalid_argument) : error_code{};
-        return compose_finish_trailers(pre, std::string{}, std::move(trailers), sink, std::forward<Token>(token));
+        return asio::async_initiate<Token, void(error_code)>(
+            initiator([this, trailers = std::move(trailers)](auto handler) mutable {
+                for (const auto &[name, value] : trailers) {
+                    // Same rule as trailer(): a field name must be a token, and a field
+                    // value must not carry control bytes other than HTAB.
+                    if (!is_http_token(name) || contains_invalid_field_value(value)) {
+                        SIMPLE_HTTP_ERROR_LOG("response trailer with invalid name/value rejected");
+                        m_field_rejected = true;
+                        break;
+                    }
+                }
+                note_activity();
+                auto sink = m_writer;
+                const error_code pre = m_field_rejected ? make_error_code(asio::error::invalid_argument) : error_code{};
+                compose_finish_trailers(pre, std::string{}, std::move(trailers), sink, std::move(handler));
+            }),
+            token);
     }
 
     template <typename Token> auto async_finish_trailers(Token &&token) {
-        return async_finish_trailers(std::move(m_trailers), std::forward<Token>(token));
+        return asio::async_initiate<Token, void(error_code)>(initiator([this](auto handler) mutable {
+                                                                 async_finish_trailers(std::move(m_trailers),
+                                                                                       std::move(handler));
+                                                             }),
+                                                             token);
     }
 
     // --- connection state ---
@@ -308,9 +351,15 @@ class ResponseWriter {
     }
 
     template <typename Token> auto async_sse_begin(Token &&token) {
-        header(field::content_type, "text/event-stream; charset=utf-8");
-        header("cache-control", "no-cache");
-        return async_begin(std::forward<Token>(token));
+        // The SSE headers are part of the operation: a deferred token must not
+        // mutate the response before it is invoked.
+        return asio::async_initiate<Token, void(error_code)>(initiator([this](auto handler) mutable {
+                                                                 header(field::content_type,
+                                                                        "text/event-stream; charset=utf-8");
+                                                                 header("cache-control", "no-cache");
+                                                                 async_begin(std::move(handler));
+                                                             }),
+                                                             token);
     }
     template <typename Token>
     auto async_sse_event(std::string data, std::string event, std::string id, std::string retry, Token &&token) {
@@ -348,6 +397,13 @@ class ResponseWriter {
     }
 
   private:
+    // Cancellation token adapters such as asio::cancel_after query the
+    // initiation object for get_executor() to build their timer; a plain
+    // lambda has none. Keep the sink's executor on the initiation.
+    template <typename F> auto initiator(F &&fn) const {
+        return detail::make_executor_initiation(std::forward<F>(fn), m_writer->get_executor());
+    }
+
     // cookie-octet = %x21 / %x23-2B / %x2D-3A / %x3C-5B / %x5D-7E
     static bool valid_cookie_value(std::string_view value) noexcept {
         for (unsigned char c : value) {

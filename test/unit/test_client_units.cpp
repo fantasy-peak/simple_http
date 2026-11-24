@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "../support/static_fixture.h"
 #include "simple_http.h"
 #include "test_support.h"
 #include <simple_http/core/asio_compat.h>
@@ -727,4 +728,120 @@ TEST_CASE("client: a refused stream keeps its retryable error", "[client]") {
     const auto ec = outcome_error(outcome);
     CHECK(ec == make_error_code(client_errc::stream_refused));
     CHECK(is_retryable(ec));
+}
+
+namespace {
+
+// A ClientStream that records whether the completion handler it receives still
+// carries the caller's cancellation slot.
+class SlotProbeStream final : public ClientStream {
+  public:
+    explicit SlotProbeStream(asio::any_io_executor ex) : m_ex(std::move(ex)) {}
+
+    void write(std::string data, WriteCompletion done) override {
+        slot_connected = asio::get_associated_cancellation_slot(done).is_connected();
+        body += data;
+        std::move(done)(error_code{});
+    }
+    void finish(std::string data, WriteCompletion done) override {
+        slot_connected = asio::get_associated_cancellation_slot(done).is_connected();
+        body += data;
+        finish_called = true;
+        std::move(done)(error_code{});
+    }
+    void read(ReadCompletion done) override {
+        slot_connected = asio::get_associated_cancellation_slot(done).is_connected();
+        std::move(done)(error_code{}, ReadResult{std::string{"data: hello\n\n"}, false});
+    }
+    void cancel(WriteCompletion done) override { std::move(done)(error_code{}); }
+    void await_head(WriteCompletion done) override { std::move(done)(error_code{}); }
+    asio::any_io_executor head_executor() const override { return m_ex; }
+    bool finished() const override { return finish_called; }
+    Version version() const override { return Version::Http11; }
+    std::uint32_t id() const override { return 1; }
+
+    asio::any_io_executor m_ex;
+    std::string body;
+    bool slot_connected{false};
+    bool finish_called{false};
+};
+
+} // namespace
+
+TEST_CASE("client/sse: async_next forwards the caller's cancellation slot", "[client][sse][token]") {
+    asio::io_context ctx;
+    auto probe = std::make_shared<SlotProbeStream>(ctx.get_executor());
+    auto stream = std::make_shared<Stream>(probe);
+    auto sse = std::make_shared<SseStream>(stream);
+
+    asio::cancellation_signal signal;
+    bool got = false;
+    std::string data;
+    sse->async_next(asio::bind_cancellation_slot(signal.slot(), [&](error_code ec, SseEvent event) {
+        got = true;
+        CHECK_FALSE(ec);
+        data = event.data;
+    }));
+    ctx.run();
+    CHECK(got);
+    CHECK(data == "hello");
+    CHECK(probe->slot_connected);
+}
+
+TEST_CASE("client/multipart: stream_file_body forwards the caller's cancellation slot", "[client][multipart][token]") {
+    StaticFixture fixture;
+    fixture.write("upload/a.txt", "hello");
+
+    asio::io_context ctx;
+    auto probe = std::make_shared<SlotProbeStream>(ctx.get_executor());
+    auto stream = std::make_shared<Stream>(probe);
+
+    asio::cancellation_signal signal;
+    bool done = false;
+    async_stream_file_body(stream, fixture.root_string() + "/upload/a.txt", 4,
+                           asio::bind_cancellation_slot(signal.slot(), [&](error_code ec) {
+                               done = true;
+                               CHECK_FALSE(ec);
+                           }));
+    ctx.run();
+    CHECK(done);
+    CHECK(probe->body == "hello");
+    CHECK(probe->slot_connected);
+}
+
+TEST_CASE("client/transport: async_error_only forwards the cancellation slot", "[client][token]") {
+    asio::io_context ctx;
+    asio::cancellation_signal signal;
+    bool slot_connected = false;
+    bool done = false;
+
+    detail::async_error_only(ctx.get_executor(),
+                             asio::bind_cancellation_slot(signal.slot(),
+                                                          [&](error_code ec) {
+                                                              done = true;
+                                                              CHECK_FALSE(ec);
+                                                          }),
+                             [&](auto completion) {
+                                 slot_connected = asio::get_associated_cancellation_slot(completion).is_connected();
+                                 std::move(completion)(error_code{}, std::size_t{0});
+                             });
+    ctx.run();
+
+    CHECK(done);
+    CHECK(slot_connected);
+}
+
+TEST_CASE("client/transport: tcp async_shutdown submits its completion", "[client][token]") {
+    asio::io_context ctx;
+    auto socket = std::make_shared<asio::ip::tcp::socket>(ctx);
+    TcpTransport<asio::ip::tcp::socket> transport{socket};
+
+    bool done = false;
+    transport.async_shutdown([&](error_code ec) {
+        done = true;
+        CHECK_FALSE(ec);
+    });
+    CHECK_FALSE(done); // posted to the transport executor
+    ctx.run();
+    CHECK(done);
 }

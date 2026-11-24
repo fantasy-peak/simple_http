@@ -15,6 +15,7 @@
 #include <utility>
 
 #include "../core/asio_compat.h"
+#include "../core/cancel.h"
 #include "../core/http_date.h"
 #include "../core/http_field.h"
 #include "../core/http_method.h"
@@ -37,9 +38,16 @@ auto async_maybe_not_modified(const RequestPtr &req, const ResponsePtr &res, std
             if (last_modified_unix > 0) {
                 res->header(field::last_modified, http_date(last_modified_unix));
             }
+            // The "not conditional" answers are decided synchronously, but an
+            // Asio operation must submit its completion rather than invoke it
+            // from inside the initiating function.
+            auto post_false = [req](auto done) {
+                auto ex = req->executor();
+                asio::post(ex, [done = std::move(done)]() mutable { std::move(done)(error_code{}, false); });
+            };
             const bool get_or_head = req->method() == Method::Get || req->method() == Method::Head;
             if (!get_or_head) {
-                std::move(handler)(error_code{}, false);
+                post_false(std::move(handler));
                 return;
             }
             bool not_modified = false;
@@ -50,12 +58,16 @@ auto async_maybe_not_modified(const RequestPtr &req, const ResponsePtr &res, std
                 not_modified = since.has_value() && last_modified_unix <= *since;
             }
             if (!not_modified) {
-                std::move(handler)(error_code{}, false);
+                post_false(std::move(handler));
                 return;
             }
             res->status(status::not_modified);
-            res->async_send_bodyless(
-                [handler = std::move(handler)](error_code ec) mutable { std::move(handler)(ec, true); });
+            // Forward the caller's cancellation slot to the 304 write, so an
+            // outer asio::cancel_after can abort it instead of waiting for the
+            // write to drain after the deadline.
+            auto slot = asio::get_associated_cancellation_slot(handler);
+            res->async_send_bodyless(forward_cancel_slot(
+                slot, [handler = std::move(handler)](error_code ec) mutable { std::move(handler)(ec, true); }));
         },
         token);
 }

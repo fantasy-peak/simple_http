@@ -70,9 +70,18 @@ template <typename Adapter> class Http2WsTransport {
         return async_read_some(buffer, std::forward<Token>(token));
     }
 
+    // The stream ends with END_STREAM and needs no extra close handshake, but
+    // the completion is still submitted to this transport's executor so it is
+    // not invoked from inside the initiating function.
     template <typename Token> auto async_shutdown(Token &&token) {
-        return asio::async_initiate<Token, void(error_code)>([](auto handler) { std::move(handler)(error_code{}); },
-                                                             token);
+        auto ex = get_executor();
+        return asio::async_initiate<Token, void(error_code)>(
+            detail::make_executor_initiation(
+                [ex](auto handler) mutable {
+                    asio::post(ex, [handler = std::move(handler)]() mutable { std::move(handler)(error_code{}); });
+                },
+                ex),
+            token);
     }
 
     void close() { m_adapter->close(); }

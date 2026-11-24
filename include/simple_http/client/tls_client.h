@@ -213,13 +213,43 @@ inline error_code apply_client_ssl_settings(SSL *ssl, const ClientTlsHandshake &
 // Templated on the transport, not hard-coded to TlsStreamTransport: an HTTPS
 // proxy needs a second TLS layer for the origin (NestedTlsTransport), and the
 // handshake is identical there.
+namespace tls_detail {
+
+// A single composed operation for both the pre-flight failure and the real
+// handshake. The previous two return statements produced different types for
+// tokens such as asio::deferred (async_initiate vs. the ssl stream's own
+// operation), so the function could not be instantiated with an arbitrary
+// completion token. The pre-flight error is posted, not completed inline.
+template <typename Transport> struct ClientHandshakeOp {
+    Transport *transport;
+    error_code pre;
+    bool started{false};
+
+    auto get_executor() { return transport->get_executor(); }
+
+    template <typename Self> void operator()(Self &self, error_code ec = {}) {
+        if (!started) {
+            started = true;
+            if (pre) {
+                auto ex = self.get_executor();
+                asio::post(ex, [self = std::move(self), ec = pre]() mutable { self.complete(ec); });
+                return;
+            }
+            transport->stream().async_handshake(asio::ssl::stream_base::client, std::move(self));
+            return;
+        }
+        self.complete(ec);
+    }
+};
+
+} // namespace tls_detail
+
 template <typename Transport, typename Token>
 auto async_tls_client_handshake(Transport &transport, const ClientTlsHandshake &hs, Token &&token) {
     SSL *ssl = transport.stream().native_handle();
-    if (error_code ec = apply_client_ssl_settings(ssl, hs)) {
-        return asio::async_initiate<Token, void(error_code)>([ec](auto handler) { std::move(handler)(ec); }, token);
-    }
-    return transport.stream().async_handshake(asio::ssl::stream_base::client, std::forward<Token>(token));
+    const error_code pre = apply_client_ssl_settings(ssl, hs);
+    return asio::async_compose<Token, void(error_code)>(tls_detail::ClientHandshakeOp<Transport>{&transport, pre},
+                                                        token, transport.get_executor());
 }
 
 // Client TLS handshake bounded by the dial budget. Closing the transport on

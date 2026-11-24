@@ -4,7 +4,7 @@
 //
 // The parser is pure and unit-testable; SseStream ties it to a Client exchange:
 //
-//   client.async_open_sse(url, opts, [](error_code ec, std::shared_ptr<SseStream> sse) { ... });
+//   SseStream::async_open(client, url, opts, [](error_code ec, std::shared_ptr<SseStream> sse) { ... });
 //   sse->async_next([](error_code ec, SseEvent event) { ... });
 //
 // End-of-stream surfaces as asio::error::eof so the caller decides whether to
@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "../core/asio_compat.h"
+#include "../core/cancel.h"
 #include "../proto/body.h"
 #include "http.h"
 
@@ -209,41 +210,51 @@ class SseStream : public std::enable_shared_from_this<SseStream> {
                 if (!options.last_event_id.empty())
                     spec.headers.add("last-event-id", options.last_event_id);
                 const bool require_event_stream = options.require_event_stream;
+                // The open is a chain of three initiating functions. Bind the
+                // caller's cancellation slot to every continuation, otherwise
+                // an outer asio::cancel_after can never reach the in-flight
+                // dial/write/head read.
+                auto slot = asio::get_associated_cancellation_slot(handler);
                 client.async_open_stream(
                     std::move(url), std::move(spec), 0,
-                    [require_event_stream, handler = std::move(handler)](error_code ec,
-                                                                         std::shared_ptr<Stream> stream) mutable {
+                    forward_cancel_slot(slot, [require_event_stream, slot, handler = std::move(handler)](
+                                                  error_code ec, std::shared_ptr<Stream> stream) mutable {
                         if (ec) {
                             std::move(handler)(ec, nullptr);
                             return;
                         }
-                        stream->async_finish(std::string{}, [stream, require_event_stream,
-                                                             handler = std::move(handler)](error_code fec) mutable {
-                            if (fec) {
-                                std::move(handler)(fec, nullptr);
-                                return;
-                            }
-                            stream->async_read_head([stream, require_event_stream, handler = std::move(handler)](
-                                                        error_code hec, detail::ResponseHead head) mutable {
-                                if (hec) {
-                                    std::move(handler)(hec, nullptr);
+                        stream->async_finish(
+                            std::string{},
+                            forward_cancel_slot(slot, [stream, require_event_stream, slot,
+                                                       handler = std::move(handler)](error_code fec) mutable {
+                                if (fec) {
+                                    std::move(handler)(fec, nullptr);
                                     return;
                                 }
-                                if (head.status != status::ok) {
-                                    std::move(handler)(make_error_code(asio::error::invalid_argument), nullptr);
-                                    return;
-                                }
-                                if (require_event_stream) {
-                                    const auto content_type = head.header("content-type");
-                                    if (!content_type || !icontains_ci(*content_type, "text/event-stream")) {
-                                        std::move(handler)(make_error_code(asio::error::invalid_argument), nullptr);
-                                        return;
-                                    }
-                                }
-                                std::move(handler)(error_code{}, std::make_shared<SseStream>(std::move(stream)));
-                            });
-                        });
-                    });
+                                stream->async_read_head(forward_cancel_slot(
+                                    slot, [stream, require_event_stream, handler = std::move(handler)](
+                                              error_code hec, detail::ResponseHead head) mutable {
+                                        if (hec) {
+                                            std::move(handler)(hec, nullptr);
+                                            return;
+                                        }
+                                        if (head.status != status::ok) {
+                                            std::move(handler)(make_error_code(asio::error::invalid_argument), nullptr);
+                                            return;
+                                        }
+                                        if (require_event_stream) {
+                                            const auto content_type = head.header("content-type");
+                                            if (!content_type || !icontains_ci(*content_type, "text/event-stream")) {
+                                                std::move(handler)(make_error_code(asio::error::invalid_argument),
+                                                                   nullptr);
+                                                return;
+                                            }
+                                        }
+                                        std::move(handler)(error_code{},
+                                                           std::make_shared<SseStream>(std::move(stream)));
+                                    }));
+                            }));
+                    }));
             },
             token);
     }
@@ -251,8 +262,10 @@ class SseStream : public std::enable_shared_from_this<SseStream> {
     template <typename Token> auto async_next(Token &&token) {
         return asio::async_initiate<Token, void(error_code, SseEvent)>(
             [self = this->shared_from_this()](auto handler) mutable {
+                auto slot = asio::get_associated_cancellation_slot(handler);
                 self->next_impl(
-                    std::make_shared<asio::any_completion_handler<void(error_code, SseEvent)>>(std::move(handler)));
+                    std::make_shared<asio::any_completion_handler<void(error_code, SseEvent)>>(std::move(handler)),
+                    slot);
             },
             token);
     }
@@ -267,7 +280,11 @@ class SseStream : public std::enable_shared_from_this<SseStream> {
     [[nodiscard]] bool eof() const noexcept { return m_eof && m_pending.empty(); }
 
   private:
-    void next_impl(std::shared_ptr<asio::any_completion_handler<void(error_code, SseEvent)>> done) {
+    void next_impl(std::shared_ptr<asio::any_completion_handler<void(error_code, SseEvent)>> done,
+                   asio::cancellation_slot slot) {
+        // A buffered event or an already-seen EOF completes inline: SseStream
+        // has no executor accessor to post to. Socket-backed reads are async
+        // and carry `slot`.
         for (;;) {
             if (!m_pending.empty()) {
                 SseEvent event = std::move(m_pending.front());
@@ -284,27 +301,28 @@ class SseStream : public std::enable_shared_from_this<SseStream> {
                 return;
             }
             auto self = this->shared_from_this();
-            m_stream->async_read([self, done = std::move(done)](error_code ec, ReadResult chunk) mutable {
-                if (ec) {
-                    auto callback = std::move(*done);
-                    std::move(callback)(ec, SseEvent{});
-                    return;
-                }
-                if (chunk.eof) {
-                    self->m_eof = true;
-                    for (auto &event : self->m_parser.finish())
-                        self->m_pending.push_back(std::move(event));
-                } else {
-                    for (auto &event : self->m_parser.feed(chunk.data))
-                        self->m_pending.push_back(std::move(event));
-                }
-                if (self->m_parser.overflowed()) {
-                    auto callback = std::move(*done);
-                    std::move(callback)(make_error_code(asio::error::message_size), SseEvent{});
-                    return;
-                }
-                self->next_impl(std::move(done));
-            });
+            m_stream->async_read(forward_cancel_slot(
+                slot, [self, done = std::move(done), slot](error_code ec, ReadResult chunk) mutable {
+                    if (ec) {
+                        auto callback = std::move(*done);
+                        std::move(callback)(ec, SseEvent{});
+                        return;
+                    }
+                    if (chunk.eof) {
+                        self->m_eof = true;
+                        for (auto &event : self->m_parser.finish())
+                            self->m_pending.push_back(std::move(event));
+                    } else {
+                        for (auto &event : self->m_parser.feed(chunk.data))
+                            self->m_pending.push_back(std::move(event));
+                    }
+                    if (self->m_parser.overflowed()) {
+                        auto callback = std::move(*done);
+                        std::move(callback)(make_error_code(asio::error::message_size), SseEvent{});
+                        return;
+                    }
+                    self->next_impl(std::move(done), slot);
+                }));
             return;
         }
     }

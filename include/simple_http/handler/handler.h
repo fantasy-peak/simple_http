@@ -38,6 +38,7 @@
 #include <vector>
 
 #include "../core/asio_compat.h"
+#include "../core/cancel.h"
 #include "../engine/dispatcher.h"
 
 #if defined(SIMPLE_HTTP_HAS_CO_AWAIT)
@@ -87,15 +88,21 @@ struct AwaitNextOp {
     SslHandle ssl;
 
     template <typename Self> void operator()(Self &self) {
+        // Carry the composed operation's cancellation slot into the rest of
+        // the chain. A bare lambda would drop it, so an outer asio::cancel_after
+        // could not reach downstream operations anymore.
+        auto slot = asio::get_associated_cancellation_slot(self);
         (*next)(std::move(req), std::move(res), ssl,
-                HandlerCompletion([self = std::move(self)]() mutable { self.complete(); }));
+                HandlerCompletion(forward_cancel_slot(slot, [self = std::move(self)]() mutable { self.complete(); })));
     }
 };
 
 template <typename Token> auto async_next(Next next, RequestPtr req, ResponsePtr res, SslHandle ssl, Token &&token) {
+    // `async_compose` takes the token as `type_identity_t<Token>&`, so it must
+    // be an lvalue. Forwarding here would reject prvalue tokens such as
+    // asio::as_tuple(asio::use_awaitable).
     return asio::async_compose<Token, void()>(
-        AwaitNextOp{std::make_shared<Next>(std::move(next)), std::move(req), std::move(res), ssl},
-        std::forward<Token>(token));
+        AwaitNextOp{std::make_shared<Next>(std::move(next)), std::move(req), std::move(res), ssl}, token);
 }
 
 inline CoroNext make_coro_next(Next next) {
