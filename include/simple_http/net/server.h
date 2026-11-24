@@ -321,7 +321,10 @@ class Server {
             cfg.address = *m_cfg.listen;
             cfg.tls = m_cfg.tls;
             cfg.max_connections = m_cfg.max_connections;
-            cfg.limits = m_cfg.limits;
+            // Leave `limits` empty: the implicit listener inherits the server
+            // defaults when limits are resolved, after every transport has
+            // bound. Copying them here would freeze the value before the QUIC
+            // port (and therefore Alt-Svc) is known.
             cfg.tcp_nodelay = m_cfg.tcp_nodelay;
             cfg.socket_setup = m_cfg.socket_setup;
             cfg.listener_setup = m_cfg.listener_setup;
@@ -341,7 +344,6 @@ class Server {
 
         auto core = std::make_shared<Core>();
         core->router = m_router;
-        core->limits = m_cfg.limits;
         core->pool = std::make_shared<IoCtxPool>(m_cfg.worker_threads);
         core->workers.resize(core->pool->size());
         store_core(core);
@@ -491,9 +493,11 @@ class Server {
         }
 
         m_listeners = std::move(started);
+        // Phase 1: bind every transport. TCP acceptors are already bound above;
+        // QUIC sockets bind here. Nothing is served yet.
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
         if (m_cfg.quic) {
-            const auto err = start_quic_listener(core);
+            const auto err = bind_quic_listener(core);
             if (err) {
                 report.failures.push_back(ListenerFailure{"quic", make_error_code(*err)});
                 if (policy == StartPolicy::AllOrNothing) {
@@ -505,6 +509,14 @@ class Server {
                 }
             }
         }
+#endif
+        // Phase 2: resolve the effective limits now that every bound port is
+        // known (Alt-Svc names the real QUIC port). The result is read-only
+        // from here on: engines copy it when a connection is created.
+        resolve_listener_limits();
+        // Phase 3: start serving.
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+        start_quic_serving();
 #endif
         for (auto &listener : m_listeners) {
             for (const auto &slot : listener->acceptors) {
@@ -601,7 +613,6 @@ class Server {
   private:
     struct Core {
         std::shared_ptr<Router> router;
-        EngineLimits limits;
         Dispatcher dispatch;
         WsLookup ws_exact;
         WsProxyLookup ws_proxy;
@@ -719,6 +730,10 @@ class Server {
         std::shared_ptr<Core> core;
         std::atomic<bool> *stopping{nullptr};
         std::size_t max_connections{0};
+        // Resolved once every transport has bound (Alt-Svc needs the real QUIC
+        // port) and never mutated afterwards. Worker threads only copy it when
+        // an h1/h2 engine is created for a new connection.
+        EngineLimits limits;
         // Connections currently served by this listener. Shared so a release
         // callback still decrements it after the listener itself is gone.
         std::shared_ptr<std::atomic<std::size_t>> active{std::make_shared<std::atomic<std::size_t>>(0)};
@@ -843,7 +858,7 @@ class Server {
             // this phase; closing the transport unwinds the pending handshake.
             auto handshake_timer = std::make_shared<asio::steady_timer>(transport->get_executor());
             auto handshake_done = std::make_shared<std::atomic<bool>>(false);
-            const auto handshake_timeout = listener_limits(listener).idle_timeout;
+            const auto handshake_timeout = listener->limits.idle_timeout;
             if (handshake_timeout.count() > 0) {
                 handshake_timer->expires_after(handshake_timeout);
                 handshake_timer->async_wait([transport, handshake_done](error_code tec) {
@@ -938,7 +953,7 @@ class Server {
             }
             run_h1(alive, std::move(transport), std::string{bytes}, alive->h2c_upgrade, closer);
         };
-        const auto idle = listener_limits(listener).idle_timeout;
+        const auto idle = listener->limits.idle_timeout;
         if (idle.count() > 0) {
             transport->async_read(ByteSpan{buffer->data(), buffer->size()},
                                   asio::cancel_after(idle, std::move(on_read)));
@@ -947,10 +962,32 @@ class Server {
         }
     }
 
-    // TCP listener config carries an optional EngineLimits override; without
-    // this every listener silently used ServerConfig::limits.
-    static EngineLimits listener_limits(const std::shared_ptr<ListenerState> &listener) {
-        return listener->cfg.limits.value_or(listener->core->limits);
+    // Called once, after every transport has bound. The base is the listener's
+    // own override when it has one, otherwise the server defaults; Alt-Svc is
+    // then filled in from the QUIC port that actually bound. An explicit
+    // Alt-Svc (server-wide or per listener) wins — auto mode only fills an
+    // empty value. render_alt_svc() honours the h3_alt_svc / max-age knobs of
+    // whichever limits won.
+    void resolve_listener_limits() {
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+        const std::uint16_t quic_port = m_quic_port.load(std::memory_order_acquire);
+        for (auto &rt : m_quic_runtimes) {
+            EngineLimits limits = m_cfg.limits;
+            if (m_cfg.auto_alt_svc && limits.alt_svc.empty()) {
+                limits.alt_svc = limits.render_alt_svc(quic_port);
+            }
+            *rt->limits = std::move(limits);
+        }
+#endif
+        for (auto &listener : m_listeners) {
+            EngineLimits limits = listener->cfg.limits ? *listener->cfg.limits : m_cfg.limits;
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+            if (m_cfg.auto_alt_svc && limits.alt_svc.empty()) {
+                limits.alt_svc = limits.render_alt_svc(quic_port);
+            }
+#endif
+            listener->limits = std::move(limits);
+        }
     }
 
     template <typename Transport>
@@ -961,7 +998,7 @@ class Server {
         auto ws_exact = core->ws_exact;
         auto ws_proxy = core->ws_proxy;
         auto ws_regex = core->ws_regex;
-        auto engine = std::make_shared<Http1Engine<Transport>>(transport, listener_limits(listener));
+        auto engine = std::make_shared<Http1Engine<Transport>>(transport, listener->limits);
         engine->allow_h2c_upgrade(allow_h2c);
         std::weak_ptr<Core> weak_core = core;
         // Keep the closer alive for the whole connection: the registry only
@@ -982,7 +1019,7 @@ class Server {
         auto ws_exact = core->ws_exact;
         auto ws_proxy = core->ws_proxy;
         auto ws_regex = core->ws_regex;
-        auto engine = std::make_shared<Http2Engine<Transport>>(transport, listener_limits(listener));
+        auto engine = std::make_shared<Http2Engine<Transport>>(transport, listener->limits);
         std::weak_ptr<Core> weak_core = core;
         auto active = listener->active;
         engine->run(std::move(dispatch), std::move(initial), std::move(ws_exact), std::move(ws_proxy),
@@ -1002,28 +1039,37 @@ class Server {
         std::shared_ptr<std::atomic<std::size_t>> active;
         std::shared_ptr<quic::SharedCidRegistry<QuicConnectionType>> cids;
         std::vector<std::shared_ptr<QuicEndpointType>> endpoints;
-        EngineLimits limits;
+        // Shared with the serve callback: the endpoints are constructed while
+        // binding, but the limits are only final after the bound port is known
+        // (Alt-Svc). Phase 2 writes it once, before any endpoint starts, and
+        // every h3 engine copies the value when a connection arrives.
+        std::shared_ptr<EngineLimits> limits;
     };
 
-    typename QuicEndpointType::ServeFn make_h3_serve(EngineLimits limits) {
+    typename QuicEndpointType::ServeFn make_h3_serve(std::shared_ptr<EngineLimits> limits) {
         auto router = m_router;
-        return [router, limits](std::shared_ptr<QuicConnectionType> conn, std::function<void()> done) {
-            auto engine = std::make_shared<Http3Engine<QuicConnectionType>>(conn, limits);
+        auto serve = [router, limits = std::move(limits)](std::shared_ptr<QuicConnectionType> conn,
+                                                          std::function<void()> done) {
+            auto engine = std::make_shared<Http3Engine<QuicConnectionType>>(conn, *limits);
             auto dispatch = [router](RequestPtr req, ResponsePtr res, SslHandle ssl, HandlerCompletion completion) {
                 router->dispatch(std::move(req), std::move(res), ssl, std::move(completion));
             };
             engine->run(std::move(dispatch), std::move(done));
         };
+        return serve;
     }
 
-    std::optional<server_errc> start_quic_listener(const std::shared_ptr<Core> &core) {
+    // Binds the UDP sockets and records the port, but does not start the
+    // receive loops: the server resolves Alt-Svc (which needs that port) first
+    // and only then calls start_quic_serving().
+    std::optional<server_errc> bind_quic_listener(const std::shared_ptr<Core> &core) {
         if (!m_cfg.tls) {
             SIMPLE_HTTP_ERROR_LOG("server: HTTP/3 needs TLS (QUIC has no plaintext mode)");
             return server_errc::invalid_config;
         }
         auto rt = std::make_shared<QuicRuntime>();
         rt->address = *m_cfg.quic;
-        rt->limits = m_cfg.limits;
+        rt->limits = std::make_shared<EngineLimits>(m_cfg.limits);
         try {
             rt->tls = std::make_shared<quic::QuicTlsContext>(*m_cfg.tls);
         } catch (const std::exception &e) {
@@ -1086,20 +1132,22 @@ class Server {
                     return server_errc::bind_failed;
                 }
             }
-            quic->start();
             rt->endpoints.push_back(std::move(quic));
         }
         const std::uint16_t bound_port = rt->endpoints.empty() ? 0 : rt->endpoints.front()->port();
         m_quic_port.store(bound_port, std::memory_order_release);
-        if (m_cfg.auto_alt_svc && bound_port != 0) {
-            // Every engine renders Alt-Svc from the shared limits, so setting it
-            // here makes h1/h2 responses point clients at this QUIC listener.
-            core->limits.alt_svc = core->limits.render_alt_svc(bound_port);
-        }
         SIMPLE_HTTP_INFO_LOG("listening on udp {}:{} (quic, alpn=h3, sockets={})", rt->address.host, rt->address.port,
                              rt->endpoints.size());
         m_quic_runtimes.push_back(std::move(rt));
         return std::nullopt;
+    }
+
+    void start_quic_serving() {
+        for (auto &rt : m_quic_runtimes) {
+            for (auto &endpoint : rt->endpoints) {
+                endpoint->start();
+            }
+        }
     }
 #endif
 
