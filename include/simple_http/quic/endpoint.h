@@ -601,6 +601,14 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
         // The Initial itself still has to be delivered — it carries the
         // ClientHello. Our own Source Connection ID is already in the table:
         // `init()` walks the IDs ngtcp2 pre-allocated and registers each one.
+        //
+        // The client's initial DCID must route here too. A ClientHello that
+        // carries a large PSK (or many extensions) is split across several
+        // Initial packets; all of them — and any Initial retransmission — use
+        // the same client-chosen DCID, not one of our server SCIDs yet. Without
+        // this entry each fragment looks like a new connection, the ClientHello
+        // is never reassembled, and no session ticket is ever decrypted.
+        associate_cid(span<const std::uint8_t>{vc.dcid, vc.dcidlen}, std::weak_ptr<Connection>(conn));
         m_live.push_back(conn);
         conn->on_datagram(data, remote);
 

@@ -44,19 +44,19 @@ PORT_H3=7792
 EXPECT_H2SPEC_PASSED=146
 EXPECT_H1SPEC_TOTAL=33
 EXPECT_H3SPEC_TOTAL=49
-# 46/49 是 0-RTT 开启后的稳定值。三条失败：
-#   * TLS 8.2 的两个变体：h3spec 客户端钩子摘掉 quic_transport_parameters，
-#     期望服务端用 0x016d 关闭。服务端确实发了（-d 可见
-#     "receiver: TransportErrorIsReceived TLSMissingExtension"），但动作随后
-#     仍被 2s 超时 AsyncCancelled 取消——套件客户端侧的时序/断言问题。
-#   * TLS 8.3 "CRYPTO in 0-RTT"：h3spec 的 0-RTT 客户端没有把我们的 OpenSSL
-#     session ticket 回传（服务端日志无 decrypt_ticket / 无 0-RTT rx key），
-#     因此只能超时。参考实现 quic-go 在 Allow0RTT=true 时也过不了这条：它返回
-#     FRAME_ENCODING_ERROR，而 h3spec 只接受 PROTOCOL_VIOLATION。该用例不是
-#     有效的跨实现 0-RTT 门线；真实 0-RTT 数据路径由 test/diff/0rtt/ 套件覆盖。
-# 关闭 0-RTT 时该用例会 pending（总数仍 49，passed 47）；合规夹具保持 0-RTT
-# 开启，以便合规构建也覆盖 0-RTT 的真实监听配置。
-EXPECT_H3SPEC_PASSED=46
+# 47/49 是 0-RTT 开启后的稳定值（同一二进制连跑多次一致）。剩下两条是同一个
+# TLS 8.2 用例的两个变体：h3spec 的客户端钩子把 ClientHello 里的
+# quic_transport_parameters 扩展摘掉，期望服务端用 0x016d 关闭。服务端确实发了
+# （-d 可见 "receiver: TransportErrorIsReceived TLSMissingExtension"），但该用例
+# 的动作随后仍被 2s 超时 AsyncCancelled 取消，HUnit 的 shouldThrow 看到的不是
+# 异常，于是判失败——这是套件客户端侧的时序/断言问题，不是服务端行为差异。
+# 服务端侧按 RFC 9001 §8.2 的实现见 quic/connection.h（OpenSSL 4 的 QUIC-TLS
+# 与 ngtcp2_crypto_ossl 都不做这个检查，所以由本库补上）。
+#
+# TLS 8.3 "CRYPTO in 0-RTT" passes with 0-RTT enabled because the endpoint
+# routes the client's initial DCID to the connection; a ClientHello split
+# across Initial packets is reassembled and its session ticket is decrypted.
+EXPECT_H3SPEC_PASSED=47
 
 # h3spec 的二进制名带平台后缀（release 资产就叫 h3spec-linux-x86_64），所以这里
 # 按名字查而不是猜路径。

@@ -912,9 +912,9 @@ test/external/stress/run.sh both
 
 - h2spec：`failed == 0` 且 `passed >= 146`；
 - h1spec：总用例 33，必须全部通过；
-- h3spec：总用例 49，`passed >= 46`（0-RTT 开启；TLS 8.3 的 CRYPTO-in-0-RTT
-  是已知失败，quic-go 在 Allow0RTT=true 时同样失败并返回 FRAME_ENCODING_ERROR；
-  真实 0-RTT 由 `0rtt` 套件覆盖）；
+- h3spec：总用例 49，`passed >= 47`（含 0-RTT 开启；剩余两条是 TLS 8.2
+  客户端超时断言问题。TLS 8.3 的 CRYPTO-in-0-RTT 通过初始 DCID 路由修复后
+  能正确返回 PROTOCOL_VIOLATION）；
 - Autobahn：`FAILED == 0` 且 `NON-STRICT == 0`；
 - 压力：连接复用 200/200；每个响应档位 `failed == 0` 且 `errored == 0`；
   h1 k6 `errors == 0`；WebSocket `recv == ITERS × WANT`（默认 1,200,000）。
@@ -1240,6 +1240,12 @@ test/run.sh server-diff
     请求子槽优先用 `cancellation_registration()` 并在完成时释放，
     `active_cancellation_slots()` 必须回到 0。`core/cancel.h`；
     `test/unit/test_cancellation.cpp` 的 registration 用例。
+
+56. **QUIC endpoint 必须路由客户端的初始 DCID**：ClientHello 较大时（例如
+    携带 PSK/ticket）会被拆成多个 Initial 包，重传也使用同一个客户端初始
+    DCID；endpoint 只注册服务端 SCID 会让后续分片被当成新连接，ClientHello
+    永远不完整、ticket 从不被解密。新连接建立后要把 `vc.dcid` 关联到连接。
+    `quic/endpoint.h`；h3spec TLS 8.3 / `0rtt`。
 
 ---
 
