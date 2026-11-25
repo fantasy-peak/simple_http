@@ -186,8 +186,14 @@ class QuicTlsContext {
         const bool compatible =
             present && self->m_early.validate_ticket_appdata &&
             self->m_early.validate_ticket_appdata(std::string_view{static_cast<const char *>(data), len});
-        if (!compatible)
-            return renew ? SSL_TICKET_RETURN_IGNORE_RENEW : SSL_TICKET_RETURN_IGNORE;
+        if (!compatible) {
+            // Full handshake, but always ask OpenSSL for a fresh ticket.
+            // SSL_TICKET_RETURN_IGNORE suppresses renewal, so a client that
+            // keeps offering the stale SETTINGS snapshot would never receive a
+            // compatible one and could not use 0-RTT again until the old ticket
+            // expired on its own.
+            return SSL_TICKET_RETURN_IGNORE_RENEW;
+        }
         return renew ? SSL_TICKET_RETURN_USE_RENEW : SSL_TICKET_RETURN_USE;
     }
 

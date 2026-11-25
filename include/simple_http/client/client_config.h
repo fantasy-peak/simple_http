@@ -414,12 +414,12 @@ struct ClientConfig {
     // caller did not set it), the method is not HEAD, and the request has no
     // Range header. Set false for Go's DisableCompression behaviour, or set
     // Accept-Encoding yourself to keep the response opaque.
+    bool auto_decompress{true};
     // Offer HTTP/3 0-RTT for requests that opt in (GET/HEAD sentinels or
     // allow_0rtt) when a resumed session exists. Requires a client-owned TLS
     // context; shared_context disables it because the new-session callback is
     // installed on the context.
     bool h3_enable_0rtt{true};
-    bool auto_decompress{true};
     // Encodings advertised when auto_decompress is on, most preferred first.
     // Go's Transport only negotiates gzip, so gzip is the default. Add "br" to
     // opt into brotli (a simple_http extension). Only encodings this build can

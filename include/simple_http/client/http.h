@@ -1554,6 +1554,7 @@ inline void Client::dial(const detail::Url &url, HttpVersionPolicy version, bool
         return;
 #else
         (void)allow_0rtt;
+        (void)early;
         std::move(done)(make_error_code(client_errc::version_not_negotiated), nullptr);
         return;
 #endif
@@ -2182,9 +2183,14 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
                        error_code dec, std::shared_ptr<detail::ClientSession> session) mutable {
                        // The session already took the request and its completion;
                        // completing it again (even on cancellation) would invoke a
-                       // moved-from handler.
-                       if (early && early->submitted)
+                       // moved-from handler. Still cache the connection: the
+                       // early stream runs on it, and returning before cache()
+                       // left every 0-RTT request without a reusable session.
+                       if (early && early->submitted) {
+                           if (!dec && session)
+                               self->cache(origin, session);
                            return;
+                       }
                        auto fail = [&](error_code ec) {
                            if (early)
                                std::move(early->done)(ec, nullptr);
@@ -2201,8 +2207,6 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
                        }
                        self->cache(origin, session);
                        if (early) {
-                           if (early->submitted)
-                               return; // the session opened it from the 0-RTT keys
                            session->open_stream(std::move(early->request), std::move(early->done));
                        } else {
                            session->open_stream(request, std::move(open_done));

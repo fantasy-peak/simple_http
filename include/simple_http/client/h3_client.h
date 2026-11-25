@@ -703,10 +703,11 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         }
         auto wake = st.in_space;
         auto outcome = st.outcome;
+        auto handle = st.handle;
         auto self = this->shared_from_this();
         auto slot = asio::get_associated_cancellation_slot(done);
-        wake->async_receive(
-            asio::bind_cancellation_slot(slot, [self, id, outcome, done = std::move(done)](error_code ec) mutable {
+        wake->async_receive(asio::bind_cancellation_slot(
+            slot, [self, id, outcome, handle, done = std::move(done)](error_code ec) mutable {
                 // A wake (state change) arrives with no error. Anything else is
                 // a cancelled/failed wait -- typically the caller's deadline
                 // cancelling this operation -- and re-waiting would spin under
@@ -722,6 +723,23 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
                         std::move(done)(outcome_error(*outcome));
                     } else {
                         std::move(done)(ec);
+                    }
+                    return;
+                }
+                auto it = self->m_streams.find(id);
+                if (it == self->m_streams.end() || it->second->outcome != outcome) {
+                    // This stream retired while the await was parked (a 0-RTT
+                    // rejection discards every early stream at once, and the id
+                    // may already have been recycled for a new exchange). A head
+                    // published before retirement is still the answer; otherwise
+                    // report the captured terminal outcome instead of "no such
+                    // stream". Matching the outcome object, not just the id, is
+                    // what keeps a recycled id from delivering another
+                    // exchange's head here.
+                    if (auto h = handle.lock(); h && h->head_ptr()) {
+                        std::move(done)(error_code{});
+                    } else {
+                        std::move(done)(outcome_error(*outcome));
                     }
                     return;
                 }
@@ -822,16 +840,30 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         }
 
         auto wake = st.in_space;
+        auto outcome = st.outcome;
         auto self = this->shared_from_this();
         auto slot = asio::get_associated_cancellation_slot(done);
         wake->async_receive(
-            asio::bind_cancellation_slot(slot, [self, id, done = std::move(done)](error_code ec) mutable {
+            asio::bind_cancellation_slot(slot, [self, id, outcome, done = std::move(done)](error_code ec) mutable {
                 if (is_cancellation_error(ec)) {
                     std::move(done)(make_error_code(asio::error::operation_aborted), ReadResult{});
                     return;
                 }
                 if (ec) {
                     std::move(done)(ec, ReadResult{});
+                    return;
+                }
+                auto it = self->m_streams.find(id);
+                if (it == self->m_streams.end() || it->second->outcome != outcome) {
+                    // Retired while this read was parked (a 0-RTT rejection drops
+                    // every early stream, and the id may have been recycled).
+                    // Report the captured terminal outcome, not "session closed".
+                    auto terminal = outcome_result(*outcome);
+                    if (terminal) {
+                        std::move(done)(error_code{}, std::move(*terminal));
+                    } else {
+                        std::move(done)(terminal.error(), ReadResult{});
+                    }
                     return;
                 }
                 self->read_step(id, std::move(done));
@@ -1035,11 +1067,16 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
             nghttp3_conn_del(m_h3);
             m_h3 = nullptr;
         }
-        for (auto &[id, stream] : m_streams) {
-            if (stream->outcome->get() == StreamState::Open)
-                stream->outcome->set(StreamState::Failed, make_error_code(client_errc::zero_rtt_rejected));
-            h3::wake(stream->in_space);
-            h3::wake(stream->out_space);
+        for (auto &entry : m_streams) {
+            Stream &stream = *entry.second;
+            if (stream.outcome->get() == StreamState::Open)
+                stream.outcome->set(StreamState::Failed, make_error_code(client_errc::zero_rtt_rejected));
+            h3::wake(stream.in_space);
+            h3::wake(stream.out_space);
+            // The entries are dropped below without going through erase_stream
+            // (ngtcp2 already discarded these ids, so there is no flow-control
+            // credit to refund), but the in-flight count still has to drop.
+            stream_closed();
         }
         m_streams.clear();
     }

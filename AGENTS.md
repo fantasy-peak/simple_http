@@ -694,8 +694,9 @@ server.serve_swagger_ui("/swagger", "/openapi.json");
 - 0-RTT：服务端默认接受，用 TLS session ticket + HTTP/3 SETTINGS 快照；
   不兼容时降级为 1-RTT。无重放保护，仅 GET/HEAD 建议开启。客户端显式
   `get_0rtt` / `allow_0rtt`；票据由 `H3SessionCache` 按 Client/origin 单次使用。
-  服务端因 ngtcp2 的 0-RTT 标志按交付时握手状态计算，使用“连接接受 0-RTT +
-  首个请求”标记 `Request::used_0rtt()`。
+  服务端在请求 header 段完成、handler 派发前用 `!handshake_completed()` 标记
+  `Request::used_0rtt()`（与 quic-go 的 `r.TLS.HandshakeComplete` 一致）；早期数据
+  丢失后在 1-RTT 重传的请求报 `false`。
 - 客户端不支持代理、请求 trailers、1xx。
 - 服务端可 Alt-Svc 通告；QUIC 缺 `quic_transport_parameters` 时按 RFC 9001
   §8.2 关闭（`CONNECTION_CLOSE 0x016d`）。

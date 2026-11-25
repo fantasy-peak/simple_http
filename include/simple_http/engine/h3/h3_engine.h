@@ -675,17 +675,6 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
     // --- quic::Protocol: the read side and events ---------------------------
 
     void on_stream_data(std::uint32_t flags, std::int64_t stream_id, span<const std::uint8_t> data) noexcept override {
-        const bool early = (flags & quic::kStreamData0RTT) != 0;
-        if (early) {
-            // Latch on the stream and the Request immediately: a 1-RTT
-            // retransmission of the same bytes will not carry the flag again.
-            if (auto stream = ensure_stream(stream_id)) {
-                stream->used_0rtt = true;
-                if (stream->request) {
-                    stream->request->set_used_0rtt(true);
-                }
-            }
-        }
         if (h3() == nullptr) {
             if (m_pending_read_bytes + data.size() > kMaxPendingReadBytes) {
                 SIMPLE_HTTP_ERROR_LOG("h3: too much stream data before nghttp3 was ready");
@@ -867,10 +856,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
     // handshake completes, so it can decode an early request. If the peer has
     // not granted the three uni-stream credits yet, wait for 1-RTT rather than
     // failing the connection.
-    void on_0rtt_keys_ready() noexcept override {
-        m_early_data_connection = m_conn->used_0rtt();
-        (void)ensure_h3(true);
-    }
+    void on_0rtt_keys_ready() noexcept override { (void)ensure_h3(true); }
 
     bool ensure_h3(bool early) noexcept {
         // Idempotent: ngtcp2 reports a key level once per connection, but a
@@ -1449,8 +1435,14 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         if (!stream.authority.empty() && !has_host) {
             request.mutable_headers().add_lower("host", std::move(stream.authority));
         }
-        // The stream may have been created before the 0-RTT flag was latched.
-        request.set_used_0rtt(stream.used_0rtt);
+        // Match quic-go's server rule (`r.TLS.HandshakeComplete`): a request
+        // whose header section completed while the handshake was still running
+        // necessarily arrived as 0-RTT data. Evaluating the connection state
+        // here, at header completion, is exactly when the handler is dispatched;
+        // ngtcp2's per-data flag is deliberately not used because it is
+        // evaluated at delivery time — bytes retransmitted at 1-RTT after the
+        // handshake completed would otherwise be reported as early.
+        request.set_used_0rtt(!m_conn->handshake_completed());
         return true;
     }
 
@@ -1463,11 +1455,6 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         auto stream = std::make_shared<Stream>();
         stream->id = stream_id;
         stream->request = std::make_shared<Request>(Version::Http3, m_executor, m_conn->peer());
-        if (m_early_data_connection && !m_first_request_seen) {
-            m_first_request_seen = true;
-            stream->used_0rtt = true;
-        }
-        stream->request->set_used_0rtt(stream->used_0rtt);
         // Credit inbound request-body bytes back to QUIC flow control as the
         // handler consumes them. nghttp3's recv_data contract requires the app
         // to do this ("increase flow control credit by datalen"), and
@@ -1763,12 +1750,6 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
     std::deque<PendingRead> m_pending_reads;
     std::size_t m_pending_read_bytes{0};
     bool m_pending_reads_scheduled{false};
-    // True once the connection installed 0-RTT read keys. ngtcp2's per-data
-    // 0-RTT flag is evaluated at delivery time and can be false when the
-    // handshake completes before early DATA is drained; the first request on
-    // such a connection is the early one.
-    bool m_early_data_connection{false};
-    bool m_first_request_seen{false};
     std::int64_t m_oversize_stream{-1};
     // A stream whose body just ended with a trailer section pending. The
     // deferred nghttp3_conn_submit_trailers runs at the top of the next write

@@ -14,6 +14,10 @@ Disabled cases check that HTTP/3 still works when either side turns 0-RTT off:
 Each client makes one normal request (obtaining a ticket), closes the
 connection, then sends GET_0RTT on a fresh one. The server handler reports
 whether the request was accepted as early data.
+
+A rejection case swaps the server for a fresh process (new ticket keys)
+between the two requests; the client must then report
+client_errc::zero_rtt_rejected, not a protocol error.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -35,6 +40,7 @@ GO_ENABLED_PORT = 7930
 CPP_ENABLED_PORT = 7931
 CPP_DISABLED_PORT = 7932
 GO_DISABLED_PORT = 7933
+CPP_REJECT_PORT = 7934
 
 
 def run(command: list[str], *, cwd: Path, timeout: int = 60) -> subprocess.CompletedProcess:
@@ -102,6 +108,57 @@ def check_go_client(name: str, client: Path, url: str, expect_early: bool,
     return ok
 
 
+def check_cpp_rejection(server_bin: Path, client_bin: Path) -> bool:
+    """A ticket is obtained from server A; A is replaced by a fresh process B
+    whose ticket keys differ, so B refuses the early data. The client must
+    report client_errc::zero_rtt_rejected rather than a protocol error."""
+    label = "cpp-client -> cpp-server (rejected ticket)"
+    url = f"https://127.0.0.1:{CPP_REJECT_PORT}/0rtt"
+    first = Server([str(server_bin), str(CPP_REJECT_PORT), "1"], "cpp server (reject #1)")
+    second = None
+    proc = None
+    swapped = False
+    lines: list[str] = []
+    try:
+        proc = subprocess.Popen([str(client_bin), url, "0", "1", "1"], cwd=str(ROOT),
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        reader = threading.Thread(target=lambda: lines.extend(proc.stdout), daemon=True)
+        reader.start()
+        # Wait for the first request to finish (and the ticket to be captured)
+        # instead of assuming a fixed latency; under sanitizers it can be slow.
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if any(line.startswith("first=") for line in lines):
+                break
+            if proc.poll() is not None:
+                break
+            time.sleep(0.05)
+        if not any(line.startswith("first=") for line in lines):
+            raise RuntimeError("client did not complete its first request")
+        # The NewSessionTicket follows the response as a separate flight; give
+        # the client a moment to receive and cache it before its source is gone.
+        time.sleep(0.75)
+        first.stop()
+        swapped = True
+        second = Server([str(server_bin), str(CPP_REJECT_PORT), "1"], "cpp server (reject #2)")
+        proc.wait(timeout=30)
+        reader.join(timeout=5)
+        out = "".join(lines)
+        print(f"--- {label} ---")
+        print(out, end="")
+        ok = proc.returncode == 0 and "first=normal" in out and "second=rejected" in out
+        print(f"{label}: {'PASS' if ok else 'FAIL'}")
+        return ok
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+        if second is not None:
+            second.stop()
+        if not swapped:
+            first.stop()
+
+
 def main() -> int:
     cpp_server_bin = BIN_DIR / "diff_0rtt_cpp_server"
     cpp_client_bin = BIN_DIR / "diff_0rtt_cpp_client"
@@ -154,6 +211,12 @@ def main() -> int:
             except subprocess.TimeoutExpired:
                 print(f"{label}: FAIL (timeout)")
                 failures += 1
+        try:
+            if not check_cpp_rejection(cpp_server_bin, cpp_client_bin):
+                failures += 1
+        except (subprocess.TimeoutExpired, RuntimeError) as exc:
+            print(f"cpp-client -> cpp-server (rejected ticket): FAIL ({exc})")
+            failures += 1
     finally:
         for server in servers:
             server.stop()
