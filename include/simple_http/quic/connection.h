@@ -227,10 +227,11 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
           m_sink(std::move(sink)), m_crypto(this) {
         ngtcp2_ccerr_default(&m_last_error);
         m_client = true;
-        // The session has to be installed before SSL_set_connect_state(), which
-        // is the last thing QuicCrypto::init does. Wrap the caller's TLS hook so
-        // SNI/ALPN still run first, then attach the cached ticket and enable
-        // early data only when the ticket actually carries an early-data limit.
+        // Matches the ngtcp2 ossl reference order: QuicCrypto::init calls
+        // SSL_set_connect_state() before this hook, then the hook installs the
+        // session/SNI/ALPN. Wrap the caller's TLS hook so SNI/ALPN still run
+        // first, then attach the cached ticket and enable early data only when
+        // the ticket actually carries an early-data limit.
         auto configure = [this](SSL *ssl) -> error_code {
             if (m_client_options.configure_ssl) {
                 if (error_code ec = m_client_options.configure_ssl(ssl)) {

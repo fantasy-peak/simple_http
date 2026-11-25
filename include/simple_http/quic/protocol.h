@@ -41,8 +41,10 @@ namespace simple_http::quic {
 // connection translates on the way in.
 inline constexpr std::uint32_t kStreamDataFin = 0x01;
 // Set when the slice arrived in a 0-RTT packet and the handshake has not
-// completed yet. The data may be replayed, so the engine must treat it as
-// advisory and expose `used_0rtt()` to the handler.
+// completed yet. Informational: the HTTP/3 server derives `Request::used_0rtt()`
+// from the handshake state when the request's header section completes (the
+// same rule quic-go uses), so bytes retransmitted at 1-RTT after the handshake
+// completed are not reported as early.
 inline constexpr std::uint32_t kStreamData0RTT = 0x02;
 
 // A piece of a scatter list. `base` is borrowed: the bytes must stay alive

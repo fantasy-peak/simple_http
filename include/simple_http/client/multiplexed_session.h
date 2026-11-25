@@ -130,7 +130,17 @@ template <typename Session, typename Id> class MultiplexedClientStream final : p
 
     friend Session;
 
-    void await_head(WriteCompletion done) override { m_session->await_stream_head(m_id, std::move(done)); }
+    void await_head(WriteCompletion done) override {
+        // A failed stream has no head to wait for, and the session may already
+        // have retired its table entry (0-RTT rejection discards every early
+        // stream at once). Report the recorded cause — zero_rtt_rejected for a
+        // refused early request — instead of "no such stream"/protocol_error.
+        if (m_outcome->get() == StreamState::Failed) {
+            std::move(done)(outcome_error(*m_outcome));
+            return;
+        }
+        m_session->await_stream_head(m_id, std::move(done));
+    }
     asio::any_io_executor head_executor() const override { return m_session->executor(); }
 
   private:
