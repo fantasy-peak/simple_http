@@ -87,5 +87,8 @@ jobs:
       - name: Server differential (C++ vs Go)
         run: test/run.sh server-diff --jobs "$XMAKE_JOBS"
 
+      - name: HTTP/3 0-RTT differential (C++ vs quic-go)
+        run: test/run.sh 0rtt --jobs "$XMAKE_JOBS"
+
       - name: Concurrency smoke (sanitizer fixture, uninstrumented)
         run: test/run.sh concurrency --jobs "$XMAKE_JOBS"

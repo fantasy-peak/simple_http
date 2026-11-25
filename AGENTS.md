@@ -49,6 +49,7 @@
 | h2c Upgrade | 支持 | **未接线** |
 | h2c prior knowledge | 支持 | 支持（明文 `HttpVersionPolicy::Http2`） |
 | HTTP/3 over QUIC | 可选（`SIMPLE_HTTP_ENABLE_HTTP3`） | 可选，且仅显式 `HttpVersionPolicy::Http3` |
+| HTTP/3 0-RTT | 支持（默认开启） | 支持（`get_0rtt` / `allow_0rtt`，仅 GET/HEAD） |
 | WebSocket over HTTP/1.1 | 支持 | 支持 |
 | WebSocket over HTTP/2（RFC 8441） | 支持 | 未实现 |
 | WebSocket over HTTP/3 | 未实现 | 未实现 |
@@ -63,7 +64,7 @@
 - 没有 C++23 协程主实现；协程只是可选 handler/middleware 适配。
 - 没有服务端 UNIX-domain listener；`UnixAddress` 在 `start()` 中会被拒绝。
 - 没有 HTTP/2 / HTTP/3 server push。
-- HTTP/3 没有 WebSocket、请求 trailers、`Expect: 100-continue`、0-RTT。
+- HTTP/3 没有 WebSocket、请求 trailers、`Expect: 100-continue`。
 - 客户端没有传统连接池；每个 `Client` 只缓存一条到某个 origin 的连接。
 
 ---
@@ -464,6 +465,7 @@ req->query_params(); req->param("id"); req->header("host"); req->headers();
 req->trailers(); req->cookie("session"); req->peer_address();
 req->body(); req->executor(); req->cancellation_slot();
 req->cancel(); req->cancelled();
+req->used_0rtt(); req->allow_0rtt();   // HTTP/3 early data
 req->set_state<T>(...); req->get_state<T>(); req->app_state<T>();
 ```
 
@@ -593,6 +595,12 @@ auto ws = co_await client.async_open_websocket("wss://host/chat", WebSocketSpec{
   当前**未接线**。
 - HTTP/3 只在 `SIMPLE_HTTP_ENABLE_HTTP3` 下可用，且必须显式
   `HttpVersionPolicy::Http3` + `https://`；不支持代理、请求 trailers、1xx。
+- HTTP/3 0-RTT：`client.get_0rtt(url)` / `.allow_0rtt()`，仅 GET/HEAD。服务端默认
+  接受（`quic_options.connection.enable_0rtt`），客户端
+  `ClientConfig::h3_enable_0rtt` 默认开。无重放保护；被拒绝返回
+  `client_errc::zero_rtt_rejected`，不自动重试。`Response::used_0rtt()` /
+  `Stream::used_0rtt()` 可观测；服务端 handler 用 `Request::used_0rtt()`。
+  票据按 Client/origin 缓存并单次使用；`tls.shared_context` 下客户端 0-RTT 不可用。
 - 取消：`send` / `async_open_stream` / `async_open_websocket` 以及
   `Stream::async_read` / `async_read_head` / `async_write` 都绑定调用方的
   cancellation slot。`asio::cancel_after` 可以在 DNS/dial/TLS/读/写任一阶段中止，
@@ -683,7 +691,12 @@ server.serve_swagger_ui("/swagger", "/openapi.json");
   未读 credit。
 - 服务端不支持 WebSocket；`Expect: 100-continue` 是 no-op；请求 trailers 不暴露。
 - 响应 trailers 支持。
-- 客户端不支持代理、请求 trailers、1xx；0-RTT 未启用。
+- 0-RTT：服务端默认接受，用 TLS session ticket + HTTP/3 SETTINGS 快照；
+  不兼容时降级为 1-RTT。无重放保护，仅 GET/HEAD 建议开启。客户端显式
+  `get_0rtt` / `allow_0rtt`；票据由 `H3SessionCache` 按 Client/origin 单次使用。
+  服务端因 ngtcp2 的 0-RTT 标志按交付时握手状态计算，使用“连接接受 0-RTT +
+  首个请求”标记 `Request::used_0rtt()`。
+- 客户端不支持代理、请求 trailers、1xx。
 - 服务端可 Alt-Svc 通告；QUIC 缺 `quic_transport_parameters` 时按 RFC 9001
   §8.2 关闭（`CONNECTION_CLOSE 0x016d`）。
 
@@ -827,6 +840,7 @@ test/run.sh unit '[h2]'
 | `openapi` | standard | OAS 3.1 元模式 + 文档/路由契约 + Swagger UI |
 | `client-diff` | full | C++ client ↔ Go `net/http` client |
 | `server-diff` | full | Go 探针 → C++ server ↔ Go server；含 `h2raw` / `h3raw` |
+| `0rtt` | full | C++/quic-go 双向 0-RTT 交叉验证（含双方关闭 0-RTT） |
 | `concurrency` | full | 多客户端/多线程/teardown harness |
 | `conformance` | full | h2spec / h1spec / h3spec / Autobahn |
 | `stress` | full | h2load / k6 |
@@ -851,6 +865,9 @@ test/run.sh unit '[h2]'
 - **client-diff**（`test/diff/client/`）：C++ 与 Go 客户端请求同一个 Go 参考
   服务端；服务端回显 method/header/body，因此差异只能来自客户端。组：
   `basic`、`body`、`policy`、`ws`、`h3`。端口 7810–7817。
+- **0rtt**（`test/diff/0rtt/`）：C++ client ↔ quic-go server、quic-go client ↔
+  C++ server 两组实现互打，覆盖服务端开启/关闭 0-RTT、客户端开启/关闭 0-RTT；
+  开启时断言 `early` / `used_0rtt=1`，关闭时断言回落到 1-RTT 的 `normal`。
 - **server-diff**（`test/diff/server/`）：同一个 Go 探针分别打 C++ 与 Go 参考
   服务端（7820–7825 / 7830–7834）。组：`routing`、`body`、`semantics`、
   `middleware`、`framework`、`static`、`ws`、`raw`、`h2raw`、`h3raw`。
@@ -895,7 +912,9 @@ test/external/stress/run.sh both
 
 - h2spec：`failed == 0` 且 `passed >= 146`；
 - h1spec：总用例 33，必须全部通过；
-- h3spec：总用例 49，`passed >= 47`；
+- h3spec：总用例 49，`passed >= 46`（0-RTT 开启；TLS 8.3 的 CRYPTO-in-0-RTT
+  是已知失败，quic-go 在 Allow0RTT=true 时同样失败并返回 FRAME_ENCODING_ERROR；
+  真实 0-RTT 由 `0rtt` 套件覆盖）；
 - Autobahn：`FAILED == 0` 且 `NON-STRICT == 0`；
 - 压力：连接复用 200/200；每个响应档位 `failed == 0` 且 `errored == 0`；
   h1 k6 `errors == 0`；WebSocket `recv == ITERS × WANT`（默认 1,200,000）。
@@ -974,6 +993,7 @@ xmake f -y -m release
 test/run.sh standard --jobs 4
 test/run.sh client-diff --jobs 4
 test/run.sh server-diff --jobs 4
+test/run.sh 0rtt --jobs 4
 test/run.sh concurrency --jobs 4
 ```
 
@@ -1238,7 +1258,8 @@ test/run.sh server-diff
 - 客户端 `Response::text()` 与 `bytes()` 相同。
 - h1 客户端没有独立 idle timeout；h2 用 `ClientConfig::idle_timeout`。
 - HTTP/3 客户端不支持代理、请求 trailers、1xx；服务端不支持 WS、request
-  trailers、100-continue、push、0-RTT。
+  trailers、100-continue、push。0-RTT 无重放保护，被拒绝的早期请求不自动重试；
+  `tls.shared_context` 下客户端 0-RTT 不可用；服务端票据不跨进程重启。
 - HTTP/3 的畸形字段由 nghttp3 定夺：非法伪头/大写字段名会以连接级
   `NGHTTP3_ERR_MALFORMED_HTTP_HEADER` 关闭连接，部分非 token 常规字段被
   nghttp3 直接丢弃（不会交给 `on_header`）。因此与 quic-go 的流级 reset
@@ -1310,6 +1331,7 @@ test/run.sh cpp17
 test/run.sh openapi
 test/run.sh client-diff
 test/run.sh server-diff
+test/run.sh 0rtt
 test/run.sh concurrency
 test/run.sh conformance
 test/run.sh stress

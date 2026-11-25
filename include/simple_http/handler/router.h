@@ -896,7 +896,7 @@ class Router {
     }
 
     struct MethodTable {
-        static constexpr std::size_t kSlots = 10; // Method::Get .. Method::Unknown
+        static constexpr std::size_t kSlots = method_count; // includes the 0-RTT sentinels
         std::array<std::optional<RouteEntry>, kSlots> by_method;
         std::optional<RouteEntry> any;
     };
@@ -1177,7 +1177,10 @@ class Router {
     static std::optional<RouteEntry> make_route_entry(const std::vector<Method> &methods, Handler handler,
                                                       std::vector<Middleware> middlewares) {
         std::uint16_t bits = 0;
-        for (Method m : methods) {
+        for (Method raw : methods) {
+            // A server route cannot receive a 0-RTT sentinel off the wire; map
+            // it to its wire method so registration stays unsurprising.
+            const Method m = wire_method(raw);
             if (m == Method::Unknown) {
                 SIMPLE_HTTP_ERROR_LOG("route: Method::Unknown is not routable; registration skipped");
                 return std::nullopt;

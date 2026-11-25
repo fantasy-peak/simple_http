@@ -414,6 +414,11 @@ struct ClientConfig {
     // caller did not set it), the method is not HEAD, and the request has no
     // Range header. Set false for Go's DisableCompression behaviour, or set
     // Accept-Encoding yourself to keep the response opaque.
+    // Offer HTTP/3 0-RTT for requests that opt in (GET/HEAD sentinels or
+    // allow_0rtt) when a resumed session exists. Requires a client-owned TLS
+    // context; shared_context disables it because the new-session callback is
+    // installed on the context.
+    bool h3_enable_0rtt{true};
     bool auto_decompress{true};
     // Encodings advertised when auto_decompress is on, most preferred first.
     // Go's Transport only negotiates gzip, so gzip is the default. Add "br" to
@@ -485,6 +490,7 @@ enum class client_errc : int {
     proxy_error,            // the proxy refused the tunnel, or its reply was malformed
     proxy_auth_failed,      // the proxy rejected the configured credentials
     invalid_header,         // a request header name/value is not a valid HTTP field
+    zero_rtt_rejected,      // the server refused the early data; retry is safe for GET/HEAD
 };
 
 } // namespace simple_http
@@ -577,6 +583,8 @@ class ClientErrorCategory : public error_category {
             return "the proxy rejected the configured credentials";
         case client_errc::invalid_header:
             return "a request header name or value is invalid";
+        case client_errc::zero_rtt_rejected:
+            return "the server rejected the early data; retry the idempotent request";
         default:
             return "unknown client error";
         }

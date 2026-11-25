@@ -59,6 +59,8 @@ SUITES = (
           tools=("go",)),
     Suite("server-diff", "full", ("diff_server_cpp",), "python",
           "diff/server/run.py", tools=("go",)),
+    Suite("0rtt", "full", ("diff_0rtt_cpp_server", "diff_0rtt_cpp_client"),
+          "python", "diff/0rtt/run.py", tools=("go",)),
     Suite("concurrency", "full", ("test_sanitizer_concurrency",), "binary",
           "test_sanitizer_concurrency", timeout=300),
     Suite("conformance", "full", ("fixture_conformance_server",), "bash",

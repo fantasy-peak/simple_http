@@ -36,16 +36,16 @@ VENV = TEST / ".venv"
 CACHE = ROOT / ".cache" / "sanitize"
 
 ALL_SUITES = {
-    "unit", "openapi", "client-diff", "server-diff", "concurrency",
+    "unit", "openapi", "client-diff", "server-diff", "0rtt", "concurrency",
     "conformance", "stress",
 }
 
 DEFAULT_SUITES = {
     # PR-sized matrix. conformance/stress are nightly/manual because they are
     # far heavier under instrumentation.
-    "asan": ["unit", "openapi", "client-diff", "server-diff", "concurrency"],
+    "asan": ["unit", "openapi", "client-diff", "server-diff", "0rtt", "concurrency"],
     "tsan": ["unit", "concurrency", "server-diff"],
-    "ubsan": ["unit", "client-diff", "server-diff"],
+    "ubsan": ["unit", "client-diff", "server-diff", "0rtt"],
 }
 
 # sanitizer name -> (compiler -fsanitize list, extra safety flags)

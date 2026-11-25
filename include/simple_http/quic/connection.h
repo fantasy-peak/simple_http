@@ -181,6 +181,16 @@ struct QuicClientOptions {
     // of its own — client/tls_client.h owns that, and its hook is shared with
     // the TCP path.
     std::function<error_code(SSL *)> configure_ssl;
+    // TLS session resumption. `session_ticket` is installed on the fresh SSL
+    // before the handshake begins; the transport parameters are what ngtcp2
+    // needs before any 0-RTT stream may be opened.
+    std::shared_ptr<SSL_SESSION> session_ticket;
+    std::vector<std::uint8_t> zero_rtt_transport_params;
+    bool allow_0rtt{false};
+    // OpenSSL hands a NewSessionTicket to the connection after the handshake.
+    // The connection pairs it with the peer's 0-RTT transport parameters and
+    // invokes this on its own executor, never from inside the OpenSSL callback.
+    std::function<void(std::shared_ptr<SSL_SESSION>, std::vector<std::uint8_t>)> on_session_ticket;
 };
 
 template <typename Executor>
@@ -200,8 +210,10 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
         std::copy_n(reset_secret.begin(), m_reset_secret_len, m_reset_secret.begin());
         ngtcp2_ccerr_default(&m_last_error);
         m_client = false;
-        if (!m_crypto.init(ssl_ctx)) {
+        if (!m_crypto.init(ssl_ctx, /*client=*/false, {}, m_config.enable_0rtt)) {
             m_init_failed = true;
+        } else if (SSL *ssl = m_crypto.ssl(); ssl != nullptr) {
+            (void)SSL_set_ex_data(ssl, session_owner_ex_index(), this);
         }
     }
 
@@ -215,8 +227,40 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
           m_sink(std::move(sink)), m_crypto(this) {
         ngtcp2_ccerr_default(&m_last_error);
         m_client = true;
-        if (!m_crypto.init(ssl_ctx, /*client=*/true, m_client_options.configure_ssl)) {
+        // The session has to be installed before SSL_set_connect_state(), which
+        // is the last thing QuicCrypto::init does. Wrap the caller's TLS hook so
+        // SNI/ALPN still run first, then attach the cached ticket and enable
+        // early data only when the ticket actually carries an early-data limit.
+        auto configure = [this](SSL *ssl) -> error_code {
+            if (m_client_options.configure_ssl) {
+                if (error_code ec = m_client_options.configure_ssl(ssl)) {
+                    return ec;
+                }
+            }
+            if (!m_client_options.session_ticket) {
+                return {};
+            }
+            if (SSL_set_session(ssl, m_client_options.session_ticket.get()) != 1) {
+                SIMPLE_HTTP_ERROR_LOG("quic: SSL_set_session failed");
+                return make_error_code(asio::error::invalid_argument);
+            }
+            if (m_client_options.allow_0rtt && !m_client_options.zero_rtt_transport_params.empty() &&
+                SSL_SESSION_get_max_early_data(m_client_options.session_ticket.get()) != 0) {
+                if (SSL_set_quic_tls_early_data_enabled(ssl, 1) != 1) {
+                    SIMPLE_HTTP_ERROR_LOG("quic: SSL_set_quic_tls_early_data_enabled failed");
+                    return make_error_code(asio::error::invalid_argument);
+                }
+                m_early_attempted = true;
+            }
+            return {};
+        };
+        if (!m_crypto.init(ssl_ctx, /*client=*/true, configure)) {
             m_init_failed = true;
+        } else if (SSL *ssl = m_crypto.ssl(); ssl != nullptr) {
+            // Route OpenSSL's new-session callback back to this connection. The
+            // callback is installed once on the client SSL_CTX; h1/h2 SSLs that
+            // share that context simply have no owner here.
+            (void)SSL_set_ex_data(ssl, session_owner_ex_index(), this);
         }
     }
 
@@ -249,6 +293,34 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
     // stream limits are keyed to).
     [[nodiscard]] bool handshake_completed() const noexcept {
         return m_conn != nullptr && ngtcp2_conn_get_handshake_completed2(m_conn) != 0;
+    }
+
+    // True once this connection has processed 0-RTT data: on the server when
+    // early keys/stream data arrived, on the client when the server accepted
+    // the early data it sent.
+    [[nodiscard]] bool used_0rtt() const noexcept { return m_used_0rtt; }
+
+    // Client only: an early session was installed and the peer's 0-RTT
+    // transport parameters were accepted, so opening a stream now really is
+    // early data. The HTTP/3 client gates its early submissions on this.
+    [[nodiscard]] bool can_send_0rtt() const noexcept { return m_client && m_early_attempted && m_early_params_set; }
+
+    // ConnectionCryptoBase: OpenSSL produced a NewSessionTicket. Only the
+    // client can resume, and the session must be paired with the peer's 0-RTT
+    // transport parameters, so it is stashed here and flushed by step() — never
+    // from inside the OpenSSL/ngtcp2 callback stack.
+    void on_new_session_ticket(SSL_SESSION *session) noexcept override {
+        if (session == nullptr || !m_client || m_closed)
+            return;
+        // Duplicate instead of up-ref: OpenSSL marks the session object handed
+        // to the new-session callback not_resumable, and ssl_session_dup()
+        // clears that flag. The duplicate owns its own reference.
+        SSL_SESSION *copy = SSL_SESSION_dup(session);
+        if (copy == nullptr)
+            return;
+        m_pending_session_ticket = std::shared_ptr<SSL_SESSION>(copy, SSL_SESSION_free);
+        m_session_ticket_pending = true;
+        poke();
     }
 
     // ALPN the TLS handshake selected, or empty if none has been negotiated
@@ -299,6 +371,14 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
         if (protocol == nullptr)
             return;
 
+        if (m_0rtt_keys_pending) {
+            m_0rtt_keys_pending = false;
+            protocol->on_0rtt_keys_ready();
+        }
+        if (m_early_rejected_pending) {
+            m_early_rejected_pending = false;
+            protocol->on_early_data_rejected();
+        }
         if (m_tx_keys_pending) {
             m_tx_keys_pending = false;
             protocol->on_tx_keys_ready();
@@ -428,6 +508,8 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
                                          void *) noexcept;
     static int cb_extend_max_remote_streams_bidi(ngtcp2_conn *, std::uint64_t max_streams, void *user_data) noexcept;
     static int cb_recv_tx_key(ngtcp2_conn *, ngtcp2_encryption_level level, void *user_data) noexcept;
+    static int cb_recv_rx_key(ngtcp2_conn *, ngtcp2_encryption_level level, void *user_data) noexcept;
+    static int cb_tls_early_data_rejected(ngtcp2_conn *, void *user_data) noexcept;
     static int cb_get_new_connection_id(ngtcp2_conn *, ngtcp2_cid *cid, ngtcp2_stateless_reset_token *token,
                                         std::size_t cidlen, void *user_data) noexcept;
     static int cb_remove_connection_id(ngtcp2_conn *, const ngtcp2_cid *cid, void *user_data) noexcept;
@@ -465,6 +547,11 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
                            ngtcp2_tstamp ts) noexcept;
     // ngtcp2's timer expired — or, since any wake-up runs this, might have.
     void handle_expiry_due();
+    // Pair a stashed NewSessionTicket with the peer's 0-RTT transport
+    // parameters and hand both to the client user. Runs from `step()`, outside
+    // the OpenSSL/ngtcp2 callback stack, because encoding the parameters calls
+    // into ngtcp2.
+    void flush_pending_session_ticket();
     // Mark the connection finished. If a callback is on the stack the packet
     // itself is deferred to `finish_close()` — see m_in_read_pkt.
     void close_now();
@@ -556,6 +643,15 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
     std::vector<PendingStreamData> m_pending_stream_data;
     std::size_t m_pending_stream_bytes{0};
     bool m_tx_keys_pending{false};
+    // 0-RTT state. `m_0rtt_keys_pending` / `m_early_rejected_pending` replay
+    // events that arrived before the engine registered (see set_protocol).
+    bool m_0rtt_keys_pending{false};
+    bool m_early_rejected_pending{false};
+    bool m_used_0rtt{false};
+    bool m_early_attempted{false};
+    bool m_early_params_set{false};
+    bool m_session_ticket_pending{false};
+    std::shared_ptr<SSL_SESSION> m_pending_session_ticket;
     CidCallback m_on_new_cid;
     CidRetireCallback m_on_retire_cid;
 
@@ -631,6 +727,8 @@ template <typename Executor> bool QuicConnection<Executor>::init() {
             cb.extend_max_stream_data = &QuicConnection::cb_extend_max_stream_data;
             cb.extend_max_remote_streams_bidi = &QuicConnection::cb_extend_max_remote_streams_bidi;
             cb.recv_tx_key = &QuicConnection::cb_recv_tx_key;
+            cb.recv_rx_key = &QuicConnection::cb_recv_rx_key;
+            cb.tls_early_data_rejected = &QuicConnection::cb_tls_early_data_rejected;
             cb.handshake_completed = &QuicConnection::cb_handshake_completed;
             cb.get_new_connection_id2 = &QuicConnection::cb_get_new_connection_id;
             cb.remove_connection_id = &QuicConnection::cb_remove_connection_id;
@@ -646,6 +744,18 @@ template <typename Executor> bool QuicConnection<Executor>::init() {
             return false;
         }
         ngtcp2_conn_set_tls_native_handle(m_conn, m_crypto.native_handle());
+        if (m_early_attempted) {
+            // ngtcp2 needs the server's remembered transport parameters before
+            // it will let us open a 0-RTT stream.
+            if (ngtcp2_conn_decode_and_set_0rtt_transport_params(
+                    m_conn, m_client_options.zero_rtt_transport_params.data(),
+                    m_client_options.zero_rtt_transport_params.size()) != 0) {
+                SIMPLE_HTTP_ERROR_LOG("quic: could not restore 0-RTT transport parameters");
+                m_early_attempted = false;
+            } else {
+                m_early_params_set = true;
+            }
+        }
         return true;
     }
 
@@ -729,6 +839,7 @@ template <typename Executor> bool QuicConnection<Executor>::init() {
         cb.extend_max_stream_data = &QuicConnection::cb_extend_max_stream_data;
         cb.extend_max_remote_streams_bidi = &QuicConnection::cb_extend_max_remote_streams_bidi;
         cb.recv_tx_key = &QuicConnection::cb_recv_tx_key;
+        cb.recv_rx_key = &QuicConnection::cb_recv_rx_key;
         cb.handshake_completed = &QuicConnection::cb_handshake_completed;
         cb.get_new_connection_id2 = &QuicConnection::cb_get_new_connection_id;
         cb.remove_connection_id = &QuicConnection::cb_remove_connection_id;
@@ -884,10 +995,46 @@ template <typename Executor> void QuicConnection<Executor>::step() {
         self->handle_expiry_due();
         if (self->m_closed)
             return;
+        self->flush_pending_session_ticket();
         if (!self->flush_writes())
             return;
         self->step();
     });
+}
+
+template <typename Executor> void QuicConnection<Executor>::flush_pending_session_ticket() {
+    if (!m_session_ticket_pending || m_closed || m_conn == nullptr || !m_client || !handshake_completed())
+        return;
+
+    if (!m_client_options.on_session_ticket) {
+        m_session_ticket_pending = false;
+        m_pending_session_ticket.reset();
+        return;
+    }
+
+    // The reference client encodes these at handshake completion; ngtcp2 needs
+    // them next to the ticket or it will not allow a 0-RTT stream to be opened.
+    std::vector<std::uint8_t> params(512);
+    for (;;) {
+        const ngtcp2_ssize n = ngtcp2_conn_encode_0rtt_transport_params2(m_conn, params.data(), params.size());
+        if (n == NGTCP2_ERR_NOBUF) {
+            params.resize(params.size() * 2);
+            continue;
+        }
+        if (n < 0) {
+            SIMPLE_HTTP_ERROR_LOG("quic: could not encode 0-RTT transport parameters: {}",
+                                  ngtcp2_strerror(static_cast<int>(n)));
+            m_session_ticket_pending = false;
+            m_pending_session_ticket.reset();
+            return;
+        }
+        params.resize(static_cast<std::size_t>(n));
+        break;
+    }
+
+    m_session_ticket_pending = false;
+    auto session = std::move(m_pending_session_ticket);
+    m_client_options.on_session_ticket(std::move(session), std::move(params));
 }
 
 template <typename Executor> std::optional<std::int64_t> QuicConnection<Executor>::open_uni_stream() {
@@ -1282,9 +1429,13 @@ int QuicConnection<Executor>::cb_recv_stream_data(ngtcp2_conn *, std::uint32_t f
                                                   std::uint64_t, const std::uint8_t *data, std::size_t datalen,
                                                   void *user_data, void *) noexcept {
     auto *self = from(user_data);
-    // ngtcp2's flags are not the engine's vocabulary; the one bit that crosses
-    // the seam is translated here so `engine/h3/` needs no ngtcp2 header.
-    const std::uint32_t translated = (flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0 ? quic::kStreamDataFin : 0u;
+    // ngtcp2's flags are not the engine's vocabulary; the bits that cross the
+    // seam are translated here so `engine/h3/` needs no ngtcp2 header.
+    std::uint32_t translated = (flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0 ? quic::kStreamDataFin : 0u;
+    if ((flags & NGTCP2_STREAM_DATA_FLAG_0RTT) != 0) {
+        translated |= quic::kStreamData0RTT;
+        self->m_used_0rtt = true;
+    }
     if (auto proto = self->protocol()) {
         proto->on_stream_data(translated, stream_id, span<const std::uint8_t>{data, datalen});
         return 0;
@@ -1369,12 +1520,23 @@ int QuicConnection<Executor>::cb_extend_max_remote_streams_bidi(ngtcp2_conn *, s
 
 template <typename Executor>
 int QuicConnection<Executor>::cb_recv_tx_key(ngtcp2_conn *, ngtcp2_encryption_level level, void *user_data) noexcept {
-    // Only the application (1-RTT) keys matter: the HTTP/3 control and QPACK
-    // streams cannot be opened before them, and opening them earlier would be
-    // sending application data at the wrong encryption level.
+    auto *self = from(user_data);
+    if (level == NGTCP2_ENCRYPTION_LEVEL_0RTT) {
+        // The client may now open early streams. The HTTP/3 engine creates
+        // nghttp3 at this point; the handshake is still in progress.
+        if (auto proto = self->protocol()) {
+            proto->on_0rtt_keys_ready();
+        } else {
+            self->m_0rtt_keys_pending = true;
+        }
+        self->poke();
+        return 0;
+    }
+    // Only the application (1-RTT) keys matter after this: the HTTP/3 control
+    // and QPACK streams cannot be opened before them, and opening them earlier
+    // would be sending application data at the wrong encryption level.
     if (level != NGTCP2_ENCRYPTION_LEVEL_1RTT)
         return 0;
-    auto *self = from(user_data);
     if (auto proto = self->protocol()) {
         proto->on_tx_keys_ready();
     } else {
@@ -1385,8 +1547,51 @@ int QuicConnection<Executor>::cb_recv_tx_key(ngtcp2_conn *, ngtcp2_encryption_le
 }
 
 template <typename Executor>
-int QuicConnection<Executor>::cb_handshake_completed(ngtcp2_conn *, void *user_data) noexcept {
+int QuicConnection<Executor>::cb_recv_rx_key(ngtcp2_conn *, ngtcp2_encryption_level level, void *user_data) noexcept {
+    // The server installs early read keys here; that is the first moment it
+    // can decode a 0-RTT request, even though the handshake is not complete.
+    if (level != NGTCP2_ENCRYPTION_LEVEL_0RTT)
+        return 0;
     auto *self = from(user_data);
+    self->m_used_0rtt = true;
+    if (auto proto = self->protocol()) {
+        proto->on_0rtt_keys_ready();
+    } else {
+        self->m_0rtt_keys_pending = true;
+    }
+    self->poke();
+    return 0;
+}
+
+template <typename Executor>
+int QuicConnection<Executor>::cb_tls_early_data_rejected(ngtcp2_conn *, void *user_data) noexcept {
+    auto *self = from(user_data);
+    self->m_used_0rtt = false;
+    if (auto proto = self->protocol()) {
+        proto->on_early_data_rejected();
+    } else {
+        self->m_early_rejected_pending = true;
+    }
+    self->poke();
+    return 0;
+}
+
+template <typename Executor>
+int QuicConnection<Executor>::cb_handshake_completed(ngtcp2_conn *conn, void *user_data) noexcept {
+    auto *self = from(user_data);
+    if (self->m_client && self->m_early_attempted) {
+        SSL *ssl = self->m_crypto.ssl();
+        const int status = ssl != nullptr ? SSL_get_early_data_status(ssl) : SSL_EARLY_DATA_NOT_SENT;
+        if (status == SSL_EARLY_DATA_ACCEPTED) {
+            self->m_used_0rtt = true;
+        } else {
+            // Tell ngtcp2 to discard the early streams and invoke our
+            // tls_early_data_rejected callback. This is the same call the
+            // ngtcp2 reference client makes from its handshake-completed hook.
+            (void)ngtcp2_conn_tls_early_data_rejected(conn);
+        }
+    }
+    self->flush_pending_session_ticket();
     if (auto proto = self->protocol())
         proto->on_handshake_complete();
     self->poke();

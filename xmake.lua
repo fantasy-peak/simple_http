@@ -170,6 +170,20 @@ for _, group in ipairs({"basic", "body", "policy", "ws", "h3"}) do
     })
 end
 
+-- HTTP/3 0-RTT differential ------------------------------------------------
+-- C++ and quic-go against each other, in both directions. The binary names
+-- are read by test/diff/0rtt/run.py from SIMPLE_HTTP_TEST_BIN_DIR.
+add_test_binary("diff_0rtt_cpp_server", "test/diff/0rtt/cpp/server.cpp", {
+    group = "test/diff/0rtt",
+    http3 = true,
+    packages = {"zlib", "brotli"},
+})
+add_test_binary("diff_0rtt_cpp_client", "test/diff/0rtt/cpp/client.cpp", {
+    group = "test/diff/0rtt",
+    http3 = true,
+    packages = {"zlib", "brotli"},
+})
+
 -- Server differential -------------------------------------------------------
 -- One C++ server implements the whole shared route table; the Go reference
 -- server and the Go probes are built by test/diff/server/run.py.

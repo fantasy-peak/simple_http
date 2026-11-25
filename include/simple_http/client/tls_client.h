@@ -29,8 +29,25 @@
 #include "../transport/openssl_init.h"
 #include "../transport/tls_transport.h"
 #include "client_config.h"
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+#include "../quic/ngtcp2_crypto.h"
+#endif
 
 namespace simple_http::detail {
+
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+// OpenSSL's new-session callback for the client SSL_CTX. Only QUIC SSLs carry a
+// connection in ex-data; an h1/h2 SSL that shares this context is a no-op.
+inline int client_new_session_cb(SSL *ssl, SSL_SESSION *session) {
+    auto *owner = static_cast<quic::ConnectionCryptoBase *>(SSL_get_ex_data(ssl, quic::session_owner_ex_index()));
+    if (owner != nullptr) {
+        owner->on_new_session_ticket(session);
+    }
+    // The connection took its own reference; OpenSSL retains ownership of the
+    // one it passed in.
+    return 0;
+}
+#endif
 
 // Whether `host` is an IP literal (an IPv4/IPv6 address rather than a name).
 // Certificate matching for an IP goes through X509_VERIFY_PARAM_set1_ip_asc,
@@ -133,6 +150,14 @@ inline std::shared_ptr<asio::ssl::context> make_client_ssl_context(const TlsClie
                 simple_http::format("client private key '{}': {}", cfg.private_key_file, ec.message()));
         }
     }
+
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+    // Capture TLS 1.3 session tickets so the HTTP/3 client can resume and, when
+    // the ticket carries an early-data limit, attempt 0-RTT. The callback is
+    // harmless for the h1/h2 connections that share this context.
+    SSL_CTX_set_session_cache_mode(ctx->native_handle(), SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_NO_INTERNAL);
+    SSL_CTX_sess_set_new_cb(ctx->native_handle(), &client_new_session_cb);
+#endif
 
     return ctx;
 }

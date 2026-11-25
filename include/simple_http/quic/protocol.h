@@ -40,6 +40,10 @@ namespace simple_http::quic {
 // own bit rather than ngtcp2's, so the engine needs no ngtcp2 header; the
 // connection translates on the way in.
 inline constexpr std::uint32_t kStreamDataFin = 0x01;
+// Set when the slice arrived in a 0-RTT packet and the handshake has not
+// completed yet. The data may be replayed, so the engine must treat it as
+// advisory and expose `used_0rtt()` to the handler.
+inline constexpr std::uint32_t kStreamData0RTT = 0x02;
 
 // A piece of a scatter list. `base` is borrowed: the bytes must stay alive
 // until the connection reports them acknowledged (or the stream is gone),
@@ -132,6 +136,16 @@ class Protocol {
     // stream credit) are applied, which is observable as a zero
     // `streams_uni_left()`.
     virtual void on_tx_keys_ready() noexcept = 0;
+
+    // The 0-RTT keys are installed: the server has the early read keys, the
+    // client has the early write keys. The engine may create nghttp3 and its
+    // control/QPACK streams now, before the handshake completes.
+    virtual void on_0rtt_keys_ready() noexcept {}
+
+    // The server rejected our early data (client only). The engine must fail
+    // the streams it opened in 0-RTT; the connection itself continues its
+    // 1-RTT handshake.
+    virtual void on_early_data_rejected() noexcept {}
 
     // The QUIC handshake completed. Optional to implement (the default does
     // nothing); the HTTP/3 client uses it to create its nghttp3 connection once

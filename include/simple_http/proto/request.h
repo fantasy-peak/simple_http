@@ -64,8 +64,8 @@ class Request {
     Request(Request &&other) noexcept
         : m_version(other.m_version), m_peer(std::move(other.m_peer)), m_exec(other.m_exec),
           m_body(std::move(other.m_body)), m_close(other.m_close), m_stream_body(other.m_stream_body),
-          m_content_length(other.m_content_length), m_url(std::move(other.m_url)),
-          m_body_source(std::move(other.m_body_source)), m_method(other.m_method),
+          m_used_0rtt(other.m_used_0rtt), m_allow_0rtt(other.m_allow_0rtt), m_content_length(other.m_content_length),
+          m_url(std::move(other.m_url)), m_body_source(std::move(other.m_body_source)), m_method(other.m_method),
           m_method_token(std::move(other.m_method_token)), m_target(std::move(other.m_target)),
           m_headers(std::move(other.m_headers)), m_trailers(std::move(other.m_trailers)),
           m_params(std::move(other.m_params)), m_query_params(std::move(other.m_query_params)),
@@ -89,6 +89,8 @@ class Request {
         m_query_parsed = other.m_query_parsed;
         m_close = other.m_close;
         m_stream_body = other.m_stream_body;
+        m_used_0rtt = other.m_used_0rtt;
+        m_allow_0rtt = other.m_allow_0rtt;
         m_content_length = other.m_content_length;
         m_url = std::move(other.m_url);
         m_body_source = std::move(other.m_body_source);
@@ -133,6 +135,16 @@ class Request {
     // Raw method token (preserves extension methods that map to Method::Unknown).
     std::string_view method_token() const { return m_method_token; }
     Version version() const { return m_version; }
+    // True when this request arrived in QUIC 0-RTT data, before the handshake
+    // completed. The data may be replayed, so handlers should only act on it
+    // for idempotent operations; the server accepts the request either way,
+    // matching quic-go.
+    bool used_0rtt() const noexcept { return m_used_0rtt; }
+    void set_used_0rtt(bool value) noexcept { m_used_0rtt = value; }
+    // Client-side opt-in: send this request (GET/HEAD only) as early data when
+    // a resumed session is available. The wire method is still GET/HEAD.
+    bool allow_0rtt() const noexcept { return m_allow_0rtt; }
+    void set_allow_0rtt(bool value) noexcept { m_allow_0rtt = value; }
     std::string_view target() const { return m_target; }
     std::string_view path() const { return m_path; }
     std::string_view query() const { return m_query; }
@@ -230,6 +242,10 @@ class Request {
         copy->m_state = m_state;
         copy->m_close = m_close;
         copy->m_stream_body = m_stream_body;
+        // A replay is a new 1-RTT exchange, never early data; the opt-in that
+        // produced the first attempt is preserved so a caller retrying after a
+        // rejected early request keeps its intent.
+        copy->m_allow_0rtt = m_allow_0rtt;
         if (!m_body_source.empty()) {
             copy->set_body(m_body_source);
         }
@@ -553,8 +569,10 @@ class Request {
     // "POST" even when no set_method_token() call follows. Extension methods use
     // set_method_token("PROPFIND") directly and keep Method::Unknown.
     void set_method(Method method) {
-        m_method = method;
-        m_method_token = method == Method::Unknown ? std::string{} : std::string{to_string(method)};
+        // 0-RTT sentinels are an API convenience: the Request and every engine
+        // see the wire method, while allow_0rtt() carries the extra intent.
+        m_method = wire_method(method);
+        m_method_token = m_method == Method::Unknown ? std::string{} : std::string{to_string(m_method)};
     }
     void set_method_token(std::string token) {
         m_method = method_from_string(token);
@@ -584,6 +602,8 @@ class Request {
 
     bool m_close{false};
     bool m_stream_body{false};
+    bool m_used_0rtt{false};
+    bool m_allow_0rtt{false};
     std::int64_t m_content_length{-1};
     std::string m_url;         // absolute URL (Go's Request.URL; client side)
     std::string m_body_source; // for clone_for_replay (empty = no up-front body)

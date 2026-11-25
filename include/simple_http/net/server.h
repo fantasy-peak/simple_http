@@ -1070,8 +1070,17 @@ class Server {
         auto rt = std::make_shared<QuicRuntime>();
         rt->address = *m_cfg.quic;
         rt->limits = std::make_shared<EngineLimits>(m_cfg.limits);
+        quic::QuicEarlyDataConfig early;
+        early.enabled = m_cfg.quic_options.connection.enable_0rtt;
+        if (early.enabled) {
+            const h3::Settings settings = h3::make_settings(*rt->limits);
+            early.ticket_appdata = h3::encode_ticket_settings(settings);
+            early.validate_ticket_appdata = [settings](std::string_view appdata) {
+                return h3::ticket_settings_compatible_for_0rtt(appdata, settings);
+            };
+        }
         try {
-            rt->tls = std::make_shared<quic::QuicTlsContext>(*m_cfg.tls);
+            rt->tls = std::make_shared<quic::QuicTlsContext>(*m_cfg.tls, std::move(early));
         } catch (const std::exception &e) {
             SIMPLE_HTTP_ERROR_LOG("server: QUIC TLS setup failed: {}", e.what());
             return server_errc::tls_setup_failed;
