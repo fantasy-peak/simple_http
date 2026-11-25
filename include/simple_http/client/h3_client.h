@@ -60,6 +60,7 @@
 #include "../quic/connection.h"
 #include "client_config.h"
 #include "client_stream.h"
+#include "h3_session_cache.h"
 #include "multiplexed_session.h"
 #include "tls_client.h"
 
@@ -69,6 +70,16 @@ namespace simple_http::detail {
 // not depend on engine/h3/h3_engine.h (which would pull the whole Dispatcher).
 inline constexpr std::size_t kH3ClientQpackMaxTableCapacity = 4096;
 inline constexpr std::size_t kH3ClientQpackBlockedStreams = 16;
+
+// What one HTTP/3 dial may resume. The cache is owned by the Client, so a
+// queued ticket outlives a stack Client's connection object.
+struct H3ResumeOptions {
+    std::shared_ptr<H3SessionCache> cache;
+    std::string key;
+    bool allow_0rtt{false};
+    // A request that may be submitted as soon as the 0-RTT write keys exist.
+    std::shared_ptr<EarlyOpen> early;
+};
 
 // The UDP transport for one QUIC client connection.
 //
@@ -176,6 +187,13 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
     struct Stream;
     using StreamMap = std::unordered_map<std::int64_t, std::shared_ptr<Stream>>;
 
+    // A request that arrived while the 1-RTT handshake was still running and
+    // did not opt into early data. Replayed by drain_pending_opens().
+    struct PendingOpen {
+        std::shared_ptr<Request> request;
+        OpenCompletion done;
+    };
+
     struct ConnectState {
         Executor ex;
         SSL_CTX *ssl_ctx{nullptr};
@@ -186,6 +204,7 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         std::chrono::milliseconds connect_timeout{};
         std::chrono::milliseconds idle_timeout{};
         ResolveFn resolve_fn;
+        H3ResumeOptions resume;
         std::vector<asio::ip::udp::endpoint> ordered;
         std::size_t next{0};
         error_code last_error{make_error_code(asio::error::host_not_found)};
@@ -207,8 +226,8 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
     static auto async_connect(Executor ex, SSL_CTX *ssl_ctx, const ClientTarget &target, const ClientTlsHandshake &hs,
                               const EngineLimits &limits, std::uint32_t max_udp_payload_size,
                               std::chrono::milliseconds connect_timeout, std::chrono::milliseconds idle_timeout,
-                              const ResolveFn &resolve_fn, std::function<void(std::function<void()>)> set_abort,
-                              Token &&token) {
+                              const ResolveFn &resolve_fn, H3ResumeOptions resume,
+                              std::function<void(std::function<void()>)> set_abort, Token &&token) {
         auto state = std::make_shared<ConnectState>();
         state->ex = ex;
         state->ssl_ctx = ssl_ctx;
@@ -219,6 +238,7 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         state->connect_timeout = connect_timeout;
         state->idle_timeout = idle_timeout;
         state->resolve_fn = resolve_fn;
+        state->resume = std::move(resume);
         state->set_abort = std::move(set_abort);
         return asio::async_initiate<Token, void(error_code, std::shared_ptr<Http3ClientSession>)>(
             [state](auto handler) {
@@ -284,6 +304,28 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
             return apply_client_ssl_settings(ssl, hs);
         };
 
+        if (state->resume.cache) {
+            // Resumption and 0-RTT both start from the cached session. The
+            // entry is single-use: a dial that never reaches the server loses
+            // it rather than replaying a stale ticket.
+            if (auto entry = state->resume.cache->take(state->resume.key)) {
+                options.session_ticket = std::move(entry->session);
+                options.zero_rtt_transport_params = std::move(entry->transport_params);
+                options.allow_0rtt = state->resume.allow_0rtt;
+            }
+            auto cache = state->resume.cache;
+            auto key = state->resume.key;
+            options.on_session_ticket = [cache, key](std::shared_ptr<SSL_SESSION> session,
+                                                     std::vector<std::uint8_t> params) {
+                H3SessionEntry entry;
+                entry.session = std::move(session);
+                entry.transport_params = std::move(params);
+                const long lifetime = entry.session ? SSL_SESSION_get_timeout(entry.session.get()) : 0;
+                entry.expires = std::chrono::steady_clock::now() + std::chrono::seconds(lifetime > 0 ? lifetime : 0);
+                cache->put(key, std::move(entry));
+            };
+        }
+
         auto conn = std::make_shared<Connection>(state->ex, state->ssl_ctx, qcfg, std::move(options), local, remote,
                                                  udp->sink());
         if (!conn->init()) {
@@ -295,20 +337,22 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
 
         auto session = std::make_shared<Http3ClientSession>(state->ex, std::move(conn), std::move(udp), state->target,
                                                             state->limits);
+        session->set_early_open(state->resume.early);
         if (state->set_abort) {
             // Once the session exists, close it (connection, timers and socket)
             // rather than only the raw UDP socket.
             state->set_abort([session] { session->close(); });
         }
         SIMPLE_HTTP_DEBUG_LOG("h3 client: connection built, waiting for handshake");
-        session->start(attempt_timeout, [session, done = std::move(done)](error_code ec) mutable {
-            if (ec) {
-                std::move(done)(ec, nullptr);
-                return;
-            }
-            SIMPLE_HTTP_DEBUG_LOG("h3 client: handshake complete and h3 ready");
-            std::move(done)(error_code{}, session);
-        });
+        session->start(attempt_timeout, state->resume.allow_0rtt,
+                       [session, done = std::move(done)](error_code ec) mutable {
+                           if (ec) {
+                               std::move(done)(ec, nullptr);
+                               return;
+                           }
+                           SIMPLE_HTTP_DEBUG_LOG("h3 client: connection ready (early={})", session->used_0rtt());
+                           std::move(done)(error_code{}, session);
+                       });
     }
 
     static void connect_next(const std::shared_ptr<ConnectState> &state) {
@@ -402,6 +446,15 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
     Http3ClientSession(const Http3ClientSession &) = delete;
     Http3ClientSession &operator=(const Http3ClientSession &) = delete;
 
+    // Connection-level view, for logging and tests. Per-response answers come
+    // from ResponseHead::used_0rtt.
+    [[nodiscard]] bool used_0rtt() const { return m_conn != nullptr && m_conn->used_0rtt(); }
+
+    // The dial may hand over one request to submit the moment the 0-RTT write
+    // keys are installed, before the handshake completes. This is what makes
+    // 0-RTT deterministic instead of relying on the handshake losing a race.
+    void set_early_open(std::shared_ptr<EarlyOpen> early) { m_early_open = std::move(early); }
+
     // --- ClientSession ---
 
     void open_stream(std::shared_ptr<Request> request, OpenCompletion done) override {
@@ -413,6 +466,15 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
             }
             if (self->m_goaway_received) {
                 std::move(done)(make_error_code(client_errc::goaway), nullptr);
+                return;
+            }
+            const bool want_early = request->allow_0rtt() && !self->m_handshake_complete && self->m_early_ready &&
+                                    !self->m_early_rejected && self->m_conn->can_send_0rtt();
+            if (!self->m_handshake_complete && !want_early) {
+                // The dial may have completed after the 0-RTT keys became
+                // available; a request that did not opt in must wait for the
+                // handshake rather than be sent at the wrong encryption level.
+                self->m_pending_opens.push_back(PendingOpen{std::move(request), std::move(done)});
                 return;
             }
             if (self->h3() == nullptr) {
@@ -435,6 +497,7 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
             auto fresh = std::make_shared<Stream>();
             fresh->outcome = std::make_shared<StreamOutcome>();
             fresh->is_head = request->method() == Method::Head;
+            fresh->sent_early = want_early;
             // Capacity-1 coalescing wake-ups on the session executor; see Stream.
             fresh->in_space = std::make_shared<Channel>(self->m_executor, 1);
             fresh->out_space = std::make_shared<Channel>(self->m_executor, 1);
@@ -943,21 +1006,75 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
     // instead — see Protocol::on_handshake_complete.
     void on_tx_keys_ready() noexcept override {}
 
-    void on_handshake_complete() noexcept override {
-        if (m_h3 != nullptr)
-            return; // idempotent: a late set_protocol replay can reach here twice
-
-        if (m_conn->streams_uni_left() < 3) {
-            SIMPLE_HTTP_ERROR_LOG("h3 client: peer allows fewer than 3 unidirectional streams (left={})",
-                                  m_conn->streams_uni_left());
-            fail_ready(make_error_code(client_errc::version_not_negotiated));
+    // The 0-RTT write keys are installed. If the caller opted into early data
+    // and the peer's saved transport parameters let us open the control/QPACK
+    // streams, create nghttp3 now and let the dial complete early. -- otherwise
+    // wait for the handshake.
+    void on_0rtt_keys_ready() noexcept override {
+        if (m_h3 == nullptr && !ensure_h3(true))
             return;
+        m_early_ready = true;
+        m_alive = true;
+        if (m_early_open && !m_early_rejected && m_conn->can_send_0rtt()) {
+            auto early = std::move(m_early_open);
+            early->submitted = true;
+            open_stream(std::move(early->request), std::move(early->done));
         }
+        if (m_allow_early)
+            h3::wake(m_ready);
+        m_conn->flush();
+    }
+
+    // The peer refused our early data. ngtcp2 has already discarded the early
+    // stream IDs, so every object anchored to them must go; the handshake
+    // continues and on_handshake_complete() rebuilds nghttp3 at 1-RTT.
+    void on_early_data_rejected() noexcept override {
+        m_early_rejected = true;
+        m_early_ready = false;
+        if (m_h3 != nullptr) {
+            nghttp3_conn_del(m_h3);
+            m_h3 = nullptr;
+        }
+        for (auto &[id, stream] : m_streams) {
+            if (stream->outcome->get() == StreamState::Open)
+                stream->outcome->set(StreamState::Failed, make_error_code(client_errc::zero_rtt_rejected));
+            h3::wake(stream->in_space);
+            h3::wake(stream->out_space);
+        }
+        m_streams.clear();
+    }
+
+    void on_handshake_complete() noexcept override {
+        m_handshake_complete = true;
+        // If the early request was not submitted (no ticket, no stream credit),
+        // the dial continuation owns it and opens the stream at 1-RTT.
+        m_early_open.reset();
         // QUIC mandates ALPN, and HTTP/3 is only meaningful if it selected h3.
         if (m_conn->alpn_selected() != quic::kHttp3Alpn) {
             SIMPLE_HTTP_ERROR_LOG("h3 client: peer selected ALPN '{}', not 'h3'", m_conn->alpn_selected());
             fail_ready(make_error_code(client_errc::version_not_negotiated));
             return;
+        }
+        if (m_h3 == nullptr && !ensure_h3(false))
+            return;
+        m_alive = true;
+        SIMPLE_HTTP_DEBUG_LOG("h3 client: h3 connection initialised (left={}, alpn={})", m_conn->streams_uni_left(),
+                              m_conn->alpn_selected());
+        h3::wake(m_ready);
+        m_conn->flush();
+        drain_pending_opens();
+    }
+
+    bool ensure_h3(bool early) noexcept {
+        if (m_h3 != nullptr)
+            return true;
+        if (m_conn->streams_uni_left() < 3) {
+            if (!early) {
+                SIMPLE_HTTP_ERROR_LOG("h3 client: peer allows fewer than 3 unidirectional streams (left={})",
+                                      m_conn->streams_uni_left());
+                fail_ready(make_error_code(client_errc::version_not_negotiated));
+            }
+            return false;
         }
 
         nghttp3_settings settings;
@@ -974,31 +1091,41 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
                                     static_cast<h3::H3CallbackSink *>(this)) != 0) {
             SIMPLE_HTTP_ERROR_LOG("h3 client: nghttp3_conn_client_new failed");
             fail_ready(make_error_code(client_errc::protocol_error));
-            return;
+            return false;
         }
         const std::optional<std::int64_t> control = m_conn->open_uni_stream();
         if (!control || nghttp3_conn_bind_control_stream(m_h3, *control) != 0) {
             SIMPLE_HTTP_ERROR_LOG("h3 client: could not open the control stream");
             fail_ready(make_error_code(client_errc::protocol_error));
-            return;
+            return false;
         }
         const std::optional<std::int64_t> qpack_enc = m_conn->open_uni_stream();
         const std::optional<std::int64_t> qpack_dec = m_conn->open_uni_stream();
         if (!qpack_enc || !qpack_dec || nghttp3_conn_bind_qpack_streams(m_h3, *qpack_enc, *qpack_dec) != 0) {
             SIMPLE_HTTP_ERROR_LOG("h3 client: could not open the QPACK streams");
             fail_ready(make_error_code(client_errc::protocol_error));
-            return;
+            return false;
         }
-        m_alive = true;
-        SIMPLE_HTTP_DEBUG_LOG("h3 client: h3 connection initialised (left={}, alpn={})", m_conn->streams_uni_left(),
-                              m_conn->alpn_selected());
-        h3::wake(m_ready);
-        m_conn->flush();
+        return true;
+    }
+
+    void drain_pending_opens() {
+        if (m_pending_opens.empty())
+            return;
+        std::vector<PendingOpen> pending = std::move(m_pending_opens);
+        m_pending_opens.clear();
+        for (PendingOpen &open : pending) {
+            open_stream(std::move(open.request), std::move(open.done));
+        }
     }
 
     void on_connection_closed() noexcept override {
         m_alive = false;
         m_conn_closed = true;
+        for (PendingOpen &open : m_pending_opens) {
+            std::move(open.done)(make_error_code(asio::error::connection_reset), nullptr);
+        }
+        m_pending_opens.clear();
         // Closed before the handshake produced h3: report a transport failure
         // rather than a stale default. (fail_ready's specific diagnosis wins.)
         if (m_h3 == nullptr && !m_failure_set)
@@ -1120,6 +1247,7 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
             }
             st.head.status = status;
             st.head.version = Version::Http3;
+            st.head.used_0rtt = st.sent_early && !m_early_rejected;
             st.head.bodyless = fin || status == status::no_content || status == status::not_modified || st.is_head;
             for (auto &[name, value] : st.header_tmp)
                 st.head.headers.add_lower(std::move(name), std::move(value));
@@ -1343,6 +1471,9 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         std::optional<ResponseHead> interim;
         bool head_seen{false};
         bool is_head{false};
+        // The request was submitted in 0-RTT. The response head reports
+        // used_0rtt only while the server has not rejected it.
+        bool sent_early{false};
         bool remote_end{false};
         bool reset{false};
         bool failed{false};
@@ -1400,7 +1531,8 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
 
     // Start the connection and wait for the 1-RTT keys (when the HTTP/3 control
     // streams can be opened). Completion signature: void(error_code).
-    void start(std::chrono::milliseconds connect_timeout, std::function<void(error_code)> done) {
+    void start(std::chrono::milliseconds connect_timeout, bool allow_early, std::function<void(error_code)> done) {
+        m_allow_early = allow_early;
         m_ready = std::make_shared<Channel>(m_executor, 1);
         auto self = this->shared_from_this();
         run();
@@ -1686,6 +1818,12 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
     error_code m_failure{make_error_code(client_errc::version_not_negotiated)};
     bool m_failure_set{false};
     Signal m_ready;
+    bool m_allow_early{false};
+    bool m_handshake_complete{false};
+    bool m_early_ready{false};
+    bool m_early_rejected{false};
+    std::shared_ptr<EarlyOpen> m_early_open;
+    std::vector<PendingOpen> m_pending_opens;
     StreamMap m_streams;
     std::array<quic::ByteVec, 8> m_vec{};
     std::size_t m_vec_count{0};

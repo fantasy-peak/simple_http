@@ -80,6 +80,9 @@ struct H3Stream {
     std::string authority;
     std::string scheme;
     bool is_head{false};
+    // At least one byte of this request arrived in a 0-RTT packet. Latched:
+    // a 1-RTT retransmission of the same range no longer carries the flag.
+    bool used_0rtt{false};
     bool seen_authority{false};
     // Sum of decoded name+value+32 over this header section. The compressed
     // size is bounded by on_headers_begin; QPACK dynamic references can expand

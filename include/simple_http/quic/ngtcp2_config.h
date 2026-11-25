@@ -61,7 +61,10 @@ struct QuicConnectionConfig {
     // The endpoint routes migrated datagrams to the owning worker and the
     // connection sends on the path ngtcp2 selects, so this is supported.
     bool disable_active_migration{false};
-    bool enable_0rtt{false};
+    // Accept TLS 1.3 early data, matching quic-go's http3.Server default. There
+    // is no replay protection: only requests the application marks idempotent
+    // (GET/HEAD) should opt in, and handlers can inspect used_0rtt().
+    bool enable_0rtt{true};
 };
 
 // How ngtcp2 is told about one connection.
@@ -139,9 +142,10 @@ inline Ngtcp2Params make_ngtcp2_params(const QuicConnectionConfig &cfg, ngtcp2_t
     // Both fields are still read by callers and still mean what they say to
     // anyone reading the struct; they just no longer reach the wire.
     //
-    // `enable_0rtt` is a real ngtcp2 concept but needs a session cache the
-    // server has nowhere to keep, so it stays off — which is what the default
-    // `false` already says.
+    // 0-RTT needs no server-side session cache: TLS 1.3 tickets are stateless
+    // and OpenSSL encrypts them with a key owned by the QUIC listener's
+    // SSL_CTX. Tickets therefore survive across SO_REUSEPORT endpoints of one
+    // process, but not a restart.
 
     return out;
 }

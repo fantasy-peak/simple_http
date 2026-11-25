@@ -85,6 +85,7 @@ token。C++17 下可以使用回调、`asio::deferred`、`asio::detached` 和
 | h2c prior knowledge | 支持（`http://` URL + `HttpVersionPolicy::Http2`） |
 | h2c `Upgrade` | 尚未接线（`H2cMode` 存在，但客户端始终使用 prior knowledge） |
 | HTTP/3 over QUIC | 可选，且只能显式指定（`HttpVersionPolicy::Http3`） |
+| HTTP/3 0-RTT | 支持，按请求显式开启（`get_0rtt` / `allow_0rtt`），仅 GET/HEAD；无重放保护 |
 | WebSocket over HTTP/1.1 | 支持 |
 | WebSocket over HTTP/2 或 HTTP/3 | 不支持 |
 | 重定向 | 支持，默认关闭（`max_redirects = 0`） |
@@ -937,7 +938,10 @@ test/external/stress/run.sh cpp h3 --no-conformance
   拒绝；transport 类型存在，但没有 listener 使用它们。
 - **没有 HTTP/3 WebSocket 或 extended CONNECT。**
 - **HTTP/3 不暴露请求 trailers 与 `Expect: 100-continue`。** 响应 trailers 支持。
-- **HTTP/2 与 HTTP/3 都没有 server push**；HTTP/3 客户端没有 0-RTT。
+- **HTTP/2 与 HTTP/3 都没有 server push。** HTTP/3 0-RTT 仅对显式开启的
+  GET/HEAD 生效，无重放保护；早期请求被拒绝时返回
+  `client_errc::zero_rtt_rejected`，不自动重试。服务端默认接受 0-RTT
+  （`quic_options.connection.enable_0rtt`）。
 - **HTTP/3 只能显式启用。** 客户端不读取 Alt-Svc 或 HTTPS RR。
 - **出站代理不覆盖 HTTP/3。**
 - **`NO_PROXY` 不支持 CIDR 或 glob。**

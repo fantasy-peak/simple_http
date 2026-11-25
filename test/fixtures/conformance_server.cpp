@@ -158,6 +158,14 @@ int main() {
     dual_cfg.listen = InetAddress{"0.0.0.0", 7792, false};
     dual_cfg.quic = InetAddress{"0.0.0.0", 7792, false};
     dual_cfg.worker_threads = 4;
+    // 0-RTT is on here too. The endpoint routes the client's initial DCID, so
+    // a ClientHello split across Initial packets is reassembled and h3spec's
+    // TLS 8.3 CRYPTO-in-0-RTT case sees PROTOCOL_VIOLATION. TLS 8.2 passes
+    // because the connection records from the ClientHello callback whether the
+    // quic_transport_parameters extension was present, and answers a truly
+    // missing one with 0x016d. The dedicated `0rtt` suite covers successful
+    // early data and the on/off fallbacks.
+    dual_cfg.quic_options.connection.enable_0rtt = true;
     dual_cfg.tls = TlsConfig{
         .cert_chain_file = "./test/tls_certificates/server_cert.pem",
         .private_key_file = "./test/tls_certificates/server_key.pem",

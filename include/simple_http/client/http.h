@@ -50,6 +50,7 @@
 #include "h2_client.h"
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
 #include "h3_client.h"
+#include "h3_session_cache.h"
 #endif
 #include "proxy.h"
 #include "tls_client.h"
@@ -210,6 +211,9 @@ class Response {
     bool ok() const { return m_head.status >= 200 && m_head.status < 300; }
     bool bodyless() const { return m_head.bodyless; }
     bool uncompressed() const { return m_head.uncompressed; }
+    // True when this request was sent as HTTP/3 0-RTT and accepted by the
+    // server. Always false for HTTP/1.x and HTTP/2.
+    bool used_0rtt() const { return m_head.used_0rtt; }
 
     // 2xx -> empty error; anything else -> client_errc::http_status (the real
     // status stays readable through status()).
@@ -257,6 +261,10 @@ struct StreamSpec {
     std::chrono::milliseconds response_head_timeout{};
     std::chrono::milliseconds body_idle_timeout{};
     std::optional<HttpVersionPolicy> version{};
+    // HTTP/3 only: send this request as 0-RTT early data when a resumed
+    // session exists. Only valid with Method::Get / Method::Head (the wire
+    // method is still GET/HEAD; this is an explicit opt-in, not a new verb).
+    bool allow_0rtt{false};
     // Automatic Expect: 100-continue: the request carries the header and the
     // first write()/finish() waits up to continue_timeout for the interim 100.
     bool auto_expect_continue{false};
@@ -314,6 +322,8 @@ class Stream : public std::enable_shared_from_this<Stream> {
     const detail::ResponseHead &head() const { return m_stream->head(); }
     const Headers &trailers() const { return m_stream->response_trailers(); }
     bool finished() const { return m_stream->finished(); }
+    // See Response::used_0rtt().
+    bool used_0rtt() const { return m_stream->head().used_0rtt; }
 
     // Cancels the exchange and releases the engine's single-connection gate
     // now: waiting for the destructor would block later requests to the same
@@ -629,6 +639,8 @@ class Client : public std::enable_shared_from_this<Client> {
     Client &operator=(const Client &) = delete;
 
     RequestBuilder get(std::string url) const;
+    RequestBuilder get_0rtt(std::string url) const;
+    RequestBuilder head_0rtt(std::string url) const;
     RequestBuilder post(std::string url) const;
     RequestBuilder put(std::string url) const;
     RequestBuilder del(std::string url) const;
@@ -765,10 +777,11 @@ class Client : public std::enable_shared_from_this<Client> {
     // `cancel` is the overall request_timeout's flag. The dial callbacks may run
     // after that timeout completed the caller and destroyed a stack Client, so
     // they must stop before dereferencing `self`.
-    void dial(const detail::Url &url, HttpVersionPolicy version, std::shared_ptr<detail::HopCancel> cancel,
-              DialDone done) const;
+    void dial(const detail::Url &url, HttpVersionPolicy version, bool allow_0rtt,
+              std::shared_ptr<detail::EarlyOpen> early, std::shared_ptr<detail::HopCancel> cancel, DialDone done) const;
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
-    void dial_h3(const detail::Url &url, std::shared_ptr<detail::HopCancel> cancel, DialDone done) const;
+    void dial_h3(const detail::Url &url, bool allow_0rtt, std::shared_ptr<detail::EarlyOpen> early,
+                 std::shared_ptr<detail::HopCancel> cancel, DialDone done) const;
 #endif
     void dial_via_proxy(const detail::Url &url, const ProxyConfig &proxy, HttpVersionPolicy version,
                         std::shared_ptr<detail::HopCancel> cancel, DialDone done) const;
@@ -825,6 +838,10 @@ class Client : public std::enable_shared_from_this<Client> {
     std::shared_ptr<asio::ssl::context> m_tls_context;
     mutable std::string m_cached_origin;
     mutable std::shared_ptr<detail::ClientSession> m_cached_session;
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+    // Survives close(): resumption is a TLS-session property, not a connection.
+    std::shared_ptr<detail::H3SessionCache> m_h3_sessions{std::make_shared<detail::H3SessionCache>()};
+#endif
 };
 
 class RequestBuilder {
@@ -879,24 +896,40 @@ class RequestBuilder {
         m_version = policy;
         return *this;
     }
+    // Opt this GET/HEAD into HTTP/3 0-RTT. Other methods fail with
+    // client_errc::invalid_spec when send() runs.
+    RequestBuilder &allow_0rtt() {
+        m_allow_0rtt = true;
+        return *this;
+    }
 
     template <typename Token> auto send(Token &&token) {
+        const Method wire = wire_method(m_method);
+        const bool early = is_0rtt(m_method) || m_allow_0rtt;
+        if (early && wire != Method::Get && wire != Method::Head) {
+            return asio::async_initiate<Token, void(error_code, Response)>(
+                detail::make_executor_initiation(
+                    [](auto handler) { std::move(handler)(make_error_code(client_errc::invalid_spec), Response{}); },
+                    m_client->executor()),
+                token);
+        }
         auto request = std::make_shared<Request>(Version::Http11, m_client->executor());
-        request->set_method(m_method);
+        request->set_method(wire);
+        request->set_allow_0rtt(early);
         request->mutable_headers() = m_headers;
         const auto &config = m_client->config();
         // Advertise only codings this build can actually decode; advertising an
         // unsupported one makes the server compress a body we would then have to
         // pass through raw (or fail to decode).
         const auto encodings = detail::normalize_accept_encodings(config.accept_encodings);
-        if (config.auto_decompress && m_method != Method::Head && !request->header(field::accept_encoding) &&
+        if (config.auto_decompress && wire != Method::Head && !request->header(field::accept_encoding) &&
             !request->header(field::range) && !encodings.empty()) {
             request->mutable_headers().add(std::string{field::accept_encoding}, detail::join_encodings(encodings));
             request->set_state(detail::AutoDecompressMark{});
         }
         if (!m_body.empty())
             request->set_body(m_body);
-        if (m_method == Method::Head)
+        if (wire == Method::Head)
             request->set_close(false);
         const std::size_t cap = m_max_body_bytes != 0 ? m_max_body_bytes : m_client->config().limits.max_body_bytes;
         return m_client->async_send(std::move(request), m_url, cap, m_head_timeout, m_idle_timeout, m_version,
@@ -913,9 +946,16 @@ class RequestBuilder {
     std::chrono::milliseconds m_head_timeout{};
     std::chrono::milliseconds m_idle_timeout{};
     std::optional<HttpVersionPolicy> m_version;
+    bool m_allow_0rtt{false};
 };
 
 inline RequestBuilder Client::get(std::string url) const { return RequestBuilder(this, Method::Get, std::move(url)); }
+inline RequestBuilder Client::get_0rtt(std::string url) const {
+    return RequestBuilder(this, Method::Get0RTT, std::move(url));
+}
+inline RequestBuilder Client::head_0rtt(std::string url) const {
+    return RequestBuilder(this, Method::Head0RTT, std::move(url));
+}
 inline RequestBuilder Client::post(std::string url) const { return RequestBuilder(this, Method::Post, std::move(url)); }
 inline RequestBuilder Client::put(std::string url) const { return RequestBuilder(this, Method::Put, std::move(url)); }
 inline RequestBuilder Client::del(std::string url) const {
@@ -1505,13 +1545,15 @@ inline std::string resolve_redirect(const Url &base, std::string_view location) 
 
 } // namespace detail
 
-inline void Client::dial(const detail::Url &url, HttpVersionPolicy version, std::shared_ptr<detail::HopCancel> cancel,
+inline void Client::dial(const detail::Url &url, HttpVersionPolicy version, bool allow_0rtt,
+                         std::shared_ptr<detail::EarlyOpen> early, std::shared_ptr<detail::HopCancel> cancel,
                          DialDone done) const {
     if (version == HttpVersionPolicy::Http3) {
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
-        dial_h3(url, std::move(cancel), std::move(done));
+        dial_h3(url, allow_0rtt, std::move(early), std::move(cancel), std::move(done));
         return;
 #else
+        (void)allow_0rtt;
         std::move(done)(make_error_code(client_errc::version_not_negotiated), nullptr);
         return;
 #endif
@@ -1599,7 +1641,8 @@ inline void Client::dial(const detail::Url &url, HttpVersionPolicy version, std:
 }
 
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
-inline void Client::dial_h3(const detail::Url &url, std::shared_ptr<detail::HopCancel> cancel, DialDone done) const {
+inline void Client::dial_h3(const detail::Url &url, bool allow_0rtt, std::shared_ptr<detail::EarlyOpen> early,
+                            std::shared_ptr<detail::HopCancel> cancel, DialDone done) const {
     if (cancel && cancel->cancelled) {
         std::move(done)(make_error_code(asio::error::operation_aborted), nullptr);
         return;
@@ -1627,9 +1670,16 @@ inline void Client::dial_h3(const detail::Url &url, std::shared_ptr<detail::HopC
 
     auto target = url.to_target();
     target.version = HttpVersionPolicy::Http3;
+    detail::H3ResumeOptions resume;
+    resume.cache = m_h3_sessions;
+    resume.key = url.scheme + "://" + url.authority();
+    // A shared SSL_CTX does not get our new-session callback (that would mutate
+    // caller-owned state), so tickets are never captured there.
+    resume.allow_0rtt = allow_0rtt && m_config.h3_enable_0rtt && !m_config.tls.shared_context;
+    resume.early = std::move(early);
     detail::Http3ClientSession<asio::any_io_executor>::async_connect(
         m_executor, context->native_handle(), target, hs, m_config.limits, m_config.quic_max_udp_payload_size,
-        m_config.connect_timeout, m_config.idle_timeout, m_config.resolve,
+        m_config.connect_timeout, m_config.idle_timeout, m_config.resolve, std::move(resume),
         [cancel](std::function<void()> abort) {
             if (cancel)
                 cancel->abort_transport = std::move(abort);
@@ -2121,19 +2171,42 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
             ready->open_stream(request, std::move(open_done));
             return;
         }
-        self->dial(target, version, cancel,
-                   [self, request, origin, cancel, open_done = std::move(open_done)](
+        std::shared_ptr<detail::EarlyOpen> early;
+        if (request->allow_0rtt()) {
+            early = std::make_shared<detail::EarlyOpen>();
+            early->request = request;
+            early->done = std::move(open_done);
+        }
+        self->dial(target, version, request->allow_0rtt(), early, cancel,
+                   [self, request, origin, cancel, early, open_done = std::move(open_done)](
                        error_code dec, std::shared_ptr<detail::ClientSession> session) mutable {
+                       // The session already took the request and its completion;
+                       // completing it again (even on cancellation) would invoke a
+                       // moved-from handler.
+                       if (early && early->submitted)
+                           return;
+                       auto fail = [&](error_code ec) {
+                           if (early)
+                               std::move(early->done)(ec, nullptr);
+                           else
+                               std::move(open_done)(ec, nullptr);
+                       };
                        if (cancel && cancel->cancelled) {
-                           open_done(make_error_code(asio::error::operation_aborted), nullptr);
+                           fail(make_error_code(asio::error::operation_aborted));
                            return;
                        }
                        if (dec) {
-                           open_done(dec, nullptr);
+                           fail(dec);
                            return;
                        }
                        self->cache(origin, session);
-                       session->open_stream(request, std::move(open_done));
+                       if (early) {
+                           if (early->submitted)
+                               return; // the session opened it from the 0-RTT keys
+                           session->open_stream(std::move(early->request), std::move(early->done));
+                       } else {
+                           session->open_stream(request, std::move(open_done));
+                       }
                    });
     };
     if (session) {
@@ -2157,8 +2230,14 @@ Client::open_stream_hop(std::string url, StreamSpec spec, std::size_t max_body_b
         return;
     }
     const detail::Url target = *parsed;
+    const Method wire = wire_method(spec.method);
+    const bool early = spec.allow_0rtt || is_0rtt(spec.method);
+    if (early && wire != Method::Get && wire != Method::Head) {
+        std::move(done)(make_error_code(client_errc::invalid_spec), nullptr);
+        return;
+    }
     detail::ResponseDecoding decoding;
-    if (m_config.auto_decompress && spec.method != Method::Head && !spec.headers.get(field::accept_encoding) &&
+    if (m_config.auto_decompress && wire != Method::Head && !spec.headers.get(field::accept_encoding) &&
         !spec.headers.get(field::range) && !m_config.accept_encodings.empty()) {
         const auto encodings = detail::normalize_accept_encodings(m_config.accept_encodings);
         if (!encodings.empty()) {
@@ -2168,7 +2247,8 @@ Client::open_stream_hop(std::string url, StreamSpec spec, std::size_t max_body_b
         }
     }
     auto request = std::make_shared<Request>(Version::Http11, m_executor);
-    request->set_method(spec.method);
+    request->set_method(wire);
+    request->set_allow_0rtt(early);
     request->set_target(spec.target.empty() ? std::string{target.target} : spec.target);
     request->mutable_headers() = std::move(spec.headers);
     if (spec.expect_100_continue || spec.auto_expect_continue) {
@@ -2184,37 +2264,58 @@ Client::open_stream_hop(std::string url, StreamSpec spec, std::size_t max_body_b
     const std::chrono::milliseconds continue_timeout = spec.continue_timeout;
     const HttpVersionPolicy version = spec.version ? *spec.version : m_config.default_version;
     auto self = keep_alive();
-    dial(target, version, cancel,
-         [self, request, max_body_bytes, decoding, head_timeout, idle_timeout, auto_continue, continue_timeout, cancel,
-          done = std::move(done)](error_code ec, std::shared_ptr<detail::ClientSession> session) mutable {
+    detail::OpenCompletion open_done =
+        [max_body_bytes, decoding, head_timeout, idle_timeout, auto_continue, continue_timeout, cancel,
+         done = std::move(done)](error_code oec, std::shared_ptr<detail::ClientStream> stream) mutable {
+            if (oec) {
+                std::move(done)(oec, nullptr);
+                return;
+            }
+            if (cancel && cancel->cancelled) {
+                stream->async_cancel(asio::detached);
+                std::move(done)(make_error_code(asio::error::operation_aborted), nullptr);
+                return;
+            }
+            if (cancel) {
+                cancel->stream = stream;
+                cancel->abort_transport = {};
+            }
+            auto wrapped = detail::maybe_decompressing_stream(std::move(stream), decoding, max_body_bytes);
+            std::move(done)(error_code{}, std::make_shared<Stream>(std::move(wrapped), head_timeout, idle_timeout,
+                                                                   auto_continue, continue_timeout));
+        };
+    std::shared_ptr<detail::EarlyOpen> early_open;
+    if (request->allow_0rtt()) {
+        early_open = std::make_shared<detail::EarlyOpen>();
+        early_open->request = request;
+        early_open->done = std::move(open_done);
+    }
+    dial(target, version, request->allow_0rtt(), early_open, cancel,
+         [request, cancel, early_open,
+          open_done = std::move(open_done)](error_code ec, std::shared_ptr<detail::ClientSession> session) mutable {
+             if (early_open && early_open->submitted)
+                 return; // the session owns the request and its completion
+             auto fail = [&](error_code fec) {
+                 if (early_open)
+                     std::move(early_open->done)(fec, nullptr);
+                 else
+                     std::move(open_done)(fec, nullptr);
+             };
              if (cancel && cancel->cancelled) {
-                 std::move(done)(make_error_code(asio::error::operation_aborted), nullptr);
+                 fail(make_error_code(asio::error::operation_aborted));
                  return;
              }
              if (ec) {
-                 std::move(done)(ec, nullptr);
+                 fail(ec);
                  return;
              }
-             session->open_stream(request, [max_body_bytes, decoding, head_timeout, idle_timeout, auto_continue,
-                                            continue_timeout, cancel, done = std::move(done)](
-                                               error_code oec, std::shared_ptr<detail::ClientStream> stream) mutable {
-                 if (oec) {
-                     std::move(done)(oec, nullptr);
-                     return;
-                 }
-                 if (cancel && cancel->cancelled) {
-                     stream->async_cancel(asio::detached);
-                     std::move(done)(make_error_code(asio::error::operation_aborted), nullptr);
-                     return;
-                 }
-                 if (cancel) {
-                     cancel->stream = stream;
-                     cancel->abort_transport = {};
-                 }
-                 auto wrapped = detail::maybe_decompressing_stream(std::move(stream), decoding, max_body_bytes);
-                 std::move(done)(error_code{}, std::make_shared<Stream>(std::move(wrapped), head_timeout, idle_timeout,
-                                                                        auto_continue, continue_timeout));
-             });
+             if (early_open) {
+                 if (early_open->submitted)
+                     return; // the session opened it from the 0-RTT keys
+                 session->open_stream(std::move(early_open->request), std::move(early_open->done));
+             } else {
+                 session->open_stream(request, std::move(open_done));
+             }
          });
 }
 

@@ -13,15 +13,20 @@
 #include <openssl/ssl.h>
 
 #include <array>
+#include <cstdint>
 #include <filesystem>
+#include <functional>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "../core/asio_ssl.h"
 #include "../core/logging.h"
 #include "../core/types.h"
 #include "../transport/tls_context.h"
+#include "ngtcp2_crypto.h"
 
 namespace simple_http::quic {
 
@@ -47,9 +52,26 @@ inline constexpr std::array<unsigned char, 3> kHttp3AlpnWire{0x02, 'h', '3'};
 // fields — including the user's `setup` hook — go through exactly the same asio
 // calls the TCP side uses. Reimplementing certificate loading against the raw
 // OpenSSL API would be a second copy of the same policy, free to drift.
+// 0-RTT state carried by one QUIC listener's context. The HTTP/3 layer owns the
+// appdata format; this file only stores the blob and asks the validator whether
+// a decrypted ticket may be used for early data. An explicit appdata value is
+// required: a ticket with no compatibility snapshot cannot be replayed safely.
+struct QuicEarlyDataConfig {
+    bool enabled{false};
+    std::string ticket_appdata;
+    std::function<bool(std::string_view)> validate_ticket_appdata;
+};
+
 class QuicTlsContext {
   public:
-    explicit QuicTlsContext(const TlsConfig &cfg) : m_ctx(context_method()) { configure(cfg); }
+    QuicTlsContext(const TlsConfig &cfg, QuicEarlyDataConfig early = {})
+        : m_ctx(context_method()), m_early(std::move(early)) {
+        configure(cfg);
+        configure_early_data();
+    }
+
+    QuicTlsContext(const QuicTlsContext &) = delete;
+    QuicTlsContext &operator=(const QuicTlsContext &) = delete;
 
     [[nodiscard]] asio::ssl::context &context() { return m_ctx; }
     [[nodiscard]] SSL_CTX *native_handle() { return m_ctx.native_handle(); }
@@ -103,6 +125,70 @@ class QuicTlsContext {
         // to configure without one (ssl/quic/quic_tls.c), because a QUIC
         // connection with no negotiated protocol has no meaning.
         SSL_CTX_set_alpn_select_cb(m_ctx.native_handle(), &QuicTlsContext::select_alpn, nullptr);
+
+        // RFC 9001 §8.2 requires quic_transport_parameters in the ClientHello.
+        // ngtcp2 reports a ClientHello without the extension and one whose
+        // parameters lack initial_source_connection_id with the same error, and
+        // OpenSSL 4 does not expose the received parameters after the fact. The
+        // ClientHello callback is the only place to learn whether the extension
+        // was actually present, which decides between a missing_extension alert
+        // (0x016d) and TRANSPORT_PARAMETER_ERROR (0x08).
+        SSL_CTX_set_client_hello_cb(m_ctx.native_handle(), &QuicTlsContext::on_client_hello, nullptr);
+    }
+
+    void configure_early_data() {
+        if (!m_early.enabled || m_early.ticket_appdata.empty())
+            return;
+
+        SSL_CTX *ctx = m_ctx.native_handle();
+        static constexpr unsigned char kSessionIdContext[] = "simple_http h3";
+        if (SSL_CTX_set_session_id_context(ctx, kSessionIdContext, sizeof(kSessionIdContext) - 1) != 1) {
+            throw std::runtime_error("QUIC SSL_CTX_set_session_id_context failed");
+        }
+        const auto max_early = std::numeric_limits<std::uint32_t>::max();
+        if (SSL_CTX_set_max_early_data(ctx, max_early) != 1 || SSL_CTX_set_recv_max_early_data(ctx, max_early) != 1) {
+            throw std::runtime_error("QUIC could not enable TLS early data");
+        }
+        // Stateless tickets shared by every SO_REUSEPORT endpoint of this
+        // listener. OpenSSL's built-in anti-replay would reject a ticket seen on
+        // a different socket (and can only remember a bounded window); quic-go
+        // makes the same trade-off: no replay protection, documented, and only
+        // idempotent requests opt in.
+        (void)SSL_CTX_set_options(ctx, SSL_OP_NO_ANTI_REPLAY);
+        if (SSL_CTX_set_session_ticket_cb(ctx, &QuicTlsContext::generate_ticket, &QuicTlsContext::decrypt_ticket,
+                                          this) != 1) {
+            throw std::runtime_error("QUIC SSL_CTX_set_session_ticket_cb failed");
+        }
+    }
+
+    static int generate_ticket(SSL *ssl, void *arg) {
+        auto *self = static_cast<QuicTlsContext *>(arg);
+        SSL_SESSION *session = SSL_get0_session(ssl);
+        if (session == nullptr)
+            return 0;
+        if (!SSL_SESSION_set1_ticket_appdata(session, self->m_early.ticket_appdata.data(),
+                                             self->m_early.ticket_appdata.size())) {
+            return 0;
+        }
+        return 1;
+    }
+
+    static SSL_TICKET_RETURN decrypt_ticket(SSL *, SSL_SESSION *session, const unsigned char *, size_t,
+                                            SSL_TICKET_STATUS status, void *arg) {
+        auto *self = static_cast<QuicTlsContext *>(arg);
+        const bool renew = status == SSL_TICKET_SUCCESS_RENEW;
+        if (status == SSL_TICKET_EMPTY || status == SSL_TICKET_NO_DECRYPT)
+            return SSL_TICKET_RETURN_IGNORE_RENEW;
+
+        void *data = nullptr;
+        size_t len = 0;
+        const bool present = SSL_SESSION_get0_ticket_appdata(session, &data, &len) == 1 && data != nullptr;
+        const bool compatible =
+            present && self->m_early.validate_ticket_appdata &&
+            self->m_early.validate_ticket_appdata(std::string_view{static_cast<const char *>(data), len});
+        if (!compatible)
+            return renew ? SSL_TICKET_RETURN_IGNORE_RENEW : SSL_TICKET_RETURN_IGNORE;
+        return renew ? SSL_TICKET_RETURN_USE_RENEW : SSL_TICKET_RETURN_USE;
     }
 
     static int select_alpn(SSL *, const unsigned char **out, unsigned char *outlen, const unsigned char *in,
@@ -120,7 +206,26 @@ class QuicTlsContext {
         return SSL_TLSEXT_ERR_OK;
     }
 
+    // The quic_transport_parameters extension type (RFC 9001 §8.2).
+    static constexpr unsigned int kTransportParamsExtension = 0x39;
+
+    // Runs while OpenSSL parses the ClientHello, which is the only moment
+    // SSL_client_hello_get0_ext is valid. The connection object is reached
+    // through the app data ngtcp2 installs on the SSL (its conn_ref); the
+    // handshake cannot start before QuicCrypto::init has set it.
+    static int on_client_hello(SSL *ssl, int *, void *) {
+        auto *ref = static_cast<ngtcp2_crypto_conn_ref *>(SSL_get_app_data(ssl));
+        if (ref == nullptr || ref->get_conn == nullptr)
+            return SSL_CLIENT_HELLO_SUCCESS;
+        const unsigned char *data = nullptr;
+        size_t len = 0;
+        const bool present = SSL_client_hello_get0_ext(ssl, kTransportParamsExtension, &data, &len) == 1;
+        static_cast<ConnectionCryptoBase *>(ref->user_data)->on_client_hello_tp(present);
+        return SSL_CLIENT_HELLO_SUCCESS;
+    }
+
     asio::ssl::context m_ctx;
+    QuicEarlyDataConfig m_early;
 };
 
 } // namespace simple_http::quic

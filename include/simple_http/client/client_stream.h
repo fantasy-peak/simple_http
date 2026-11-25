@@ -42,6 +42,8 @@ struct ResponseHead {
     Headers headers;
     bool bodyless{false};
     bool uncompressed{false};
+    // The request was sent as HTTP/3 0-RTT and the server accepted it.
+    bool used_0rtt{false};
 
     std::optional<std::string_view> header(std::string_view name) const { return headers.get(name); }
 };
@@ -106,6 +108,17 @@ inline error_code outcome_error(const StreamOutcome &outcome) {
 
 using ReadCompletion = asio::any_completion_handler<void(error_code, ReadResult)>;
 using OpenCompletion = asio::any_completion_handler<void(error_code, std::shared_ptr<class ClientStream>)>;
+
+// A request that may be submitted as soon as the HTTP/3 0-RTT write keys are
+// installed, before the handshake completes. The dial continuation checks
+// `submitted`: when true the session already opened the stream and will invoke
+// `done` itself; when false the caller falls back to open_stream() after the
+// handshake.
+struct EarlyOpen {
+    std::shared_ptr<Request> request;
+    OpenCompletion done;
+    bool submitted{false};
+};
 
 // A concurrent_channel receive cancelled through the caller's cancellation
 // slot completes with the experimental channel category, not
@@ -191,6 +204,9 @@ class ClientStream {
     virtual bool finished() const = 0;
     virtual Version version() const = 0;
     virtual std::uint32_t id() const = 0;
+    // Set by the HTTP/3 session once the response head proves the exchange was
+    // accepted 0-RTT. Other protocols never report it.
+    virtual bool used_0rtt() const { return head().used_0rtt; }
 
     template <typename Token> auto async_cancel(Token &&token) {
         auto initiation = [this](auto handler) { cancel(std::move(handler)); };

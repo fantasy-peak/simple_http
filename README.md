@@ -91,6 +91,7 @@ The library is header-only: `include/` contains no `.cpp` files.
 | h2c prior knowledge | Yes (`HttpVersionPolicy::Http2` on an `http://` URL) |
 | h2c `Upgrade` | Not wired (`H2cMode` exists, but the client always uses prior knowledge) |
 | HTTP/3 over QUIC | Optional, explicit only (`HttpVersionPolicy::Http3`) |
+| HTTP/3 0-RTT | Yes, opt-in per GET/HEAD (`get_0rtt` / `allow_0rtt`); no replay protection |
 | WebSocket over HTTP/1.1 | Yes |
 | WebSocket over HTTP/2 or HTTP/3 | No |
 | Redirects | Yes, off by default (`max_redirects = 0`) |
@@ -973,7 +974,10 @@ prerequisites.
 - **No HTTP/3 WebSocket or extended CONNECT.**
 - **HTTP/3 request trailers and `Expect: 100-continue` are not exposed.**
   Response trailers are supported.
-- **No server push** in HTTP/2 or HTTP/3, and no 0-RTT in the HTTP/3 client.
+- **No server push** in HTTP/2 or HTTP/3. HTTP/3 0-RTT is opt-in per GET/HEAD
+  request and has no replay protection; a rejected early request returns
+  `client_errc::zero_rtt_rejected` and is not retried automatically. The server
+  accepts 0-RTT by default (`quic_options.connection.enable_0rtt`).
 - **HTTP/3 is explicit only.** The client does not read Alt-Svc or HTTPS RRs.
 - **Outbound proxies do not cover HTTP/3.**
 - **`NO_PROXY` does not support CIDR or glob patterns.**

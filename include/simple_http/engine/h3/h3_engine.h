@@ -46,6 +46,7 @@
 
 #include "../../core/asio_compat.h"
 #include "../../core/compat.h"
+#include "h3_settings.h"
 #include <algorithm>
 #include <array>
 
@@ -90,10 +91,11 @@ inline constexpr std::uint64_t kH3ExcessiveLoad = NGHTTP3_H3_EXCESSIVE_LOAD;
 inline constexpr std::uint64_t kH3RequestCancelled = NGHTTP3_H3_REQUEST_CANCELLED;
 inline constexpr std::uint64_t kH3MessageError = NGHTTP3_H3_MESSAGE_ERROR;
 
-// HTTP/3's two connection-level knobs that are ours to choose, kept at the
-// values the hand-written engine advertised so the wire does not change.
-inline constexpr std::size_t kH3QpackMaxTableCapacity = 4096;
-inline constexpr std::size_t kH3QpackBlockedStreams = 16;
+// Upper bound on stream data the engine may hold while nghttp3 does not exist
+// yet (0-RTT keys installed, or a late protocol registration). The connection
+// has the same kind of bound one layer down; a request's HEADERS plus a small
+// body fit comfortably.
+inline constexpr std::size_t kMaxPendingReadBytes = 64 * 1024;
 
 template <typename Connection> class Http3Engine;
 
@@ -673,8 +675,30 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
     // --- quic::Protocol: the read side and events ---------------------------
 
     void on_stream_data(std::uint32_t flags, std::int64_t stream_id, span<const std::uint8_t> data) noexcept override {
-        if (h3() == nullptr)
+        const bool early = (flags & quic::kStreamData0RTT) != 0;
+        if (early) {
+            // Latch on the stream and the Request immediately: a 1-RTT
+            // retransmission of the same bytes will not carry the flag again.
+            if (auto stream = ensure_stream(stream_id)) {
+                stream->used_0rtt = true;
+                if (stream->request) {
+                    stream->request->set_used_0rtt(true);
+                }
+            }
+        }
+        if (h3() == nullptr) {
+            if (m_pending_read_bytes + data.size() > kMaxPendingReadBytes) {
+                SIMPLE_HTTP_ERROR_LOG("h3: too much stream data before nghttp3 was ready");
+                m_alive = false;
+                m_conn->close(kH3ExcessiveLoad, "http3: pending read overflow");
+                return;
+            }
+            std::vector<std::uint8_t> copy(data.size());
+            std::copy(data.begin(), data.end(), copy.begin());
+            m_pending_read_bytes += copy.size();
+            m_pending_reads.push_back(PendingRead{flags, stream_id, std::move(copy)});
             return;
+        }
 
         const bool fin = (flags & quic::kStreamDataFin) != 0;
         const nghttp3_ssize nconsumed =
@@ -837,20 +861,36 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
             nghttp3_conn_set_max_client_streams_bidi(m_h3, max_streams);
     }
 
-    void on_tx_keys_ready() noexcept override {
-        // Idempotent: ngtcp2 reports the 1-RTT keys once per connection, but a
+    void on_tx_keys_ready() noexcept override { (void)ensure_h3(false); }
+
+    // The server may create nghttp3 from the 0-RTT read keys, before the
+    // handshake completes, so it can decode an early request. If the peer has
+    // not granted the three uni-stream credits yet, wait for 1-RTT rather than
+    // failing the connection.
+    void on_0rtt_keys_ready() noexcept override {
+        m_early_data_connection = m_conn->used_0rtt();
+        (void)ensure_h3(true);
+    }
+
+    bool ensure_h3(bool early) noexcept {
+        // Idempotent: ngtcp2 reports a key level once per connection, but a
         // replay after a late `set_protocol` could reach here twice.
-        if (h3() != nullptr)
-            return;
+        if (h3() != nullptr) {
+            schedule_pending_reads();
+            return true;
+        }
 
         // Three unidirectional streams: control, and the two QPACK halves. Below
-        // that the protocol cannot be spoken at all, so there is nothing to do
-        // but fail the connection.
+        // that the protocol cannot be spoken at all. In the early path the peer
+        // may not have applied its transport parameters yet, so wait instead of
+        // killing the connection.
         if (m_conn->streams_uni_left() < 3) {
-            SIMPLE_HTTP_ERROR_LOG("h3: peer allows fewer than 3 unidirectional streams");
-            m_alive = false;
-            m_conn->close(kH3InternalError, "http3: no stream credit");
-            return;
+            if (!early) {
+                SIMPLE_HTTP_ERROR_LOG("h3: peer allows fewer than 3 unidirectional streams");
+                m_alive = false;
+                m_conn->close(kH3InternalError, "http3: no stream credit");
+            }
+            return false;
         }
 
         nghttp3_settings settings;
@@ -858,10 +898,13 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         // nghttp3 enforces none of these; they are what we *advertise*, and the
         // two QPACK values in particular have to be set explicitly — their
         // defaults are zero, which would silently advertise a QPACK decoder that
-        // accepts no dynamic table at all.
-        settings.max_field_section_size = m_limits.max_header_bytes;
-        settings.qpack_max_dtable_capacity = kH3QpackMaxTableCapacity;
-        settings.qpack_blocked_streams = kH3QpackBlockedStreams;
+        // accepts no dynamic table at all. The same snapshot goes into the
+        // session ticket, so an early request cannot be decoded against limits
+        // this build no longer advertises.
+        const h3::Settings advertised = h3::make_settings(m_limits);
+        settings.max_field_section_size = advertised.max_field_section_size;
+        settings.qpack_max_dtable_capacity = advertised.qpack_max_dtable_capacity;
+        settings.qpack_blocked_streams = advertised.qpack_blocked_streams;
         // Our encoder stays static-table-only, which is what the previous engine
         // did (ls-qpack was initialised with a zero-sized dynamic table). Turning
         // it on is a separate change with its own risk surface — dynamic table
@@ -879,7 +922,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
             SIMPLE_HTTP_ERROR_LOG("h3: nghttp3_conn_server_new failed");
             m_alive = false;
             m_conn->close(kH3InternalError, "http3: init");
-            return;
+            return false;
         }
         nghttp3_conn_set_max_client_streams_bidi(m_h3, m_conn->local_max_streams_bidi());
 
@@ -888,7 +931,7 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
             SIMPLE_HTTP_ERROR_LOG("h3: could not open the control stream");
             m_alive = false;
             m_conn->close(kH3InternalError, "http3: control stream");
-            return;
+            return false;
         }
         const std::optional<std::int64_t> qpack_enc = m_conn->open_uni_stream();
         const std::optional<std::int64_t> qpack_dec = m_conn->open_uni_stream();
@@ -896,9 +939,38 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
             SIMPLE_HTTP_ERROR_LOG("h3: could not open the QPACK streams");
             m_alive = false;
             m_conn->close(kH3InternalError, "http3: qpack streams");
-            return;
+            return false;
         }
         m_conn->flush();
+        schedule_pending_reads();
+        return true;
+    }
+
+    // Data can arrive between `set_protocol` and the nghttp3 creation above.
+    // Draining it from the key callback would run nghttp3 (and, on a malformed
+    // field, ngtcp2) inside an ngtcp2 callback; post it instead.
+    void schedule_pending_reads() {
+        if (m_pending_reads.empty() || m_pending_reads_scheduled)
+            return;
+        m_pending_reads_scheduled = true;
+        auto self = this->weak_from_this();
+        asio::post(m_executor, [self] {
+            if (auto engine = self.lock()) {
+                engine->m_pending_reads_scheduled = false;
+                engine->drain_pending_reads();
+            }
+        });
+    }
+
+    void drain_pending_reads() {
+        if (h3() == nullptr || m_pending_reads.empty())
+            return;
+        std::deque<PendingRead> pending = std::move(m_pending_reads);
+        m_pending_reads.clear();
+        m_pending_read_bytes = 0;
+        for (const PendingRead &read : pending) {
+            on_stream_data(read.flags, read.stream_id, span<const std::uint8_t>{read.data.data(), read.data.size()});
+        }
     }
 
     void on_connection_closed() noexcept override {
@@ -1377,6 +1449,8 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         if (!stream.authority.empty() && !has_host) {
             request.mutable_headers().add_lower("host", std::move(stream.authority));
         }
+        // The stream may have been created before the 0-RTT flag was latched.
+        request.set_used_0rtt(stream.used_0rtt);
         return true;
     }
 
@@ -1389,6 +1463,11 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
         auto stream = std::make_shared<Stream>();
         stream->id = stream_id;
         stream->request = std::make_shared<Request>(Version::Http3, m_executor, m_conn->peer());
+        if (m_early_data_connection && !m_first_request_seen) {
+            m_first_request_seen = true;
+            stream->used_0rtt = true;
+        }
+        stream->request->set_used_0rtt(stream->used_0rtt);
         // Credit inbound request-body bytes back to QUIC flow control as the
         // handler consumes them. nghttp3's recv_data contract requires the app
         // to do this ("increase flow control credit by datalen"), and
@@ -1675,6 +1754,21 @@ class Http3Engine : public std::enable_shared_from_this<Http3Engine<Connection>>
     // fields while the engine is parsing the encoder stream, and several
     // streams can be rejected in the same read.
     std::vector<std::int64_t> m_rejected_streams;
+    // See schedule_pending_reads(): data that arrived before nghttp3 existed.
+    struct PendingRead {
+        std::uint32_t flags{0};
+        std::int64_t stream_id{-1};
+        std::vector<std::uint8_t> data;
+    };
+    std::deque<PendingRead> m_pending_reads;
+    std::size_t m_pending_read_bytes{0};
+    bool m_pending_reads_scheduled{false};
+    // True once the connection installed 0-RTT read keys. ngtcp2's per-data
+    // 0-RTT flag is evaluated at delivery time and can be false when the
+    // handshake completes before early DATA is drained; the first request on
+    // such a connection is the early one.
+    bool m_early_data_connection{false};
+    bool m_first_request_seen{false};
     std::int64_t m_oversize_stream{-1};
     // A stream whose body just ended with a trailer section pending. The
     // deferred nghttp3_conn_submit_trailers runs at the top of the next write

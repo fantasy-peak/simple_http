@@ -48,7 +48,27 @@ class ConnectionCryptoBase {
     ConnectionCryptoBase &operator=(const ConnectionCryptoBase &) = delete;
 
     [[nodiscard]] virtual ngtcp2_conn *native_conn() noexcept = 0;
+
+    // OpenSSL produced a NewSessionTicket. The connection must up-ref the
+    // session and process it outside the OpenSSL/ngtcp2 callback stack.
+    virtual void on_new_session_ticket(SSL_SESSION *) noexcept {}
+
+    // Whether the peer's ClientHello carried the quic_transport_parameters
+    // extension (RFC 9001 §8.2). OpenSSL 4 exposes the ClientHello here but not
+    // the peer's parameters afterwards, and ngtcp2 reports both "extension
+    // absent" and "extension present but initial_source_connection_id missing"
+    // as NGTCP2_ERR_REQUIRED_TRANSPORT_PARAM. Only the former must be answered
+    // with a missing_extension alert; the latter is TRANSPORT_PARAMETER_ERROR.
+    virtual void on_client_hello_tp(bool /*present*/) noexcept {}
 };
+
+// Process-wide SSL ex-data index that routes OpenSSL's new-session callback to
+// the QUIC connection owning the SSL. Non-QUIC SSLs leave it unset, so the
+// callback is a no-op for h1/h2 connections that share the same SSL_CTX.
+inline int session_owner_ex_index() {
+    static const int index = SSL_get_ex_new_index(0, nullptr, nullptr, nullptr, nullptr);
+    return index;
+}
 
 // The OpenSSL glue for one QUIC connection. Owned by the connection, which must
 // outlive it — `get_conn` dereferences the owner from inside OpenSSL callbacks.
@@ -118,7 +138,7 @@ class QuicCrypto {
     // knows nothing about TLS client configuration, and the client layer already
     // has one implementation of it (client/tls_client.h).
     [[nodiscard]] bool init(SSL_CTX *ssl_ctx, bool client = false,
-                            const std::function<error_code(SSL *)> &configure = {}) {
+                            const std::function<error_code(SSL *)> &configure = {}, bool enable_early_data = false) {
         if (m_ctx == nullptr)
             return false;
 
@@ -137,16 +157,26 @@ class QuicCrypto {
             SIMPLE_HTTP_ERROR_LOG("quic: ngtcp2_crypto_ossl_configure_server_session failed");
             return false;
         }
+        // The OpenSSL QUIC-TLS layer has to be told explicitly that this side
+        // may process early data; the SSL_CTX-level max_early_data alone only
+        // sizes the ticket.
+        if (enable_early_data && SSL_set_quic_tls_early_data_enabled(ssl, 1) != 1) {
+            SIMPLE_HTTP_ERROR_LOG("quic: SSL_set_quic_tls_early_data_enabled failed");
+            return false;
+        }
         // Where OpenSSL callbacks find their way back to the ngtcp2 connection.
         SSL_set_app_data(ssl, &m_conn_ref);
         if (client) {
+            // Match the ngtcp2 ossl reference: the SSL is put into client mode
+            // before the caller installs the session/SNI/ALPN. OpenSSL's
+            // QUIC-TLS session-resumption path is sensitive to this order.
+            SSL_set_connect_state(ssl);
             if (configure) {
                 if (error_code ec = configure(ssl)) {
                     SIMPLE_HTTP_ERROR_LOG("quic: client TLS configuration failed: {}", ec.message());
                     return false;
                 }
             }
-            SSL_set_connect_state(ssl);
         } else {
             SSL_set_accept_state(ssl);
         }

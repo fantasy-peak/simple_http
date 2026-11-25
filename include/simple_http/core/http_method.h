@@ -6,6 +6,7 @@
 // HTTP/2 :method pseudo-header) rather than going through boost.beast's verb,
 // so this small type replaces http::verb across the request path.
 
+#include <cstddef>
 #include <cstdint>
 #include <string_view>
 
@@ -22,7 +23,30 @@ enum class Method : std::uint8_t {
     Connect,
     Trace,
     Unknown,
+    // API-only sentinels for HTTP/3 0-RTT. They serialize as GET/HEAD, and
+    // method_from_string() never produces them, so they cannot arrive off the
+    // wire. Use is_0rtt() / wire_method() rather than comparing the enum.
+    Get0RTT,
+    Head0RTT,
 };
+
+// Number of distinct enumerators, including the API-only sentinels.
+inline constexpr std::size_t method_count = static_cast<std::size_t>(Method::Head0RTT) + 1;
+
+// Whether this is the 0-RTT sentinel (client-side opt-in).
+inline constexpr bool is_0rtt(Method m) noexcept { return m == Method::Get0RTT || m == Method::Head0RTT; }
+
+// The method that actually goes on the wire. Sentinels map to GET/HEAD.
+inline constexpr Method wire_method(Method m) noexcept {
+    switch (m) {
+    case Method::Get0RTT:
+        return Method::Get;
+    case Method::Head0RTT:
+        return Method::Head;
+    default:
+        return m;
+    }
+}
 
 // Case-sensitive match against the canonical uppercase method tokens (HTTP
 // methods are case-sensitive per RFC 7230 §3.1.1).
@@ -60,6 +84,8 @@ inline constexpr bool is_idempotent(Method m) noexcept {
     case Method::Delete:
     case Method::Options:
     case Method::Trace:
+    case Method::Get0RTT:
+    case Method::Head0RTT:
         return true;
     case Method::Post:
     case Method::Patch:
@@ -78,8 +104,10 @@ inline constexpr std::uint16_t method_bit(Method m) noexcept { return std::uint1
 inline constexpr std::string_view to_string(Method m) noexcept {
     switch (m) {
     case Method::Get:
+    case Method::Get0RTT:
         return "GET";
     case Method::Head:
+    case Method::Head0RTT:
         return "HEAD";
     case Method::Post:
         return "POST";

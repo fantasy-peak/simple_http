@@ -520,8 +520,10 @@ class OpenApiSpec {
     static constexpr std::string_view method_name_lower(Method m) noexcept {
         switch (m) {
         case Method::Get:
+        case Method::Get0RTT:
             return "get";
         case Method::Head:
+        case Method::Head0RTT:
             return "head";
         case Method::Post:
             return "post";
