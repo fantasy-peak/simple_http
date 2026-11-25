@@ -912,9 +912,9 @@ test/external/stress/run.sh both
 
 - h2spec：`failed == 0` 且 `passed >= 146`；
 - h1spec：总用例 33，必须全部通过；
-- h3spec：总用例 49，`passed >= 47`（含 0-RTT 开启；剩余两条是 TLS 8.2
-  客户端超时断言问题。TLS 8.3 的 CRYPTO-in-0-RTT 通过初始 DCID 路由修复后
-  能正确返回 PROTOCOL_VIOLATION）；
+- h3spec：总用例 49，必须全部通过（含 0-RTT 开启；TLS 8.3 的
+  CRYPTO-in-0-RTT 依赖初始 DCID 路由，TLS 8.2 依赖 ClientHello 回调记录的
+  扩展是否存在）；
 - Autobahn：`FAILED == 0` 且 `NON-STRICT == 0`；
 - 压力：连接复用 200/200；每个响应档位 `failed == 0` 且 `errored == 0`；
   h1 k6 `errors == 0`；WebSocket `recv == ITERS × WANT`（默认 1,200,000）。
@@ -1246,6 +1246,15 @@ test/run.sh server-diff
     DCID；endpoint 只注册服务端 SCID 会让后续分片被当成新连接，ClientHello
     永远不完整、ticket 从不被解密。新连接建立后要把 `vc.dcid` 关联到连接。
     `quic/endpoint.h`；h3spec TLS 8.3 / `0rtt`。
+
+57. **缺 quic_transport_parameters 是 0x016d，缺 initial_source_connection_id
+    是 0x08**：ngtcp2 对两者都返回 `NGTCP2_ERR_REQUIRED_TRANSPORT_PARAM`，且
+    都不保存远端参数，直接映射会让前者变成 `TRANSPORT_PARAMETER_ERROR`。
+    OpenSSL 4 不暴露已收到的参数，只能在 ClientHello 回调里用
+    `SSL_client_hello_get0_ext(ssl, 0x39, ...)` 记录扩展是否出现；只有真正
+    缺失时才 `ngtcp2_ccerr_set_tls_alert(SSL_AD_MISSING_EXTENSION)`，
+    参数集存在但缺 required 项时仍走 `fail(rv)` 得到 0x08。
+    `quic/tls.h`、`quic/connection.h`；h3spec TLS 8.2 / Transport 7.3。
 
 ---
 

@@ -483,6 +483,10 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
     // ngtcp2's connection, for the crypto helper's `get_conn`.
     [[nodiscard]] ngtcp2_conn *native_conn() noexcept override { return m_conn; }
 
+    // Recorded from the ClientHello callback; see on_datagram's RFC 9001 §8.2
+    // handling.
+    void on_client_hello_tp(bool present) noexcept override { m_client_hello_had_tp = present; }
+
   private:
     // --- ngtcp2 callbacks ----------------------------------------------------
     //
@@ -575,6 +579,12 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
 
     QuicConnectionConfig m_config;
     QuicBootstrap m_bootstrap;
+    // Set by the ClientHello callback when the peer's ClientHello carries the
+    // quic_transport_parameters extension. It is the only way to tell a missing
+    // extension (missing_extension alert) from a present parameter set that
+    // lacks initial_source_connection_id (TRANSPORT_PARAMETER_ERROR): ngtcp2
+    // reports both with NGTCP2_ERR_REQUIRED_TRANSPORT_PARAM and stores neither.
+    bool m_client_hello_had_tp{false};
     QuicClientOptions m_client_options;
     std::vector<std::uint32_t> m_versions;
     // Which side of the handshake this connection is. It decides how ngtcp2 is
@@ -907,20 +917,34 @@ void QuicConnection<Executor>::on_datagram(span<const std::uint8_t> datagram, co
         finish_close();
         return;
     }
-    if (rv == 0 && ngtcp2_conn_is_server2(m_conn) && !ngtcp2_conn_get_handshake_completed2(m_conn) &&
-        ngtcp2_conn_get_remote_transport_params2(m_conn) == nullptr) {
-        // RFC 9001 §8.2: the ClientHello must carry quic_transport_parameters;
-        // an endpoint that does not receive it closes the connection with
-        // 0x016d (NGTCP2_CRYPTO_ERROR | missing_extension). Neither OpenSSL 4's
-        // QUIC-TLS layer nor ngtcp2_crypto_ossl enforces this — the ossl
-        // helper's set_remote_transport_params() is a no-op and the OpenSSL
-        // "got extension" callback never fires. Enforce it here, but only once
-        // the ClientHello has actually been consumed: while it is still being
-        // read (fragmented across CRYPTO frames) the TLS state stays at
-        // TLS_ST_SR_CLNT_HELLO and the params are legitimately absent so far.
-        SSL *ssl = m_crypto.ssl();
-        const OSSL_HANDSHAKE_STATE state = ssl != nullptr ? SSL_get_state(ssl) : TLS_ST_BEFORE;
-        if (state != TLS_ST_BEFORE && state != TLS_ST_SR_CLNT_HELLO) {
+    // RFC 9001 §8.2: the ClientHello must carry quic_transport_parameters; an
+    // endpoint that does not receive it closes the connection with 0x016d
+    // (NGTCP2_CRYPTO_ERROR | missing_extension).
+    //
+    // ngtcp2 reports the omission as NGTCP2_ERR_REQUIRED_TRANSPORT_PARAM, but
+    // so it does a present parameter set that lacks
+    // initial_source_connection_id — and its generic liberr mapping would turn
+    // the missing-extension case into TRANSPORT_PARAMETER_ERROR (0x08). The
+    // ClientHello callback recorded whether the extension was actually there,
+    // so only a genuinely absent one takes this branch; the incomplete case
+    // falls through to fail(rv) and keeps ngtcp2's 0x08.
+    if (ngtcp2_conn_is_server2(m_conn) && ngtcp2_conn_get_remote_transport_params2(m_conn) == nullptr &&
+        !m_client_hello_had_tp) {
+        bool missing = false;
+        if (rv == NGTCP2_ERR_REQUIRED_TRANSPORT_PARAM) {
+            // ngtcp2 only raises this after the full ClientHello has been
+            // consumed, so no TLS-state guard is needed.
+            missing = true;
+        } else if (rv == 0 && !ngtcp2_conn_get_handshake_completed2(m_conn)) {
+            // Defensive path for a TLS backend that does not flag the omission
+            // at all. While the ClientHello is still fragmented across CRYPTO
+            // frames the TLS state stays at TLS_ST_SR_CLNT_HELLO and the
+            // parameters are legitimately absent so far.
+            SSL *ssl = m_crypto.ssl();
+            const OSSL_HANDSHAKE_STATE state = ssl != nullptr ? SSL_get_state(ssl) : TLS_ST_BEFORE;
+            missing = state != TLS_ST_BEFORE && state != TLS_ST_SR_CLNT_HELLO;
+        }
+        if (missing) {
             SIMPLE_HTTP_ERROR_LOG("quic: ClientHello without quic_transport_parameters; closing");
             ngtcp2_ccerr_set_tls_alert(&m_last_error, SSL_AD_MISSING_EXTENSION, nullptr, 0);
             m_has_error = true;

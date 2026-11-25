@@ -44,19 +44,19 @@ PORT_H3=7792
 EXPECT_H2SPEC_PASSED=146
 EXPECT_H1SPEC_TOTAL=33
 EXPECT_H3SPEC_TOTAL=49
-# 47/49 是 0-RTT 开启后的稳定值（同一二进制连跑多次一致）。剩下两条是同一个
-# TLS 8.2 用例的两个变体：h3spec 的客户端钩子把 ClientHello 里的
-# quic_transport_parameters 扩展摘掉，期望服务端用 0x016d 关闭。服务端确实发了
-# （-d 可见 "receiver: TransportErrorIsReceived TLSMissingExtension"），但该用例
-# 的动作随后仍被 2s 超时 AsyncCancelled 取消，HUnit 的 shouldThrow 看到的不是
-# 异常，于是判失败——这是套件客户端侧的时序/断言问题，不是服务端行为差异。
-# 服务端侧按 RFC 9001 §8.2 的实现见 quic/connection.h（OpenSSL 4 的 QUIC-TLS
-# 与 ngtcp2_crypto_ossl 都不做这个检查，所以由本库补上）。
+# 49/49 是 0-RTT 开启后的稳定值（同一二进制连跑多次一致）。两条曾经的失败都
+# 已确认不是套件问题：
 #
-# TLS 8.3 "CRYPTO in 0-RTT" passes with 0-RTT enabled because the endpoint
-# routes the client's initial DCID to the connection; a ClientHello split
-# across Initial packets is reassembled and its session ticket is decrypted.
-EXPECT_H3SPEC_PASSED=47
+# * TLS 8.2（quic_transport_parameters 扩展缺失）：ngtcp2 对「扩展缺失」和
+#   「扩展存在但缺 initial_source_connection_id」都返回
+#   NGTCP2_ERR_REQUIRED_TRANSPORT_PARAM，直接映射会变成
+#   TRANSPORT_PARAMETER_ERROR（0x08）。服务端在 ClientHello 回调里记录扩展是否
+#   出现，只在真正缺失时回 0x016d（CRYPTO_ERROR | missing_extension），同时
+#   Transport 7.3 仍然回 0x08。见 quic/tls.h、quic/connection.h。
+# * TLS 8.3 "CRYPTO in 0-RTT"：endpoint 现在按客户端的初始 DCID 路由，跨多个
+#   Initial 分片的 ClientHello 能重组、会话 ticket 能解密，于是正确返回
+#   PROTOCOL_VIOLATION。
+EXPECT_H3SPEC_PASSED=49
 
 # h3spec 的二进制名带平台后缀（release 资产就叫 h3spec-linux-x86_64），所以这里
 # 按名字查而不是猜路径。

@@ -26,6 +26,7 @@
 #include "../core/logging.h"
 #include "../core/types.h"
 #include "../transport/tls_context.h"
+#include "ngtcp2_crypto.h"
 
 namespace simple_http::quic {
 
@@ -124,6 +125,15 @@ class QuicTlsContext {
         // to configure without one (ssl/quic/quic_tls.c), because a QUIC
         // connection with no negotiated protocol has no meaning.
         SSL_CTX_set_alpn_select_cb(m_ctx.native_handle(), &QuicTlsContext::select_alpn, nullptr);
+
+        // RFC 9001 §8.2 requires quic_transport_parameters in the ClientHello.
+        // ngtcp2 reports a ClientHello without the extension and one whose
+        // parameters lack initial_source_connection_id with the same error, and
+        // OpenSSL 4 does not expose the received parameters after the fact. The
+        // ClientHello callback is the only place to learn whether the extension
+        // was actually present, which decides between a missing_extension alert
+        // (0x016d) and TRANSPORT_PARAMETER_ERROR (0x08).
+        SSL_CTX_set_client_hello_cb(m_ctx.native_handle(), &QuicTlsContext::on_client_hello, nullptr);
     }
 
     void configure_early_data() {
@@ -194,6 +204,24 @@ class QuicTlsContext {
             return SSL_TLSEXT_ERR_ALERT_FATAL;
         }
         return SSL_TLSEXT_ERR_OK;
+    }
+
+    // The quic_transport_parameters extension type (RFC 9001 §8.2).
+    static constexpr unsigned int kTransportParamsExtension = 0x39;
+
+    // Runs while OpenSSL parses the ClientHello, which is the only moment
+    // SSL_client_hello_get0_ext is valid. The connection object is reached
+    // through the app data ngtcp2 installs on the SSL (its conn_ref); the
+    // handshake cannot start before QuicCrypto::init has set it.
+    static int on_client_hello(SSL *ssl, int *, void *) {
+        auto *ref = static_cast<ngtcp2_crypto_conn_ref *>(SSL_get_app_data(ssl));
+        if (ref == nullptr || ref->get_conn == nullptr)
+            return SSL_CLIENT_HELLO_SUCCESS;
+        const unsigned char *data = nullptr;
+        size_t len = 0;
+        const bool present = SSL_client_hello_get0_ext(ssl, kTransportParamsExtension, &data, &len) == 1;
+        static_cast<ConnectionCryptoBase *>(ref->user_data)->on_client_hello_tp(present);
+        return SSL_CLIENT_HELLO_SUCCESS;
     }
 
     asio::ssl::context m_ctx;

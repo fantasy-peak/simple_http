@@ -52,6 +52,14 @@ class ConnectionCryptoBase {
     // OpenSSL produced a NewSessionTicket. The connection must up-ref the
     // session and process it outside the OpenSSL/ngtcp2 callback stack.
     virtual void on_new_session_ticket(SSL_SESSION *) noexcept {}
+
+    // Whether the peer's ClientHello carried the quic_transport_parameters
+    // extension (RFC 9001 §8.2). OpenSSL 4 exposes the ClientHello here but not
+    // the peer's parameters afterwards, and ngtcp2 reports both "extension
+    // absent" and "extension present but initial_source_connection_id missing"
+    // as NGTCP2_ERR_REQUIRED_TRANSPORT_PARAM. Only the former must be answered
+    // with a missing_extension alert; the latter is TRANSPORT_PARAMETER_ERROR.
+    virtual void on_client_hello_tp(bool /*present*/) noexcept {}
 };
 
 // Process-wide SSL ex-data index that routes OpenSSL's new-session callback to
