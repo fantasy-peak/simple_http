@@ -1132,17 +1132,14 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
         if (m_finish_started)
             return;
         m_finish_started = true;
-        if (m_goaway_sent) {
-            // Keep whatever is already queued. The RST_STREAM that refused the
-            // offending stream is still meaningful to the peer, and the write
-            // loop may not have flushed it before the read loop saw the error.
-            // The GOAWAY follows it; whole frames only, so the stream stays
-            // parseable.
-            std::string payload;
-            codec::append_u32(payload, m_next_peer_stream_id);
-            codec::append_u32(payload, m_goaway_error);
-            append_frame(codec::H2FrameType::Goaway, 0, 0, payload);
-        }
+        // A GOAWAY queued by go_away() is still in m_out (the write loop cannot
+        // have swapped it away: this path runs synchronously after go_away(), or
+        // waits for a write that was started before it). The final write below
+        // therefore carries it exactly once, after whatever RST_STREAM preceded
+        // it. Re-emitting it here would duplicate the frame -- and, if any
+        // stream had been parsed in the meantime, the second GOAWAY's
+        // last-stream-id would be larger than the first, which RFC 9113 §6.8
+        // forbids.
         auto self = this->shared_from_this();
         auto shutdown = [self]() {
             self->m_transport->async_shutdown([self](error_code) {
@@ -2496,9 +2493,6 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
     void go_away(std::uint32_t error_code_value) {
         if (m_goaway_sent)
             return;
-        // Remember the code so the teardown path can re-serialize the GOAWAY if the
-        // write loop was cancelled before it reached the wire.
-        m_goaway_error = error_code_value;
         std::string payload;
         codec::append_u32(payload, m_next_peer_stream_id); // last stream id we processed
         codec::append_u32(payload, error_code_value);
@@ -3404,7 +3398,6 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
     std::string m_writing;     // bytes of the in-flight transport write (reused)
     std::string m_out;         // serialized frames awaiting transport write
 
-    std::uint32_t m_goaway_error{0};                       // code for the GOAWAY re-emitted on teardown
     std::int64_t m_conn_send_window = kH2InitialWindow;    // peer's connection-level window for us (send side)
     std::int64_t m_conn_recv_window = kH2InitialWindow;    // our connection-level window to the peer (recv side)
     std::int64_t m_conn_recv_pending = 0;                  // consumed bytes awaiting a batched connection WINDOW_UPDATE

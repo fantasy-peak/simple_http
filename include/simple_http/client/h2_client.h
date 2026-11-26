@@ -846,6 +846,14 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
         auto self = this->shared_from_this();
         m_transport->async_read_some(
             ByteSpan{m_read_scratch.data(), m_read_scratch.size()}, [self](error_code ec, std::size_t n) {
+                // A write error can drive finish_session() while this read is
+                // still outstanding (the transport is closed only after the
+                // optional in-flight write drains). Parsing late bytes then would
+                // touch a session whose streams were already failed/reset, so
+                // drop the read exactly like the server engine does.
+                if (self->m_finished) {
+                    return;
+                }
                 if (ec) {
                     self->finish_session();
                     return;
@@ -1049,6 +1057,11 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
     // Parses every complete frame buffered in m_recv_buf. Returns false on a
     // connection-fatal error (GOAWAY already queued).
     bool parse_available() {
+        // Once the session is finished, buffered bytes must not touch stream
+        // state that finish_session() already failed (see read_loop()).
+        if (m_finished) {
+            return false;
+        }
         std::size_t pos = 0;
         while (m_recv_buf.size() - pos >= codec::kH2FrameHeaderSize) {
             codec::H2FrameHeader hdr;
@@ -1161,9 +1174,17 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
     // next response on this pooled connection decodes to wrong values or fails.
     bool decode_discarded_header_block(std::string_view block) {
         std::vector<codec::HpackHeader> ignored;
-        if (!m_decoder.decode(block, ignored) && !m_decoder.header_list_too_large()) {
-            go_away(codec::H2_COMPRESSION_ERROR);
-            return false;
+        if (!m_decoder.decode(block, ignored)) {
+            // Same classification as the server engine: a malformed
+            // representation is a connection-level compression error even when the
+            // decoded list also crossed the size cap (decode() stopped mid-block,
+            // so the dynamic table may already have diverged from the peer's).
+            // Crossing the cap on a well-formed block is only a stream error, and
+            // there is no live stream here to reset.
+            if (m_decoder.compression_error()) {
+                go_away(codec::H2_COMPRESSION_ERROR);
+                return false;
+            }
         }
         return true;
     }

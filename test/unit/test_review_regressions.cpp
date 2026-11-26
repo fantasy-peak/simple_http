@@ -1066,6 +1066,67 @@ TEST_CASE("review: h2 connection window is 65535 even with a smaller stream wind
     CHECK_FALSE(written_has_goaway(transport->written(), codec::H2_FLOW_CONTROL_ERROR));
 }
 
+// A response field block for a cancelled/closed stream still has to reach the
+// HPACK decoder, but a malformed one is a connection-level COMPRESSION_ERROR
+// even when it also crosses the decoded-list cap (RFC 9113 §4.3.1/§6.5.2).
+TEST_CASE("review: h2 client treats a malformed discarded HPACK block as a compression error",
+          "[review][regression][client]") {
+    using Session = detail::Http2ClientSession<MockTransport>;
+    asio::io_context ctx;
+    auto pump = [&ctx] {
+        ctx.restart();
+        ctx.run_for(std::chrono::milliseconds(200));
+    };
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    transport->hold_open();
+    std::string settings;
+    append_h2_frame(settings, codec::H2FrameType::Settings, 0, 0, {});
+    transport->push(std::move(settings));
+
+    detail::ClientTarget target;
+    target.host = "example.com";
+    target.port = 80;
+    auto session = std::make_shared<Session>(transport, target, EngineLimits{}, std::chrono::milliseconds{0});
+    bool started = false;
+    session->start([&started](error_code ec) { started = !ec; });
+    pump();
+    REQUIRE(started);
+
+    auto request = std::make_shared<Request>(Version::Http11, ctx.get_executor());
+    request->set_method(Method::Get);
+    request->set_target("/x");
+    std::shared_ptr<detail::ClientStream> stream;
+    session->open_stream(request, [&stream](error_code ec, std::shared_ptr<detail::ClientStream> s) {
+        if (!ec)
+            stream = std::move(s);
+    });
+    pump();
+    REQUIRE(stream);
+
+    // The peer resets stream 1; the client retires it. A later HEADERS on that
+    // id is decoded only for its dynamic-table side effects.
+    std::string reset_payload;
+    codec::append_u32(reset_payload, codec::H2_CANCEL);
+    std::string reset;
+    append_h2_frame(reset, codec::H2FrameType::RstStream, 0, 1, reset_payload);
+    transport->push(std::move(reset));
+    pump();
+
+    std::string block;
+    block.push_back('\x40'); // literal with incremental indexing: mutates the table
+    codec::hpack_append_string(block, "x-dyn");
+    codec::hpack_append_string(block, "v");
+    for (int i = 0; i < 1500; ++i)
+        codec::hpack_append_literal_indexed_name(block, 31, "a"); // 45 bytes each
+    block.push_back('\x80');                                      // indexed field, index 0 -> malformed
+    std::string response;
+    append_h2_frame(response, codec::H2FrameType::Headers, codec::H2_FLAG_END_HEADERS, 1, block);
+    transport->push(std::move(response));
+    pump();
+
+    CHECK(written_has_goaway(transport->written(), codec::H2_COMPRESSION_ERROR));
+}
+
 TEST_CASE("request: state pointers survive later set_state calls", "[request][review]") {
     asio::io_context ctx;
     Request req(Version::Http11, ctx.get_executor());

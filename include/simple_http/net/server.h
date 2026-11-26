@@ -342,6 +342,21 @@ class Server {
             listeners.push_back(std::move(cfg));
         }
 
+        // Reject invalid HTTP/2 SETTINGS before any socket is bound: the engine
+        // serializes these values verbatim, and a peer that receives an
+        // out-of-range SETTINGS_MAX_FRAME_SIZE / INITIAL_WINDOW_SIZE must close
+        // the connection. (The client config source uses the same helper.)
+        if (!m_cfg.limits.h2_settings_valid()) {
+            return StartupError{{ListenerFailure{"server", make_error_code(server_errc::invalid_config)}}};
+        }
+        for (const auto &cfg : listeners) {
+            const EngineLimits &limits = cfg.limits ? *cfg.limits : m_cfg.limits;
+            if (!limits.h2_settings_valid()) {
+                return StartupError{{ListenerFailure{cfg.name.empty() ? "server" : cfg.name,
+                                                     make_error_code(server_errc::invalid_config)}}};
+            }
+        }
+
         auto core = std::make_shared<Core>();
         core->router = m_router;
         core->pool = std::make_shared<IoCtxPool>(m_cfg.worker_threads);

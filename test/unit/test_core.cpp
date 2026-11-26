@@ -128,6 +128,28 @@ TEST_CASE("core/limits: defaults are protocol-legal", "[core]") {
     CHECK(limits.h2_max_concurrent_streams > 0);
 }
 
+TEST_CASE("core/limits: h2 SETTINGS parameters are range-checked", "[core]") {
+    EngineLimits limits;
+    CHECK(limits.h2_settings_valid());
+
+    limits.h2_max_frame_size = 16383; // below the RFC 9113 §6.5.2 floor
+    CHECK_FALSE(limits.h2_settings_valid());
+    limits.h2_max_frame_size = 16384;
+    CHECK(limits.h2_settings_valid());
+    limits.h2_max_frame_size = 0xFFFFFFu;
+    CHECK(limits.h2_settings_valid());
+    limits.h2_max_frame_size = 0x1000000u; // above the 24-bit ceiling
+    CHECK_FALSE(limits.h2_settings_valid());
+
+    limits.h2_max_frame_size = 16384;
+    limits.h2_initial_window = -1; // INITIAL_WINDOW_SIZE is unsigned
+    CHECK_FALSE(limits.h2_settings_valid());
+    limits.h2_initial_window = 0;
+    CHECK(limits.h2_settings_valid());
+    limits.h2_initial_window = 0x7FFFFFFF;
+    CHECK(limits.h2_settings_valid());
+}
+
 TEST_CASE("core/logging: level filter, formatting and source location", "[core]") {
     ScopedLog capture{LogLevel::Info}; // note: `log` is also the library's logging function
 

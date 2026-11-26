@@ -157,6 +157,23 @@ bool has_window_update(std::string_view written, std::uint32_t stream_id) {
     return false;
 }
 
+// How many frames of `type` the recorded output contains.
+std::size_t count_frames(std::string_view written, H2FrameType type) {
+    std::size_t count = 0;
+    for (std::size_t i = 0; i + kH2FrameHeaderSize <= written.size();) {
+        H2FrameHeader hdr;
+        if (!parse_frame_header(written.substr(i), hdr))
+            break;
+        const std::size_t end = i + kH2FrameHeaderSize + hdr.length;
+        if (end > written.size())
+            break;
+        if (hdr.type == static_cast<std::uint8_t>(type))
+            ++count;
+        i = end;
+    }
+    return count;
+}
+
 // A handler that stays alive long enough for the read loop to process the rest
 // of a pre-pushed frame burst. A handler that returns immediately now releases
 // its stream (and its concurrency slot) — see handler_finished(stream_id).
@@ -786,6 +803,25 @@ TEST_CASE("h2/engine: a read completing after teardown does not dispatch a handl
     drain(ctx, std::chrono::milliseconds(20));
 
     CHECK(dispatched == 0);
+}
+
+TEST_CASE("h2/engine: a connection error emits exactly one GOAWAY", "[h2]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+
+    std::string in{codec::kH2ClientPreface};
+    append_frame(in, H2FrameType::Settings, 0, 0, "");
+    append_frame(in, H2FrameType::Data, 0, 0, "x"); // DATA on stream 0: PROTOCOL_ERROR
+    transport->push(std::move(in));
+
+    auto dispatcher = [](RequestPtr, ResponsePtr, SslHandle) {};
+    auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, EngineLimits{});
+    REQUIRE(run_on(ctx, run_engine(*engine, dispatcher)));
+
+    // go_away() queues the frame; the teardown write must carry it as-is rather
+    // than appending a second one (RFC 9113 §6.8 also forbids a later GOAWAY
+    // from increasing its last stream id).
+    CHECK(count_frames(transport->written(), H2FrameType::Goaway) == 1);
 }
 
 TEST_CASE("h2/engine: a regular field name must be an HTTP token", "[h2]") {
