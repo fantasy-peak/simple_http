@@ -992,6 +992,16 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
         auto self = this->shared_from_this();
         m_transport->async_read_some(
             ByteSpan{m_read_scratch.data(), m_read_scratch.size()}, [self](error_code ec, std::size_t n) {
+                // Teardown may have started while this read was outstanding: a
+                // transport write error drives finish_connection() without
+                // cancelling the pending read, and the transport is closed only
+                // after the optional in-flight write is drained. Parsing here
+                // would create a stream whose request was never failed or
+                // cancelled (finish_connection()'s phase 2 snapshot predates it)
+                // and dispatch its handler on a dead connection.
+                if (self->m_finished) {
+                    return;
+                }
                 if (ec) {
                     self->finish_connection();
                     return;
@@ -1180,6 +1190,12 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
     // false on a connection-fatal protocol error (a GOAWAY has been queued);
     // true if it consumed all it could and wants more bytes.
     bool parse_available() {
+        // Once teardown has started, buffered bytes must not create more streams:
+        // the requests that existed were already failed and cancelled, and a new
+        // one would never be (see read_loop()'s completion).
+        if (m_finished) {
+            return false;
+        }
         // Re-entry guard. Dispatching a request happens inside handle_frame,
         // and a callback handler can read already-buffered body data inline,
         // which calls on_body_consumed() -> parse_available() again. The
@@ -1370,9 +1386,20 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
     // discarded; only the table side effects matter.
     bool decode_discarded_header_block(std::string_view block) {
         std::vector<codec::HpackHeader> ignored;
-        if (!m_decoder.decode(block, ignored) && !m_decoder.header_list_too_large()) {
-            go_away(codec::H2_COMPRESSION_ERROR);
-            return false;
+        if (!m_decoder.decode(block, ignored)) {
+            // A malformed representation is a connection-level compression error
+            // even when the decoded list also crossed the size cap: decode() stops
+            // mid-block, so the dynamic-table inserts it already performed may
+            // leave us out of sync with the peer's encoder. `header_list_too_large()`
+            // alone would misclassify that case (finish_header_block() checks the
+            // same two flags in this order). Crossing the cap on an otherwise
+            // well-formed block is only a stream error, and there is no live stream
+            // here to reset, so that case is discarded.
+            if (m_decoder.compression_error()) {
+                SIMPLE_HTTP_ERROR_LOG("h2 HPACK decode failed on a discarded block (err={})", m_decoder.last_error());
+                go_away(codec::H2_COMPRESSION_ERROR);
+                return false;
+            }
         }
         return true; // list-too-large still decoded to the end: table stays in sync
     }

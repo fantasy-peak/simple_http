@@ -8,13 +8,16 @@
 // over a scripted transport and assert on the concurrency actually observed by a
 // dispatcher, not on any counter the engine exposes.
 
+#include <algorithm>
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "simple_http.h"
 #include "test_support.h"
@@ -640,6 +643,150 @@ std::string request_block(std::string method = "GET", std::string path = "/") {
 }
 
 } // namespace
+
+namespace {
+
+// A transport whose writes always fail and whose outstanding read survives
+// teardown, so a test can complete it with late peer bytes. Mirrors the real
+// ordering: serve_loops() starts the read before the first write, and a write
+// error drives finish_connection() while that read is still pending.
+class FailingWriteTransport {
+  public:
+    explicit FailingWriteTransport(asio::any_io_executor ex) : m_ex(std::move(ex)) {}
+
+    asio::any_io_executor get_executor() { return m_ex; }
+    asio::ip::tcp::endpoint peer() const { return {}; }
+    SslHandle tls_handle() const { return std::nullopt; }
+    void close() { m_closed = true; }
+
+    template <typename Token> auto async_read_some(ByteSpan buffer, Token &&token) {
+        auto initiation = [this, buffer](auto handler) mutable {
+            m_buf = buffer.data();
+            m_cap = buffer.size();
+            m_read = asio::any_completion_handler<void(error_code, std::size_t)>(std::move(handler));
+        };
+        return asio::async_initiate<Token, void(error_code, std::size_t)>(
+            ExecInit<decltype(initiation)>{std::move(initiation), m_ex}, token);
+    }
+
+    template <typename Token> auto async_write(ConstByteSpan, Token &&token) {
+        auto initiation = [this](auto handler) {
+            asio::post(m_ex, [handler = std::move(handler)]() mutable {
+                std::move(handler)(make_error_code(asio::error::connection_reset), 0);
+            });
+        };
+        return asio::async_initiate<Token, void(error_code, std::size_t)>(
+            ExecInit<decltype(initiation)>{std::move(initiation), m_ex}, token);
+    }
+
+    template <typename Token> auto async_shutdown(Token &&token) {
+        auto initiation = [this](auto handler) {
+            asio::post(m_ex, [handler = std::move(handler)]() mutable { std::move(handler)(error_code{}); });
+        };
+        return asio::async_initiate<Token, void(error_code)>(
+            ExecInit<decltype(initiation)>{std::move(initiation), m_ex}, token);
+    }
+
+    bool pending_read() const { return static_cast<bool>(m_read); }
+    bool closed() const { return m_closed; }
+
+    // Completes the outstanding read with `bytes` (truncated to the engine's
+    // buffer). Called on the connection's (single) thread.
+    void complete_read(std::string_view bytes) {
+        auto handler = std::move(m_read);
+        m_read = nullptr;
+        const std::size_t n = std::min(m_cap, bytes.size());
+        std::memcpy(m_buf, bytes.data(), n);
+        std::move(handler)(error_code{}, n);
+    }
+
+  private:
+    asio::any_io_executor m_ex;
+    bool m_closed = false;
+    std::byte *m_buf = nullptr;
+    std::size_t m_cap = 0;
+    asio::any_completion_handler<void(error_code, std::size_t)> m_read;
+};
+
+// Decodes to a field list above the 64 KiB cap, inserts one dynamic-table
+// entry, then ends with a malformed representation (indexed field, index 0).
+std::string bomb_then_malformed_block() {
+    std::string block;
+    block.push_back('\x40'); // literal with incremental indexing: mutates the table
+    hpack_append_string(block, "x-dyn");
+    hpack_append_string(block, "v");
+    // 12 ("content-type") + 1 + 32 = 45 bytes per field; 1500 * 45 = 67.5 KiB.
+    for (int i = 0; i < 1500; ++i)
+        hpack_append_literal_indexed_name(block, 31, "a");
+    block.push_back('\x80'); // 6.1 indexed header field, index 0 -> malformed
+    return block;
+}
+
+} // namespace
+
+TEST_CASE("h2/engine: a malformed discarded HPACK block is a COMPRESSION_ERROR", "[h2]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    EngineLimits limits;
+    limits.h2_max_concurrent_streams = 1;
+
+    std::string in{codec::kH2ClientPreface};
+    append_frame(in, H2FrameType::Settings, 0, 0, "");
+    in += headers_frame(1, /*end_stream=*/true); // fills the only stream slot
+
+    // Stream 3 is refused, so its field block goes through the discard path.
+    // Crossing the decoded-list cap alone is a stream error, but a malformed
+    // representation is a connection-level COMPRESSION_ERROR and must GOAWAY
+    // even when the same block also crossed the cap (the prefix decode already
+    // mutated the dynamic table).
+    append_frame(in, H2FrameType::Headers, H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM, 3, bomb_then_malformed_block());
+    transport->push(std::move(in));
+
+    std::vector<HandlerCompletion> parked;
+    std::vector<std::shared_ptr<Request>> keep;
+    auto dispatcher = [&](RequestPtr req, ResponsePtr, SslHandle, HandlerCompletion done) {
+        keep.push_back(std::move(req));
+        parked.push_back(std::move(done)); // never complete: stream 1 stays open
+    };
+    auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, limits);
+    REQUIRE(run_on(ctx, run_engine(*engine, dispatcher)));
+
+    CHECK(has_goaway(transport->written(), codec::H2_COMPRESSION_ERROR));
+    CHECK_FALSE(has_rst_stream(transport->written(), 3, codec::H2_REFUSED_STREAM));
+}
+
+TEST_CASE("h2/engine: a read completing after teardown does not dispatch a handler", "[h2]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<FailingWriteTransport>(ctx.get_executor());
+    EngineLimits limits;
+    limits.idle_timeout = std::chrono::seconds(0);
+
+    int dispatched = 0;
+    std::vector<HandlerCompletion> parked;
+    std::vector<std::shared_ptr<Request>> keep;
+    auto dispatcher = [&](RequestPtr req, ResponsePtr, SslHandle, HandlerCompletion done) {
+        ++dispatched;
+        keep.push_back(std::move(req));
+        parked.push_back(std::move(done));
+    };
+    auto engine = std::make_shared<Http2Engine<FailingWriteTransport>>(transport, limits);
+
+    // The first write fails, which tears the connection down while the read
+    // started by serve_loops() is still outstanding.
+    REQUIRE(run_until(ctx, run_engine(*engine, dispatcher)));
+    REQUIRE(transport->closed());
+    REQUIRE(transport->pending_read());
+    CHECK(dispatched == 0);
+
+    // Late peer bytes: the read was never cancelled, so it may still complete
+    // successfully. They must not create a stream on the dead connection.
+    std::string in{codec::kH2ClientPreface};
+    in += headers_frame(1, /*end_stream=*/true);
+    transport->complete_read(in);
+    drain(ctx, std::chrono::milliseconds(20));
+
+    CHECK(dispatched == 0);
+}
 
 TEST_CASE("h2/engine: a regular field name must be an HTTP token", "[h2]") {
     auto block = request_block();
