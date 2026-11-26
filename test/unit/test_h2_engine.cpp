@@ -981,6 +981,37 @@ TEST_CASE("h2/engine: a plain CONNECT without :authority is malformed", "[h2]") 
     CHECK(out.rst_protocol_error);
 }
 
+TEST_CASE("h2/engine: an unimplemented :protocol is dispatched like the Go server", "[h2]") {
+    // With SETTINGS_ENABLE_CONNECT_PROTOCOL advertised, Go's x/net/http2 hands
+    // an extended CONNECT for any :protocol to the application (the handler sees
+    // ":protocol"); it does not answer 501 at the framing layer. This engine
+    // dispatches it as an ordinary CONNECT for the same reason.
+    std::string block;
+    hpack_append_literal(block, ":method", "CONNECT");
+    hpack_append_literal(block, ":protocol", "foo");
+    hpack_append_literal(block, ":scheme", "https");
+    hpack_append_literal(block, ":path", "/x");
+    hpack_append_literal(block, ":authority", "example.com");
+    const auto out = run_headers(block);
+    REQUIRE(out.completed);
+    CHECK(out.dispatched);
+    CHECK_FALSE(out.rst_protocol_error);
+}
+
+TEST_CASE("h2/engine: an extended CONNECT may take its authority from Host", "[h2]") {
+    // Go's newWriterAndRequest() falls back to the Host field when :authority is
+    // absent; an extended CONNECT is held to the same rule.
+    std::string block;
+    hpack_append_literal(block, ":method", "CONNECT");
+    hpack_append_literal(block, ":protocol", "foo");
+    hpack_append_literal(block, ":scheme", "https");
+    hpack_append_literal(block, ":path", "/x");
+    hpack_append_literal(block, "host", "example.com");
+    const auto out = run_headers(block);
+    REQUIRE(out.completed);
+    CHECK(out.dispatched);
+}
+
 TEST_CASE("h2/engine: a body write without a response head is rejected", "[h2]") {
     asio::io_context ctx;
     auto transport = std::make_shared<MockTransport>(ctx.get_executor());

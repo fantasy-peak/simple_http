@@ -19,3 +19,9 @@ cp review/h2-repro/go-diff/main.go "$GP/src/goh2diff/main.go"
 
 (cd "$GP/src/goh2diff" && GOPATH="$GP" GO111MODULE=off go build -o "$WORK/go-diff" .)
 "$WORK/go-diff" "$WORK/malformed.bin" "$WORK/wellformed.bin"
+
+# Extended CONNECT with an unimplemented :protocol.
+mkdir -p "$GP/src/goh2connect"
+cp review/h2-repro/go-diff/connect/main.go "$GP/src/goh2connect/main.go"
+(cd "$GP/src/goh2connect" && GOPATH="$GP" GO111MODULE=off go build -o "$WORK/go-connect" .)
+GODEBUG=http2xconnect=1 "$WORK/go-connect"

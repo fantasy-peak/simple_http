@@ -322,7 +322,7 @@ Go 的对应结构是显式的：
 
 ## 第二轮修复（剩余 P2 + P3）
 
-提交 `47e5b39`（client 镜像 / 重复 GOAWAY / limits 校验）与本提交（P3 项）。
+提交 `47e5b39`（client 镜像 / 重复 GOAWAY / limits 校验）与 `2ef67cb`（P3 项）。
 
 - **client P1/P2 镜像**（`client/h2_client.h`）：
   `decode_discarded_header_block()` 改为先判 `compression_error()`；read 完成回调与
@@ -368,21 +368,68 @@ Go 的对应结构是显式的：
 - 全量 `test_unit` → **66229 assertions in 578 test cases passed**；
 - `./format.sh --check` → 176 files properly formatted。
 
+## 第三轮：Go 运行时对照与剩余项
+
+### extended CONNECT 的 `:protocol`（对照结论：不是引擎缺陷，不改 501）
+
+`review/h2-repro/go-diff/connect/main.go` 对真实 Go `http2.Server`：
+
+- 默认（Go 不广告 `SETTINGS_ENABLE_CONNECT_PROTOCOL`）：客户端发 `:protocol` →
+  `RST_STREAM(PROTOCOL_ERROR)`（Go 用流错误）。
+- `GODEBUG=http2xconnect=1`（开启并广告该设置）：
+
+  ```
+  [go] extended CONNECT :protocol=foo -> dispatched=true method="CONNECT" protocol="foo" status="200"
+  [go] OK: the application decides; no 501 at the framing layer
+  ```
+
+即 Go 把任意 `:protocol` 的 extended CONNECT 交给应用（handler 能看到
+`:protocol`），框架层不返回 501。
+
+本引擎默认广告 `ENABLE_CONNECT_PROTOCOL=1`，行为与 Go 的「开启」配置一致：作为普通
+CONNECT 交给路由/应用（`http_proxy` 对 CONNECT 返回 405）。因此**不改为 501**，并加
+回归用例锁定该行为。两处已知差异：
+
+- 关闭 `h2_enable_connect_protocol` 时，本引擎按 RFC 8441 §3 用连接级
+  `GOAWAY(PROTOCOL_ERROR)`；Go 用流级 RST。
+- 本引擎不向 handler 暴露 `:protocol`（`Request` 无此访问器）；本库也不支持
+  CONNECT 隧道，所以应用只能整体拒绝 CONNECT。
+
+### extended CONNECT 的 authority 回退
+
+Go 的 `newWriterAndRequest()` 在 `:authority` 缺失时回退到 `Host`。本引擎的 extended
+CONNECT 校验同步放宽为「`:authority` 或 `Host` 至少一个」，与 non-CONNECT 一致。
+
+### ws_inbox 的 O(n²) 消费（已修）
+
+原实现 `ws_inbox.erase(0, n)` 每次读都移动整个缓冲；Go 的 h2 请求体缓冲
+`dataBuffer` 用「chunk 列表 + 读偏移」消费（`databuffer.go:68-98`），O(1)。现改为
+`ws_inbox_pos` 读游标 + 阈值 compaction（与同文件 `out_queue` / `paused_frames`
+一致），字节顺序语义不变。
+
+新增回归用例：
+
+- `h2/engine: an unimplemented :protocol is dispatched like the Go server`
+- `h2/engine: an extended CONNECT may take its authority from Host`
+
+## 仍未处理（记录在案）
+
+- `Request` 不暴露 `:protocol`；本库无 CONNECT 隧道，因此非 websocket 的 extended
+  CONNECT 只能由应用整体拒绝（与 Go「交给应用」的结论一致，但少一个访问器）。
+- 关闭 `ENABLE_CONNECT_PROTOCOL` 时的错误级别与 Go 不同（RFC 8441 §3 要求连接错误，
+  Go 实际用流错误）。
+- body_discarded 的分离读者、`pump_dispatch` 深递归：已修复，但异常路径没有稳定的
+  回归用例。
+- `review/h2-repro/` 的 Go 差分依赖本机 module cache（脚本用 GOPATH 软链）。
+
 ## 变更文件汇总
 
-- `include/simple_http/engine/h2/h2_engine.h`：P1/P2 服务端、重复 GOAWAY、P3 各项；
+- `include/simple_http/engine/h2/h2_engine.h`：P1/P2 服务端、重复 GOAWAY、P3 各项、
+  extended CONNECT 的 Host 回退、`ws_inbox` 读游标；
 - `include/simple_http/client/h2_client.h`：P1/P2 客户端镜像；
 - `include/simple_http/core/limits.h`、`include/simple_http/net/server.h`：
   SETTINGS 参数校验；
 - `test/unit/test_h2_engine.cpp`、`test/unit/test_review_regressions.cpp`、
-  `test/unit/test_server_lifecycle.cpp`、`test/unit/test_core.cpp`：10 个回归用例；
+  `test/unit/test_server_lifecycle.cpp`、`test/unit/test_core.cpp`：12 个回归用例；
 - `review/h2-repro/`：P1/P2 最小复现、HPACK 块导出、Go `x/net/http2` 运行时差分
-  （构建产物未入库，运行 `build.sh` 生成 `bin/repro`）。
-
-## 仍未处理（记录在案）
-
-- `:protocol` 为非 `websocket` 的 extended CONNECT 仍按普通 CONNECT 派发（应用可
-  405/404；RFC 8441 建议 501，需要引擎在派发前合成响应）。
-- `ws_inbox` 的 `erase(0, n)` 仍是 O(n) FIFO（纯性能项，建议游标 + compaction）。
-- 两个仅在异常路径可达、未加独立回归用例的场景：body_discarded 的分离读者、
-  `pump_dispatch` 的深递归（前者已按 `operation_aborted` 语义修复，后者已加门控）。
+  （含 extended CONNECT 对照；构建产物未入库，运行 `build.sh` / `run-go-diff.sh`）。

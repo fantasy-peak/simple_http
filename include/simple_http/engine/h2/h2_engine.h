@@ -810,8 +810,32 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
 
         // --- HTTP/2 WebSocket (RFC 8441) ---
         bool websocket = false;
-        std::string protocol;   // raw `:protocol` value
-        std::string ws_inbox;   // inbound tunnel bytes, ordered
+        std::string protocol; // raw `:protocol` value
+        // Inbound tunnel bytes, ordered. Consumed with a read cursor and only
+        // compacted once the consumed prefix is worth the memmove: erasing on
+        // every read made a bulk tunnel O(n^2). (Go's h2 request body buffer,
+        // dataBuffer, consumes the same way: chunk pointer + read offset.)
+        std::string ws_inbox;
+        std::size_t ws_inbox_pos{0};
+        bool ws_inbox_empty() const { return ws_inbox_pos >= ws_inbox.size(); }
+        std::string_view ws_inbox_front() const { return std::string_view{ws_inbox}.substr(ws_inbox_pos); }
+        void ws_inbox_append(std::string_view data) {
+            if (ws_inbox_pos >= ws_inbox.size()) {
+                ws_inbox.clear();
+                ws_inbox_pos = 0;
+            } else if (ws_inbox_pos >= kQueueCompactFloor && ws_inbox_pos * kQueueCompactDivisor >= ws_inbox.size()) {
+                ws_inbox.erase(0, ws_inbox_pos);
+                ws_inbox_pos = 0;
+            }
+            ws_inbox.append(data);
+        }
+        void ws_inbox_consume(std::size_t n) {
+            ws_inbox_pos += n;
+            if (ws_inbox_pos >= ws_inbox.size()) {
+                ws_inbox.clear();
+                ws_inbox_pos = 0;
+            }
+        }
         bool ws_eof = false;    // the peer ended its half (END_STREAM)
         bool ws_closed = false; // we tore the tunnel down
         std::shared_ptr<asio::experimental::channel<void(error_code)>> ws_wake;
@@ -2021,8 +2045,9 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
                     return true;
                 }
                 // The extended CONNECT target is an absolute URI with an
-                // authority as well.
-                if (authority.empty()) {
+                // authority as well. A Host field is the same fallback the
+                // reference Go server applies when :authority is absent.
+                if (authority.empty() && !st.request->headers().contains("host")) {
                     malformed("missing :authority");
                     return true;
                 }
@@ -2177,7 +2202,7 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
                         credit_consumed(st, static_cast<std::int64_t>(data.size()));
                     } else {
                         st.recv_owed_conn += static_cast<std::int64_t>(data.size());
-                        st.ws_inbox.append(data);
+                        st.ws_inbox_append(data);
                         if (st.ws_wake)
                             (void)st.ws_wake->try_send(error_code{});
                     }
@@ -3057,10 +3082,11 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
             return;
         }
         Stream &st = it->second;
-        if (!st.ws_inbox.empty()) {
-            const std::size_t n = std::min<std::size_t>(out.size(), st.ws_inbox.size());
-            std::memcpy(out.data(), st.ws_inbox.data(), n);
-            st.ws_inbox.erase(0, n);
+        if (!st.ws_inbox_empty()) {
+            const std::string_view pending = st.ws_inbox_front();
+            const std::size_t n = std::min<std::size_t>(out.size(), pending.size());
+            std::memcpy(out.data(), pending.data(), n);
+            st.ws_inbox_consume(n);
             // Same guard as on_body_consumed(): the credit may already have been
             // prepaid when the tunnel handler finished (see handler_finished).
             if (!st.body_credit_prepaid) {
