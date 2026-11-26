@@ -11,7 +11,7 @@
 
 | 项 | 当前值 |
 |---|---|
-| 版本 | `0.9.0`（`include/simple_http/core/version.h`） |
+| 版本 | `0.9.1`（`include/simple_http/core/version.h`） |
 | 形态 | 纯头文件；`include/` 下没有 `.cpp` |
 | 入口头 | `#include <simple_http.h>` |
 | 最低标准 | C++17 |

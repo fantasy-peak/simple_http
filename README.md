@@ -12,7 +12,7 @@ explicit completion token. Callbacks, `asio::deferred`, `asio::detached` and
 or newer, `asio::use_awaitable` and coroutine handlers are available as well.
 The library is header-only: `include/` contains no `.cpp` files.
 
-- **Version:** 0.9.0
+- **Version:** 0.9.1
 - **License:** MIT
 - **Minimum standard:** C++17
 - **Umbrella header:** `#include <simple_http.h>`

@@ -12,7 +12,7 @@ token。C++17 下可以使用回调、`asio::deferred`、`asio::detached` 和
 `asio::use_awaitable` 与协程 handler。库是纯头文件的：`include/` 下没有任何
 `.cpp` 文件。
 
-- **版本：** 0.9.0
+- **版本：** 0.9.1
 - **许可证：** MIT
 - **最低标准：** C++17
 - **伞形头：** `#include <simple_http.h>`
