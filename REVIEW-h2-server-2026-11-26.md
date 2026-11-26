@@ -320,21 +320,69 @@ Go 的对应结构是显式的：
 - `review/h2-repro/run-go-diff.sh` → exit 0（见上）。
 - 格式：`clang-format --dry-run --Werror` 对改动文件通过。
 
-## 本轮变更文件
+## 第二轮修复（剩余 P2 + P3）
 
-- `include/simple_http/engine/h2/h2_engine.h`
-  - `read_loop()` 读完成回调：`m_finished` 后丢弃迟到的读（P2）；
-  - `parse_available()`：`m_finished` 后直接返回 false（P2 防御）；
-  - `decode_discarded_header_block()`：优先判 `compression_error()`（P1）。
-- `test/unit/test_h2_engine.cpp`：新增两个回归用例（见上）。
-- `review/h2-repro/`
-  - `repro.cpp` / `build.sh`：P1/P2 最小复现 + HPACK 块导出（构建产物未入库，
-    运行 `build.sh` 生成 `bin/repro`）；
-  - `run-go-diff.sh` / `go-diff/main.go`：Go `x/net/http2` 运行时差分。
+提交 `47e5b39`（client 镜像 / 重复 GOAWAY / limits 校验）与本提交（P3 项）。
 
-## 后续（本轮未改）
+- **client P1/P2 镜像**（`client/h2_client.h`）：
+  `decode_discarded_header_block()` 改为先判 `compression_error()`；read 完成回调与
+  `parse_available()` 增加 `m_finished` 门控。
+- **重复 GOAWAY**（`finish_connection()`）：删除补发逻辑。`go_away()` 已把 GOAWAY
+  放进 `m_out`，最终写必然带上它；原补发会产生第二份，且可能把 last-stream-id
+  增大（RFC 9113 §6.8 禁止）。
+- **SETTINGS 参数校验**（`core/limits.h` + `net/server.h`）：
+  `EngineLimits::h2_settings_valid()` 检查
+  `h2_max_frame_size ∈ [2^14, 2^24-1]`、`h2_initial_window >= 0`；`Server::start()`
+  在绑定前以 `invalid_config` 拒绝。
+- **body_discarded 收尾**：handler 提前结束后清空停放帧；请求 END_STREAM 到达时
+  `body().fail(operation_aborted)`，分离读者不会把被丢弃的尾部当成干净 EOF。
+- **`:authority` / CONNECT**：非 CONNECT 请求必须带 `:authority` 或 `Host`；
+  plain CONNECT 必须 authority-form（拒绝 `:scheme`/`:path`，要求非空
+  `:authority`）；extended CONNECT 同样要求非空 `:authority`。
+- **响应写入顺序**：`Http2ResponseSink` 的
+  `send_chunk`/`send_last`/`send_trailers` 在未提交最终 HEADERS 时返回
+  `invalid_argument`，避免先发 DATA 造成连接级协议错误。
+- **h2c 重放过滤**：`run_h2c()` 移除 `connection`/`keep-alive`/
+  `proxy-connection`/`transfer-encoding`/`upgrade`/`http2-settings`。
+- **pump_dispatch 递归**：加 `m_pumping` 门控，改为外层循环排空队列。
+- **discard 路径头块上限**：`decode_discarded_header_block()` 对单帧块也执行
+  `max_header_bytes` 上限（`ENHANCE_YOUR_CALM`）。
+- 杂项：`h2_engine.h` 增加 `<algorithm>`，删除未使用的 `<random>`/`<thread>`。
 
-- `client/h2_client.h:1162-1169` 的 `decode_discarded_header_block()` 是 P1 的
-  同一份逻辑，应同步修复。
-- `client/h2_client.h:848-861` 的 read 完成回调同样缺少 `m_finished` 检查
-  （P2 的镜像问题）。
+新增回归用例：
+
+- `h2/engine: a connection error emits exactly one GOAWAY`
+- `review: h2 client treats a malformed discarded HPACK block as a compression error`
+- `server: invalid h2 SETTINGS limits are rejected before binding`
+- `core/limits: h2 SETTINGS parameters are range-checked`
+- `h2/engine: a request without :authority or Host is malformed`
+- `h2/engine: a Host field satisfies the authority requirement`
+- `h2/engine: a plain CONNECT must be authority-form`
+- `h2/engine: a plain CONNECT without :authority is malformed`
+- `h2/engine: a body write without a response head is rejected`
+- `h2/engine: the h2c replayed request drops HTTP/1.1-only fields`
+
+第二轮验证（最终态重建）：
+
+- `test_unit '[h2]'` → **295 assertions in 52 test cases passed**；
+- 全量 `test_unit` → **66229 assertions in 578 test cases passed**；
+- `./format.sh --check` → 176 files properly formatted。
+
+## 变更文件汇总
+
+- `include/simple_http/engine/h2/h2_engine.h`：P1/P2 服务端、重复 GOAWAY、P3 各项；
+- `include/simple_http/client/h2_client.h`：P1/P2 客户端镜像；
+- `include/simple_http/core/limits.h`、`include/simple_http/net/server.h`：
+  SETTINGS 参数校验；
+- `test/unit/test_h2_engine.cpp`、`test/unit/test_review_regressions.cpp`、
+  `test/unit/test_server_lifecycle.cpp`、`test/unit/test_core.cpp`：10 个回归用例；
+- `review/h2-repro/`：P1/P2 最小复现、HPACK 块导出、Go `x/net/http2` 运行时差分
+  （构建产物未入库，运行 `build.sh` 生成 `bin/repro`）。
+
+## 仍未处理（记录在案）
+
+- `:protocol` 为非 `websocket` 的 extended CONNECT 仍按普通 CONNECT 派发（应用可
+  405/404；RFC 8441 建议 501，需要引擎在派发前合成响应）。
+- `ws_inbox` 的 `erase(0, n)` 仍是 O(n) FIFO（纯性能项，建议游标 + compaction）。
+- 两个仅在异常路径可达、未加独立回归用例的场景：body_discarded 的分离读者、
+  `pump_dispatch` 的深递归（前者已按 `operation_aborted` 语义修复，后者已加门控）。

@@ -937,6 +937,106 @@ TEST_CASE("h2/engine: an early response returns the unread body's flow-control c
     CHECK_FALSE(has_goaway(transport->written(), codec::H2_FLOW_CONTROL_ERROR));
 }
 
+TEST_CASE("h2/engine: a request without :authority or Host is malformed", "[h2]") {
+    std::string block;
+    hpack_append_literal(block, ":method", "GET");
+    hpack_append_literal(block, ":scheme", "https");
+    hpack_append_literal(block, ":path", "/");
+    const auto out = run_headers(block);
+    REQUIRE(out.completed);
+    CHECK_FALSE(out.dispatched);
+    CHECK(out.rst_protocol_error);
+}
+
+TEST_CASE("h2/engine: a Host field satisfies the authority requirement", "[h2]") {
+    std::string block;
+    hpack_append_literal(block, ":method", "GET");
+    hpack_append_literal(block, ":scheme", "https");
+    hpack_append_literal(block, ":path", "/");
+    hpack_append_literal(block, "host", "example.com");
+    const auto out = run_headers(block);
+    REQUIRE(out.completed);
+    CHECK(out.dispatched);
+}
+
+TEST_CASE("h2/engine: a plain CONNECT must be authority-form", "[h2]") {
+    // RFC 9113 §8.3.1: :scheme and :path are omitted for CONNECT.
+    std::string block;
+    hpack_append_literal(block, ":method", "CONNECT");
+    hpack_append_literal(block, ":authority", "example.com:443");
+    hpack_append_literal(block, ":scheme", "https");
+    hpack_append_literal(block, ":path", "/");
+    const auto out = run_headers(block);
+    REQUIRE(out.completed);
+    CHECK_FALSE(out.dispatched);
+    CHECK(out.rst_protocol_error);
+}
+
+TEST_CASE("h2/engine: a plain CONNECT without :authority is malformed", "[h2]") {
+    std::string block;
+    hpack_append_literal(block, ":method", "CONNECT");
+    const auto out = run_headers(block);
+    REQUIRE(out.completed);
+    CHECK_FALSE(out.dispatched);
+    CHECK(out.rst_protocol_error);
+}
+
+TEST_CASE("h2/engine: a body write without a response head is rejected", "[h2]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    std::string in{codec::kH2ClientPreface};
+    append_frame(in, H2FrameType::Settings, 0, 0, "");
+    in += headers_frame(1, /*end_stream=*/true);
+    transport->push(std::move(in));
+
+    error_code finish_ec;
+    auto dispatcher = [&finish_ec](RequestPtr, ResponsePtr res, SslHandle) -> asio::awaitable<void> {
+        auto [ec] = co_await res->async_finish("x", asio::as_tuple(asio::use_awaitable));
+        finish_ec = ec;
+    };
+    auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, EngineLimits{});
+    REQUIRE(run_on(ctx, run_engine(*engine, dispatcher)));
+
+    CHECK(finish_ec == asio::error::invalid_argument);
+    // A stream may not begin with DATA: nothing may precede the response head.
+    CHECK(count_frames(transport->written(), H2FrameType::Data) == 0);
+}
+
+TEST_CASE("h2/engine: the h2c replayed request drops HTTP/1.1-only fields", "[h2]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    EngineLimits limits;
+    limits.idle_timeout = std::chrono::seconds(0);
+
+    Headers headers;
+    headers.add_lower("host", "example.com");
+    headers.add_lower("connection", "Upgrade, HTTP2-Settings");
+    headers.add_lower("upgrade", "h2c");
+    headers.add_lower("http2-settings", "AAMAAABkAAQAAP__");
+    headers.add_lower("x-keep", "v");
+
+    std::shared_ptr<Request> seen;
+    CallbackHandler dispatcher = [&seen](RequestPtr req, ResponsePtr, SslHandle, HandlerCompletion done) {
+        seen = std::move(req);
+        std::move(done)();
+    };
+    bool finished = false;
+    auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, limits);
+    engine->run_h2c(std::move(dispatcher), std::string{}, Method::Get, "GET", "/", std::move(headers), std::string{},
+                    std::string{codec::kH2ClientPreface}, {}, {}, {}, [&finished] { finished = true; });
+
+    ctx.restart();
+    ctx.run_for(std::chrono::milliseconds(200));
+
+    REQUIRE(seen);
+    CHECK(seen->header("host").value_or("") == "example.com");
+    CHECK_FALSE(seen->headers().contains("connection"));
+    CHECK_FALSE(seen->headers().contains("upgrade"));
+    CHECK_FALSE(seen->headers().contains("http2-settings"));
+    CHECK(seen->header("x-keep").value_or("") == "v");
+    CHECK(finished);
+}
+
 TEST_CASE("core: :path origin-form and asterisk-form validation", "[core][path]") {
     // Shared by the h2 and h3 servers (and mirrored by the clients): the value
     // is the URI path/query, so no fragment, no SP/DEL/backslash or other

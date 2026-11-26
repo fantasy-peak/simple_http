@@ -24,6 +24,7 @@
 // streaming handlers that suspend after run() would otherwise have returned.
 // Http2ResponseSink holds a weak_ptr and lock()s it per operation.
 
+#include <algorithm>
 #include <array>
 
 #include "../../core/asio_compat.h"
@@ -36,10 +37,8 @@
 #include <limits>
 #include <memory>
 #include <optional>
-#include <random>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <variant>
@@ -224,6 +223,14 @@ template <typename Transport> class Http2ResponseSink final : public ResponseSin
             std::move(done)(error_code{});
             return;
         }
+        if (!m_head_started) {
+            // RFC 9113 §8: a stream begins with HEADERS. A DATA frame sent first
+            // is a connection-level protocol error at the peer and would take
+            // every other stream on the connection with it, so refuse a body
+            // write that async_begin() did not precede.
+            std::move(done)(make_error_code(asio::error::invalid_argument));
+            return;
+        }
         if (!eng->stream_writable(m_stream_id)) {
             std::move(done)(make_error_code(asio::error::not_connected));
             return;
@@ -254,6 +261,12 @@ template <typename Transport> class Http2ResponseSink final : public ResponseSin
             std::move(done)(error_code{});
             return;
         }
+        if (!m_head_started) {
+            // See send_chunk(): a body frame before the response HEADERS is a
+            // connection-level protocol error at the peer.
+            std::move(done)(make_error_code(asio::error::invalid_argument));
+            return;
+        }
         if (!eng->stream_writable(m_stream_id)) {
             std::move(done)(make_error_code(asio::error::not_connected));
             return;
@@ -279,6 +292,12 @@ template <typename Transport> class Http2ResponseSink final : public ResponseSin
         }
         if (m_head_request) {
             std::move(done)(error_code{});
+            return;
+        }
+        if (!m_head_started) {
+            // See send_chunk(): a trailer section without a response head is the
+            // same connection-level protocol error.
+            std::move(done)(make_error_code(asio::error::invalid_argument));
             return;
         }
         if (!eng->stream_writable(m_stream_id)) {
@@ -392,6 +411,13 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
         st.request->set_method(method);
         st.request->set_method_token(std::move(method_token));
         st.request->set_target(std::move(target));
+        // The HTTP/1.1 upgrade request carries fields HTTP/2 forbids. A native
+        // h2 request containing any of them is reset as malformed; the replayed
+        // stream 1 must present the same view to handlers and the reverse proxy.
+        for (const std::string_view name :
+             {"connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade", "http2-settings"}) {
+            headers.erase(name);
+        }
         st.request->mutable_headers() = std::move(headers);
         if (!body.empty()) {
             (void)st.request->body().feed(std::move(body));
@@ -1382,6 +1408,15 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
     // the connection (RFC 9113 §4.3.1, RFC 7541 §2.2). The decoded fields are
     // discarded; only the table side effects matter.
     bool decode_discarded_header_block(std::string_view block) {
+        // The live-stream path bounds the compressed block before creating the
+        // stream; a refused/closed one takes this path, where a single large
+        // HEADERS frame (only reachable when h2_max_frame_size exceeds
+        // max_header_bytes) must obey the same bound.
+        if (block.size() > m_limits.max_header_bytes) {
+            SIMPLE_HTTP_ERROR_LOG("h2: discarded header block exceeds {} bytes", m_limits.max_header_bytes);
+            go_away(codec::H2_ENHANCE_YOUR_CALM);
+            return false;
+        }
         std::vector<codec::HpackHeader> ignored;
         if (!m_decoder.decode(block, ignored)) {
             // A malformed representation is a connection-level compression error
@@ -1945,6 +1980,24 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
                     malformed("empty :path");
                     return true;
                 }
+                // RFC 9113 §8.3.1: the target URI has an authority. Without
+                // :authority or Host, Host-based routing (and any HTTP/1.1 replay
+                // downstream) sees an empty host; h1 rejects the same shape.
+                if (authority.empty() && !st.request->headers().contains("host")) {
+                    malformed("missing :authority");
+                    return true;
+                }
+            } else if (!seen_protocol) {
+                // A plain CONNECT is authority-form: :scheme and :path are
+                // forbidden (§8.3.1) and :authority is required.
+                if (seen_scheme || seen_path) {
+                    malformed("CONNECT with :scheme/:path");
+                    return true;
+                }
+                if (authority.empty()) {
+                    malformed("missing :authority");
+                    return true;
+                }
             }
             // RFC 8441 §3: an extended CONNECT selects a protocol with
             // `:protocol`, must be a CONNECT, and carries `:scheme` and `:path`.
@@ -1965,6 +2018,12 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
                 }
                 if (!seen_path || st.request->target().empty()) {
                     malformed("missing :path");
+                    return true;
+                }
+                // The extended CONNECT target is an absolute URI with an
+                // authority as well.
+                if (authority.empty()) {
+                    malformed("missing :authority");
                     return true;
                 }
                 if (iequals_ci(st.protocol, "websocket")) {
@@ -2095,6 +2154,10 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
                 credit_consumed(st, frame_len);
                 if (hdr.has_flag(codec::H2_FLAG_END_STREAM)) {
                     st.half_closed_remote = true;
+                    // A reader that outlived the handler (a detached consumer)
+                    // must not be told "clean EOF" for a body whose tail was
+                    // intentionally dropped: it was never delivered.
+                    (void)st.request->body().fail(make_error_code(asio::error::operation_aborted));
                     maybe_complete_stream(hdr.stream_id);
                 }
                 return true;
@@ -2766,6 +2829,11 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
                     flush();
                 }
                 it->second.body_discarded = true;
+                // The handler was the only consumer: frames it never took must
+                // not stay parked for the rest of the stream's life. Their
+                // connection credit was just prepaid above.
+                it->second.paused_frames.clear();
+                it->second.paused_head = 0;
             } else if (it->second.finish_pending) {
                 // END_STREAM arrived while DATA was still parked, and the
                 // handler has now returned without draining it. Nothing will
@@ -2792,6 +2860,18 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
             m_pending_dispatch.clear();
             return;
         }
+        // A handler that completes synchronously calls handler_finished() from
+        // inside start_handler(), which calls back here. Re-entering the loop
+        // would recurse once per queued stream (the queue is bounded by
+        // h2_max_concurrent_streams, but a large configured cap can still
+        // exhaust the stack); let the outer call keep draining instead.
+        if (m_pumping)
+            return;
+        struct PumpGuard {
+            bool &flag;
+            explicit PumpGuard(bool &f) : flag(f) { flag = true; }
+            ~PumpGuard() { flag = false; }
+        } guard{m_pumping};
         while (m_active_handlers < m_limits.h2_max_concurrent_streams && !m_pending_dispatch.empty()) {
             const std::uint32_t id = m_pending_dispatch.front();
             m_pending_dispatch.pop_front();
@@ -3390,6 +3470,7 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
     // executor (dispatch runs from the read loop; handler_finished from the
     // handler coroutines, which run there too).
     std::size_t m_active_handlers{0};
+    bool m_pumping{false}; // pump_dispatch() re-entry guard
     std::deque<std::uint32_t> m_pending_dispatch;
 
     std::string m_recv_buf;    // received bytes awaiting frame parsing
