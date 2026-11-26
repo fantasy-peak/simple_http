@@ -422,6 +422,36 @@ CONNECT 校验同步放宽为「`:authority` 或 `Host` 至少一个」，与 no
   回归用例。
 - `review/h2-repro/` 的 Go 差分依赖本机 module cache（脚本用 GOPATH 软链）。
 
+## 外部一致性与压力（最终态二进制）
+
+构建：`xmake build -j6 fixture_conformance_server`（0.9.1 + 本轮全部修复）。
+
+### Conformance（`test/external/conformance/run.sh`）
+
+| 套件 | 结果 | 门线 |
+|---|---|---|
+| h2spec（h2c :7790） | 146 tests, 146 passed, 0 skipped, 0 failed | failed==0 且 passed>=146 |
+| h1spec（h1 :7791） | 33/33 | 33/33 |
+| h3spec（QUIC :7792） | 49/49（含 0-RTT） | 49/49 |
+| Autobahn（WS :7788） | 517 用例：OK 514、INFORMATIONAL 3；FAILED 0、NON-STRICT 0 | FAILED==0 且 NON-STRICT==0 |
+
+### Stress（`test/external/stress/run.sh cpp --no-conformance`）
+
+（合规套件已在上一小节单独跑过，故用 `--no-conformance` 避免重复。）
+
+| 档位 | 结果 |
+|---|---|
+| h1 连接复用 | 200/200，0 失败 |
+| h1@2k / 10k / 20k | 39589 / 34233 / 29743 req/s，0 错误 |
+| h2c 连接复用 | 200/200，0 失败 |
+| h2c@2k / 10k / 20k | 3 × 300,000 请求全成 |
+| h3 连接复用 | 200/200，0 失败 |
+| h3@2k / 10k / 20k | 3 × 300,000 请求全成 |
+| WebSocket echo1k | 1,200,000 / 1,200,000 条全成，0 失败（~163,796 msgs/s） |
+
+两个脚本均退出码 0、汇总「全部达标」；结束后确认 7788–7792 TCP/UDP 端口已释放、
+无遗留 `fixture_conformance_server` 进程。
+
 ## 变更文件汇总
 
 - `include/simple_http/engine/h2/h2_engine.h`：P1/P2 服务端、重复 GOAWAY、P3 各项、
