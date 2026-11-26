@@ -1682,7 +1682,8 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
     }
 
     // Decodes an accumulated header block into the stream's Request and clears
-    // the buffer. Dispatch happens once END_STREAM is also seen.
+    // the buffer. Dispatch happens as soon as END_HEADERS completes the block;
+    // the request body may still be arriving.
     // RFC 9113 §8.2.1: HTTP/2 field names are lowercase. An uppercase byte makes
     // the request malformed rather than something to fold away — folding is how
     // HTTP/1.1 tolerated it, and this layer deliberately does not.
@@ -1987,7 +1988,7 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
             st.request->mutable_headers().erase("host");
             st.request->mutable_headers().add_lower("host", std::move(authority));
         }
-        // Dispatch is triggered by the caller once END_STREAM is also observed.
+        // Dispatch is triggered by the caller once END_HEADERS is also observed.
         return true;
     }
 

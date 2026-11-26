@@ -553,9 +553,9 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
     // ngtcp2's timer expired — or, since any wake-up runs this, might have.
     void handle_expiry_due();
     // Pair a stashed NewSessionTicket with the peer's 0-RTT transport
-    // parameters and hand both to the client user. Runs from `step()`, outside
-    // the OpenSSL/ngtcp2 callback stack, because encoding the parameters calls
-    // into ngtcp2.
+    // parameters and hand both to the client user. Runs only from `step()`,
+    // outside the OpenSSL/ngtcp2 callback stack, because encoding the
+    // parameters calls into ngtcp2.
     void flush_pending_session_ticket();
     // Mark the connection finished. If a callback is on the stack the packet
     // itself is deferred to `finish_close()` — see m_in_read_pkt.
@@ -1457,10 +1457,10 @@ int QuicConnection<Executor>::cb_recv_stream_data(ngtcp2_conn *, std::uint32_t f
     // ngtcp2's flags are not the engine's vocabulary; the bits that cross the
     // seam are translated here so `engine/h3/` needs no ngtcp2 header.
     std::uint32_t translated = (flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0 ? quic::kStreamDataFin : 0u;
-    if ((flags & NGTCP2_STREAM_DATA_FLAG_0RTT) != 0) {
-        translated |= quic::kStreamData0RTT;
+    // Connection-level observation only: HTTP/3 derives Request::used_0rtt()
+    // from the handshake state when the header section completes.
+    if ((flags & NGTCP2_STREAM_DATA_FLAG_0RTT) != 0)
         self->m_used_0rtt = true;
-    }
     if (auto proto = self->protocol()) {
         proto->on_stream_data(translated, stream_id, span<const std::uint8_t>{data, datalen});
         return 0;
@@ -1616,7 +1616,9 @@ int QuicConnection<Executor>::cb_handshake_completed(ngtcp2_conn *conn, void *us
             (void)ngtcp2_conn_tls_early_data_rejected(conn);
         }
     }
-    self->flush_pending_session_ticket();
+    // The ticket flush is deferred to `step()` (outside this callback stack);
+    // `poke()` below makes sure that step runs even if this callback did not
+    // come from a read/write iteration.
     if (auto proto = self->protocol())
         proto->on_handshake_complete();
     self->poke();

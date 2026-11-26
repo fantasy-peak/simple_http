@@ -2,11 +2,12 @@
 
 // Streaming multipart/form-data upload for the client (C++17 token-only port).
 //
-//   client.async_open_multipart(url, opts, [](error_code, shared_ptr<MultipartStreamWriter> w) {
-//       w->async_field("title", "hello", ...);
-//       w->async_file("upload", "notes.txt", "./notes.txt", ...);
-//       w->async_finish(...);
-//   });
+//   MultipartStreamWriter::async_open(client, url, opts,
+//       [](error_code, shared_ptr<MultipartStreamWriter> w) {
+//           w->async_field("title", "hello", ...);
+//           w->async_file("upload", "notes.txt", "./notes.txt", ...);
+//           w->async_finish(...);
+//       });
 //
 // Each part is written as it is added; file parts are copied from disk in
 // fixed-size chunks. File I/O is synchronous (std::ifstream), matching

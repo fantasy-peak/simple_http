@@ -9,13 +9,11 @@
 // per type and costs nothing for types that do not use it.
 //
 //     template <> struct simple_http::Validator<CreateUser> {
-//         static std::expected<void, std::vector<FieldError>>
-//         validate(const CreateUser &v) {
-//             std::vector<FieldError> errors;
-//             push_if(errors, required_field("name", !v.name.empty()));
-//             push_if(errors, range("age", v.age, 1, 150));
-//             return errors.empty() ? std::expected<void, std::vector<FieldError>>{}
-//                                   : std::unexpected(std::move(errors));
+//         static ValidationResult validate(const CreateUser &v) {
+//             ValidationResult out;
+//             push_if(out.errors, required_field("name", !v.name.empty()));
+//             push_if(out.errors, range("age", v.age, 1, 150));
+//             return out;
 //         }
 //     };
 //

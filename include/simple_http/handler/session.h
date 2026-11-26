@@ -258,8 +258,8 @@ namespace middleware {
 
 // Loads/creates a session, publishes it on the request, and persists changes
 // after the chain. The cookie is set before next() so it rides on the response
-// head; session data is saved afterwards (a failed save is logged, not turned
-// into a response after the head has gone out).
+// head; session data is saved afterwards. The store's error is ignored: the
+// response head has already gone out, so a failed save cannot become a 500.
 inline Middleware session(std::shared_ptr<SessionStore> store, SessionConfig config = {}) {
     return [store = std::move(store), config = std::move(config)](RequestPtr req, ResponsePtr res, SslHandle ssl,
                                                                   Next next, HandlerCompletion done) {
