@@ -102,6 +102,16 @@ struct EngineLimits {
         return h2_max_queued_streams != 0 ? h2_max_queued_streams : h2_max_concurrent_streams;
     }
 
+    // Whether the HTTP/2 parameters that are serialized verbatim into SETTINGS
+    // are inside the ranges RFC 9113 §6.5.2 allows. Outside them a conforming
+    // peer must close the connection, and the frame-size value is also our own
+    // receive bound, so a too-small value would reject valid peer frames.
+    // (SETTINGS_INITIAL_WINDOW_SIZE is an unsigned 31-bit field; the int32 value
+    // here can only violate it by being negative.)
+    [[nodiscard]] bool h2_settings_valid() const {
+        return h2_max_frame_size >= 16384 && h2_max_frame_size <= 0xFFFFFFu && h2_initial_window >= 0;
+    }
+
     // HTTP/3 counterpart of the Rapid Reset bound above: how many handlers may
     // run at once (and, via effective_max_queued_streams(), how many streams may
     // wait for a slot). 0 follows h2_max_concurrent_streams, so the two

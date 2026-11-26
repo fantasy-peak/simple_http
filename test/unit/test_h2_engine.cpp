@@ -8,13 +8,16 @@
 // over a scripted transport and assert on the concurrency actually observed by a
 // dispatcher, not on any counter the engine exposes.
 
+#include <algorithm>
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "simple_http.h"
 #include "test_support.h"
@@ -152,6 +155,23 @@ bool has_window_update(std::string_view written, std::uint32_t stream_id) {
         i = end;
     }
     return false;
+}
+
+// How many frames of `type` the recorded output contains.
+std::size_t count_frames(std::string_view written, H2FrameType type) {
+    std::size_t count = 0;
+    for (std::size_t i = 0; i + kH2FrameHeaderSize <= written.size();) {
+        H2FrameHeader hdr;
+        if (!parse_frame_header(written.substr(i), hdr))
+            break;
+        const std::size_t end = i + kH2FrameHeaderSize + hdr.length;
+        if (end > written.size())
+            break;
+        if (hdr.type == static_cast<std::uint8_t>(type))
+            ++count;
+        i = end;
+    }
+    return count;
 }
 
 // A handler that stays alive long enough for the read loop to process the rest
@@ -641,6 +661,169 @@ std::string request_block(std::string method = "GET", std::string path = "/") {
 
 } // namespace
 
+namespace {
+
+// A transport whose writes always fail and whose outstanding read survives
+// teardown, so a test can complete it with late peer bytes. Mirrors the real
+// ordering: serve_loops() starts the read before the first write, and a write
+// error drives finish_connection() while that read is still pending.
+class FailingWriteTransport {
+  public:
+    explicit FailingWriteTransport(asio::any_io_executor ex) : m_ex(std::move(ex)) {}
+
+    asio::any_io_executor get_executor() { return m_ex; }
+    asio::ip::tcp::endpoint peer() const { return {}; }
+    SslHandle tls_handle() const { return std::nullopt; }
+    void close() { m_closed = true; }
+
+    template <typename Token> auto async_read_some(ByteSpan buffer, Token &&token) {
+        auto initiation = [this, buffer](auto handler) mutable {
+            m_buf = buffer.data();
+            m_cap = buffer.size();
+            m_read = asio::any_completion_handler<void(error_code, std::size_t)>(std::move(handler));
+        };
+        return asio::async_initiate<Token, void(error_code, std::size_t)>(
+            ExecInit<decltype(initiation)>{std::move(initiation), m_ex}, token);
+    }
+
+    template <typename Token> auto async_write(ConstByteSpan, Token &&token) {
+        auto initiation = [this](auto handler) {
+            asio::post(m_ex, [handler = std::move(handler)]() mutable {
+                std::move(handler)(make_error_code(asio::error::connection_reset), 0);
+            });
+        };
+        return asio::async_initiate<Token, void(error_code, std::size_t)>(
+            ExecInit<decltype(initiation)>{std::move(initiation), m_ex}, token);
+    }
+
+    template <typename Token> auto async_shutdown(Token &&token) {
+        auto initiation = [this](auto handler) {
+            asio::post(m_ex, [handler = std::move(handler)]() mutable { std::move(handler)(error_code{}); });
+        };
+        return asio::async_initiate<Token, void(error_code)>(
+            ExecInit<decltype(initiation)>{std::move(initiation), m_ex}, token);
+    }
+
+    bool pending_read() const { return static_cast<bool>(m_read); }
+    bool closed() const { return m_closed; }
+
+    // Completes the outstanding read with `bytes` (truncated to the engine's
+    // buffer). Called on the connection's (single) thread.
+    void complete_read(std::string_view bytes) {
+        auto handler = std::move(m_read);
+        m_read = nullptr;
+        const std::size_t n = std::min(m_cap, bytes.size());
+        std::memcpy(m_buf, bytes.data(), n);
+        std::move(handler)(error_code{}, n);
+    }
+
+  private:
+    asio::any_io_executor m_ex;
+    bool m_closed = false;
+    std::byte *m_buf = nullptr;
+    std::size_t m_cap = 0;
+    asio::any_completion_handler<void(error_code, std::size_t)> m_read;
+};
+
+// Decodes to a field list above the 64 KiB cap, inserts one dynamic-table
+// entry, then ends with a malformed representation (indexed field, index 0).
+std::string bomb_then_malformed_block() {
+    std::string block;
+    block.push_back('\x40'); // literal with incremental indexing: mutates the table
+    hpack_append_string(block, "x-dyn");
+    hpack_append_string(block, "v");
+    // 12 ("content-type") + 1 + 32 = 45 bytes per field; 1500 * 45 = 67.5 KiB.
+    for (int i = 0; i < 1500; ++i)
+        hpack_append_literal_indexed_name(block, 31, "a");
+    block.push_back('\x80'); // 6.1 indexed header field, index 0 -> malformed
+    return block;
+}
+
+} // namespace
+
+TEST_CASE("h2/engine: a malformed discarded HPACK block is a COMPRESSION_ERROR", "[h2]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    EngineLimits limits;
+    limits.h2_max_concurrent_streams = 1;
+
+    std::string in{codec::kH2ClientPreface};
+    append_frame(in, H2FrameType::Settings, 0, 0, "");
+    in += headers_frame(1, /*end_stream=*/true); // fills the only stream slot
+
+    // Stream 3 is refused, so its field block goes through the discard path.
+    // Crossing the decoded-list cap alone is a stream error, but a malformed
+    // representation is a connection-level COMPRESSION_ERROR and must GOAWAY
+    // even when the same block also crossed the cap (the prefix decode already
+    // mutated the dynamic table).
+    append_frame(in, H2FrameType::Headers, H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM, 3, bomb_then_malformed_block());
+    transport->push(std::move(in));
+
+    std::vector<HandlerCompletion> parked;
+    std::vector<std::shared_ptr<Request>> keep;
+    auto dispatcher = [&](RequestPtr req, ResponsePtr, SslHandle, HandlerCompletion done) {
+        keep.push_back(std::move(req));
+        parked.push_back(std::move(done)); // never complete: stream 1 stays open
+    };
+    auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, limits);
+    REQUIRE(run_on(ctx, run_engine(*engine, dispatcher)));
+
+    CHECK(has_goaway(transport->written(), codec::H2_COMPRESSION_ERROR));
+    CHECK_FALSE(has_rst_stream(transport->written(), 3, codec::H2_REFUSED_STREAM));
+}
+
+TEST_CASE("h2/engine: a read completing after teardown does not dispatch a handler", "[h2]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<FailingWriteTransport>(ctx.get_executor());
+    EngineLimits limits;
+    limits.idle_timeout = std::chrono::seconds(0);
+
+    int dispatched = 0;
+    std::vector<HandlerCompletion> parked;
+    std::vector<std::shared_ptr<Request>> keep;
+    auto dispatcher = [&](RequestPtr req, ResponsePtr, SslHandle, HandlerCompletion done) {
+        ++dispatched;
+        keep.push_back(std::move(req));
+        parked.push_back(std::move(done));
+    };
+    auto engine = std::make_shared<Http2Engine<FailingWriteTransport>>(transport, limits);
+
+    // The first write fails, which tears the connection down while the read
+    // started by serve_loops() is still outstanding.
+    REQUIRE(run_until(ctx, run_engine(*engine, dispatcher)));
+    REQUIRE(transport->closed());
+    REQUIRE(transport->pending_read());
+    CHECK(dispatched == 0);
+
+    // Late peer bytes: the read was never cancelled, so it may still complete
+    // successfully. They must not create a stream on the dead connection.
+    std::string in{codec::kH2ClientPreface};
+    in += headers_frame(1, /*end_stream=*/true);
+    transport->complete_read(in);
+    drain(ctx, std::chrono::milliseconds(20));
+
+    CHECK(dispatched == 0);
+}
+
+TEST_CASE("h2/engine: a connection error emits exactly one GOAWAY", "[h2]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+
+    std::string in{codec::kH2ClientPreface};
+    append_frame(in, H2FrameType::Settings, 0, 0, "");
+    append_frame(in, H2FrameType::Data, 0, 0, "x"); // DATA on stream 0: PROTOCOL_ERROR
+    transport->push(std::move(in));
+
+    auto dispatcher = [](RequestPtr, ResponsePtr, SslHandle) {};
+    auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, EngineLimits{});
+    REQUIRE(run_on(ctx, run_engine(*engine, dispatcher)));
+
+    // go_away() queues the frame; the teardown write must carry it as-is rather
+    // than appending a second one (RFC 9113 §6.8 also forbids a later GOAWAY
+    // from increasing its last stream id).
+    CHECK(count_frames(transport->written(), H2FrameType::Goaway) == 1);
+}
+
 TEST_CASE("h2/engine: a regular field name must be an HTTP token", "[h2]") {
     auto block = request_block();
     hpack_append_literal(block, "bad name", "v");
@@ -752,6 +935,137 @@ TEST_CASE("h2/engine: an early response returns the unread body's flow-control c
     CHECK(has_window_update(transport->written(), 0));
     CHECK(has_window_update(transport->written(), 1));
     CHECK_FALSE(has_goaway(transport->written(), codec::H2_FLOW_CONTROL_ERROR));
+}
+
+TEST_CASE("h2/engine: a request without :authority or Host is malformed", "[h2]") {
+    std::string block;
+    hpack_append_literal(block, ":method", "GET");
+    hpack_append_literal(block, ":scheme", "https");
+    hpack_append_literal(block, ":path", "/");
+    const auto out = run_headers(block);
+    REQUIRE(out.completed);
+    CHECK_FALSE(out.dispatched);
+    CHECK(out.rst_protocol_error);
+}
+
+TEST_CASE("h2/engine: a Host field satisfies the authority requirement", "[h2]") {
+    std::string block;
+    hpack_append_literal(block, ":method", "GET");
+    hpack_append_literal(block, ":scheme", "https");
+    hpack_append_literal(block, ":path", "/");
+    hpack_append_literal(block, "host", "example.com");
+    const auto out = run_headers(block);
+    REQUIRE(out.completed);
+    CHECK(out.dispatched);
+}
+
+TEST_CASE("h2/engine: a plain CONNECT must be authority-form", "[h2]") {
+    // RFC 9113 §8.3.1: :scheme and :path are omitted for CONNECT.
+    std::string block;
+    hpack_append_literal(block, ":method", "CONNECT");
+    hpack_append_literal(block, ":authority", "example.com:443");
+    hpack_append_literal(block, ":scheme", "https");
+    hpack_append_literal(block, ":path", "/");
+    const auto out = run_headers(block);
+    REQUIRE(out.completed);
+    CHECK_FALSE(out.dispatched);
+    CHECK(out.rst_protocol_error);
+}
+
+TEST_CASE("h2/engine: a plain CONNECT without :authority is malformed", "[h2]") {
+    std::string block;
+    hpack_append_literal(block, ":method", "CONNECT");
+    const auto out = run_headers(block);
+    REQUIRE(out.completed);
+    CHECK_FALSE(out.dispatched);
+    CHECK(out.rst_protocol_error);
+}
+
+TEST_CASE("h2/engine: an unimplemented :protocol is dispatched like the Go server", "[h2]") {
+    // With SETTINGS_ENABLE_CONNECT_PROTOCOL advertised, Go's x/net/http2 hands
+    // an extended CONNECT for any :protocol to the application (the handler sees
+    // ":protocol"); it does not answer 501 at the framing layer. This engine
+    // dispatches it as an ordinary CONNECT for the same reason.
+    std::string block;
+    hpack_append_literal(block, ":method", "CONNECT");
+    hpack_append_literal(block, ":protocol", "foo");
+    hpack_append_literal(block, ":scheme", "https");
+    hpack_append_literal(block, ":path", "/x");
+    hpack_append_literal(block, ":authority", "example.com");
+    const auto out = run_headers(block);
+    REQUIRE(out.completed);
+    CHECK(out.dispatched);
+    CHECK_FALSE(out.rst_protocol_error);
+}
+
+TEST_CASE("h2/engine: an extended CONNECT may take its authority from Host", "[h2]") {
+    // Go's newWriterAndRequest() falls back to the Host field when :authority is
+    // absent; an extended CONNECT is held to the same rule.
+    std::string block;
+    hpack_append_literal(block, ":method", "CONNECT");
+    hpack_append_literal(block, ":protocol", "foo");
+    hpack_append_literal(block, ":scheme", "https");
+    hpack_append_literal(block, ":path", "/x");
+    hpack_append_literal(block, "host", "example.com");
+    const auto out = run_headers(block);
+    REQUIRE(out.completed);
+    CHECK(out.dispatched);
+}
+
+TEST_CASE("h2/engine: a body write without a response head is rejected", "[h2]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    std::string in{codec::kH2ClientPreface};
+    append_frame(in, H2FrameType::Settings, 0, 0, "");
+    in += headers_frame(1, /*end_stream=*/true);
+    transport->push(std::move(in));
+
+    error_code finish_ec;
+    auto dispatcher = [&finish_ec](RequestPtr, ResponsePtr res, SslHandle) -> asio::awaitable<void> {
+        auto [ec] = co_await res->async_finish("x", asio::as_tuple(asio::use_awaitable));
+        finish_ec = ec;
+    };
+    auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, EngineLimits{});
+    REQUIRE(run_on(ctx, run_engine(*engine, dispatcher)));
+
+    CHECK(finish_ec == asio::error::invalid_argument);
+    // A stream may not begin with DATA: nothing may precede the response head.
+    CHECK(count_frames(transport->written(), H2FrameType::Data) == 0);
+}
+
+TEST_CASE("h2/engine: the h2c replayed request drops HTTP/1.1-only fields", "[h2]") {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    EngineLimits limits;
+    limits.idle_timeout = std::chrono::seconds(0);
+
+    Headers headers;
+    headers.add_lower("host", "example.com");
+    headers.add_lower("connection", "Upgrade, HTTP2-Settings");
+    headers.add_lower("upgrade", "h2c");
+    headers.add_lower("http2-settings", "AAMAAABkAAQAAP__");
+    headers.add_lower("x-keep", "v");
+
+    std::shared_ptr<Request> seen;
+    CallbackHandler dispatcher = [&seen](RequestPtr req, ResponsePtr, SslHandle, HandlerCompletion done) {
+        seen = std::move(req);
+        std::move(done)();
+    };
+    bool finished = false;
+    auto engine = std::make_shared<Http2Engine<MockTransport>>(transport, limits);
+    engine->run_h2c(std::move(dispatcher), std::string{}, Method::Get, "GET", "/", std::move(headers), std::string{},
+                    std::string{codec::kH2ClientPreface}, {}, {}, {}, [&finished] { finished = true; });
+
+    ctx.restart();
+    ctx.run_for(std::chrono::milliseconds(200));
+
+    REQUIRE(seen);
+    CHECK(seen->header("host").value_or("") == "example.com");
+    CHECK_FALSE(seen->headers().contains("connection"));
+    CHECK_FALSE(seen->headers().contains("upgrade"));
+    CHECK_FALSE(seen->headers().contains("http2-settings"));
+    CHECK(seen->header("x-keep").value_or("") == "v");
+    CHECK(finished);
 }
 
 TEST_CASE("core: :path origin-form and asterisk-form validation", "[core][path]") {

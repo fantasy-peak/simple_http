@@ -24,6 +24,7 @@
 // streaming handlers that suspend after run() would otherwise have returned.
 // Http2ResponseSink holds a weak_ptr and lock()s it per operation.
 
+#include <algorithm>
 #include <array>
 
 #include "../../core/asio_compat.h"
@@ -36,10 +37,8 @@
 #include <limits>
 #include <memory>
 #include <optional>
-#include <random>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <variant>
@@ -224,6 +223,14 @@ template <typename Transport> class Http2ResponseSink final : public ResponseSin
             std::move(done)(error_code{});
             return;
         }
+        if (!m_head_started) {
+            // RFC 9113 §8: a stream begins with HEADERS. A DATA frame sent first
+            // is a connection-level protocol error at the peer and would take
+            // every other stream on the connection with it, so refuse a body
+            // write that async_begin() did not precede.
+            std::move(done)(make_error_code(asio::error::invalid_argument));
+            return;
+        }
         if (!eng->stream_writable(m_stream_id)) {
             std::move(done)(make_error_code(asio::error::not_connected));
             return;
@@ -254,6 +261,12 @@ template <typename Transport> class Http2ResponseSink final : public ResponseSin
             std::move(done)(error_code{});
             return;
         }
+        if (!m_head_started) {
+            // See send_chunk(): a body frame before the response HEADERS is a
+            // connection-level protocol error at the peer.
+            std::move(done)(make_error_code(asio::error::invalid_argument));
+            return;
+        }
         if (!eng->stream_writable(m_stream_id)) {
             std::move(done)(make_error_code(asio::error::not_connected));
             return;
@@ -279,6 +292,12 @@ template <typename Transport> class Http2ResponseSink final : public ResponseSin
         }
         if (m_head_request) {
             std::move(done)(error_code{});
+            return;
+        }
+        if (!m_head_started) {
+            // See send_chunk(): a trailer section without a response head is the
+            // same connection-level protocol error.
+            std::move(done)(make_error_code(asio::error::invalid_argument));
             return;
         }
         if (!eng->stream_writable(m_stream_id)) {
@@ -392,6 +411,13 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
         st.request->set_method(method);
         st.request->set_method_token(std::move(method_token));
         st.request->set_target(std::move(target));
+        // The HTTP/1.1 upgrade request carries fields HTTP/2 forbids. A native
+        // h2 request containing any of them is reset as malformed; the replayed
+        // stream 1 must present the same view to handlers and the reverse proxy.
+        for (const std::string_view name :
+             {"connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade", "http2-settings"}) {
+            headers.erase(name);
+        }
         st.request->mutable_headers() = std::move(headers);
         if (!body.empty()) {
             (void)st.request->body().feed(std::move(body));
@@ -784,8 +810,32 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
 
         // --- HTTP/2 WebSocket (RFC 8441) ---
         bool websocket = false;
-        std::string protocol;   // raw `:protocol` value
-        std::string ws_inbox;   // inbound tunnel bytes, ordered
+        std::string protocol; // raw `:protocol` value
+        // Inbound tunnel bytes, ordered. Consumed with a read cursor and only
+        // compacted once the consumed prefix is worth the memmove: erasing on
+        // every read made a bulk tunnel O(n^2). (Go's h2 request body buffer,
+        // dataBuffer, consumes the same way: chunk pointer + read offset.)
+        std::string ws_inbox;
+        std::size_t ws_inbox_pos{0};
+        bool ws_inbox_empty() const { return ws_inbox_pos >= ws_inbox.size(); }
+        std::string_view ws_inbox_front() const { return std::string_view{ws_inbox}.substr(ws_inbox_pos); }
+        void ws_inbox_append(std::string_view data) {
+            if (ws_inbox_pos >= ws_inbox.size()) {
+                ws_inbox.clear();
+                ws_inbox_pos = 0;
+            } else if (ws_inbox_pos >= kQueueCompactFloor && ws_inbox_pos * kQueueCompactDivisor >= ws_inbox.size()) {
+                ws_inbox.erase(0, ws_inbox_pos);
+                ws_inbox_pos = 0;
+            }
+            ws_inbox.append(data);
+        }
+        void ws_inbox_consume(std::size_t n) {
+            ws_inbox_pos += n;
+            if (ws_inbox_pos >= ws_inbox.size()) {
+                ws_inbox.clear();
+                ws_inbox_pos = 0;
+            }
+        }
         bool ws_eof = false;    // the peer ended its half (END_STREAM)
         bool ws_closed = false; // we tore the tunnel down
         std::shared_ptr<asio::experimental::channel<void(error_code)>> ws_wake;
@@ -992,6 +1042,16 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
         auto self = this->shared_from_this();
         m_transport->async_read_some(
             ByteSpan{m_read_scratch.data(), m_read_scratch.size()}, [self](error_code ec, std::size_t n) {
+                // Teardown may have started while this read was outstanding: a
+                // transport write error drives finish_connection() without
+                // cancelling the pending read, and the transport is closed only
+                // after the optional in-flight write is drained. Parsing here
+                // would create a stream whose request was never failed or
+                // cancelled (finish_connection()'s phase 2 snapshot predates it)
+                // and dispatch its handler on a dead connection.
+                if (self->m_finished) {
+                    return;
+                }
                 if (ec) {
                     self->finish_connection();
                     return;
@@ -1122,17 +1182,14 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
         if (m_finish_started)
             return;
         m_finish_started = true;
-        if (m_goaway_sent) {
-            // Keep whatever is already queued. The RST_STREAM that refused the
-            // offending stream is still meaningful to the peer, and the write
-            // loop may not have flushed it before the read loop saw the error.
-            // The GOAWAY follows it; whole frames only, so the stream stays
-            // parseable.
-            std::string payload;
-            codec::append_u32(payload, m_next_peer_stream_id);
-            codec::append_u32(payload, m_goaway_error);
-            append_frame(codec::H2FrameType::Goaway, 0, 0, payload);
-        }
+        // A GOAWAY queued by go_away() is still in m_out (the write loop cannot
+        // have swapped it away: this path runs synchronously after go_away(), or
+        // waits for a write that was started before it). The final write below
+        // therefore carries it exactly once, after whatever RST_STREAM preceded
+        // it. Re-emitting it here would duplicate the frame -- and, if any
+        // stream had been parsed in the meantime, the second GOAWAY's
+        // last-stream-id would be larger than the first, which RFC 9113 §6.8
+        // forbids.
         auto self = this->shared_from_this();
         auto shutdown = [self]() {
             self->m_transport->async_shutdown([self](error_code) {
@@ -1180,6 +1237,12 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
     // false on a connection-fatal protocol error (a GOAWAY has been queued);
     // true if it consumed all it could and wants more bytes.
     bool parse_available() {
+        // Once teardown has started, buffered bytes must not create more streams:
+        // the requests that existed were already failed and cancelled, and a new
+        // one would never be (see read_loop()'s completion).
+        if (m_finished) {
+            return false;
+        }
         // Re-entry guard. Dispatching a request happens inside handle_frame,
         // and a callback handler can read already-buffered body data inline,
         // which calls on_body_consumed() -> parse_available() again. The
@@ -1369,10 +1432,30 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
     // the connection (RFC 9113 §4.3.1, RFC 7541 §2.2). The decoded fields are
     // discarded; only the table side effects matter.
     bool decode_discarded_header_block(std::string_view block) {
-        std::vector<codec::HpackHeader> ignored;
-        if (!m_decoder.decode(block, ignored) && !m_decoder.header_list_too_large()) {
-            go_away(codec::H2_COMPRESSION_ERROR);
+        // The live-stream path bounds the compressed block before creating the
+        // stream; a refused/closed one takes this path, where a single large
+        // HEADERS frame (only reachable when h2_max_frame_size exceeds
+        // max_header_bytes) must obey the same bound.
+        if (block.size() > m_limits.max_header_bytes) {
+            SIMPLE_HTTP_ERROR_LOG("h2: discarded header block exceeds {} bytes", m_limits.max_header_bytes);
+            go_away(codec::H2_ENHANCE_YOUR_CALM);
             return false;
+        }
+        std::vector<codec::HpackHeader> ignored;
+        if (!m_decoder.decode(block, ignored)) {
+            // A malformed representation is a connection-level compression error
+            // even when the decoded list also crossed the size cap: decode() stops
+            // mid-block, so the dynamic-table inserts it already performed may
+            // leave us out of sync with the peer's encoder. `header_list_too_large()`
+            // alone would misclassify that case (finish_header_block() checks the
+            // same two flags in this order). Crossing the cap on an otherwise
+            // well-formed block is only a stream error, and there is no live stream
+            // here to reset, so that case is discarded.
+            if (m_decoder.compression_error()) {
+                SIMPLE_HTTP_ERROR_LOG("h2 HPACK decode failed on a discarded block (err={})", m_decoder.last_error());
+                go_away(codec::H2_COMPRESSION_ERROR);
+                return false;
+            }
         }
         return true; // list-too-large still decoded to the end: table stays in sync
     }
@@ -1921,6 +2004,24 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
                     malformed("empty :path");
                     return true;
                 }
+                // RFC 9113 §8.3.1: the target URI has an authority. Without
+                // :authority or Host, Host-based routing (and any HTTP/1.1 replay
+                // downstream) sees an empty host; h1 rejects the same shape.
+                if (authority.empty() && !st.request->headers().contains("host")) {
+                    malformed("missing :authority");
+                    return true;
+                }
+            } else if (!seen_protocol) {
+                // A plain CONNECT is authority-form: :scheme and :path are
+                // forbidden (§8.3.1) and :authority is required.
+                if (seen_scheme || seen_path) {
+                    malformed("CONNECT with :scheme/:path");
+                    return true;
+                }
+                if (authority.empty()) {
+                    malformed("missing :authority");
+                    return true;
+                }
             }
             // RFC 8441 §3: an extended CONNECT selects a protocol with
             // `:protocol`, must be a CONNECT, and carries `:scheme` and `:path`.
@@ -1941,6 +2042,13 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
                 }
                 if (!seen_path || st.request->target().empty()) {
                     malformed("missing :path");
+                    return true;
+                }
+                // The extended CONNECT target is an absolute URI with an
+                // authority as well. A Host field is the same fallback the
+                // reference Go server applies when :authority is absent.
+                if (authority.empty() && !st.request->headers().contains("host")) {
+                    malformed("missing :authority");
                     return true;
                 }
                 if (iequals_ci(st.protocol, "websocket")) {
@@ -2071,6 +2179,10 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
                 credit_consumed(st, frame_len);
                 if (hdr.has_flag(codec::H2_FLAG_END_STREAM)) {
                     st.half_closed_remote = true;
+                    // A reader that outlived the handler (a detached consumer)
+                    // must not be told "clean EOF" for a body whose tail was
+                    // intentionally dropped: it was never delivered.
+                    (void)st.request->body().fail(make_error_code(asio::error::operation_aborted));
                     maybe_complete_stream(hdr.stream_id);
                 }
                 return true;
@@ -2090,7 +2202,7 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
                         credit_consumed(st, static_cast<std::int64_t>(data.size()));
                     } else {
                         st.recv_owed_conn += static_cast<std::int64_t>(data.size());
-                        st.ws_inbox.append(data);
+                        st.ws_inbox_append(data);
                         if (st.ws_wake)
                             (void)st.ws_wake->try_send(error_code{});
                     }
@@ -2469,9 +2581,6 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
     void go_away(std::uint32_t error_code_value) {
         if (m_goaway_sent)
             return;
-        // Remember the code so the teardown path can re-serialize the GOAWAY if the
-        // write loop was cancelled before it reached the wire.
-        m_goaway_error = error_code_value;
         std::string payload;
         codec::append_u32(payload, m_next_peer_stream_id); // last stream id we processed
         codec::append_u32(payload, error_code_value);
@@ -2745,6 +2854,11 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
                     flush();
                 }
                 it->second.body_discarded = true;
+                // The handler was the only consumer: frames it never took must
+                // not stay parked for the rest of the stream's life. Their
+                // connection credit was just prepaid above.
+                it->second.paused_frames.clear();
+                it->second.paused_head = 0;
             } else if (it->second.finish_pending) {
                 // END_STREAM arrived while DATA was still parked, and the
                 // handler has now returned without draining it. Nothing will
@@ -2771,6 +2885,18 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
             m_pending_dispatch.clear();
             return;
         }
+        // A handler that completes synchronously calls handler_finished() from
+        // inside start_handler(), which calls back here. Re-entering the loop
+        // would recurse once per queued stream (the queue is bounded by
+        // h2_max_concurrent_streams, but a large configured cap can still
+        // exhaust the stack); let the outer call keep draining instead.
+        if (m_pumping)
+            return;
+        struct PumpGuard {
+            bool &flag;
+            explicit PumpGuard(bool &f) : flag(f) { flag = true; }
+            ~PumpGuard() { flag = false; }
+        } guard{m_pumping};
         while (m_active_handlers < m_limits.h2_max_concurrent_streams && !m_pending_dispatch.empty()) {
             const std::uint32_t id = m_pending_dispatch.front();
             m_pending_dispatch.pop_front();
@@ -2956,10 +3082,11 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
             return;
         }
         Stream &st = it->second;
-        if (!st.ws_inbox.empty()) {
-            const std::size_t n = std::min<std::size_t>(out.size(), st.ws_inbox.size());
-            std::memcpy(out.data(), st.ws_inbox.data(), n);
-            st.ws_inbox.erase(0, n);
+        if (!st.ws_inbox_empty()) {
+            const std::string_view pending = st.ws_inbox_front();
+            const std::size_t n = std::min<std::size_t>(out.size(), pending.size());
+            std::memcpy(out.data(), pending.data(), n);
+            st.ws_inbox_consume(n);
             // Same guard as on_body_consumed(): the credit may already have been
             // prepaid when the tunnel handler finished (see handler_finished).
             if (!st.body_credit_prepaid) {
@@ -3369,6 +3496,7 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
     // executor (dispatch runs from the read loop; handler_finished from the
     // handler coroutines, which run there too).
     std::size_t m_active_handlers{0};
+    bool m_pumping{false}; // pump_dispatch() re-entry guard
     std::deque<std::uint32_t> m_pending_dispatch;
 
     std::string m_recv_buf;    // received bytes awaiting frame parsing
@@ -3377,7 +3505,6 @@ template <typename Transport> class Http2Engine : public std::enable_shared_from
     std::string m_writing;     // bytes of the in-flight transport write (reused)
     std::string m_out;         // serialized frames awaiting transport write
 
-    std::uint32_t m_goaway_error{0};                       // code for the GOAWAY re-emitted on teardown
     std::int64_t m_conn_send_window = kH2InitialWindow;    // peer's connection-level window for us (send side)
     std::int64_t m_conn_recv_window = kH2InitialWindow;    // our connection-level window to the peer (recv side)
     std::int64_t m_conn_recv_pending = 0;                  // consumed bytes awaiting a batched connection WINDOW_UPDATE

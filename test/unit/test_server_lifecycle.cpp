@@ -4,6 +4,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
+#include <cstdint>
 #include <thread>
 
 #include "simple_http.h"
@@ -50,6 +51,35 @@ TEST_CASE("server: stop closes idle keep-alive connections promptly", "[server][
     // An idle connection has no request in flight; shutdown_grace is 200 ms.
     // The generic io-context drain grace is 2 s and must not be paid here.
     CHECK(elapsed < std::chrono::milliseconds{1000});
+}
+
+TEST_CASE("server: invalid h2 SETTINGS limits are rejected before binding", "[server][review]") {
+    auto config_with = [](std::uint32_t max_frame_size, std::int32_t initial_window) {
+        ServerConfig cfg = lifecycle_config(0);
+        cfg.plaintext_protocols = PlaintextProtocols::Both;
+        cfg.limits.h2_max_frame_size = max_frame_size;
+        cfg.limits.h2_initial_window = initial_window;
+        return cfg;
+    };
+
+    {
+        Server server{config_with(1024, 65535)}; // below the RFC 9113 §6.5.2 floor of 2^14
+        CHECK_FALSE(server.start().has_value());
+    }
+    {
+        Server server{config_with(1u << 24, 65535)}; // above 2^24-1
+        CHECK_FALSE(server.start().has_value());
+    }
+    {
+        Server server{config_with(16384, -1)}; // negative window
+        CHECK_FALSE(server.start().has_value());
+    }
+    {
+        Server server{config_with(16384, 65535)};
+        auto started = server.start();
+        REQUIRE(started.has_value());
+        server.stop();
+    }
 }
 
 TEST_CASE("client: per-request version overrides the default", "[client][server][review]") {
