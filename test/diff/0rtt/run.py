@@ -18,11 +18,19 @@ whether the request was accepted as early data.
 A rejection case swaps the server for a fresh process (new ticket keys)
 between the two requests; the client must then report
 client_errc::zero_rtt_rejected, not a protocol error.
+
+A dropped-data case runs the quic-go client through a UDP proxy that removes
+every 0-RTT packet. The request is retransmitted at 1-RTT after the handshake,
+so both the C++ and the Go server must report `normal`: `used_0rtt()` follows
+the handshake state at header completion, not the fact that the connection
+once had 0-RTT keys.
 """
 
 from __future__ import annotations
 
 import os
+import select
+import socket
 import subprocess
 import sys
 import threading
@@ -41,6 +49,8 @@ CPP_ENABLED_PORT = 7931
 CPP_DISABLED_PORT = 7932
 GO_DISABLED_PORT = 7933
 CPP_REJECT_PORT = 7934
+CPP_DROP_PROXY_PORT = 7935
+GO_DROP_PROXY_PORT = 7936
 
 
 def run(command: list[str], *, cwd: Path, timeout: int = 60) -> subprocess.CompletedProcess:
@@ -76,6 +86,129 @@ class Server:
         except subprocess.TimeoutExpired:
             self.process.kill()
             self.process.wait(timeout=5)
+
+
+def _quic_varint(data: bytes, pos: int) -> tuple[int, int]:
+    first = data[pos]
+    if first < 0x40:
+        return first, 1
+    if first < 0x80:
+        return int.from_bytes(data[pos:pos + 2], "big") & 0x3FFF, 2
+    if first < 0xC0:
+        return int.from_bytes(data[pos:pos + 4], "big") & 0x3FFFFFFF, 4
+    return int.from_bytes(data[pos:pos + 8], "big") & 0x3FFFFFFFFFFFFFFF, 8
+
+
+class Drops0RttProxy:
+    """UDP proxy that drops QUIC v1 long-header type-1 (0-RTT) packets.
+
+    Initial/Handshake/1-RTT traffic is forwarded, so the connection and the
+    normal retransmission still reach the server; only the early data is lost.
+    """
+
+    VERSION_1 = 0x00000001
+
+    def __init__(self, listen_port: int, upstream_port: int):
+        self.front = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.front.bind(("127.0.0.1", listen_port))
+        self.upstream_addr = ("127.0.0.1", upstream_port)
+        self.back_by_client: dict[tuple[str, int], socket.socket] = {}
+        self.client_by_back: dict[socket.socket, tuple[str, int]] = {}
+        self.dropped = 0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    @classmethod
+    def _split(cls, datagram: bytes) -> list[tuple[int | None, bytes]]:
+        """Splits coalesced long-header packets; an unparsed tail is kept whole
+        with type None."""
+        out: list[tuple[int | None, bytes]] = []
+        off = 0
+        while off < len(datagram):
+            first = datagram[off]
+            if not first & 0x80 or off + 5 > len(datagram):
+                out.append((None, datagram[off:]))
+                break
+            if int.from_bytes(datagram[off + 1:off + 5], "big") != cls.VERSION_1:
+                out.append((None, datagram[off:]))
+                break
+            pos = off + 5
+            try:
+                pos += 1 + datagram[pos]        # DCID length + DCID
+                pos += 1 + datagram[pos]        # SCID length + SCID
+                ptype = (first >> 4) & 0x03
+                if ptype == 0:
+                    token_len, n = _quic_varint(datagram, pos)
+                    pos += n + token_len
+                length, n = _quic_varint(datagram, pos)
+                pos += n
+            except IndexError:
+                out.append((None, datagram[off:]))
+                break
+            end = pos + length
+            if end > len(datagram):
+                out.append((None, datagram[off:]))
+                break
+            out.append((ptype, datagram[off:end]))
+            off = end
+        return out
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            watch = [self.front, *self.back_by_client.values()]
+            try:
+                ready, _, _ = select.select(watch, [], [], 0.1)
+            except (OSError, ValueError):
+                return
+            for sock in ready:
+                if sock is self.front:
+                    data, addr = sock.recvfrom(65535)
+                    back = self.back_by_client.get(addr)
+                    if back is None:
+                        back = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                        back.bind(("127.0.0.1", 0))
+                        self.back_by_client[addr] = back
+                        self.client_by_back[back] = addr
+                    kept = []
+                    for ptype, packet in self._split(data):
+                        if ptype == 1:
+                            self.dropped += 1
+                        else:
+                            kept.append(packet)
+                    if kept:
+                        back.sendto(b"".join(kept), self.upstream_addr)
+                else:
+                    data, _ = sock.recvfrom(65535)
+                    self.front.sendto(data, self.client_by_back[sock])
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2)
+        self.front.close()
+        for sock in self.back_by_client.values():
+            sock.close()
+
+
+def check_dropped_early(label: str, client: Path, upstream_port: int, proxy_port: int) -> bool:
+    """The quic-go client's 0-RTT packets are all dropped; the request reaches
+    the server after the handshake, so used_0rtt() must be false on both
+    implementations."""
+    proxy = Drops0RttProxy(proxy_port, upstream_port)
+    try:
+        result = run([str(client), f"https://127.0.0.1:{proxy_port}/0rtt", "0", "1"],
+                     cwd=ROOT, timeout=60)
+        dropped = proxy.dropped
+    finally:
+        proxy.stop()
+    print(f"--- {label} ---")
+    print(result.stdout, end="")
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr)
+    ok = (result.returncode == 0 and "first=normal" in result.stdout and
+          "second=normal" in result.stdout and dropped > 0)
+    print(f"{label}: {'PASS' if ok else 'FAIL'} (dropped {dropped} 0-RTT packet(s))")
+    return ok
 
 
 def check_cpp_client(name: str, client: Path, url: str, expect_early: bool,
@@ -217,6 +350,18 @@ def main() -> int:
         except (subprocess.TimeoutExpired, RuntimeError) as exc:
             print(f"cpp-client -> cpp-server (rejected ticket): FAIL ({exc})")
             failures += 1
+        # Early packets lost in transit (retransmitted at 1-RTT) must look like
+        # a plain request to C++ and quic-go alike.
+        for label, upstream, proxy_port in (
+            ("go-client -> cpp-server (0-RTT packets dropped)", CPP_ENABLED_PORT, CPP_DROP_PROXY_PORT),
+            ("go-client -> go-server (0-RTT packets dropped)", GO_ENABLED_PORT, GO_DROP_PROXY_PORT),
+        ):
+            try:
+                if not check_dropped_early(label, go_client_bin, upstream, proxy_port):
+                    failures += 1
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                print(f"{label}: FAIL ({exc})")
+                failures += 1
     finally:
         for server in servers:
             server.stop()

@@ -23,7 +23,7 @@
 //     (model A), so there are no locks; the stream handles hop onto it before
 //     touching session state.
 //
-// Only compiled with SIMPLE_HTTP_ENABLE_HTTP3 (see client/http_client.h).
+// Only compiled with SIMPLE_HTTP_ENABLE_HTTP3 (see client/http.h).
 
 #include <nghttp3/nghttp3.h>
 

@@ -12,7 +12,8 @@
 // handler/framework layer (middleware, sessions, JWT/JWKS, extractors), static
 // files, file responses/uploads, the HTTP and WebSocket reverse proxies, the
 // h1/h2 client (including streaming uploads, SSE and decompression) and outbound
-// proxies. HTTP/3/QUIC is not part of this port.
+// proxies. HTTP/3 and QUIC are compiled in when SIMPLE_HTTP_ENABLE_HTTP3 is
+// defined.
 //
 // Deliberate differences from the C++23 implementation:
 //   * no coroutine keywords anywhere except the feature-guarded adapter in

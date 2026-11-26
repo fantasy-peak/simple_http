@@ -11,7 +11,7 @@
 
 | 项 | 当前值 |
 |---|---|
-| 版本 | `0.9.0`（`include/simple_http/core/version.h`） |
+| 版本 | `0.9.1`（`include/simple_http/core/version.h`） |
 | 形态 | 纯头文件；`include/` 下没有 `.cpp` |
 | 入口头 | `#include <simple_http.h>` |
 | 最低标准 | C++17 |
@@ -869,6 +869,8 @@ test/run.sh unit '[h2]'
 - **0rtt**（`test/diff/0rtt/`）：C++ client ↔ quic-go server、quic-go client ↔
   C++ server 两组实现互打，覆盖服务端开启/关闭 0-RTT、客户端开启/关闭 0-RTT；
   开启时断言 `early` / `used_0rtt=1`，关闭时断言回落到 1-RTT 的 `normal`。
+  另有拒绝用例（取票后换新服务进程，要求 `zero_rtt_rejected`）和丢包用例
+  （UDP 代理丢弃所有 type-1 0-RTT 包，C++ 与 quic-go 都必须报 `normal`）。
 - **server-diff**（`test/diff/server/`）：同一个 Go 探针分别打 C++ 与 Go 参考
   服务端（7820–7825 / 7830–7834）。组：`routing`、`body`、`semantics`、
   `middleware`、`framework`、`static`、`ws`、`raw`、`h2raw`、`h3raw`。
@@ -1302,23 +1304,13 @@ test/run.sh server-diff
 
 ### 10.2 当前代码中已过时的注释（改到相关位置时顺手修正）
 
-- `include/simple_http.h` 说 “HTTP/3/QUIC is not part of this port”，但 h3 引擎
-  与 QUIC 监听实际存在（宏门控）。
-- `engine/h2/h2_engine.h` 某处注释说 dispatch 等 END_STREAM；实际在
-  END_HEADERS 后即 dispatch。
-- `client/sse.h` 注释写 `client.async_open_sse(...)`；实际是
-  `SseStream::async_open(client, ...)`。
-- `client/multipart_stream.h` 注释写 `client.async_open_multipart(...)`；
-  实际是 `MultipartStreamWriter::async_open(client, ...)`。
-- `client/h3_client.h` 注释指向不存在的 `client/http_client.h`。
-- `handler/validation.h` 顶部示例用 `std::expected<void, vector<FieldError>>`；
-  实际接口是 `static ValidationResult validate(const T&)`。
-- `openapi/openapi.h` 说 “There is no compile-time on/off switch”；实际整文件在
-  `SIMPLE_HTTP_HAS_GLAZE` 内。
-- `core/compression.h` 说 `EngineLimits` 可以携带 `CompressionConfig`；实际
-  没有该成员。
-- `handler/session.h` 说 save 失败会记录日志；实际代码忽略 error_code。
 - `CMakeLists.txt` 的 `simple_http_cpp17` 目标指向不存在的 `cpp17/include`。
+
+其余曾在 2026-11 之前列在这里的注释——`include/simple_http.h` 的 HTTP/3 说明、
+`h2_engine.h` 的 dispatch 时序、`client/sse.h` / `client/multipart_stream.h`
+的客户端示例、`client/h3_client.h` 的 `http_client.h` 引用、`validation.h` 的
+`std::expected` 示例、`openapi.h` 的“无门控”说明、`compression.h` 的
+`EngineLimits` 表述、`session.h` 的 save 失败日志——已在 2026-11-26 修正。
 
 ---
 

@@ -11,6 +11,7 @@
 
 #include "simple_http.h"
 #include <simple_http/client/h3_session_cache.h>
+#include <simple_http/quic/tls.h>
 
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
 
@@ -60,6 +61,25 @@ TEST_CASE("Request used_0rtt survives a move", "[h3][0rtt]") {
     req.set_used_0rtt(true);
     Request moved(std::move(req));
     CHECK(moved.used_0rtt());
+}
+
+TEST_CASE("incompatible ticket appdata still asks for a fresh ticket", "[h3][0rtt][tls]") {
+    using quic::ticket_return_code;
+
+    // No ticket, or one this process cannot decrypt: full handshake, and the
+    // client still needs a new ticket so it can try 0-RTT again.
+    CHECK(ticket_return_code(SSL_TICKET_EMPTY, false) == SSL_TICKET_RETURN_IGNORE_RENEW);
+    CHECK(ticket_return_code(SSL_TICKET_NO_DECRYPT, false) == SSL_TICKET_RETURN_IGNORE_RENEW);
+
+    // Decryptable but with a stale HTTP/3 SETTINGS snapshot: resumption is
+    // refused, yet the return code must renew. A bare IGNORE would leave the
+    // client replaying the stale ticket until it expires.
+    CHECK(ticket_return_code(SSL_TICKET_SUCCESS, false) == SSL_TICKET_RETURN_IGNORE_RENEW);
+    CHECK(ticket_return_code(SSL_TICKET_SUCCESS_RENEW, false) == SSL_TICKET_RETURN_IGNORE_RENEW);
+
+    // Compatible appdata: resume normally.
+    CHECK(ticket_return_code(SSL_TICKET_SUCCESS, true) == SSL_TICKET_RETURN_USE);
+    CHECK(ticket_return_code(SSL_TICKET_SUCCESS_RENEW, true) == SSL_TICKET_RETURN_USE_RENEW);
 }
 
 TEST_CASE("H3 session cache is single-use and expires", "[h3][0rtt]") {

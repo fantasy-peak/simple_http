@@ -3,7 +3,7 @@
 // CompressionConfig: whether and how the server compresses response bodies.
 //
 // This lives on its own (rather than inside content_encoding.h) so that
-// EngineLimits can carry one without pulling in the codec headers.
+// middleware::compress() can take it without pulling in the codec headers.
 //
 // Compiled in unconditionally; `enabled` is the runtime decision to use it.
 

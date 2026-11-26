@@ -10,8 +10,9 @@
 // and `schema_json<T>()` returns its JSON Schema, which router.h records into
 // the document model (openapi_doc.h).
 //
-// There is no compile-time on/off switch. glaze is a normal dependency of the
-// library (it backs proto/json.h), and documentation is per-route metadata:
+// This header is compiled only when SIMPLE_HTTP_HAS_GLAZE is set (C++23 with
+// glaze available); within it there is no per-route on/off switch. glaze backs
+// proto/json.h, and documentation is per-route metadata:
 // every route may carry an optional `openapi::doc()...` descriptor as its
 // trailing argument (see Operation below), and a route without one is not
 // documented and pays nothing. Collecting is always on, serving is opt-in via
@@ -435,7 +436,7 @@ inline SecurityScheme api_key(std::string name, std::string in = "header") {
 // --- per-route operation descriptor -----------------------------------------
 // A route annotates its OAS operation with a value built here, passed as the
 // optional trailing argument of route(). A route with no descriptor is not
-// documented and pays nothing; there is no compile-time on/off switch and no
+// documented and pays nothing; there is no per-route on/off switch and no
 // template-arity overload set — every setter below reduces its type to runtime
 // data (a schema string, capured field names) at the call site, so the router
 // only ever sees one plain object.

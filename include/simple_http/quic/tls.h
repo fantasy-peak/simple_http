@@ -30,6 +30,17 @@
 
 namespace simple_http::quic {
 
+// Maps OpenSSL's decrypted-ticket verdict to the code we hand back. A ticket
+// whose appdata no longer matches (stale HTTP/3 SETTINGS snapshot) must still
+// be renewed: SSL_TICKET_RETURN_IGNORE would leave the client offering the
+// stale ticket forever. Kept pure so this rule is unit-testable without a TLS
+// handshake.
+constexpr SSL_TICKET_RETURN ticket_return_code(SSL_TICKET_STATUS status, bool appdata_compatible) noexcept {
+    if (status == SSL_TICKET_EMPTY || status == SSL_TICKET_NO_DECRYPT || !appdata_compatible)
+        return SSL_TICKET_RETURN_IGNORE_RENEW;
+    return status == SSL_TICKET_SUCCESS_RENEW ? SSL_TICKET_RETURN_USE_RENEW : SSL_TICKET_RETURN_USE;
+}
+
 // The ALPN token HTTP/3 uses. QUIC mandates ALPN (§8.1), so this is not
 // optional the way it is for TCP: a connection that negotiates nothing is
 // closed with a no_application_protocol alert.
@@ -176,9 +187,8 @@ class QuicTlsContext {
     static SSL_TICKET_RETURN decrypt_ticket(SSL *, SSL_SESSION *session, const unsigned char *, size_t,
                                             SSL_TICKET_STATUS status, void *arg) {
         auto *self = static_cast<QuicTlsContext *>(arg);
-        const bool renew = status == SSL_TICKET_SUCCESS_RENEW;
         if (status == SSL_TICKET_EMPTY || status == SSL_TICKET_NO_DECRYPT)
-            return SSL_TICKET_RETURN_IGNORE_RENEW;
+            return ticket_return_code(status, false);
 
         void *data = nullptr;
         size_t len = 0;
@@ -186,15 +196,7 @@ class QuicTlsContext {
         const bool compatible =
             present && self->m_early.validate_ticket_appdata &&
             self->m_early.validate_ticket_appdata(std::string_view{static_cast<const char *>(data), len});
-        if (!compatible) {
-            // Full handshake, but always ask OpenSSL for a fresh ticket.
-            // SSL_TICKET_RETURN_IGNORE suppresses renewal, so a client that
-            // keeps offering the stale SETTINGS snapshot would never receive a
-            // compatible one and could not use 0-RTT again until the old ticket
-            // expired on its own.
-            return SSL_TICKET_RETURN_IGNORE_RENEW;
-        }
-        return renew ? SSL_TICKET_RETURN_USE_RENEW : SSL_TICKET_RETURN_USE;
+        return ticket_return_code(status, compatible);
     }
 
     static int select_alpn(SSL *, const unsigned char **out, unsigned char *outlen, const unsigned char *in,
