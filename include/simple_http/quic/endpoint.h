@@ -73,17 +73,6 @@ namespace simple_http::quic {
 // the client owned its address at some point, and "some point" has to expire.
 inline constexpr ngtcp2_duration kRetryTokenTimeout = 30 * NGTCP2_SECONDS;
 
-// The receive batch. recvmmsg gathers up to this many datagrams per syscall,
-// which is what keeps the receive side from being one event-loop wake-up per
-// packet; the scratch it reads into is `kRecvBatch * kMaxDatagram` bytes per
-// endpoint. `MSG_WAITFORONE` makes recvmmsg return as soon as one datagram is
-// available rather than waiting for the whole batch, which fits a readiness-
-// driven loop: read what is here, wake again when more arrives.
-#if defined(__linux__)
-inline constexpr std::size_t kRecvBatch = 64;
-inline constexpr std::size_t kRecvScratch = kRecvBatch * kMaxDatagram;
-#endif
-
 // A Connection ID, for the endpoint's routing table.
 //
 // Keyed by its bytes rather than by a std::string: this lookup runs once per
@@ -842,56 +831,10 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
         (void)m_send_wake.try_send(error_code{});
     }
 
-    // One datagram on the wire. With `item.gso_size` set, the payload is a GSO
-    // segment — several QUIC packets the kernel splits into separate datagrams
-    // (UDP_SEGMENT). Returns the number of bytes handed to the kernel, or -1
-    // with errno set.
-    static int raw_send(int fd, const SendItem &item) {
-        if (item.to.size() > sizeof(sockaddr_storage))
-            return -1;
-        sockaddr_storage ss{};
-        std::memcpy(&ss, item.to.data(), item.to.size());
-#if defined(__linux__) && defined(SOL_UDP) && defined(UDP_SEGMENT)
-        iovec iov{const_cast<std::uint8_t *>(item.data.data()), item.data.size()};
-        msghdr mh{};
-        mh.msg_name = &ss;
-        mh.msg_namelen = item.to.size();
-        mh.msg_iov = &iov;
-        mh.msg_iovlen = 1;
-        // The UDP_SEGMENT control message, as a POD with the same layout as
-        // `struct cmsghdr` (len/level/type) plus the segment size. It cannot
-        // embed a real cmsghdr — glibc ends that with a flexible array member,
-        // so it can never be the first member of a wrapper.
-        //
-        // Declared at function scope, not inside the `if`: msg_control points
-        // at it and sendmsg below reads it after the `if` ends, so its lifetime
-        // must cover the call. Scoping it inside the `if` was a genuine
-        // use-after-scope — ASan flagged it outright, and at -O2 it read stale
-        // stack bytes (EINVAL) because the compiler is free to reuse the dead
-        // slot. The `asm` barrier is belt-and-braces against the same class of
-        // -O2 store elision (GCC 16 trunk) and costs nothing.
-        struct cmsg_gso {
-            std::size_t cmsg_len; // cmsghdr: 8-byte len, 4-byte level, 4-byte type
-            int cmsg_level;
-            int cmsg_type;
-            std::uint16_t seg; // the GSO segment size
-        } c{};
-        if (item.gso_size > 0) {
-            c.cmsg_len = CMSG_LEN(sizeof(std::uint16_t));
-            c.cmsg_level = SOL_UDP;
-            c.cmsg_type = UDP_SEGMENT;
-            c.seg = item.gso_size;
-            static_assert(sizeof(c) >= sizeof(cmsghdr) + sizeof(std::uint16_t));
-            mh.msg_control = &c;
-            mh.msg_controllen = sizeof(c);
-        }
-        asm volatile("" : : "r"(&c) : "memory");
-        return static_cast<int>(::sendmsg(fd, &mh, 0));
-#else
-        return static_cast<int>(::sendto(fd, item.data.data(), item.data.size(), 0,
-                                         reinterpret_cast<const sockaddr *>(&ss), item.to.size()));
-#endif
-    }
+    // One datagram on the wire (shared with the HTTP/3 client, see
+    // quic::raw_send_datagram). Returns the number of bytes handed to the
+    // kernel, or -1 with errno set.
+    static int raw_send(int fd, const SendItem &item) { return raw_send_datagram(fd, item); }
 
     void send_loop() {
         auto self = this->shared_from_this();

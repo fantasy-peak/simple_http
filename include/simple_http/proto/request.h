@@ -224,6 +224,16 @@ class Request {
         m_body.finish();
     }
 
+    // Client-side up-front body: keeps the bytes for replay/send but does not
+    // also feed the Body channel. The client transports take `buffered_body()`
+    // directly, so the channel (and its copy) would be dead weight on the
+    // request critical path. A caller that needs to read the body itself must
+    // use set_body() instead.
+    void set_buffered_body(std::string data) {
+        m_body_source = std::move(data);
+        m_content_length = static_cast<std::int64_t>(m_body_source.size());
+    }
+
     // A fresh shared request carrying the same method/target/headers and a re-fed
     // body. `exec` drives the new body's channel. Used by the client when a
     // pooled connection turned out stale before the request was written, or
@@ -263,6 +273,19 @@ class Request {
     // The up-front body's source bytes, for replay (redirect 307/308, pooled
     // retry). Empty when the request has a streamed or no body.
     const std::string &body_source() const { return m_body_source; }
+
+    // The complete up-front body, when `set_body()` or `set_buffered_body()`
+    // supplied it and the declared length matches. Clients use this to submit
+    // the request without first draining the Body channel — an extra
+    // event-loop hop on the request critical path. Directly-fed bodies
+    // (Body::feed) return nullopt and take the channel path.
+    std::optional<std::string_view> buffered_body() const {
+        if (stream_body() || m_content_length < 0 ||
+            m_body_source.size() != static_cast<std::size_t>(m_content_length)) {
+            return std::nullopt;
+        }
+        return std::string_view{m_body_source};
+    }
 
     // HTTP Basic (RFC 7617): sets `Authorization: Basic base64(user:pass)` —
     // the client-side counterpart of middleware::basic_auth. Returns *this for
