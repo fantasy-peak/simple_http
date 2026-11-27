@@ -65,6 +65,14 @@ namespace simple_http {
 // writer(s) it creates.
 using SharedDeadline = std::shared_ptr<std::chrono::steady_clock::time_point>;
 
+// How many unread request-body bytes the server is willing to consume after
+// the handler returns just to keep the connection alive. Matches Go net/http's
+// maxPostHandlerReadBytes (256 KiB, see `net/http/server.go`): a declared
+// Content-Length body with at least this many bytes unread is not drained at
+// all and the response head carries `Connection: close`; a chunked body is
+// drained only until the tolerance is exceeded.
+inline constexpr std::uint64_t kH1DrainLimitBytes = std::uint64_t{256} * 1024;
+
 // ResponseSink for HTTP/1.x. Owns the response framing; the bytes go through
 // one SerializedWriter so the connection never has two writes in flight.
 template <typename Transport>
@@ -80,6 +88,11 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
     void set_head_request(bool head) { m_head_request = head; }
     void set_keep_alive(bool ka) { m_keep_alive_out = ka; }
     bool keep_alive_out() const { return m_keep_alive_out; }
+    // Consulted when the response head is serialized, because only the engine
+    // knows how much of the request body the handler left unread. Go net/http
+    // decides this at the same point (its writeHeader) so that a body it will
+    // not drain still produces `Connection: close` on the wire.
+    void set_body_keep_alive(std::function<bool()> check) { m_body_keep_alive = std::move(check); }
 
     // Sink calls arrive on the connection executor (model A), so they run the
     // enqueue path inline.
@@ -194,7 +207,7 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
         out.append(buf, static_cast<std::size_t>(end - buf));
     }
 
-    void append_headers(std::string &out, const Headers &headers) const {
+    void append_headers(std::string &out, const Headers &headers) {
         bool saw_connection = false;
         for (const auto &[name, value] : headers) {
             if (name == "connection")
@@ -210,11 +223,16 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
             out.append("\r\n");
         }
         if (!saw_connection) {
+            // The body check can only turn keep-alive off: a handler-set
+            // `Connection` header is stripped before this point (hop-by-hop).
+            // Latch the decision so the engine's reuse check agrees with what
+            // the peer was told (the handler may read the body afterwards).
+            m_keep_alive_out = m_keep_alive_out && (!m_body_keep_alive || m_body_keep_alive());
             out.append(m_keep_alive_out ? kKeepAliveConnection : kCloseConnection);
         }
     }
 
-    void build_head(std::string &out, int status, const Headers &headers) const {
+    void build_head(std::string &out, int status, const Headers &headers) {
         out.reserve(kResponseOverhead + headers_bytes_with_alt_svc(headers));
         append_status_line(out, status);
         append_headers(out, headers);
@@ -501,6 +519,9 @@ class Http1ResponseSink final : public ResponseSink, public std::enable_shared_f
     Version m_version;
     bool m_open{true};
     bool m_keep_alive_out{true};
+    // Engine-provided check for whether the still-unread request body allows
+    // keep-alive; see set_body_keep_alive().
+    std::function<bool()> m_body_keep_alive;
     bool m_head_request{false};
     bool m_chunked{false};
     // A final response head has been queued. Interim 1xx must not follow it.
@@ -756,6 +777,17 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
 
         auto writer = std::make_shared<Http1ResponseSink<Transport>>(
             m_transport, version, m_deadline, m_limits.idle_timeout, m_limits.alt_svc_value(), m_continue_sent);
+        // The head is serialized while the handler still owns the body state;
+        // let the sink see whether the remainder can be drained cheaply enough
+        // for the connection to stay alive (Go net/http emits `Connection:
+        // close` at this point too). Weak: the sink may outlive the engine when
+        // a handler keeps the ResponseWriter in request state.
+        auto weak_engine = this->weak_from_this();
+        writer->set_body_keep_alive([weak_engine]() {
+            if (auto engine = weak_engine.lock())
+                return engine->body_allows_keep_alive();
+            return true;
+        });
         m_active_writer = writer;
         writer->set_keep_alive(request_keep_alive && !expect_continue);
         const bool head_request = m_parser.head().method == Method::Head;
@@ -814,7 +846,31 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
             proceed(false);
             return;
         }
+        // Go net/http: a declared Content-Length body with at least
+        // kH1DrainLimitBytes still unread is not read at all. The head already
+        // carried `Connection: close` (body_allows_keep_alive()), so the
+        // connection ends after this response instead of consuming an upload
+        // the handler explicitly ignored.
+        if (m_body_state.mode == BodyState::Mode::Fixed && !m_body_state.done &&
+            m_body_state.remaining >= kH1DrainLimitBytes) {
+            proceed(false);
+            return;
+        }
         drain_body(std::move(proceed));
+    }
+
+    // Consulted by the response sink while it serializes the head. A fixed
+    // length body with fewer than kH1DrainLimitBytes left will be drained
+    // cheaply (and can keep the connection); a chunked body has no size to
+    // consult yet, so it stays keep-alive here and is closed later if the drain
+    // exceeds the tolerance. That last case cannot add the header (the bytes
+    // are already on the wire), unlike Go, which drains before the head.
+    bool body_allows_keep_alive() const {
+        if (m_body_state.done)
+            return true;
+        if (m_body_state.mode != BodyState::Mode::Fixed)
+            return true;
+        return m_body_state.remaining < kH1DrainLimitBytes;
     }
 
     // --- body framing --------------------------------------------------------
@@ -1167,13 +1223,26 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
     // chunked body can overflow it). Yield to the executor periodically.
     static constexpr std::size_t kDrainYieldAfter = 32;
 
-    void drain_body(std::function<void(bool)> done, std::size_t budget = kDrainYieldAfter) {
+    // Bytes consumed so far by the post-handler drain, capped like Go net/http:
+    // more than kH1DrainLimitBytes means the connection is closed instead of
+    // reading an upload the handler ignored. (Fixed-length bodies with at least
+    // the tolerance unread are rejected before the drain even starts.)
+    struct DrainBudget {
+        std::uint64_t consumed{0};
+    };
+
+    void drain_body(std::function<void(bool)> done) {
+        drain_body_step(std::move(done), std::make_shared<DrainBudget>(), kDrainYieldAfter);
+    }
+
+    void drain_body_step(std::function<void(bool)> done, std::shared_ptr<DrainBudget> budget, std::size_t yield) {
         if (m_body_state.done) {
             done(!m_body_state.error);
             return;
         }
         auto self = this->shared_from_this();
-        pull_body_chunk([self, done = std::move(done), budget](error_code ec, ReadResult r) mutable {
+        pull_body_chunk([self, done = std::move(done), budget, yield](error_code ec, ReadResult r) mutable {
+            budget->consumed += r.data.size();
             if (ec) {
                 done(false);
                 return;
@@ -1182,12 +1251,20 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
                 done(!self->m_body_state.error);
                 return;
             }
-            if (budget == 0) {
-                asio::post(self->m_executor,
-                           [self, done = std::move(done)]() mutable { self->drain_body(std::move(done)); });
+            if (budget->consumed > kH1DrainLimitBytes) {
+                // A chunked body had no declared size when its response head
+                // was written, so the head could not say "close"; stop reading
+                // now and let after_handler() end the connection.
+                done(false);
                 return;
             }
-            self->drain_body(std::move(done), budget - 1);
+            if (yield == 0) {
+                asio::post(self->m_executor, [self, done = std::move(done), budget]() mutable {
+                    self->drain_body_step(std::move(done), budget, kDrainYieldAfter);
+                });
+                return;
+            }
+            self->drain_body_step(std::move(done), budget, yield - 1);
         });
     }
 

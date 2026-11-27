@@ -656,7 +656,11 @@ server.serve_swagger_ui("/swagger", "/openapi.json");
   不支持的 transfer coding（501）、重复 chunked。
 - `Expect: 100-continue` 仅 HTTP/1.1；惰性发、最多一次；最终响应已开始时不再发 100。
 - 请求 trailers：chunked 终止符 `0\r\n<fields>\r\n`；每个消息重置 trailer 字节预算。
-- body 用 pull provider；handler 返回后 drain 未读 body 以复用连接。
+- body 用 pull provider；handler 返回后 drain 未读 body 以复用连接。drain 上限
+  对齐 Go `net/http` 的 `maxPostHandlerReadBytes`（256 KiB，`kH1DrainLimitBytes`）：
+  定长 body 还剩 ≥ 256 KiB 时不 drain，响应头带 `Connection: close`；chunked 只在
+  累计读过 256 KiB 后仍有剩余时停止并关闭（此时响应头已发出，无法再补
+  `Connection: close`）。
 - 升级：WebSocket、h2c Upgrade（101 后把原请求重放为 stream 1）。
 - h1 的响应字节和 WebSocket 101 都经每连接一个 `SerializedWriter`。
 
@@ -1259,6 +1263,16 @@ test/run.sh server-diff
     参数集存在但缺 required 项时仍走 `fail(rv)` 得到 0x08。
     `quic/tls.h`、`quic/connection.h`；h3spec TLS 8.2 / Transport 7.3。
 
+58. **h1 handler 不读 body 时的 drain 上限 = 256 KiB（与 Go 一致）**：handler
+    返回后只为复用连接而读的 body 受 `kH1DrainLimitBytes` 约束。定长 body
+    剩余 ≥ 256 KiB 时不读，响应头由 sink 在序列化时通过
+    `body_allows_keep_alive()` 决定为 `Connection: close`；chunked 累计超过
+    256 KiB 后停止并关闭连接。阈值是 `>=`（Go 的 `unreadDataSizeLocked() >=
+    maxPostHandlerReadBytes`）。`Expect: 100-continue` 且 body 未开始时仍直接
+    关闭、不 drain。`h1_engine.h` 的 `after_handler` / `drain_body_step` /
+    `body_allows_keep_alive`；`test/unit/test_h1_body.cpp` 的 drain 用例；
+    `test/diff/server` 的 `raw.drain_*`。
+
 ---
 
 ## 10. 已知限制与「注释过时」清单
@@ -1275,6 +1289,10 @@ test/run.sh server-diff
 - 客户端没有传统连接池；只缓存一个 origin 的连接。
 - 客户端 `Response::text()` 与 `bytes()` 相同。
 - h1 客户端没有独立 idle timeout；h2 用 `ClientConfig::idle_timeout`。
+- h1 服务端对 chunked 请求的 drain 上限在响应头发出之后才判定：超出 256 KiB
+  时连接会关闭，但响应头已无法补 `Connection: close`（Go 在写头之前 drain，
+  可以补）。定长 body 的头部行为与 Go 一致。差额只体现在该响应头上，
+  `raw.drain_chunked_over` 因此只比较连接是否复用、不比较 `Connection`。
 - HTTP/3 客户端不支持代理、请求 trailers、1xx；服务端不支持 WS、request
   trailers、100-continue、push。0-RTT 无重放保护，被拒绝的早期请求不自动重试；
   `tls.shared_context` 下客户端 0-RTT 不可用；服务端票据不跨进程重启。
