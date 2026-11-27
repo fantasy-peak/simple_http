@@ -498,6 +498,11 @@ req->body().async_read_all(token);  // void(error_code, std::string)
 返回 false 时参数保持原样，调用方可重试；`finish()` / `fail()` 不可丢，
 channel 满时用 out-of-band pending 状态。
 
+客户端 buffered send 的 up-front body 走 `Request::set_buffered_body()` /
+`buffered_body()`：字节留在 `m_body_source` 里直接提交，不再建 Body channel，
+也不再多拷一份。只有 `Body::feed()` 直接喂入的请求才回退到 channel 读取；三种
+客户端的请求路径都必须先检查 `buffered_body()`，否则会等一个永远不会结束的 body。
+
 响应：
 
 ```cpp
@@ -704,6 +709,10 @@ server.serve_swagger_ui("/swagger", "/openapi.json");
   `Request::used_0rtt()`（与 quic-go 的 `r.TLS.HandshakeComplete` 一致）；早期数据
   丢失后在 1-RTT 重传的请求报 `false`。
 - 客户端不支持代理、请求 trailers、1xx。
+- 客户端发送复用服务端的 GSO 路径：`kPacketsPerFlush` 聚合 + `PADDING`，
+  `QuicClientUdp::sink()` 同步 `sendmsg + UDP_SEGMENT`（仅 `EAGAIN` 回退异步）；
+  接收用 `async_wait + recvmmsg`。sink 必须在返回前消费掉 `SendItem` 的字节，
+  因为连接复用了唯一的 `m_flush_scratch`。
 - 服务端可 Alt-Svc 通告；QUIC 缺 `quic_transport_parameters` 时按 RFC 9001
   §8.2 关闭（`CONNECTION_CLOSE 0x016d`）。
 
@@ -1277,6 +1286,17 @@ test/run.sh server-diff
     `body_allows_keep_alive()` 返回 false，响应头不会再写 keep-alive。
     `h1_engine.h` 的 `after_handler` / `drain_body_step` / `body_allows_keep_alive`；
     `test/unit/test_h1_body.cpp` 的 drain 用例；`test/diff/server` 的 `raw.drain_*`。
+
+59. **h3 客户端 sink 必须同步消费聚合缓冲**：`QuicConnection::flush_writes()` 在
+    客户端复用 `m_flush_scratch`，`QuicClientUdp::sink()` 在返回前用
+    `sendmsg + UDP_SEGMENT` 把字节交给内核（`EAGAIN` 时才拆包异步发送）。把 sink
+    改成持有缓冲区的异步发送会让下一次 flush 覆盖仍在途的字节；服务端角色仍然每
+    flush 分配 `owned`，不受影响。`quic/connection.h`、`client/h3_client.h`。
+
+60. **buffered send 可以 move 走 stream 的 head**：便利客户端用
+    `async_read_final_head_bounded(..., take=true)` 走 `async_read_head_take()`，
+    完成后 stream 的 head 缓存为空；公共 `Stream::async_read_head()` 仍必须保留
+    head，不能改为 take。`client/client_stream.h`、`client/http.h`。
 
 ---
 

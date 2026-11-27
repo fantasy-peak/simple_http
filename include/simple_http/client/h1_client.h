@@ -269,6 +269,31 @@ class Http1ClientSession final : public ClientSession,
         }
         if (!m_spec->stream_body()) {
             auto self = this->shared_from_this();
+            if (auto buffered = m_spec->buffered_body()) {
+                // The up-front body is already owned: write it in this turn.
+                std::string out = head;
+                if (!buffered->empty()) {
+                    if (self->m_request_chunked) {
+                        out += encode_chunk(std::string{*buffered});
+                        out += "0\r\n\r\n";
+                    } else {
+                        out.append(buffered->data(), buffered->size());
+                    }
+                }
+                auto bytes = std::make_shared<std::string>(std::move(out));
+                self->m_transport->async_write(
+                    ConstByteSpan{reinterpret_cast<const std::byte *>(bytes->data()), bytes->size()},
+                    asio::bind_cancellation_slot(caller_slot, [self, stream, bytes, done = std::move(done)](
+                                                                  error_code wec, std::size_t) mutable {
+                        if (wec) {
+                            self->fail_exchange(wec);
+                            std::move(done)(wec, nullptr);
+                            return;
+                        }
+                        std::move(done)(error_code{}, stream);
+                    }));
+                return;
+            }
             m_spec->body().async_read_all(asio::bind_cancellation_slot(
                 caller_slot, [self, stream, head = std::move(head), caller_slot,
                               done = std::move(done)](error_code ec, std::string body) mutable {

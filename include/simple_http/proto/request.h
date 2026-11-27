@@ -249,7 +249,9 @@ class Request {
         // Middleware-installed marks (notably AutoDecompressMark) are part of
         // the request's meaning: dropping them makes the replay treat a body
         // the client itself negotiated as gzip as opaque compressed bytes.
-        copy->m_state = m_state;
+        if (m_state) {
+            copy->m_state = std::make_unique<std::deque<std::any>>(*m_state);
+        }
         copy->m_close = m_close;
         copy->m_stream_body = m_stream_body;
         // A replay is a new 1-RTT exchange, never early data; the opt-in that
@@ -333,11 +335,19 @@ class Request {
     // `get_state<T>()` finds the value most recently set *as T*: last set wins.
     // The type must match exactly — `set_state<std::string>("x")` is not found
     // by `get_state<std::string_view>()`.
-    template <typename T> void set_state(T value) { m_state.push_back(std::any{std::move(value)}); }
+    template <typename T> void set_state(T value) {
+        if (!m_state) {
+            m_state = std::make_unique<std::deque<std::any>>();
+        }
+        m_state->push_back(std::any{std::move(value)});
+    }
 
     // The value most recently set as T, or nullptr if none was.
     template <typename T> T *get_state() {
-        for (auto it = m_state.rbegin(); it != m_state.rend(); ++it) {
+        if (!m_state) {
+            return nullptr;
+        }
+        for (auto it = m_state->rbegin(); it != m_state->rend(); ++it) {
             if (auto *p = std::any_cast<T>(&*it)) {
                 return p;
             }
@@ -345,7 +355,10 @@ class Request {
         return nullptr;
     }
     template <typename T> const T *get_state() const {
-        for (auto it = m_state.rbegin(); it != m_state.rend(); ++it) {
+        if (!m_state) {
+            return nullptr;
+        }
+        for (auto it = m_state->rbegin(); it != m_state->rend(); ++it) {
             if (auto *p = std::any_cast<T>(&*it)) {
                 return p;
             }
@@ -669,7 +682,10 @@ class Request {
     // references into these elements, and middleware chains keep setting more
     // state after taking them. `deque::push_back` does not move existing
     // elements, so those pointers stay valid for the request's lifetime.
-    std::deque<std::any> m_state;
+    // Lazily allocated: the client's buffered requests never set state, and a
+    // default deque allocates its node map in the constructor. unique_ptr
+    // keeps the deque's stable-address guarantee for get_state().
+    std::unique_ptr<std::deque<std::any>> m_state;
 
     // Request-scoped cancellation (see cancel()/cancellation_slot() above).
     // Shared so a cross-thread cancel can post an emission that outlives the

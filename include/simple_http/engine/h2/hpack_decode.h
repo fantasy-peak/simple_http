@@ -111,6 +111,10 @@ class HpackDecoder {
     // Resolves a table index (1-based) to a name/value pair. Index into the
     // static table if < 62, otherwise into the dynamic table.
     bool resolve_index(uint64_t index, std::string &name, std::string &value) const;
+    // Name-only form, for a literal field whose name is indexed and whose value
+    // follows on the wire. Resolving the value too would copy a string the
+    // caller immediately discards.
+    bool resolve_index_name(uint64_t index, std::string &name) const;
 
     void dynamic_insert(std::string name, std::string value);
 
@@ -237,6 +241,26 @@ inline bool HpackDecoder::resolve_index(uint64_t index, std::string &name, std::
     return false;
 }
 
+inline bool HpackDecoder::resolve_index_name(uint64_t index, std::string &name) const {
+    if (index == 0) {
+        return false;
+    }
+    if (index <= detail::kStaticTableCount) {
+        name = http2_header_static_table[index].key;
+        return true;
+    }
+    uint64_t dyn = index - detail::kStaticTableCount - 1; // 0-based into dynamic table
+    uint64_t j = 0;
+    for (const auto &entry : m_dynamic) {
+        if (j == dyn) {
+            name = entry.first;
+            return true;
+        }
+        j++;
+    }
+    return false;
+}
+
 inline void HpackDecoder::dynamic_insert(std::string name, std::string value) {
     // RFC 7541 §4.1: an entry costs 32 bytes plus the name and value lengths.
     const std::size_t entry_size = name.size() + value.size() + 32;
@@ -327,8 +351,7 @@ inline bool HpackDecoder::decode(std::string_view block, std::vector<HpackHeader
                 return false;
             std::string name, value;
             if (index != 0) {
-                std::string dummy;
-                if (!resolve_index(index, name, dummy)) {
+                if (!resolve_index_name(index, name)) {
                     m_error = 40151;
                     return false;
                 }
