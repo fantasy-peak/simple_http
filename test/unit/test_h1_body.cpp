@@ -363,3 +363,16 @@ TEST_CASE("h1/engine: a body the handler read is reusable above the drain limit"
     REQUIRE(out.completed);
     CHECK(out.dispatched == 2);
 }
+
+TEST_CASE("h1/engine: a body that failed to parse is not advertised as keep-alive", "[h1]") {
+    // The handler reads the body, hits a malformed chunk size, and still answers.
+    // The engine is going to close the connection, so the head must say close
+    // rather than keep-alive.
+    const std::string request =
+        "POST /a HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nZZ\r\nabcd\r\n0\r\n\r\n";
+    const auto out = run_without_reading(request, /*read_body=*/true);
+    REQUIRE(out.completed);
+    CHECK(out.dispatched == 1);
+    CHECK(out.response.find("connection: close") != std::string::npos);
+    CHECK(out.closed);
+}

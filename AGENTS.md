@@ -660,7 +660,9 @@ server.serve_swagger_ui("/swagger", "/openapi.json");
   对齐 Go `net/http` 的 `maxPostHandlerReadBytes`（256 KiB，`kH1DrainLimitBytes`）：
   定长 body 还剩 ≥ 256 KiB 时不 drain，响应头带 `Connection: close`；chunked 只在
   累计读过 256 KiB 后仍有剩余时停止并关闭（此时响应头已发出，无法再补
-  `Connection: close`）。
+  `Connection: close`）。连接本就不会复用时（handler 失败、请求/响应已决定
+  close、body 读取出错导致 `body_allows_keep_alive()` 为 false）直接跳过 drain，
+  避免对端中途停发时占用连接直到 `idle_timeout`。
 - 升级：WebSocket、h2c Upgrade（101 后把原请求重放为 stream 1）。
 - h1 的响应字节和 WebSocket 101 都经每连接一个 `SerializedWriter`。
 
@@ -1269,9 +1271,12 @@ test/run.sh server-diff
     `body_allows_keep_alive()` 决定为 `Connection: close`；chunked 累计超过
     256 KiB 后停止并关闭连接。阈值是 `>=`（Go 的 `unreadDataSizeLocked() >=
     maxPostHandlerReadBytes`）。`Expect: 100-continue` 且 body 未开始时仍直接
-    关闭、不 drain。`h1_engine.h` 的 `after_handler` / `drain_body_step` /
-    `body_allows_keep_alive`；`test/unit/test_h1_body.cpp` 的 drain 用例；
-    `test/diff/server` 的 `raw.drain_*`。
+    关闭、不 drain。连接本就不会复用时（handler 失败 / 请求或响应已决定 close /
+    body 读到错误导致 `body_allows_keep_alive()` 为 false）也直接跳过 drain，
+    否则对端中途停发会占住连接直到 `idle_timeout`；body 读取出错后
+    `body_allows_keep_alive()` 返回 false，响应头不会再写 keep-alive。
+    `h1_engine.h` 的 `after_handler` / `drain_body_step` / `body_allows_keep_alive`；
+    `test/unit/test_h1_body.cpp` 的 drain 用例；`test/diff/server` 的 `raw.drain_*`。
 
 ---
 

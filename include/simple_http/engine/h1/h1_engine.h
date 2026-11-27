@@ -856,6 +856,15 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
             proceed(false);
             return;
         }
+        // The connection cannot be reused anyway (handler failed, the peer asked
+        // to close, or the response head already said "close"). Reading the rest
+        // of the body only to discard it would hold the connection - up to
+        // idle_timeout - if the peer stops mid-body. Go's closeAfterReply skips
+        // the drain for the same reason.
+        if (handler_failed || !writer->keep_alive_out()) {
+            proceed(false);
+            return;
+        }
         drain_body(std::move(proceed));
     }
 
@@ -866,8 +875,11 @@ template <typename Transport> class Http1Engine : public std::enable_shared_from
     // exceeds the tolerance. That last case cannot add the header (the bytes
     // are already on the wire), unlike Go, which drains before the head.
     bool body_allows_keep_alive() const {
+        // A body that ended in an error poisons the connection: the engine will
+        // close it, so the head must not promise keep-alive even though the
+        // handler may still answer (e.g. after a chunked framing error).
         if (m_body_state.done)
-            return true;
+            return !m_body_state.error;
         if (m_body_state.mode != BodyState::Mode::Fixed)
             return true;
         return m_body_state.remaining < kH1DrainLimitBytes;
