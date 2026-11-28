@@ -195,13 +195,28 @@ inline constexpr std::uint32_t kQuicVersion1 = 0x00000001;
 // peer's advertised limit or our own `max_udp_payload_size`.
 inline constexpr std::size_t kMaxDatagram = 1500;
 
+// The datagram size a connection must be prepared to *receive*. QUIC lets a peer
+// send up to the `max_udp_payload_size` we advertise, so the receive buffer has
+// to follow the configured value (capped at what a UDP length field can carry)
+// rather than assume kMaxDatagram. The send side uses the same value, so a
+// connection never buffers less than it may put on the wire. Using
+// kMaxDatagram alone here was a real mismatch: a client configured for a jumbo
+// payload advertised it to the peer and then truncated the reply in recvmmsg.
+// (kMaxDatagram stays the floor: 1500 is still what the default configurations
+// need, and shrinking the buffer below it would only save memory nobody is
+// short of.)
+constexpr std::size_t max_datagram_size(std::uint64_t configured) noexcept {
+    const std::uint64_t capped = std::min<std::uint64_t>(std::max<std::uint64_t>(kMaxDatagram, configured), 65535);
+    return static_cast<std::size_t>(capped);
+}
+
 // The receive batch. recvmmsg gathers up to this many datagrams per syscall,
 // which is what keeps the receive side from being one event-loop wake-up per
-// packet; the scratch it reads into is `kRecvBatch * kMaxDatagram` bytes per
-// endpoint/connection. Shared by the server endpoint and the HTTP/3 client.
+// packet; the scratch it reads into is `kRecvBatch * max_datagram_size(...)`
+// bytes per endpoint/connection. Shared by the server endpoint and the HTTP/3
+// client.
 #if defined(__linux__)
 inline constexpr std::size_t kRecvBatch = 64;
-inline constexpr std::size_t kRecvScratch = kRecvBatch * kMaxDatagram;
 #endif
 
 // How many packets the send loop packs into one UDP datagram. Each packet in a
@@ -1398,10 +1413,8 @@ template <typename Executor> bool QuicConnection<Executor>::flush_writes() {
         // shaping ceiling (see make_ngtcp2_params). Allocating kMaxDatagram
         // per segment would let it write past the buffer whenever the
         // configured payload is larger than the default datagram size.
-        // 65535 is the largest value a UDP length field can represent.
         const auto configured_payload = static_cast<std::size_t>(m_config.max_udp_payload_size);
-        const std::size_t max_datagram =
-            std::min<std::size_t>(std::max<std::size_t>(kMaxDatagram, configured_payload), 65535);
+        const std::size_t max_datagram = max_datagram_size(configured_payload);
         const std::size_t needed = max_datagram * packets_per_flush;
         std::vector<std::uint8_t> owned;
         std::uint8_t *buf = nullptr;

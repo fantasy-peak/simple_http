@@ -711,8 +711,12 @@ server.serve_swagger_ui("/swagger", "/openapi.json");
 - 客户端不支持代理、请求 trailers、1xx。
 - 客户端发送复用服务端的 GSO 路径：`kPacketsPerFlush` 聚合 + `PADDING`，
   `QuicClientUdp::sink()` 同步 `sendmsg + UDP_SEGMENT`（仅 `EAGAIN` 回退异步）；
-  接收用 `async_wait + recvmmsg`。sink 必须在返回前消费掉 `SendItem` 的字节，
-  因为连接复用了唯一的 `m_flush_scratch`。
+  接收用 `async_wait + recvmmsg`。`flush_writes()` 在客户端把聚合缓冲拷进
+  `SendItem`，所以 sink 不需要在返回前消费字节；sink 仍保持同步是为了避免每个
+  datagram 一个异步操作。
+- QUIC 收发缓冲必须按 `max_udp_payload_size` 定尺寸（`quic::max_datagram_size`，
+  上限 65535），不能用固定的 `kMaxDatagram`：对端可以按我们通告的值发更大的包，
+  固定 1500 会把它截断。
 - 服务端可 Alt-Svc 通告；QUIC 缺 `quic_transport_parameters` 时按 RFC 9001
   §8.2 关闭（`CONNECTION_CLOSE 0x016d`）。
 
@@ -1249,8 +1253,12 @@ test/run.sh server-diff
     `async_open_websocket` 和 `Stream::read_head_with` / `read_with` 把 caller slot
     转发给内层 dial/read；`HopState`/`HopCancel::abort_transport` 让
     DNS/dial/TLS 阶段可被 timer 中止。完成必须 post 回调用方 executor，不能在
-    emit 内销毁 cancellation_state。`client/http.h`、`client/h1_client.h`；
-    `test/unit/test_client_units.cpp` 的 `[client][cancel]`。
+    emit 内销毁 cancellation_state。把一次 read 拆成「先等 response head、再读
+    body」的实现（h2/h3）也必须把 caller slot 绑到 head 等待上，否则 read 在等头
+    阶段不可取消，只能等连接 idle timeout。`client/http.h`、`client/h1_client.h`、
+    `client/h2_client.h`、`client/h3_client.h`；`test/unit/test_client_units.cpp`
+    的 `[client][cancel]` 与 `test/unit/test_review_regressions.cpp` 的 parked
+    head/body / 等头取消用例。
 55. **取消适配器统一入口**：改变 completion handler 形状只能用
     `forward_cancel_slot()`；自定义槽处理器用 `install_cancel_handler()` /
     `SlotGuard`；从取消处理器完成调用方用 `post_cancelled()`。禁止把
@@ -1287,11 +1295,13 @@ test/run.sh server-diff
     `h1_engine.h` 的 `after_handler` / `drain_body_step` / `body_allows_keep_alive`；
     `test/unit/test_h1_body.cpp` 的 drain 用例；`test/diff/server` 的 `raw.drain_*`。
 
-59. **h3 客户端 sink 必须同步消费聚合缓冲**：`QuicConnection::flush_writes()` 在
-    客户端复用 `m_flush_scratch`，`QuicClientUdp::sink()` 在返回前用
-    `sendmsg + UDP_SEGMENT` 把字节交给内核（`EAGAIN` 时才拆包异步发送）。把 sink
-    改成持有缓冲区的异步发送会让下一次 flush 覆盖仍在途的字节；服务端角色仍然每
-    flush 分配 `owned`，不受影响。`quic/connection.h`、`client/h3_client.h`。
+59. **h3 客户端 sink 同步消费聚合缓冲**：`QuicConnection::flush_writes()` 在
+    客户端复用 `m_flush_scratch` 并把这一段拷进 `SendItem`，所以 sink 拿到的是
+    自有字节；`QuicClientUdp::sink()` 在返回前用 `sendmsg + UDP_SEGMENT` 把它交给
+    内核（`EAGAIN` 时才拆包异步发送）。同步发送是性能选择（每个 datagram 少了
+    shared_ptr + 异步操作），不是正确性要求；若去掉那份拷贝，sink 就必须重新
+    变回同步消费。服务端角色仍然每 flush 分配 `owned`。`quic/connection.h`、
+    `client/h3_client.h`。
 
 60. **buffered send 可以 move 走 stream 的 head**：便利客户端用
     `async_read_final_head_bounded(..., take=true)` 走 `async_read_head_take()`，

@@ -259,7 +259,11 @@ class Request {
         // rejected early request keeps its intent.
         copy->m_allow_0rtt = m_allow_0rtt;
         if (!m_body_source.empty()) {
-            copy->set_body(m_body_source);
+            // set_body() would also copy the bytes into the Body channel, which
+            // every client path now skips in favour of buffered_body(). Keep the
+            // source only: one copy instead of two, and no channel node for a
+            // replay that is written straight from m_body_source.
+            copy->set_buffered_body(m_body_source);
         }
         return copy;
     }

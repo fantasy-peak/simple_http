@@ -51,6 +51,7 @@
 
 #include "../core/asio_compat.h"
 #include "../core/base64.h"
+#include "../core/cancel.h" // cancel_slot_of / forward_cancel_slot
 #include "../core/compat.h"
 #include "../core/http_field.h" // is_connection_specific_field
 #include "../core/http_method.h"
@@ -188,6 +189,7 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
         });
     }
 
+  private:
     void open_stream_impl(std::shared_ptr<Request> request, OpenCompletion done) {
         if (m_goaway_received) {
             std::move(done)(make_error_code(client_errc::goaway), nullptr);
@@ -446,9 +448,12 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
             auto it = self->m_streams.find(id);
             if (it == self->m_streams.end())
                 return;
-            // RST_STREAM: only this stream dies; the connection lives on. A
-            // stream whose HEADERS never reached the wire is still idle there;
-            // resetting it would be a protocol error.
+            // RST_STREAM: only this stream dies; the connection lives on.
+            // `headers_sent` means the HEADERS block was appended to m_out, not
+            // that it is on the wire; an appended block is written before the
+            // RST (same buffer), so the peer will have seen the stream open. A
+            // stream still waiting for its body has never been appended and is
+            // idle on the wire: resetting that one would be a protocol error.
             if (it->second.headers_sent) {
                 self->send_rst_stream(id, codec::H2_CANCEL);
             }
@@ -516,13 +521,19 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
         }
         if (!it->second.head_seen) {
             auto self = this->shared_from_this();
-            await_head_impl(id, [self, id, done = std::move(done)](error_code ec) mutable {
+            // The head wait is part of the caller's read: forward its slot, or
+            // a per-read deadline cannot abort while the response head is still
+            // outstanding (the read would hang until the connection idle
+            // timeout). Sampled before `done` is moved.
+            auto slot = cancel_slot_of(done);
+            auto resume = [self, id, done = std::move(done)](error_code ec) mutable {
                 if (ec) {
                     std::move(done)(ec, ReadResult{});
                     return;
                 }
                 self->stream_read_impl(id, std::move(done));
-            });
+            };
+            await_head_impl(id, WriteCompletion(forward_cancel_slot(slot, std::move(resume))));
             return;
         }
         it = m_streams.find(id);
@@ -1948,6 +1959,8 @@ class Http2ClientSession final : public MultiplexedClientSession<Http2ClientSess
         auto it = m_streams.find(id);
         if (it == m_streams.end())
             return;
+        // Same rule as stream_cancel(): RST_STREAM is only legal once the
+        // HEADERS block has been appended (the peer knows the stream exists).
         if (it->second.headers_sent) {
             send_rst_stream(id, error);
         }

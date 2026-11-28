@@ -336,26 +336,37 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
     // --- datagram in -------------------------------------------------------
 
     struct RecvState {
+        // `datagram_size` follows the max_udp_payload_size this endpoint
+        // advertises: the peer may send up to it, so a fixed kMaxDatagram slot
+        // would truncate larger datagrams.
+        explicit RecvState(std::size_t datagram_size) : datagram_size(datagram_size) {
 #if defined(__linux__)
-        // One large scratch the batch reads into (reused across calls: every
-        // datagram is consumed synchronously and copied where it needs to live,
-        // so nothing references it after the batch is processed).
-        std::vector<std::uint8_t> scratch = std::vector<std::uint8_t>(static_cast<std::size_t>(kRecvScratch));
+            // One large scratch the batch reads into (reused across calls: every
+            // datagram is consumed synchronously and copied where it needs to
+            // live, so nothing references it after the batch is processed).
+            scratch.resize(kRecvBatch * datagram_size);
+#else
+            buffer.resize(datagram_size);
+#endif
+        }
+        std::size_t datagram_size;
+#if defined(__linux__)
+        std::vector<std::uint8_t> scratch;
         std::array<asio::ip::udp::endpoint, kRecvBatch> from{};
         std::array<iovec, kRecvBatch> iov{};
         std::array<mmsghdr, kRecvBatch> msgs{};
 #else
-        std::vector<std::uint8_t> buffer = std::vector<std::uint8_t>(static_cast<std::size_t>(kMaxDatagram));
+        std::vector<std::uint8_t> buffer;
         asio::ip::udp::endpoint remote{};
 #endif
     };
 
     void receive_loop() {
-        auto state = std::make_shared<RecvState>();
+        auto state = std::make_shared<RecvState>(max_datagram_size(m_config.connection.max_udp_payload_size));
 #if defined(__linux__)
         for (std::size_t i = 0; i < kRecvBatch; ++i) {
-            state->iov[i].iov_base = state->scratch.data() + i * kMaxDatagram;
-            state->iov[i].iov_len = kMaxDatagram;
+            state->iov[i].iov_base = state->scratch.data() + (i * state->datagram_size);
+            state->iov[i].iov_len = state->datagram_size;
             state->msgs[i].msg_hdr.msg_iov = &state->iov[i];
             state->msgs[i].msg_hdr.msg_iovlen = 1;
             state->msgs[i].msg_hdr.msg_name = state->from[i].data();
@@ -392,7 +403,8 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
                         continue;
                     state->from[i].resize(state->msgs[i].msg_hdr.msg_namelen);
                     self->handle_datagram(
-                        span<const std::uint8_t>{state->scratch.data() + static_cast<std::size_t>(i) * kMaxDatagram,
+                        span<const std::uint8_t>{state->scratch.data() +
+                                                     (static_cast<std::size_t>(i) * state->datagram_size),
                                                  static_cast<std::size_t>(state->msgs[i].msg_len)},
                         state->from[i]);
                 }
