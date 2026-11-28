@@ -6,9 +6,12 @@
 // so each malformed shape must fail closed.
 
 #include <catch2/catch_test_macros.hpp>
+#include <charconv>
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "simple_http.h"
 #include "test_support.h"
@@ -235,4 +238,141 @@ TEST_CASE("h1/body: Transfer-Encoding must be a single final chunked coding", "[
     frames("Transfer-Encoding: gzip\r\n", 501);
     // Repeated chunked.
     frames("Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n", 400);
+}
+
+// --- post-handler drain limit (Go net/http maxPostHandlerReadBytes) ---------
+//
+// A handler that ignores the body used to make the server consume up to
+// max_body_bytes (64 MiB by default, unbounded when that limit is disabled)
+// just so the connection could be reused. Go net/http caps that at 256 KiB and
+// answers with `Connection: close` instead; these cases pin the same policy.
+
+namespace {
+
+struct DrainOutcome {
+    bool completed{false};
+    int dispatched{0};
+    std::string response;
+    bool closed{false};
+
+    // Whether a follow-up request queued on the same connection was served.
+    bool reused() const { return dispatched > 1; }
+};
+
+DrainOutcome run_without_reading(std::string request, bool read_body = false) {
+    asio::io_context ctx;
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    transport->push(std::move(request));
+
+    DrainOutcome out;
+    auto dispatcher = [&out, read_body](std::shared_ptr<Request> req, std::shared_ptr<ResponseWriter> res,
+                                        SslHandle) -> asio::awaitable<void> {
+        ++out.dispatched;
+        if (read_body) {
+            (void)co_await body_read_all(req->body());
+        }
+        co_await res->status(status::ok).async_send("ok", asio::use_awaitable);
+    };
+    auto engine = std::make_shared<Http1Engine<MockTransport>>(transport);
+    out.completed = run_on(ctx, run_engine(*engine, dispatcher));
+    out.response = transport->written();
+    out.closed = transport->closed();
+    return out;
+}
+
+constexpr std::size_t kDrainCap = static_cast<std::size_t>(kH1DrainLimitBytes);
+
+std::string fixed_request(std::size_t declared, std::string bytes = {}) {
+    return "POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: " + std::to_string(declared) + "\r\n\r\n" + bytes;
+}
+
+std::string chunked_request(const std::string &body, std::string suffix = {}) {
+    char hex[32];
+    auto [end, ec] = std::to_chars(hex, hex + sizeof(hex), body.size(), 16);
+    (void)ec;
+    std::string out = "POST /a HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
+    out.append(hex, static_cast<std::size_t>(end - hex));
+    out.append("\r\n");
+    out.append(body);
+    out.append("\r\n0\r\n\r\n");
+    out.append(suffix);
+    return out;
+}
+
+constexpr std::string_view kNextRequest = "GET /b HTTP/1.1\r\nHost: x\r\n\r\n";
+
+} // namespace
+
+TEST_CASE("h1/engine: a Content-Length body at the drain limit is not drained", "[h1]") {
+    // Head only: if the engine tried to read the declared body this would block
+    // (or fail on EOF), and a client that never sends it could pin the
+    // connection. The response head must say the connection is closing.
+    const auto out = run_without_reading(fixed_request(kDrainCap));
+    REQUIRE(out.completed);
+    CHECK(out.dispatched == 1);
+    CHECK(out.response.find("connection: close") != std::string::npos);
+    CHECK(out.closed);
+}
+
+TEST_CASE("h1/engine: a Content-Length body at the drain limit is not consumed for reuse", "[h1]") {
+    // The body (and a queued follow-up request) are already on the wire, but
+    // the tolerance is reached, so the server stops instead of draining 256 KiB
+    // to reuse the connection. The follow-up must never be dispatched.
+    const std::string request = fixed_request(kDrainCap, std::string(kDrainCap, 'x')) + std::string(kNextRequest);
+    const auto out = run_without_reading(request);
+    REQUIRE(out.completed);
+    CHECK(out.dispatched == 1);
+    CHECK_FALSE(out.reused());
+    CHECK(out.response.find("connection: close") != std::string::npos);
+    CHECK(out.closed);
+}
+
+TEST_CASE("h1/engine: an unread body under the drain limit keeps the connection", "[h1]") {
+    // One byte below the tolerance: Go drains it and reuses the connection, so
+    // the queued follow-up request is served.
+    const std::string request =
+        fixed_request(kDrainCap - 1, std::string(kDrainCap - 1, 'x')) + std::string(kNextRequest);
+    const auto out = run_without_reading(request);
+    REQUIRE(out.completed);
+    CHECK(out.dispatched == 2);
+    CHECK(out.response.find("connection: close") == std::string::npos);
+}
+
+TEST_CASE("h1/engine: a chunked body at the drain limit keeps the connection", "[h1]") {
+    const std::string request = chunked_request(std::string(kDrainCap, 'y'), std::string(kNextRequest));
+    const auto out = run_without_reading(request);
+    REQUIRE(out.completed);
+    CHECK(out.dispatched == 2);
+}
+
+TEST_CASE("h1/engine: a chunked body over the drain limit is not drained", "[h1]") {
+    const std::string request = chunked_request(std::string(kDrainCap + 1, 'y'), std::string(kNextRequest));
+    const auto out = run_without_reading(request);
+    REQUIRE(out.completed);
+    CHECK(out.dispatched == 1);
+    CHECK_FALSE(out.reused());
+    CHECK(out.closed);
+}
+
+TEST_CASE("h1/engine: a body the handler read is reusable above the drain limit", "[h1]") {
+    // The cap applies to bytes left unread, not to the request size: a handler
+    // that consumed the body itself leaves nothing to drain.
+    const std::string request =
+        fixed_request(kDrainCap + 1, std::string(kDrainCap + 1, 'z')) + std::string(kNextRequest);
+    const auto out = run_without_reading(request, /*read_body=*/true);
+    REQUIRE(out.completed);
+    CHECK(out.dispatched == 2);
+}
+
+TEST_CASE("h1/engine: a body that failed to parse is not advertised as keep-alive", "[h1]") {
+    // The handler reads the body, hits a malformed chunk size, and still answers.
+    // The engine is going to close the connection, so the head must say close
+    // rather than keep-alive.
+    const std::string request =
+        "POST /a HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nZZ\r\nabcd\r\n0\r\n\r\n";
+    const auto out = run_without_reading(request, /*read_body=*/true);
+    REQUIRE(out.completed);
+    CHECK(out.dispatched == 1);
+    CHECK(out.response.find("connection: close") != std::string::npos);
+    CHECK(out.closed);
 }

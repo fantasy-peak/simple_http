@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -173,7 +174,16 @@ class ClientStream {
 
     // --- response side ---
     template <typename Token> auto async_read_head(Token &&token) {
-        return asio::async_compose<Token, void(error_code, ResponseHead)>(ReadHeadOp{*this}, token, head_executor());
+        return asio::async_compose<Token, void(error_code, ResponseHead)>(ReadHeadOp{*this, false}, token,
+                                                                          head_executor());
+    }
+
+    // Buffered-send variant: the caller consumes the head and never reads the
+    // stream's cached copy, so the head is moved out instead of copied. This
+    // removes a header-vector + string copy per exchange.
+    template <typename Token> auto async_read_head_take(Token &&token) {
+        return asio::async_compose<Token, void(error_code, ResponseHead)>(ReadHeadOp{*this, true}, token,
+                                                                          head_executor());
     }
 
     const ResponseHead &head() const { return m_head ? *m_head : m_no_head; }
@@ -239,26 +249,47 @@ class ClientStream {
   protected:
     void set_head(ResponseHead head) {
         if (!m_head)
-            m_head = std::make_shared<ResponseHead>();
+            m_head.emplace();
         *m_head = std::move(head);
         m_head_ready = true;
     }
     void reset_head() { m_head_ready = false; }
     void set_trailers(Headers trailers) { m_trailers = std::move(trailers); }
 
-    const std::shared_ptr<ResponseHead> &head_ptr() const { return m_head; }
+    const ResponseHead *head_ptr() const { return m_head ? &*m_head : nullptr; }
+
+    // Moves the cached head out. Used only by async_read_head_take(): the plain
+    // async_read_head() contract leaves the head readable through head().
+    ResponseHead take_head() {
+        m_head_ready = false;
+        if (!m_head) {
+            return ResponseHead{};
+        }
+        ResponseHead out = std::move(*m_head);
+        m_head.reset();
+        return out;
+    }
 
   private:
     struct ReadHeadOp {
         ClientStream &stream;
+        bool take{false};
 
         asio::any_io_executor get_executor() const noexcept { return stream.head_executor(); }
+
+        template <typename Self> void complete_head(Self &self) {
+            if (take) {
+                self.complete(error_code{}, stream.take_head());
+            } else {
+                self.complete(error_code{}, *stream.head_ptr());
+            }
+        }
 
         template <typename Self> void operator()(Self &self, error_code ec = {}) {
             if (!started) {
                 started = true;
                 if (stream.head_ready()) {
-                    self.complete(error_code{}, *stream.head_ptr());
+                    complete_head(self);
                     return;
                 }
                 stream.await_head(WriteCompletion(std::move(self)));
@@ -272,7 +303,7 @@ class ClientStream {
                 self.complete(make_error_code(client_errc::protocol_error), ResponseHead{});
                 return;
             }
-            self.complete(error_code{}, *stream.head_ptr());
+            complete_head(self);
         }
         bool started{false};
     };
@@ -331,7 +362,9 @@ class ClientStream {
         }
     };
 
-    std::shared_ptr<ResponseHead> m_head;
+    // Optional rather than shared_ptr: the head is only ever read on the
+    // stream's executor, and one allocation per exchange is measurable on h2.
+    std::optional<ResponseHead> m_head;
     bool m_head_ready{false};
     ResponseHead m_no_head{};
     Headers m_trailers;

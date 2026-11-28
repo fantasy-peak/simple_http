@@ -7,6 +7,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -23,7 +24,6 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -634,11 +634,36 @@ func runWS(target, base string) {
 
 type rawCase struct {
 	ID      string
-	Request string
+	Request string // head bytes (and, for the small cases, the body)
+	// Body is written after Request. It lets one case send a body larger than a
+	// single write without making the case literal unreadable.
+	Body []byte
+	// Reuse probes whether the connection survives the response: after reading
+	// it, the probe writes a plain GET and reports whether a second response
+	// arrives. Post-handler body draining decides this.
+	Reuse bool
+	// CompareConn records whether the first response said `Connection: close`.
+	// Skipped for chunked bodies that exceed the drain tolerance: C++ decides
+	// after the head is on the wire, so it closes without the header, while Go
+	// (which drains before writing the head) can still add it.
+	CompareConn bool
 }
+
+// maxPostHandlerReadBytes in Go net/http: the server drains at most this many
+// unread request-body bytes to keep a connection alive.
+const drainLimit = 256 << 10
 
 func rawCases() []rawCase {
 	big := strings.Repeat("a", 70*1024)
+	under := strings.Repeat("b", 200<<10)
+	atLimit := strings.Repeat("c", drainLimit)
+	overLimit := strings.Repeat("d", drainLimit+1)
+	atChunk := fmt.Sprintf("%x\r\n%s\r\n0\r\n\r\n", len(atLimit), atLimit)
+	// A single oversized chunk with no terminating chunk: both servers stop
+	// reading once they know the body is over the tolerance, so leaving the
+	// terminator off keeps the peer from closing with unread bytes buffered.
+	overChunk := fmt.Sprintf("%x\r\n%s", len(overLimit), overLimit)
+	chunkHead := "POST /plain HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
 	return []rawCase{
 		{ID: "raw.get_plain", Request: "GET /plain HTTP/1.1\r\nHost: x\r\n\r\n"},
 		{ID: "raw.h1_0", Request: "GET /plain HTTP/1.0\r\n\r\n"},
@@ -647,10 +672,25 @@ func rawCases() []rawCase {
 		{ID: "raw.bad_line", Request: "GARBAGE\r\n\r\n"},
 		{ID: "raw.obs_fold", Request: "GET /plain HTTP/1.1\r\nHost: x\r\nX-Test: a\r\n b\r\n\r\n"},
 		{ID: "raw.large_head", Request: "GET /plain HTTP/1.1\r\nHost: x\r\nX-Big: " + big + "\r\n\r\n"},
+		// The handler (/plain) never reads the body. A Content-Length body with
+		// at least drainLimit bytes left is not drained; the head says "close".
+		{ID: "raw.drain_fixed_under",
+			Request: fmt.Sprintf("POST /plain HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n", len(under)),
+			Body:    []byte(under), Reuse: true, CompareConn: true},
+		{ID: "raw.drain_fixed_at",
+			Request: fmt.Sprintf("POST /plain HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n", drainLimit),
+			Reuse:   true, CompareConn: true},
+		{ID: "raw.drain_fixed_over",
+			Request: fmt.Sprintf("POST /plain HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n", drainLimit+1),
+			Reuse:   true, CompareConn: true},
+		// Chunked bodies have no declared size: exactly the tolerance reuses the
+		// connection, one byte more closes it.
+		{ID: "raw.drain_chunked_at", Request: chunkHead + atChunk, Reuse: true, CompareConn: true},
+		{ID: "raw.drain_chunked_over", Request: chunkHead + overChunk, Reuse: true},
 	}
 }
 
-func rawObservation(target, caseID, base, request string) observation {
+func rawObservation(target, caseID, base string, c rawCase) observation {
 	obs := observation{Case: caseID, Target: target, Headers: map[string][]string{}, BodyEncoding: "utf8"}
 	host := strings.TrimPrefix(strings.TrimPrefix(base, "http://"), "https://")
 	conn, err := net.DialTimeout("tcp", host, 2*time.Second)
@@ -663,40 +703,51 @@ func rawObservation(target, caseID, base, request string) observation {
 	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
 	// An oversized head may be rejected before the whole write completes; the
 	// response is still on the socket, so ignore write errors and read.
-	_, _ = conn.Write([]byte(request))
-	buffer := make([]byte, 8192)
-	n, _ := conn.Read(buffer)
-	if n == 0 {
-		reason := "other"
-		obs.Error = &reason
-		return obs
+	_, _ = conn.Write([]byte(c.Request))
+	if len(c.Body) > 0 {
+		_, _ = conn.Write(c.Body)
 	}
-	text := string(buffer[:n])
-	line := text
-	if index := strings.Index(text, "\r\n"); index >= 0 {
-		line = text[:index]
-	}
-	fields := strings.Fields(line)
-	if len(fields) < 2 {
-		reason := "other"
-		obs.Error = &reason
-		return obs
-	}
-	code, err := strconv.Atoi(fields[1])
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, nil)
 	if err != nil {
 		reason := "other"
 		obs.Error = &reason
 		return obs
 	}
+	code := resp.StatusCode
 	obs.Status = &code
-	obs.Version = fields[0]
+	obs.Version = resp.Proto
+	if obs.Notes == nil {
+		obs.Notes = map[string]string{}
+	}
+	if c.CompareConn {
+		note := "keep-alive"
+		if strings.EqualFold(resp.Header.Get("Connection"), "close") {
+			note = "close"
+		}
+		obs.Notes["connection"] = note
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if c.Reuse {
+		reused := false
+		if _, err := conn.Write([]byte("GET /plain HTTP/1.1\r\nHost: x\r\n\r\n")); err == nil {
+			_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+			if follow, err := http.ReadResponse(reader, nil); err == nil {
+				reused = true
+				_, _ = io.Copy(io.Discard, follow.Body)
+				_ = follow.Body.Close()
+			}
+		}
+		obs.Notes["reused"] = fmt.Sprint(reused)
+	}
 	return obs
 }
 
 func runRawGroup(h harness) {
 	for _, raw := range rawCases() {
 		for _, target := range []string{"cpp", "go"} {
-			emit(rawObservation(target, raw.ID, h.rawBase(target), raw.Request))
+			emit(rawObservation(target, raw.ID, h.rawBase(target), raw))
 		}
 	}
 }

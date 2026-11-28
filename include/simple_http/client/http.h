@@ -16,6 +16,7 @@
 // promise.
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cstdio>
 #include <functional>
@@ -74,6 +75,16 @@ struct HopCancel {
     // Set while a dial/handshake/upgrade owns a transport but no ClientStream
     // exists yet; an external cancel closes it to abort the pending I/O.
     std::function<void()> abort_transport;
+};
+
+// One parsed request URL and the origin key derived from it. The buffered path
+// parses the same URL for every request on a connection; caching the result
+// (and sharing it with in-flight hop lambdas by shared_ptr) removes a full
+// parse plus the scheme://authority concatenation from the hot path.
+struct ParsedTarget {
+    std::string url;
+    Url target;
+    std::string origin;
 };
 
 // Forwards a caller's cancellation emission into a signal owned by an
@@ -838,6 +849,10 @@ class Client : public std::enable_shared_from_this<Client> {
     std::shared_ptr<asio::ssl::context> m_tls_context;
     mutable std::string m_cached_origin;
     mutable std::shared_ptr<detail::ClientSession> m_cached_session;
+    // Last URL parsed by the buffered path. A Client is single-threaded, so a
+    // plain one-entry cache is safe; a different URL simply replaces it (the
+    // shared_ptr keeps any in-flight hop's entry alive).
+    mutable std::shared_ptr<const detail::ParsedTarget> m_parsed_target;
 #ifdef SIMPLE_HTTP_ENABLE_HTTP3
     // Survives close(): resumption is a TLS-session property, not a connection.
     std::shared_ptr<detail::H3SessionCache> m_h3_sessions{std::make_shared<detail::H3SessionCache>()};
@@ -921,14 +936,16 @@ class RequestBuilder {
         // Advertise only codings this build can actually decode; advertising an
         // unsupported one makes the server compress a body we would then have to
         // pass through raw (or fail to decode).
-        const auto encodings = detail::normalize_accept_encodings(config.accept_encodings);
         if (config.auto_decompress && wire != Method::Head && !request->header(field::accept_encoding) &&
-            !request->header(field::range) && !encodings.empty()) {
-            request->mutable_headers().add(std::string{field::accept_encoding}, detail::join_encodings(encodings));
-            request->set_state(detail::AutoDecompressMark{});
+            !request->header(field::range) && !config.accept_encodings.empty()) {
+            const auto encodings = detail::normalize_accept_encodings(config.accept_encodings);
+            if (!encodings.empty()) {
+                request->mutable_headers().add(std::string{field::accept_encoding}, detail::join_encodings(encodings));
+                request->set_state(detail::AutoDecompressMark{});
+            }
         }
         if (!m_body.empty())
-            request->set_body(m_body);
+            request->set_buffered_body(m_body);
         if (wire == Method::Head)
             request->set_close(false);
         const std::size_t cap = m_max_body_bytes != 0 ? m_max_body_bytes : m_client->config().limits.max_body_bytes;
@@ -1208,7 +1225,19 @@ inline void async_proxy_tunnel_bounded(asio::any_io_executor ex, std::chrono::mi
 // disables the deadline.
 inline void async_read_head_bounded(std::shared_ptr<ClientStream> stream, std::chrono::milliseconds limit,
                                     client_errc reason,
-                                    asio::any_completion_handler<void(error_code, ResponseHead)> done) {
+                                    asio::any_completion_handler<void(error_code, ResponseHead)> done,
+                                    bool take = false) {
+    if (limit.count() <= 0) {
+        // No deadline: hand the completion straight to the stream. Every caller
+        // keeps the stream alive through its own state, and this avoids
+        // allocating the timer/signal wrapper for the common no-timeout case.
+        if (take) {
+            stream->async_read_head_take(std::move(done));
+        } else {
+            stream->async_read_head(std::move(done));
+        }
+        return;
+    }
     struct State {
         std::shared_ptr<ClientStream> stream;
         client_errc reason;
@@ -1243,14 +1272,19 @@ inline void async_read_head_bounded(std::shared_ptr<ClientStream> stream, std::c
             state->signal.emit(asio::cancellation_type::terminal);
         });
     }
-    state->stream->async_read_head(
+    auto on_head =
         asio::bind_cancellation_slot(state->signal.slot(), [state, finish](error_code ec, ResponseHead head) mutable {
             if (ec == asio::error::operation_aborted && state->timed_out) {
                 finish(make_error_code(state->reason), ResponseHead{});
                 return;
             }
             finish(ec, std::move(head));
-        }));
+        });
+    if (take) {
+        state->stream->async_read_head_take(std::move(on_head));
+    } else {
+        state->stream->async_read_head(std::move(on_head));
+    }
 }
 
 // Reads the final (non-informational) response head. The h1/h2 sessions surface
@@ -1261,6 +1295,7 @@ struct FinalHeadState {
     std::shared_ptr<ClientStream> stream;
     std::chrono::milliseconds limit;
     client_errc reason;
+    bool take{false};
     asio::any_completion_handler<void(error_code, ResponseHead)> done;
 };
 
@@ -1268,36 +1303,46 @@ inline void read_final_head_next(const std::shared_ptr<FinalHeadState> &state);
 
 inline void async_read_final_head_bounded(std::shared_ptr<ClientStream> stream, std::chrono::milliseconds limit,
                                           client_errc reason,
-                                          asio::any_completion_handler<void(error_code, ResponseHead)> done) {
+                                          asio::any_completion_handler<void(error_code, ResponseHead)> done,
+                                          bool take = false) {
     auto state = std::make_shared<FinalHeadState>();
     state->stream = std::move(stream);
     state->limit = limit;
     state->reason = reason;
+    state->take = take;
     state->done = std::move(done);
     read_final_head_next(state);
 }
 
 inline void read_final_head_next(const std::shared_ptr<FinalHeadState> &state) {
-    async_read_head_bounded(state->stream, state->limit, state->reason,
-                            [state](error_code ec, ResponseHead head) mutable {
-                                if (ec) {
-                                    auto completion = std::move(state->done);
-                                    std::move(completion)(ec, ResponseHead{});
-                                    return;
-                                }
-                                if (head.status >= 100 && head.status < 200) {
-                                    state->stream->clear_head_cache();
-                                    read_final_head_next(state);
-                                    return;
-                                }
-                                auto completion = std::move(state->done);
-                                std::move(completion)(error_code{}, std::move(head));
-                            });
+    async_read_head_bounded(
+        state->stream, state->limit, state->reason,
+        [state](error_code ec, ResponseHead head) mutable {
+            if (ec) {
+                auto completion = std::move(state->done);
+                std::move(completion)(ec, ResponseHead{});
+                return;
+            }
+            if (head.status >= 100 && head.status < 200) {
+                state->stream->clear_head_cache();
+                read_final_head_next(state);
+                return;
+            }
+            auto completion = std::move(state->done);
+            std::move(completion)(error_code{}, std::move(head));
+        },
+        state->take);
 }
 
 // Same shape for a single body read (per-read idle deadline).
 inline void async_read_bounded(std::shared_ptr<ClientStream> stream, std::chrono::milliseconds limit,
                                client_errc reason, asio::any_completion_handler<void(error_code, ReadResult)> done) {
+    if (limit.count() <= 0) {
+        // No per-read deadline: skip the timer/signal wrapper. The owning
+        // ReadAllBoundedState/DiscardBoundedState keeps the stream alive.
+        stream->read(std::move(done));
+        return;
+    }
     struct State {
         std::shared_ptr<ClientStream> stream;
         client_errc reason;
@@ -1359,12 +1404,19 @@ inline void read_all_bounded_next(const std::shared_ptr<ReadAllBoundedState> &st
 
 inline void async_read_all_bounded(std::shared_ptr<ClientStream> stream, std::size_t max_bytes,
                                    std::chrono::milliseconds idle_limit,
-                                   asio::any_completion_handler<void(error_code, std::string)> done) {
+                                   asio::any_completion_handler<void(error_code, std::string)> done,
+                                   std::size_t reserve_hint = 0) {
     auto state = std::make_shared<ReadAllBoundedState>();
     state->stream = std::move(stream);
     state->max_bytes = max_bytes;
     state->idle_limit = idle_limit;
     state->done = std::move(done);
+    if (reserve_hint != 0) {
+        // The declared length is only a hint: cap it so a hostile value cannot
+        // force a large allocation, and so a body limit still wins.
+        const std::size_t cap = max_bytes != 0 ? std::min<std::size_t>(max_bytes, 1u << 20) : (1u << 20);
+        state->out.reserve(std::min(reserve_hint, cap));
+    }
     read_all_bounded_next(state);
 }
 
@@ -1923,25 +1975,36 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
     const std::chrono::milliseconds idle_budget =
         body_idle_timeout.count() > 0 ? body_idle_timeout : m_config.body_idle_timeout;
 
-    auto parsed = detail::parse_url(url);
-    if (!parsed) {
-        std::move(done)(parsed.error(), Response{});
-        return;
+    std::shared_ptr<const detail::ParsedTarget> parsed_target;
+    if (m_parsed_target && m_parsed_target->url == url) {
+        parsed_target = m_parsed_target;
+    } else {
+        auto parsed = detail::parse_url(url);
+        if (!parsed) {
+            std::move(done)(parsed.error(), Response{});
+            return;
+        }
+        auto entry = std::make_shared<detail::ParsedTarget>();
+        entry->url = url;
+        entry->target = std::move(*parsed);
+        entry->origin = entry->target.scheme + "://" + entry->target.authority();
+        m_parsed_target = entry;
+        parsed_target = std::move(entry);
     }
-    const detail::Url &target = *parsed;
+    const detail::Url &target = parsed_target->target;
+    const std::string &origin = parsed_target->origin;
     request->set_target(std::string{target.target});
     if (m_config.cookie_jar && !request->header(field::cookie)) {
         const std::string cookies = m_config.cookie_jar->cookie_header(url);
         if (!cookies.empty())
             request->mutable_headers().add(std::string{field::cookie}, cookies);
     }
-    const std::string origin = target.scheme + "://" + target.authority();
     auto session = take_cached(origin, version);
     auto self = keep_alive();
-    auto start = [self, request, url, target, origin, max_body_bytes, redirects, retries, head_budget, idle_budget,
-                  version, cancel, done = std::move(done)](std::shared_ptr<detail::ClientSession> ready) mutable {
-        auto open_done = [self, request, url, target, origin, max_body_bytes, redirects, retries, head_budget,
-                          idle_budget, version, cancel, done = std::move(done)](
+    auto start = [self, request, parsed_target, max_body_bytes, redirects, retries, head_budget, idle_budget, version,
+                  cancel, done = std::move(done)](std::shared_ptr<detail::ClientSession> ready) mutable {
+        auto open_done = [self, request, parsed_target, max_body_bytes, redirects, retries, head_budget, idle_budget,
+                          version, cancel, done = std::move(done)](
                              error_code oec, std::shared_ptr<detail::ClientStream> stream) mutable {
             if (oec) {
                 std::move(done)(oec, Response{});
@@ -1961,8 +2024,8 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
             }
             detail::async_read_final_head_bounded(
                 stream, head_budget, client_errc::response_head_timeout,
-                [self, request, url, target, origin, max_body_bytes, redirects, retries, head_budget, idle_budget,
-                 stream, version, cancel, done = std::move(done)](error_code hec, detail::ResponseHead head) mutable {
+                [self, request, parsed_target, max_body_bytes, redirects, retries, head_budget, idle_budget, stream,
+                 version, cancel, done = std::move(done)](error_code hec, detail::ResponseHead head) mutable {
                     if (cancel && cancel->cancelled) {
                         std::move(done)(make_error_code(asio::error::operation_aborted), Response{});
                         return;
@@ -1984,7 +2047,7 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
                         // A redirect response's Set-Cookie applies before the
                         // next hop, exactly like any other response.
                         if (self->m_config.cookie_jar)
-                            self->m_config.cookie_jar->store(url, head.headers);
+                            self->m_config.cookie_jar->store(parsed_target->url, head.headers);
                         // Discard, don't buffer. A redirect body is irrelevant,
                         // and a peer must not be able to make the client hold an
                         // arbitrarily large one; past the drain budget the
@@ -1992,8 +2055,8 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
                         // fresh connection.
                         detail::async_discard_bounded(
                             stream, 256 * 1024, idle_budget,
-                            [stream, self, request, url, target, origin, max_body_bytes, redirects, retries,
-                             head_budget, idle_budget, status, location_value, version, cancel,
+                            [stream, self, request, parsed_target, max_body_bytes, redirects, retries, head_budget,
+                             idle_budget, status, location_value, version, cancel,
                              done = std::move(done)](error_code bec) mutable {
                                 if (cancel && cancel->cancelled) {
                                     std::move(done)(make_error_code(asio::error::operation_aborted), Response{});
@@ -2007,7 +2070,7 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
                                     }
                                 }
                                 // RFC 3986 §5.2 reference resolution.
-                                std::string next_url = detail::resolve_redirect(target, location_value);
+                                std::string next_url = detail::resolve_redirect(parsed_target->target, location_value);
                                 auto next = detail::parse_url(next_url);
                                 if (!next) {
                                     std::move(done)(next.error(), Response{});
@@ -2015,16 +2078,17 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
                                 }
                                 // A downgrade would put the next request (and any
                                 // credentials it carries) on the wire in clear.
-                                if (target.scheme == "https" && next->scheme == "http") {
+                                if (parsed_target->target.scheme == "https" && next->scheme == "http") {
                                     std::move(done)(make_error_code(client_errc::redirect_to_insecure), Response{});
                                     return;
                                 }
                                 // Scheme and host are case-insensitive (RFC 3986
                                 // §3.1/§3.2.2); comparing raw bytes cleared
                                 // credentials on a mere spelling difference.
-                                const bool same_origin = iequals_ci(next->scheme, target.scheme) &&
-                                                         iequals_ci(next->host, target.host) &&
-                                                         next->effective_port() == target.effective_port();
+                                const bool same_origin =
+                                    iequals_ci(next->scheme, parsed_target->target.scheme) &&
+                                    iequals_ci(next->host, parsed_target->target.host) &&
+                                    next->effective_port() == parsed_target->target.effective_port();
                                 // Replay from the saved body: the first hop
                                 // consumed the live Body, and a 307/308 must
                                 // resend the same entity. clone_for_replay keeps
@@ -2057,10 +2121,22 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
                         return;
                     }
                     // max_redirects == 0 (or no Location): the 3xx is final.
+                    // Reserve the declared body length once instead of letting
+                    // the accumulator grow 1→2→4 KB as chunks arrive.
+                    std::size_t body_reserve = 0;
+                    if (const auto cl = head.header(field::content_length)) {
+                        std::uint64_t value = 0;
+                        const auto [ptr, ec] = std::from_chars(cl->data(), cl->data() + cl->size(), value);
+                        if (ec == std::errc{} && ptr == cl->data() + cl->size() &&
+                            value <= std::numeric_limits<std::size_t>::max()) {
+                            body_reserve = static_cast<std::size_t>(value);
+                        }
+                    }
                     detail::async_read_all_bounded(
                         stream, max_body_bytes, idle_budget,
-                        [self, url, request, head, stream, max_body_bytes, retries, head_budget, idle_budget, version,
-                         cancel, done = std::move(done)](error_code bec, std::string body) mutable {
+                        [self, parsed_target, request, head = std::move(head), stream, max_body_bytes, retries,
+                         head_budget, idle_budget, version, cancel,
+                         done = std::move(done)](error_code bec, std::string body) mutable {
                             if (cancel && cancel->cancelled) {
                                 std::move(done)(make_error_code(asio::error::operation_aborted), Response{});
                                 return;
@@ -2070,7 +2146,7 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
                                 return;
                             }
                             if (self->m_config.cookie_jar)
-                                self->m_config.cookie_jar->store(url, head.headers);
+                                self->m_config.cookie_jar->store(parsed_target->url, head.headers);
                             // Opt-in status retry (default off, matching Go and
                             // reqwest): the body is consumed, so the retry is a
                             // fresh exchange from the saved request source.
@@ -2085,12 +2161,12 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
                                 const auto retry_after = head.header(field::retry_after);
                                 const auto delay =
                                     retry_after ? retry_after_delay(*retry_after) : retry_delay(policy, retries + 1);
-                                SIMPLE_HTTP_WARN_LOG("client: {} returned {}, retry {} of {}", url, head.status,
-                                                     retries + 1, policy.max_retries);
+                                SIMPLE_HTTP_WARN_LOG("client: {} returned {}, retry {} of {}", parsed_target->url,
+                                                     head.status, retries + 1, policy.max_retries);
                                 auto timer = std::make_shared<asio::steady_timer>(self->m_executor);
                                 timer->expires_after(delay);
-                                timer->async_wait([self, request, url, max_body_bytes, head_budget, idle_budget,
-                                                   retries, timer, version, cancel,
+                                timer->async_wait([self, request, parsed_target, max_body_bytes, head_budget,
+                                                   idle_budget, retries, timer, version, cancel,
                                                    done = std::move(done)](error_code tec) mutable {
                                     if (tec) {
                                         return;
@@ -2099,7 +2175,8 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
                                         std::move(done)(make_error_code(asio::error::operation_aborted), Response{});
                                         return;
                                     }
-                                    self->send_hop(request->clone_for_replay(self->m_executor), url, max_body_bytes,
+                                    self->send_hop(request->clone_for_replay(self->m_executor), parsed_target->url,
+                                                   max_body_bytes,
                                                    /*redirects=*/0, retries + 1, head_budget, idle_budget, version,
                                                    cancel, std::move(done));
                                 });
@@ -2163,10 +2240,12 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
                                     }
                                 }
                             }
-                            Response response{head, std::move(body)};
+                            Response response{std::move(head), std::move(body)};
                             std::move(done)(error_code{}, std::move(response));
-                        });
-                });
+                        },
+                        body_reserve);
+                },
+                /*take=*/true);
         };
         if (ready) {
             ready->open_stream(request, std::move(open_done));
@@ -2178,8 +2257,8 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
             early->request = request;
             early->done = std::move(open_done);
         }
-        self->dial(target, version, request->allow_0rtt(), early, cancel,
-                   [self, request, origin, cancel, early, open_done = std::move(open_done)](
+        self->dial(parsed_target->target, version, request->allow_0rtt(), early, cancel,
+                   [self, request, parsed_target, cancel, early, open_done = std::move(open_done)](
                        error_code dec, std::shared_ptr<detail::ClientSession> session) mutable {
                        // The session already took the request and its completion;
                        // completing it again (even on cancellation) would invoke a
@@ -2188,7 +2267,7 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
                        // left every 0-RTT request without a reusable session.
                        if (early && early->submitted) {
                            if (!dec && session)
-                               self->cache(origin, session);
+                               self->cache(parsed_target->origin, session);
                            return;
                        }
                        auto fail = [&](error_code ec) {
@@ -2205,7 +2284,7 @@ inline void Client::send_hop(std::shared_ptr<Request> request, std::string url, 
                            fail(dec);
                            return;
                        }
-                       self->cache(origin, session);
+                       self->cache(parsed_target->origin, session);
                        if (early) {
                            session->open_stream(std::move(early->request), std::move(early->done));
                        } else {

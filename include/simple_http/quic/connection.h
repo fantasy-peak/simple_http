@@ -35,10 +35,12 @@
 #include "../core/compat.h"
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <functional>
 #include <limits>
@@ -65,6 +67,8 @@
 // which the libc header also declares, and the redefinition is a compile
 // error.)
 #include <netinet/udp.h>
+#include <sys/socket.h> // sendmsg, cmsghdr, CMSG_LEN
+#include <sys/uio.h>    // iovec
 #endif
 
 #include "../core/logging.h"
@@ -89,6 +93,61 @@ struct SendItem {
     asio::ip::udp::endpoint to;
     std::uint16_t gso_size{0};
 };
+
+// Hand one datagram to the kernel. With `gso_size` set, `data` is a GSO
+// segment — several QUIC packets the kernel splits into separate datagrams
+// (UDP_SEGMENT) — so a whole send burst costs one syscall instead of one per
+// packet. Shared by the server endpoint (which queues sends) and the HTTP/3
+// client (which sends inline from its sink).
+inline int raw_send_datagram(int fd, const SendItem &item) {
+    if (item.to.size() > sizeof(sockaddr_storage)) {
+        errno = EINVAL;
+        return -1;
+    }
+    sockaddr_storage ss{};
+    std::memcpy(&ss, item.to.data(), item.to.size());
+#if defined(__linux__) && defined(SOL_UDP) && defined(UDP_SEGMENT)
+    iovec iov{const_cast<std::uint8_t *>(item.data.data()), item.data.size()};
+    msghdr mh{};
+    mh.msg_name = &ss;
+    mh.msg_namelen = item.to.size();
+    mh.msg_iov = &iov;
+    mh.msg_iovlen = 1;
+    // The UDP_SEGMENT control message, as a POD with the same layout as
+    // `struct cmsghdr` (len/level/type) plus the segment size. It cannot embed
+    // a real cmsghdr — glibc ends that with a flexible array member, so it can
+    // never be the first member of a wrapper.
+    //
+    // Declared at function scope, not inside the `if`: msg_control points at it
+    // and sendmsg below reads it after the `if` ends, so its lifetime must
+    // cover the call. Scoping it inside the `if` was a genuine use-after-scope
+    // — ASan flagged it outright, and at -O2 it read stale stack bytes
+    // (EINVAL) because the compiler is free to reuse the dead slot. The `asm`
+    // barrier is belt-and-braces against the same class of -O2 store elision
+    // (GCC 16 trunk) and costs nothing.
+    struct cmsg_gso {
+        std::size_t cmsg_len; // cmsghdr: 8-byte len, 4-byte level, 4-byte type
+        int cmsg_level;
+        int cmsg_type;
+        std::uint16_t seg; // the GSO segment size
+    } c{};
+    if (item.gso_size > 0) {
+        c.cmsg_len = CMSG_LEN(sizeof(std::uint16_t));
+        c.cmsg_level = SOL_UDP;
+        c.cmsg_type = UDP_SEGMENT;
+        c.seg = item.gso_size;
+        static_assert(sizeof(c) >= sizeof(cmsghdr) + sizeof(std::uint16_t));
+        mh.msg_control = &c;
+        mh.msg_controllen = sizeof(c);
+    }
+    asm volatile("" : : "r"(&c) : "memory");
+    return static_cast<int>(::sendmsg(fd, &mh, 0));
+#else
+    (void)item.gso_size;
+    return static_cast<int>(
+        ::sendto(fd, item.data.data(), item.data.size(), 0, reinterpret_cast<const sockaddr *>(&ss), item.to.size()));
+#endif
+}
 
 // The connection hands finished datagrams to the endpoint, which owns the
 // socket.
@@ -136,12 +195,37 @@ inline constexpr std::uint32_t kQuicVersion1 = 0x00000001;
 // peer's advertised limit or our own `max_udp_payload_size`.
 inline constexpr std::size_t kMaxDatagram = 1500;
 
+// The datagram size a connection must be prepared to *receive*. QUIC lets a peer
+// send up to the `max_udp_payload_size` we advertise, so the receive buffer has
+// to follow the configured value (capped at what a UDP length field can carry)
+// rather than assume kMaxDatagram. The send side uses the same value, so a
+// connection never buffers less than it may put on the wire. Using
+// kMaxDatagram alone here was a real mismatch: a client configured for a jumbo
+// payload advertised it to the peer and then truncated the reply in recvmmsg.
+// (kMaxDatagram stays the floor: 1500 is still what the default configurations
+// need, and shrinking the buffer below it would only save memory nobody is
+// short of.)
+constexpr std::size_t max_datagram_size(std::uint64_t configured) noexcept {
+    const std::uint64_t capped = std::min<std::uint64_t>(std::max<std::uint64_t>(kMaxDatagram, configured), 65535);
+    return static_cast<std::size_t>(capped);
+}
+
+// The receive batch. recvmmsg gathers up to this many datagrams per syscall,
+// which is what keeps the receive side from being one event-loop wake-up per
+// packet; the scratch it reads into is `kRecvBatch * max_datagram_size(...)`
+// bytes per endpoint/connection. Shared by the server endpoint and the HTTP/3
+// client.
+#if defined(__linux__)
+inline constexpr std::size_t kRecvBatch = 64;
+#endif
+
 // How many packets the send loop packs into one UDP datagram. Each packet in a
 // batch is padded to the path MTU (see the PADDING flag in `write_pkt`), which
 // is what makes ngtcp2's packet aggregation engage — `write_aggregate_pkt2`
-// only batches when the first packet is full. The endpoint sends the batch with
-// UDP_SEGMENT, so every packet still lands as its own datagram on the wire, for
-// the price of one syscall instead of one per packet.
+// only batches when the first packet is full. Both the server endpoint and the
+// HTTP/3 client send the batch with UDP_SEGMENT, so every packet still lands as
+// its own datagram on the wire, for the price of one syscall instead of one per
+// packet.
 //
 // On platforms without GSO (non-Linux), batching is off: one packet per
 // datagram, exactly what the stack has always done — the aggregation above
@@ -670,6 +754,11 @@ class QuicConnection : public std::enable_shared_from_this<QuicConnection<Execut
     // local because the bytes have to survive until the packet is written, and
     // because `write_pkt` runs inside ngtcp2's frame.
     std::array<ngtcp2_vec, 8> m_vec_scratch{};
+
+    // Client-only aggregate write buffer. The client sink sends inline, so the
+    // bytes never outlive flush_writes() and this can be reused across the
+    // many wake-ups that have nothing to send.
+    std::vector<std::uint8_t> m_flush_scratch;
 
     bool m_closed{false};
     bool m_init_failed{false};
@@ -1266,11 +1355,11 @@ ngtcp2_ssize QuicConnection<Executor>::write_pkt(ngtcp2_path *path, ngtcp2_pkt_i
             // anti-amplification limit is untouched; ACK-only packets are not
             // ack-eliciting and are likewise left alone.
             //
-            // A client never aggregates: its sink is a plain UDP send, with no
-            // UDP_SEGMENT to split the batch, so padding would only waste
-            // bandwidth on every request.
-            if (!m_client)
-                flags |= NGTCP2_WRITE_STREAM_FLAG_PADDING;
+            // Both roles aggregate; the HTTP/3 client's sink now emits the
+            // batch with UDP_SEGMENT just like the server endpoint. The extra
+            // padding is the price of one syscall per burst instead of one per
+            // packet.
+            flags |= NGTCP2_WRITE_STREAM_FLAG_PADDING;
         }
 
         ngtcp2_ssize datalen = -1;
@@ -1314,33 +1403,38 @@ template <typename Executor> bool QuicConnection<Executor>::flush_writes() {
 
     for (;;) {
         // The aggregate buffer: up to kPacketsPerFlush full datagrams, one GSO
-        // segment when there is that much to say. The vector is moved into the
-        // send queue and ends up at the socket un-copied; allocating it per
-        // flush avoids threading a lifetime through (and the allocator's
-        // per-thread cache keeps the cost of doing so negligible).
-        //
-        // The client asks ngtcp2 for one packet per flush: its sink has no GSO
-        // (see the PADDING note in write_pkt), so a batch would be sent as one
-        // malformed datagram.
-        const std::size_t packets_per_flush = m_client ? 1 : kPacketsPerFlush;
+        // segment when there is that much to say. The server moves the vector
+        // into its send queue, so it needs a fresh allocation per non-empty
+        // flush. The client's sink sends inline and consumes the bytes before
+        // this function returns, so it reuses a per-connection scratch: most
+        // step() iterations have nothing to write, and those must not allocate.
+        const std::size_t packets_per_flush = kPacketsPerFlush;
         // ngtcp2 is told to use `max_udp_payload_size` as both the MTU and the
         // shaping ceiling (see make_ngtcp2_params). Allocating kMaxDatagram
         // per segment would let it write past the buffer whenever the
         // configured payload is larger than the default datagram size.
-        // 65535 is the largest value a UDP length field can represent.
         const auto configured_payload = static_cast<std::size_t>(m_config.max_udp_payload_size);
-        const std::size_t max_datagram =
-            std::min<std::size_t>(std::max<std::size_t>(kMaxDatagram, configured_payload), 65535);
-        std::vector<std::uint8_t> buf(max_datagram * packets_per_flush);
+        const std::size_t max_datagram = max_datagram_size(configured_payload);
+        const std::size_t needed = max_datagram * packets_per_flush;
+        std::vector<std::uint8_t> owned;
+        std::uint8_t *buf = nullptr;
+        if (m_client) {
+            if (m_flush_scratch.size() < needed) {
+                m_flush_scratch.resize(needed);
+            }
+            buf = m_flush_scratch.data();
+        } else {
+            owned.resize(needed);
+            buf = owned.data();
+        }
         ngtcp2_path_storage ps;
         ngtcp2_path_storage_zero(&ps);
         ngtcp2_pkt_info pi{};
         std::size_t gso_size = 0;
         const ngtcp2_tstamp ts = now();
 
-        const ngtcp2_ssize n =
-            ngtcp2_conn_write_aggregate_pkt2(m_conn, &ps.path, &pi, buf.data(), buf.size(), &gso_size,
-                                             &QuicConnection::cb_write_pkt, packets_per_flush, ts);
+        const ngtcp2_ssize n = ngtcp2_conn_write_aggregate_pkt2(m_conn, &ps.path, &pi, buf, needed, &gso_size,
+                                                                &QuicConnection::cb_write_pkt, packets_per_flush, ts);
         if (n < 0) {
             // NGTCP2_ERR_CALLBACK_FAILURE means one of our callbacks already set
             // `m_last_error`; anything else — a TLS alert included — is
@@ -1364,8 +1458,14 @@ template <typename Executor> bool QuicConnection<Executor>::flush_writes() {
         if (item.to.port() == 0)
             item.to = m_remote;
         item.gso_size = static_cast<std::uint16_t>(gso_size);
-        buf.resize(static_cast<std::size_t>(n));
-        item.data = std::move(buf);
+        if (m_client) {
+            // The client sink consumes the bytes inline; copying out of the
+            // scratch is one memcpy and keeps the scratch reusable.
+            item.data.assign(buf, buf + n);
+        } else {
+            owned.resize(static_cast<std::size_t>(n));
+            item.data = std::move(owned);
+        }
         m_sink(std::move(item));
     }
 }

@@ -28,13 +28,16 @@
 #include <nghttp3/nghttp3.h>
 
 #include "../core/asio_compat.h"
+#include "../core/cancel.h" // cancel_slot_of / forward_cancel_slot
 #include "../core/compat.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <optional>
@@ -43,6 +46,11 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#if defined(__linux__)
+#include <sys/socket.h> // recvmmsg, mmsghdr, sendto
+#include <sys/uio.h>    // iovec
+#endif
 
 #include "../core/http_field.h" // is_connection_specific_field
 #include "../core/http_method.h"
@@ -90,35 +98,125 @@ template <typename Executor> class QuicClientUdp : public std::enable_shared_fro
   public:
     using Connection = quic::QuicConnection<Executor>;
 
-    explicit QuicClientUdp(std::shared_ptr<asio::ip::udp::socket> socket) : m_socket(std::move(socket)) {}
+    // `max_udp_payload_size` is what this connection advertises to the peer, so
+    // it bounds the datagram size the peer may send us. The receive scratch must
+    // be sized from it (see quic::max_datagram_size); a fixed 1500-byte buffer
+    // would truncate a larger advertised limit.
+    QuicClientUdp(std::shared_ptr<asio::ip::udp::socket> socket, std::uint32_t max_udp_payload_size)
+        : m_socket(std::move(socket)), m_datagram_size(quic::max_datagram_size(max_udp_payload_size)) {}
 
     QuicClientUdp(const QuicClientUdp &) = delete;
     QuicClientUdp &operator=(const QuicClientUdp &) = delete;
 
-    // The DatagramSink the connection is built with. Each datagram gets its own
-    // shared buffer because the async send outlives this call; UDP itself is
-    // allowed to lose anything, so a failed send is simply dropped and QUIC's
-    // retransmission covers it.
+    // The DatagramSink the connection is built with. The socket is
+    // non-blocking, and flush_writes() hands the segment an owned copy, so the
+    // sink may consume it synchronously: no shared_ptr and no async operation
+    // per datagram. UDP loss is QUIC's business.
     quic::DatagramSink sink() {
         std::weak_ptr<QuicClientUdp> weak = this->weak_from_this();
         return [weak](quic::SendItem &&item) {
             auto self = weak.lock();
             if (!self || !self->m_socket->is_open())
                 return;
-            auto data = std::make_shared<std::vector<std::uint8_t>>(std::move(item.data));
-            const auto to = item.to;
-            self->m_socket->async_send_to(asio::buffer(*data), to,
-                                          [data](const error_code &, std::size_t) { /* loss is QUIC's */ });
+            const int fd = self->m_socket->native_handle();
+            const int sent = quic::raw_send_datagram(fd, item);
+            if (sent >= 0) {
+                return;
+            }
+            const int error = errno;
+#if defined(__linux__) && defined(SOL_UDP) && defined(UDP_SEGMENT)
+            if (item.gso_size > 0 && (error == EINVAL || error == EOPNOTSUPP || error == ENOPROTOOPT)) {
+                // This path does not accept UDP_SEGMENT (an old kernel, or a
+                // middlebox in the way). The packets are already framed, so
+                // deliver them one at a time.
+                quic::SendItem one;
+                one.to = item.to;
+                for (std::size_t offset = 0; offset < item.data.size(); offset += item.gso_size) {
+                    const std::size_t len = std::min<std::size_t>(item.gso_size, item.data.size() - offset);
+                    one.data.assign(item.data.begin() + static_cast<std::ptrdiff_t>(offset),
+                                    item.data.begin() + static_cast<std::ptrdiff_t>(offset + len));
+                    (void)quic::raw_send_datagram(fd, one);
+                }
+                return;
+            }
+#endif
+            if (error != EAGAIN && error != EWOULDBLOCK) {
+                return; // UDP loss is covered by QUIC retransmission.
+            }
+            self->async_send(std::move(item));
         };
     }
 
     // Feed datagrams into the connection until the socket is closed.
     void receive_loop(std::shared_ptr<Connection> conn) {
+#if defined(__linux__)
+        auto state = std::make_shared<RecvState>(m_datagram_size);
+        for (std::size_t i = 0; i < quic::kRecvBatch; ++i) {
+            state->iov[i].iov_base = state->scratch.data() + (i * state->datagram_size);
+            state->iov[i].iov_len = state->datagram_size;
+            state->msgs[i].msg_hdr.msg_iov = &state->iov[i];
+            state->msgs[i].msg_hdr.msg_iovlen = 1;
+            state->msgs[i].msg_hdr.msg_name = state->from[i].data();
+            state->msgs[i].msg_hdr.msg_namelen = state->from[i].capacity();
+        }
+        receive_wait(std::move(conn), std::move(state));
+#else
         auto buf = std::make_shared<std::array<std::uint8_t, 65535>>();
         receive_next(std::move(conn), std::move(buf));
+#endif
     }
 
   private:
+#if defined(__linux__)
+    // One scratch block per connection; every datagram is consumed
+    // synchronously, so nothing references it after the batch is processed.
+    struct RecvState {
+        explicit RecvState(std::size_t datagram_size)
+            : datagram_size(datagram_size), scratch(quic::kRecvBatch * datagram_size) {}
+        std::size_t datagram_size;
+        std::vector<std::uint8_t> scratch;
+        std::array<asio::ip::udp::endpoint, quic::kRecvBatch> from{};
+        std::array<iovec, quic::kRecvBatch> iov{};
+        std::array<mmsghdr, quic::kRecvBatch> msgs{};
+    };
+
+    void receive_wait(std::shared_ptr<Connection> conn, std::shared_ptr<RecvState> state) {
+        auto self = this->shared_from_this();
+        m_socket->async_wait(asio::ip::udp::socket::wait_read, [self, conn, state](error_code ec) {
+            if (ec) {
+                // ICMP port-unreachable surfaces as connection_refused on some
+                // stacks; only a cancelled/closed socket stops the loop.
+                if (ec == asio::error::operation_aborted || !self->m_socket->is_open())
+                    return;
+                self->receive_wait(std::move(conn), std::move(state));
+                return;
+            }
+            // Readiness first, then drain with recvmmsg until the socket is
+            // empty: one event-loop wake-up serves a whole burst.
+            for (;;) {
+                const int n = static_cast<int>(::recvmmsg(self->m_socket->native_handle(), state->msgs.data(),
+                                                          static_cast<unsigned int>(quic::kRecvBatch), 0, nullptr));
+                if (n <= 0) {
+                    break;
+                }
+                for (int i = 0; i < n; ++i) {
+                    if (state->msgs[i].msg_len == 0) {
+                        continue;
+                    }
+                    state->from[i].resize(state->msgs[i].msg_hdr.msg_namelen);
+                    conn->on_datagram(span<const std::uint8_t>{state->scratch.data() +
+                                                                   (static_cast<std::size_t>(i) * state->datagram_size),
+                                                               static_cast<std::size_t>(state->msgs[i].msg_len)},
+                                      state->from[i]);
+                    if (!self->m_socket->is_open()) {
+                        return; // the connection closed itself while parsing
+                    }
+                }
+            }
+            self->receive_wait(std::move(conn), std::move(state));
+        });
+    }
+#else
     void receive_next(std::shared_ptr<Connection> conn, std::shared_ptr<std::array<std::uint8_t, 65535>> buf) {
         auto self = this->shared_from_this();
         auto from = std::make_shared<asio::ip::udp::endpoint>();
@@ -137,6 +235,25 @@ template <typename Executor> class QuicClientUdp : public std::enable_shared_fro
                                          self->receive_next(std::move(conn), std::move(buf));
                                      });
     }
+#endif
+
+    // Async fallback for the rare EAGAIN. asio has no UDP_SEGMENT control
+    // message, so each GSO segment becomes its own datagram.
+    void async_send(quic::SendItem &&item) {
+        auto socket = m_socket;
+        const std::size_t segment = item.gso_size > 0 ? item.gso_size : item.data.size();
+        if (segment == 0) {
+            return;
+        }
+        for (std::size_t offset = 0; offset < item.data.size(); offset += segment) {
+            const std::size_t len = std::min(segment, item.data.size() - offset);
+            auto data = std::make_shared<std::vector<std::uint8_t>>(
+                item.data.begin() + static_cast<std::ptrdiff_t>(offset),
+                item.data.begin() + static_cast<std::ptrdiff_t>(offset + len));
+            socket->async_send_to(asio::buffer(*data), item.to,
+                                  [data](const error_code &, std::size_t) { /* loss is QUIC's */ });
+        }
+    }
 
   public:
     // Unblocks receive_loop. The connection's run() calls this when it ends.
@@ -147,6 +264,9 @@ template <typename Executor> class QuicClientUdp : public std::enable_shared_fro
 
   private:
     std::shared_ptr<asio::ip::udp::socket> m_socket;
+    // Per-datagram receive buffer size, derived from the advertised
+    // max_udp_payload_size. See quic::max_datagram_size().
+    std::size_t m_datagram_size{quic::kMaxDatagram};
 };
 
 template <typename Executor> class Http3ClientSession;
@@ -258,6 +378,11 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
         if (!ec)
             socket->bind(
                 asio::ip::udp::endpoint(remote.address().is_v6() ? asio::ip::udp::v6() : asio::ip::udp::v4(), 0), ec);
+        if (!ec)
+            // The receive loop calls recvmmsg on the native handle; a blocking
+            // socket would freeze the io_context thread, and the send path
+            // relies on EAGAIN rather than blocking in the sink.
+            socket->non_blocking(true, ec);
         if (ec) {
             SIMPLE_HTTP_ERROR_LOG("h3 client: UDP socket setup failed: {}", ec.message());
             std::move(done)(ec, nullptr);
@@ -278,7 +403,10 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
             });
         }
 
-        auto udp = std::make_shared<Udp>(socket);
+        // The receive buffer follows the value we advertise (see
+        // QuicClientUdp), so a jumbo configuration is accepted instead of
+        // truncated, and the default 1200 keeps kMaxDatagram bytes per slot.
+        auto udp = std::make_shared<Udp>(socket, state->max_udp_payload_size);
 
         quic::QuicConnectionConfig qcfg;
         qcfg.max_udp_payload_size = state->max_udp_payload_size;
@@ -513,6 +641,12 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
                 self->submit_open(request, id, fresh, std::move(up_front), std::move(completion));
             };
             if (!request->stream_body() && request->content_length() > 0) {
+                if (auto buffered = request->buffered_body()) {
+                    // The bytes are already owned: submit in this turn instead
+                    // of bouncing through the Body channel first.
+                    submit(std::string{*buffered}, std::move(done));
+                    return;
+                }
                 request->body().async_read_all([self, id = *id, submit = std::move(submit),
                                                 done = std::move(done)](error_code ec, std::string body) mutable {
                     if (ec) {
@@ -768,13 +902,18 @@ class Http3ClientSession final : public MultiplexedClientSession<Http3ClientSess
                 return;
             }
             if (!it->second->head_seen) {
-                self->head_step(id, [self, id, done = std::move(done)](error_code ec) mutable {
+                // The head wait is part of the caller's read: forward its slot,
+                // or a per-read deadline cannot abort while the response head is
+                // still outstanding. Sampled before `done` is moved.
+                auto slot = cancel_slot_of(done);
+                auto resume = [self, id, done = std::move(done)](error_code ec) mutable {
                     if (ec) {
                         std::move(done)(ec, ReadResult{});
                         return;
                     }
                     self->read_step(id, std::move(done));
-                });
+                };
+                self->head_step(id, WriteCompletion(forward_cancel_slot(slot, std::move(resume))));
                 return;
             }
             self->read_step(id, std::move(done));

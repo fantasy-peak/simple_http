@@ -73,17 +73,6 @@ namespace simple_http::quic {
 // the client owned its address at some point, and "some point" has to expire.
 inline constexpr ngtcp2_duration kRetryTokenTimeout = 30 * NGTCP2_SECONDS;
 
-// The receive batch. recvmmsg gathers up to this many datagrams per syscall,
-// which is what keeps the receive side from being one event-loop wake-up per
-// packet; the scratch it reads into is `kRecvBatch * kMaxDatagram` bytes per
-// endpoint. `MSG_WAITFORONE` makes recvmmsg return as soon as one datagram is
-// available rather than waiting for the whole batch, which fits a readiness-
-// driven loop: read what is here, wake again when more arrives.
-#if defined(__linux__)
-inline constexpr std::size_t kRecvBatch = 64;
-inline constexpr std::size_t kRecvScratch = kRecvBatch * kMaxDatagram;
-#endif
-
 // A Connection ID, for the endpoint's routing table.
 //
 // Keyed by its bytes rather than by a std::string: this lookup runs once per
@@ -347,26 +336,37 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
     // --- datagram in -------------------------------------------------------
 
     struct RecvState {
+        // `datagram_size` follows the max_udp_payload_size this endpoint
+        // advertises: the peer may send up to it, so a fixed kMaxDatagram slot
+        // would truncate larger datagrams.
+        explicit RecvState(std::size_t datagram_size) : datagram_size(datagram_size) {
 #if defined(__linux__)
-        // One large scratch the batch reads into (reused across calls: every
-        // datagram is consumed synchronously and copied where it needs to live,
-        // so nothing references it after the batch is processed).
-        std::vector<std::uint8_t> scratch = std::vector<std::uint8_t>(static_cast<std::size_t>(kRecvScratch));
+            // One large scratch the batch reads into (reused across calls: every
+            // datagram is consumed synchronously and copied where it needs to
+            // live, so nothing references it after the batch is processed).
+            scratch.resize(kRecvBatch * datagram_size);
+#else
+            buffer.resize(datagram_size);
+#endif
+        }
+        std::size_t datagram_size;
+#if defined(__linux__)
+        std::vector<std::uint8_t> scratch;
         std::array<asio::ip::udp::endpoint, kRecvBatch> from{};
         std::array<iovec, kRecvBatch> iov{};
         std::array<mmsghdr, kRecvBatch> msgs{};
 #else
-        std::vector<std::uint8_t> buffer = std::vector<std::uint8_t>(static_cast<std::size_t>(kMaxDatagram));
+        std::vector<std::uint8_t> buffer;
         asio::ip::udp::endpoint remote{};
 #endif
     };
 
     void receive_loop() {
-        auto state = std::make_shared<RecvState>();
+        auto state = std::make_shared<RecvState>(max_datagram_size(m_config.connection.max_udp_payload_size));
 #if defined(__linux__)
         for (std::size_t i = 0; i < kRecvBatch; ++i) {
-            state->iov[i].iov_base = state->scratch.data() + i * kMaxDatagram;
-            state->iov[i].iov_len = kMaxDatagram;
+            state->iov[i].iov_base = state->scratch.data() + (i * state->datagram_size);
+            state->iov[i].iov_len = state->datagram_size;
             state->msgs[i].msg_hdr.msg_iov = &state->iov[i];
             state->msgs[i].msg_hdr.msg_iovlen = 1;
             state->msgs[i].msg_hdr.msg_name = state->from[i].data();
@@ -403,7 +403,8 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
                         continue;
                     state->from[i].resize(state->msgs[i].msg_hdr.msg_namelen);
                     self->handle_datagram(
-                        span<const std::uint8_t>{state->scratch.data() + static_cast<std::size_t>(i) * kMaxDatagram,
+                        span<const std::uint8_t>{state->scratch.data() +
+                                                     (static_cast<std::size_t>(i) * state->datagram_size),
                                                  static_cast<std::size_t>(state->msgs[i].msg_len)},
                         state->from[i]);
                 }
@@ -842,56 +843,10 @@ template <typename Executor> class QuicEndpoint : public std::enable_shared_from
         (void)m_send_wake.try_send(error_code{});
     }
 
-    // One datagram on the wire. With `item.gso_size` set, the payload is a GSO
-    // segment — several QUIC packets the kernel splits into separate datagrams
-    // (UDP_SEGMENT). Returns the number of bytes handed to the kernel, or -1
-    // with errno set.
-    static int raw_send(int fd, const SendItem &item) {
-        if (item.to.size() > sizeof(sockaddr_storage))
-            return -1;
-        sockaddr_storage ss{};
-        std::memcpy(&ss, item.to.data(), item.to.size());
-#if defined(__linux__) && defined(SOL_UDP) && defined(UDP_SEGMENT)
-        iovec iov{const_cast<std::uint8_t *>(item.data.data()), item.data.size()};
-        msghdr mh{};
-        mh.msg_name = &ss;
-        mh.msg_namelen = item.to.size();
-        mh.msg_iov = &iov;
-        mh.msg_iovlen = 1;
-        // The UDP_SEGMENT control message, as a POD with the same layout as
-        // `struct cmsghdr` (len/level/type) plus the segment size. It cannot
-        // embed a real cmsghdr — glibc ends that with a flexible array member,
-        // so it can never be the first member of a wrapper.
-        //
-        // Declared at function scope, not inside the `if`: msg_control points
-        // at it and sendmsg below reads it after the `if` ends, so its lifetime
-        // must cover the call. Scoping it inside the `if` was a genuine
-        // use-after-scope — ASan flagged it outright, and at -O2 it read stale
-        // stack bytes (EINVAL) because the compiler is free to reuse the dead
-        // slot. The `asm` barrier is belt-and-braces against the same class of
-        // -O2 store elision (GCC 16 trunk) and costs nothing.
-        struct cmsg_gso {
-            std::size_t cmsg_len; // cmsghdr: 8-byte len, 4-byte level, 4-byte type
-            int cmsg_level;
-            int cmsg_type;
-            std::uint16_t seg; // the GSO segment size
-        } c{};
-        if (item.gso_size > 0) {
-            c.cmsg_len = CMSG_LEN(sizeof(std::uint16_t));
-            c.cmsg_level = SOL_UDP;
-            c.cmsg_type = UDP_SEGMENT;
-            c.seg = item.gso_size;
-            static_assert(sizeof(c) >= sizeof(cmsghdr) + sizeof(std::uint16_t));
-            mh.msg_control = &c;
-            mh.msg_controllen = sizeof(c);
-        }
-        asm volatile("" : : "r"(&c) : "memory");
-        return static_cast<int>(::sendmsg(fd, &mh, 0));
-#else
-        return static_cast<int>(::sendto(fd, item.data.data(), item.data.size(), 0,
-                                         reinterpret_cast<const sockaddr *>(&ss), item.to.size()));
-#endif
-    }
+    // One datagram on the wire (shared with the HTTP/3 client, see
+    // quic::raw_send_datagram). Returns the number of bytes handed to the
+    // kernel, or -1 with errno set.
+    static int raw_send(int fd, const SendItem &item) { return raw_send_datagram(fd, item); }
 
     void send_loop() {
         auto self = this->shared_from_this();

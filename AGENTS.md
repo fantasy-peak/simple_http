@@ -498,6 +498,11 @@ req->body().async_read_all(token);  // void(error_code, std::string)
 返回 false 时参数保持原样，调用方可重试；`finish()` / `fail()` 不可丢，
 channel 满时用 out-of-band pending 状态。
 
+客户端 buffered send 的 up-front body 走 `Request::set_buffered_body()` /
+`buffered_body()`：字节留在 `m_body_source` 里直接提交，不再建 Body channel，
+也不再多拷一份。只有 `Body::feed()` 直接喂入的请求才回退到 channel 读取；三种
+客户端的请求路径都必须先检查 `buffered_body()`，否则会等一个永远不会结束的 body。
+
 响应：
 
 ```cpp
@@ -656,7 +661,13 @@ server.serve_swagger_ui("/swagger", "/openapi.json");
   不支持的 transfer coding（501）、重复 chunked。
 - `Expect: 100-continue` 仅 HTTP/1.1；惰性发、最多一次；最终响应已开始时不再发 100。
 - 请求 trailers：chunked 终止符 `0\r\n<fields>\r\n`；每个消息重置 trailer 字节预算。
-- body 用 pull provider；handler 返回后 drain 未读 body 以复用连接。
+- body 用 pull provider；handler 返回后 drain 未读 body 以复用连接。drain 上限
+  对齐 Go `net/http` 的 `maxPostHandlerReadBytes`（256 KiB，`kH1DrainLimitBytes`）：
+  定长 body 还剩 ≥ 256 KiB 时不 drain，响应头带 `Connection: close`；chunked 只在
+  累计读过 256 KiB 后仍有剩余时停止并关闭（此时响应头已发出，无法再补
+  `Connection: close`）。连接本就不会复用时（handler 失败、请求/响应已决定
+  close、body 读取出错导致 `body_allows_keep_alive()` 为 false）直接跳过 drain，
+  避免对端中途停发时占用连接直到 `idle_timeout`。
 - 升级：WebSocket、h2c Upgrade（101 后把原请求重放为 stream 1）。
 - h1 的响应字节和 WebSocket 101 都经每连接一个 `SerializedWriter`。
 
@@ -698,6 +709,14 @@ server.serve_swagger_ui("/swagger", "/openapi.json");
   `Request::used_0rtt()`（与 quic-go 的 `r.TLS.HandshakeComplete` 一致）；早期数据
   丢失后在 1-RTT 重传的请求报 `false`。
 - 客户端不支持代理、请求 trailers、1xx。
+- 客户端发送复用服务端的 GSO 路径：`kPacketsPerFlush` 聚合 + `PADDING`，
+  `QuicClientUdp::sink()` 同步 `sendmsg + UDP_SEGMENT`（仅 `EAGAIN` 回退异步）；
+  接收用 `async_wait + recvmmsg`。`flush_writes()` 在客户端把聚合缓冲拷进
+  `SendItem`，所以 sink 不需要在返回前消费字节；sink 仍保持同步是为了避免每个
+  datagram 一个异步操作。
+- QUIC 收发缓冲必须按 `max_udp_payload_size` 定尺寸（`quic::max_datagram_size`，
+  上限 65535），不能用固定的 `kMaxDatagram`：对端可以按我们通告的值发更大的包，
+  固定 1500 会把它截断。
 - 服务端可 Alt-Svc 通告；QUIC 缺 `quic_transport_parameters` 时按 RFC 9001
   §8.2 关闭（`CONNECTION_CLOSE 0x016d`）。
 
@@ -1234,8 +1253,12 @@ test/run.sh server-diff
     `async_open_websocket` 和 `Stream::read_head_with` / `read_with` 把 caller slot
     转发给内层 dial/read；`HopState`/`HopCancel::abort_transport` 让
     DNS/dial/TLS 阶段可被 timer 中止。完成必须 post 回调用方 executor，不能在
-    emit 内销毁 cancellation_state。`client/http.h`、`client/h1_client.h`；
-    `test/unit/test_client_units.cpp` 的 `[client][cancel]`。
+    emit 内销毁 cancellation_state。把一次 read 拆成「先等 response head、再读
+    body」的实现（h2/h3）也必须把 caller slot 绑到 head 等待上，否则 read 在等头
+    阶段不可取消，只能等连接 idle timeout。`client/http.h`、`client/h1_client.h`、
+    `client/h2_client.h`、`client/h3_client.h`；`test/unit/test_client_units.cpp`
+    的 `[client][cancel]` 与 `test/unit/test_review_regressions.cpp` 的 parked
+    head/body / 等头取消用例。
 55. **取消适配器统一入口**：改变 completion handler 形状只能用
     `forward_cancel_slot()`；自定义槽处理器用 `install_cancel_handler()` /
     `SlotGuard`；从取消处理器完成调用方用 `post_cancelled()`。禁止把
@@ -1259,6 +1282,32 @@ test/run.sh server-diff
     参数集存在但缺 required 项时仍走 `fail(rv)` 得到 0x08。
     `quic/tls.h`、`quic/connection.h`；h3spec TLS 8.2 / Transport 7.3。
 
+58. **h1 handler 不读 body 时的 drain 上限 = 256 KiB（与 Go 一致）**：handler
+    返回后只为复用连接而读的 body 受 `kH1DrainLimitBytes` 约束。定长 body
+    剩余 ≥ 256 KiB 时不读，响应头由 sink 在序列化时通过
+    `body_allows_keep_alive()` 决定为 `Connection: close`；chunked 累计超过
+    256 KiB 后停止并关闭连接。阈值是 `>=`（Go 的 `unreadDataSizeLocked() >=
+    maxPostHandlerReadBytes`）。`Expect: 100-continue` 且 body 未开始时仍直接
+    关闭、不 drain。连接本就不会复用时（handler 失败 / 请求或响应已决定 close /
+    body 读到错误导致 `body_allows_keep_alive()` 为 false）也直接跳过 drain，
+    否则对端中途停发会占住连接直到 `idle_timeout`；body 读取出错后
+    `body_allows_keep_alive()` 返回 false，响应头不会再写 keep-alive。
+    `h1_engine.h` 的 `after_handler` / `drain_body_step` / `body_allows_keep_alive`；
+    `test/unit/test_h1_body.cpp` 的 drain 用例；`test/diff/server` 的 `raw.drain_*`。
+
+59. **h3 客户端 sink 同步消费聚合缓冲**：`QuicConnection::flush_writes()` 在
+    客户端复用 `m_flush_scratch` 并把这一段拷进 `SendItem`，所以 sink 拿到的是
+    自有字节；`QuicClientUdp::sink()` 在返回前用 `sendmsg + UDP_SEGMENT` 把它交给
+    内核（`EAGAIN` 时才拆包异步发送）。同步发送是性能选择（每个 datagram 少了
+    shared_ptr + 异步操作），不是正确性要求；若去掉那份拷贝，sink 就必须重新
+    变回同步消费。服务端角色仍然每 flush 分配 `owned`。`quic/connection.h`、
+    `client/h3_client.h`。
+
+60. **buffered send 可以 move 走 stream 的 head**：便利客户端用
+    `async_read_final_head_bounded(..., take=true)` 走 `async_read_head_take()`，
+    完成后 stream 的 head 缓存为空；公共 `Stream::async_read_head()` 仍必须保留
+    head，不能改为 take。`client/client_stream.h`、`client/http.h`。
+
 ---
 
 ## 10. 已知限制与「注释过时」清单
@@ -1275,6 +1324,10 @@ test/run.sh server-diff
 - 客户端没有传统连接池；只缓存一个 origin 的连接。
 - 客户端 `Response::text()` 与 `bytes()` 相同。
 - h1 客户端没有独立 idle timeout；h2 用 `ClientConfig::idle_timeout`。
+- h1 服务端对 chunked 请求的 drain 上限在响应头发出之后才判定：超出 256 KiB
+  时连接会关闭，但响应头已无法补 `Connection: close`（Go 在写头之前 drain，
+  可以补）。定长 body 的头部行为与 Go 一致。差额只体现在该响应头上，
+  `raw.drain_chunked_over` 因此只比较连接是否复用、不比较 `Connection`。
 - HTTP/3 客户端不支持代理、请求 trailers、1xx；服务端不支持 WS、request
   trailers、100-continue、push。0-RTT 无重放保护，被拒绝的早期请求不自动重试；
   `tls.shared_context` 下客户端 0-RTT 不可用；服务端票据不跨进程重启。

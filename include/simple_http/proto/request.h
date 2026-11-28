@@ -224,6 +224,16 @@ class Request {
         m_body.finish();
     }
 
+    // Client-side up-front body: keeps the bytes for replay/send but does not
+    // also feed the Body channel. The client transports take `buffered_body()`
+    // directly, so the channel (and its copy) would be dead weight on the
+    // request critical path. A caller that needs to read the body itself must
+    // use set_body() instead.
+    void set_buffered_body(std::string data) {
+        m_body_source = std::move(data);
+        m_content_length = static_cast<std::int64_t>(m_body_source.size());
+    }
+
     // A fresh shared request carrying the same method/target/headers and a re-fed
     // body. `exec` drives the new body's channel. Used by the client when a
     // pooled connection turned out stale before the request was written, or
@@ -239,7 +249,9 @@ class Request {
         // Middleware-installed marks (notably AutoDecompressMark) are part of
         // the request's meaning: dropping them makes the replay treat a body
         // the client itself negotiated as gzip as opaque compressed bytes.
-        copy->m_state = m_state;
+        if (m_state) {
+            copy->m_state = std::make_unique<std::deque<std::any>>(*m_state);
+        }
         copy->m_close = m_close;
         copy->m_stream_body = m_stream_body;
         // A replay is a new 1-RTT exchange, never early data; the opt-in that
@@ -247,7 +259,11 @@ class Request {
         // rejected early request keeps its intent.
         copy->m_allow_0rtt = m_allow_0rtt;
         if (!m_body_source.empty()) {
-            copy->set_body(m_body_source);
+            // set_body() would also copy the bytes into the Body channel, which
+            // every client path now skips in favour of buffered_body(). Keep the
+            // source only: one copy instead of two, and no channel node for a
+            // replay that is written straight from m_body_source.
+            copy->set_buffered_body(m_body_source);
         }
         return copy;
     }
@@ -263,6 +279,19 @@ class Request {
     // The up-front body's source bytes, for replay (redirect 307/308, pooled
     // retry). Empty when the request has a streamed or no body.
     const std::string &body_source() const { return m_body_source; }
+
+    // The complete up-front body, when `set_body()` or `set_buffered_body()`
+    // supplied it and the declared length matches. Clients use this to submit
+    // the request without first draining the Body channel — an extra
+    // event-loop hop on the request critical path. Directly-fed bodies
+    // (Body::feed) return nullopt and take the channel path.
+    std::optional<std::string_view> buffered_body() const {
+        if (stream_body() || m_content_length < 0 ||
+            m_body_source.size() != static_cast<std::size_t>(m_content_length)) {
+            return std::nullopt;
+        }
+        return std::string_view{m_body_source};
+    }
 
     // HTTP Basic (RFC 7617): sets `Authorization: Basic base64(user:pass)` —
     // the client-side counterpart of middleware::basic_auth. Returns *this for
@@ -310,11 +339,19 @@ class Request {
     // `get_state<T>()` finds the value most recently set *as T*: last set wins.
     // The type must match exactly — `set_state<std::string>("x")` is not found
     // by `get_state<std::string_view>()`.
-    template <typename T> void set_state(T value) { m_state.push_back(std::any{std::move(value)}); }
+    template <typename T> void set_state(T value) {
+        if (!m_state) {
+            m_state = std::make_unique<std::deque<std::any>>();
+        }
+        m_state->push_back(std::any{std::move(value)});
+    }
 
     // The value most recently set as T, or nullptr if none was.
     template <typename T> T *get_state() {
-        for (auto it = m_state.rbegin(); it != m_state.rend(); ++it) {
+        if (!m_state) {
+            return nullptr;
+        }
+        for (auto it = m_state->rbegin(); it != m_state->rend(); ++it) {
             if (auto *p = std::any_cast<T>(&*it)) {
                 return p;
             }
@@ -322,7 +359,10 @@ class Request {
         return nullptr;
     }
     template <typename T> const T *get_state() const {
-        for (auto it = m_state.rbegin(); it != m_state.rend(); ++it) {
+        if (!m_state) {
+            return nullptr;
+        }
+        for (auto it = m_state->rbegin(); it != m_state->rend(); ++it) {
             if (auto *p = std::any_cast<T>(&*it)) {
                 return p;
             }
@@ -646,7 +686,10 @@ class Request {
     // references into these elements, and middleware chains keep setting more
     // state after taking them. `deque::push_back` does not move existing
     // elements, so those pointers stay valid for the request's lifetime.
-    std::deque<std::any> m_state;
+    // Lazily allocated: the client's buffered requests never set state, and a
+    // default deque allocates its node map in the constructor. unique_ptr
+    // keeps the deque's stable-address guarantee for get_state().
+    std::unique_ptr<std::deque<std::any>> m_state;
 
     // Request-scoped cancellation (see cancel()/cancellation_slot() above).
     // Shared so a cross-thread cancel can post an emission that outlives the

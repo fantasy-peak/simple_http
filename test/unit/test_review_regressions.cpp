@@ -1385,3 +1385,239 @@ TEST_CASE("review: an h2 interim 100 wakes a parked head read", "[review][regres
     REQUIRE(head.has_value());
     CHECK(head->status == status::continue_);
 }
+
+// The h2 client no longer parks readers on a per-stream channel: it stores the
+// completion handler and clears the caller's cancellation slot when it wakes.
+// That rewrite must keep Asio's per-operation cancellation contract, which a
+// fake ClientStream cannot exercise. Park a real session read, cancel it, and
+// require operation_aborted instead of a hang.
+TEST_CASE("review: cancelling a parked h2 body read reports operation_aborted",
+          "[review][regression][client][cancel]") {
+    using Session = detail::Http2ClientSession<MockTransport>;
+    asio::io_context ctx;
+    auto pump = [&ctx] {
+        ctx.restart();
+        ctx.run_for(std::chrono::milliseconds(200));
+    };
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    transport->hold_open();
+
+    std::string settings;
+    append_h2_frame(settings, codec::H2FrameType::Settings, 0, 0, {});
+    transport->push(std::move(settings));
+
+    detail::ClientTarget target;
+    target.host = "example.com";
+    target.port = 80;
+    auto session = std::make_shared<Session>(transport, target, EngineLimits{}, std::chrono::milliseconds{0});
+    bool started = false;
+    session->start([&started](error_code ec) { started = !ec; });
+    pump();
+    REQUIRE(started);
+
+    auto request = std::make_shared<Request>(Version::Http11, ctx.get_executor());
+    request->set_method(Method::Get);
+    request->set_target("/x");
+    std::shared_ptr<detail::ClientStream> stream;
+    session->open_stream(request, [&stream](error_code ec, std::shared_ptr<detail::ClientStream> s) {
+        if (!ec)
+            stream = std::move(s);
+    });
+    pump();
+    REQUIRE(stream);
+
+    // Head only, no END_STREAM: the body read has nowhere to go and parks.
+    std::string response;
+    {
+        std::string block;
+        codec::hpack_append_indexed(block, 8); // :status 200
+        append_h2_frame(response, codec::H2FrameType::Headers, codec::H2_FLAG_END_HEADERS, 1, block);
+    }
+    transport->push(std::move(response));
+    pump();
+
+    std::optional<error_code> read_ec;
+    asio::cancellation_signal signal;
+    stream->async_read(
+        asio::bind_cancellation_slot(signal.slot(), [&read_ec](error_code ec, ReadResult) { read_ec = ec; }));
+    pump();
+    REQUIRE_FALSE(read_ec.has_value()); // parked, not completed
+
+    signal.emit(asio::cancellation_type::terminal);
+    pump();
+    REQUIRE(read_ec.has_value());
+    CHECK(*read_ec == asio::error::operation_aborted);
+}
+
+// Same contract for a head read parked before any response arrived.
+TEST_CASE("review: cancelling a parked h2 head read reports operation_aborted",
+          "[review][regression][client][cancel]") {
+    using Session = detail::Http2ClientSession<MockTransport>;
+    asio::io_context ctx;
+    auto pump = [&ctx] {
+        ctx.restart();
+        ctx.run_for(std::chrono::milliseconds(200));
+    };
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    transport->hold_open();
+
+    std::string settings;
+    append_h2_frame(settings, codec::H2FrameType::Settings, 0, 0, {});
+    transport->push(std::move(settings));
+
+    detail::ClientTarget target;
+    target.host = "example.com";
+    target.port = 80;
+    auto session = std::make_shared<Session>(transport, target, EngineLimits{}, std::chrono::milliseconds{0});
+    bool started = false;
+    session->start([&started](error_code ec) { started = !ec; });
+    pump();
+    REQUIRE(started);
+
+    auto request = std::make_shared<Request>(Version::Http11, ctx.get_executor());
+    request->set_method(Method::Get);
+    request->set_target("/x");
+    std::shared_ptr<detail::ClientStream> stream;
+    session->open_stream(request, [&stream](error_code ec, std::shared_ptr<detail::ClientStream> s) {
+        if (!ec)
+            stream = std::move(s);
+    });
+    pump();
+    REQUIRE(stream);
+
+    std::optional<error_code> head_ec;
+    asio::cancellation_signal signal;
+    stream->async_read_head(
+        asio::bind_cancellation_slot(signal.slot(), [&head_ec](error_code ec, detail::ResponseHead) { head_ec = ec; }));
+    pump();
+    REQUIRE_FALSE(head_ec.has_value());
+
+    signal.emit(asio::cancellation_type::terminal);
+    pump();
+    REQUIRE(head_ec.has_value());
+    CHECK(*head_ec == asio::error::operation_aborted);
+}
+
+// The buffered clients submit set_buffered_body() bytes directly, so the body
+// must reach the wire without anyone feeding the Body channel.
+TEST_CASE("review: a buffered up-front body is written without the Body channel", "[review][regression][client]") {
+    asio::io_context ctx;
+    auto pump = [&ctx] {
+        ctx.restart();
+        ctx.run_for(std::chrono::milliseconds(200));
+    };
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    transport->hold_open();
+    auto session =
+        std::make_shared<detail::Http1ClientSession<MockTransport>>(transport, "example.com", EngineLimits{});
+
+    auto request = std::make_shared<Request>(Version::Http11, ctx.get_executor());
+    request->set_method(Method::Post);
+    request->set_target("/x");
+    request->set_buffered_body("hello");
+    REQUIRE(request->buffered_body().has_value());
+    CHECK(*request->buffered_body() == "hello");
+
+    std::shared_ptr<detail::ClientStream> stream;
+    session->open_stream(request, [&stream](error_code ec, std::shared_ptr<detail::ClientStream> s) {
+        if (!ec)
+            stream = std::move(s);
+    });
+    pump();
+    REQUIRE(stream);
+    CHECK(transport->written().find("content-length: 5") != std::string::npos);
+    CHECK(transport->written().find("hello") != std::string::npos);
+}
+
+// A replay is written from its saved bytes, never read through the Body
+// channel (the clients check buffered_body() first). clone_for_replay used to
+// feed both, holding a second copy of every replayed request body.
+TEST_CASE("review: clone_for_replay keeps exactly one copy of a buffered body", "[review][regression]") {
+    asio::io_context ctx;
+    auto request = std::make_shared<Request>(Version::Http11, ctx.get_executor());
+    request->set_method(Method::Post);
+    request->set_target("/x");
+    request->set_buffered_body("hello");
+
+    // Declared before `copy` so it outlives it: the pending read is destroyed
+    // with the body at scope exit and must not complete into a dead flag.
+    bool completed = false;
+    auto copy = request->clone_for_replay(ctx.get_executor());
+    REQUIRE(copy->buffered_body().has_value());
+    CHECK(*copy->buffered_body() == "hello");
+
+    // The channel copy is the tell: reading must not produce the bytes, because
+    // nothing fed it and no client will ever read it.
+    copy->body().async_read_all([&completed](error_code, std::string) { completed = true; });
+    ctx.restart();
+    ctx.run_for(std::chrono::milliseconds(50));
+    CHECK_FALSE(completed);
+}
+
+// A peer may send up to the max_udp_payload_size we advertise, so the receive
+// buffer must follow it. A fixed kMaxDatagram truncated larger configurations.
+TEST_CASE("review: QUIC receive buffer follows the advertised udp payload size", "[review][regression][h3]") {
+#ifdef SIMPLE_HTTP_ENABLE_HTTP3
+    CHECK(quic::max_datagram_size(1200) == quic::kMaxDatagram); // default: no shrink
+    CHECK(quic::max_datagram_size(1472) == quic::kMaxDatagram);
+    CHECK(quic::max_datagram_size(quic::kMaxDatagram) == quic::kMaxDatagram);
+    CHECK(quic::max_datagram_size(4000) == 4000);
+    CHECK(quic::max_datagram_size(65527) == 65527);
+    CHECK(quic::max_datagram_size(70000) == 65535); // capped at the UDP maximum
+#else
+    SUCCEED("HTTP/3 disabled");
+#endif
+}
+
+// A read() that is still waiting for the response head is part of the same
+// operation: the caller's slot must reach that wait too. It used to be dropped
+// when the head continuation was wrapped in a plain lambda, so a per-read
+// deadline could not abort and the read hung until the connection died.
+TEST_CASE("review: cancelling a read that is waiting for the h2 head reports operation_aborted",
+          "[review][regression][client][cancel]") {
+    using Session = detail::Http2ClientSession<MockTransport>;
+    asio::io_context ctx;
+    auto pump = [&ctx] {
+        ctx.restart();
+        ctx.run_for(std::chrono::milliseconds(200));
+    };
+    auto transport = std::make_shared<MockTransport>(ctx.get_executor());
+    transport->hold_open();
+
+    std::string settings;
+    append_h2_frame(settings, codec::H2FrameType::Settings, 0, 0, {});
+    transport->push(std::move(settings));
+
+    detail::ClientTarget target;
+    target.host = "example.com";
+    target.port = 80;
+    auto session = std::make_shared<Session>(transport, target, EngineLimits{}, std::chrono::milliseconds{0});
+    bool started = false;
+    session->start([&started](error_code ec) { started = !ec; });
+    pump();
+    REQUIRE(started);
+
+    auto request = std::make_shared<Request>(Version::Http11, ctx.get_executor());
+    request->set_method(Method::Get);
+    request->set_target("/x");
+    std::shared_ptr<detail::ClientStream> stream;
+    session->open_stream(request, [&stream](error_code ec, std::shared_ptr<detail::ClientStream> s) {
+        if (!ec)
+            stream = std::move(s);
+    });
+    pump();
+    REQUIRE(stream);
+
+    // No response yet: the read parks on the head phase.
+    std::optional<error_code> read_ec;
+    asio::cancellation_signal signal;
+    stream->async_read(
+        asio::bind_cancellation_slot(signal.slot(), [&read_ec](error_code ec, ReadResult) { read_ec = ec; }));
+    pump();
+    REQUIRE_FALSE(read_ec.has_value());
+
+    signal.emit(asio::cancellation_type::terminal);
+    pump();
+    REQUIRE(read_ec.has_value());
+    CHECK(*read_ec == asio::error::operation_aborted);
+}
